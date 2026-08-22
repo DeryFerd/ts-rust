@@ -1870,45 +1870,75 @@ mod tests {
 
     #[test]
     fn fixed_tuple_out_of_bounds_indices_emit_ts2493_without_no_implicit_any() {
-        let parsed = parse_fixture("const result = tuple[0];");
-        let file = FileId::new(613);
-        let mut store = registered_store(&parsed, file);
-        let undefined = store.intrinsic_bootstrap().unwrap().undefined_type;
-        let tuple = store.create_canonical_empty_tuple_type().unwrap();
-        let array_target = canonical_array_target(&mut store);
-        let receiver_symbol = alloc_symbol(&mut store, SymbolFlags::BLOCK_SCOPED_VARIABLE, "tuple");
-        let zero = store
-            .regular_number_literal_type(ts_jsnum::Number::new(0.0))
-            .unwrap();
-        let plan = source_plan(
-            &parsed,
-            file,
-            &store,
-            PlannedExpressionKind::Number {
-                value: ts_jsnum::Number::new(0.0),
-                unary_operand: None,
-            },
-            receiver_symbol,
-        );
+        for (file_id, source, nonempty, index, expected) in [
+            (
+                613,
+                "const result = tuple[0];",
+                false,
+                0_u32,
+                "Tuple type '[]' of length '0' has no element at index '0'.",
+            ),
+            (
+                616,
+                "const result = tuple[2];",
+                true,
+                2_u32,
+                "Tuple type '[string]' of length '1' has no element at index '2'.",
+            ),
+        ] {
+            let parsed = parse_fixture(source);
+            let file = FileId::new(file_id);
+            let mut store = registered_store(&parsed, file);
+            let (string, undefined) = {
+                let bootstrap = store.intrinsic_bootstrap().unwrap();
+                (bootstrap.string_type, bootstrap.undefined_type)
+            };
+            let tuple = if nonempty {
+                let info = store
+                    .create_tuple_element_info(ElementFlags::REQUIRED, None)
+                    .unwrap();
+                store
+                    .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(
+                        &[string],
+                        &[info],
+                        false,
+                    ))
+                    .unwrap()
+            } else {
+                store.create_canonical_empty_tuple_type().unwrap()
+            };
+            let array_target = canonical_array_target(&mut store);
+            let receiver_symbol =
+                alloc_symbol(&mut store, SymbolFlags::BLOCK_SCOPED_VARIABLE, "tuple");
+            let value = ts_jsnum::Number::new(f64::from(index));
+            let index_type = store.regular_number_literal_type(value).unwrap();
+            let plan = source_plan(
+                &parsed,
+                file,
+                &store,
+                PlannedExpressionKind::Number {
+                    value,
+                    unary_operand: None,
+                },
+                receiver_symbol,
+            );
 
-        let checked = check_direct_source_element_with_array_targets(
-            &mut store,
-            &empty_host(),
-            CanonicalArrayTargets::for_test(array_target, array_target),
-            CanonicalCheckerOptions::default(),
-            &plan,
-            tuple,
-            zero,
-        )
-        .unwrap();
-        assert_eq!(checked.type_, undefined);
-        let diagnostic = checked.diagnostic.unwrap();
-        assert_eq!(diagnostic.node, Some(plan.index.node));
-        assert_eq!(diagnostic.diagnostic.code(), 2493);
-        assert_eq!(
-            diagnostic.diagnostic.render().unwrap(),
-            "Tuple type '[]' of length '0' has no element at index '0'.",
-        );
+            let checked = check_direct_source_element_with_array_targets(
+                &mut store,
+                &empty_host(),
+                CanonicalArrayTargets::for_test(array_target, array_target),
+                CanonicalCheckerOptions::default(),
+                &plan,
+                tuple,
+                index_type,
+            )
+            .unwrap();
+            assert_eq!(checked.type_, undefined);
+            let diagnostic = checked.diagnostic.unwrap();
+            assert_eq!(diagnostic.node, Some(plan.index.node));
+            assert_eq!(diagnostic.diagnostic.code(), 2493);
+            assert_eq!(diagnostic.diagnostic.render().unwrap(), expected);
+        }
     }
 
     #[test]

@@ -25,17 +25,24 @@ use super::{
         ValidatedSingleCallSignatureDisplay, single_callable_display_projection,
         single_callable_family, validate_stored_single_callable,
     },
+    classes::{ClassHeritageMembersValidation, validate_class_heritage_members},
     declared::cached_ordinary_type_parameter_owner,
     derived_types::DerivedObjectLiteralValidation,
     enums,
     functions::{FunctionTypeDisplayError, FunctionTypeUnsupported},
     keyof_types,
     links::ValueSymbolLinks,
+    mapped_types::plan_mapped_type_declaration,
     object_members,
     reference_types::validate_direct_generic_reference,
-    signatures::IndexFlags,
-    source_callables::{SourceCallableDisplayError, SourceCallableUnsupported},
+    signatures::{ElementFlags, IndexFlags},
+    source_callables::{
+        SourceCallableDisplayError, SourceCallableUnsupported, StoredSourceCallableValidation,
+        validate_stored_source_callable,
+    },
+    source_overloads::{StoredSourceOverloadValidation, validate_stored_source_overload},
     structured_members::{InterfaceHeritageMembersValidation, validate_interface_heritage_members},
+    tuple_types::TupleShape,
     type_records::{
         LiteralTypeData, LiteralValue, TypeCacheState, TypeData, TypeDataKind, TypeRecord,
     },
@@ -581,6 +588,17 @@ fn display_type_worker(
         state.add(2);
         return Ok("[]".to_owned());
     }
+    if type_flags.intersects(TypeFlags::OBJECT)
+        && matches!(
+            record.data(),
+            TypeData::Tuple(_) | TypeData::TypeReference(_)
+        )
+        && let Some(tuple) = store
+            .canonical_tuple_shape(type_id)
+            .map_err(|_| TypeDisplayUnavailable::MalformedType(type_id))?
+    {
+        return display_tuple_type(store, host, global_types, tuple, flags, state, visiting);
+    }
 
     if type_flags.intersects(TypeFlags::ANY) {
         if let Some(alias) = record.alias() {
@@ -853,6 +871,27 @@ fn display_object_type(
     if record.flags() != TypeFlags::OBJECT {
         return Err(TypeDisplayUnavailable::MalformedType(type_id));
     }
+    if store
+        .intrinsic_bootstrap()
+        .is_some_and(|bootstrap| type_id == bootstrap.empty_type_literal_type)
+    {
+        return match object_members::validate_resolved_declared_property_object(store, type_id) {
+            object_members::DeclaredPropertyObjectValidation::Valid(
+                object_members::DeclaredPropertyObjectProof::TypeLiteral,
+            ) => {
+                state.add(2);
+                Ok("{}".to_owned())
+            }
+            _ => Err(TypeDisplayUnavailable::MalformedType(type_id)),
+        };
+    }
+    if matches!(record.data(), TypeData::Mapped(_)) {
+        let host = host.ok_or(TypeDisplayUnavailable::UnsupportedType {
+            type_id,
+            kind: record.data().kind(),
+        })?;
+        return display_mapped_type_alias(store, host, type_id, state);
+    }
     if let Some(global_types) = global_types
         && let Some(array) = store
             .canonical_array_reference(global_types, type_id)
@@ -879,6 +918,11 @@ fn display_object_type(
         return display_alias_name(store, type_id, alias, state);
     }
     if let Some(host) = host
+        && let Some(name) = display_validated_class_type(store, host, type_id, record, state)?
+    {
+        return Ok(name);
+    }
+    if let Some(host) = host
         && record.object_flags().contains(ObjectFlags::REFERENCE)
         && matches!(
             record.data(),
@@ -886,6 +930,38 @@ fn display_object_type(
         )
     {
         return display_direct_generic_reference(
+            store,
+            host,
+            global_types,
+            type_id,
+            flags,
+            state,
+            visiting,
+        );
+    }
+    if let Some(host) = host
+        && store
+            .source_callable_provenance(type_id)
+            .is_some_and(|provenance| {
+                store
+                    .signature(provenance.signature)
+                    .is_some_and(|signature| !signature.type_parameters().is_empty())
+            })
+    {
+        return display_generic_source_callable(
+            store,
+            host,
+            global_types,
+            type_id,
+            flags,
+            state,
+            visiting,
+        );
+    }
+    if let Some(host) = host
+        && store.source_overload_provenance(type_id).is_some()
+    {
+        return display_source_overload_set(
             store,
             host,
             global_types,
@@ -944,6 +1020,497 @@ fn display_object_type(
         visiting,
     );
     visiting.remove(&type_id);
+    result
+}
+
+fn display_validated_class_type(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    type_id: TypeId,
+    record: &TypeRecord,
+    state: &mut DisplayState,
+) -> Result<Option<String>, TypeDisplayUnavailable> {
+    let Some(symbol) = record.symbol() else {
+        return Ok(None);
+    };
+    let Some(owner) = store.symbol(symbol) else {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    };
+    if !owner.flags().contains(SymbolFlags::CLASS) {
+        return Ok(None);
+    }
+    let Some(instance) = store
+        .declared_type_links(symbol)
+        .and_then(|links| links.declared_type)
+    else {
+        return Ok(None);
+    };
+    if validate_class_heritage_members(store, instance) != ClassHeritageMembersValidation::Valid {
+        return Ok(None);
+    }
+    let value = store
+        .value_symbol_links(symbol)
+        .and_then(|links| links.resolved_type)
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    if type_id != instance && type_id != value {
+        return Ok(None);
+    }
+    let [declaration] = owner.declarations().unwrap_or_default() else {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    };
+    let declaration_node = host
+        .node(*declaration)
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let NodeData::ClassDeclaration(class) = &declaration_node.data else {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    };
+    let name = class
+        .name
+        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    if !host.symbol_matches(store, *declaration, symbol)
+        || !host.node(name).is_some_and(|node| {
+            matches!(&node.data, NodeData::Identifier(name)
+                if owner.name().as_utf8() == Some(name.text.as_str()))
+        })
+    {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
+    let name = display_symbol_name(store, type_id, symbol, state)
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    if type_id == value {
+        state.add(7);
+        Ok(Some(format!("typeof {name}")))
+    } else {
+        Ok(Some(name))
+    }
+}
+
+fn display_mapped_type_alias(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    type_id: TypeId,
+    state: &mut DisplayState,
+) -> Result<String, TypeDisplayUnavailable> {
+    let record = store
+        .type_payload(type_id)
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let TypeData::Mapped(mapped) = record.data() else {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    };
+    let declaration = mapped
+        .declaration
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let plan = plan_mapped_type_declaration(store, host, declaration)
+        .map_err(|_| TypeDisplayUnavailable::MalformedType(type_id))?;
+    if record.flags() != TypeFlags::OBJECT
+        || !record.object_flags().contains(ObjectFlags::MAPPED)
+        || record.symbol() != Some(plan.symbol())
+        || store
+            .type_node_links(declaration)
+            .and_then(|links| links.resolved_type)
+            != Some(type_id)
+        || mapped
+            .type_parameter
+            .is_none_or(|type_| store.type_payload(type_).is_none())
+        || mapped
+            .constraint_type
+            .is_none_or(|type_| store.type_payload(type_).is_none())
+        || mapped
+            .template_type
+            .is_none_or(|type_| store.type_payload(type_).is_none())
+        || mapped
+            .modifiers_type
+            .is_none_or(|type_| store.type_payload(type_).is_none())
+        || mapped
+            .name_type
+            .is_some_and(|type_| store.type_payload(type_).is_none())
+    {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
+    let mapped_node = host
+        .node(declaration)
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let alias = mapped_node
+        .parent
+        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+        .ok_or(TypeDisplayUnavailable::UnsupportedType {
+            type_id,
+            kind: record.data().kind(),
+        })?;
+    let alias_node = host
+        .node(alias)
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let NodeData::TypeAliasDeclaration(alias_data) = &alias_node.data else {
+        return Err(TypeDisplayUnavailable::UnsupportedType {
+            type_id,
+            kind: record.data().kind(),
+        });
+    };
+    if alias_data.type_ != declaration.node {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
+    let symbol = host
+        .bound_file(alias)
+        .and_then(|bound| bound.symbol(alias))
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    if store
+        .symbol(symbol)
+        .is_none_or(|symbol| symbol.flags() != SymbolFlags::TYPE_ALIAS)
+        || store
+            .type_alias_links(symbol)
+            .and_then(|links| links.declared_type)
+            != Some(type_id)
+    {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
+    display_symbol_name(store, type_id, symbol, state)
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))
+}
+
+#[allow(clippy::too_many_arguments)] // Keep recursive formatter state explicit.
+fn display_generic_source_callable(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: Option<&CanonicalGlobalTypes>,
+    type_id: TypeId,
+    flags: CanonicalTypeFormatFlags,
+    state: &mut DisplayState,
+    visiting: &mut HashSet<TypeId>,
+) -> Result<String, TypeDisplayUnavailable> {
+    if !matches!(
+        validate_stored_source_callable(store, type_id),
+        StoredSourceCallableValidation::Valid(_)
+    ) {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
+    let provenance = store
+        .source_callable_provenance(type_id)
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let signature = store
+        .signature(provenance.signature)
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let type_parameters = store
+        .source_callable_type_parameters(provenance.signature)
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    if type_parameters.is_empty()
+        || type_parameters.len() != signature.type_parameters().len()
+        || !host.symbol_matches(store, provenance.declaration, provenance.owner_symbol)
+    {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
+    if !visiting.insert(type_id) {
+        return Err(TypeDisplayUnavailable::CyclicType(type_id));
+    }
+    let result = (|| {
+        let mut result = String::from("<");
+        state.add(2);
+        for (index, parameter) in type_parameters.iter().enumerate() {
+            if signature.type_parameters()[index] != parameter.type_parameter
+                || !host.symbol_matches(store, parameter.declaration, parameter.symbol)
+            {
+                return Err(TypeDisplayUnavailable::MalformedType(type_id));
+            }
+            if index != 0 {
+                result.push_str(", ");
+                state.add(2);
+            }
+            result.push_str(&display_type_worker(
+                store,
+                Some(host),
+                global_types,
+                parameter.type_parameter,
+                flags,
+                state,
+                visiting,
+            )?);
+            for (node, prefix) in [
+                (parameter.constraint, " extends "),
+                (parameter.default_type, " = "),
+            ] {
+                if let Some(node) = node {
+                    let type_ = store
+                        .type_node_links(node)
+                        .and_then(|links| links.resolved_type)
+                        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+                    result.push_str(prefix);
+                    state.add(prefix.len());
+                    result.push_str(&display_type_worker(
+                        store,
+                        Some(host),
+                        global_types,
+                        type_,
+                        flags,
+                        state,
+                        visiting,
+                    )?);
+                }
+            }
+        }
+        result.push('>');
+        append_source_signature_parameters(
+            store,
+            host,
+            global_types,
+            type_id,
+            provenance.signature,
+            flags,
+            state,
+            visiting,
+            &mut result,
+        )?;
+        result.push_str(" => ");
+        state.add(4);
+        let return_type =
+            signature
+                .resolved_return_type()
+                .ok_or(TypeDisplayUnavailable::FunctionType {
+                    type_id,
+                    reason: FunctionTypeDisplayUnavailable::UnresolvedReturn,
+                })?;
+        result.push_str(&display_type_worker(
+            store,
+            Some(host),
+            global_types,
+            return_type,
+            flags,
+            state,
+            visiting,
+        )?);
+        Ok(result)
+    })();
+    visiting.remove(&type_id);
+    result
+}
+
+#[allow(clippy::too_many_arguments)] // Keep recursive formatter state explicit.
+fn display_source_overload_set(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: Option<&CanonicalGlobalTypes>,
+    type_id: TypeId,
+    flags: CanonicalTypeFormatFlags,
+    state: &mut DisplayState,
+    visiting: &mut HashSet<TypeId>,
+) -> Result<String, TypeDisplayUnavailable> {
+    if !matches!(
+        validate_stored_source_overload(store, type_id),
+        StoredSourceOverloadValidation::Valid(_)
+    ) {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
+    let provenance = store
+        .source_overload_provenance(type_id)
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    if !visiting.insert(type_id) {
+        return Err(TypeDisplayUnavailable::CyclicType(type_id));
+    }
+    let result = (|| {
+        let mut result = String::from("{ ");
+        state.add(4);
+        for row in &provenance.signatures {
+            if !host.symbol_matches(store, row.declaration, provenance.owner_symbol) {
+                return Err(TypeDisplayUnavailable::MalformedType(type_id));
+            }
+            append_source_signature_parameters(
+                store,
+                host,
+                global_types,
+                type_id,
+                row.signature,
+                flags,
+                state,
+                visiting,
+                &mut result,
+            )?;
+            result.push_str(": ");
+            state.add(2);
+            result.push_str(&display_type_worker(
+                store,
+                Some(host),
+                global_types,
+                row.return_type,
+                flags,
+                state,
+                visiting,
+            )?);
+            result.push_str("; ");
+            state.add(2);
+        }
+        result.push('}');
+        Ok(result)
+    })();
+    visiting.remove(&type_id);
+    result
+}
+
+#[allow(clippy::too_many_arguments)] // One validated signature shares the caller's display state.
+fn append_source_signature_parameters(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: Option<&CanonicalGlobalTypes>,
+    owner: TypeId,
+    signature: SignatureId,
+    flags: CanonicalTypeFormatFlags,
+    state: &mut DisplayState,
+    visiting: &mut HashSet<TypeId>,
+    result: &mut String,
+) -> Result<(), TypeDisplayUnavailable> {
+    let signature_record = store
+        .signature(signature)
+        .ok_or(TypeDisplayUnavailable::MalformedType(owner))?;
+    let parameter_types = store
+        .callable_signature_parameter_types(signature)
+        .ok_or(TypeDisplayUnavailable::MalformedType(owner))?;
+    if parameter_types.len() != signature_record.parameters().len() {
+        return Err(TypeDisplayUnavailable::MalformedType(owner));
+    }
+    result.push('(');
+    state.add(2);
+    for (index, (parameter, type_)) in signature_record
+        .parameters()
+        .iter()
+        .zip(parameter_types)
+        .enumerate()
+    {
+        let symbol = store
+            .symbol(*parameter)
+            .ok_or(TypeDisplayUnavailable::MalformedType(owner))?;
+        let declaration = symbol
+            .value_declaration()
+            .ok_or(TypeDisplayUnavailable::MalformedType(owner))?;
+        let parameter_node = host
+            .node(declaration)
+            .ok_or(TypeDisplayUnavailable::MalformedType(owner))?;
+        let NodeData::ParameterDeclaration(data) = &parameter_node.data else {
+            return Err(TypeDisplayUnavailable::MalformedType(owner));
+        };
+        let name = NodeRef::new(declaration.arena, declaration.file, data.name);
+        let Some(NodeData::Identifier(identifier)) = host.node(name).map(|node| &node.data) else {
+            return Err(TypeDisplayUnavailable::MalformedType(owner));
+        };
+        if !host.symbol_matches(store, declaration, *parameter)
+            || symbol.name().as_utf8() != Some(identifier.text.as_str())
+        {
+            return Err(TypeDisplayUnavailable::MalformedType(owner));
+        }
+        if index != 0 {
+            result.push_str(", ");
+            state.add(2);
+        }
+        if data.dot_dot_dot_token.is_some() {
+            result.push_str("...");
+            state.add(3);
+        }
+        result.push_str(&identifier.text);
+        state.add(identifier.text.len());
+        if data.question_token.is_some() || data.initializer.is_some() {
+            result.push('?');
+            state.add(1);
+        }
+        result.push_str(": ");
+        state.add(2);
+        result.push_str(&display_type_worker(
+            store,
+            Some(host),
+            global_types,
+            *type_,
+            flags,
+            state,
+            visiting,
+        )?);
+    }
+    result.push(')');
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)] // Keep recursive formatter state explicit.
+fn display_tuple_type(
+    store: &CanonicalTypeMapperStore,
+    host: Option<&DeclaredTypeHost<'_>>,
+    global_types: Option<&CanonicalGlobalTypes>,
+    tuple: TupleShape<'_>,
+    flags: CanonicalTypeFormatFlags,
+    state: &mut DisplayState,
+    visiting: &mut HashSet<TypeId>,
+) -> Result<String, TypeDisplayUnavailable> {
+    if !visiting.insert(tuple.type_()) {
+        return Err(TypeDisplayUnavailable::CyclicType(tuple.type_()));
+    }
+    let result = (|| {
+        let mut result = if tuple.is_readonly() {
+            state.add(9);
+            "readonly [".to_owned()
+        } else {
+            "[".to_owned()
+        };
+        state.add(2);
+        for (index, (element, info)) in tuple
+            .element_types()
+            .iter()
+            .copied()
+            .zip(tuple.element_infos().iter().copied())
+            .enumerate()
+        {
+            if index != 0 {
+                result.push_str(", ");
+                state.add(2);
+            }
+            let rest = info.flags().contains(ElementFlags::REST);
+            let optional = info.flags().contains(ElementFlags::OPTIONAL);
+            if rest {
+                result.push_str("...");
+                state.add(3);
+            }
+            if let Some(label) = info.labeled_declaration() {
+                let host = host.ok_or(TypeDisplayUnavailable::MalformedType(tuple.type_()))?;
+                let record = host
+                    .node(label)
+                    .ok_or(TypeDisplayUnavailable::MalformedType(tuple.type_()))?;
+                let NodeData::NamedTupleMember(member) = &record.data else {
+                    return Err(TypeDisplayUnavailable::MalformedType(tuple.type_()));
+                };
+                if member.dot_dot_dot_token.is_some() != rest
+                    || member.question_token.is_some() != optional
+                {
+                    return Err(TypeDisplayUnavailable::MalformedType(tuple.type_()));
+                }
+                let name = NodeRef::new(label.arena, label.file, member.name);
+                let Some(NodeData::Identifier(identifier)) = host.node(name).map(|node| &node.data)
+                else {
+                    return Err(TypeDisplayUnavailable::MalformedType(tuple.type_()));
+                };
+                result.push_str(&identifier.text);
+                state.add(identifier.text.len());
+                if optional {
+                    result.push('?');
+                    state.add(1);
+                }
+                result.push_str(": ");
+                state.add(2);
+            }
+            result.push_str(&display_type_worker(
+                store,
+                host,
+                global_types,
+                element,
+                flags,
+                state,
+                visiting,
+            )?);
+            if rest {
+                result.push_str("[]");
+                state.add(2);
+            } else if optional && info.labeled_declaration().is_none() {
+                result.push('?');
+                state.add(1);
+            }
+        }
+        result.push(']');
+        Ok(result)
+    })();
+    visiting.remove(&tuple.type_());
     result
 }
 
@@ -3295,6 +3862,7 @@ mod tests {
     use crate::semantic::{
         CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions, SignatureId,
         bootstrap::UnionReduction,
+        tuple_types::CanonicalTupleTypeRequest,
         type_records::{ConstituentMapState, LiteralValue, RegularLiteralLink},
         types::ObjectFlags,
     };
@@ -3717,6 +4285,213 @@ mod tests {
             type_to_string(&store, object).unwrap(),
             "{ a: string; b?: number; child: { value: string; }; }",
         );
+    }
+
+    #[test]
+    fn canonical_empty_type_literals_format_without_a_source_declaration() {
+        let store = bootstrapped_store();
+        let empty = store.intrinsic_bootstrap().unwrap().empty_type_literal_type;
+
+        assert_eq!(type_to_string(&store, empty).unwrap(), "{}");
+    }
+
+    #[test]
+    fn canonical_tuples_keep_element_order_labels_and_readonly_state() {
+        let mut store = bootstrapped_store();
+        let (string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let infos = [
+            store
+                .create_tuple_element_info(ElementFlags::REQUIRED, None)
+                .unwrap(),
+            store
+                .create_tuple_element_info(ElementFlags::REQUIRED, None)
+                .unwrap(),
+        ];
+        let tuple = store
+            .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(
+                &[string, number],
+                &infos,
+                false,
+            ))
+            .unwrap();
+        assert_eq!(type_to_string(&store, tuple).unwrap(), "[string, number]");
+
+        let parsed = parse_source_file(concat!(
+            "type Named = [name: string, count?: number]; ",
+            "type Frozen = readonly [first: string, second?: number];",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(197);
+        let mut context = parsed_context(
+            &parsed,
+            file,
+            IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                exact_optional_property_types: false,
+            },
+        );
+        for (alias, expected) in [
+            ("Named", "[name: string, count?: number | undefined]"),
+            (
+                "Frozen",
+                "readonly [first: string, second?: number | undefined]",
+            ),
+        ] {
+            let node = type_alias_body(&parsed, file, alias);
+            let tuple = context.get_type_from_type_node(node).unwrap();
+            assert_eq!(context.type_to_string(tuple).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn source_generic_signatures_preserve_constraints_defaults_and_parameter_names() {
+        let parsed = parse_source_file(concat!(
+            "declare function identity<T>(value: T): T; ",
+            "declare function constrained<T extends string = \"ready\">(value: T): T;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(198);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        for (name, expected) in [
+            ("identity", "<T>(value: T) => T"),
+            (
+                "constrained",
+                "<T extends string = \"ready\">(value: T) => T",
+            ),
+        ] {
+            let declaration = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::FunctionDeclaration(function) = &record.data else {
+                        return None;
+                    };
+                    let NodeData::Identifier(identifier) = &parsed.arena.get(function.name?)?.data
+                    else {
+                        return None;
+                    };
+                    (identifier.text == name).then_some(NodeRef::new(parsed.arena.id(), file, node))
+                })
+                .unwrap();
+            let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+            let type_ = context
+                .store()
+                .value_symbol_links(symbol)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            assert_eq!(context.type_to_string(type_).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn source_overload_sets_preserve_declaration_order_and_optional_parameters() {
+        let parsed = parse_source_file(concat!(
+            "declare function pick(value: string): number; ",
+            "declare function pick(value: number, count?: boolean): string;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(199);
+        let mut context = parsed_context(
+            &parsed,
+            file,
+            IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                exact_optional_property_types: false,
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                matches!(record.data, NodeData::FunctionDeclaration(_)).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        let type_ = context
+            .store()
+            .value_symbol_links(symbol)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        assert_eq!(
+            context.type_to_string(type_).unwrap(),
+            "{ (value: string): number; (value: number, count?: boolean | undefined): string; }"
+        );
+    }
+
+    #[test]
+    fn mapped_aliases_reuse_their_validated_declaration_names() {
+        let parsed = parse_source_file(concat!(
+            "type Foo = { [P in \"bar\"] }; ",
+            "type Values = { [P in \"bar\" | \"baz\"]: number };",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(200);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        for name in ["Foo", "Values"] {
+            let node = type_alias_body(&parsed, file, name);
+            let type_ = context.get_type_from_type_node(node).unwrap();
+            assert_eq!(context.type_to_string(type_).unwrap(), name);
+        }
+    }
+
+    #[test]
+    fn source_class_instances_and_values_keep_distinct_type_names() {
+        let parsed = parse_source_file(concat!(
+            "class Base {} ",
+            "class Derived extends Base { value!: number; }",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(201);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        for name in ["Base", "Derived"] {
+            let declaration = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::ClassDeclaration(class) = &record.data else {
+                        return None;
+                    };
+                    let NodeData::Identifier(identifier) = &parsed.arena.get(class.name?)?.data
+                    else {
+                        return None;
+                    };
+                    (identifier.text == name).then_some(NodeRef::new(parsed.arena.id(), file, node))
+                })
+                .unwrap();
+            let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+            let members = context.get_nongeneric_class_members(symbol).unwrap();
+            assert_eq!(
+                context
+                    .type_to_string(members.shells().instance_type())
+                    .unwrap(),
+                name
+            );
+            assert_eq!(
+                context
+                    .type_to_string(members.shells().value_type())
+                    .unwrap(),
+                format!("typeof {name}")
+            );
+        }
     }
 
     #[test]
