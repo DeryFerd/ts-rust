@@ -707,6 +707,7 @@ struct PlannedVariable {
 #[derive(Clone, Debug)]
 enum PlannedVariableInitializer {
     Expression(PlannedExpression),
+    Jsx(NodeRef),
     AbsentAnnotated,
 }
 
@@ -3887,32 +3888,49 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         SourceSyntaxRole::VariableInitializer,
                     ));
                 }
-                let initializer = self.plan_expression(initializer)?;
-                if type_node.is_none()
-                    && !exported
-                    && matches!(&initializer.kind, PlannedExpressionKind::Array(elements) if elements.is_empty())
-                {
-                    return Err(SourceCheckError::Unsupported(
-                        UnsupportedSourceSyntax::Variable(
-                            VariableUnsupported::InferredEmptyArrayOption(declaration),
-                        ),
-                    ));
+                if matches!(
+                    self.node(initializer)?.kind,
+                    SyntaxKind::JsxElement
+                        | SyntaxKind::JsxSelfClosingElement
+                        | SyntaxKind::JsxFragment
+                ) {
+                    let Some((store, host)) = self.semantic else {
+                        return Err(self.unsupported(
+                            initializer,
+                            self.node(initializer)?.kind,
+                            SourceSyntaxRole::VariableInitializer,
+                        ));
+                    };
+                    store.preflight_jsx_element(host, initializer)?;
+                    PlannedVariableInitializer::Jsx(initializer)
+                } else {
+                    let initializer = self.plan_expression(initializer)?;
+                    if type_node.is_none()
+                        && !exported
+                        && matches!(&initializer.kind, PlannedExpressionKind::Array(elements) if elements.is_empty())
+                    {
+                        return Err(SourceCheckError::Unsupported(
+                            UnsupportedSourceSyntax::Variable(
+                                VariableUnsupported::InferredEmptyArrayOption(declaration),
+                            ),
+                        ));
+                    }
+                    if type_node.is_none()
+                        && !exported
+                        && !binding.is_const()
+                        && matches!(
+                            &initializer.unparenthesized().kind,
+                            PlannedExpressionKind::Null | PlannedExpressionKind::GlobalUndefined
+                        )
+                    {
+                        return Err(SourceCheckError::Unsupported(
+                            UnsupportedSourceSyntax::Variable(
+                                VariableUnsupported::InferredMutableNullishOption(declaration),
+                            ),
+                        ));
+                    }
+                    PlannedVariableInitializer::Expression(initializer)
                 }
-                if type_node.is_none()
-                    && !exported
-                    && !binding.is_const()
-                    && matches!(
-                        &initializer.unparenthesized().kind,
-                        PlannedExpressionKind::Null | PlannedExpressionKind::GlobalUndefined
-                    )
-                {
-                    return Err(SourceCheckError::Unsupported(
-                        UnsupportedSourceSyntax::Variable(
-                            VariableUnsupported::InferredMutableNullishOption(declaration),
-                        ),
-                    ));
-                }
-                PlannedVariableInitializer::Expression(initializer)
             }
             None if type_node.is_some() && !binding.is_const() && !exported => {
                 PlannedVariableInitializer::AbsentAnnotated
@@ -10559,6 +10577,100 @@ pub(super) fn check_source_file(
                             )?;
                             (declared_type, current_flow_type)
                         }
+                        (PlannedVariableInitializer::Jsx(initializer), type_node) => {
+                            let mut jsx_diagnostics = CanonicalCheckerDiagnostics::default();
+                            let jsx_type = store.check_jsx_element(
+                                host,
+                                *initializer,
+                                options,
+                                &mut jsx_diagnostics,
+                            );
+                            merge_retry_diagnostics(diagnostics, jsx_diagnostics);
+                            let jsx_type = jsx_type?;
+                            let declared_type = if let Some(type_node) = type_node {
+                                let mut annotation_diagnostics =
+                                    CanonicalCheckerDiagnostics::default();
+                                let type_reference_alias_targets: &[CanonicalTypeReferenceAliasTarget] =
+                                    type_import_capabilities
+                                        .get(&type_node)
+                                        .map_or(&[], Vec::as_slice);
+                                let declared_type =
+                                    CanonicalTypeQuery::new_with_global_types_and_session(
+                                        store,
+                                        host,
+                                        global_types,
+                                        options,
+                                        session,
+                                        &mut annotation_diagnostics,
+                                    )?
+                                    .with_type_reference_alias_targets(
+                                        type_reference_alias_targets.iter().copied(),
+                                    )?
+                                    .get_type_from_type_node(type_node);
+                                merge_retry_diagnostics(diagnostics, annotation_diagnostics);
+                                let declared_type = declared_type?;
+                                if !source_type_is_assignable_to(
+                                    store,
+                                    host,
+                                    global_types,
+                                    options,
+                                    session,
+                                    diagnostics,
+                                    jsx_type,
+                                    declared_type,
+                                )? {
+                                    let mut flags =
+                                        CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT;
+                                    if options.no_error_truncation {
+                                        flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
+                                    }
+                                    let display =
+                                        get_type_names_for_assignability_error_with_host_global_types_and_flags(
+                                            store,
+                                            host,
+                                            global_types,
+                                            jsx_type,
+                                            declared_type,
+                                            flags,
+                                        )?;
+                                    merge_retry_diagnostic(
+                                        diagnostics,
+                                        CanonicalCheckerDiagnostic {
+                                            node: Some(variable.name),
+                                            range_override: None,
+                                            diagnostic: Diagnostic::with_arguments(
+                                                message_by_code(2322).ok_or(
+                                                    SourceCheckError::MissingDiagnostic(2322),
+                                                )?,
+                                                [display.source, display.target],
+                                            ),
+                                            related_information: Vec::new(),
+                                        },
+                                    );
+                                }
+                                declared_type
+                            } else {
+                                inferred_variable_type(
+                                    store,
+                                    global_types,
+                                    variable.binding,
+                                    jsx_type,
+                                )?
+                            };
+                            let current_flow_type = current_flow_type_after_assignment(
+                                store,
+                                host,
+                                global_types,
+                                options,
+                                session,
+                                diagnostics,
+                                CheckedAssignment {
+                                    declared_type,
+                                    assigned_type: jsx_type,
+                                },
+                            )?;
+                            (declared_type, current_flow_type)
+                        }
                         (PlannedVariableInitializer::AbsentAnnotated, Some(type_node)) => {
                             let mut annotation_diagnostics = CanonicalCheckerDiagnostics::default();
                             let type_reference_alias_targets: &[CanonicalTypeReferenceAliasTarget] =
@@ -11512,6 +11624,86 @@ mod tests {
         {
             AliasTargetState::Resolved(target) => target,
             state => panic!("import alias {alias:?} is not resolved: {state:?}"),
+        }
+    }
+
+    #[test]
+    fn jsx_variable_initializers_check_intrinsic_attributes_and_replay_warm() {
+        let declarations = parsed(concat!(
+            "declare namespace JSX { ",
+            "interface Element {} ",
+            "interface IntrinsicElements { div: { label: string } } ",
+            "}",
+        ));
+        let source = ts_parser::parse_jsx_source_file(concat!(
+            "const good = <div label=\"ready\" />; ",
+            "const bad = <div label={1} />;",
+        ));
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let declarations_file = FileId::new(3_790);
+        let file = FileId::new(3_791);
+        let mut context = context(
+            &[(declarations_file, &declarations), (file, &source)],
+            CanonicalCheckerOptions::default(),
+        );
+        let good = variable_symbol(&context, &source, file, "good");
+        let bad = variable_symbol(&context, &source, file, "bad");
+
+        context.check_source_file(file).unwrap();
+
+        for symbol in [good, bad] {
+            assert!(
+                context
+                    .store()
+                    .value_symbol_links(symbol)
+                    .and_then(|links| links.resolved_type)
+                    .is_some()
+            );
+        }
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected one JSX attribute diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2322);
+        assert!(is_type_checked(&context, file));
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn unsupported_jsx_spread_rejects_the_complete_source_before_publication() {
+        let declarations = parsed(concat!(
+            "declare namespace JSX { ",
+            "interface Element {} ",
+            "interface IntrinsicElements { div: {} } ",
+            "}",
+        ));
+        let source = ts_parser::parse_jsx_source_file(concat!(
+            "const earlier = 1; ",
+            "const view = <div {...props} />;",
+        ));
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let declarations_file = FileId::new(3_792);
+        let file = FileId::new(3_793);
+        let mut context = context(
+            &[(declarations_file, &declarations), (file, &source)],
+            CanonicalCheckerOptions::default(),
+        );
+        let earlier = variable_symbol(&context, &source, file, "earlier");
+        let cold = observable_state(&context, file);
+
+        for _ in 0..2 {
+            assert!(matches!(
+                context.check_source_file(file),
+                Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Syntax { .. }
+                ))
+            ));
+            assert_eq!(observable_state(&context, file), cold);
+            assert!(context.store().value_symbol_links(earlier).is_none());
+            assert!(context.diagnostics().is_empty());
+            assert!(!is_type_checked(&context, file));
         }
     }
 
