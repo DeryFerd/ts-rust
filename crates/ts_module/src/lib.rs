@@ -27,6 +27,8 @@ pub struct ResolutionOptions {
     pub allow_arbitrary_extensions: bool,
     pub allow_javascript: bool,
     pub resolve_json: bool,
+    pub resolve_package_json_exports: bool,
+    pub resolve_package_json_imports: bool,
     pub prefer_types: bool,
     pub base_url: Option<String>,
     pub paths: BTreeMap<String, Vec<String>>,
@@ -42,6 +44,8 @@ impl Default for ResolutionOptions {
             allow_arbitrary_extensions: false,
             allow_javascript: true,
             resolve_json: false,
+            resolve_package_json_exports: true,
+            resolve_package_json_imports: true,
             prefer_types: true,
             base_url: None,
             paths: BTreeMap::new(),
@@ -130,9 +134,9 @@ impl<'a, F: FileSystem + ?Sized> Resolver<'a, F> {
         let containing_directory = directory_path(containing_file);
         let resolved = if is_relative(specifier) {
             let candidate = resolve_path(&containing_directory, &[specifier]);
-            state.resolve_candidate(&candidate, false).or_else(|| {
-                state.resolve_root_dirs(specifier, &containing_directory)
-            })
+            state
+                .resolve_candidate(&candidate, false)
+                .or_else(|| state.resolve_root_dirs(specifier, &containing_directory))
         } else if is_absolute(specifier) {
             state.resolve_paths_or_base_url(specifier).or_else(|| {
                 let candidate = resolve_path(&containing_directory, &[specifier]);
@@ -279,6 +283,8 @@ impl<F: FileSystem + ?Sized> ResolutionState<'_, '_, F> {
         }
         if specifier == "#"
             || (self.resolver.options.mode == ResolutionMode::Node16 && specifier.starts_with("#/"))
+            || (specifier.starts_with('#') && !self.resolver.options.resolve_package_json_imports)
+            || (!specifier.starts_with('#') && !self.resolver.options.resolve_package_json_exports)
         {
             return None;
         }
@@ -399,7 +405,8 @@ impl<F: FileSystem + ?Sized> ResolutionState<'_, '_, F> {
         let Some(package) = self.read_package_json(&package_json_path) else {
             return PackageMetadataResolution::NotApplicable;
         };
-        if let Some(exports) = &package.exports
+        if self.resolver.options.resolve_package_json_exports
+            && let Some(exports) = &package.exports
             && matches!(
                 self.resolver.options.mode,
                 ResolutionMode::Node16 | ResolutionMode::NodeNext | ResolutionMode::Bundler
@@ -1205,6 +1212,44 @@ mod tests {
     }
 
     #[test]
+    fn disabled_package_exports_use_legacy_package_resolution() {
+        let fs = fs(&[
+            (
+                "/app/node_modules/pkg/package.json",
+                r#"{"types":"./legacy/index.d.ts","exports":{".":"./public/index.d.ts"}}"#,
+            ),
+            ("/app/node_modules/pkg/legacy/index.d.ts", ""),
+            ("/app/node_modules/pkg/public/index.d.ts", ""),
+            ("/app/node_modules/pkg/private.ts", ""),
+        ]);
+        let resolver = Resolver::new(
+            &fs,
+            ResolutionOptions {
+                mode: ResolutionMode::Bundler,
+                resolve_package_json_exports: false,
+                ..ResolutionOptions::default()
+            },
+        );
+
+        assert_eq!(
+            resolver
+                .resolve("pkg", "/app/src/main.ts")
+                .resolved
+                .unwrap()
+                .resolved_file_name,
+            "/app/node_modules/pkg/legacy/index.d.ts"
+        );
+        assert_eq!(
+            resolver
+                .resolve("pkg/private", "/app/src/main.ts")
+                .resolved
+                .unwrap()
+                .resolved_file_name,
+            "/app/node_modules/pkg/private.ts"
+        );
+    }
+
+    #[test]
     fn resolves_package_types_versions_subpaths() {
         let fs = fs(&[
             (
@@ -1289,6 +1334,32 @@ mod tests {
                 .unwrap()
                 .resolved_file_name,
             "/repo/types/features/tool.d.ts"
+        );
+    }
+
+    #[test]
+    fn disabled_package_imports_do_not_resolve_internal_specifiers() {
+        let fs = fs(&[
+            (
+                "/repo/package.json",
+                r##"{"imports":{"#core":"./types/core.d.ts"}}"##,
+            ),
+            ("/repo/types/core.d.ts", ""),
+        ]);
+        let resolver = Resolver::new(
+            &fs,
+            ResolutionOptions {
+                mode: ResolutionMode::NodeNext,
+                resolve_package_json_imports: false,
+                ..ResolutionOptions::default()
+            },
+        );
+
+        assert!(
+            resolver
+                .resolve("#core", "/repo/src/main.ts")
+                .resolved
+                .is_none()
         );
     }
 

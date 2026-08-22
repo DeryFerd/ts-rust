@@ -186,6 +186,8 @@ fn compiler_boolean_name(argument: &str) -> Option<&'static str> {
         "--nounusedlocals" => "nounusedlocals",
         "--nounusedparameters" => "nounusedparameters",
         "--preserveconstenums" => "preserveconstenums",
+        "--resolvepackagejsonexports" => "resolvepackagejsonexports",
+        "--resolvepackagejsonimports" => "resolvepackagejsonimports",
         "--skiplibcheck" => "skiplibcheck",
         "--sourcemap" => "sourcemap",
         "--strict" => "strict",
@@ -562,6 +564,35 @@ mod tests {
         assert!(options.compiler_options.allow_js);
         assert!(options.compiler_options.strict);
         assert!(options.compiler_options.no_implicit_any);
+    }
+
+    #[test]
+    fn parses_package_json_resolution_options() {
+        let Command::Compile(options) = parse(&[
+            "--moduleResolution",
+            "bundler",
+            "--resolvePackageJsonExports",
+            "false",
+            "--resolvePackageJsonImports",
+            "false",
+            "main.ts",
+        ])
+        .unwrap() else {
+            panic!("expected compile command");
+        };
+
+        assert!(!options.compiler_options.resolve_package_json_exports);
+        assert!(!options.compiler_options.resolve_package_json_imports);
+        assert!(
+            options
+                .specified_options
+                .contains("resolvepackagejsonexports")
+        );
+        assert!(
+            options
+                .specified_options
+                .contains("resolvepackagejsonimports")
+        );
     }
 
     #[test]

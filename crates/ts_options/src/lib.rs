@@ -162,6 +162,8 @@ pub struct CompilerOptions {
     pub jsx_import_source: Option<String>,
     pub react_namespace: Option<String>,
     pub resolve_json_module: bool,
+    pub resolve_package_json_exports: bool,
+    pub resolve_package_json_imports: bool,
     pub source_map: bool,
     pub inline_source_map: bool,
     pub inline_sources: bool,
@@ -248,6 +250,8 @@ impl Default for CompilerOptions {
             jsx_import_source: None,
             react_namespace: None,
             resolve_json_module: false,
+            resolve_package_json_exports: true,
+            resolve_package_json_imports: true,
             source_map: false,
             inline_source_map: false,
             inline_sources: false,
@@ -401,6 +405,12 @@ impl CompilerOptions {
                 "preserveconstenums" => {
                     self.preserve_const_enums = overrides.preserve_const_enums;
                 }
+                "resolvepackagejsonexports" => {
+                    self.resolve_package_json_exports = overrides.resolve_package_json_exports;
+                }
+                "resolvepackagejsonimports" => {
+                    self.resolve_package_json_imports = overrides.resolve_package_json_imports;
+                }
                 "rootdir" => self.root_dir.clone_from(&overrides.root_dir),
                 "skiplibcheck" => self.skip_lib_check = overrides.skip_lib_check,
                 "stripinternal" => self.strip_internal = overrides.strip_internal,
@@ -497,6 +507,8 @@ impl CompilerOptions {
             allow_arbitrary_extensions: self.allow_arbitrary_extensions,
             allow_javascript: self.allow_js,
             resolve_json: self.resolve_json_module,
+            resolve_package_json_exports: self.resolve_package_json_exports,
+            resolve_package_json_imports: self.resolve_package_json_imports,
             prefer_types: true,
             base_url: self.base_url.clone(),
             paths: self.paths.clone(),
@@ -732,6 +744,14 @@ pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> Pars
             "resolvejsonmodule" => {
                 parsed.resolve_json_module = boolean(original_name, value, &mut diagnostics);
             }
+            "resolvepackagejsonexports" => {
+                parsed.resolve_package_json_exports =
+                    boolean(original_name, value, &mut diagnostics);
+            }
+            "resolvepackagejsonimports" => {
+                parsed.resolve_package_json_imports =
+                    boolean(original_name, value, &mut diagnostics);
+            }
             "sourcemap" => parsed.source_map = boolean(original_name, value, &mut diagnostics),
             "inlinesourcemap" => {
                 parsed.inline_source_map = boolean(original_name, value, &mut diagnostics);
@@ -843,6 +863,8 @@ struct PartialOptions {
     jsx_import_source: Option<String>,
     react_namespace: Option<String>,
     resolve_json_module: Option<bool>,
+    resolve_package_json_exports: Option<bool>,
+    resolve_package_json_imports: Option<bool>,
     source_map: Option<bool>,
     inline_source_map: Option<bool>,
     inline_sources: Option<bool>,
@@ -968,6 +990,8 @@ impl PartialOptions {
             jsx_import_source: self.jsx_import_source,
             react_namespace: self.react_namespace,
             resolve_json_module: self.resolve_json_module.unwrap_or(false),
+            resolve_package_json_exports: self.resolve_package_json_exports.unwrap_or(true),
+            resolve_package_json_imports: self.resolve_package_json_imports.unwrap_or(true),
             source_map: self.source_map.unwrap_or(false),
             inline_source_map: self.inline_source_map.unwrap_or(false),
             inline_sources: self.inline_sources.unwrap_or(false),
@@ -1700,6 +1724,41 @@ mod tests {
                 ..ResolutionOptions::default()
             }
         );
+    }
+
+    #[test]
+    fn preserves_explicit_package_json_resolution_options() {
+        let disabled = parse_compiler_options(&object([
+            ("moduleResolution", JsonValue::String("bundler".into())),
+            ("resolvePackageJsonExports", JsonValue::Bool(false)),
+            ("resolvePackageJsonImports", JsonValue::Bool(false)),
+        ]));
+        assert!(disabled.is_ok(), "{:?}", disabled.diagnostics);
+        assert!(!disabled.options.resolve_package_json_exports);
+        assert!(!disabled.options.resolve_package_json_imports);
+        assert!(
+            !disabled
+                .options
+                .module_resolution_options()
+                .resolve_package_json_exports
+        );
+        assert!(
+            !disabled
+                .options
+                .module_resolution_options()
+                .resolve_package_json_imports
+        );
+
+        let mut defaults = CompilerOptions::default();
+        defaults.apply_overrides(
+            &disabled.options,
+            &BTreeSet::from([
+                "resolvepackagejsonexports".to_owned(),
+                "resolvepackagejsonimports".to_owned(),
+            ]),
+        );
+        assert!(!defaults.resolve_package_json_exports);
+        assert!(!defaults.resolve_package_json_imports);
     }
 
     #[test]
