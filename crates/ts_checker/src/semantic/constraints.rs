@@ -9,11 +9,17 @@
 use std::collections::HashSet;
 
 use super::{
-    SemanticSymbolId, TypeId,
+    RelationUnavailable, SemanticSymbolId, TypeId,
     bootstrap::LiteralTypeCacheError,
+    conditional_types::{
+        ConditionalTypeError, cached_conditional_branches, get_constraint_from_conditional_type,
+    },
     instantiate::{InstantiationError, canonical_anonymous_union, instantiate_type},
+    intersection_types::IntersectionTypeError,
     mapper::CanonicalTypeMapperStore,
-    type_records::TypeData,
+    template_types::TemplateTypeError,
+    type_records::{TypeData, TypeRecord},
+    types::TypeFlags,
 };
 
 const MINIMUM_CONSTRAINT_DEPTH: usize = 10;
@@ -47,9 +53,14 @@ pub(super) enum ConstraintError {
     InvalidCachedConstraint(TypeId),
     InvalidConstraintPublication(TypeId),
     UnresolvedTypeParameter(TypeId),
+    UnresolvedConditionalBranches(TypeId),
     UnsupportedBaseType(TypeId),
     CountLimit { count: usize, limit: usize },
+    Conditional(Box<ConditionalTypeError>),
+    Intersection(IntersectionTypeError),
     Instantiation(InstantiationError),
+    Relation(RelationUnavailable),
+    Template(TemplateTypeError),
     Union(LiteralTypeCacheError),
 }
 
@@ -74,6 +85,10 @@ impl std::fmt::Display for ConstraintError {
                 formatter,
                 "type parameter {type_:?} requires declaration or inferred constraint resolution"
             ),
+            Self::UnresolvedConditionalBranches(type_) => write!(
+                formatter,
+                "conditional type {type_:?} requires resolved true and false branches"
+            ),
             Self::UnsupportedBaseType(type_) => write!(
                 formatter,
                 "type {type_:?} is outside the installed base-constraint slice"
@@ -82,7 +97,13 @@ impl std::fmt::Display for ConstraintError {
                 formatter,
                 "base-constraint count {count} reached configured limit {limit}"
             ),
+            Self::Conditional(error) => error.fmt(formatter),
+            Self::Intersection(error) => {
+                write!(formatter, "intersection constraint failed: {error:?}")
+            }
             Self::Instantiation(error) => error.fmt(formatter),
+            Self::Relation(error) => error.fmt(formatter),
+            Self::Template(error) => error.fmt(formatter),
             Self::Union(error) => error.fmt(formatter),
         }
     }
@@ -91,7 +112,10 @@ impl std::fmt::Display for ConstraintError {
 impl std::error::Error for ConstraintError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Conditional(error) => Some(error.as_ref()),
             Self::Instantiation(error) => Some(error),
+            Self::Relation(error) => Some(error),
+            Self::Template(error) => Some(error),
             Self::Union(error) => Some(error),
             _ => None,
         }
@@ -107,6 +131,30 @@ impl From<InstantiationError> for ConstraintError {
 impl From<LiteralTypeCacheError> for ConstraintError {
     fn from(error: LiteralTypeCacheError) -> Self {
         Self::Union(error)
+    }
+}
+
+impl From<ConditionalTypeError> for ConstraintError {
+    fn from(error: ConditionalTypeError) -> Self {
+        Self::Conditional(Box::new(error))
+    }
+}
+
+impl From<IntersectionTypeError> for ConstraintError {
+    fn from(error: IntersectionTypeError) -> Self {
+        Self::Intersection(error)
+    }
+}
+
+impl From<RelationUnavailable> for ConstraintError {
+    fn from(error: RelationUnavailable) -> Self {
+        Self::Relation(error)
+    }
+}
+
+impl From<TemplateTypeError> for ConstraintError {
+    fn from(error: TemplateTypeError) -> Self {
+        Self::Template(error)
     }
 }
 
@@ -126,8 +174,25 @@ enum ConstraintRecursionIdentity {
 #[derive(Debug)]
 enum ConstraintKind {
     Leaf,
-    Parameter { is_this_type: bool },
+    Parameter {
+        is_this_type: bool,
+    },
     Union(Vec<TypeId>),
+    Intersection(Vec<TypeId>),
+    Index,
+    Template {
+        texts: Vec<String>,
+        types: Vec<TypeId>,
+    },
+    StringMapping {
+        symbol: Option<SemanticSymbolId>,
+        target: TypeId,
+    },
+    Conditional,
+    Substitution {
+        base_type: TypeId,
+        constraint: TypeId,
+    },
     Unsupported,
 }
 
@@ -268,6 +333,23 @@ impl<'store> ConstraintSession<'store> {
                     is_this_type: data.is_this_type,
                 },
                 TypeData::Union(data) => ConstraintKind::Union(data.union.types.clone()),
+                TypeData::Intersection(data) => {
+                    ConstraintKind::Intersection(data.intersection.types.clone())
+                }
+                TypeData::Index(_) => ConstraintKind::Index,
+                TypeData::TemplateLiteral(data) => ConstraintKind::Template {
+                    texts: data.texts.clone(),
+                    types: data.types.clone(),
+                },
+                TypeData::StringMapping(data) => ConstraintKind::StringMapping {
+                    symbol: record.symbol(),
+                    target: data.target,
+                },
+                TypeData::Conditional(_) => ConstraintKind::Conditional,
+                TypeData::Substitution(data) => ConstraintKind::Substitution {
+                    base_type: data.base_type,
+                    constraint: data.constraint,
+                },
                 _ => ConstraintKind::Unsupported,
             };
             let identity = match record.data() {
@@ -335,6 +417,26 @@ impl<'store> ConstraintSession<'store> {
                 ConstraintKind::Union(members) => {
                     self.compute_union_constraint(type_, &members, stack)
                 }
+                ConstraintKind::Intersection(members) => {
+                    self.compute_intersection_constraint(type_, &members, stack)
+                }
+                ConstraintKind::Index => Ok(BaseConstraint::Type(
+                    self.store
+                        .intrinsic_bootstrap()
+                        .ok_or(ConstraintError::MissingBootstrap)?
+                        .string_number_symbol_type,
+                )),
+                ConstraintKind::Template { texts, types } => {
+                    self.compute_template_constraint(&texts, &types, stack)
+                }
+                ConstraintKind::StringMapping { symbol, target } => {
+                    self.compute_string_mapping_constraint(symbol, target, stack)
+                }
+                ConstraintKind::Conditional => self.compute_conditional_constraint(type_, stack),
+                ConstraintKind::Substitution {
+                    base_type,
+                    constraint,
+                } => self.compute_substitution_constraint(base_type, constraint, stack),
                 ConstraintKind::Unsupported => Err(ConstraintError::UnsupportedBaseType(type_)),
             };
             stack.pop();
@@ -393,6 +495,145 @@ impl<'store> ConstraintSession<'store> {
             &constraints,
         )?))
     }
+
+    fn compute_intersection_constraint(
+        &mut self,
+        source: TypeId,
+        types: &[TypeId],
+        stack: &mut Vec<ConstraintRecursionIdentity>,
+    ) -> Result<BaseConstraint, ConstraintError> {
+        let mut constraints = Vec::with_capacity(types.len());
+        let mut changed = false;
+        for type_ in types {
+            match self.resolve_base_constraint(*type_, stack)? {
+                BaseConstraint::Type(constraint) => {
+                    changed |= constraint != *type_;
+                    constraints.push(constraint);
+                }
+                BaseConstraint::None | BaseConstraint::Circular => changed = true,
+            }
+        }
+        if !changed {
+            return Ok(BaseConstraint::Type(source));
+        }
+        if constraints.is_empty() {
+            return Ok(BaseConstraint::None);
+        }
+        self.intersect_constraints(&constraints)
+            .map(BaseConstraint::Type)
+    }
+
+    fn compute_template_constraint(
+        &mut self,
+        texts: &[String],
+        types: &[TypeId],
+        stack: &mut Vec<ConstraintRecursionIdentity>,
+    ) -> Result<BaseConstraint, ConstraintError> {
+        let mut constraints = Vec::with_capacity(types.len());
+        for type_ in types {
+            match self.resolve_base_constraint(*type_, stack)? {
+                BaseConstraint::Type(constraint) => constraints.push(constraint),
+                BaseConstraint::None | BaseConstraint::Circular => {
+                    return Ok(BaseConstraint::Type(
+                        self.store
+                            .intrinsic_bootstrap()
+                            .ok_or(ConstraintError::MissingBootstrap)?
+                            .string_type,
+                    ));
+                }
+            }
+        }
+        Ok(BaseConstraint::Type(
+            self.store.get_template_literal_type(texts, &constraints)?,
+        ))
+    }
+
+    fn compute_string_mapping_constraint(
+        &mut self,
+        symbol: Option<SemanticSymbolId>,
+        target: TypeId,
+        stack: &mut Vec<ConstraintRecursionIdentity>,
+    ) -> Result<BaseConstraint, ConstraintError> {
+        if let BaseConstraint::Type(constraint) = self.resolve_base_constraint(target, stack)?
+            && constraint != target
+        {
+            let symbol = symbol.ok_or(ConstraintError::UnsupportedBaseType(target))?;
+            return Ok(BaseConstraint::Type(
+                self.store.get_string_mapping_type(symbol, constraint)?,
+            ));
+        }
+        Ok(BaseConstraint::Type(
+            self.store
+                .intrinsic_bootstrap()
+                .ok_or(ConstraintError::MissingBootstrap)?
+                .string_type,
+        ))
+    }
+
+    fn compute_conditional_constraint(
+        &mut self,
+        conditional: TypeId,
+        stack: &mut Vec<ConstraintRecursionIdentity>,
+    ) -> Result<BaseConstraint, ConstraintError> {
+        let branches = cached_conditional_branches(self.store, conditional)?
+            .ok_or(ConstraintError::UnresolvedConditionalBranches(conditional))?;
+        let constraint =
+            get_constraint_from_conditional_type(self.store, conditional, branches, None, None)?;
+        self.resolve_base_constraint(constraint, stack)
+    }
+
+    fn compute_substitution_constraint(
+        &mut self,
+        base_type: TypeId,
+        constraint: TypeId,
+        stack: &mut Vec<ConstraintRecursionIdentity>,
+    ) -> Result<BaseConstraint, ConstraintError> {
+        let base = self.resolve_base_constraint(base_type, stack)?;
+        let constraint = self.resolve_base_constraint(constraint, stack)?;
+        match (base, constraint) {
+            (BaseConstraint::Type(base), BaseConstraint::Type(constraint)) => self
+                .intersect_constraints(&[base, constraint])
+                .map(BaseConstraint::Type),
+            _ => Ok(BaseConstraint::None),
+        }
+    }
+
+    fn intersect_constraints(&mut self, types: &[TypeId]) -> Result<TypeId, ConstraintError> {
+        let mut result = types[0];
+        let never = self
+            .store
+            .intrinsic_bootstrap()
+            .ok_or(ConstraintError::MissingBootstrap)?
+            .never_type;
+        for candidate in &types[1..] {
+            if result == *candidate || self.store.is_type_assignable_to(result, *candidate)? {
+                continue;
+            }
+            if self.store.is_type_assignable_to(*candidate, result)? {
+                result = *candidate;
+                continue;
+            }
+            let result_flags = self
+                .store
+                .type_payload(result)
+                .map(TypeRecord::flags)
+                .ok_or(ConstraintError::InvalidType(result))?;
+            let candidate_flags = self
+                .store
+                .type_payload(*candidate)
+                .map(TypeRecord::flags)
+                .ok_or(ConstraintError::InvalidType(*candidate))?;
+            if result_flags.intersects(TypeFlags::PRIMITIVE)
+                && candidate_flags.intersects(TypeFlags::PRIMITIVE)
+            {
+                return Ok(never);
+            }
+            result = self
+                .store
+                .canonical_intersection_type(&[result, *candidate], None)?;
+        }
+        Ok(result)
+    }
 }
 
 /// Pinned `getConstraintOfType` for the installed dependency-closed domain.
@@ -418,7 +659,13 @@ pub(super) fn get_constraint_of_type_with_limits(
         .data()
     {
         TypeData::TypeParameter(_) => 0,
-        TypeData::Union(_) => 1,
+        TypeData::Union(_)
+        | TypeData::Intersection(_)
+        | TypeData::Index(_)
+        | TypeData::TemplateLiteral(_)
+        | TypeData::StringMapping(_)
+        | TypeData::Conditional(_)
+        | TypeData::Substitution(_) => 1,
         _ => return Ok(None),
     };
     let result = if kind == 0 {
@@ -432,7 +679,7 @@ pub(super) fn get_constraint_of_type_with_limits(
     })
 }
 
-/// Pinned `getBaseConstraintOfType` for type parameters and unions.
+/// Pinned `getBaseConstraintOfType` for supported instantiable records.
 #[allow(dead_code)] // Installed ahead of the relation and generic-call consumers.
 pub(super) fn get_base_constraint_of_type(
     store: &mut CanonicalTypeMapperStore,
@@ -454,7 +701,14 @@ pub(super) fn get_base_constraint_of_type_with_limits(
         .ok_or(ConstraintError::InvalidType(type_))?;
     if !matches!(
         record.data(),
-        TypeData::TypeParameter(_) | TypeData::Union(_)
+        TypeData::TypeParameter(_)
+            | TypeData::Union(_)
+            | TypeData::Intersection(_)
+            | TypeData::Index(_)
+            | TypeData::TemplateLiteral(_)
+            | TypeData::StringMapping(_)
+            | TypeData::Conditional(_)
+            | TypeData::Substitution(_)
     ) {
         return Ok(None);
     }
@@ -472,6 +726,7 @@ mod tests {
     use crate::semantic::{
         IntrinsicBootstrapOptions, SemanticStore,
         mapper::TypeMapper,
+        signatures::IndexFlags,
         type_records::{TypeData, TypeRecord},
         types::ObjectFlags,
     };
@@ -787,5 +1042,99 @@ mod tests {
             unreachable!();
         };
         assert_eq!(data.constrained.resolved_base_constraint, None);
+    }
+
+    #[test]
+    fn index_constraints_use_the_canonical_property_key_union() {
+        let mut store = initialized_store();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let (string, keys) = (bootstrap.string_type, bootstrap.string_number_symbol_type);
+        let index = store.alloc_index_type(string, IndexFlags::NONE).unwrap();
+
+        assert_eq!(get_constraint_of_type(&mut store, index), Ok(Some(keys)));
+        assert_eq!(
+            get_base_constraint_of_type(&mut store, index),
+            Ok(Some(keys))
+        );
+        let TypeData::Index(data) = store.type_payload(index).unwrap().data() else {
+            unreachable!();
+        };
+        assert_eq!(data.constrained.resolved_base_constraint, Some(keys));
+    }
+
+    #[test]
+    fn template_constraints_substitute_resolved_parameter_constraints() {
+        let mut store = initialized_store();
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let literal = store
+            .regular_string_literal_type("value".to_owned())
+            .unwrap();
+        let parameter = store.alloc_type_parameter(None).unwrap();
+        assert!(store.set_type_parameter_resolution(parameter, Some(literal), None, None, None));
+        let template = store
+            .alloc_template_literal_type(vec!["prefix-".to_owned(), String::new()], vec![parameter])
+            .unwrap();
+        let expected = store
+            .regular_string_literal_type("prefix-value".to_owned())
+            .unwrap();
+
+        assert_eq!(
+            get_base_constraint_of_type(&mut store, template),
+            Ok(Some(expected))
+        );
+        let TypeData::TemplateLiteral(data) = store.type_payload(template).unwrap().data() else {
+            unreachable!();
+        };
+        assert_eq!(data.constrained.resolved_base_constraint, Some(expected));
+
+        let unconstrained = store.alloc_type_parameter(None).unwrap();
+        let no_constraint = store.intrinsic_bootstrap().unwrap().no_constraint_type;
+        assert!(store.set_type_parameter_resolution(
+            unconstrained,
+            Some(no_constraint),
+            None,
+            None,
+            None,
+        ));
+        let fallback = store
+            .alloc_template_literal_type(vec![String::new(), String::new()], vec![unconstrained])
+            .unwrap();
+        assert_eq!(
+            get_base_constraint_of_type(&mut store, fallback),
+            Ok(Some(string))
+        );
+    }
+
+    #[test]
+    fn substitution_and_intersection_constraints_reduce_primitive_domains() {
+        let mut store = initialized_store();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let (string, number, never) = (
+            bootstrap.string_type,
+            bootstrap.number_type,
+            bootstrap.never_type,
+        );
+        let parameter = store.alloc_type_parameter(None).unwrap();
+        assert!(store.set_type_parameter_resolution(parameter, Some(string), None, None, None));
+
+        let compatible = store.alloc_substitution_type(parameter, string).unwrap();
+        assert_eq!(
+            get_base_constraint_of_type(&mut store, compatible),
+            Ok(Some(string))
+        );
+
+        let incompatible = store.alloc_substitution_type(parameter, number).unwrap();
+        assert_eq!(
+            get_base_constraint_of_type(&mut store, incompatible),
+            Ok(Some(never))
+        );
+
+        let intersection = store
+            .alloc_intersection_type(ObjectFlags::NONE, vec![parameter, number])
+            .unwrap();
+        assert_eq!(
+            get_base_constraint_of_type(&mut store, intersection),
+            Ok(Some(never))
+        );
     }
 }

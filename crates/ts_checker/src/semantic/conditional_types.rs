@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use ts_ast::NodeRef;
+use ts_ast::{NodeRef, SyntaxKind};
 use xxhash_rust::xxh3::Xxh3;
 
 use super::{
@@ -14,13 +14,18 @@ use super::{
     TypeMapperId,
     array_types::CanonicalArrayTargets,
     bootstrap::LiteralTypeCacheError,
+    constraints::{self, ConstraintError},
     instantiate::{
         InstantiationError, InstantiationLimits, InstantiationSession, canonical_anonymous_union,
-        instantiate_type_with_vector_and_session,
+        instantiate_type_with_session, instantiate_type_with_vector_and_session,
     },
     mapper::CanonicalTypeMapperStore,
     signatures::Signature,
-    type_records::{CacheHashKey, TypeCacheState, TypeData, TypeRecord},
+    store::SourceNodeParent,
+    template_types::TemplateTypeError,
+    type_records::{
+        CacheHashKey, ConditionalTypeData, LiteralValue, TypeCacheState, TypeData, TypeRecord,
+    },
     types::TypeFlags,
 };
 
@@ -71,11 +76,14 @@ pub(super) enum ConditionalTypeError {
     InvalidInstantiationArity { expected: usize, actual: usize },
     InvalidInstantiationCache(ConditionalRootId),
     InvalidTypeNodeCache(NodeRef),
+    InvalidConditionalResolution(TypeId),
     InvalidSignature(SignatureId),
     UnsupportedInference { source: TypeId, target: TypeId },
     TailRecursionLimit { count: usize, limit: usize },
     Instantiation(InstantiationError),
+    Constraint(Box<ConstraintError>),
     Relation(RelationUnavailable),
+    Template(TemplateTypeError),
     Union(LiteralTypeCacheError),
 }
 
@@ -111,6 +119,12 @@ impl std::fmt::Display for ConditionalTypeError {
             Self::InvalidTypeNodeCache(node) => {
                 write!(formatter, "conditional node {node:?} has an invalid cache")
             }
+            Self::InvalidConditionalResolution(type_) => {
+                write!(
+                    formatter,
+                    "conditional type {type_:?} has invalid resolution caches"
+                )
+            }
             Self::InvalidSignature(signature) => {
                 write!(
                     formatter,
@@ -126,7 +140,9 @@ impl std::fmt::Display for ConditionalTypeError {
                 "conditional tail recursion count {count} reached limit {limit}"
             ),
             Self::Instantiation(error) => error.fmt(formatter),
+            Self::Constraint(error) => error.fmt(formatter),
             Self::Relation(error) => error.fmt(formatter),
+            Self::Template(error) => error.fmt(formatter),
             Self::Union(error) => error.fmt(formatter),
         }
     }
@@ -136,7 +152,9 @@ impl std::error::Error for ConditionalTypeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Instantiation(error) => Some(error),
+            Self::Constraint(error) => Some(error.as_ref()),
             Self::Relation(error) => Some(error),
+            Self::Template(error) => Some(error),
             Self::Union(error) => Some(error),
             _ => None,
         }
@@ -152,6 +170,18 @@ impl From<InstantiationError> for ConditionalTypeError {
 impl From<RelationUnavailable> for ConditionalTypeError {
     fn from(error: RelationUnavailable) -> Self {
         Self::Relation(error)
+    }
+}
+
+impl From<ConstraintError> for ConditionalTypeError {
+    fn from(error: ConstraintError) -> Self {
+        Self::Constraint(Box::new(error))
+    }
+}
+
+impl From<TemplateTypeError> for ConditionalTypeError {
+    fn from(error: TemplateTypeError) -> Self {
+        Self::Template(error)
     }
 }
 
@@ -235,6 +265,334 @@ pub(super) fn get_conditional_type_instantiation(
     session: Option<&mut InstantiationSession>,
 ) -> Result<TypeId, ConditionalTypeError> {
     get_conditional_type_instantiation_with_tail_count(store, request, global_types, session, 0)
+}
+
+/// Resolves the true branch only when its canonical lazy cache is requested.
+pub(super) fn get_true_type_from_conditional_type(
+    store: &mut CanonicalTypeMapperStore,
+    conditional: TypeId,
+    branches: ConditionalTypeBranches,
+    global_types: Option<&CanonicalGlobalTypes>,
+    session: Option<&mut InstantiationSession>,
+) -> Result<TypeId, ConditionalTypeError> {
+    resolve_conditional_branch(
+        store,
+        conditional,
+        branches,
+        ConditionalBranchKind::True,
+        global_types,
+        session,
+    )
+}
+
+/// Resolves the false branch only when its canonical lazy cache is requested.
+pub(super) fn get_false_type_from_conditional_type(
+    store: &mut CanonicalTypeMapperStore,
+    conditional: TypeId,
+    branches: ConditionalTypeBranches,
+    global_types: Option<&CanonicalGlobalTypes>,
+    session: Option<&mut InstantiationSession>,
+) -> Result<TypeId, ConditionalTypeError> {
+    resolve_conditional_branch(
+        store,
+        conditional,
+        branches,
+        ConditionalBranchKind::False,
+        global_types,
+        session,
+    )
+}
+
+/// Resolves the true branch through the inference mapper when one exists.
+pub(super) fn get_inferred_true_type_from_conditional_type(
+    store: &mut CanonicalTypeMapperStore,
+    conditional: TypeId,
+    branches: ConditionalTypeBranches,
+    global_types: Option<&CanonicalGlobalTypes>,
+    session: Option<&mut InstantiationSession>,
+) -> Result<TypeId, ConditionalTypeError> {
+    if conditional_snapshot(store, conditional)?
+        .combined_mapper
+        .is_none()
+    {
+        let resolved = get_true_type_from_conditional_type(
+            store,
+            conditional,
+            branches,
+            global_types,
+            session,
+        )?;
+        let mut data = conditional_snapshot(store, conditional)?;
+        if data.resolved_inferred_true_type != Some(resolved) {
+            data.resolved_inferred_true_type = Some(resolved);
+            publish_conditional_snapshot(store, conditional, &data)?;
+        }
+        return Ok(resolved);
+    }
+    resolve_conditional_branch(
+        store,
+        conditional,
+        branches,
+        ConditionalBranchKind::InferredTrue,
+        global_types,
+        session,
+    )
+}
+
+/// Computes the pinned default constraint, excluding a single `any` branch.
+pub(super) fn get_default_constraint_of_conditional_type(
+    store: &mut CanonicalTypeMapperStore,
+    conditional: TypeId,
+    branches: ConditionalTypeBranches,
+    global_types: Option<&CanonicalGlobalTypes>,
+    session: Option<&mut InstantiationSession>,
+) -> Result<TypeId, ConditionalTypeError> {
+    let data = conditional_snapshot(store, conditional)?;
+    if let Some(cached) = data.resolved_default_constraint {
+        validate_owned_type(store, cached)?;
+        return Ok(cached);
+    }
+
+    let mut owned_session = InstantiationSession::new(InstantiationLimits::default());
+    let session = session.unwrap_or(&mut owned_session);
+    let true_type = get_inferred_true_type_from_conditional_type(
+        store,
+        conditional,
+        branches,
+        global_types,
+        Some(session),
+    )?;
+    let false_type = get_false_type_from_conditional_type(
+        store,
+        conditional,
+        branches,
+        global_types,
+        Some(session),
+    )?;
+    let result = if type_flags(store, true_type)?.intersects(TypeFlags::ANY) {
+        false_type
+    } else if type_flags(store, false_type)?.intersects(TypeFlags::ANY) {
+        true_type
+    } else {
+        union_result(store, &[true_type, false_type], global_types)?
+    };
+    let mut data = conditional_snapshot(store, conditional)?;
+    data.resolved_default_constraint = Some(result);
+    publish_conditional_snapshot(store, conditional, &data)?;
+    Ok(result)
+}
+
+/// Instantiates a distributive conditional with its checked parameter's constraint.
+pub(super) fn get_constraint_of_distributive_conditional_type(
+    store: &mut CanonicalTypeMapperStore,
+    conditional: TypeId,
+    branches: ConditionalTypeBranches,
+    global_types: Option<&CanonicalGlobalTypes>,
+    session: Option<&mut InstantiationSession>,
+) -> Result<Option<TypeId>, ConditionalTypeError> {
+    let data = conditional_snapshot(store, conditional)?;
+    let no_constraint = store
+        .intrinsic_bootstrap()
+        .ok_or(ConditionalTypeError::MissingBootstrap)?
+        .no_constraint_type;
+    if let Some(cached) = data.resolved_constraint_of_distributive {
+        validate_owned_type(store, cached)?;
+        return Ok((cached != no_constraint).then_some(cached));
+    }
+
+    let (distributive, root_check, parameters) = {
+        let root = store
+            .conditional_root(data.root)
+            .ok_or(ConditionalTypeError::InvalidRoot(data.root))?;
+        (
+            root.is_distributive(),
+            root.check_type(),
+            root.outer_type_parameters().unwrap_or_default().to_vec(),
+        )
+    };
+    let mut result = None;
+    if distributive {
+        let constraint = match constraints::get_constraint_of_type(store, data.check_type) {
+            Ok(constraint) => constraint,
+            Err(ConstraintError::UnresolvedTypeParameter(type_)) if type_ == data.check_type => {
+                None
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if let Some(constraint) = constraint
+            && constraint != data.check_type
+        {
+            let mut owned_session = InstantiationSession::new(InstantiationLimits::default());
+            let session = session.unwrap_or(&mut owned_session);
+            let mut arguments = Vec::with_capacity(parameters.len());
+            for parameter in parameters {
+                let argument = if parameter == root_check {
+                    constraint
+                } else {
+                    map_type_with_stored_mapper(
+                        store,
+                        parameter,
+                        data.mapper,
+                        global_types,
+                        session,
+                    )?
+                };
+                arguments.push(argument);
+            }
+            let instantiated = get_conditional_type_instantiation(
+                store,
+                ConditionalTypeInstantiation {
+                    conditional_type: conditional,
+                    type_arguments: &arguments,
+                    branches,
+                    alias: None,
+                    for_constraint: true,
+                },
+                global_types,
+                Some(session),
+            )?;
+            if !is_never(store, instantiated)? {
+                result = Some(instantiated);
+            }
+        }
+    }
+
+    let mut data = conditional_snapshot(store, conditional)?;
+    data.resolved_constraint_of_distributive = Some(result.unwrap_or(no_constraint));
+    publish_conditional_snapshot(store, conditional, &data)?;
+    Ok(result)
+}
+
+/// Uses the distributive constraint first, then the pinned default constraint.
+pub(super) fn get_constraint_from_conditional_type(
+    store: &mut CanonicalTypeMapperStore,
+    conditional: TypeId,
+    branches: ConditionalTypeBranches,
+    global_types: Option<&CanonicalGlobalTypes>,
+    session: Option<&mut InstantiationSession>,
+) -> Result<TypeId, ConditionalTypeError> {
+    let mut owned_session = InstantiationSession::new(InstantiationLimits::default());
+    let session = session.unwrap_or(&mut owned_session);
+    if let Some(distributive) = get_constraint_of_distributive_conditional_type(
+        store,
+        conditional,
+        branches,
+        global_types,
+        Some(session),
+    )? {
+        return Ok(distributive);
+    }
+    get_default_constraint_of_conditional_type(
+        store,
+        conditional,
+        branches,
+        global_types,
+        Some(session),
+    )
+}
+
+/// Returns resolved branch identities without forcing an unavailable syntax query.
+pub(super) fn cached_conditional_branches(
+    store: &CanonicalTypeMapperStore,
+    conditional: TypeId,
+) -> Result<Option<ConditionalTypeBranches>, ConditionalTypeError> {
+    let data = conditional_snapshot(store, conditional)?;
+    let Some(true_type) = data.resolved_inferred_true_type.or(data.resolved_true_type) else {
+        return Ok(None);
+    };
+    let Some(false_type) = data.resolved_false_type else {
+        return Ok(None);
+    };
+    let branches = ConditionalTypeBranches {
+        true_type,
+        false_type,
+    };
+    validate_branch_types(store, branches)?;
+    Ok(Some(branches))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConditionalBranchKind {
+    True,
+    False,
+    InferredTrue,
+}
+
+fn resolve_conditional_branch(
+    store: &mut CanonicalTypeMapperStore,
+    conditional: TypeId,
+    branches: ConditionalTypeBranches,
+    branch: ConditionalBranchKind,
+    global_types: Option<&CanonicalGlobalTypes>,
+    session: Option<&mut InstantiationSession>,
+) -> Result<TypeId, ConditionalTypeError> {
+    validate_branch_types(store, branches)?;
+    let data = conditional_snapshot(store, conditional)?;
+    let (cached, source, mapper) = match branch {
+        ConditionalBranchKind::True => (data.resolved_true_type, branches.true_type, data.mapper),
+        ConditionalBranchKind::False => {
+            (data.resolved_false_type, branches.false_type, data.mapper)
+        }
+        ConditionalBranchKind::InferredTrue => (
+            data.resolved_inferred_true_type,
+            branches.true_type,
+            data.combined_mapper.or(data.mapper),
+        ),
+    };
+    if let Some(cached) = cached {
+        validate_owned_type(store, cached)?;
+        return Ok(cached);
+    }
+
+    let mut owned_session = InstantiationSession::new(InstantiationLimits::default());
+    let session = session.unwrap_or(&mut owned_session);
+    let resolved = map_type_with_stored_mapper(store, source, mapper, global_types, session)?;
+    let mut data = conditional_snapshot(store, conditional)?;
+    match branch {
+        ConditionalBranchKind::True => data.resolved_true_type = Some(resolved),
+        ConditionalBranchKind::False => data.resolved_false_type = Some(resolved),
+        ConditionalBranchKind::InferredTrue => {
+            data.resolved_inferred_true_type = Some(resolved);
+            if data.combined_mapper.is_none() {
+                data.resolved_true_type = Some(resolved);
+            }
+        }
+    }
+    publish_conditional_snapshot(store, conditional, &data)?;
+    Ok(resolved)
+}
+
+fn conditional_snapshot(
+    store: &CanonicalTypeMapperStore,
+    conditional: TypeId,
+) -> Result<ConditionalTypeData, ConditionalTypeError> {
+    match store.type_payload(conditional).map(TypeRecord::data) {
+        Some(TypeData::Conditional(data)) => Ok(data.clone()),
+        _ => Err(ConditionalTypeError::InvalidConditional(conditional)),
+    }
+}
+
+fn publish_conditional_snapshot(
+    store: &mut CanonicalTypeMapperStore,
+    conditional: TypeId,
+    data: &ConditionalTypeData,
+) -> Result<(), ConditionalTypeError> {
+    if store.set_conditional_resolution(
+        conditional,
+        data.resolved_true_type,
+        data.resolved_false_type,
+        data.resolved_inferred_true_type,
+        data.resolved_default_constraint,
+        data.resolved_constraint_of_distributive,
+        data.mapper,
+        data.combined_mapper,
+    ) {
+        Ok(())
+    } else {
+        Err(ConditionalTypeError::InvalidConditionalResolution(
+            conditional,
+        ))
+    }
 }
 
 fn get_conditional_type_instantiation_with_tail_count(
@@ -607,6 +965,20 @@ fn evaluate_conditional(
     }
 
     if assignable {
+        if let Some(result) = evaluate_conditional_tail(
+            store,
+            root,
+            branches.true_type,
+            branches,
+            &combined_parameters,
+            &combined_arguments,
+            global_types,
+            for_constraint,
+            session,
+            tail_count,
+        )? {
+            return Ok(result);
+        }
         map_type(
             store,
             branches.true_type,
@@ -616,6 +988,20 @@ fn evaluate_conditional(
             session,
         )
     } else {
+        if let Some(result) = evaluate_conditional_tail(
+            store,
+            root,
+            branches.false_type,
+            branches,
+            mapped_parameters,
+            type_arguments,
+            global_types,
+            for_constraint,
+            session,
+            tail_count,
+        )? {
+            return Ok(result);
+        }
         map_type(
             store,
             branches.false_type,
@@ -624,6 +1010,129 @@ fn evaluate_conditional(
             global_types,
             session,
         )
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // Tail recursion retains the current root and active mapper.
+fn evaluate_conditional_tail(
+    store: &mut CanonicalTypeMapperStore,
+    current_root: ConditionalRootId,
+    branch: TypeId,
+    current_branches: ConditionalTypeBranches,
+    mapped_parameters: &[TypeId],
+    type_arguments: &[TypeId],
+    global_types: Option<&CanonicalGlobalTypes>,
+    for_constraint: bool,
+    session: &mut InstantiationSession,
+    tail_count: usize,
+) -> Result<Option<TypeId>, ConditionalTypeError> {
+    let Some(TypeData::Conditional(conditional)) = store.type_payload(branch).map(TypeRecord::data)
+    else {
+        return Ok(None);
+    };
+    let next_root = conditional.root;
+    let nested_mapper = conditional.mapper;
+    if mapped_parameters.is_empty() && nested_mapper.is_none() {
+        return Ok(None);
+    }
+    let (parameters, check_type, distributive, aliased) = {
+        let root = store
+            .conditional_root(next_root)
+            .ok_or(ConditionalTypeError::InvalidRoot(next_root))?;
+        (
+            root.outer_type_parameters().unwrap_or_default().to_vec(),
+            root.check_type(),
+            root.is_distributive(),
+            root.alias().is_some() || conditional_node_has_alias_owner(store, root.node()),
+        )
+    };
+    if parameters.is_empty() {
+        return Ok(None);
+    }
+
+    let mut arguments = Vec::with_capacity(parameters.len());
+    for parameter in &parameters {
+        let nested =
+            map_type_with_stored_mapper(store, *parameter, nested_mapper, global_types, session)?;
+        arguments.push(map_type(
+            store,
+            nested,
+            mapped_parameters,
+            type_arguments,
+            global_types,
+            session,
+        )?);
+    }
+    if distributive {
+        let mapped_check = map_type(
+            store,
+            check_type,
+            &parameters,
+            &arguments,
+            global_types,
+            session,
+        )?;
+        if mapped_check != check_type
+            && type_flags(store, mapped_check)?.intersects(TypeFlags::UNION | TypeFlags::NEVER)
+        {
+            return Ok(None);
+        }
+    }
+
+    let branches = if next_root == current_root {
+        current_branches
+    } else if let Some(branches) = cached_conditional_branches(store, branch)? {
+        branches
+    } else {
+        return Ok(None);
+    };
+    if next_root == current_root
+        && parameters.as_slice() == mapped_parameters
+        && arguments.as_slice() == type_arguments
+        && branches == current_branches
+    {
+        if !aliased {
+            return Ok(None);
+        }
+        let mut count = tail_count;
+        while count < CONDITIONAL_TAIL_RECURSION_LIMIT {
+            count += 1;
+        }
+        return Err(ConditionalTypeError::TailRecursionLimit {
+            count,
+            limit: CONDITIONAL_TAIL_RECURSION_LIMIT,
+        });
+    }
+
+    let next_count = tail_count + usize::from(aliased);
+    get_conditional_type_instantiation_with_tail_count(
+        store,
+        ConditionalTypeInstantiation {
+            conditional_type: branch,
+            type_arguments: &arguments,
+            branches,
+            alias: None,
+            for_constraint,
+        },
+        global_types,
+        Some(session),
+        next_count,
+    )
+    .map(Some)
+}
+
+fn conditional_node_has_alias_owner(store: &CanonicalTypeMapperStore, mut node: NodeRef) -> bool {
+    loop {
+        let Some(SourceNodeParent::Parent(parent)) = store.source_node_parent(node) else {
+            return false;
+        };
+        match store.source_node_kind(parent) {
+            Some(SyntaxKind::ParenthesizedType) => node = parent,
+            Some(SyntaxKind::TypeAliasDeclaration | SyntaxKind::JsTypeAliasDeclaration) => {
+                return true;
+            }
+            _ => return false,
+        }
     }
 }
 
@@ -811,6 +1320,30 @@ fn map_type(
     {
         return Ok(type_);
     }
+
+    let template = match store.type_payload(type_).map(TypeRecord::data) {
+        Some(TypeData::TemplateLiteral(template)) => {
+            Some((template.texts.clone(), template.types.clone()))
+        }
+        _ => None,
+    };
+    if let Some((texts, types)) = template {
+        let mut mapped = Vec::with_capacity(types.len());
+        for placeholder in types {
+            mapped.push(map_type(
+                store,
+                placeholder,
+                parameters,
+                arguments,
+                global_types,
+                session,
+            )?);
+        }
+        return store
+            .get_template_literal_type(&texts, &mapped)
+            .map_err(Into::into);
+    }
+
     let array_targets = global_types.map(CanonicalArrayTargets::from_global_types);
     instantiate_type_with_vector_and_session(
         store,
@@ -818,6 +1351,51 @@ fn map_type(
         parameters,
         arguments,
         array_targets,
+        session,
+    )
+    .map_err(Into::into)
+}
+
+fn map_type_with_stored_mapper(
+    store: &mut CanonicalTypeMapperStore,
+    type_: TypeId,
+    mapper: Option<TypeMapperId>,
+    global_types: Option<&CanonicalGlobalTypes>,
+    session: &mut InstantiationSession,
+) -> Result<TypeId, ConditionalTypeError> {
+    validate_owned_type(store, type_)?;
+    let Some(mapper) = mapper else {
+        return Ok(type_);
+    };
+    if store.mapper_payload(mapper).is_none() {
+        return Err(ConditionalTypeError::InvalidMapper(mapper));
+    }
+    let template = match store.type_payload(type_).map(TypeRecord::data) {
+        Some(TypeData::TemplateLiteral(template)) => {
+            Some((template.texts.clone(), template.types.clone()))
+        }
+        _ => None,
+    };
+    if let Some((texts, types)) = template {
+        let mut substituted = Vec::with_capacity(types.len());
+        for placeholder in types {
+            substituted.push(map_type_with_stored_mapper(
+                store,
+                placeholder,
+                Some(mapper),
+                global_types,
+                session,
+            )?);
+        }
+        return store
+            .get_template_literal_type(&texts, &substituted)
+            .map_err(Into::into);
+    }
+    instantiate_type_with_session(
+        store,
+        type_,
+        mapper,
+        global_types.map(CanonicalArrayTargets::from_global_types),
         session,
     )
     .map_err(Into::into)
@@ -884,6 +1462,22 @@ fn contains_mapped_type_parameter(
                     visiting,
                 )?
         }
+        TypeData::TemplateLiteral(template) => {
+            template
+                .types
+                .iter()
+                .try_fold(false, |found, placeholder| {
+                    Ok::<_, ConditionalTypeError>(
+                        found
+                            || contains_mapped_type_parameter(
+                                store,
+                                *placeholder,
+                                parameters,
+                                visiting,
+                            )?,
+                    )
+                })?
+        }
         _ => false,
     };
     visiting.remove(&type_);
@@ -937,6 +1531,11 @@ fn contains_type_parameter(
                     Ok::<_, ConditionalTypeError>(found || visit(store, *item, excluded, visiting)?)
                 })?,
             TypeData::Conditional(_) => true,
+            TypeData::TemplateLiteral(template) => {
+                template.types.iter().try_fold(false, |found, item| {
+                    Ok::<_, ConditionalTypeError>(found || visit(store, *item, excluded, visiting)?)
+                })?
+            }
             _ => false,
         };
         visiting.remove(&type_);
@@ -967,6 +1566,34 @@ fn infer_from_types(
     let target_record = store
         .type_payload(target)
         .ok_or(ConditionalTypeError::InvalidType(target))?;
+    if let TypeData::TemplateLiteral(target_template) = target_record.data() {
+        let target_texts = target_template.texts.clone();
+        let target_types = target_template.types.clone();
+        let (source_texts, source_types) = match source_record.data() {
+            TypeData::Literal(literal) => match &literal.value {
+                LiteralValue::String(value) => (vec![value.clone()], Vec::new()),
+                _ => return Ok(false),
+            },
+            TypeData::TemplateLiteral(template) => (template.texts.clone(), template.types.clone()),
+            _ => return Ok(false),
+        };
+        let Some(matches) = infer_template_literal_matches(
+            store,
+            &source_texts,
+            &source_types,
+            &target_texts,
+            &target_types,
+        )?
+        else {
+            return Ok(false);
+        };
+        for (source, target) in matches.into_iter().zip(target_types) {
+            if !infer_from_types(store, source, target, parameters, candidates, global_types)? {
+                return Ok(false);
+            }
+        }
+        return Ok(true);
+    }
     if let (TypeData::TypeReference(source_ref), TypeData::TypeReference(target_ref)) =
         (source_record.data(), target_record.data())
     {
@@ -1018,6 +1645,135 @@ fn infer_from_types(
     } else {
         is_assignable(store, source, target, global_types)
     }
+}
+
+fn infer_template_literal_matches(
+    store: &mut CanonicalTypeMapperStore,
+    source_texts: &[String],
+    source_types: &[TypeId],
+    target_texts: &[String],
+    target_types: &[TypeId],
+) -> Result<Option<Vec<TypeId>>, ConditionalTypeError> {
+    if source_texts.len() != source_types.len().saturating_add(1)
+        || target_texts.len() != target_types.len().saturating_add(1)
+        || source_texts.is_empty()
+        || target_types.is_empty()
+    {
+        return Ok(None);
+    }
+    if source_texts == target_texts && source_types.len() == target_types.len() {
+        return Ok(Some(source_types.to_vec()));
+    }
+
+    let last_source = source_texts.len() - 1;
+    let last_target = target_texts.len() - 1;
+    let source_start = &source_texts[0];
+    let source_end = &source_texts[last_source];
+    let target_start = &target_texts[0];
+    let target_end = &target_texts[last_target];
+    if last_source == 0 && source_start.len() < target_start.len() + target_end.len()
+        || !source_start.starts_with(target_start)
+        || !source_end.ends_with(target_end)
+    {
+        return Ok(None);
+    }
+    let remaining_end = &source_end[..source_end.len() - target_end.len()];
+    let mut segment = 0;
+    let mut position = target_start.len();
+    let mut matches = Vec::with_capacity(target_types.len());
+
+    for delimiter in &target_texts[1..last_target] {
+        let (match_segment, match_position) = if delimiter.is_empty() {
+            let current = if segment == last_source {
+                remaining_end
+            } else {
+                &source_texts[segment]
+            };
+            if let Some(character) = current[position..].chars().next() {
+                (segment, position + character.len_utf8())
+            } else if segment < last_source {
+                (segment + 1, 0)
+            } else {
+                return Ok(None);
+            }
+        } else {
+            let mut search_segment = segment;
+            let mut search_position = position;
+            loop {
+                let current = if search_segment == last_source {
+                    remaining_end
+                } else {
+                    &source_texts[search_segment]
+                };
+                if let Some(offset) = current[search_position..].find(delimiter) {
+                    break (search_segment, search_position + offset);
+                }
+                search_segment += 1;
+                if search_segment == source_texts.len() {
+                    return Ok(None);
+                }
+                search_position = 0;
+            }
+        };
+        matches.push(capture_template_literal_part(
+            store,
+            source_texts,
+            source_types,
+            remaining_end,
+            segment,
+            position,
+            match_segment,
+            match_position,
+        )?);
+        segment = match_segment;
+        position = match_position + delimiter.len();
+    }
+    matches.push(capture_template_literal_part(
+        store,
+        source_texts,
+        source_types,
+        remaining_end,
+        segment,
+        position,
+        last_source,
+        remaining_end.len(),
+    )?);
+    Ok(Some(matches))
+}
+
+#[allow(clippy::too_many_arguments)] // Both source endpoints are needed for upstream segment capture.
+fn capture_template_literal_part(
+    store: &mut CanonicalTypeMapperStore,
+    source_texts: &[String],
+    source_types: &[TypeId],
+    remaining_end: &str,
+    start_segment: usize,
+    start_position: usize,
+    end_segment: usize,
+    end_position: usize,
+) -> Result<TypeId, ConditionalTypeError> {
+    let source_text = |index: usize| {
+        if index + 1 == source_texts.len() {
+            remaining_end
+        } else {
+            source_texts[index].as_str()
+        }
+    };
+    if start_segment == end_segment {
+        return store
+            .regular_string_literal_type(
+                source_text(start_segment)[start_position..end_position].to_owned(),
+            )
+            .map_err(Into::into);
+    }
+
+    let mut texts = Vec::with_capacity(end_segment - start_segment + 1);
+    texts.push(source_texts[start_segment][start_position..].to_owned());
+    texts.extend(source_texts[start_segment + 1..end_segment].iter().cloned());
+    texts.push(source_text(end_segment)[..end_position].to_owned());
+    store
+        .get_template_literal_type(&texts, &source_types[start_segment..end_segment])
+        .map_err(Into::into)
 }
 
 fn single_call_signature(data: &TypeData) -> Option<SignatureId> {
@@ -1486,20 +2242,23 @@ mod tests {
     }
 
     #[test]
-    fn tail_recursion_stops_at_the_pinned_limit_before_mutation() {
-        let mut fixture = Fixture::new("type Result<T> = T extends string ? T : never;");
+    fn source_owned_conditional_self_recursion_reaches_the_pinned_limit() {
+        let mut fixture = Fixture::new("type Loop<T> = T extends string ? string : Loop<T>;");
         let node = fixture.conditional();
         let parameter = fixture.type_parameter("T");
         let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
-        let (string, never) = (bootstrap.string_type, bootstrap.never_type);
-        let branch_types = branches(parameter, never);
+        let (string, number, never) = (
+            bootstrap.string_type,
+            bootstrap.number_type,
+            bootstrap.never_type,
+        );
         let declared = get_type_from_conditional_type(
             &mut fixture.store,
             ConditionalTypeRequest {
                 node,
                 check_type: parameter,
                 extends_type: string,
-                branches: branch_types,
+                branches: branches(string, never),
                 infer_type_parameters: &[],
                 outer_type_parameters: &[parameter],
                 alias: None,
@@ -1507,24 +2266,34 @@ mod tests {
             None,
         )
         .unwrap();
+        let TypeData::Conditional(data) = fixture.store.type_payload(declared).unwrap().data()
+        else {
+            panic!("the recursive source alias must retain its conditional root")
+        };
+        let root = fixture.store.conditional_root(data.root).unwrap();
+        assert!(root.alias().is_none());
+        assert!(conditional_node_has_alias_owner(
+            &fixture.store,
+            root.node()
+        ));
+        let branch_types = branches(string, declared);
         let before = (
             fixture.store.type_len(),
             fixture.store.conditional_root_len(),
             fixture.store.mapper_len(),
         );
         assert_eq!(
-            get_conditional_type_instantiation_with_tail_count(
+            get_conditional_type_instantiation(
                 &mut fixture.store,
                 ConditionalTypeInstantiation {
                     conditional_type: declared,
-                    type_arguments: &[string],
+                    type_arguments: &[number],
                     branches: branch_types,
                     alias: None,
                     for_constraint: false,
                 },
                 None,
                 None,
-                CONDITIONAL_TAIL_RECURSION_LIMIT,
             ),
             Err(ConditionalTypeError::TailRecursionLimit {
                 count: CONDITIONAL_TAIL_RECURSION_LIMIT,
@@ -1585,5 +2354,286 @@ mod tests {
             Err(ConditionalTypeError::DuplicateTypeParameter(parameter))
         );
         assert_eq!(fixture.store.conditional_root_len(), before);
+    }
+
+    #[test]
+    fn default_constraints_cache_branches_and_exclude_any() {
+        for true_branch_is_any in [true, false] {
+            let mut fixture = Fixture::new("type Result<T> = T extends string ? any : number;");
+            let node = fixture.conditional();
+            let parameter = fixture.type_parameter("T");
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            let (string, number, any) = (
+                bootstrap.string_type,
+                bootstrap.number_type,
+                bootstrap.any_type,
+            );
+            let branch_types = if true_branch_is_any {
+                branches(any, number)
+            } else {
+                branches(number, any)
+            };
+            let conditional = get_type_from_conditional_type(
+                &mut fixture.store,
+                ConditionalTypeRequest {
+                    node,
+                    check_type: parameter,
+                    extends_type: string,
+                    branches: branch_types,
+                    infer_type_parameters: &[],
+                    outer_type_parameters: &[parameter],
+                    alias: None,
+                },
+                None,
+            )
+            .unwrap();
+            let cold = conditional_snapshot(&fixture.store, conditional).unwrap();
+            assert_eq!(cold.resolved_true_type, None);
+            assert_eq!(cold.resolved_false_type, None);
+            assert_eq!(cold.resolved_default_constraint, None);
+
+            assert_eq!(
+                get_default_constraint_of_conditional_type(
+                    &mut fixture.store,
+                    conditional,
+                    branch_types,
+                    None,
+                    None,
+                ),
+                Ok(number)
+            );
+            let resolved = conditional_snapshot(&fixture.store, conditional).unwrap();
+            assert_eq!(resolved.resolved_true_type, Some(branch_types.true_type));
+            assert_eq!(resolved.resolved_false_type, Some(branch_types.false_type));
+            assert_eq!(resolved.resolved_default_constraint, Some(number));
+
+            let warm = (fixture.store.type_len(), fixture.store.mapper_len());
+            assert_eq!(
+                get_default_constraint_of_conditional_type(
+                    &mut fixture.store,
+                    conditional,
+                    branch_types,
+                    None,
+                    None,
+                ),
+                Ok(number)
+            );
+            assert_eq!((fixture.store.type_len(), fixture.store.mapper_len()), warm);
+        }
+    }
+
+    #[test]
+    fn distributive_constraints_filter_a_constrained_parameter() {
+        let mut fixture = Fixture::new("type Result<T> = T extends string ? T : never;");
+        let node = fixture.conditional();
+        let parameter = fixture.type_parameter("T");
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let (string, number, never) = (
+            bootstrap.string_type,
+            bootstrap.number_type,
+            bootstrap.never_type,
+        );
+        let constraint = canonical_anonymous_union(&mut fixture.store, &[string, number]).unwrap();
+        assert!(fixture.store.set_type_parameter_resolution(
+            parameter,
+            Some(constraint),
+            None,
+            None,
+            None,
+        ));
+        let branch_types = branches(parameter, never);
+        let conditional = get_type_from_conditional_type(
+            &mut fixture.store,
+            ConditionalTypeRequest {
+                node,
+                check_type: parameter,
+                extends_type: string,
+                branches: branch_types,
+                infer_type_parameters: &[],
+                outer_type_parameters: &[parameter],
+                alias: None,
+            },
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            get_constraint_of_distributive_conditional_type(
+                &mut fixture.store,
+                conditional,
+                branch_types,
+                None,
+                None,
+            ),
+            Ok(Some(string))
+        );
+        let resolved = conditional_snapshot(&fixture.store, conditional).unwrap();
+        assert_eq!(resolved.resolved_constraint_of_distributive, Some(string));
+        assert_eq!(
+            get_constraint_from_conditional_type(
+                &mut fixture.store,
+                conditional,
+                branch_types,
+                None,
+                None,
+            ),
+            Ok(string)
+        );
+
+        assert_eq!(
+            get_true_type_from_conditional_type(
+                &mut fixture.store,
+                conditional,
+                branch_types,
+                None,
+                None,
+            ),
+            Ok(parameter)
+        );
+        assert_eq!(
+            get_false_type_from_conditional_type(
+                &mut fixture.store,
+                conditional,
+                branch_types,
+                None,
+                None,
+            ),
+            Ok(never)
+        );
+        assert_eq!(
+            constraints::get_constraint_of_type(&mut fixture.store, conditional),
+            Ok(Some(string))
+        );
+    }
+
+    #[test]
+    fn template_inference_consumes_complete_unicode_code_points() {
+        for (source, expected, selected) in [
+            (
+                "type Head<T> = T extends `${infer H}${infer R}` ? H : never;",
+                "\u{1F600}",
+                "H",
+            ),
+            (
+                "type Rest<T> = T extends `${infer H}${infer R}` ? R : never;",
+                "abc",
+                "R",
+            ),
+        ] {
+            let mut fixture = Fixture::new(source);
+            let node = fixture.conditional();
+            let parameter = fixture.type_parameter("T");
+            let head = fixture.type_parameter("H");
+            let rest = fixture.type_parameter("R");
+            let never = fixture.store.intrinsic_bootstrap().unwrap().never_type;
+            let template = fixture
+                .store
+                .get_template_literal_type(
+                    &[String::new(), String::new(), String::new()],
+                    &[head, rest],
+                )
+                .unwrap();
+            let selected = if selected == "H" { head } else { rest };
+            let branch_types = branches(selected, never);
+            let conditional = get_type_from_conditional_type(
+                &mut fixture.store,
+                ConditionalTypeRequest {
+                    node,
+                    check_type: parameter,
+                    extends_type: template,
+                    branches: branch_types,
+                    infer_type_parameters: &[head, rest],
+                    outer_type_parameters: &[parameter],
+                    alias: None,
+                },
+                None,
+            )
+            .unwrap();
+            let value = fixture
+                .store
+                .regular_string_literal_type("\u{1F600}abc".to_owned())
+                .unwrap();
+            let result = get_conditional_type_instantiation(
+                &mut fixture.store,
+                ConditionalTypeInstantiation {
+                    conditional_type: conditional,
+                    type_arguments: &[value],
+                    branches: branch_types,
+                    alias: None,
+                    for_constraint: false,
+                },
+                None,
+                None,
+            )
+            .unwrap();
+            let Some(TypeData::Literal(literal)) =
+                fixture.store.type_payload(result).map(TypeRecord::data)
+            else {
+                panic!("template inference must produce a string literal")
+            };
+            assert_eq!(literal.value, LiteralValue::String(expected.to_owned()));
+        }
+    }
+
+    #[test]
+    fn template_inference_matches_delimiters_and_rejects_missing_segments() {
+        let mut fixture =
+            Fixture::new("type Left<T> = T extends `start-${infer A}:${infer B}-end` ? A : never;");
+        let node = fixture.conditional();
+        let parameter = fixture.type_parameter("T");
+        let left = fixture.type_parameter("A");
+        let right = fixture.type_parameter("B");
+        let never = fixture.store.intrinsic_bootstrap().unwrap().never_type;
+        let template = fixture
+            .store
+            .get_template_literal_type(
+                &["start-".to_owned(), ":".to_owned(), "-end".to_owned()],
+                &[left, right],
+            )
+            .unwrap();
+        let branch_types = branches(left, never);
+        let conditional = get_type_from_conditional_type(
+            &mut fixture.store,
+            ConditionalTypeRequest {
+                node,
+                check_type: parameter,
+                extends_type: template,
+                branches: branch_types,
+                infer_type_parameters: &[left, right],
+                outer_type_parameters: &[parameter],
+                alias: None,
+            },
+            None,
+        )
+        .unwrap();
+        for (source, expected) in [("start-first:second-end", Some("first")), ("bad", None)] {
+            let value = fixture
+                .store
+                .regular_string_literal_type(source.to_owned())
+                .unwrap();
+            let result = get_conditional_type_instantiation(
+                &mut fixture.store,
+                ConditionalTypeInstantiation {
+                    conditional_type: conditional,
+                    type_arguments: &[value],
+                    branches: branch_types,
+                    alias: None,
+                    for_constraint: false,
+                },
+                None,
+                None,
+            )
+            .unwrap();
+            if let Some(expected) = expected {
+                let Some(TypeData::Literal(literal)) =
+                    fixture.store.type_payload(result).map(TypeRecord::data)
+                else {
+                    panic!("a matching template must infer its first segment")
+                };
+                assert_eq!(literal.value, LiteralValue::String(expected.to_owned()));
+            } else {
+                assert_eq!(result, never);
+            }
+        }
     }
 }
