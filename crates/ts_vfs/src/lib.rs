@@ -217,7 +217,21 @@ impl FileSystem for OsFileSystem {
     }
 
     fn write_file(&self, path: &str, contents: &str) -> io::Result<()> {
-        fs::write(normalize_path(path), contents)
+        let path = normalize_path(path);
+        match fs::write(&path, contents) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if let Some(parent) = std::path::Path::new(&path).parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    fs::create_dir_all(parent)?;
+                    fs::write(path, contents)
+                } else {
+                    Err(error)
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn read_directory(&self, path: &str) -> io::Result<DirectoryEntries> {
@@ -229,7 +243,11 @@ impl FileSystem for OsFileSystem {
             let name = entry.file_name().into_string().map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidData, "directory entry is not UTF-8")
             })?;
-            let metadata = entry.metadata()?;
+            let metadata = match fs::metadata(entry.path()) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
             if metadata.is_dir() {
                 directories.push(name);
             } else if metadata.is_file() {
@@ -938,6 +956,55 @@ mod tests {
 
         fs::write(path, [0xff, 0xfe, b'o', 0, b'k', 0])?;
         assert_eq!(vfs.read_file(path)?, "ok");
+
+        fs::remove_dir_all(directory)
+    }
+
+    #[test]
+    fn os_file_system_creates_missing_parent_directories() -> io::Result<()> {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        let directory = std::env::temp_dir().join(format!(
+            "ts-vfs-nested-{}-{}",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let output = directory.join("dist/nested/main.js");
+        let output_path = output
+            .to_str()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "temp path is not UTF-8"))?;
+
+        OsFileSystem::default().write_file(output_path, "export const value = 1;")?;
+        assert_eq!(fs::read_to_string(&output)?, "export const value = 1;");
+
+        fs::remove_dir_all(directory)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn os_file_system_follows_directory_entry_symlinks() -> io::Result<()> {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        let directory = std::env::temp_dir().join(format!(
+            "ts-vfs-links-{}-{}",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let target = directory.join("target");
+        fs::create_dir_all(target.join("nested"))?;
+        fs::write(target.join("source.ts"), "export {};")?;
+        std::os::unix::fs::symlink(target.join("source.ts"), directory.join("linked.ts"))?;
+        std::os::unix::fs::symlink(target.join("nested"), directory.join("linked-dir"))?;
+        std::os::unix::fs::symlink(directory.join("missing"), directory.join("broken"))?;
+        let directory_path = directory
+            .to_str()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "temp path is not UTF-8"))?;
+
+        assert_eq!(
+            OsFileSystem::default().read_directory(directory_path)?,
+            DirectoryEntries {
+                files: vec!["linked.ts".into()],
+                directories: vec!["linked-dir".into(), "target".into()],
+            }
+        );
 
         fs::remove_dir_all(directory)
     }
