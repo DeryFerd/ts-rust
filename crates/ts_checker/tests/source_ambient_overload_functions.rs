@@ -451,6 +451,49 @@ fn failed_multi_overload_recovery_does_not_publish_a_fake_candidate() {
 }
 
 #[test]
+fn declaration_file_ambient_overloads_publish_signatures_in_source_order() {
+    let parsed = parse_source_file(concat!(
+        "declare function choose(value: number): number;",
+        "declare function choose(value: string): string;",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(2_419);
+    let mut context = checker_context(&parsed, file, true, CanonicalModuleState::Script);
+    let declarations = function_declarations(&parsed, file, "choose");
+    let owner = merged_symbol(&context, file, declarations[0]);
+
+    context.check_source_file(file).unwrap();
+
+    let signatures = declarations
+        .iter()
+        .map(|declaration| signature_for_declaration(&context, *declaration))
+        .collect::<Vec<_>>();
+    assert_eq!(signatures.len(), 2);
+    assert_ne!(signatures[0], signatures[1]);
+    assert!(context.store().value_symbol_links(owner).is_some());
+    assert!(context.diagnostics().is_empty());
+    assert!(is_type_checked(&context, file));
+
+    let warm = (
+        context.store().type_len(),
+        context.store().signature_len(),
+        signatures,
+    );
+    context.check_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().signature_len(),
+            declarations
+                .iter()
+                .map(|declaration| signature_for_declaration(&context, *declaration))
+                .collect::<Vec<_>>(),
+        ),
+        warm,
+    );
+}
+
+#[test]
 fn overload_forms_outside_the_exact_leaf_remain_typed_boundaries() {
     for (index, (source, declaration_file, module_state)) in [
         (
@@ -458,12 +501,6 @@ fn overload_forms_outside_the_exact_leaf_remain_typed_boundaries() {
              export declare function f(value: string): string;",
             false,
             CanonicalModuleState::External,
-        ),
-        (
-            "declare function f(value: number): number;\
-             declare function f(value: string): string;",
-            true,
-            CanonicalModuleState::Script,
         ),
         (
             "declare function f<T>(value: T): T;\

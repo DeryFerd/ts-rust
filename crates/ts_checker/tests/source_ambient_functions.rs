@@ -390,18 +390,64 @@ fn later_invalid_ambient_signature_rejects_the_whole_source_before_publication()
 }
 
 #[test]
-fn ambient_function_forms_outside_the_exact_leaf_remain_typed_boundaries() {
-    for (index, (source, declaration_file, module_state)) in [
+fn declaration_file_and_exported_ambient_functions_publish_canonical_signatures() {
+    for (index, (source, name, declaration_file, module_state)) in [
         (
             "export declare function exported(value: number): number;",
+            "exported",
             false,
             CanonicalModuleState::External,
         ),
         (
             "declare function explicit(value: number): number;",
+            "explicit",
             true,
             CanonicalModuleState::Script,
         ),
+        (
+            "export declare function declaration(value: number): number;",
+            "declaration",
+            true,
+            CanonicalModuleState::External,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let parsed = parse_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(2_240 + u32::try_from(index).unwrap());
+        let mut context = checker_context(&parsed, file, declaration_file, module_state);
+        let declaration = function_declaration(&parsed, file, name);
+        let owner = merged_symbol(&context, file, declaration);
+
+        context.check_source_file(file).unwrap();
+
+        assert!(context.store().value_symbol_links(owner).is_some());
+        assert!(context.store().signature_links(declaration).is_some());
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, file));
+
+        let warm = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.diagnostics().clone(),
+        );
+        context.check_source_file(file).unwrap();
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.diagnostics().clone(),
+            ),
+            warm,
+        );
+    }
+}
+
+#[test]
+fn ambient_function_forms_outside_the_exact_leaf_remain_typed_boundaries() {
+    for (index, (source, declaration_file, module_state)) in [
         (
             "declare function genericMerged<T>(value: T): T;\
              declare function genericMerged<T>(value: T, other: T): T;",

@@ -858,6 +858,67 @@ fn invalid_later_generic_ambient_function_rejects_the_whole_source_atomically() 
 }
 
 #[test]
+fn declaration_file_and_exported_ambient_generic_functions_publish_signatures() {
+    for (index, (source, name, declaration_file, module_state)) in [
+        (
+            "export declare function exported<T>(value: T): T;",
+            "exported",
+            false,
+            CanonicalModuleState::External,
+        ),
+        (
+            "declare function explicit<T>(value: T): T;",
+            "explicit",
+            true,
+            CanonicalModuleState::Script,
+        ),
+        (
+            "export declare function declaration<T>(value: T): T;",
+            "declaration",
+            true,
+            CanonicalModuleState::External,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let parsed = parse_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(2_340 + u32::try_from(index).unwrap());
+        let mut context = checker_context(&parsed, file, declaration_file, module_state);
+        let function = function_parts(&parsed, file, name);
+        let owner = merged_symbol(&context, file, function.declaration);
+
+        context.check_source_file(file).unwrap();
+
+        assert!(context.store().value_symbol_links(owner).is_some());
+        assert!(
+            context
+                .store()
+                .signature_links(function.declaration)
+                .is_some()
+        );
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, file));
+
+        let warm = (
+            context.store().type_len(),
+            context.store().mapper_len(),
+            context.store().signature_len(),
+        );
+        context.check_source_file(file).unwrap();
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().mapper_len(),
+                context.store().signature_len(),
+            ),
+            warm,
+        );
+    }
+}
+
+#[test]
 fn ambient_generic_forms_outside_the_existing_exact_closure_remain_typed_boundaries() {
     for (index, (source, declaration_file, module_state)) in [
         (
@@ -896,11 +957,6 @@ fn ambient_generic_forms_outside_the_existing_exact_closure_remain_typed_boundar
             CanonicalModuleState::Script,
         ),
         (
-            "export declare function exported<T>(value: T): T;",
-            false,
-            CanonicalModuleState::External,
-        ),
-        (
             "declare function merged<T>(value: T): T;\
              declare function merged<T>(value: T): T;",
             false,
@@ -909,11 +965,6 @@ fn ambient_generic_forms_outside_the_existing_exact_closure_remain_typed_boundar
         (
             "declare namespace Nested { function member<T>(value: T): T; }",
             false,
-            CanonicalModuleState::Script,
-        ),
-        (
-            "declare function explicit<T>(value: T): T;",
-            true,
             CanonicalModuleState::Script,
         ),
     ]

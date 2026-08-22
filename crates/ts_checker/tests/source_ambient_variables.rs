@@ -466,6 +466,59 @@ fn later_missing_ambient_annotation_is_typed_atomic_and_repeatable() {
 }
 
 #[test]
+fn declaration_file_and_exported_ambient_variables_publish_canonical_types() {
+    for (index, (source, name, declaration_file, module_state)) in [
+        (
+            "export declare const exported: number;",
+            "exported",
+            false,
+            CanonicalModuleState::External,
+        ),
+        (
+            "declare const explicit: number;",
+            "explicit",
+            true,
+            CanonicalModuleState::Script,
+        ),
+        (
+            "export declare const declared: number;",
+            "declared",
+            true,
+            CanonicalModuleState::External,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let parsed = parse_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(2_140 + u32::try_from(index).unwrap());
+        let mut context = checker_context(&parsed, file, declaration_file, module_state);
+        let owner = variable_symbol(&parsed, file, &context, name);
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+
+        context.check_source_file(file).unwrap();
+
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(owner)
+                .and_then(|links| links.resolved_type),
+            Some(number),
+        );
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, file));
+
+        let warm = (context.store().type_len(), context.diagnostics().clone());
+        context.check_source_file(file).unwrap();
+        assert_eq!(
+            (context.store().type_len(), context.diagnostics().clone()),
+            warm,
+        );
+    }
+}
+
+#[test]
 fn ambient_variable_forms_outside_the_exact_leaf_remain_typed_boundaries() {
     for (index, (source, declaration_file, module_state)) in [
         (
@@ -479,18 +532,8 @@ fn ambient_variable_forms_outside_the_exact_leaf_remain_typed_boundaries() {
             CanonicalModuleState::Script,
         ),
         (
-            "export declare const exported: number;",
-            false,
-            CanonicalModuleState::External,
-        ),
-        (
             "declare var merged: number; declare var merged: number;",
             false,
-            CanonicalModuleState::Script,
-        ),
-        (
-            "declare const explicit: number;",
-            true,
             CanonicalModuleState::Script,
         ),
         (
