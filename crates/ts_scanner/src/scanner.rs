@@ -2001,6 +2001,41 @@ mod tests {
     }
 
     #[test]
+    fn string_values_preserve_surrogate_identity_across_escape_forms() {
+        let mut scanner = Scanner::new(
+            r#""\uD800" "\uDC00" "\u{D800}" "\uD83D\uDE00" "\uD83D\u{DE00}" "\u{D83D}\uDE00" "\uD83D-\uDE00""#,
+        );
+        for expected in [
+            &[0xd800][..],
+            &[0xdc00],
+            &[0xd800],
+            &[0xd83d, 0xde00],
+            &[0xd83d, 0xde00],
+            &[0xd83d, 0xde00],
+            &[0xd83d, u16::from(b'-'), 0xde00],
+        ] {
+            let token = scanner.scan();
+            assert_eq!(token.kind, SyntaxKind::StringLiteral);
+            assert_eq!(token.value.unwrap().as_units(), expected);
+        }
+        assert!(scanner.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn template_fragments_keep_lone_surrogates_until_the_parser_combines_them() {
+        let mut scanner = Scanner::new(r"`\uD83D${value}\uDE00`");
+        let head = scanner.scan();
+        assert_eq!(head.kind, SyntaxKind::TemplateHead);
+        assert_eq!(head.value.unwrap().as_units(), &[0xd83d]);
+        assert_eq!(scanner.scan().kind, SyntaxKind::Identifier);
+        assert_eq!(scanner.scan().kind, SyntaxKind::CloseBraceToken);
+        let tail = scanner.rescan_template_token();
+        assert_eq!(tail.kind, SyntaxKind::TemplateTail);
+        assert_eq!(tail.value.unwrap().as_units(), &[0xde00]);
+        assert!(scanner.diagnostics().is_empty());
+    }
+
+    #[test]
     fn contextually_rescans_template_middle_and_tail() {
         let mut scanner = Scanner::new("`a${x}b${y}c`");
         assert_eq!(scanner.scan().kind, SyntaxKind::TemplateHead);

@@ -2,10 +2,12 @@
 
 mod ast_generated;
 mod flow;
+mod js_string;
 mod syntax_kind;
 
 pub use ast_generated::*;
 pub use flow::*;
+pub use js_string::{append_js_string, decode_js_string, encode_js_string, normalize_js_string};
 pub use syntax_kind::SyntaxKind;
 
 impl NodeData {
