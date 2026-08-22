@@ -6839,8 +6839,14 @@ impl<'a> Parser<'a> {
                 self.parse_jsx_element(false)
             }
             _ => {
-                let position = self.current.range.start;
-                self.error_current("Expected an expression.");
+                let position = if self.current.kind == SyntaxKind::EndOfFile {
+                    let position = self.current.full_start;
+                    self.error_code_at(TextRange::new(position, position), 1109, []);
+                    position
+                } else {
+                    self.error_current("Expected an expression.");
+                    self.current.range.start
+                };
                 if self.current.kind != SyntaxKind::Unknown
                     && self.current.kind != SyntaxKind::EqualsGreaterThanToken
                     && binary_precedence(self.current.kind).is_none()
@@ -7817,10 +7823,7 @@ impl<'a> Parser<'a> {
             return self.missing_identifier(position);
         }
         let token = self.consume();
-        let text = token
-            .value
-            .as_ref()
-            .map_or_else(|| token.text.to_owned(), ts_core::JsString::to_string_lossy);
+        let text = token_value(&token);
         self.alloc_node(
             SyntaxKind::Identifier,
             token.range,
@@ -8011,10 +8014,7 @@ impl<'a> Parser<'a> {
         } else {
             0
         });
-        let text = token
-            .value
-            .as_ref()
-            .map_or_else(|| token.text.to_owned(), ts_core::JsString::to_string_lossy);
+        let text = token_value(&token);
         self.alloc_node(
             SyntaxKind::StringLiteral,
             token.range,
@@ -8121,10 +8121,7 @@ impl<'a> Parser<'a> {
 
     fn parse_template_literal(&mut self) -> NodeId {
         let token = self.consume();
-        let text = token
-            .value
-            .as_ref()
-            .map_or_else(|| token.text.to_owned(), ts_core::JsString::to_string_lossy);
+        let text = token_value(&token);
         self.alloc_node(
             SyntaxKind::NoSubstitutionTemplateLiteral,
             token.range,
@@ -9458,7 +9455,7 @@ fn token_value(token: &Token<'_>) -> String {
     token
         .value
         .as_ref()
-        .map_or_else(|| token.text.to_owned(), ts_core::JsString::to_string_lossy)
+        .map_or_else(|| token.text.to_owned(), ts_ast::encode_js_string)
 }
 
 fn parser_diagnostic(range: TextRange, message: &str) -> Diagnostic {
@@ -10022,6 +10019,58 @@ mod tests {
                 ("1234n", "12_34n"),
             ]
         );
+    }
+
+    #[test]
+    fn preserves_lone_surrogates_in_string_and_template_literal_values() {
+        let source = concat!(
+            r#"type High = "\uD800"; type Low = "\uDC00";"#,
+            r#"type Template = `\uD800${High}\uDC00`;"#,
+            r#"const high = "\uD83D"; const low = "\uDE00";"#,
+            r#"const plain = "ordinary 😀";"#,
+        );
+        let result = parse_source_file(source);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+
+        let strings = result
+            .arena
+            .iter()
+            .filter_map(|(_, node)| {
+                let NodeData::StringLiteral(literal) = &node.data else {
+                    return None;
+                };
+                Some((
+                    literal.text.as_str(),
+                    ts_ast::decode_js_string(&literal.text),
+                ))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(strings.len(), 5);
+        assert_ne!(strings[0].0, strings[1].0);
+        assert_eq!(strings[0].1.as_units(), &[0xd800]);
+        assert_eq!(strings[1].1.as_units(), &[0xdc00]);
+        assert_eq!(strings[2].1.as_units(), &[0xd83d]);
+        assert_eq!(strings[3].1.as_units(), &[0xde00]);
+        assert_eq!(strings[4].0, "ordinary 😀");
+
+        let head = result
+            .arena
+            .iter()
+            .find_map(|(_, node)| match &node.data {
+                NodeData::TemplateHead(head) => Some(ts_ast::decode_js_string(&head.text)),
+                _ => None,
+            })
+            .unwrap();
+        let tail = result
+            .arena
+            .iter()
+            .find_map(|(_, node)| match &node.data {
+                NodeData::TemplateTail(tail) => Some(ts_ast::decode_js_string(&tail.text)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(head.as_units(), &[0xd800]);
+        assert_eq!(tail.as_units(), &[0xdc00]);
     }
 
     #[test]
@@ -16008,6 +16057,29 @@ export as namespace GlobalName;
             spread.arena.get(prefix.operand).map(|node| &node.data),
             Some(NodeData::JsxElement(_))
         ));
+    }
+
+    #[test]
+    fn reports_trailing_jsx_comparison_expression_at_end_of_file() {
+        for source in ["~<></> <", "~<></> <\n", "~<></> <\r\n"] {
+            let result = parse_javascript_source_file(source);
+            assert_eq!(
+                result
+                    .diagnostics
+                    .iter()
+                    .map(|diagnostic| {
+                        (
+                            diagnostic.code,
+                            diagnostic.range.start.get(),
+                            diagnostic.range.end.get(),
+                            diagnostic.message.as_str(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                [(Some(1109), 8, 8, "Expression expected.")],
+                "source: {source:?}"
+            );
+        }
     }
 
     #[test]
