@@ -82,7 +82,12 @@ pub fn normalize_path(path: &str) -> String {
 
 fn split_root(path: &str) -> (&str, &str, bool) {
     if let Some(rest) = path.strip_prefix("//") {
-        return ("//", rest.trim_start_matches('/'), true);
+        let root_length = rest.find('/').map_or(path.len(), |separator| separator + 3);
+        return (
+            &path[..root_length],
+            path[root_length..].trim_start_matches('/'),
+            true,
+        );
     }
     if let Some(rest) = path.strip_prefix('/') {
         return ("/", rest.trim_start_matches('/'), true);
@@ -92,6 +97,49 @@ fn split_root(path: &str) -> (&str, &str, bool) {
     {
         return (&path[..2], path[2..].trim_start_matches('/'), true);
     }
+    if let Some(rest) = path.strip_prefix("^/") {
+        return ("^/", rest.trim_start_matches('/'), true);
+    }
+    if let Some(scheme_end) = path.find("://") {
+        let authority_start = scheme_end + 3;
+        let Some(authority_length) = path[authority_start..].find('/') else {
+            return (path, "", true);
+        };
+        let authority_end = authority_start + authority_length;
+        let mut root_length = authority_end + 1;
+        let scheme = &path[..scheme_end];
+        let authority = &path[authority_start..authority_end];
+        if scheme == "file" && matches!(authority, "" | "localhost") {
+            let bytes = path.as_bytes();
+            let volume_start = authority_end + 1;
+            if bytes.get(volume_start).is_some_and(u8::is_ascii_alphabetic) {
+                let separator_end = if bytes.get(volume_start + 1) == Some(&b':') {
+                    Some(volume_start + 2)
+                } else if bytes.get(volume_start + 1) == Some(&b'%')
+                    && bytes.get(volume_start + 2) == Some(&b'3')
+                    && bytes
+                        .get(volume_start + 3)
+                        .is_some_and(|byte| matches!(byte, b'a' | b'A'))
+                {
+                    Some(volume_start + 4)
+                } else {
+                    None
+                };
+                if let Some(end) = separator_end {
+                    if end == bytes.len() {
+                        root_length = end;
+                    } else if bytes.get(end) == Some(&b'/') {
+                        root_length = end + 1;
+                    }
+                }
+            }
+        }
+        return (
+            &path[..root_length],
+            path[root_length..].trim_start_matches('/'),
+            true,
+        );
+    }
     ("", path, false)
 }
 
@@ -99,9 +147,9 @@ fn join_normalized(root: &str, components: &[&str]) -> String {
     let joined = components.join("/");
     match (root, joined.is_empty()) {
         ("", _) => joined,
-        ("/" | "//", true) => root.to_owned(),
-        ("/" | "//", false) => format!("{root}{joined}"),
-        (_, true) => format!("{root}/"),
+        (_, true) if root.len() == 2 && root.ends_with(':') => format!("{root}/"),
+        (_, true) => root.to_owned(),
+        (_, false) if root.ends_with('/') => format!("{root}{joined}"),
         (_, false) => format!("{root}/{joined}"),
     }
 }
@@ -288,46 +336,7 @@ impl MemoryFileSystem {
         }
     }
 
-    fn lock_error() -> io::Error {
-        io::Error::other("memory file system lock is poisoned")
-    }
-
-    fn normalized_directory_exists(&self, directory: &str) -> bool {
-        if directory.is_empty() || is_root(directory) {
-            return true;
-        }
-
-        let canonical = self.canonical_path(directory);
-        let prefix = format!("{canonical}/");
-        self.files
-            .read()
-            .is_ok_and(|files| files.keys().any(|path| path.starts_with(&prefix)))
-    }
-}
-
-impl Default for MemoryFileSystem {
-    fn default() -> Self {
-        Self::new(true)
-    }
-}
-
-impl FileSystem for MemoryFileSystem {
-    fn use_case_sensitive_file_names(&self) -> bool {
-        self.case_sensitive
-    }
-
-    fn file_exists(&self, path: &str) -> bool {
-        let canonical = self.canonical_path(path);
-        self.files
-            .read()
-            .is_ok_and(|files| files.contains_key(&canonical))
-    }
-
-    fn directory_exists(&self, path: &str) -> bool {
-        self.normalized_directory_exists(&normalize_path(path))
-    }
-
-    fn realpath(&self, path: &str) -> String {
+    fn resolve_linked_path(&self, path: &str) -> String {
         let mut path = normalize_path(path);
         let Ok(links) = self.directory_links.read() else {
             return path;
@@ -356,8 +365,95 @@ impl FileSystem for MemoryFileSystem {
         path
     }
 
+    fn canonical_lookup_path(&self, path: &str) -> String {
+        self.canonical_path(&self.resolve_linked_path(path))
+    }
+
+    fn lock_error() -> io::Error {
+        io::Error::other("memory file system lock is poisoned")
+    }
+
+    fn normalized_directory_exists(&self, directory: &str) -> bool {
+        if directory.is_empty() || is_root(directory) {
+            return true;
+        }
+
+        let canonical = self.canonical_lookup_path(directory);
+        let prefix = format!("{canonical}/");
+        if self
+            .files
+            .read()
+            .is_ok_and(|files| files.keys().any(|path| path.starts_with(&prefix)))
+        {
+            return true;
+        }
+
+        let canonical_directory = self.canonical_path(directory);
+        let alias_prefix = format!("{canonical_directory}/");
+        self.directory_links.read().is_ok_and(|links| {
+            links.iter().any(|(alias, _)| {
+                self.canonical_path(alias)
+                    .strip_prefix(&alias_prefix)
+                    .is_some_and(|remainder| !remainder.is_empty())
+            })
+        })
+    }
+}
+
+impl Default for MemoryFileSystem {
+    fn default() -> Self {
+        Self::new(true)
+    }
+}
+
+impl FileSystem for MemoryFileSystem {
+    fn use_case_sensitive_file_names(&self) -> bool {
+        self.case_sensitive
+    }
+
+    fn file_exists(&self, path: &str) -> bool {
+        let canonical = self.canonical_lookup_path(path);
+        self.files
+            .read()
+            .is_ok_and(|files| files.contains_key(&canonical))
+    }
+
+    fn directory_exists(&self, path: &str) -> bool {
+        self.normalized_directory_exists(&normalize_path(path))
+    }
+
+    fn realpath(&self, path: &str) -> String {
+        let resolved = self.resolve_linked_path(path);
+        if self.case_sensitive {
+            return resolved;
+        }
+
+        let canonical = self.canonical_path(&resolved);
+        let Ok(files) = self.files.read() else {
+            return resolved;
+        };
+        if let Some(file) = files.get(&canonical) {
+            return file.path.clone();
+        }
+
+        for file in files.values() {
+            let canonical_file = self.canonical_path(&file.path);
+            let Some(remainder) = path_relative_to(&canonical_file, &canonical) else {
+                continue;
+            };
+            if remainder.is_empty() {
+                continue;
+            }
+            let display = display_remainder(&file.path, remainder);
+            let directory = &file.path[..file.path.len() - display.len()];
+            return normalize_path(directory);
+        }
+
+        resolved
+    }
+
     fn modified_time(&self, path: &str) -> Option<u128> {
-        let canonical = self.canonical_path(path);
+        let canonical = self.canonical_lookup_path(path);
         self.files
             .read()
             .ok()?
@@ -366,7 +462,7 @@ impl FileSystem for MemoryFileSystem {
     }
 
     fn read_file(&self, path: &str) -> io::Result<String> {
-        let canonical = self.canonical_path(path);
+        let canonical = self.canonical_lookup_path(path);
         self.files
             .read()
             .map_err(|_| Self::lock_error())?
@@ -376,7 +472,7 @@ impl FileSystem for MemoryFileSystem {
     }
 
     fn write_file(&self, path: &str, contents: &str) -> io::Result<()> {
-        let normalized = normalize_path(path);
+        let normalized = self.resolve_linked_path(path);
         if normalized.is_empty() || is_root(&normalized) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -411,7 +507,7 @@ impl FileSystem for MemoryFileSystem {
             return Err(io::Error::new(io::ErrorKind::NotFound, normalized));
         }
 
-        let canonical_directory = self.canonical_path(&normalized);
+        let canonical_directory = self.canonical_lookup_path(&normalized);
         let files = self.files.read().map_err(|_| Self::lock_error())?;
         let mut child_files = BTreeSet::new();
         let mut child_directories = BTreeSet::new();
@@ -433,6 +529,26 @@ impl FileSystem for MemoryFileSystem {
             }
         }
 
+        let canonical_requested_directory = self.canonical_path(&normalized);
+        let links = self
+            .directory_links
+            .read()
+            .map_err(|_| Self::lock_error())?;
+        for (alias, _) in links.iter() {
+            let canonical_alias = self.canonical_path(alias);
+            let Some(remainder) =
+                path_relative_to(&canonical_alias, &canonical_requested_directory)
+            else {
+                continue;
+            };
+            if remainder.is_empty() {
+                continue;
+            }
+            let display = display_remainder(alias, remainder);
+            let child = display.split('/').next().unwrap_or(display);
+            child_directories.insert(child.to_owned());
+        }
+
         Ok(DirectoryEntries {
             files: child_files.into_iter().collect(),
             directories: child_directories.into_iter().collect(),
@@ -441,7 +557,8 @@ impl FileSystem for MemoryFileSystem {
 }
 
 fn is_root(path: &str) -> bool {
-    path == "/" || path == "//" || path.ends_with(":/") && !path[..path.len() - 2].contains('/')
+    let (root, remainder, absolute) = split_root(path);
+    absolute && !root.is_empty() && remainder.is_empty()
 }
 
 fn path_relative_to<'a>(path: &'a str, directory: &str) -> Option<&'a str> {
@@ -481,6 +598,24 @@ mod tests {
         assert_eq!(normalize_path("/src//compiler/../../index.ts"), "/index.ts");
         assert_eq!(normalize_path("../../src/../index.ts"), "../../index.ts");
         assert_eq!(normalize_path("/../../"), "/");
+    }
+
+    #[test]
+    fn preserves_dynamic_network_and_url_roots() {
+        assert_eq!(normalize_path("^/../../untitled.ts"), "^/untitled.ts");
+        assert_eq!(
+            normalize_path("//server/../../share/file.ts"),
+            "//server/share/file.ts"
+        );
+        assert_eq!(normalize_path("file:///src/../main.ts"), "file:///main.ts");
+        assert_eq!(
+            normalize_path("file:///C:/src/../../main.ts"),
+            "file:///C:/main.ts"
+        );
+        assert_eq!(
+            normalize_path("https://example.test/src/../main.ts"),
+            "https://example.test/main.ts"
+        );
     }
 
     #[test]
@@ -550,8 +685,81 @@ mod tests {
 
         assert_eq!(
             file_system.realpath("/node_modules/caf\u{00e9}/Entry.ts"),
-            "/packages/Caf\u{00e9}/Entry.ts"
+            "/packages/Caf\u{00e9}/entry.ts"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn case_insensitive_realpath_returns_stored_file_and_directory_casing() -> io::Result<()> {
+        let file_system = MemoryFileSystem::new(false);
+        file_system.write_file("/Source/Upper/Entry.ts", "")?;
+
+        assert_eq!(
+            file_system.realpath("/SOURCE/upper/ENTRY.TS"),
+            "/Source/Upper/Entry.ts"
+        );
+        assert_eq!(file_system.realpath("/source/UPPER"), "/Source/Upper");
+        assert_eq!(
+            file_system.realpath("/source/Missing.ts"),
+            "/source/Missing.ts"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn directory_links_share_file_contents_and_directory_entries() -> io::Result<()> {
+        let file_system = MemoryFileSystem::new(false);
+        file_system.write_file("/packages/Shared/index.ts", "before")?;
+        file_system.write_file("/packages/Shared/src/nested.ts", "nested")?;
+        file_system.add_directory_link("/packages/Shared", "/app/node_modules/shared");
+
+        assert!(file_system.directory_exists("/app/node_modules"));
+        assert!(file_system.directory_exists("/APP/NODE_MODULES/SHARED"));
+        assert!(file_system.file_exists("/app/node_modules/shared/INDEX.TS"));
+        assert_eq!(
+            file_system.read_file("/app/node_modules/shared/index.ts")?,
+            "before"
+        );
+        assert_eq!(
+            file_system.read_directory("/app/node_modules")?,
+            DirectoryEntries {
+                files: Vec::new(),
+                directories: vec!["shared".into()],
+            }
+        );
+        assert_eq!(
+            file_system.read_directory("/app/node_modules/shared")?,
+            DirectoryEntries {
+                files: vec!["index.ts".into()],
+                directories: vec!["src".into()],
+            }
+        );
+
+        file_system.write_file("/app/node_modules/shared/index.ts", "after")?;
+        assert_eq!(file_system.read_file("/packages/Shared/index.ts")?, "after");
+        assert_eq!(
+            file_system.modified_time("/packages/Shared/index.ts"),
+            file_system.modified_time("/app/node_modules/shared/index.ts")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn follows_chained_directory_links_for_all_file_operations() -> io::Result<()> {
+        let file_system = MemoryFileSystem::new(true);
+        file_system.write_file("/real/package/index.ts", "content")?;
+        file_system.add_directory_link("/real/package", "/middle/package");
+        file_system.add_directory_link("/middle/package", "/app/node_modules/package");
+
+        assert!(file_system.directory_exists("/app/node_modules/package"));
+        assert!(file_system.file_exists("/app/node_modules/package/index.ts"));
+        assert_eq!(
+            file_system.read_file("/app/node_modules/package/index.ts")?,
+            "content"
+        );
+        file_system.write_file("/app/node_modules/package/new.ts", "new")?;
+        assert_eq!(file_system.read_file("/real/package/new.ts")?, "new");
         Ok(())
     }
 

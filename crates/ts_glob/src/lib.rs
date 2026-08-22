@@ -366,10 +366,12 @@ fn should_include_file(pattern: &str, file_name: &str, case_sensitive: bool) -> 
 }
 
 fn has_allowed_extension(file: &str, extensions: &[FileExtension]) -> bool {
-    extensions.iter().any(|extension| {
-        let extension = extension.as_str();
-        file.len() > extension.len() && file.get(file.len() - extension.len()..) == Some(extension)
-    })
+    extensions.is_empty()
+        || extensions.iter().any(|extension| {
+            let extension = extension.as_str();
+            file.len() > extension.len()
+                && file.get(file.len() - extension.len()..) == Some(extension)
+        })
 }
 
 fn is_implicit_excluded_component(component: &str) -> bool {
@@ -470,6 +472,34 @@ mod tests {
         assert_eq!(
             discover_files(&fs, &options).unwrap(),
             vec!["/dev/z/a.ts", "/dev/x/a.ts"]
+        );
+    }
+
+    #[test]
+    fn empty_extension_filters_include_every_matching_file() {
+        let file_system = file_system(
+            true,
+            &["/project/main.ts", "/project/main.js", "/project/data.json"],
+        );
+        let mut options = DiscoveryOptions::new("/project");
+        options.extensions.clear();
+
+        assert_eq!(
+            discover_files(&file_system, &options).unwrap(),
+            vec!["/project/data.json", "/project/main.js", "/project/main.ts"]
+        );
+    }
+
+    #[test]
+    fn discovers_files_through_virtual_directory_links_once() {
+        let file_system = file_system(true, &["/packages/shared/index.ts"]);
+        file_system.add_directory_link("/packages/shared", "/app/node_modules/shared");
+        let mut options = DiscoveryOptions::new("/app");
+        options.include = vec!["node_modules/shared/**/*.ts".into()];
+
+        assert_eq!(
+            discover_files(&file_system, &options).unwrap(),
+            vec!["/app/node_modules/shared/index.ts"]
         );
     }
 

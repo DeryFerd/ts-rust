@@ -73,6 +73,9 @@ pub fn common_source_directory(
     current_directory: &str,
     case_sensitivity: CaseSensitivity,
 ) -> String {
+    if file_names.is_empty() {
+        return ensure_trailing_directory_separator(&normalize_path(current_directory));
+    }
     let directories: Vec<_> = file_names
         .iter()
         .map(|file_name| {
@@ -84,9 +87,9 @@ pub fn common_source_directory(
         })
         .collect();
     let directory_refs: Vec<_> = directories.iter().map(String::as_str).collect();
-    let common = common_path_prefix(&directory_refs, case_sensitivity)
-        .filter(|path| !path.is_empty())
-        .unwrap_or_else(|| normalize_path(current_directory));
+    let Some(common) = common_path_prefix(&directory_refs, case_sensitivity) else {
+        return String::new();
+    };
     ensure_trailing_directory_separator(&common)
 }
 
@@ -250,6 +253,19 @@ mod tests {
                 CaseSensitivity::Sensitive,
             ),
             "/project/dist/nested/b.ts"
+        );
+    }
+
+    #[test]
+    fn different_disk_roots_have_no_common_source_directory() {
+        let files = vec![
+            "C:/project/main.ts".to_owned(),
+            "D:/shared/util.ts".to_owned(),
+        ];
+
+        assert_eq!(
+            common_source_directory(&files, "C:/project", CaseSensitivity::Insensitive),
+            ""
         );
     }
 
