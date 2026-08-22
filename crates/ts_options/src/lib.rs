@@ -509,7 +509,15 @@ impl CompilerOptions {
         is_fragment: bool,
     ) -> &'a str {
         let fragment_factory = is_fragment
-            .then(|| fragment_factory_pragma.or(self.jsx_fragment_factory.as_deref()))
+            .then(|| {
+                fragment_factory_pragma
+                    .filter(|factory| is_jsx_entity_name(factory, true))
+                    .or_else(|| {
+                        self.jsx_fragment_factory
+                            .as_deref()
+                            .filter(|factory| is_jsx_entity_name(factory, true))
+                    })
+            })
             .flatten();
         fragment_factory
             .or_else(|| (!is_fragment).then_some(factory_pragma).flatten())
@@ -3087,6 +3095,45 @@ mod tests {
         assert_eq!(
             null_fragment.jsx_factory_namespace_for_source(None, None, true),
             "null"
+        );
+    }
+
+    #[test]
+    fn invalid_fragment_factories_fall_back_to_the_valid_classic_factory() {
+        let invalid = parse_compiler_options(&object([
+            ("jsx", JsonValue::String("react".into())),
+            ("jsxFactory", JsonValue::String("h".into())),
+            ("jsxFragmentFactory", JsonValue::String("234".into())),
+        ]));
+        assert_eq!(invalid.diagnostics.len(), 1);
+        assert_eq!(invalid.diagnostics[0].code(), 18_035);
+        assert_eq!(
+            invalid
+                .options
+                .jsx_factory_namespace_for_source(None, None, true),
+            "h"
+        );
+
+        let valid = parse_compiler_options(&object([
+            ("jsx", JsonValue::String("react".into())),
+            ("jsxFactory", JsonValue::String("h".into())),
+            (
+                "jsxFragmentFactory",
+                JsonValue::String("Fragments.Fragment".into()),
+            ),
+        ]));
+        assert!(valid.is_ok(), "{:?}", valid.diagnostics);
+        assert_eq!(
+            valid
+                .options
+                .jsx_factory_namespace_for_source(None, None, true),
+            "Fragments"
+        );
+        assert_eq!(
+            valid
+                .options
+                .jsx_factory_namespace_for_source(None, Some("234"), true),
+            "Fragments"
         );
     }
 
