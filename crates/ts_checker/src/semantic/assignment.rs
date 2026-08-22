@@ -191,6 +191,7 @@ struct AssignmentPlanner<'a, 'sources> {
     host: &'a DeclaredTypeHost<'sources>,
     ambient_targets: &'a HashSet<SemanticSymbolId>,
     uninitialized_targets: &'a HashSet<SemanticSymbolId>,
+    mutable_targets: &'a HashSet<SemanticSymbolId>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -255,6 +256,30 @@ pub(super) fn plan_simple_assignment_with_source_targets(
     uninitialized_targets: &HashSet<SemanticSymbolId>,
     statement: NodeRef,
 ) -> Result<SimpleAssignmentPlan, AssignmentPlanError> {
+    plan_simple_assignment_with_all_source_targets(
+        arena,
+        bound,
+        store,
+        host,
+        ambient_targets,
+        uninitialized_targets,
+        &HashSet::new(),
+        statement,
+    )
+}
+
+/// Plans an assignment with exact ambient, uninitialized, or mutable source targets.
+#[allow(clippy::too_many_arguments)] // Each target family has a distinct provenance contract.
+pub(super) fn plan_simple_assignment_with_all_source_targets(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    ambient_targets: &HashSet<SemanticSymbolId>,
+    uninitialized_targets: &HashSet<SemanticSymbolId>,
+    mutable_targets: &HashSet<SemanticSymbolId>,
+    statement: NodeRef,
+) -> Result<SimpleAssignmentPlan, AssignmentPlanError> {
     AssignmentPlanner {
         arena,
         bound,
@@ -262,6 +287,7 @@ pub(super) fn plan_simple_assignment_with_source_targets(
         host,
         ambient_targets,
         uninitialized_targets,
+        mutable_targets,
     }
     .plan(statement)
 }
@@ -370,11 +396,13 @@ impl AssignmentPlanner<'_, '_> {
         let export_local = routed.export_local;
         let ambient_target = self.ambient_targets.contains(&target);
         let uninitialized_target = self.uninitialized_targets.contains(&target);
+        let mutable_target = self.mutable_targets.contains(&target);
         let javascript_target = self
             .bound
             .source_facts()
             .is_some_and(ts_binder::CanonicalSourceFileFacts::is_javascript_file);
-        if ambient_target && uninitialized_target {
+        if u8::from(ambient_target) + u8::from(uninitialized_target) + u8::from(mutable_target) > 1
+        {
             return Err(AssignmentInvariant::InvalidSymbolShape(target).into());
         }
         let target_record = self
@@ -393,6 +421,7 @@ impl AssignmentPlanner<'_, '_> {
         if flags.intersects(SymbolFlags::BLOCK_SCOPED_VARIABLE)
             && !ambient_target
             && !uninitialized_target
+            && !mutable_target
             && !javascript_target
         {
             return Err(AssignmentPlanError::Unsupported(
@@ -466,6 +495,7 @@ impl AssignmentPlanner<'_, '_> {
             &name,
             ambient_target.then_some((target, flags)),
             uninitialized_target.then_some((target, flags)),
+            mutable_target.then_some((target, flags)),
             javascript_target.then_some((target, flags)),
         )?;
         Ok(SimpleAssignmentPlan {
@@ -725,6 +755,7 @@ impl AssignmentPlanner<'_, '_> {
         reference_name: &str,
         ambient_target: Option<(SemanticSymbolId, SymbolFlags)>,
         uninitialized_target: Option<(SemanticSymbolId, SymbolFlags)>,
+        mutable_target: Option<(SemanticSymbolId, SymbolFlags)>,
         javascript_target: Option<(SemanticSymbolId, SymbolFlags)>,
     ) -> Result<Option<NodeRef>, AssignmentPlanError> {
         let declaration_node = self.node(declaration)?;
@@ -776,7 +807,7 @@ impl AssignmentPlanner<'_, '_> {
         if let Some(type_node) = type_node {
             self.require_parent(type_node, Some(declaration.node))?;
             self.node(type_node)?;
-        } else if javascript_target.is_none() {
+        } else if javascript_target.is_none() && mutable_target.is_none() {
             return Err(AssignmentPlanError::Unsupported(
                 AssignmentUnsupported::MissingTargetType(declaration),
             ));
@@ -817,7 +848,10 @@ impl AssignmentPlanner<'_, '_> {
         let NodeData::VariableDeclarationList(list_data) = &list_node.data else {
             return Err(AssignmentInvariant::InvalidDeclarationList(list).into());
         };
-        let expected_list_flags = match uninitialized_target.or(javascript_target) {
+        let expected_list_flags = match uninitialized_target
+            .or(mutable_target)
+            .or(javascript_target)
+        {
             None => 0,
             Some((_, flags)) if flags == SymbolFlags::FUNCTION_SCOPED_VARIABLE => 0,
             Some((_, flags)) if flags == SymbolFlags::BLOCK_SCOPED_VARIABLE => NODE_FLAG_LET,
@@ -829,14 +863,17 @@ impl AssignmentPlanner<'_, '_> {
             return Err(AssignmentPlanError::Unsupported(
                 AssignmentUnsupported::BlockScopedTarget {
                     node: left,
-                    symbol: uninitialized_target.or(javascript_target).map_or_else(
-                        || {
-                            self.bound
-                                .symbol(declaration)
-                                .ok_or(AssignmentInvariant::MissingDeclarationSymbol(declaration))
-                        },
-                        |(symbol, _)| Ok(symbol),
-                    )?,
+                    symbol: uninitialized_target
+                        .or(mutable_target)
+                        .or(javascript_target)
+                        .map_or_else(
+                            || {
+                                self.bound.symbol(declaration).ok_or(
+                                    AssignmentInvariant::MissingDeclarationSymbol(declaration),
+                                )
+                            },
+                            |(symbol, _)| Ok(symbol),
+                        )?,
                 },
             ));
         }
@@ -1614,6 +1651,70 @@ mod tests {
             )) if symbol == target
         ));
         assert_eq!(observable_state(&fixture.store), before);
+    }
+
+    #[test]
+    fn initialized_mutable_assignment_capability_requires_exact_declaration_provenance() {
+        for source in [
+            "var target: number = 0; target = 1;",
+            "let target: number = 0; target = 1;",
+            "var target = 0; target = 1;",
+            "let target = 0; target = 1;",
+        ] {
+            let fixture = Fixture::new(source);
+            let declaration = fixture.variable_declaration("target");
+            let raw = fixture.bound.symbol(declaration).unwrap();
+            let target = fixture.store.get_merged_symbol(raw).unwrap();
+            let mutable_targets = HashSet::from([target]);
+            let host = fixture.host();
+            let before = observable_state(&fixture.store);
+
+            assert!(
+                plan_simple_assignment_with_all_source_targets(
+                    &fixture.parsed.arena,
+                    &fixture.bound,
+                    &fixture.store,
+                    &host,
+                    &HashSet::new(),
+                    &HashSet::new(),
+                    &mutable_targets,
+                    fixture.expression_statement(0),
+                )
+                .is_ok(),
+                "exact mutable target was rejected: {source}",
+            );
+            assert_eq!(observable_state(&fixture.store), before);
+        }
+
+        for source in [
+            "const target: number = 0; target = 1;",
+            "var target: number; target = 1;",
+            "declare var target: number; target = 1;",
+        ] {
+            let fixture = Fixture::new(source);
+            let declaration = fixture.variable_declaration("target");
+            let raw = fixture.bound.symbol(declaration).unwrap();
+            let target = fixture.store.get_merged_symbol(raw).unwrap();
+            let mutable_targets = HashSet::from([target]);
+            let host = fixture.host();
+            let before = observable_state(&fixture.store);
+
+            assert!(
+                plan_simple_assignment_with_all_source_targets(
+                    &fixture.parsed.arena,
+                    &fixture.bound,
+                    &fixture.store,
+                    &host,
+                    &HashSet::new(),
+                    &HashSet::new(),
+                    &mutable_targets,
+                    fixture.expression_statement(0),
+                )
+                .is_err(),
+                "forged mutable capability bypassed declaration proof: {source}",
+            );
+            assert_eq!(observable_state(&fixture.store), before);
+        }
     }
 
     #[test]

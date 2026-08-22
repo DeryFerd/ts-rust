@@ -106,7 +106,7 @@ pub(super) fn check_logical_binary(
         .strict_null_checks;
     let facts = logical_type_facts(store, request.left_type, strict_null_checks)?;
     let result_type = match request.operator {
-        SyntaxKind::AmpersandAmpersandToken => {
+        SyntaxKind::AmpersandAmpersandToken | SyntaxKind::AmpersandAmpersandEqualsToken => {
             if facts.truthy {
                 // This seemingly surprising non-strict branch is exact: the
                 // pinned checker extracts the falsy part of the widened right
@@ -138,7 +138,7 @@ pub(super) fn check_logical_binary(
                 request.left_type
             }
         }
-        SyntaxKind::BarBarToken => {
+        SyntaxKind::BarBarToken | SyntaxKind::BarBarEqualsToken => {
             if facts.falsy {
                 let truthy = remove_definitely_falsy_types(
                     store,
@@ -158,7 +158,7 @@ pub(super) fn check_logical_binary(
                 request.left_type
             }
         }
-        SyntaxKind::QuestionQuestionToken => {
+        SyntaxKind::QuestionQuestionToken | SyntaxKind::QuestionQuestionEqualsToken => {
             if facts.nullish {
                 let non_nullable = get_non_nullable_type(
                     store,
@@ -198,21 +198,25 @@ pub(super) fn narrow_logical_right_operand(
         .options
         .strict_null_checks;
     match operator {
-        SyntaxKind::AmpersandAmpersandToken => narrow_by_truthiness_with_strict_null_checks(
-            store,
-            global_types,
-            left_type,
-            TruthinessAssumption::Truthy,
-            strict_null_checks,
-        ),
-        SyntaxKind::BarBarToken => narrow_by_truthiness_with_strict_null_checks(
-            store,
-            global_types,
-            left_type,
-            TruthinessAssumption::Falsy,
-            strict_null_checks,
-        ),
-        SyntaxKind::QuestionQuestionToken => {
+        SyntaxKind::AmpersandAmpersandToken | SyntaxKind::AmpersandAmpersandEqualsToken => {
+            narrow_by_truthiness_with_strict_null_checks(
+                store,
+                global_types,
+                left_type,
+                TruthinessAssumption::Truthy,
+                strict_null_checks,
+            )
+        }
+        SyntaxKind::BarBarToken | SyntaxKind::BarBarEqualsToken => {
+            narrow_by_truthiness_with_strict_null_checks(
+                store,
+                global_types,
+                left_type,
+                TruthinessAssumption::Falsy,
+                strict_null_checks,
+            )
+        }
+        SyntaxKind::QuestionQuestionToken | SyntaxKind::QuestionQuestionEqualsToken => {
             narrow_nullish_right(store, global_types, left_type, strict_null_checks)
         }
         operator => Err(LogicalBinaryError::Unsupported(
@@ -856,6 +860,55 @@ mod tests {
                 .unwrap(),
             falsy,
         );
+    }
+
+    #[test]
+    fn logical_assignment_operators_share_expression_results_and_rhs_narrowing() {
+        for strict_null_checks in [false, true] {
+            let mut store = initialized_store(strict_null_checks);
+            let (string, number, null, undefined) = {
+                let bootstrap = store.intrinsic_bootstrap().unwrap();
+                (
+                    bootstrap.string_type,
+                    bootstrap.number_type,
+                    bootstrap.null_type,
+                    bootstrap.undefined_type,
+                )
+            };
+            let input = if strict_null_checks {
+                store
+                    .literal_union_type(&[string, null, undefined], None)
+                    .unwrap()
+            } else {
+                string
+            };
+
+            for (expression, assignment) in [
+                (
+                    SyntaxKind::AmpersandAmpersandToken,
+                    SyntaxKind::AmpersandAmpersandEqualsToken,
+                ),
+                (SyntaxKind::BarBarToken, SyntaxKind::BarBarEqualsToken),
+                (
+                    SyntaxKind::QuestionQuestionToken,
+                    SyntaxKind::QuestionQuestionEqualsToken,
+                ),
+            ] {
+                let plain =
+                    check_logical_binary(&mut store, None, request(expression, input, number))
+                        .unwrap();
+                let compound =
+                    check_logical_binary(&mut store, None, request(assignment, input, number))
+                        .unwrap();
+                assert_eq!(compound, plain);
+
+                let plain_narrowed =
+                    narrow_logical_right_operand(&mut store, None, expression, input).unwrap();
+                let compound_narrowed =
+                    narrow_logical_right_operand(&mut store, None, assignment, input).unwrap();
+                assert_eq!(compound_narrowed, plain_narrowed);
+            }
+        }
     }
 
     #[test]

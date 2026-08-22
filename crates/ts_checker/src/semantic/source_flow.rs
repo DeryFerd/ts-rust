@@ -1,10 +1,10 @@
 //! Invocation-local control-flow snapshots for source checking.
 //!
 //! This slice accepts the flow chains needed by direct identifier truthiness
-//! and strict `typeof` comparisons in two-arm `if` statements: function
-//! `START`, initialized local `ASSIGNMENT` nodes, condition edges, and bounded
-//! two-antecedent branch labels. Loops, reachability, and mutation expressions
-//! remain typed capability boundaries.
+//! and strict `typeof` comparisons: function `START`, initialized local
+//! `ASSIGNMENT` nodes, condition edges, unreachable nodes, ordered branch
+//! joins, and cyclic loop labels. Mutation expressions and switch-clause
+//! narrowing remain typed capability boundaries.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -161,6 +161,7 @@ pub(super) enum SourceFlowInvariant {
         actual: FlowRef,
     },
     InvalidStart(FlowRef),
+    InvalidUnreachable(FlowRef),
     MissingFlowPoint(NodeRef),
     MissingFlowNode(FlowRef),
     InvalidFlowFlags {
@@ -234,11 +235,13 @@ impl From<SourceFlowInvariant> for SourceFlowError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SourceFlowKind {
+    Unreachable,
     Start,
     Assignment,
     TrueCondition,
     FalseCondition,
     BranchLabel,
+    LoopLabel,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -366,6 +369,7 @@ impl SourceFlowPlan {
                 .collect(),
             memo: HashMap::new(),
             visiting: HashSet::new(),
+            loop_snapshots: HashMap::new(),
         })
     }
 
@@ -379,6 +383,9 @@ impl SourceFlowPlan {
                 .get(point)
                 .ok_or(SourceFlowInvariant::MissingFlowPoint(*point))?;
             self.validate_flow(graph, flow, 0, &mut validated, &mut visiting, &mut coverage)?;
+        }
+        if let Some(end) = graph.container_end(self.container) {
+            self.validate_flow(graph, end, 0, &mut validated, &mut visiting, &mut coverage)?;
         }
         for declaration in self.assignments.keys() {
             if !coverage.assignments.contains(declaration) {
@@ -417,7 +424,12 @@ impl SourceFlowPlan {
             return Err(SourceFlowInvariant::DepthLimit(flow).into());
         }
         if !visiting.insert(flow) {
-            return Err(SourceFlowInvariant::Cycle(flow).into());
+            let node = flow_node(graph, flow)?;
+            return if source_flow_kind(flow, node.flags)? == SourceFlowKind::LoopLabel {
+                Ok(())
+            } else {
+                Err(SourceFlowInvariant::Cycle(flow).into())
+            };
         }
         let result = self.validate_flow_uncached(graph, flow, depth, validated, visiting, coverage);
         let removed = visiting.remove(&flow);
@@ -439,6 +451,7 @@ impl SourceFlowPlan {
     ) -> Result<(), SourceFlowError> {
         let node = flow_node(graph, flow)?;
         match source_flow_kind(flow, node.flags)? {
+            SourceFlowKind::Unreachable => validate_unreachable_node(graph, flow, &node),
             SourceFlowKind::Start => validate_start_node(self, flow, &node),
             SourceFlowKind::Assignment => {
                 let antecedent = linear_antecedent(flow, &node)?;
@@ -458,17 +471,27 @@ impl SourceFlowPlan {
                 let edge = match kind {
                     SourceFlowKind::TrueCondition => TRUE_CONDITION_EDGE,
                     SourceFlowKind::FalseCondition => FALSE_CONDITION_EDGE,
-                    SourceFlowKind::Start
+                    SourceFlowKind::Unreachable
+                    | SourceFlowKind::Start
                     | SourceFlowKind::Assignment
-                    | SourceFlowKind::BranchLabel => unreachable!(),
+                    | SourceFlowKind::BranchLabel
+                    | SourceFlowKind::LoopLabel => unreachable!(),
                 };
                 *coverage.condition_edges.entry(condition).or_default() |= edge;
                 self.validate_flow(graph, antecedent, depth + 1, validated, visiting, coverage)
             }
-            SourceFlowKind::BranchLabel => {
-                let [then_flow, else_flow] = branch_antecedents(flow, &node)?;
-                self.validate_flow(graph, then_flow, depth + 1, validated, visiting, coverage)?;
-                self.validate_flow(graph, else_flow, depth + 1, validated, visiting, coverage)
+            SourceFlowKind::BranchLabel | SourceFlowKind::LoopLabel => {
+                for antecedent in label_antecedents(flow, &node)? {
+                    self.validate_flow(
+                        graph,
+                        *antecedent,
+                        depth + 1,
+                        validated,
+                        visiting,
+                        coverage,
+                    )?;
+                }
+                Ok(())
             }
         }
     }
@@ -482,6 +505,7 @@ pub(super) struct SourceFlowFrame<'plan, 'graph> {
     assignment_states: HashMap<NodeRef, SourceFlowAssignmentState>,
     memo: HashMap<FlowRef, SourceFlowSnapshot>,
     visiting: HashSet<FlowRef>,
+    loop_snapshots: HashMap<FlowRef, SourceFlowSnapshot>,
 }
 
 impl SourceFlowFrame<'_, '_> {
@@ -546,6 +570,9 @@ impl SourceFlowFrame<'_, '_> {
         flow: FlowRef,
         depth: usize,
     ) -> Result<SourceFlowSnapshot, SourceFlowError> {
+        if let Some(snapshot) = self.loop_snapshots.get(&flow) {
+            return Ok(snapshot.clone());
+        }
         if let Some(snapshot) = self.memo.get(&flow) {
             return Ok(snapshot.clone());
         }
@@ -558,7 +585,9 @@ impl SourceFlowFrame<'_, '_> {
         let result = self.resolve_flow_uncached(store, globals, flow, depth);
         let removed = self.visiting.remove(&flow);
         debug_assert!(removed);
-        if let Ok(snapshot) = &result {
+        if let Ok(snapshot) = &result
+            && self.loop_snapshots.is_empty()
+        {
             self.memo.insert(flow, snapshot.clone());
         }
         result
@@ -573,6 +602,10 @@ impl SourceFlowFrame<'_, '_> {
     ) -> Result<SourceFlowSnapshot, SourceFlowError> {
         let node = flow_node(self.graph, flow)?;
         match source_flow_kind(flow, node.flags)? {
+            SourceFlowKind::Unreachable => {
+                validate_unreachable_node(self.graph, flow, &node)?;
+                Ok(self.base.clone())
+            }
             SourceFlowKind::Start => {
                 validate_start_node(self.plan, flow, &node)?;
                 Ok(self.base.clone())
@@ -612,9 +645,11 @@ impl SourceFlowFrame<'_, '_> {
                 let assume_true = match kind {
                     SourceFlowKind::TrueCondition => true,
                     SourceFlowKind::FalseCondition => false,
-                    SourceFlowKind::Start
+                    SourceFlowKind::Unreachable
+                    | SourceFlowKind::Start
                     | SourceFlowKind::Assignment
-                    | SourceFlowKind::BranchLabel => unreachable!(),
+                    | SourceFlowKind::BranchLabel
+                    | SourceFlowKind::LoopLabel => unreachable!(),
                 };
                 let narrowed = match condition {
                     SourceFlowCondition::Truthiness(_) => narrow_by_truthiness(
@@ -651,12 +686,55 @@ impl SourceFlowFrame<'_, '_> {
                 Ok(prior.with_type(condition.symbol(), narrowed))
             }
             SourceFlowKind::BranchLabel => {
-                let [then_flow, else_flow] = branch_antecedents(flow, &node)?;
-                let then_snapshot = self.resolve_flow(store, globals, then_flow, depth + 1)?;
-                let else_snapshot = self.resolve_flow(store, globals, else_flow, depth + 1)?;
-                self.join_snapshots(store, globals, flow, &then_snapshot, &else_snapshot)
+                self.resolve_branch_label(store, globals, flow, &node, depth)
+            }
+            SourceFlowKind::LoopLabel => {
+                self.resolve_loop_label(store, globals, flow, &node, depth)
             }
         }
+    }
+
+    fn resolve_branch_label(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        globals: &CanonicalGlobalTypes,
+        flow: FlowRef,
+        node: &FlowNode,
+        depth: usize,
+    ) -> Result<SourceFlowSnapshot, SourceFlowError> {
+        let antecedents = label_antecedents(flow, node)?;
+        let mut joined = self.resolve_flow(store, globals, antecedents[0], depth + 1)?;
+        for antecedent in &antecedents[1..] {
+            let next = self.resolve_flow(store, globals, *antecedent, depth + 1)?;
+            joined = self.join_snapshots(store, globals, flow, &joined, &next)?;
+        }
+        Ok(joined)
+    }
+
+    fn resolve_loop_label(
+        &mut self,
+        store: &mut CanonicalTypeMapperStore,
+        globals: &CanonicalGlobalTypes,
+        flow: FlowRef,
+        node: &FlowNode,
+        depth: usize,
+    ) -> Result<SourceFlowSnapshot, SourceFlowError> {
+        let antecedents = label_antecedents(flow, node)?;
+        let mut current = self.resolve_flow(store, globals, antecedents[0], depth + 1)?;
+        let previous = self.loop_snapshots.insert(flow, current.clone());
+        debug_assert!(previous.is_none());
+
+        let result = (|| {
+            for antecedent in &antecedents[1..] {
+                let next = self.resolve_flow(store, globals, *antecedent, depth + 1)?;
+                current = self.join_snapshots(store, globals, flow, &current, &next)?;
+                self.loop_snapshots.insert(flow, current.clone());
+            }
+            Ok(current)
+        })();
+        let removed = self.loop_snapshots.remove(&flow);
+        debug_assert!(removed.is_some());
+        result
     }
 
     fn join_snapshots(
@@ -1074,6 +1152,9 @@ fn flow_node(graph: &BoundFlowGraph, flow: FlowRef) -> Result<FlowNode, SourceFl
 
 fn source_flow_kind(flow: FlowRef, flags: FlowFlags) -> Result<SourceFlowKind, SourceFlowError> {
     let semantic = flags.bits() & !FLOW_METADATA_BITS;
+    if semantic == FlowFlags::UNREACHABLE.bits() {
+        return Ok(SourceFlowKind::Unreachable);
+    }
     if semantic == FlowFlags::START.bits() {
         return Ok(SourceFlowKind::Start);
     }
@@ -1089,11 +1170,12 @@ fn source_flow_kind(flow: FlowRef, flags: FlowFlags) -> Result<SourceFlowKind, S
     if semantic == FlowFlags::BRANCH_LABEL.bits() {
         return Ok(SourceFlowKind::BranchLabel);
     }
+    if semantic == FlowFlags::LOOP_LABEL.bits() {
+        return Ok(SourceFlowKind::LoopLabel);
+    }
     if matches!(
         semantic,
-        value if value == FlowFlags::UNREACHABLE.bits()
-            || value == FlowFlags::LOOP_LABEL.bits()
-            || value == FlowFlags::SWITCH_CLAUSE.bits()
+        value if value == FlowFlags::SWITCH_CLAUSE.bits()
             || value == FlowFlags::ARRAY_MUTATION.bits()
             || value == FlowFlags::CALL.bits()
             || value == FlowFlags::REDUCE_LABEL.bits()
@@ -1101,6 +1183,21 @@ fn source_flow_kind(flow: FlowRef, flags: FlowFlags) -> Result<SourceFlowKind, S
         return Err(SourceFlowUnsupported::FlowKind { flow, flags }.into());
     }
     Err(SourceFlowInvariant::InvalidFlowFlags { flow, flags }.into())
+}
+
+fn validate_unreachable_node(
+    graph: &BoundFlowGraph,
+    flow: FlowRef,
+    node: &FlowNode,
+) -> Result<(), SourceFlowError> {
+    if flow != graph.nodes().unreachable()
+        || node.payload.is_some()
+        || node.antecedent.is_some()
+        || !node.antecedents.is_empty()
+    {
+        return Err(SourceFlowInvariant::InvalidUnreachable(flow).into());
+    }
+    Ok(())
 }
 
 fn validate_start_node(
@@ -1150,14 +1247,21 @@ fn linear_antecedent(flow: FlowRef, node: &FlowNode) -> Result<FlowRef, SourceFl
         .ok_or_else(|| SourceFlowInvariant::InvalidAntecedents(flow).into())
 }
 
-fn branch_antecedents(flow: FlowRef, node: &FlowNode) -> Result<[FlowRef; 2], SourceFlowError> {
-    let [then_flow, else_flow] = node.antecedents.as_slice() else {
-        return Err(SourceFlowInvariant::InvalidAntecedents(flow).into());
-    };
-    if node.antecedent.is_some() || node.payload.is_some() || then_flow == else_flow {
+fn label_antecedents(flow: FlowRef, node: &FlowNode) -> Result<&[FlowRef], SourceFlowError> {
+    if node.antecedents.len() < 2 {
         return Err(SourceFlowInvariant::InvalidAntecedents(flow).into());
     }
-    Ok([*then_flow, *else_flow])
+    let mut unique = HashSet::with_capacity(node.antecedents.len());
+    if node.antecedent.is_some()
+        || node.payload.is_some()
+        || node
+            .antecedents
+            .iter()
+            .any(|antecedent| !unique.insert(*antecedent))
+    {
+        return Err(SourceFlowInvariant::InvalidAntecedents(flow).into());
+    }
+    Ok(&node.antecedents)
 }
 
 fn union_constituents(store: &CanonicalTypeMapperStore, type_: TypeId) -> Option<&[TypeId]> {
@@ -1176,18 +1280,100 @@ fn ast_payload(flow: FlowRef, node: &FlowNode) -> Result<NodeRef, SourceFlowErro
 
 #[cfg(test)]
 mod tests {
-    use ts_ast::{FileId, FlowNodeId, NodeArena, NodeId};
+    use ts_ast::{FileId, FlowNodeId, NodeArena, NodeData, NodeId};
+    use ts_binder::{
+        CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
+        EscapedName,
+    };
+    use ts_parser::{ParseResult, parse_source_file};
 
     use super::*;
+    use crate::semantic::{
+        CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions,
+    };
 
     fn flow() -> FlowRef {
         let arena = NodeArena::default();
         FlowRef::new(arena.id(), FileId::new(7), FlowNodeId(3))
     }
 
+    fn loop_context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/source-flow-loop.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            [(file, &parsed.arena)].into_iter().collect(),
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn loop_nodes(parsed: &ParseResult, file: FileId) -> (NodeRef, NodeRef, NodeRef, NodeRef) {
+        let (function, parameter) = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::FunctionDeclaration(function) = &record.data else {
+                    return None;
+                };
+                Some((
+                    NodeRef::new(parsed.arena.id(), file, node),
+                    NodeRef::new(parsed.arena.id(), file, *function.parameters.nodes.first()?),
+                ))
+            })
+            .unwrap();
+        let condition = parsed
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::WhileStatement(statement) = &record.data else {
+                    return None;
+                };
+                Some(NodeRef::new(parsed.arena.id(), file, statement.expression))
+            })
+            .unwrap();
+        let return_statement = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                matches!(&record.data, NodeData::ReturnStatement(_)).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        (function, parameter, condition, return_statement)
+    }
+
     #[test]
     fn metadata_bits_do_not_change_admitted_flow_kinds() {
         let flow = flow();
+        assert_eq!(
+            source_flow_kind(flow, FlowFlags::UNREACHABLE | FlowFlags::REFERENCED),
+            Ok(SourceFlowKind::Unreachable),
+        );
         assert_eq!(
             source_flow_kind(
                 flow,
@@ -1213,6 +1399,10 @@ mod tests {
         assert_eq!(
             source_flow_kind(flow, FlowFlags::BRANCH_LABEL | FlowFlags::SHARED),
             Ok(SourceFlowKind::BranchLabel),
+        );
+        assert_eq!(
+            source_flow_kind(flow, FlowFlags::LOOP_LABEL | FlowFlags::SHARED),
+            Ok(SourceFlowKind::LoopLabel),
         );
     }
 
@@ -1266,31 +1456,46 @@ mod tests {
     }
 
     #[test]
-    fn branch_labels_require_two_distinct_ordered_antecedents() {
+    fn branch_and_loop_labels_require_distinct_ordered_antecedents() {
         let arena = NodeArena::default();
         let file = FileId::new(7);
         let first = FlowRef::new(arena.id(), file, FlowNodeId(1));
         let second = FlowRef::new(arena.id(), file, FlowNodeId(2));
-        let branch = FlowRef::new(arena.id(), file, FlowNodeId(3));
+        let third = FlowRef::new(arena.id(), file, FlowNodeId(3));
+        let branch = FlowRef::new(arena.id(), file, FlowNodeId(4));
 
         let mut node = FlowNode::new(FlowFlags::BRANCH_LABEL);
         node.antecedents = vec![first, second];
-        assert_eq!(branch_antecedents(branch, &node), Ok([first, second]));
+        assert_eq!(
+            label_antecedents(branch, &node),
+            Ok([first, second].as_slice())
+        );
+
+        node.antecedents = vec![first, second, third];
+        assert_eq!(
+            label_antecedents(branch, &node),
+            Ok([first, second, third].as_slice()),
+        );
 
         node.antecedents = vec![first];
         assert_eq!(
-            branch_antecedents(branch, &node),
+            label_antecedents(branch, &node),
             Err(SourceFlowInvariant::InvalidAntecedents(branch).into()),
         );
         node.antecedents = vec![first, first];
         assert_eq!(
-            branch_antecedents(branch, &node),
+            label_antecedents(branch, &node),
+            Err(SourceFlowInvariant::InvalidAntecedents(branch).into()),
+        );
+        node.antecedents = vec![first, second, first];
+        assert_eq!(
+            label_antecedents(branch, &node),
             Err(SourceFlowInvariant::InvalidAntecedents(branch).into()),
         );
         node.antecedents = vec![first, second];
         node.antecedent = Some(first);
         assert_eq!(
-            branch_antecedents(branch, &node),
+            label_antecedents(branch, &node),
             Err(SourceFlowInvariant::InvalidAntecedents(branch).into()),
         );
         node.antecedent = None;
@@ -1300,8 +1505,65 @@ mod tests {
             NodeId::new(1),
         )));
         assert_eq!(
-            branch_antecedents(branch, &node),
+            label_antecedents(branch, &node),
             Err(SourceFlowInvariant::InvalidAntecedents(branch).into()),
         );
+    }
+
+    #[test]
+    fn loop_backedges_converge_and_preserve_false_edge_narrowing() {
+        let parsed = parse_source_file(concat!(
+            "function loop(value: object | undefined): object | undefined {\n",
+            "  while (value) {}\n",
+            "  return value;\n",
+            "}\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(2_401);
+        let mut context = loop_context(&parsed, file);
+        let bound = context.file(file).unwrap().1.clone();
+        let globals = context.global_types().clone();
+        let (function, parameter, condition, return_statement) = loop_nodes(&parsed, file);
+        let symbol = bound.symbol(parameter).unwrap();
+        let plan = SourceFlowPlan::preflight(
+            &bound,
+            function,
+            None,
+            [condition, return_statement],
+            [SourceFlowCondition::Truthiness(SourceTruthinessCondition {
+                expression: condition,
+                symbol,
+            })],
+            [],
+        )
+        .unwrap();
+        let (object, undefined) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (bootstrap.non_primitive_type, bootstrap.undefined_type)
+        };
+        let input = context
+            .store_mut_for_test()
+            .expression_union_type_with_global_types(
+                &globals,
+                &[object, undefined],
+                UnionReduction::Literal,
+            )
+            .unwrap();
+        let mut frame = plan
+            .frame(&bound, [(symbol, input)].into_iter().collect())
+            .unwrap();
+
+        let at_loop = frame
+            .snapshot_at(context.store_mut_for_test(), &globals, condition)
+            .unwrap();
+        assert_eq!(at_loop.type_of(symbol), Some(input));
+        let after_loop = frame
+            .snapshot_at(context.store_mut_for_test(), &globals, return_statement)
+            .unwrap();
+        assert_eq!(after_loop.type_of(symbol), Some(undefined));
+        let repeated = frame
+            .snapshot_at(context.store_mut_for_test(), &globals, return_statement)
+            .unwrap();
+        assert_eq!(repeated, after_loop);
     }
 }

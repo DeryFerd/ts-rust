@@ -1,10 +1,11 @@
 //! Exact syntax and binder proof for the first function-statement vertical.
 //!
 //! This leaf admits two additive annotated-function shapes. The first contains
-//! initialized identifier-named `let`/`const` declarations followed by one
-//! final two-arm `if`, with a value return in each arm. The second contains one
-//! two-arm fallthrough `if` between leading and trailing declarations, followed
-//! by one final value return. It deliberately stops before expression planning,
+//! initialized identifier-named `var`/`let`/`const` declarations followed by
+//! one final two-arm `if`, with a value return in each arm. The second contains
+//! one fallthrough `if` between leading and trailing declarations, followed by
+//! one final value return. The fallthrough `else` arm may be absent. This leaf
+//! deliberately stops before expression planning,
 //! lexical admission-set mutation, flow narrowing, or checking. Direct
 //! identifier truthiness and the bounded strict `typeof` comparison form are
 //! proven here; their semantic execution remains a source-dispatch
@@ -191,10 +192,19 @@ pub(super) struct SourceFunctionStatementsSyntax {
     pub(super) final_if: SourceFinalIfSyntax,
 }
 
-/// One fallthrough block arm containing initialized locals only.
+/// Ordered local declarations with an optional final return statement.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceLinearFunctionStatementsSyntax {
+    pub(super) body: NodeRef,
+    pub(super) locals: Vec<SourceLocalDeclarationSyntax>,
+    pub(super) return_statement: Option<NodeRef>,
+    pub(super) return_expression: Option<NodeRef>,
+}
+
+/// One fallthrough arm containing initialized locals only.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SourceFallthroughBranchSyntax {
-    pub(super) block: NodeRef,
+    pub(super) block: Option<NodeRef>,
     pub(super) locals: Vec<SourceLocalDeclarationSyntax>,
 }
 
@@ -232,7 +242,6 @@ pub(super) enum SourceJoinedFunctionStatementsUnsupported {
     InferredCallable(NodeRef),
     MissingIf(NodeRef),
     AdditionalIf(NodeRef),
-    MissingElse(NodeRef),
     MissingReturn(NodeRef),
     IncompleteFlow(NodeRef),
 }
@@ -304,6 +313,22 @@ pub(super) fn plan_source_function_statements_syntax(
     .plan()
 }
 
+/// Proves an inferred or annotated function body with straight-line locals.
+pub(super) fn plan_source_linear_function_statements_syntax(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    callable: &SourceCallablePlan,
+) -> Result<SourceLinearFunctionStatementsSyntax, SourceFunctionStatementsError> {
+    SyntaxPlanner {
+        arena,
+        bound,
+        store,
+        callable,
+    }
+    .plan_linear()
+}
+
 /// Proves one local-plus-fallthrough-`if`-plus-return body and its binder join.
 ///
 /// This is intentionally separate from [`plan_source_function_statements_syntax`]
@@ -333,6 +358,140 @@ struct SyntaxPlanner<'a> {
 }
 
 impl SyntaxPlanner<'_> {
+    fn plan_linear(
+        &self,
+    ) -> Result<SourceLinearFunctionStatementsSyntax, SourceFunctionStatementsError> {
+        let declaration = self.callable.declaration;
+        if !declaration.is_for(self.arena.id(), self.bound.file_id())
+            || self.bound.node_arena_id() != self.arena.id()
+            || self.bound.node_arena_revision() != self.arena.revision()
+        {
+            return Err(SourceFunctionStatementsInvariant::BoundSourceMismatch(declaration).into());
+        }
+        if self.callable.family != SourceCallableFamily::FunctionDeclaration {
+            return Err(self.unsupported(
+                declaration,
+                self.node(declaration)?.kind,
+                SourceFunctionStatementsRole::Callable,
+            ));
+        }
+
+        let record = self.node(declaration)?;
+        let NodeData::FunctionDeclaration(function) = &record.data else {
+            return Err(self.unsupported(
+                declaration,
+                record.kind,
+                SourceFunctionStatementsRole::Callable,
+            ));
+        };
+        if record.kind != SyntaxKind::FunctionDeclaration
+            || function.body != Some(self.callable.body.node)
+            || function.type_
+                != self
+                    .callable
+                    .return_type
+                    .type_node()
+                    .map(|type_node| type_node.node)
+        {
+            return Err(SourceFunctionStatementsInvariant::InvalidCallableEdge(declaration).into());
+        }
+
+        let body = self.callable.body;
+        self.validate_range(body, declaration)?;
+        let statements = self.plan_body(body, declaration)?;
+        let mut locals = Vec::new();
+        let mut return_statement = None;
+        let mut return_expression = None;
+        for (index, statement_id) in statements.iter().copied().enumerate() {
+            let statement = self.reference(statement_id);
+            match self.node(statement)?.kind {
+                SyntaxKind::VariableStatement => {
+                    locals.extend(self.plan_local_statement(statement, body, declaration)?);
+                }
+                SyntaxKind::ReturnStatement if index + 1 == statements.len() => {
+                    return_expression = self.plan_linear_return(statement, body, declaration)?;
+                    return_statement = Some(statement);
+                }
+                kind => {
+                    return Err(self.unsupported(
+                        statement,
+                        kind,
+                        SourceFunctionStatementsRole::BodyStatement,
+                    ));
+                }
+            }
+        }
+
+        let flow = self.bound.flow_graph();
+        if flow.container_is_complete(declaration) != Some(true) {
+            return Err(SourceFunctionStatementsError::Unsupported(
+                SourceFunctionStatementsUnsupported::IncompleteFlow(declaration),
+            ));
+        }
+        if flow.container_start(declaration).is_none() {
+            return Err(SourceFunctionStatementsInvariant::MissingFlowStart(declaration).into());
+        }
+        if return_statement.is_some() && flow.container_end(declaration).is_some() {
+            return Err(SourceFunctionStatementsInvariant::UnexpectedFlowEnd(declaration).into());
+        }
+        if flow.container_return(declaration).is_some() {
+            return Err(
+                SourceFunctionStatementsInvariant::UnexpectedReturnFlow(declaration).into(),
+            );
+        }
+
+        Ok(SourceLinearFunctionStatementsSyntax {
+            body,
+            locals,
+            return_statement,
+            return_expression,
+        })
+    }
+
+    fn plan_linear_return(
+        &self,
+        statement: NodeRef,
+        body: NodeRef,
+        callable: NodeRef,
+    ) -> Result<Option<NodeRef>, SourceFunctionStatementsError> {
+        let record = self.node(statement)?;
+        let NodeData::ReturnStatement(return_data) = &record.data else {
+            return Err(self.unsupported(
+                statement,
+                record.kind,
+                SourceFunctionStatementsRole::ReturnStatement,
+            ));
+        };
+        if record.kind != SyntaxKind::ReturnStatement
+            || record.flags.0 != 0
+            || record.parent != Some(body.node)
+            || return_data.flow_node.is_some()
+            || return_data.facts != 0
+        {
+            return Err(self.unsupported(
+                statement,
+                record.kind,
+                SourceFunctionStatementsRole::ReturnStatement,
+            ));
+        }
+        self.validate_range(statement, body)?;
+        self.validate_container(statement, callable)?;
+        self.validate_block_scope_container(statement, callable)?;
+
+        let Some(expression) = return_data.expression.map(|node| self.reference(node)) else {
+            return Ok(None);
+        };
+        self.validate_parent(
+            expression,
+            Some(statement.node),
+            SourceFunctionStatementsRole::ReturnExpression,
+        )?;
+        self.validate_range(expression, statement)?;
+        self.validate_container(expression, callable)?;
+        self.validate_block_scope_container(expression, callable)?;
+        Ok(Some(expression))
+    }
+
     fn plan(&self) -> Result<SourceFunctionStatementsSyntax, SourceFunctionStatementsError> {
         let declaration = self.callable.declaration;
         if !declaration.is_for(self.arena.id(), self.bound.file_id())
@@ -503,6 +662,7 @@ impl SyntaxPlanner<'_> {
             &list_data.declarations.nodes,
         )?;
         let binding = match list_record.flags.0 {
+            0 if parent == self.callable.body => VariableBindingKind::Var,
             NODE_FLAG_LET => VariableBindingKind::Let,
             NODE_FLAG_CONST => VariableBindingKind::Const,
             _ => {
@@ -843,17 +1003,25 @@ impl SyntaxPlanner<'_> {
             }
         };
 
+        let left_kind = self.node(left)?.kind;
+        let right_kind = self.node(right)?.kind;
+        let string_like = |kind| {
+            matches!(
+                kind,
+                SyntaxKind::StringLiteral | SyntaxKind::NoSubstitutionTemplateLiteral
+            )
+        };
         let (type_of_expression, literal, type_of_on_left) =
-            match (self.node(left)?.kind, self.node(right)?.kind) {
-                (SyntaxKind::TypeOfExpression, SyntaxKind::StringLiteral) => (left, right, true),
-                (SyntaxKind::StringLiteral, SyntaxKind::TypeOfExpression) => (right, left, false),
-                _ => {
-                    return Err(self.unsupported(
-                        condition,
-                        record.kind,
-                        SourceFunctionStatementsRole::Condition,
-                    ));
-                }
+            if left_kind == SyntaxKind::TypeOfExpression && string_like(right_kind) {
+                (left, right, true)
+            } else if right_kind == SyntaxKind::TypeOfExpression && string_like(left_kind) {
+                (right, left, false)
+            } else {
+                return Err(self.unsupported(
+                    condition,
+                    record.kind,
+                    SourceFunctionStatementsRole::Condition,
+                ));
             };
 
         let type_of_record = self.node(type_of_expression)?;
@@ -902,26 +1070,37 @@ impl SyntaxPlanner<'_> {
         self.validate_block_scope_container(identifier, callable)?;
 
         let literal_record = self.node(literal)?;
-        let NodeData::StringLiteral(literal_data) = &literal_record.data else {
-            return Err(self.unsupported(
-                literal,
-                literal_record.kind,
-                SourceFunctionStatementsRole::Condition,
-            ));
-        };
-        if literal_record.kind != SyntaxKind::StringLiteral
-            || literal_record.flags.0 != 0
-            || literal_data.token_flags.0 != 0
-        {
+        if literal_record.flags.0 != 0 {
             return Err(self.unsupported(
                 literal,
                 literal_record.kind,
                 SourceFunctionStatementsRole::Condition,
             ));
         }
+        let literal_text = match &literal_record.data {
+            NodeData::StringLiteral(data)
+                if literal_record.kind == SyntaxKind::StringLiteral && data.token_flags.0 == 0 =>
+            {
+                data.text.as_str()
+            }
+            NodeData::NoSubstitutionTemplateLiteral(data)
+                if literal_record.kind == SyntaxKind::NoSubstitutionTemplateLiteral
+                    && data.token_flags.0 == 0
+                    && data.template_flags.0 == 0 =>
+            {
+                data.text.as_str()
+            }
+            _ => {
+                return Err(self.unsupported(
+                    literal,
+                    literal_record.kind,
+                    SourceFunctionStatementsRole::Condition,
+                ));
+            }
+        };
         self.validate_container(literal, callable)?;
         self.validate_block_scope_container(literal, callable)?;
-        let tag = match literal_data.text.as_str() {
+        let tag = match literal_text {
             "string" => SourceTypeofTag::String,
             "number" => SourceTypeofTag::Number,
             "boolean" => SourceTypeofTag::Boolean,
@@ -1433,24 +1612,29 @@ impl SyntaxPlanner<'_> {
         let condition_syntax = self.plan_condition(condition, callable)?;
 
         let then_block = self.reference(if_statement.then_statement);
-        let else_block = if_statement
-            .else_statement
-            .map(|node| self.reference(node))
-            .ok_or(SourceJoinedFunctionStatementsError::Unsupported(
-                SourceJoinedFunctionStatementsUnsupported::MissingElse(statement),
-            ))?;
         self.validate_range(then_block, statement)?;
-        self.validate_range(else_block, statement)?;
         self.validate_order(condition, then_block)?;
-        self.validate_order(then_block, else_block)?;
+        let then_branch = self.plan_fallthrough_branch(then_block, statement, callable)?;
+        let else_branch = if let Some(else_block) =
+            if_statement.else_statement.map(|node| self.reference(node))
+        {
+            self.validate_range(else_block, statement)?;
+            self.validate_order(then_block, else_block)?;
+            self.plan_fallthrough_branch(else_block, statement, callable)?
+        } else {
+            SourceFallthroughBranchSyntax {
+                block: None,
+                locals: Vec::new(),
+            }
+        };
 
         Ok(SourceJoinedIfSyntax {
             statement,
             condition,
             condition_identifier: condition_syntax.identifier,
             typeof_condition: condition_syntax.typeof_condition,
-            then_branch: self.plan_fallthrough_branch(then_block, statement, callable)?,
-            else_branch: self.plan_fallthrough_branch(else_block, statement, callable)?,
+            then_branch,
+            else_branch,
         })
     }
 
@@ -1503,7 +1687,10 @@ impl SyntaxPlanner<'_> {
                 callable,
             )?);
         }
-        Ok(SourceFallthroughBranchSyntax { block, locals })
+        Ok(SourceFallthroughBranchSyntax {
+            block: Some(block),
+            locals,
+        })
     }
 
     fn plan_joined_return(
@@ -1822,6 +2009,7 @@ mod joined_tests {
         DeclaredTypeHost, IntrinsicBootstrapOptions,
         production::GlobalMergeCompletion,
         source_callables::{SourceCallablePlan, plan_source_callable},
+        source_flow::{SourceFlowAssignment, SourceFlowPlan},
     };
 
     const JOINED_SOURCE: &str = concat!(
@@ -1931,6 +2119,90 @@ mod joined_tests {
                 &callable,
             )
         }
+
+        fn linear_plan(
+            &self,
+        ) -> Result<SourceLinearFunctionStatementsSyntax, SourceFunctionStatementsError> {
+            let callable = self.callable();
+            plan_source_linear_function_statements_syntax(
+                &self.parsed.arena,
+                &self.bound,
+                &self.store,
+                &callable,
+            )
+        }
+    }
+
+    #[test]
+    fn linear_body_accepts_inferred_function_scoped_var_and_covers_final_assignment() {
+        let fixture = JoinedFixture::new("function avoid() { var x = 1; }", FileId::new(1_190));
+        let syntax = fixture.linear_plan().unwrap();
+        assert_eq!(syntax.locals.len(), 1);
+        assert_eq!(syntax.locals[0].binding, VariableBindingKind::Var);
+        assert!(syntax.return_statement.is_none());
+        assert!(syntax.return_expression.is_none());
+
+        let assignments = syntax.locals.iter().map(|local| SourceFlowAssignment {
+            declaration: local.declaration,
+            symbol: local.symbol,
+        });
+        assert!(
+            SourceFlowPlan::preflight(
+                &fixture.bound,
+                fixture.declaration(),
+                None,
+                syntax.locals.iter().map(|local| local.name),
+                [],
+                assignments,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn linear_body_retains_ordered_locals_and_optional_final_return() {
+        let returned = JoinedFixture::new(
+            concat!(
+                "function value(input: number): number {\n",
+                "  const first: number = input;\n",
+                "  var second: number = first;\n",
+                "  return second;\n",
+                "}\n",
+            ),
+            FileId::new(1_191),
+        );
+        let syntax = returned.linear_plan().unwrap();
+        assert_eq!(syntax.locals.len(), 2);
+        assert_eq!(syntax.locals[0].binding, VariableBindingKind::Const);
+        assert_eq!(syntax.locals[1].binding, VariableBindingKind::Var);
+        assert!(syntax.return_statement.is_some());
+        assert!(syntax.return_expression.is_some());
+
+        let bare = JoinedFixture::new(
+            "function empty(): void { let value = 1; return; }",
+            FileId::new(1_192),
+        );
+        let syntax = bare.linear_plan().unwrap();
+        assert_eq!(syntax.locals.len(), 1);
+        assert!(syntax.return_statement.is_some());
+        assert!(syntax.return_expression.is_none());
+    }
+
+    #[test]
+    fn linear_body_rejects_statements_after_return() {
+        let fixture = JoinedFixture::new(
+            "function invalid(): void { return; const later = 1; }",
+            FileId::new(1_193),
+        );
+        assert!(matches!(
+            fixture.linear_plan(),
+            Err(SourceFunctionStatementsError::Unsupported(
+                SourceFunctionStatementsUnsupported::Syntax {
+                    role: SourceFunctionStatementsRole::BodyStatement,
+                    ..
+                },
+            )),
+        ));
     }
 
     #[test]
@@ -1981,6 +2253,18 @@ mod joined_tests {
             (
                 FileId::new(1_206),
                 "\"number\" !== typeof value",
+                SourceTypeofComparison::NotEqual,
+                false,
+            ),
+            (
+                FileId::new(1_209),
+                "typeof value === `string`",
+                SourceTypeofComparison::Equal,
+                true,
+            ),
+            (
+                FileId::new(1_213),
+                "`number` !== typeof value",
                 SourceTypeofComparison::NotEqual,
                 false,
             ),
@@ -2037,18 +2321,32 @@ mod joined_tests {
     }
 
     #[test]
-    fn joined_shape_rejects_missing_else_returns_and_nested_control() {
-        let no_else = JoinedFixture::new(
-            "function f(value: boolean): boolean { if (value) {} return value; }",
+    fn joined_shape_accepts_missing_else_and_function_scoped_var_locals() {
+        let fixture = JoinedFixture::new(
+            concat!(
+                "function f(value: string | undefined): string | undefined {\n",
+                "  var before: string | undefined = value;\n",
+                "  if (value) {\n",
+                "    const selected: string = value;\n",
+                "  }\n",
+                "  var after: string | undefined = value;\n",
+                "  return value;\n",
+                "}\n",
+            ),
             FileId::new(1_210),
         );
-        assert!(matches!(
-            no_else.plan(),
-            Err(SourceJoinedFunctionStatementsError::Unsupported(
-                SourceJoinedFunctionStatementsUnsupported::MissingElse(_),
-            )),
-        ));
+        let syntax = fixture.plan().unwrap();
+        assert_eq!(syntax.leading.len(), 1);
+        assert_eq!(syntax.leading[0].binding, VariableBindingKind::Var);
+        assert_eq!(syntax.joined_if.then_branch.locals.len(), 1);
+        assert!(syntax.joined_if.else_branch.block.is_none());
+        assert!(syntax.joined_if.else_branch.locals.is_empty());
+        assert_eq!(syntax.trailing.len(), 1);
+        assert_eq!(syntax.trailing[0].binding, VariableBindingKind::Var);
+    }
 
+    #[test]
+    fn joined_shape_rejects_branch_returns_and_nested_control() {
         for (file, source) in [
             (
                 FileId::new(1_211),

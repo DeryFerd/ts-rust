@@ -106,37 +106,6 @@ pub(super) fn resolve_direct_interface_members(
         return Err(invalid(plan, type_));
     }
 
-    for (index, property) in plan.properties.iter().enumerate() {
-        let base_property = base_surface.properties.iter().copied().find(|base| {
-            store
-                .symbol(*base)
-                .is_some_and(|record| record.name().as_utf8() == Some(property.name.as_str()))
-        });
-        let Some(base_property) = base_property else {
-            continue;
-        };
-        let own_type = *property_types
-            .get(index)
-            .ok_or_else(|| invalid(plan, type_))?;
-        let base_type = store
-            .value_symbol_links(base_property)
-            .and_then(|links| links.resolved_type)
-            .ok_or_else(|| invalid(plan, type_))?;
-        let base_optional = store
-            .symbol(base_property)
-            .is_some_and(|record| record.flags().contains(SymbolFlags::OPTIONAL));
-        if property.optional && !base_optional
-            || store.is_type_assignable_to(own_type, base_type) != Ok(true)
-        {
-            return Err(PropertyObjectError::UnsupportedMember {
-                node: property.declaration,
-                kind: store
-                    .source_node_kind(property.declaration)
-                    .unwrap_or(SyntaxKind::PropertySignature),
-            });
-        }
-    }
-
     let declared_state =
         prepare_direct_interface_declared_properties(store, plan, type_, property_types)?;
     let total_properties = plan
@@ -173,7 +142,7 @@ pub(super) fn resolve_direct_interface_members(
         expected_entries.push((name, property.symbol));
         expected_properties.push(property.symbol);
     }
-    for property in base_surface.properties {
+    for &property in &base_surface.properties {
         let record = store.symbol(property).ok_or_else(|| invalid(plan, type_))?;
         let name = record.name().to_owned();
         if !seen_names.insert(name.clone()) {
@@ -181,6 +150,37 @@ pub(super) fn resolve_direct_interface_members(
         }
         expected_entries.push((name, property));
         expected_properties.push(property);
+    }
+
+    for (index, property) in plan.properties.iter().enumerate() {
+        let base_property = base_surface.properties.iter().copied().find(|base| {
+            store
+                .symbol(*base)
+                .is_some_and(|record| record.name().as_utf8() == Some(property.name.as_str()))
+        });
+        let Some(base_property) = base_property else {
+            continue;
+        };
+        let own_type = *property_types
+            .get(index)
+            .ok_or_else(|| invalid(plan, type_))?;
+        let base_type = store
+            .value_symbol_links(base_property)
+            .and_then(|links| links.resolved_type)
+            .ok_or_else(|| invalid(plan, type_))?;
+        let base_optional = store
+            .symbol(base_property)
+            .is_some_and(|record| record.flags().contains(SymbolFlags::OPTIONAL));
+        if property.optional && !base_optional
+            || store.is_type_assignable_to(own_type, base_type) != Ok(true)
+        {
+            return Err(PropertyObjectError::UnsupportedMember {
+                node: property.declaration,
+                kind: store
+                    .source_node_kind(property.declaration)
+                    .unwrap_or(SyntaxKind::PropertySignature),
+            });
+        }
     }
 
     if declared_state == DirectInterfaceDeclaredState::Resolved {
@@ -936,6 +936,62 @@ mod tests {
         assert_eq!(
             derived_state(&prepared.fixture.store, prepared.derived_type, own),
             poisoned,
+        );
+    }
+
+    #[test]
+    fn malformed_override_is_rejected_before_relation_cache_or_member_publication() {
+        let mut prepared = prepare();
+        let own = prepared.derived_plan.properties[0].symbol;
+        let base_first = {
+            let record = prepared
+                .fixture
+                .store
+                .type_payload(prepared.base_type)
+                .unwrap();
+            let TypeData::Interface(interface) = record.data() else {
+                panic!("base must retain its interface payload")
+            };
+            interface
+                .reference
+                .object
+                .structured
+                .properties
+                .as_ref()
+                .unwrap()[0]
+        };
+        let base_property_type =
+            property_wrapper(&mut prepared.fixture.store, prepared.number_type);
+        let own_property_type = property_wrapper(&mut prepared.fixture.store, prepared.number_type);
+        assert!(prepared.fixture.store.set_value_symbol_links(
+            base_first,
+            ValueSymbolLinks {
+                resolved_type: Some(base_property_type),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        prepared.derived_plan.properties[0].name = "first".to_owned();
+        let before = (
+            derived_state(&prepared.fixture.store, prepared.derived_type, own),
+            prepared.fixture.store.relation_state_snapshot(),
+        );
+
+        assert!(
+            resolve_direct_interface_members(
+                &mut prepared.fixture.store,
+                &prepared.derived_plan,
+                prepared.derived_type,
+                &[own_property_type],
+                &[prepared.base_type],
+            )
+            .is_err()
+        );
+        assert_eq!(
+            (
+                derived_state(&prepared.fixture.store, prepared.derived_type, own),
+                prepared.fixture.store.relation_state_snapshot(),
+            ),
+            before
         );
     }
 

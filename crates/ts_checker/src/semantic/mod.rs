@@ -66,6 +66,7 @@ mod source_enums;
 mod source_flow;
 mod source_functions;
 mod source_imports;
+mod source_namespaces;
 mod source_new;
 mod source_overloads;
 mod source_properties;
