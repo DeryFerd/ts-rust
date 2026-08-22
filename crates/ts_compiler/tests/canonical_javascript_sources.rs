@@ -101,3 +101,84 @@ fn unchecked_javascript_keeps_typescript_source_diagnostics() {
     assert_eq!(diagnostic.file_name.as_deref(), Some("/project/input.ts"));
     assert_eq!(diagnostic.code, Some(2322));
 }
+
+#[test]
+fn leading_ts_check_directives_override_global_javascript_checking() {
+    for (source, check_js, expect_error) in [
+        (
+            "// @ts-check\nconst value = true; value.missing;",
+            false,
+            true,
+        ),
+        (
+            "// @ts-nocheck\nconst value = true; value.missing;",
+            true,
+            false,
+        ),
+        (
+            "// @ts-check\n// @ts-nocheck\nconst value = true; value.missing;",
+            true,
+            false,
+        ),
+        (
+            "// @ts-nocheck\n// @ts-check\nconst value = true; value.missing;",
+            false,
+            true,
+        ),
+        (
+            "const value = true;\n// @ts-check\nvalue.missing;",
+            false,
+            false,
+        ),
+        (
+            "/* @ts-check */\nconst value = true; value.missing;",
+            false,
+            false,
+        ),
+        (
+            "/// @ts-check\nconst value = true; value.missing;",
+            false,
+            true,
+        ),
+    ] {
+        let filesystem = MemoryFileSystem::new(true);
+        filesystem.write_file("/project/input.js", source).unwrap();
+        let mut options = javascript_options();
+        options.check_js = check_js;
+
+        let program =
+            Program::new_with_options(&filesystem, "/project", &["input.js".to_owned()], options);
+        let actual = program
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code == Some(2339));
+        assert_eq!(actual, expect_error, "source: {source}");
+    }
+}
+
+#[test]
+fn canonical_ts_nocheck_disables_global_javascript_checking() {
+    let filesystem = MemoryFileSystem::new(true);
+    filesystem
+        .write_file(
+            "/project/input.js",
+            "// @ts-nocheck\nconst value = true; value.missing;\n",
+        )
+        .unwrap();
+    let mut options = javascript_options();
+    options.check_js = true;
+
+    let program = Program::try_new_with_canonical_checker(
+        &filesystem,
+        "/project",
+        &["input.js".to_owned()],
+        options,
+    )
+    .unwrap();
+
+    assert!(
+        program.diagnostics().is_empty(),
+        "{:?}",
+        program.diagnostics()
+    );
+}

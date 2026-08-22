@@ -1078,6 +1078,50 @@ fn source_jsx_pragma_value<'a>(source: &'a str, pragma: &str) -> Option<&'a str>
         .last()
 }
 
+fn source_check_js_directive(source: &str) -> Option<bool> {
+    let mut remaining = source.strip_prefix('\u{feff}').unwrap_or(source);
+    if remaining.starts_with("#!") {
+        remaining = remaining
+            .split_once('\n')
+            .map_or("", |(_, source)| source);
+    }
+
+    let mut directive = None;
+    loop {
+        remaining = remaining.trim_start_matches([' ', '\t', '\r', '\n']);
+        if let Some(comment) = remaining.strip_prefix("//") {
+            let (line, rest) = comment.split_once('\n').unwrap_or((comment, ""));
+            remaining = rest;
+            let pragma = line
+                .strip_prefix('/')
+                .unwrap_or(line)
+                .trim_start_matches([' ', '\t']);
+            if let Some(pragma) = pragma.strip_prefix('@') {
+                let end = pragma
+                    .find(|character: char| !character.is_ascii_alphabetic() && character != '-')
+                    .unwrap_or(pragma.len());
+                let name = &pragma[..end];
+                if name.eq_ignore_ascii_case("ts-check") {
+                    directive = Some(true);
+                } else if name.eq_ignore_ascii_case("ts-nocheck") {
+                    directive = Some(false);
+                }
+            }
+            continue;
+        }
+        if let Some(comment) = remaining.strip_prefix("/*") {
+            let Some((_, rest)) = comment.split_once("*/") else {
+                break;
+            };
+            remaining = rest;
+            continue;
+        }
+        break;
+    }
+
+    directive
+}
+
 fn source_printer_settings(mut settings: PrinterSettings, source: &str) -> PrinterSettings {
     if settings.jsx == ts_options::JsxEmit::React
         && source_jsx_pragma_value(source, "@jsxImportSource").is_some()
@@ -1609,9 +1653,9 @@ impl Program {
         program.load_remaining_program_graph(file_system);
         let mut result = None;
         if !program.options.no_check {
-            let (diagnostics, queried) = program.check_program_canonical(queries)?;
+            let (diagnostics, query_result) = program.check_program_canonical(queries)?;
             program.diagnostics.extend(diagnostics);
-            result = Some(queried);
+            result = Some(query_result);
         }
         program.diagnostics.sort_by(compare_program_diagnostics);
         Ok((program, result))
@@ -1754,6 +1798,12 @@ impl Program {
             discovery.files.clone()
         });
         if options_result.options.resolve_json_module {
+            let has_json_extension = |path: &str| {
+                Path::new(path)
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+            };
             let case_sensitive = file_system.use_case_sensitive_file_names();
             let case_sensitivity = if case_sensitive {
                 CaseSensitivity::Sensitive
@@ -1768,13 +1818,13 @@ impl Program {
             let json_patterns = discovery
                 .include
                 .iter()
-                .filter(|include| include.ends_with(".json"))
+                .filter(|include| has_json_extension(include))
                 .filter_map(|include| {
                     GlobPattern::compile(include, config_directory, case_sensitive, false)
                 })
                 .collect::<Vec<_>>();
             roots.retain(|root| {
-                !root.ends_with(".json")
+                !has_json_extension(root)
                     || explicit_files.contains(&canonicalize(
                         root,
                         config_directory,
@@ -3409,7 +3459,14 @@ impl Program {
                     CanonicalProgramCheckError::DeclarationFileCheckingUnsupported { file_name },
                 );
             }
-            if is_javascript_file && !self.options.check_js {
+            if is_javascript_file
+                && !self
+                    .source_file_by_id(file)
+                    .is_some_and(|source| {
+                        source_check_js_directive(&source.source_text)
+                            .unwrap_or(self.options.check_js)
+                    })
+            {
                 continue;
             }
             context
@@ -3648,8 +3705,9 @@ impl Program {
                     resolved_modules,
                     is_default_library: source_file.is_default_library,
                     skip_diagnostics: self.options.no_check
-                        || (!self.options.check_js
-                            && is_javascript_file_name(&source_file.file_name))
+                        || (is_javascript_file_name(&source_file.file_name)
+                            && !source_check_js_directive(&source_file.source_text)
+                                .unwrap_or(self.options.check_js))
                         || (self.options.skip_lib_check
                             && ts_path::is_declaration_file(&source_file.file_name)),
                     checker_options: CheckerOptions {
