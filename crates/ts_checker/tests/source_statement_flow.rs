@@ -792,3 +792,95 @@ fn joined_if_branch_returns_remain_an_atomic_boundary() {
         FileId::new(9),
     );
 }
+
+#[test]
+fn final_if_accepts_direct_and_mixed_return_branches() {
+    let source = concat!(
+        "function direct(value: string | undefined): string | undefined {\n",
+        "  if (value) return value;\n",
+        "  else return value;\n",
+        "}\n",
+        "function mixedThen(value: string | undefined): string | undefined {\n",
+        "  if (value) {\n",
+        "    const narrowed: string = value;\n",
+        "    return narrowed;\n",
+        "  } else return value;\n",
+        "}\n",
+        "function mixedElse(value: string | undefined): string | undefined {\n",
+        "  if (value) return value;\n",
+        "  else {\n",
+        "    const remaining: string | undefined = value;\n",
+        "    return remaining;\n",
+        "  }\n",
+        "}\n",
+        "function typed(value: string | number): string | number {\n",
+        "  if (typeof value === \"string\") return value;\n",
+        "  else return value;\n",
+        "}\n",
+    );
+    let parsed = parse_source_file(source);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(10);
+    let mut context = context(&parsed, file);
+
+    context.check_source_file(file).unwrap();
+    assert!(context.diagnostics().is_empty());
+    assert_eq!(rendered_type(&context, &parsed, file, "narrowed"), "string");
+    assert_eq!(
+        rendered_type(&context, &parsed, file, "remaining"),
+        "string | undefined",
+    );
+
+    let mut returns = parsed
+        .arena
+        .iter()
+        .filter_map(|(_, node)| {
+            let NodeData::ReturnStatement(statement) = &node.data else {
+                return None;
+            };
+            statement.expression.map(|expression| {
+                (
+                    node.range.start.get(),
+                    NodeRef::new(parsed.arena.id(), file, expression),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    returns.sort_by_key(|(start, _)| *start);
+    let return_types = returns
+        .into_iter()
+        .map(|(_, expression)| {
+            context
+                .type_to_string(resolved_type(&context, expression))
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        return_types,
+        [
+            "string",
+            "string | undefined",
+            "string",
+            "string | undefined",
+            "string",
+            "string | undefined",
+            "string",
+            "number",
+        ],
+    );
+
+    let counts = (
+        context.store().type_len(),
+        context.store().mapper_len(),
+        context.store().signature_len(),
+    );
+    context.check_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().mapper_len(),
+            context.store().signature_len(),
+        ),
+        counts,
+    );
+}

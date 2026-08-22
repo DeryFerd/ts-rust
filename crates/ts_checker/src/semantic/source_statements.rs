@@ -151,10 +151,10 @@ pub(super) struct SourceLocalDeclarationSyntax {
     pub(super) initializer: NodeRef,
 }
 
-/// One exact block arm ending in a value-returning `return`.
+/// One exact `if` arm ending in a value-returning `return`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SourceReturnBranchSyntax {
-    pub(super) block: NodeRef,
+    pub(super) block: Option<NodeRef>,
     pub(super) locals: Vec<SourceLocalDeclarationSyntax>,
     pub(super) return_statement: NodeRef,
     pub(super) return_expression: NodeRef,
@@ -960,6 +960,43 @@ impl SyntaxPlanner<'_> {
         callable: NodeRef,
     ) -> Result<SourceReturnBranchSyntax, SourceFunctionStatementsError> {
         let record = self.node(block)?;
+        if let NodeData::ReturnStatement(return_data) = &record.data {
+            if record.kind != SyntaxKind::ReturnStatement
+                || record.flags.0 != 0
+                || record.parent != Some(if_statement.node)
+                || return_data.flow_node.is_some()
+                || return_data.facts != 0
+            {
+                return Err(self.unsupported(
+                    block,
+                    record.kind,
+                    SourceFunctionStatementsRole::ReturnStatement,
+                ));
+            }
+            self.validate_range(block, if_statement)?;
+            self.validate_container(block, callable)?;
+            self.validate_block_scope_container(block, callable)?;
+            let return_expression = return_data
+                .expression
+                .map(|node| self.reference(node))
+                .ok_or(SourceFunctionStatementsError::Unsupported(
+                    SourceFunctionStatementsUnsupported::MissingReturn(block),
+                ))?;
+            self.validate_parent(
+                return_expression,
+                Some(block.node),
+                SourceFunctionStatementsRole::ReturnExpression,
+            )?;
+            self.validate_range(return_expression, block)?;
+            self.validate_container(return_expression, callable)?;
+            self.validate_block_scope_container(return_expression, callable)?;
+            return Ok(SourceReturnBranchSyntax {
+                block: None,
+                locals: Vec::new(),
+                return_statement: block,
+                return_expression,
+            });
+        }
         let NodeData::Block(block_data) = &record.data else {
             return Err(self.unsupported(
                 block,
@@ -1042,7 +1079,7 @@ impl SyntaxPlanner<'_> {
         self.validate_block_scope_container(return_expression, block)?;
 
         Ok(SourceReturnBranchSyntax {
-            block,
+            block: Some(block),
             locals,
             return_statement,
             return_expression,
@@ -1957,14 +1994,14 @@ mod joined_tests {
                 .joined_if
                 .typeof_condition
                 .expect("expected a retained typeof condition");
-            assert_eq!(typeof_condition.identifier, syntax.joined_if.condition_identifier);
+            assert_eq!(
+                typeof_condition.identifier,
+                syntax.joined_if.condition_identifier
+            );
             assert_eq!(typeof_condition.comparison, comparison);
             assert_eq!(typeof_condition.type_of_on_left, type_of_on_left);
 
-            for branch in [
-                &syntax.joined_if.then_branch,
-                &syntax.joined_if.else_branch,
-            ] {
+            for branch in [&syntax.joined_if.then_branch, &syntax.joined_if.else_branch] {
                 let flow = fixture.bound.flow_at(branch.locals[0].name).unwrap();
                 let flow = fixture.bound.flow_graph().nodes().get(flow).unwrap();
                 assert_eq!(

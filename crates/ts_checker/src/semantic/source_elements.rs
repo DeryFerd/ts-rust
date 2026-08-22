@@ -3,10 +3,11 @@
 //! This is the dependency-closed expression prefix of pinned
 //! `checkElementAccessExpression` plus `getPropertyTypeForIndexType`. It
 //! supports canonical `any`, direct `Array<T>`/`ReadonlyArray<T>` references,
-//! required own properties selected by string or number literals, primitive
-//! string indexing, and resolved anonymous string/number index signatures.
-//! Optional chains, writes, tuples, unions, generic indexed access types, and
-//! apparent/global property lookup stay typed boundaries.
+//! required own and shared union properties selected by string or number
+//! literals, primitive string indexing, resolved anonymous string/number index
+//! signatures, and finite unions of valid literal keys. Optional chains,
+//! writes, tuples, generic indexed access types, and apparent/global property
+//! lookup stay typed boundaries.
 
 use std::collections::HashSet;
 
@@ -19,11 +20,12 @@ use super::{
     CanonicalTypeFormatFlags, CanonicalTypeMapperStore, DeclaredTypeHost, RelationUnavailable,
     SymbolNodeLinks, TypeDisplayUnavailable, TypeId, TypeNodeLinks,
     array_types::CanonicalArrayTargets,
-    bootstrap::LiteralTypeCacheError,
+    bootstrap::{LiteralTypeCacheError, UnionReduction},
     formatter::{
         type_to_string_with_host_and_flags, type_to_string_with_host_global_types_and_flags,
     },
-    source::{PlannedExpression, PlannedExpressionKind},
+    member_resolution::UnionPropertyError,
+    source::PlannedExpression,
     store::SourceNodeParent,
     type_records::{LiteralValue, TypeCacheState, TypeData},
     types::{ObjectFlags, TypeFlags},
@@ -223,25 +225,12 @@ pub(super) fn finish_direct_source_element_plan(
     receiver: PlannedExpression,
     index: PlannedExpression,
 ) -> Result<SourceElementPlan, SourceElementError> {
-    if receiver.node != syntax.receiver
-        || !matches!(receiver.kind, PlannedExpressionKind::Identifier(_))
-    {
+    if receiver.node != syntax.receiver {
         return Err(SourceElementError::Unsupported(
             SourceElementUnsupported::Receiver(syntax.receiver),
         ));
     }
-    if index.node != syntax.index
-        || !matches!(
-            index.kind,
-            PlannedExpressionKind::Null
-                | PlannedExpressionKind::String(_)
-                | PlannedExpressionKind::Number { .. }
-                | PlannedExpressionKind::BigInt { .. }
-                | PlannedExpressionKind::Boolean(_)
-                | PlannedExpressionKind::GlobalUndefined
-                | PlannedExpressionKind::Identifier(_)
-        )
-    {
+    if index.node != syntax.index {
         return Err(SourceElementError::Unsupported(
             SourceElementUnsupported::Index(syntax.index),
         ));
@@ -313,7 +302,7 @@ fn check_direct_source_element_worker(
     if store.type_payload(receiver_type).is_none() {
         return Err(SourceElementError::InvalidType(receiver_type));
     }
-    let index = classify_index(store, index_type)?;
+    let indices = classify_indices(store, index_type)?;
     let bootstrap = store
         .intrinsic_bootstrap()
         .ok_or(RelationUnavailable::MissingBootstrap)?;
@@ -321,7 +310,84 @@ fn check_direct_source_element_worker(
     let error = bootstrap.error_type;
     let string = bootstrap.string_type;
 
-    let resolution = if matches!(index.shape, IndexShape::Invalid) {
+    let mut resolutions = Vec::with_capacity(indices.len());
+    for index in &indices {
+        let resolution = resolve_element_index(
+            store,
+            array_targets,
+            plan,
+            receiver_type,
+            index,
+            any,
+            error,
+            string,
+        )?;
+        if indices.len() != 1 && resolution.diagnostic.is_some() {
+            return Err(SourceElementError::Unsupported(
+                SourceElementUnsupported::IndexType(index_type),
+            ));
+        }
+        resolutions.push(resolution);
+    }
+    let resolution = if let [resolution] = resolutions.as_slice() {
+        *resolution
+    } else {
+        let values = resolutions
+            .iter()
+            .map(|resolution| resolution.type_)
+            .collect::<Vec<_>>();
+        let type_ = if values.iter().all(|value| *value == values[0]) {
+            values[0]
+        } else if let Some(global_types) = global_types {
+            store.expression_union_type_with_global_types(
+                global_types,
+                &values,
+                UnionReduction::Literal,
+            )?
+        } else {
+            #[cfg(test)]
+            {
+                store.expression_union_type(&values, UnionReduction::Literal)?
+            }
+            #[cfg(not(test))]
+            {
+                return Err(SourceElementError::Unsupported(
+                    SourceElementUnsupported::IndexType(index_type),
+                ));
+            }
+        };
+        ElementResolution::success(type_, None)
+    };
+
+    let diagnostic = prepare_element_diagnostic(
+        store,
+        host,
+        global_types,
+        options,
+        plan,
+        receiver_type,
+        index_type,
+        resolution.diagnostic,
+    )?;
+    publish_element_links(store, plan.node, resolution.property, resolution.type_)?;
+    Ok(CheckedSourceElement {
+        type_: resolution.type_,
+        diagnostic,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_element_index(
+    store: &mut CanonicalTypeMapperStore,
+    array_targets: CanonicalArrayTargets,
+    plan: &SourceElementPlan,
+    receiver_type: TypeId,
+    index: &ClassifiedIndex,
+    any: TypeId,
+    error: TypeId,
+    string: TypeId,
+) -> Result<ElementResolution, SourceElementError> {
+    Ok(if matches!(index.shape, IndexShape::Invalid) {
         ElementResolution::diagnostic(error, ElementDiagnostic::InvalidIndexType)
     } else if receiver_type == any {
         ElementResolution::success(any, None)
@@ -344,23 +410,7 @@ fn check_direct_source_element_worker(
             ElementResolution::diagnostic(error, ElementDiagnostic::InvalidIndexType)
         }
     } else {
-        resolve_object_element(store, plan, receiver_type, &index, any, error)?
-    };
-
-    let diagnostic = prepare_element_diagnostic(
-        store,
-        host,
-        global_types,
-        options,
-        plan,
-        receiver_type,
-        index_type,
-        resolution.diagnostic,
-    )?;
-    publish_element_links(store, plan.node, resolution.property, resolution.type_)?;
-    Ok(CheckedSourceElement {
-        type_: resolution.type_,
-        diagnostic,
+        resolve_object_element(store, plan, receiver_type, index, any, error)?
     })
 }
 
@@ -392,6 +442,51 @@ impl ClassifiedIndex {
     }
 }
 
+fn classify_indices(
+    store: &CanonicalTypeMapperStore,
+    index_type: TypeId,
+) -> Result<Vec<ClassifiedIndex>, SourceElementError> {
+    let mut types = Vec::new();
+    collect_index_types(store, index_type, &mut types, &mut HashSet::new())?;
+    types
+        .into_iter()
+        .map(|type_| classify_index(store, type_))
+        .collect()
+}
+
+fn collect_index_types(
+    store: &CanonicalTypeMapperStore,
+    index_type: TypeId,
+    result: &mut Vec<TypeId>,
+    visiting: &mut HashSet<TypeId>,
+) -> Result<(), SourceElementError> {
+    let record = store
+        .type_payload(index_type)
+        .ok_or(SourceElementError::InvalidType(index_type))?;
+    if !record.flags().intersects(TypeFlags::UNION) {
+        if matches!(record.data(), TypeData::Union(_)) {
+            return Err(SourceElementError::InvalidType(index_type));
+        }
+        result.push(index_type);
+        return Ok(());
+    }
+    let TypeData::Union(union) = record.data() else {
+        return Err(SourceElementError::InvalidType(index_type));
+    };
+    if record.flags().intersects(TypeFlags::BOOLEAN) {
+        result.push(index_type);
+        return Ok(());
+    }
+    if union.union.types.is_empty() || !visiting.insert(index_type) {
+        return Err(SourceElementError::InvalidType(index_type));
+    }
+    for constituent in &union.union.types {
+        collect_index_types(store, *constituent, result, visiting)?;
+    }
+    visiting.remove(&index_type);
+    Ok(())
+}
+
 fn classify_index(
     store: &CanonicalTypeMapperStore,
     index_type: TypeId,
@@ -418,6 +513,12 @@ fn classify_index(
     if flags == TypeFlags::ANY {
         return Ok(ClassifiedIndex {
             shape: IndexShape::Any,
+            property_name: None,
+        });
+    }
+    if flags.intersects(TypeFlags::BOOLEAN) {
+        return Ok(ClassifiedIndex {
+            shape: IndexShape::Invalid,
             property_name: None,
         });
     }
@@ -529,6 +630,23 @@ fn resolve_object_element(
     }
 
     if let Some(name) = index.property_name.as_deref() {
+        if store
+            .type_payload(receiver_type)
+            .is_some_and(|record| record.flags().intersects(TypeFlags::UNION))
+        {
+            let property = store
+                .resolved_union_property(receiver_type, name)
+                .map_err(|error| union_property_error(plan.node, receiver_type, error))?;
+            return Ok(match property {
+                Some(property) => {
+                    ElementResolution::success(property.type_id(), Some(property.symbol()))
+                }
+                None => ElementResolution::diagnostic(
+                    error_type,
+                    ElementDiagnostic::MissingLiteralProperty,
+                ),
+            });
+        }
         match store.resolved_own_property(receiver_type, name) {
             Ok(Some(property)) => {
                 if property.optional {
@@ -589,6 +707,29 @@ fn resolve_object_element(
             ElementDiagnostic::MissingBroadIndex
         },
     ))
+}
+
+fn union_property_error(
+    node: NodeRef,
+    receiver_type: TypeId,
+    error: UnionPropertyError,
+) -> SourceElementError {
+    match error {
+        UnionPropertyError::UnsupportedUnion(_)
+        | UnionPropertyError::UnsupportedConstituent(_)
+        | UnionPropertyError::UnsupportedPropertyType(_)
+        | UnionPropertyError::UnsupportedExactOptionalProperty(_) => {
+            SourceElementError::Unsupported(SourceElementUnsupported::IndexSignatureSurface(
+                receiver_type,
+            ))
+        }
+        UnionPropertyError::InvalidUnion(_)
+        | UnionPropertyError::InvalidProperty(_)
+        | UnionPropertyError::InvalidCache(_)
+        | UnionPropertyError::Capacity(_) => SourceElementError::InvalidCache(node),
+        UnionPropertyError::Relation(error) => SourceElementError::Relation(error),
+        UnionPropertyError::TypeCache(error) => SourceElementError::Literal(error),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -945,7 +1086,7 @@ mod tests {
         DeclaredTypeLinks, IntrinsicBootstrapOptions, ValueSymbolLinks,
         declared::type_list_key,
         global_types::create_type_from_generic_global_type,
-        source::{PlannedIdentifierRead, PlannedIdentifierReadKind},
+        source::{PlannedExpressionKind, PlannedIdentifierRead, PlannedIdentifierReadKind},
     };
 
     fn parse_fixture(text: &str) -> ParseResult {

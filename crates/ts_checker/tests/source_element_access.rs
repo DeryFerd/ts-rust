@@ -4,7 +4,7 @@ use ts_binder::{
     EscapedName,
 };
 use ts_checker::semantic::{CanonicalCheckerContext, CanonicalCheckerOptions, TypeId};
-use ts_parser::{parse_source_file, ParseResult};
+use ts_parser::{ParseResult, parse_source_file};
 
 const LIBRARY: &str = "interface Array<T> {} interface ReadonlyArray<T> {}";
 
@@ -163,10 +163,12 @@ fn source_element_access_checks_properties_arrays_strings_compositions_and_diagn
     }
 
     let known = variable_initializer(&parsed, file, "known");
-    assert!(context
-        .store()
-        .symbol_node_links(known)
-        .is_some_and(|links| links.resolved_symbol.is_some()));
+    assert!(
+        context
+            .store()
+            .symbol_node_links(known)
+            .is_some_and(|links| links.resolved_symbol.is_some())
+    );
 
     let diagnostics = context
         .diagnostics()
@@ -193,4 +195,132 @@ fn source_element_access_checks_properties_arrays_strings_compositions_and_diagn
     context.check_source_file(file).unwrap();
     assert_eq!(context.store().type_len(), type_count);
     assert_eq!(context.diagnostics(), &diagnostics);
+}
+
+#[test]
+fn indexed_access_accepts_nested_receivers_parenthesized_keys_and_literal_key_unions() {
+    let source = concat!(
+        "type Pair = { first: number; second: string };\n",
+        "type Numbers = { first: number; second: number };\n",
+        "type Left = { value: number; left: string };\n",
+        "type Right = { value: string; right: number };\n",
+        "function select(pair: Pair, key: \"first\" | \"second\"): string | number {\n",
+        "  return pair[key];\n",
+        "}\n",
+        "function selectNumber(pair: Numbers, key: \"first\" | \"second\"): number {\n",
+        "  return pair[key];\n",
+        "}\n",
+        "function shared(pair: Left | Right): string | number {\n",
+        "  return pair[\"value\"];\n",
+        "}\n",
+        "function arrayAt(values: number[], key: 0 | 1): number {\n",
+        "  return values[key];\n",
+        "}\n",
+        "const container = { text: \"ab\" };\n",
+        "const matrix: number[][] = [[1, 2]];\n",
+        "const fromProperty = container.text[0];\n",
+        "const fromElement = matrix[0][0];\n",
+        "const wrappedReceiver = (matrix)[0];\n",
+        "const wrappedIndex = matrix[(0)];\n",
+    );
+    let library = parse_source_file(LIBRARY);
+    assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+    let parsed = parse_source_file(source);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let library_file = FileId::new(20);
+    let file = FileId::new(21);
+    let mut context = context(&library, library_file, &parsed, file);
+
+    context.check_source_file(file).unwrap();
+    assert!(context.diagnostics().is_empty());
+    for (name, expected) in [
+        ("fromProperty", "string"),
+        ("fromElement", "number"),
+        ("wrappedReceiver", "number[]"),
+        ("wrappedIndex", "number[]"),
+    ] {
+        assert_eq!(
+            context
+                .type_to_string(resolved_type(
+                    &context,
+                    variable_initializer(&parsed, file, name),
+                ))
+                .unwrap(),
+            expected,
+            "initializer for {name}",
+        );
+    }
+
+    for (expression, expected) in [
+        ("pair[key]", "string | number"),
+        ("pair[\"value\"]", "string | number"),
+        ("values[key]", "number"),
+    ] {
+        let element = element_expression(source, &parsed, file, expression);
+        assert_eq!(
+            context
+                .type_to_string(resolved_type(&context, element))
+                .unwrap(),
+            expected,
+            "element {expression}",
+        );
+    }
+
+    let union_key = element_expression(source, &parsed, file, "pair[key]");
+    assert!(
+        context
+            .store()
+            .symbol_node_links(union_key)
+            .is_none_or(|links| links.resolved_symbol.is_none()),
+    );
+    let union_property = element_expression(source, &parsed, file, "pair[\"value\"]");
+    assert!(
+        context
+            .store()
+            .symbol_node_links(union_property)
+            .is_some_and(|links| links.resolved_symbol.is_some()),
+    );
+
+    let counts = (
+        context.store().type_len(),
+        context.store().mapper_len(),
+        context.store().signature_len(),
+    );
+    context.check_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().mapper_len(),
+            context.store().signature_len(),
+        ),
+        counts,
+    );
+}
+
+#[test]
+fn boolean_index_reports_the_complete_boolean_type() {
+    let source = concat!(
+        "type Pair = { first: number };\n",
+        "function invalid(pair: Pair, key: boolean): unknown {\n",
+        "  return pair[key];\n",
+        "}\n",
+    );
+    let library = parse_source_file(LIBRARY);
+    assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+    let parsed = parse_source_file(source);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let library_file = FileId::new(22);
+    let file = FileId::new(23);
+    let mut context = context(&library, library_file, &parsed, file);
+
+    context.check_source_file(file).unwrap();
+    let [diagnostic] = context.diagnostics().as_slice() else {
+        panic!("expected one invalid-index diagnostic")
+    };
+    assert_eq!(diagnostic.diagnostic.code(), 2538);
+    assert_eq!(node_text(source, &parsed, diagnostic.node.unwrap()), "key");
+    assert_eq!(
+        diagnostic.diagnostic.render().unwrap(),
+        "Type 'boolean' cannot be used as an index type.",
+    );
 }

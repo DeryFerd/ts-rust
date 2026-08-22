@@ -378,14 +378,7 @@ impl SourceFlowPlan {
                 .points
                 .get(point)
                 .ok_or(SourceFlowInvariant::MissingFlowPoint(*point))?;
-            self.validate_flow(
-                graph,
-                flow,
-                0,
-                &mut validated,
-                &mut visiting,
-                &mut coverage,
-            )?;
+            self.validate_flow(graph, flow, 0, &mut validated, &mut visiting, &mut coverage)?;
         }
         for declaration in self.assignments.keys() {
             if !coverage.assignments.contains(declaration) {
@@ -426,8 +419,7 @@ impl SourceFlowPlan {
         if !visiting.insert(flow) {
             return Err(SourceFlowInvariant::Cycle(flow).into());
         }
-        let result =
-            self.validate_flow_uncached(graph, flow, depth, validated, visiting, coverage);
+        let result = self.validate_flow_uncached(graph, flow, depth, validated, visiting, coverage);
         let removed = visiting.remove(&flow);
         debug_assert!(removed);
         if result.is_ok() {
@@ -455,14 +447,7 @@ impl SourceFlowPlan {
                     return Err(SourceFlowInvariant::UnknownAssignment(declaration).into());
                 }
                 coverage.assignments.insert(declaration);
-                self.validate_flow(
-                    graph,
-                    antecedent,
-                    depth + 1,
-                    validated,
-                    visiting,
-                    coverage,
-                )
+                self.validate_flow(graph, antecedent, depth + 1, validated, visiting, coverage)
             }
             kind @ (SourceFlowKind::TrueCondition | SourceFlowKind::FalseCondition) => {
                 let antecedent = linear_antecedent(flow, &node)?;
@@ -478,33 +463,12 @@ impl SourceFlowPlan {
                     | SourceFlowKind::BranchLabel => unreachable!(),
                 };
                 *coverage.condition_edges.entry(condition).or_default() |= edge;
-                self.validate_flow(
-                    graph,
-                    antecedent,
-                    depth + 1,
-                    validated,
-                    visiting,
-                    coverage,
-                )
+                self.validate_flow(graph, antecedent, depth + 1, validated, visiting, coverage)
             }
             SourceFlowKind::BranchLabel => {
                 let [then_flow, else_flow] = branch_antecedents(flow, &node)?;
-                self.validate_flow(
-                    graph,
-                    then_flow,
-                    depth + 1,
-                    validated,
-                    visiting,
-                    coverage,
-                )?;
-                self.validate_flow(
-                    graph,
-                    else_flow,
-                    depth + 1,
-                    validated,
-                    visiting,
-                    coverage,
-                )
+                self.validate_flow(graph, then_flow, depth + 1, validated, visiting, coverage)?;
+                self.validate_flow(graph, else_flow, depth + 1, validated, visiting, coverage)
             }
         }
     }
@@ -679,9 +643,9 @@ impl SourceFlowFrame<'_, '_> {
                         SourceTypeofNarrowingError::Union(error) => {
                             SourceFlowError::Join { flow, error }
                         }
-                        error => SourceFlowError::Invariant(
-                            SourceFlowInvariant::TypeofNarrowing(error),
-                        ),
+                        error => {
+                            SourceFlowError::Invariant(SourceFlowInvariant::TypeofNarrowing(error))
+                        }
                     })?,
                 };
                 Ok(prior.with_type(condition.symbol(), narrowed))
@@ -713,10 +677,9 @@ impl SourceFlowFrame<'_, '_> {
 
         let mut joined = SourceFlowTypes::with_capacity(symbols.len());
         for symbol in symbols {
-            let (Some(then_type), Some(else_type)) = (
-                then_snapshot.type_of(symbol),
-                else_snapshot.type_of(symbol),
-            ) else {
+            let (Some(then_type), Some(else_type)) =
+                (then_snapshot.type_of(symbol), else_snapshot.type_of(symbol))
+            else {
                 return Err(SourceFlowInvariant::MissingCurrentType(symbol).into());
             };
             let candidates = self.join_identity_candidates(symbol);
@@ -914,9 +877,7 @@ fn source_typeof_leaf_matches(
     let function_object = if flags.intersects(TypeFlags::OBJECT) {
         let known_function = store
             .intrinsic_bootstrap()
-            .map(|bootstrap| {
-                type_ == globals.function_type || type_ == bootstrap.any_function_type
-            })
+            .map(|bootstrap| type_ == globals.function_type || type_ == bootstrap.any_function_type)
             .ok_or(SourceTypeofNarrowingError::MissingBootstrap)?;
         if !known_function
             && !record
