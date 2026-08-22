@@ -7298,6 +7298,20 @@ fn canonical_static_module_specifiers(
             continue;
         };
         let specifier = NodeRef::new(source.parse.arena.id(), source.id, specifier);
+        let Some(specifier_node) = source.parse.arena.get(specifier.node) else {
+            return Err(CanonicalProgramCheckError::InvalidModuleSpecifier(
+                specifier,
+            ));
+        };
+        match (specifier_node.kind, &specifier_node.data) {
+            (SyntaxKind::StringLiteral, NodeData::StringLiteral(_)) => {}
+            (SyntaxKind::StringLiteral, _) | (_, NodeData::StringLiteral(_)) => {
+                return Err(CanonicalProgramCheckError::InvalidModuleSpecifier(
+                    specifier,
+                ));
+            }
+            _ => continue,
+        }
         let requested_mode =
             canonical_resolution_mode_override(source, attributes, type_only, specifier)?
                 .or(syntax_mode);
@@ -8732,6 +8746,113 @@ mod tests {
             manifest.entries()[0].resolution(),
             CanonicalModuleResolutionInput::Resolved(_)
         ));
+    }
+
+    #[test]
+    fn canonical_module_manifest_skips_recovered_bigint_import_specifiers() {
+        for recovered in [
+            r#"import { 0n as broken } from "./broken";"#,
+            r#"import { broken as 0n } from "./broken";"#,
+        ] {
+            let fs = MemoryFileSystem::new(true);
+            fs.write_file("/project/target.ts", "export const value: number = 1;")
+                .unwrap();
+            fs.write_file(
+                "/project/importer.ts",
+                &format!("import {{ value }} from './target';\n{recovered}"),
+            )
+            .unwrap();
+            let program = Program::new_with_options(
+                &fs,
+                "/project",
+                &["importer.ts".to_owned()],
+                plain_esm_bundler_options(),
+            );
+
+            assert_eq!(
+                program
+                    .diagnostics()
+                    .iter()
+                    .filter_map(|diagnostic| diagnostic.code)
+                    .collect::<Vec<_>>(),
+                [1003, 1128, 1434],
+                "{recovered}: {:?}",
+                program.diagnostics()
+            );
+            let manifest = program
+                .canonical_module_resolution_manifest()
+                .unwrap_or_else(|error| panic!("{recovered}: {error:?}"));
+            let [entry] = manifest.entries() else {
+                panic!("expected only the valid module import: {recovered}");
+            };
+            let CanonicalModuleResolutionInput::Resolved(resolved) = entry.resolution() else {
+                panic!("the neighboring valid module import must resolve: {recovered}");
+            };
+            assert_eq!(
+                resolved.target_file(),
+                program.source_file("/project/target.ts").unwrap().id
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_module_manifest_rejects_corrupted_specifier_nodes_as_invariants() {
+        for missing_node in [false, true] {
+            let fs = MemoryFileSystem::new(true);
+            fs.write_file("/project/target.ts", "export const value: number = 1;")
+                .unwrap();
+            fs.write_file("/project/importer.ts", "import { value } from './target';")
+                .unwrap();
+            let mut program = Program::new_with_options(
+                &fs,
+                "/project",
+                &["importer.ts".to_owned()],
+                plain_esm_bundler_options(),
+            );
+            let importer_index = program
+                .source_file("/project/importer.ts")
+                .unwrap()
+                .id
+                .index();
+            let source = &mut program.source_files[importer_index];
+            let statement = match &source
+                .parse
+                .arena
+                .get(source.parse.source_file)
+                .unwrap()
+                .data
+            {
+                NodeData::SourceFile(file) => file.statements.nodes[0],
+                _ => panic!("expected an importer source file"),
+            };
+            let specifier = match &source.parse.arena.get(statement).unwrap().data {
+                NodeData::ImportDeclaration(import) => import.module_specifier,
+                _ => panic!("expected an import declaration"),
+            };
+            let expected = if missing_node {
+                let missing = ts_ast::NodeId::new(u32::MAX);
+                let NodeData::ImportDeclaration(import) =
+                    &mut source.parse.arena.get_mut(statement).unwrap().data
+                else {
+                    panic!("expected a mutable import declaration");
+                };
+                import.module_specifier = missing;
+                missing
+            } else {
+                source.parse.arena.get_mut(specifier).unwrap().kind = SyntaxKind::Identifier;
+                specifier
+            };
+
+            let Err(error) = program.canonical_module_resolution_manifest() else {
+                panic!("expected an invalid module specifier, missing={missing_node}");
+            };
+            assert!(!error.is_unsupported_boundary(), "{error:?}");
+            assert!(matches!(
+                error,
+                CanonicalProgramCheckError::InvalidModuleSpecifier(actual)
+                    if actual.node == expected
+            ));
+        }
     }
 
     #[test]
