@@ -82,7 +82,7 @@ fn build(options: &BuildOptions) -> ExitCode {
     };
     if options.force
         && let Err(error) =
-            invalidate_project_build_info(&file_system, &current_directory_text, &roots, overrides)
+            invalidate_project_build_info(file_system, &current_directory_text, &roots, overrides)
     {
         eprintln!("{error}");
         return exit(ExitStatus::DiagnosticsPresentOutputsSkipped);
@@ -366,7 +366,7 @@ impl WatchCompiler for BuildWatchCompiler {
             ..ProgramOptionsOverride::default()
         };
         if self.options.force {
-            invalidate_project_build_info(&file_system, &current_directory, &self.roots, overrides)
+            invalidate_project_build_info(file_system, &current_directory, &self.roots, overrides)
                 .map_err(WatchError::Compile)?;
             self.options.force = false;
         }
@@ -522,14 +522,14 @@ fn resolve_project_path(
 }
 
 fn invalidate_project_build_info(
-    file_system: &OsFileSystem,
+    file_system: OsFileSystem,
     current_directory: &str,
     roots: &[String],
     overrides: ProgramOptionsOverride,
 ) -> Result<(), String> {
-    let graph = load_project_graph(file_system, current_directory, roots);
+    let graph = load_project_graph(&file_system, current_directory, roots);
     for config_path in graph.projects {
-        let program = Program::from_config_with_options(file_system, &config_path, overrides);
+        let program = Program::from_config_with_options(&file_system, &config_path, overrides);
         let build_info_path = program.options().ts_build_info_file.as_ref().map_or_else(
             || Path::new(&config_path).with_extension("tsbuildinfo"),
             PathBuf::from,

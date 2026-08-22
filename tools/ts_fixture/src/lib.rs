@@ -227,6 +227,7 @@ pub enum OutputDifferenceKind {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[allow(clippy::struct_excessive_bools)] // Keep each independent CLI mode directly addressable.
 pub struct RunnerOptions {
     pub filter: Option<String>,
     pub skip: usize,
@@ -1503,6 +1504,7 @@ struct FixedDiagnosticCase {
     disposition: UpstreamCaseDisposition,
 }
 
+#[allow(clippy::too_many_lines)] // Keep variant expansion and oracle selection in one ordered pass.
 fn prepare_diagnostic_case_variants(
     repository: &Path,
     case_path: &Path,
@@ -2109,7 +2111,9 @@ fn execute_diagnostic_variant(
                 comparison
                     .mismatch_kinds
                     .push(DiagnosticArtifactMismatchKind::Artifact);
-                comparison.first_difference = mismatch.first_difference.clone();
+                comparison
+                    .first_difference
+                    .clone_from(&mismatch.first_difference);
             }
         }
     }
@@ -2202,6 +2206,7 @@ fn execute_diagnostic_variant(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)] // Keep fixed manifest validation and execution order together.
 fn run_fixed_variant_diagnostic_baselines(
     repository: &Path,
     options: &RunnerOptions,

@@ -9122,6 +9122,7 @@ Merged.fresh = 1;
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Keep one complete CommonJS binding scenario together.
     fn javascript_commonjs_assignments_create_exact_source_exports_and_locals() {
         let parsed = parse_javascript_source_file(concat!(
             "exports.first = 1;\n",

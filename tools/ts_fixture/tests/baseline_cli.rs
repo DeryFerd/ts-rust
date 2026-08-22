@@ -823,6 +823,7 @@ fn canonical_checker_matches_related_information_artifact_and_scorecard_exactly(
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // Keep pinned project and directive oracle cases side by side.
 fn canonical_fixture_configs_match_pinned_project_and_type_directive_oracles() {
     for (name, source, baseline) in [
         (

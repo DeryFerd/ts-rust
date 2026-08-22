@@ -4035,6 +4035,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Keep the complete LSP lifecycle in one scenario.
     fn runs_an_in_memory_lifecycle_and_document_session() {
         let uri = DocumentUri("file:///workspace/main.ts".to_owned());
         let mut input = FramedWriter::new(Vec::new());
