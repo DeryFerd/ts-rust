@@ -5,6 +5,7 @@ use ts_path::{
     CaseSensitivity, FileExtension, canonical_file_name, canonicalize, change_extension,
     common_path_prefix, declaration_emit_extension, directory_path,
     ensure_trailing_directory_separator, extension_from_path, normalize_path, resolve_path,
+    root_length,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -109,7 +110,20 @@ pub fn source_file_path_in_new_directory(
     ));
     let canonical_source = canonical_file_name(&source, case_sensitivity);
     let canonical_common = canonical_file_name(&common, case_sensitivity);
-    let Some(remainder) = canonical_source.strip_prefix(&canonical_common) else {
+    let source_root = root_length(&canonical_source);
+    let common_root = root_length(&canonical_common);
+    if canonical_file_name(
+        &canonical_source[..source_root],
+        CaseSensitivity::Insensitive,
+    ) != canonical_file_name(
+        &canonical_common[..common_root],
+        CaseSensitivity::Insensitive,
+    ) {
+        return source;
+    }
+    let Some(remainder) =
+        canonical_source[source_root..].strip_prefix(&canonical_common[common_root..])
+    else {
         return source;
     };
     let component_count = remainder.bytes().filter(|byte| *byte == b'/').count() + 1;
@@ -280,6 +294,16 @@ mod tests {
                 CaseSensitivity::Insensitive,
             ),
             "/dist/a.ts"
+        );
+        assert_eq!(
+            source_file_path_in_new_directory(
+                "C:/Project/src/a.ts",
+                "D:/dist",
+                "C:/Project",
+                "c:/Project/src",
+                CaseSensitivity::Sensitive,
+            ),
+            "D:/dist/a.ts"
         );
         assert_eq!(
             source_file_path_in_new_directory(

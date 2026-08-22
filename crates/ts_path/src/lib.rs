@@ -309,7 +309,9 @@ pub fn relative_path_from_directory(
     let target = normalize_path(target);
     let directory_root = root_length(&directory);
     let target_root = root_length(&target);
-    if !directory[..directory_root].eq_ignore_ascii_case(&target[..target_root]) {
+    if canonical_file_name(&directory[..directory_root], CaseSensitivity::Insensitive)
+        != canonical_file_name(&target[..target_root], CaseSensitivity::Insensitive)
+    {
         return path_from_components(
             &target[..target_root],
             &path_components(&target, target_root),
@@ -409,7 +411,9 @@ pub fn common_path_prefix(paths: &[&str], case_sensitivity: CaseSensitivity) -> 
     for path in &paths[1..] {
         let path = normalize_path(path);
         let path_root = root_length(&path);
-        if !root_text.eq_ignore_ascii_case(&path[..path_root]) {
+        if canonical_file_name(root_text, CaseSensitivity::Insensitive)
+            != canonical_file_name(&path[..path_root], CaseSensitivity::Insensitive)
+        {
             return None;
         }
         let parts: Vec<&str> = path[path_root..]
@@ -617,6 +621,16 @@ mod tests {
         );
         assert_eq!(
             common_path_prefix(
+                &[
+                    "//S\u{00c9}RVER/share/first.ts",
+                    "//s\u{00e9}rver/share/second.ts",
+                ],
+                CaseSensitivity::Sensitive,
+            ),
+            Some("//S\u{00c9}RVER/share".into())
+        );
+        assert_eq!(
+            common_path_prefix(
                 &["/src/CAF\u{00c9}/first.ts", "/src/caf\u{00e9}/second.ts",],
                 CaseSensitivity::Insensitive,
             ),
@@ -665,6 +679,14 @@ mod tests {
                 CaseSensitivity::Sensitive,
             ),
             "//other/share/a.ts"
+        );
+        assert_eq!(
+            relative_path_from_directory(
+                "//S\u{00c9}RVER/share",
+                "//s\u{00e9}rver/share/a.ts",
+                CaseSensitivity::Sensitive,
+            ),
+            "a.ts"
         );
         assert_eq!(
             relative_path_from_directory(

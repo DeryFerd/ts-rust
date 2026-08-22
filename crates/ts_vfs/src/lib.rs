@@ -494,7 +494,12 @@ impl FileSystem for MemoryFileSystem {
             .read()
             .map_err(|_| Self::lock_error())?
             .get(&canonical)
-            .map(|file| file.contents.clone())
+            .map(|file| {
+                file.contents
+                    .strip_prefix('\u{feff}')
+                    .unwrap_or(&file.contents)
+                    .to_owned()
+            })
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, canonical))
     }
 
@@ -659,6 +664,23 @@ mod tests {
             "export {}"
         );
         assert_eq!(fs.file_paths()?, vec!["/src/compiler/scanner.ts"]);
+        Ok(())
+    }
+
+    #[test]
+    fn memory_file_system_strips_a_leading_utf8_byte_order_mark() -> io::Result<()> {
+        let file_system = MemoryFileSystem::new(true);
+        file_system.write_file("/project/source.ts", "\u{feff}const value = 1;")?;
+        file_system.write_file("/project/embedded.ts", "const value = '\u{feff}';")?;
+
+        assert_eq!(
+            file_system.read_file("/project/source.ts")?,
+            "const value = 1;"
+        );
+        assert_eq!(
+            file_system.read_file("/project/embedded.ts")?,
+            "const value = '\u{feff}';"
+        );
         Ok(())
     }
 

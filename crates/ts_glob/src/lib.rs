@@ -73,9 +73,11 @@ impl GlobPattern {
     pub fn matches(&self, path: &str) -> bool {
         let normalized = normalize_path(path);
         let root_end = root_length(&normalized);
-        if !self
-            .root
-            .eq_ignore_ascii_case(normalized_root(&normalized[..root_end]))
+        if canonical_file_name(&self.root, CaseSensitivity::Insensitive)
+            != canonical_file_name(
+                normalized_root(&normalized[..root_end]),
+                CaseSensitivity::Insensitive,
+            )
         {
             return false;
         }
@@ -320,9 +322,13 @@ fn include_traversal_root<F: FileSystem + ?Sized>(
 fn contains_path(directory: &str, path: &str, case_sensitive: bool) -> bool {
     let directory_root = root_length(directory);
     let path_root = root_length(path);
-    if !normalized_root(&directory[..directory_root])
-        .eq_ignore_ascii_case(normalized_root(&path[..path_root]))
-    {
+    if canonical_file_name(
+        normalized_root(&directory[..directory_root]),
+        CaseSensitivity::Insensitive,
+    ) != canonical_file_name(
+        normalized_root(&path[..path_root]),
+        CaseSensitivity::Insensitive,
+    ) {
         return false;
     }
     let directory = canonical(
@@ -555,6 +561,11 @@ mod tests {
             .expect("network pattern compiles");
         assert!(network.matches("//SERVER/share/nested/index.ts"));
         assert!(!network.matches("/server/share/nested/index.ts"));
+
+        let unicode_network =
+            GlobPattern::compile("//S\u{00c9}RVER/share/**/*.ts", "/project", true, false)
+                .expect("Unicode network pattern compiles");
+        assert!(unicode_network.matches("//s\u{00e9}rver/share/index.ts"));
 
         let url = GlobPattern::compile("file:///project/**/*.ts", "/project", true, false)
             .expect("file URL pattern compiles");
