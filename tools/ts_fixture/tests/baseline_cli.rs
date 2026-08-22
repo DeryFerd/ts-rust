@@ -142,11 +142,12 @@ fn canonical_scorecard_retains_capabilities_then_continues_to_exact_case() {
         None,
     );
     repository.write_case(
-        "importMetaUnsupported",
+        "spreadElementUnsupported",
         concat!(
             "// @module: esnext\n",
             "// @filename: unsupported.ts\n",
-            "const value = import.meta.url;\n",
+            "const source = [1, 2];\n",
+            "const value = [...source];\n",
         ),
         None,
     );
@@ -194,7 +195,7 @@ fn canonical_scorecard_retains_capabilities_then_continues_to_exact_case() {
     assert_eq!(variants[0]["frontierBlocker"]["code"], "E00.SOURCE_SYNTAX");
     assert_eq!(
         variants[1]["case"],
-        "testdata/tests/cases/compiler/importMetaUnsupported.ts"
+        "testdata/tests/cases/compiler/spreadElementUnsupported.ts"
     );
     assert_eq!(variants[1]["status"], "unsupported_detail");
     assert_eq!(variants[1]["outcomeClass"], "checker_capability");
@@ -202,10 +203,7 @@ fn canonical_scorecard_retains_capabilities_then_continues_to_exact_case() {
         variants[1]["frontierBlocker"]["outcomeClass"],
         "checker_capability"
     );
-    assert_eq!(
-        variants[1]["frontierBlocker"]["code"],
-        "M03.IMPORT_META_MODULE_MODE"
-    );
+    assert_eq!(variants[1]["frontierBlocker"]["code"], "E00.SOURCE_SYNTAX");
     assert_eq!(
         variants[2]["case"],
         "testdata/tests/cases/compiler/zzExact.ts"
@@ -1355,7 +1353,8 @@ fn semantic_artifacts_remain_not_reached_after_a_checker_capability() {
         concat!(
             "// @module: esnext\n",
             "// @filename: unsupported.ts\n",
-            "const value = import.meta.url;\n",
+            "const source = [1, 2];\n",
+            "const value = [...source];\n",
         ),
         None,
     );
@@ -1380,7 +1379,7 @@ fn semantic_artifacts_remain_not_reached_after_a_checker_capability() {
     );
     assert_eq!(
         scorecard["variants"][0]["frontierBlocker"]["code"],
-        "M03.IMPORT_META_MODULE_MODE"
+        "E00.SOURCE_SYNTAX"
     );
     for kind in ["types", "symbols"] {
         assert_eq!(scorecard["semanticArtifacts"][kind]["notReached"], 1);
