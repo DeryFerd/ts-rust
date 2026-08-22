@@ -2932,6 +2932,28 @@ impl<'a> ProgramChecker<'a> {
                     completed,
                 );
                 let exported_names = module_exports.keys().cloned().collect::<BTreeSet<_>>();
+                let export_assignment_root = self
+                    .resolved_module_export_symbols(target, specifier)
+                    .get("export=")
+                    .and_then(|export| {
+                        let target_source = self.sources.get(target)?;
+                        let export = target_source.bindings.symbols.get(*export)?;
+                        export
+                            .target
+                            .and_then(|target| target_source.bindings.symbols.get(target))
+                            .map(|symbol| symbol.name.clone())
+                            .or_else(|| {
+                                export.declarations.iter().find_map(|declaration| {
+                                    let NodeData::ExportAssignment(assignment) =
+                                        &target_source.arena.get(*declaration)?.data
+                                    else {
+                                        return None;
+                                    };
+                                    identifier_text(target_source.arena, assignment.expression)
+                                        .map(str::to_owned)
+                                })
+                            })
+                    });
                 let mut descriptor = module_exports.get("export=").cloned().unwrap_or_else(|| {
                     TypeDescriptor::Object {
                         properties: module_exports,
@@ -2990,6 +3012,12 @@ impl<'a> ProgramChecker<'a> {
                         .entry(specifier.to_owned())
                         .or_insert_with(|| local_name.to_owned())
                         .clone();
+                    if let Some(root) = export_assignment_root {
+                        rename_descriptor_reference_roots(
+                            &mut descriptor,
+                            &BTreeMap::from([(root, qualifier.clone())]),
+                        );
+                    }
                     rewrite_exported_named_descriptor_qualifier(
                         &mut descriptor,
                         &qualifier,
@@ -17776,6 +17804,10 @@ impl<'a> Checker<'a> {
                     NodeData::FunctionDeclaration(_)
                         | NodeData::FunctionExpression(_)
                         | NodeData::ArrowFunction(_)
+                        | NodeData::MethodDeclaration(_)
+                        | NodeData::ConstructorDeclaration(_)
+                        | NodeData::GetAccessorDeclaration(_)
+                        | NodeData::SetAccessorDeclaration(_)
                         | NodeData::ClassDeclaration(_)
                         | NodeData::ClassExpression(_)
                 )
@@ -17810,6 +17842,10 @@ impl<'a> Checker<'a> {
                         NodeData::FunctionDeclaration(_)
                             | NodeData::FunctionExpression(_)
                             | NodeData::ArrowFunction(_)
+                            | NodeData::MethodDeclaration(_)
+                            | NodeData::ConstructorDeclaration(_)
+                            | NodeData::GetAccessorDeclaration(_)
+                            | NodeData::SetAccessorDeclaration(_)
                             | NodeData::ClassDeclaration(_)
                             | NodeData::ClassExpression(_)
                     )
@@ -17845,6 +17881,12 @@ impl<'a> Checker<'a> {
                     NodeData::FunctionDeclaration(_)
                         | NodeData::FunctionExpression(_)
                         | NodeData::ArrowFunction(_)
+                        | NodeData::MethodDeclaration(_)
+                        | NodeData::ConstructorDeclaration(_)
+                        | NodeData::GetAccessorDeclaration(_)
+                        | NodeData::SetAccessorDeclaration(_)
+                        | NodeData::ClassDeclaration(_)
+                        | NodeData::ClassExpression(_)
                 )
             {
                 continue;
@@ -28142,6 +28184,33 @@ mod tests {
     }
 
     #[test]
+    fn nested_object_method_returns_do_not_escape_the_outer_function() {
+        let parsed = parse_source_file(concat!(
+            "function create() { return { ",
+            "first() { return this; }, ",
+            "second() { return this; } ",
+            "}; }",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        let create = bindings.root_scope().unwrap().symbols.get("create").unwrap();
+        let create_type = result.type_of_symbol(create).unwrap();
+        let TypeKind::Function(signature) = &result.types.get(create_type).unwrap().kind else {
+            panic!("expected a function type");
+        };
+        let TypeKind::Object(object) = &result.types.get(signature.return_type).unwrap().kind
+        else {
+            panic!(
+                "expected only the returned object, got {}",
+                result.types.display(signature.return_type)
+            );
+        };
+        assert!(object.properties.contains_key("first"));
+        assert!(object.properties.contains_key("second"));
+    }
+
+    #[test]
     fn evaluates_const_enum_members_and_publishes_their_values() {
         let parsed = parse_source_file(
             r#"
@@ -33252,6 +33321,86 @@ mod tests {
             assert_eq!(meanings.get(statement), Some(&true), "{statement:?}");
         }
         assert_eq!(meanings.get(&source.statements.nodes[5]), Some(&false));
+    }
+
+    #[test]
+    fn imported_export_assignment_rewrites_merged_namespace_type_references() {
+        let provider = parse_source_file(concat!(
+            "namespace api { ",
+            "export interface Result { listen(port: number): void; } ",
+            "export interface Middleware { (value: string): void; } ",
+            "} ",
+            "declare var api: { ",
+            "(): api.Result; ",
+            "test1: api.Middleware; ",
+            "test2(): api.Middleware; ",
+            "}; ",
+            "export = api;",
+        ));
+        let consumer = parse_source_file(concat!(
+            "import imported = require('./provider'); ",
+            "export var value = imported;",
+        ));
+        assert!(provider.diagnostics.is_empty(), "{:?}", provider.diagnostics);
+        assert!(consumer.diagnostics.is_empty(), "{:?}", consumer.diagnostics);
+        let provider_bindings = bind_source_file(&provider.arena, provider.source_file);
+        let consumer_bindings = bind_source_file(&consumer.arena, consumer.source_file);
+        let no_modules = BTreeMap::new();
+        let consumer_modules = BTreeMap::from([("./provider".into(), 0)]);
+        let checked = check_program(&[
+            ProgramSource {
+                arena: &provider.arena,
+                source_file: provider.source_file,
+                bindings: &provider_bindings,
+                resolved_modules: &no_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+            ProgramSource {
+                arena: &consumer.arena,
+                source_file: consumer.source_file,
+                bindings: &consumer_bindings,
+                resolved_modules: &consumer_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+        ]);
+        let result = &checked.files()[1];
+        let value = consumer_bindings
+            .root_scope()
+            .unwrap()
+            .symbols
+            .get("value")
+            .unwrap();
+        let value_type = result.type_of_symbol(value).unwrap();
+        let TypeKind::Object(object) = &result.types.get(value_type).unwrap().kind else {
+            panic!("expected an exported callable object");
+        };
+        let reference_name = |type_id| {
+            result
+                .named_type_references
+                .get(&type_id)
+                .map(|reference| reference.name.as_str())
+        };
+        assert_eq!(
+            reference_name(object.call_signatures[0].return_type),
+            Some("imported.Result")
+        );
+        assert_eq!(
+            reference_name(object.properties["test1"]),
+            Some("imported.Middleware")
+        );
+        let TypeKind::Function(method) =
+            &result.types.get(object.properties["test2"]).unwrap().kind
+        else {
+            panic!("expected a method signature");
+        };
+        assert_eq!(
+            reference_name(method.return_type),
+            Some("imported.Middleware")
+        );
     }
 
     #[test]
