@@ -4397,7 +4397,9 @@ fn javascript_assignment_kind(
                 .get(binary.operator_token)
                 .is_some_and(|operator| operator.kind == SyntaxKind::EqualsToken) =>
         {
-            if is_module_exports_access(arena, binary.left) {
+            if is_module_exports_access(arena, binary.left)
+                && !is_exports_identifier(arena, binary.right)
+            {
                 return Some(JavaScriptAssignmentKind::ModuleExports);
             }
             let base = access_expression_base(arena, binary.left)?;
@@ -4436,7 +4438,7 @@ fn is_javascript_require_call(arena: &NodeArena, node: NodeId) -> bool {
     let Some(NodeData::CallExpression(call)) = arena.get(node).map(|node| &node.data) else {
         return false;
     };
-    !call.arguments.nodes.is_empty()
+    call.arguments.nodes.len() == 1
         && arena
             .get(call.expression)
             .is_some_and(|expression| expression.kind == SyntaxKind::Identifier)
@@ -9007,6 +9009,114 @@ Merged.fresh = 1;
         );
         assert_eq!(binder.symbol_store().symbol_len(), 0);
         assert_eq!(binder.symbol_store().symbol_table_len(), 0);
+    }
+
+    #[test]
+    fn javascript_module_exports_self_assignment_does_not_create_commonjs_module() {
+        let parsed = parse_javascript_source_file("module.exports = exports; const marker = 1;");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(77);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/self-assignment.js\""),
+                    CanonicalSourceLanguage::JavaScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_javascript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+
+        let bound = binder.file(file).unwrap();
+        assert!(!bound.source_facts().unwrap().is_common_js_module());
+        assert_eq!(bound.symbol(bound.source_file()), None);
+        let locals = binder
+            .symbol_store()
+            .symbol_table(bound.locals(bound.source_file()).unwrap())
+            .unwrap();
+        assert!(locals.get_source("marker").is_some());
+        assert!(locals.get_source("module").is_none());
+        assert!(locals.get_source("exports").is_none());
+        let assignment = node_with_source(
+            &parsed.arena,
+            SyntaxKind::BinaryExpression,
+            "module.exports = exports",
+        );
+        assert_eq!(
+            bound.symbol(node_ref(&parsed.arena, file, assignment)),
+            None
+        );
+    }
+
+    #[test]
+    fn javascript_require_calls_need_exactly_one_argument_for_commonjs() {
+        for (index, (source, expected_commonjs, expected_flags)) in [
+            (
+                "const dependency = require();",
+                false,
+                SymbolFlags::BLOCK_SCOPED_VARIABLE,
+            ),
+            (
+                "const dependency = require(first, second);",
+                false,
+                SymbolFlags::BLOCK_SCOPED_VARIABLE,
+            ),
+            (
+                "const dependency = require(first);",
+                true,
+                SymbolFlags::ALIAS,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let parsed = parse_javascript_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(78 + u32::try_from(index).unwrap());
+            let mut binder = CanonicalBinder::new();
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source("\"/project/require.js\""),
+                        CanonicalSourceLanguage::JavaScript,
+                        false,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_javascript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+
+            let bound = binder.file(file).unwrap();
+            assert_eq!(
+                bound.source_facts().unwrap().is_common_js_module(),
+                expected_commonjs,
+                "{source}"
+            );
+            let locals = binder
+                .symbol_store()
+                .symbol_table(bound.locals(bound.source_file()).unwrap())
+                .unwrap();
+            let dependency = locals.get_source("dependency").unwrap();
+            assert_eq!(
+                binder.symbol_store().symbol(dependency).unwrap().flags(),
+                expected_flags,
+                "{source}"
+            );
+            assert_eq!(locals.get_source("module").is_some(), expected_commonjs);
+            assert_eq!(locals.get_source("exports").is_some(), expected_commonjs);
+        }
     }
 
     #[test]
