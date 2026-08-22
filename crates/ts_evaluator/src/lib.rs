@@ -42,7 +42,10 @@ impl Value {
             Self::Undefined => "undefined".to_owned(),
             Self::Array(values) => values
                 .iter()
-                .map(Self::js_string)
+                .map(|value| match value {
+                    Self::Null | Self::Undefined => String::new(),
+                    _ => value.js_string(),
+                })
                 .collect::<Vec<_>>()
                 .join(","),
             Self::Object(_) => "[object Object]".to_owned(),
@@ -257,7 +260,8 @@ impl<F: FnMut(NodeId) -> Evaluation> Evaluator<'_, F> {
     }
 
     fn evaluate_prefix(&mut self, operator: SyntaxKind, operand: NodeId) -> Evaluation {
-        let result = self.evaluate(operand);
+        let mut result = self.evaluate(operand);
+        result.metadata.is_syntactically_string = false;
         let metadata = result.metadata;
         let EvaluationOutcome::Value(value) = result.outcome else {
             return result;
@@ -302,48 +306,57 @@ impl<F: FnMut(NodeId) -> Evaluation> Evaluator<'_, F> {
 
     fn evaluate_binary(&mut self, operator: SyntaxKind, left: NodeId, right: NodeId) -> Evaluation {
         let left = self.evaluate(left);
-        let EvaluationOutcome::Value(left_value) = &left.outcome else {
-            return left;
-        };
-        if operator == SyntaxKind::AmpersandAmpersandToken && !left_value.is_truthy()
-            || operator == SyntaxKind::BarBarToken && left_value.is_truthy()
-            || operator == SyntaxKind::QuestionQuestionToken
-                && !matches!(left_value, Value::Null | Value::Undefined)
-        {
+        if matches!(left.outcome, EvaluationOutcome::Error(_)) {
             return left;
         }
+        let logical = matches!(
+            operator,
+            SyntaxKind::AmpersandAmpersandToken
+                | SyntaxKind::BarBarToken
+                | SyntaxKind::QuestionQuestionToken
+        );
+        if logical {
+            let EvaluationOutcome::Value(left_value) = &left.outcome else {
+                return left;
+            };
+            if operator == SyntaxKind::AmpersandAmpersandToken && !left_value.is_truthy()
+                || operator == SyntaxKind::BarBarToken && left_value.is_truthy()
+                || operator == SyntaxKind::QuestionQuestionToken
+                    && !matches!(left_value, Value::Null | Value::Undefined)
+            {
+                return left;
+            }
+        }
         let right = self.evaluate(right);
-        let metadata = left.metadata.merge(right.metadata);
+        let metadata = EvaluationMetadata {
+            is_syntactically_string: operator == SyntaxKind::PlusToken
+                && (left.metadata.is_syntactically_string
+                    || right.metadata.is_syntactically_string),
+            ..left.metadata.merge(right.metadata)
+        };
+        let EvaluationOutcome::Value(left_value) = &left.outcome else {
+            return Evaluation {
+                outcome: left.outcome,
+                metadata,
+            };
+        };
         let EvaluationOutcome::Value(right_value) = &right.outcome else {
             return Evaluation {
                 outcome: right.outcome,
                 metadata,
             };
         };
-        if matches!(
-            operator,
-            SyntaxKind::AmpersandAmpersandToken
-                | SyntaxKind::BarBarToken
-                | SyntaxKind::QuestionQuestionToken
-        ) {
+        if logical {
             return Evaluation {
                 outcome: EvaluationOutcome::Value(right_value.clone()),
                 metadata,
             };
         }
-        let is_string = operator == SyntaxKind::PlusToken
-            && (left.metadata.is_syntactically_string || right.metadata.is_syntactically_string);
         let outcome = binary_value(operator, left_value, right_value).map_or_else(
             || EvaluationOutcome::Unknown(UnknownReason::InvalidOperands(operator)),
             EvaluationOutcome::Value,
         );
-        Evaluation {
-            outcome,
-            metadata: EvaluationMetadata {
-                is_syntactically_string: is_string,
-                ..metadata
-            },
-        }
+        Evaluation { outcome, metadata }
     }
 
     fn evaluate_template(&mut self, head: NodeId, spans: &[NodeId]) -> Evaluation {
@@ -375,7 +388,7 @@ impl<F: FnMut(NodeId) -> Evaluation> Evaluator<'_, F> {
                     outcome: result.outcome,
                     metadata: EvaluationMetadata {
                         is_syntactically_string: true,
-                        ..metadata
+                        ..EvaluationMetadata::default()
                     },
                 };
             };
@@ -485,9 +498,13 @@ impl<F: FnMut(NodeId) -> Evaluation> Evaluator<'_, F> {
         optional: bool,
     ) -> Evaluation {
         let base = self.evaluate(expression);
-        let metadata = base.metadata;
-        let EvaluationOutcome::Value(base_value) = base.outcome else {
-            return (self.resolve_entity)(id);
+        let mut metadata = base.metadata;
+        let base_value = match base.outcome {
+            EvaluationOutcome::Value(value) => value,
+            EvaluationOutcome::Unknown(reason) if self.is_entity_name_expression(expression) => {
+                return (self.resolve_entity)(id);
+            }
+            outcome => return Evaluation { outcome, metadata },
         };
         if optional && matches!(base_value, Value::Null | Value::Undefined) {
             return Evaluation {
@@ -499,14 +516,10 @@ impl<F: FnMut(NodeId) -> Evaluation> Evaluator<'_, F> {
             Property::Node(node) => self.property_node_name(node),
             Property::Expression(expression) => {
                 let result = self.evaluate(expression);
+                metadata = metadata.merge(result.metadata);
                 match result.outcome {
                     EvaluationOutcome::Value(value) => Some(value.js_string()),
-                    outcome => {
-                        return Evaluation {
-                            outcome,
-                            metadata: metadata.merge(result.metadata),
-                        };
-                    }
+                    outcome => return Evaluation { outcome, metadata },
                 }
             }
         };
@@ -528,6 +541,19 @@ impl<F: FnMut(NodeId) -> Evaluation> Evaluator<'_, F> {
             NodeData::StringLiteral(data) => Some(data.text.clone()),
             NodeData::NumericLiteral(data) => Some(Number::from_string(&data.text).to_string()),
             _ => None,
+        }
+    }
+
+    fn is_entity_name_expression(&self, id: NodeId) -> bool {
+        match self.arena.get(id).map(|node| &node.data) {
+            Some(NodeData::Identifier(_)) => true,
+            Some(NodeData::PropertyAccessExpression(access)) => {
+                matches!(
+                    self.arena.get(access.name).map(|node| &node.data),
+                    Some(NodeData::Identifier(_))
+                ) && self.is_entity_name_expression(access.expression)
+            }
+            _ => false,
         }
     }
 }
@@ -625,18 +651,14 @@ fn property_value(value: &Value, property: &str) -> Value {
     match value {
         Value::Object(values) => values.get(property).cloned().unwrap_or(Value::Undefined),
         Value::Array(values) if property == "length" => Value::Number(length_number(values.len())),
-        Value::Array(values) => property
-            .parse::<usize>()
-            .ok()
+        Value::Array(values) => property_index(property)
             .and_then(|index| values.get(index))
             .cloned()
             .unwrap_or(Value::Undefined),
         Value::String(value) if property == "length" => {
             Value::Number(length_number(value.encode_utf16().count()))
         }
-        Value::String(value) => property
-            .parse::<usize>()
-            .ok()
+        Value::String(value) => property_index(property)
             .and_then(|index| value.encode_utf16().nth(index))
             .and_then(|value| char::from_u32(u32::from(value)))
             .map_or(Value::Undefined, |character| {
@@ -644,6 +666,11 @@ fn property_value(value: &Value, property: &str) -> Value {
             }),
         _ => Value::Undefined,
     }
+}
+
+fn property_index(property: &str) -> Option<usize> {
+    let index = property.parse::<usize>().ok()?;
+    (index.to_string() == property).then_some(index)
 }
 
 fn length_number(length: usize) -> Number {
@@ -678,8 +705,8 @@ mod tests {
     use ts_parser::parse_source_file;
 
     use super::{
-        Evaluation, EvaluationError, EvaluationOutcome, UnknownReason, Value, evaluate,
-        evaluate_with,
+        Evaluation, EvaluationError, EvaluationMetadata, EvaluationOutcome, UnknownReason, Value,
+        evaluate, evaluate_with,
     };
 
     fn parse_expression(source: &str) -> (ts_ast::NodeArena, ts_ast::NodeId) {
@@ -751,6 +778,150 @@ mod tests {
         assert_eq!(
             evaluate(&arena, ts_ast::NodeId::new(u32::MAX)).outcome,
             EvaluationOutcome::Error(EvaluationError::MissingNode(ts_ast::NodeId::new(u32::MAX)))
+        );
+    }
+
+    #[test]
+    fn evaluates_both_operands_and_retains_upstream_binary_metadata() {
+        let (arena, expression) = parse_expression("missing + external;");
+        let mut resolved = Vec::new();
+        let result = evaluate_with(&arena, expression, &mut |reference| {
+            let NodeData::Identifier(identifier) = &arena.get(reference).unwrap().data else {
+                unreachable!();
+            };
+            resolved.push(identifier.text.clone());
+            if identifier.text == "external" {
+                Evaluation {
+                    outcome: EvaluationOutcome::Value(Value::String("value".into())),
+                    metadata: EvaluationMetadata {
+                        is_syntactically_string: true,
+                        resolved_other_files: true,
+                        has_external_references: true,
+                    },
+                }
+            } else {
+                Evaluation::unknown(UnknownReason::UnresolvedEntity(reference))
+            }
+        });
+
+        assert_eq!(resolved, ["missing", "external"]);
+        assert!(matches!(
+            result.outcome,
+            EvaluationOutcome::Unknown(UnknownReason::UnresolvedEntity(_))
+        ));
+        assert_eq!(
+            result.metadata,
+            EvaluationMetadata {
+                is_syntactically_string: true,
+                resolved_other_files: true,
+                has_external_references: true,
+            }
+        );
+    }
+
+    #[test]
+    fn prefix_operators_clear_syntactic_string_metadata() {
+        let (arena, expression) = parse_expression("+external;");
+        let result = evaluate_with(&arena, expression, &mut |_| Evaluation {
+            outcome: EvaluationOutcome::Value(Value::Number(ts_jsnum::Number(2.0))),
+            metadata: EvaluationMetadata {
+                is_syntactically_string: true,
+                resolved_other_files: true,
+                has_external_references: true,
+            },
+        });
+
+        assert_eq!(result.value(), Some(&Value::Number(ts_jsnum::Number(2.0))));
+        assert_eq!(
+            result.metadata,
+            EvaluationMetadata {
+                is_syntactically_string: false,
+                resolved_other_files: true,
+                has_external_references: true,
+            }
+        );
+    }
+
+    #[test]
+    fn only_resolves_property_access_on_entity_names() {
+        let (arena, expression) = parse_expression("factory().value;");
+        let mut resolution_count = 0;
+        let result = evaluate_with(&arena, expression, &mut |_| {
+            resolution_count += 1;
+            Evaluation::known(Value::Number(ts_jsnum::Number(42.0)))
+        });
+
+        assert_eq!(resolution_count, 0);
+        assert!(matches!(
+            result.outcome,
+            EvaluationOutcome::Unknown(UnknownReason::UnsupportedSyntax(_))
+        ));
+    }
+
+    #[test]
+    fn successful_element_access_merges_index_metadata() {
+        let (arena, expression) = parse_expression("[10, 20][index];");
+        let result = evaluate_with(&arena, expression, &mut |_| Evaluation {
+            outcome: EvaluationOutcome::Value(Value::Number(ts_jsnum::Number(1.0))),
+            metadata: EvaluationMetadata {
+                is_syntactically_string: false,
+                resolved_other_files: true,
+                has_external_references: true,
+            },
+        });
+
+        assert_eq!(result.value(), Some(&Value::Number(ts_jsnum::Number(20.0))));
+        assert!(result.metadata.resolved_other_files);
+        assert!(result.metadata.has_external_references);
+    }
+
+    #[test]
+    fn uses_javascript_array_string_and_index_rules() {
+        assert_eq!(
+            Value::Array(vec![
+                Value::Null,
+                Value::Undefined,
+                Value::String("x".into())
+            ])
+            .js_string(),
+            ",,x"
+        );
+        assert_eq!(value("[10, 20]['01'];"), Value::Undefined);
+        assert_eq!(value("'ab'['01'];"), Value::Undefined);
+    }
+
+    #[test]
+    fn failed_template_interpolation_clears_reference_metadata() {
+        let (arena, expression) = parse_expression("`${external}${missing}`;");
+        let result = evaluate_with(&arena, expression, &mut |reference| {
+            let NodeData::Identifier(identifier) = &arena.get(reference).unwrap().data else {
+                unreachable!();
+            };
+            if identifier.text == "external" {
+                Evaluation {
+                    outcome: EvaluationOutcome::Value(Value::String("value".into())),
+                    metadata: EvaluationMetadata {
+                        is_syntactically_string: true,
+                        resolved_other_files: true,
+                        has_external_references: true,
+                    },
+                }
+            } else {
+                Evaluation::unknown(UnknownReason::UnresolvedEntity(reference))
+            }
+        });
+
+        assert!(matches!(
+            result.outcome,
+            EvaluationOutcome::Unknown(UnknownReason::UnresolvedEntity(_))
+        ));
+        assert_eq!(
+            result.metadata,
+            EvaluationMetadata {
+                is_syntactically_string: true,
+                resolved_other_files: false,
+                has_external_references: false,
+            }
         );
     }
 }

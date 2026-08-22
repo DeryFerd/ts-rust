@@ -59,15 +59,15 @@ impl Version {
     }
 
     fn increment_major(&self) -> Self {
-        Self::new(self.major.saturating_add(1), 0, 0)
+        Self::new(self.major.wrapping_add(1), 0, 0)
     }
 
     fn increment_minor(&self) -> Self {
-        Self::new(self.major, self.minor.saturating_add(1), 0)
+        Self::new(self.major, self.minor.wrapping_add(1), 0)
     }
 
     fn increment_patch(&self) -> Self {
-        Self::new(self.major, self.minor, self.patch.saturating_add(1))
+        Self::new(self.major, self.minor, self.patch.wrapping_add(1))
     }
 
     fn with_zero_prerelease(mut self) -> Self {
@@ -195,22 +195,20 @@ impl VersionRange {
 
 impl fmt::Display for VersionRange {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.alternatives.is_empty() {
+        if self.alternatives.is_empty()
+            || self.alternatives.len() == 1 && self.alternatives[0].is_empty()
+        {
             return formatter.write_str("*");
         }
         for (alternative_index, alternative) in self.alternatives.iter().enumerate() {
             if alternative_index != 0 {
                 formatter.write_str(" || ")?;
             }
-            if alternative.is_empty() {
-                formatter.write_str("*")?;
-            } else {
-                for (index, comparator) in alternative.iter().enumerate() {
-                    if index != 0 {
-                        formatter.write_str(" ")?;
-                    }
-                    write!(formatter, "{}{}", comparator.operator, comparator.operand)?;
+            for (index, comparator) in alternative.iter().enumerate() {
+                if index != 0 {
+                    formatter.write_str(" ")?;
                 }
+                write!(formatter, "{}{}", comparator.operator, comparator.operand)?;
             }
         }
         Ok(())
@@ -283,7 +281,10 @@ fn parse_version(text: &str) -> Result<Version, SemverParseError> {
     let (without_build, build) = split_once_optional(text, '+', false)?;
     let (core, prerelease) = split_once_optional(without_build, '-', true)?;
     let components = core.split('.').collect::<Vec<_>>();
-    if components.is_empty() || components.len() > 3 {
+    if components.is_empty()
+        || components.len() > 3
+        || components.len() != 3 && (prerelease.is_some() || build.is_some())
+    {
         return Err(SemverParseError::new(text));
     }
     let major = parse_number(components[0]).ok_or_else(|| SemverParseError::new(text))?;
@@ -325,13 +326,16 @@ fn split_once_optional(
 }
 
 fn parse_number(text: &str) -> Option<u32> {
-    if text.is_empty()
-        || !text.bytes().all(|byte| byte.is_ascii_digit())
-        || (text.len() > 1 && text.starts_with('0'))
-    {
+    if !is_number_text(text) {
         return None;
     }
     text.parse().ok()
+}
+
+fn is_number_text(text: &str) -> bool {
+    !text.is_empty()
+        && text.bytes().all(|byte| byte.is_ascii_digit())
+        && (text.len() == 1 || !text.starts_with('0'))
 }
 
 fn parse_identifiers(value: Option<&str>, prerelease: bool) -> Option<Vec<String>> {
@@ -341,17 +345,32 @@ fn parse_identifiers(value: Option<&str>, prerelease: bool) -> Option<Vec<String
     value
         .split('.')
         .map(|part| {
+            let numeric = part.bytes().all(|byte| byte.is_ascii_digit());
             let valid = !part.is_empty()
                 && part
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
                 && (!prerelease
-                    || !part.bytes().all(|byte| byte.is_ascii_digit())
-                    || part == "0"
-                    || !part.starts_with('0'));
+                    || if numeric {
+                        part == "0" || !part.starts_with('0')
+                    } else {
+                        part.bytes()
+                            .next()
+                            .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'-')
+                    });
             valid.then(|| part.to_owned())
         })
         .collect()
+}
+
+fn parse_partial_identifiers(value: Option<&str>) -> Option<Vec<String>> {
+    let Some(value) = value else {
+        return Some(Vec::new());
+    };
+    value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.'))
+        .then(|| value.split('.').map(str::to_owned).collect())
 }
 
 fn compare_prerelease(left: &[String], right: &[String]) -> Ordering {
@@ -457,28 +476,29 @@ fn parse_partial(text: &str) -> Option<PartialVersion> {
     let (without_build, build) = split_once_optional(text, '+', false).ok()?;
     let (core, prerelease) = split_once_optional(without_build, '-', true).ok()?;
     let components = core.split('.').collect::<Vec<_>>();
-    if components.is_empty() || components.len() > 3 {
+    if components.is_empty()
+        || components.len() > 3
+        || components.len() != 3 && (prerelease.is_some() || build.is_some())
+        || !components
+            .iter()
+            .all(|component| is_wildcard(component) || is_number_text(component))
+    {
         return None;
     }
     let major_wildcard = is_wildcard(components[0]);
     let minor_wildcard = components.get(1).is_none_or(|value| is_wildcard(value));
     let patch_wildcard = components.get(2).is_none_or(|value| is_wildcard(value));
-    if major_wildcard && components.iter().any(|component| !is_wildcard(component))
-        || minor_wildcard && components.get(2).is_some_and(|value| !is_wildcard(value))
-    {
-        return None;
-    }
     let major = if major_wildcard {
         0
     } else {
         parse_number(components[0])?
     };
-    let minor = if minor_wildcard {
+    let minor = if major_wildcard || minor_wildcard {
         0
     } else {
         parse_number(components[1])?
     };
-    let patch = if patch_wildcard {
+    let patch = if major_wildcard || minor_wildcard || patch_wildcard {
         0
     } else {
         parse_number(components[2])?
@@ -488,8 +508,8 @@ fn parse_partial(text: &str) -> Option<PartialVersion> {
             major,
             minor,
             patch,
-            prerelease: parse_identifiers(prerelease, true)?,
-            build: parse_identifiers(build, false)?,
+            prerelease: parse_partial_identifiers(prerelease)?,
+            build: parse_partial_identifiers(build)?,
         },
         major_wildcard,
         minor_wildcard,
@@ -642,6 +662,23 @@ mod tests {
     }
 
     #[test]
+    fn requires_full_versions_for_prerelease_and_build_qualifiers() {
+        for invalid in [
+            "1-pre",
+            "1.2-pre",
+            "1+build",
+            "1.2+build",
+            "1.2.3-1alpha",
+            "1.2.3-alpha.2beta",
+        ] {
+            assert!(Version::parse(invalid).is_err(), "{invalid}");
+        }
+        for valid in ["1.2.3-alpha1", "1.2.3-alpha.2", "1.2.3+01.2beta"] {
+            assert!(Version::parse(valid).is_ok(), "{valid}");
+        }
+    }
+
+    #[test]
     fn supports_wildcards_and_comparators() {
         assert_range("1", &["1.0.0-pre", "1.9.9"], &["0.9.9", "2.0.0"]);
         assert_range("1.2", &["1.2.0-pre", "1.2.9"], &["1.1.9", "1.3.0"]);
@@ -664,5 +701,43 @@ mod tests {
             assert_eq!(VersionRange::parse(range).unwrap().to_string(), expected);
         }
         assert_eq!(VersionRange::parse("").unwrap().to_string(), "*");
+    }
+
+    #[test]
+    fn matches_upstream_partial_version_grammar() {
+        assert_eq!(VersionRange::parse("*.2.3").unwrap().to_string(), "*");
+        assert_eq!(
+            VersionRange::parse("1.*.3").unwrap().to_string(),
+            VersionRange::parse("1").unwrap().to_string()
+        );
+        assert_eq!(
+            VersionRange::parse("1.2.3-01").unwrap().to_string(),
+            "=1.2.3-01"
+        );
+        assert_eq!(
+            VersionRange::parse("1.2.3-alpha..beta")
+                .unwrap()
+                .to_string(),
+            "=1.2.3-alpha..beta"
+        );
+        for invalid in ["1-pre", "1.2-pre", "1+build", "1.2+build"] {
+            assert!(VersionRange::parse(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn preserves_upstream_overflow_and_empty_alternative_formatting() {
+        assert_eq!(
+            VersionRange::parse("^4294967295.1.2").unwrap().to_string(),
+            ">=4294967295.1.2 <0.0.0"
+        );
+        assert_eq!(
+            VersionRange::parse("~1.4294967295.2").unwrap().to_string(),
+            ">=1.4294967295.2 <1.0.0"
+        );
+        assert_eq!(
+            VersionRange::parse("* || 1").unwrap().to_string(),
+            " || >=1.0.0-0 <2.0.0-0"
+        );
     }
 }

@@ -527,6 +527,14 @@ mod tests {
     }
 
     #[test]
+    fn overflowing_radix_literals_convert_to_positive_infinity() {
+        for (prefix, digit, count) in [("0b", '1', 1_100), ("0o", '7', 400), ("0x", 'f', 300)] {
+            let literal = format!("{prefix}{}", digit.to_string().repeat(count));
+            assert_eq!(Number::from_string(&literal), Number::infinity(1));
+        }
+    }
+
+    #[test]
     fn handles_pseudo_bigints() {
         assert_eq!(parse_pseudo_big_int("00042n"), "42");
         assert_eq!(parse_pseudo_big_int("0b1010_0101n"), "165");
