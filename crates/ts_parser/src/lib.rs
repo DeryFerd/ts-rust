@@ -483,6 +483,14 @@ impl<'a> Parser<'a> {
             {
                 continue;
             }
+            if diagnostic.code == Some(1161)
+                && self
+                    .diagnostics
+                    .iter()
+                    .any(|reported| reported.range.start == diagnostic.range.start)
+            {
+                continue;
+            }
             if self.diagnostics.iter().any(|reported| {
                 reported.range.start == diagnostic.range.start
                     && reported.code == diagnostic.code
@@ -2156,7 +2164,9 @@ impl<'a> Parser<'a> {
             let keyword = self.consume();
             let mut types = Vec::new();
             let mut has_trailing_comma = false;
-            loop {
+            while self.current.kind != SyntaxKind::OpenBraceToken
+                || self.is_valid_heritage_clause_object_literal()
+            {
                 let mut expression = self.parse_heritage_expression();
                 let mut type_arguments = self.parse_type_arguments();
                 while self.current.kind == SyntaxKind::OpenParenToken {
@@ -2237,6 +2247,20 @@ impl<'a> Parser<'a> {
             nodes: clauses,
             has_trailing_comma: false,
         })
+    }
+
+    fn is_valid_heritage_clause_object_literal(&mut self) -> bool {
+        let checkpoint = self.scanner.mark();
+        let result = self.scanner.scan().kind != SyntaxKind::CloseBraceToken
+            || matches!(
+                self.scanner.scan().kind,
+                SyntaxKind::CommaToken
+                    | SyntaxKind::OpenBraceToken
+                    | SyntaxKind::ExtendsKeyword
+                    | SyntaxKind::ImplementsKeyword
+            );
+        self.scanner.rewind(checkpoint);
+        result
     }
 
     fn parse_heritage_expression(&mut self) -> NodeId {
@@ -6033,7 +6057,7 @@ impl<'a> Parser<'a> {
         if self.current.kind != SyntaxKind::CloseBracketToken {
             return self.parse_binary_expression(0);
         }
-        let position = self.current.range.start;
+        let position = self.current.full_start;
         self.error_code_at(TextRange::new(position, position), 1011, []);
         self.missing_identifier(position)
     }
@@ -7465,7 +7489,10 @@ impl<'a> Parser<'a> {
         let children = self.parse_jsx_children(opening);
         let closing_start = self.current.range.start;
         self.parse_jsx_closing_tag_start();
-        let missing_closing_tag = self.current.kind == SyntaxKind::EndOfFile;
+        let missing_closing_tag = matches!(
+            self.current.kind,
+            SyntaxKind::EndOfFile | SyntaxKind::ConflictMarkerTrivia
+        );
         let closing_name = if missing_closing_tag {
             self.missing_identifier(closing_start)
         } else {
@@ -7693,7 +7720,9 @@ impl<'a> Parser<'a> {
                 && diagnostic.code == Some(1005)
                 && diagnostic.message == "'</' expected."
         }) {
-            if missing_position == self.current.range.start {
+            if missing_position == self.current.range.start
+                && self.current.kind != SyntaxKind::ConflictMarkerTrivia
+            {
                 self.error_current("Expected '</'.");
             } else {
                 self.error_code_at(
@@ -12428,6 +12457,14 @@ mod tests {
         assert_eq!(missing_close.message, "'</' expected.");
         assert_eq!(missing_close.range.start.get(), 15);
         assert_eq!(missing_close.range.end.get(), 15);
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [Some(1005), Some(1185)]
+        );
     }
 
     #[test]
@@ -15583,6 +15620,44 @@ export as namespace GlobalName;
     }
 
     #[test]
+    fn preserves_empty_class_heritage_lists_for_jsdoc_grammar_checks() {
+        let source = concat!(
+            "/** @augments X */\nclass C extends {}\n",
+            "/** @extends X */\nclass D extends {}",
+        );
+        let result = parse_javascript_source_file(source);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        for statement in source_statements(&result) {
+            let NodeData::ClassDeclaration(class) = &result.arena.get(*statement).unwrap().data
+            else {
+                panic!("expected class declaration");
+            };
+            assert!(class.members.nodes.is_empty());
+            let clause = class.heritage_clauses.as_ref().unwrap().nodes[0];
+            let NodeData::HeritageClause(clause) = &result.arena.get(clause).unwrap().data else {
+                panic!("expected class heritage clause");
+            };
+            assert!(clause.types.nodes.is_empty());
+        }
+
+        let object = parse_source_file("class C extends {} {}");
+        assert!(object.diagnostics.is_empty(), "{:?}", object.diagnostics);
+        let NodeData::ClassDeclaration(class) = &object
+            .arena
+            .get(source_statements(&object)[0])
+            .unwrap()
+            .data
+        else {
+            panic!("expected object-literal class heritage");
+        };
+        let clause = class.heritage_clauses.as_ref().unwrap().nodes[0];
+        let NodeData::HeritageClause(clause) = &object.arena.get(clause).unwrap().data else {
+            panic!("expected object-literal heritage clause");
+        };
+        assert_eq!(clause.types.nodes.len(), 1);
+    }
+
+    #[test]
     fn leaves_void_after_an_anonymous_recovered_class() {
         let result = parse_source_file("class void {}");
         let statements = source_statements(&result);
@@ -15808,6 +15883,39 @@ export as namespace GlobalName;
                 6,
                 "An element access expression should take an argument."
             ),]
+        );
+    }
+
+    #[test]
+    fn reports_empty_element_access_before_interior_whitespace() {
+        let source = "new Z[      ]; value[  ];";
+        let result = parse_source_file(source);
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| {
+                    (
+                        diagnostic.code,
+                        diagnostic.range.start.get(),
+                        diagnostic.range.end.get(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            [(Some(1011), 6, 6), (Some(1011), 21, 21)]
+        );
+    }
+
+    #[test]
+    fn suppresses_regex_rescan_errors_at_an_existing_parser_diagnostic() {
+        let result = parse_source_file("class C { factory() { return <div></div>; } }");
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .filter_map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [1110]
         );
     }
 
