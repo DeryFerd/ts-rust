@@ -5778,9 +5778,8 @@ mod tests {
         let case = Case::parse(
             "unsupported.ts",
             concat!(
-                "// @allowJs: true\n",
                 "// @outDir: out\n",
-                "// @filename: unsupported.js\n",
+                "// @filename: unsupported.mts\n",
                 "const value = 1;\n",
             ),
         )
@@ -5797,8 +5796,9 @@ mod tests {
         assert!(compilation.outputs.is_empty());
         assert_eq!(variant.unsupported_details.len(), 1);
         assert!(
-            variant.unsupported_details[0]
-                .contains("canonical checking does not support Js source '/.src/unsupported.js'"),
+            variant.unsupported_details[0].contains(
+                "cannot yet retain fixed module-format facts for '/.src/unsupported.mts'"
+            ),
             "{:?}",
             variant.unsupported_details
         );

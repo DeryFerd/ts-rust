@@ -142,12 +142,8 @@ fn canonical_scorecard_retains_capabilities_then_continues_to_exact_case() {
         None,
     );
     repository.write_case(
-        "javascriptUnsupported",
-        concat!(
-            "// @allowJs: true\n",
-            "// @filename: unsupported.js\n",
-            "const value = 1;\n",
-        ),
+        "moduleFormatUnsupported",
+        concat!("// @filename: unsupported.mts\n", "const value = 1;\n",),
         None,
     );
     repository.write_case("zzExact", "const value: number = 1;\n", None);
@@ -194,7 +190,7 @@ fn canonical_scorecard_retains_capabilities_then_continues_to_exact_case() {
     assert_eq!(variants[0]["frontierBlocker"]["code"], "E00.SOURCE_SYNTAX");
     assert_eq!(
         variants[1]["case"],
-        "testdata/tests/cases/compiler/javascriptUnsupported.ts"
+        "testdata/tests/cases/compiler/moduleFormatUnsupported.ts"
     );
     assert_eq!(variants[1]["status"], "unsupported_detail");
     assert_eq!(variants[1]["outcomeClass"], "checker_capability");
@@ -202,7 +198,10 @@ fn canonical_scorecard_retains_capabilities_then_continues_to_exact_case() {
         variants[1]["frontierBlocker"]["outcomeClass"],
         "checker_capability"
     );
-    assert_eq!(variants[1]["frontierBlocker"]["code"], "C00.SOURCE_KIND");
+    assert_eq!(
+        variants[1]["frontierBlocker"]["code"],
+        "M00.FIXED_MODULE_FORMAT"
+    );
     assert_eq!(
         variants[2]["case"],
         "testdata/tests/cases/compiler/zzExact.ts"
@@ -1175,11 +1174,7 @@ fn semantic_artifacts_remain_not_reached_after_a_checker_capability() {
     let repository = TestRepository::new();
     repository.write_case(
         "unsupportedSemanticSource",
-        concat!(
-            "// @allowJs: true\n",
-            "// @filename: unsupported.js\n",
-            "const value = 1;\n",
-        ),
+        concat!("// @filename: unsupported.mts\n", "const value = 1;\n",),
         None,
     );
     let scorecard_path = repository.0.join("not-reached-semantic-scorecard.json");
@@ -1203,7 +1198,7 @@ fn semantic_artifacts_remain_not_reached_after_a_checker_capability() {
     );
     assert_eq!(
         scorecard["variants"][0]["frontierBlocker"]["code"],
-        "C00.SOURCE_KIND"
+        "M00.FIXED_MODULE_FORMAT"
     );
     for kind in ["types", "symbols"] {
         assert_eq!(scorecard["semanticArtifacts"][kind]["notReached"], 1);
