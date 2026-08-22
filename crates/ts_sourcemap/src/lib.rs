@@ -79,6 +79,10 @@ impl SourceMapBuilder {
     }
 
     /// Registers a source-map name and returns its stable index.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the name index exceeds `u32::MAX`.
     pub fn add_name(&mut self, name: &str) -> u32 {
         if let Some(index) = self.names.iter().position(|existing| existing == name) {
             return u32::try_from(index).expect("source-map name index exceeds u32::MAX");

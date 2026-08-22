@@ -286,7 +286,14 @@ impl<B: Backend> Watcher<B> {
         let ignore = self.ignore.clone();
         let worker_root = root.clone();
         let worker = thread::spawn(move || {
-            run_worker(&receiver, &worker_root, mode, debounce, ignore, callback);
+            run_worker(
+                &receiver,
+                &worker_root,
+                mode,
+                debounce,
+                ignore.as_ref(),
+                callback,
+            );
         });
         Ok(Watch {
             root,
@@ -406,7 +413,7 @@ fn run_worker(
     root: &Path,
     mode: WatchMode,
     config: DebounceConfig,
-    ignore: Option<IgnoreFilter>,
+    ignore: Option<&IgnoreFilter>,
     callback: impl Fn(WatchBatch),
 ) {
     let mut pending = DebouncedEvents::new(config);
@@ -425,7 +432,7 @@ fn run_worker(
                     .events
                     .into_iter()
                     .map(|event| event.map_paths(|path| canonical_event_path(root, &path)))
-                    .filter_map(|event| event.filter_paths(root, mode, ignore.as_ref()))
+                    .filter_map(|event| event.filter_paths(root, mode, ignore))
                     .collect();
                 if batch.events.is_empty() && batch.error.is_none() {
                     continue;
