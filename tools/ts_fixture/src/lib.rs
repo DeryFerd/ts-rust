@@ -4407,6 +4407,7 @@ fn compile_case_variant(
     {
         compiler_options.root_dir = Some(project_directory.clone());
     }
+    materialize_upstream_test_libraries(case, &file_system, &roots)?;
     // Compiler baselines generally assume libraries. Keeping this enabled is
     // important for diagnostic fidelity even though syntax-only corpus tests
     // use the cheaper parser path directly.
@@ -4574,6 +4575,43 @@ fn compile_case_variant(
     })
 }
 
+fn materialize_upstream_test_libraries(
+    case: &Case,
+    file_system: &MemoryFileSystem,
+    roots: &[String],
+) -> io::Result<()> {
+    let case_sensitive = fixture_case_sensitive(case);
+    let needs_test_libraries = case.units.iter().enumerate().any(|(index, unit)| {
+        unit.source_text.as_scannable_str().contains("/.lib/")
+            && roots.iter().any(|root| {
+                project_paths_equal(root, &virtual_unit_path(case, unit, index), case_sensitive)
+            })
+    });
+    if !needs_test_libraries {
+        return Ok(());
+    }
+
+    let Some(library_root) = case.path.ancestors().find_map(|ancestor| {
+        let candidate = ancestor.join("_submodules/TypeScript/tests/lib");
+        candidate.is_dir().then_some(candidate)
+    }) else {
+        return Ok(());
+    };
+
+    for path in collect_files(&library_root, |_| true)? {
+        let relative = path.strip_prefix(&library_root).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("test library path is outside its root: {error}"),
+            )
+        })?;
+        let virtual_path = format!("/.lib/{}", relative.to_string_lossy().replace('\\', "/"));
+        let source = fs::read_to_string(path)?;
+        file_system.write_file(&virtual_path, source.trim_start_matches('\u{feff}'))?;
+    }
+    Ok(())
+}
+
 fn virtual_harness_path(case: &Case, path: &str) -> String {
     if ts_path::is_absolute(path) {
         ts_path::normalize_path(path)
@@ -4679,6 +4717,13 @@ fn fixture_compiler_options_result(
     let mut values = project_config
         .as_ref()
         .map_or_else(BTreeMap::new, |config| config.compiler_options.clone());
+    if let Some((name, value)) = bom_prefixed_compiler_directive(case) {
+        values.retain(|configured_name, _| !configured_name.eq_ignore_ascii_case(name));
+        values.insert(
+            name.to_owned(),
+            directive_json_value(name, pinned_setting_value(value)),
+        );
+    }
     for (name, value) in &variant.values {
         if name.eq_ignore_ascii_case("pretty") {
             continue;
@@ -4730,6 +4775,17 @@ fn fixture_compiler_options_result(
         options.module = ts_options::ModuleKind::CommonJs;
     }
     parsed
+}
+
+fn bom_prefixed_compiler_directive(case: &Case) -> Option<(&str, &str)> {
+    let source = case.source_text.as_str()?.strip_prefix('\u{feff}')?;
+    let first_line = source.lines().next()?;
+    let (name, value) = parse_directive_line(first_line)?;
+    COMPILER_OPTION_NAMES
+        .iter()
+        .chain(LIST_OPTION_NAMES)
+        .any(|option| option.eq_ignore_ascii_case(name))
+        .then_some((name, value))
 }
 
 fn project_configuration_unsupported_details(case: &Case) -> Vec<String> {
@@ -5322,6 +5378,7 @@ const RUST_APPLIED_COMPILER_OPTION_NAMES: &[&str] = &[
     "noEmit",
     "noEmitHelpers",
     "noEmitOnError",
+    "noErrorTruncation",
     "noFallthroughCasesInSwitch",
     "noImplicitAny",
     "noImplicitReturns",
@@ -5345,6 +5402,7 @@ const RUST_APPLIED_COMPILER_OPTION_NAMES: &[&str] = &[
     "sourceRoot",
     "strict",
     "strictBuiltinIteratorReturn",
+    "strictFunctionTypes",
     "strictNullChecks",
     "strictPropertyInitialization",
     "stripInternal",
@@ -6422,6 +6480,37 @@ mod tests {
         assert_eq!(
             case.units[0].source_text.as_scannable_str(),
             "\u{feff}// @target: es2015\nconst value = 1;"
+        );
+    }
+
+    #[test]
+    fn applies_a_bom_prefixed_compiler_setting_without_changing_fixture_identity() {
+        let case = Case::parse(
+            "bomStrict.ts",
+            concat!(
+                "\u{feff}// @strict: false\n",
+                "// @target: es2015\n",
+                "function value(parameter) {}\n",
+            ),
+        )
+        .unwrap();
+        let variant = expand_option_matrix(&case).remove(0);
+        assert_eq!(variant.values.len(), 1);
+        assert_eq!(variant.values["target"], "es2015");
+        assert!(
+            case.units[0]
+                .source_text
+                .as_scannable_str()
+                .starts_with('\u{feff}')
+        );
+        let options = fixture_compiler_options(&case, &variant);
+        assert!(!options.strict);
+        assert!(!options.no_implicit_any);
+        let compilation = compile_case(&case).unwrap();
+        assert!(
+            compilation.diagnostics.is_empty(),
+            "{:?}",
+            compilation.diagnostics
         );
     }
 
@@ -7676,6 +7765,31 @@ mod tests {
         let options = fixture_compiler_options(&classic, &variants[0]);
         assert!(!options.strict_builtin_iterator_return);
         assert!(options.strict_builtin_iterator_return_specified);
+    }
+
+    #[test]
+    fn applies_supported_function_variance_and_error_truncation_options() {
+        let case = Case::parse(
+            "supportedCheckerOptions.ts",
+            concat!(
+                "// @strict: false\n",
+                "// @strictFunctionTypes: true\n",
+                "// @noErrorTruncation: false\n",
+                "const value = 1;\n",
+            ),
+        )
+        .unwrap();
+        let variant = expand_option_matrix(&case).remove(0);
+        assert!(
+            variant.unsupported_details.is_empty(),
+            "{:?}",
+            variant.unsupported_details
+        );
+        let options = fixture_compiler_options(&case, &variant);
+        assert!(!options.strict);
+        assert!(options.strict_function_types);
+        assert!(options.strict_function_types_specified);
+        assert!(!options.no_error_truncation);
     }
 
     #[test]

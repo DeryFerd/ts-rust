@@ -1131,6 +1131,61 @@ fn semantic_artifacts_resolve_relative_units_from_the_configured_current_directo
 }
 
 #[test]
+fn canonical_diagnostics_mount_real_upstream_test_libraries_when_referenced() {
+    let repository = TestRepository::new();
+    let library = repository
+        .0
+        .join("_submodules/TypeScript/tests/lib/react18");
+    fs::create_dir_all(&library).unwrap();
+    fs::write(
+        library.join("global.d.ts"),
+        "\u{feff}interface MountedGlobal { value: number; }\n",
+    )
+    .unwrap();
+    fs::write(
+        library.join("react18.d.ts"),
+        "/// <reference path=\"global.d.ts\" />\n",
+    )
+    .unwrap();
+    repository.write_case(
+        "mountedReactLibraries",
+        concat!(
+            "// @skipLibCheck: true\n",
+            "/// <reference path=\"/.lib/react18/react18.d.ts\" />\n",
+            "/// <reference path=\"/.lib/react18/global.d.ts\" />\n",
+            "const value: number = 1;\n",
+        ),
+        None,
+    );
+    let scorecard_path = repository.0.join("mounted-test-libraries.json");
+
+    let output = run(
+        &repository.0,
+        &[
+            "--diagnostics",
+            "--canonical-checker",
+            "--scorecard-json",
+            scorecard_path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}\nscorecard:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        fs::read_to_string(&scorecard_path).unwrap_or_default(),
+    );
+    let scorecard: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(scorecard_path).unwrap()).unwrap();
+    assert_eq!(scorecard["summary"]["exactMatches"], 1);
+    assert_eq!(scorecard["summary"]["actualDiagnostics"], 0);
+    assert_eq!(
+        scorecard["variants"][0]["diagnostics"],
+        serde_json::json!([])
+    );
+}
+
+#[test]
 fn semantic_artifact_mode_matches_the_pinned_single_file_oracles() {
     let repository = TestRepository::new();
     repository.write_case("simpleTestSingleFile", "const x: number = \"\";", None);
