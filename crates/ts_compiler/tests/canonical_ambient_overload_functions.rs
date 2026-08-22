@@ -1,7 +1,4 @@
-use ts_checker::semantic::{SourceCheckError, UnsupportedSourceSyntax};
-use ts_compiler::{
-    CanonicalProgramCheckError, CanonicalProgramCheckFailureClass, Program,
-};
+use ts_compiler::Program;
 use ts_options::{CompilerOptions, ModuleKind, ModuleResolutionKind, ScriptTarget};
 use ts_vfs::{FileSystem, MemoryFileSystem};
 
@@ -70,13 +67,14 @@ fn canonical_program_checks_local_ambient_overload_order_and_hoisting() {
 }
 
 #[test]
-fn pinned_strict_false_fixture_advances_to_uninitialized_variable() {
+fn pinned_strict_false_fixture_checks_exactly_without_diagnostics() {
     // Pinned typescript-go dc37b524:
     // `_submodules/TypeScript/tests/cases/compiler/ambiguousOverloadResolution.ts`.
     //
     // Direct class heritage and the bare instance field are both admitted
     // when strictNullChecks and strictPropertyInitialization are disabled.
-    // The original fixture therefore reaches the later top-level variable.
+    // The original fixture's annotated uninitialized `var` is also admitted
+    // under those options, so the complete overload-resolution case checks.
     let fs = MemoryFileSystem::new(true);
     fs.write_file(
         "/project/ambiguousOverloadResolution.ts",
@@ -92,36 +90,19 @@ fn pinned_strict_false_fixture_advances_to_uninitialized_variable() {
         ),
     )
     .unwrap();
-    let error = Program::try_new_with_canonical_checker(
+    let program = Program::try_new_with_canonical_checker(
         &fs,
         "/project",
         &["ambiguousOverloadResolution.ts".to_owned()],
         pinned_strict_false_options(),
     )
-    .unwrap_err();
+    .unwrap();
 
-    assert_eq!(
-        error.failure_class(),
-        CanonicalProgramCheckFailureClass::Unsupported {
-            capability_code: "E00.SOURCE_SYNTAX",
-        }
-    );
-    assert!(
-        matches!(
-            &error,
-            CanonicalProgramCheckError::SourceCheck {
-                error: SourceCheckError::Unsupported(
-                    UnsupportedSourceSyntax::MissingVariableInitializer(_)
-                ),
-                ..
-            }
-        ),
-        "{error:?}"
-    );
+    assert!(program.diagnostics().is_empty());
 }
 
 #[test]
-fn both_strict_property_options_stop_at_the_uninitialized_class_field() {
+fn strict_property_options_report_field_and_unassigned_variable_reads() {
     let fs = MemoryFileSystem::new(true);
     fs.write_file(
         "/project/ambiguousOverloadResolution.ts",
@@ -138,34 +119,26 @@ fn both_strict_property_options_stop_at_the_uninitialized_class_field() {
     )
     .unwrap();
 
-    let error = Program::try_new_with_canonical_checker(
+    let program = Program::try_new_with_canonical_checker(
         &fs,
         "/project",
         &["ambiguousOverloadResolution.ts".to_owned()],
         pinned_strict_property_options(),
     )
-    .unwrap_err();
+    .unwrap();
 
     assert_eq!(
-        error.failure_class(),
-        CanonicalProgramCheckFailureClass::Unsupported {
-            capability_code: "E00.SOURCE_SYNTAX",
-        }
-    );
-    assert!(
-        matches!(
-            &error,
-            CanonicalProgramCheckError::SourceCheck {
-                error: SourceCheckError::Unsupported(UnsupportedSourceSyntax::Class(_)),
-                ..
-            }
-        ),
-        "{error:?}"
+        program
+            .diagnostics()
+            .iter()
+            .map(|diagnostic| diagnostic.code)
+            .collect::<Vec<_>>(),
+        [Some(2564), Some(2454), Some(2454)]
     );
 }
 
 #[test]
-fn definite_field_variant_advances_under_both_options_to_uninitialized_variable() {
+fn definite_field_variant_reports_only_unassigned_variable_reads() {
     let fs = MemoryFileSystem::new(true);
     fs.write_file(
         "/project/ambiguousOverloadResolution.ts",
@@ -182,30 +155,20 @@ fn definite_field_variant_advances_under_both_options_to_uninitialized_variable(
     )
     .unwrap();
 
-    let error = Program::try_new_with_canonical_checker(
+    let program = Program::try_new_with_canonical_checker(
         &fs,
         "/project",
         &["ambiguousOverloadResolution.ts".to_owned()],
         pinned_strict_property_options(),
     )
-    .unwrap_err();
+    .unwrap();
 
     assert_eq!(
-        error.failure_class(),
-        CanonicalProgramCheckFailureClass::Unsupported {
-            capability_code: "E00.SOURCE_SYNTAX",
-        }
-    );
-    assert!(
-        matches!(
-            &error,
-            CanonicalProgramCheckError::SourceCheck {
-                error: SourceCheckError::Unsupported(
-                    UnsupportedSourceSyntax::MissingVariableInitializer(_)
-                ),
-                ..
-            }
-        ),
-        "{error:?}"
+        program
+            .diagnostics()
+            .iter()
+            .map(|diagnostic| diagnostic.code)
+            .collect::<Vec<_>>(),
+        [Some(2454), Some(2454)]
     );
 }

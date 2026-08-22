@@ -329,7 +329,7 @@ fn loose_options_admit_bare_instance_fields_and_replay_without_growth() {
 }
 
 #[test]
-fn strict_property_options_reject_later_unsafe_field_before_earlier_publication() {
+fn strict_property_options_report_later_unsafe_field_without_rejecting_classes() {
     let parsed = parse_source_file(concat!(
         "class Early { value?: string; }\n",
         "class Later { value: string; static count: number; }\n",
@@ -343,82 +343,92 @@ fn strict_property_options_reject_later_unsafe_field_before_earlier_publication(
         strict_property_options(),
     );
     let early = class_symbol(&parsed, file, &context, "Early");
-    let later = class_declaration(&parsed, file, "Later");
     let later_symbol = class_symbol(&parsed, file, &context, "Later");
-    let before = (
-        context.store().type_len(),
-        context.store().signature_len(),
-        context.store().symbol_len(),
-        context.store().symbol_store().symbol_table_len(),
-        context.store().relation_state_snapshot(),
-    );
 
-    for _ in 0..2 {
-        assert_eq!(
-            context.check_source_file(file),
-            Err(SourceCheckError::Unsupported(
-                UnsupportedSourceSyntax::Class(later)
-            ))
-        );
-        assert_eq!(
-            (
-                context.store().type_len(),
-                context.store().signature_len(),
-                context.store().symbol_len(),
-                context.store().symbol_store().symbol_table_len(),
-                context.store().relation_state_snapshot(),
-            ),
-            before
-        );
-        for symbol in [early, later_symbol] {
-            assert!(context.store().declared_type_links(symbol).is_none());
-            assert!(context.store().value_symbol_links(symbol).is_none());
-        }
-        assert!(!is_type_checked(&context, file));
-        assert!(context.diagnostics().is_empty());
+    context.check_source_file(file).unwrap();
+
+    for symbol in [early, later_symbol] {
+        assert!(context.store().declared_type_links(symbol).is_some());
+        assert!(context.store().value_symbol_links(symbol).is_some());
     }
+    let [diagnostic] = context.diagnostics().as_slice() else {
+        panic!("expected one strict property initialization diagnostic")
+    };
+    assert_eq!(diagnostic.diagnostic.code(), 2564);
+    assert_eq!(diagnostic.diagnostic.arguments, ["value"]);
+    assert_eq!(
+        diagnostic.diagnostic.render().unwrap(),
+        "Property 'value' has no initializer and is not definitely assigned in the constructor."
+    );
+    let NodeData::Identifier(name) = &parsed
+        .arena
+        .get(
+            diagnostic
+                .node
+                .expect("field diagnostic has an anchor")
+                .node,
+        )
+        .unwrap()
+        .data
+    else {
+        panic!("field diagnostic must point to its name")
+    };
+    assert_eq!(name.text, "value");
+    assert!(is_type_checked(&context, file));
+
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(context.diagnostics().len(), 1);
 }
 
 #[test]
-fn later_uninitialized_variable_keeps_an_admitted_loose_class_cold_across_retries() {
+fn later_unannotated_variable_keeps_classes_and_field_diagnostics_cold_across_retries() {
     let parsed = parse_source_file(concat!(
         "class Loose { bare: string; optional?: number; static count: number; }\n",
-        "var missing: Loose;\n",
+        "var missing;\n",
     ));
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
-    let file = FileId::new(13);
-    let mut context = checker_context(&parsed, file);
-    let class = class_symbol(&parsed, file, &context, "Loose");
-    let missing = variable_declaration(&parsed, file, "missing");
-    let cold = (
-        context.store().type_len(),
-        context.store().signature_len(),
-        context.store().symbol_len(),
-        context.store().symbol_store().symbol_table_len(),
-        context.store().relation_state_snapshot(),
-    );
+    for (index, options) in [
+        CanonicalCheckerOptions::default(),
+        strict_property_options(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let file = FileId::new(13 + u32::try_from(index).unwrap());
+        let mut context =
+            checker_context_with_options(&parsed, file, CanonicalModuleState::Script, options);
+        let class = class_symbol(&parsed, file, &context, "Loose");
+        let missing = variable_declaration(&parsed, file, "missing");
+        let cold = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().symbol_len(),
+            context.store().symbol_store().symbol_table_len(),
+            context.store().relation_state_snapshot(),
+        );
 
-    for _ in 0..2 {
-        assert_eq!(
-            context.check_source_file(file),
-            Err(SourceCheckError::Unsupported(
-                UnsupportedSourceSyntax::MissingVariableInitializer(missing)
-            ))
-        );
-        assert_eq!(
-            (
-                context.store().type_len(),
-                context.store().signature_len(),
-                context.store().symbol_len(),
-                context.store().symbol_store().symbol_table_len(),
-                context.store().relation_state_snapshot(),
-            ),
-            cold
-        );
-        assert!(context.store().declared_type_links(class).is_none());
-        assert!(context.store().value_symbol_links(class).is_none());
-        assert!(!is_type_checked(&context, file));
-        assert!(context.diagnostics().is_empty());
+        for _ in 0..2 {
+            assert_eq!(
+                context.check_source_file(file),
+                Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::MissingVariableInitializer(missing)
+                ))
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().symbol_len(),
+                    context.store().symbol_store().symbol_table_len(),
+                    context.store().relation_state_snapshot(),
+                ),
+                cold
+            );
+            assert!(context.store().declared_type_links(class).is_none());
+            assert!(context.store().value_symbol_links(class).is_none());
+            assert!(!is_type_checked(&context, file));
+            assert!(context.diagnostics().is_empty());
+        }
     }
 }
 
