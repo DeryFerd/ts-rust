@@ -58,7 +58,7 @@ use super::{
     },
     source_overloads::{StoredSourceOverloadValidation, validate_stored_source_overload},
     structured_members,
-    template_types::StringMappingKind,
+    template_types::{StringMappingKind, TemplateTypeError},
     tuple_type_nodes::{self, TupleTypeNodeError, TupleTypeNodePlan, validate_warm_tuple_elements},
     tuple_types::{CanonicalTupleTypeRequest, TupleTypeError, TupleTypeQueryPreparationError},
     type_records::{CacheHashKey, TypeData, TypeRecord},
@@ -652,10 +652,8 @@ fn intersection_type_error(error: IntersectionTypeError, node: NodeRef) -> Decla
         IntersectionTypeError::UnsupportedPropertyType(type_) => type_node_unavailable(
             TypeNodeUnavailable::UnsupportedIntersectionPropertyType(type_),
         ),
-        IntersectionTypeError::MalformedConstituent(_) => {
-            type_node_unavailable(TypeNodeUnavailable::InvalidIntersectionType(node))
-        }
-        IntersectionTypeError::InvalidAliasSymbol(_) => {
+        IntersectionTypeError::MalformedConstituent(_)
+        | IntersectionTypeError::InvalidAliasSymbol(_) => {
             type_node_unavailable(TypeNodeUnavailable::InvalidIntersectionType(node))
         }
         IntersectionTypeError::InvalidCachedIntersection(type_) => {
@@ -3093,6 +3091,32 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                                 ))
                             };
                         }
+                        if symbol_is_string_mapping_intrinsic(self.store, canonical)
+                            && self.store.intrinsic_bootstrap().is_some_and(|bootstrap| {
+                                target_cached.declared_type == bootstrap.intrinsic_marker_type
+                            })
+                        {
+                            let arguments = self.type_reference_argument_nodes(reference)?;
+                            let [argument] = arguments.as_slice() else {
+                                return Err(type_node_unavailable(
+                                    TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
+                                ));
+                            };
+                            let argument =
+                                self.cached_type_node_identity(root_symbol, *argument)?;
+                            return if self.cached_string_mapping_result(
+                                canonical,
+                                argument,
+                                declared_type,
+                                &mut HashSet::new(),
+                            ) {
+                                Ok(())
+                            } else {
+                                Err(type_node_unavailable(
+                                    TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
+                                ))
+                            };
+                        }
                         let is_cached_instantiation = if target_cached.type_parameter_count == 0 {
                             false
                         } else {
@@ -3126,6 +3150,98 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 }
             }
         }
+    }
+
+    fn cached_string_mapping_result(
+        &self,
+        symbol: SemanticSymbolId,
+        input: TypeId,
+        result: TypeId,
+        active: &mut HashSet<(TypeId, TypeId)>,
+    ) -> bool {
+        if !active.insert((input, result)) {
+            return false;
+        }
+        let Some(kind) = self
+            .store
+            .symbol(symbol)
+            .and_then(|record| record.name().as_utf8())
+            .and_then(StringMappingKind::from_name)
+        else {
+            return false;
+        };
+        let Some(input_record) = self.store.type_payload(input) else {
+            return false;
+        };
+        let Some(result_record) = self.store.type_payload(result) else {
+            return false;
+        };
+        let valid = match (input_record.data(), result_record.data()) {
+            (TypeData::Literal(input), TypeData::Literal(output)) => {
+                matches!(
+                    (&input.value, &output.value),
+                    (
+                        super::type_records::LiteralValue::String(input),
+                        super::type_records::LiteralValue::String(output),
+                    ) if kind.apply(input) == *output
+                        && self
+                            .store
+                            .intrinsic_bootstrap()
+                            .and_then(|bootstrap| bootstrap.cached_string_literal_type(output))
+                            == Some(result)
+                )
+            }
+            (TypeData::Union(input), TypeData::Union(output)) => {
+                input.union.types.iter().all(|source| {
+                    output.union.types.iter().any(|candidate| {
+                        self.cached_string_mapping_result(symbol, *source, *candidate, active)
+                    })
+                }) && output.union.types.iter().all(|candidate| {
+                    input.union.types.iter().any(|source| {
+                        self.cached_string_mapping_result(symbol, *source, *candidate, active)
+                    })
+                })
+            }
+            (TypeData::TemplateLiteral(input), TypeData::TemplateLiteral(output)) => {
+                let expected_texts = input
+                    .texts
+                    .iter()
+                    .enumerate()
+                    .map(|(index, text)| match kind {
+                        StringMappingKind::Uppercase | StringMappingKind::Lowercase => {
+                            kind.apply(text)
+                        }
+                        StringMappingKind::Capitalize | StringMappingKind::Uncapitalize
+                            if index == 0 && !text.is_empty() =>
+                        {
+                            kind.apply(text)
+                        }
+                        _ => text.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                output.texts == expected_texts
+                    && input.types.len() == output.types.len()
+                    && input.types.iter().zip(&output.types).enumerate().all(
+                        |(index, (source, mapped))| {
+                            let transform = matches!(
+                                kind,
+                                StringMappingKind::Uppercase | StringMappingKind::Lowercase
+                            ) || index == 0 && input.texts[0].is_empty();
+                            if transform {
+                                self.cached_string_mapping_result(symbol, *source, *mapped, active)
+                            } else {
+                                source == mapped
+                            }
+                        },
+                    )
+            }
+            (_, TypeData::StringMapping(mapping)) => {
+                result_record.symbol() == Some(symbol) && mapping.target == input
+            }
+            _ => input == result,
+        };
+        active.remove(&(input, result));
+        valid
     }
 
     fn type_reference_argument_nodes(
@@ -7204,10 +7320,26 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         for child in &template.types {
             types.push(self.execute_type_node(*child, plan, prepared)?);
         }
-        let resolved = self
+        let resolved = match self
             .store
             .get_template_literal_type(&template.texts, &types)
-            .map_err(|_| type_node_unavailable(TypeNodeUnavailable::InvalidLiteralType(node)))?;
+        {
+            Ok(resolved) => resolved,
+            Err(TemplateTypeError::CrossProductTooLarge { .. }) => {
+                self.diagnostics.add(
+                    Some(node),
+                    Diagnostic::new(
+                        message_by_code(2590).expect("TS2590 is in the diagnostic catalog"),
+                    ),
+                );
+                self.error_type()?
+            }
+            Err(_) => {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidLiteralType(node),
+                ));
+            }
+        };
         let mut links = self
             .store
             .type_node_links(node)
@@ -7236,7 +7368,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         })?;
         let constraint = self.execute_type_node(mapped.constraint(), plan, prepared)?;
         let type_parameter = execute_type_parameter(self.store, mapped.type_parameter_symbol());
-        let (existing_constraint, target, mapper, default_type) = match self
+        let (existing_constraint, target, type_mapper, default_type) = match self
             .store
             .type_payload(type_parameter)
             .map(TypeRecord::data)
@@ -7259,7 +7391,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     type_parameter,
                     Some(constraint),
                     target,
-                    mapper,
+                    type_mapper,
                     default_type,
                 )
         {
@@ -7267,24 +7399,23 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 TypeNodeUnavailable::InvalidTypeReference(node),
             ));
         }
-        let template = match mapped.template() {
-            Some(template) => self.execute_type_node(template, plan, prepared)?,
-            None => {
-                if self.options.no_implicit_any {
-                    self.diagnostics.add(
-                        Some(node),
-                        Diagnostic::new(
-                            message_by_code(7039).expect("TS7039 is in the diagnostic catalog"),
-                        ),
-                    );
-                }
-                self.store
-                    .intrinsic_bootstrap()
-                    .ok_or(DeclaredTypeError::Unavailable(
-                        DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
-                    ))?
-                    .any_type
+        let template = if let Some(template) = mapped.template() {
+            self.execute_type_node(template, plan, prepared)?
+        } else {
+            if self.options.no_implicit_any {
+                self.diagnostics.add(
+                    Some(node),
+                    Diagnostic::new(
+                        message_by_code(7039).expect("TS7039 is in the diagnostic catalog"),
+                    ),
+                );
             }
+            self.store
+                .intrinsic_bootstrap()
+                .ok_or(DeclaredTypeError::Unavailable(
+                    DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
+                ))?
+                .any_type
         };
         let modifiers_source = match mapped.modifiers_source() {
             Some(source) => self.execute_type_node(source, plan, prepared)?,
@@ -11504,6 +11635,103 @@ mod tests {
             after_first_queries
         );
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn string_mapping_aliases_replay_without_generic_instantiation_cache_entries() {
+        let mut fixture = fixture(concat!(
+            "type Uppercase<Input extends string> = intrinsic; ",
+            "type Loud = Uppercase<'hello'>; ",
+            "let value: Loud;",
+        ));
+        let uppercase = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Uppercase");
+        let loud = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Loud");
+        let reference = variable_type_node(&fixture, "value");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let resolved = query_declared(
+            &mut fixture,
+            loud,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .expect("the first intrinsic mapping resolves");
+        let TypeData::Literal(literal) = fixture.store.type_payload(resolved).unwrap().data()
+        else {
+            panic!("Uppercase<'hello'> must resolve to a string literal")
+        };
+        assert_eq!(literal.value, LiteralValue::String("HELLO".to_owned()));
+        assert_eq!(
+            fixture
+                .store
+                .type_alias_links(uppercase)
+                .and_then(|links| links.instantiations.as_ref())
+                .map(HashMap::len),
+            Some(1),
+            "intrinsic string mappings bypass the ordinary generic alias cache"
+        );
+
+        let before = union_state(&fixture.store);
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                loud,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(resolved)
+        );
+        assert_eq!(union_state(&fixture.store), before);
+        assert_eq!(
+            query_node(&mut fixture, reference, &mut diagnostics),
+            Ok(resolved)
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn excessive_template_cross_products_report_ts2590_once_and_cache_error() {
+        let mut fixture = fixture(concat!(
+            "type N = 0 | 1 | 2 | 3; ",
+            "type TooComplex = `${N}${N}${N}${N}${N}${N}${N}${N}${N}`;",
+        ));
+        let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "TooComplex");
+        let template = alias_parts(&fixture, "TooComplex").2;
+        let error_type = fixture.store.intrinsic_bootstrap().unwrap().error_type;
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(error_type)
+        );
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics.as_slice()[0].diagnostic.code(), 2590);
+        assert_eq!(diagnostics.as_slice()[0].node, Some(template));
+        assert_eq!(
+            fixture
+                .store
+                .type_node_links(template)
+                .and_then(|links| links.resolved_type),
+            Some(error_type)
+        );
+
+        let warm = union_state(&fixture.store);
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(error_type)
+        );
+        assert_eq!(union_state(&fixture.store), warm);
+        assert_eq!(diagnostics.len(), 1);
     }
 
     #[test]

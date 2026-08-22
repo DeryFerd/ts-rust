@@ -420,6 +420,90 @@ fn production_checker_applies_intrinsic_string_mappings_from_source_aliases() {
 }
 
 #[test]
+fn production_checker_replays_intrinsic_aliases_with_lone_surrogate_escapes() {
+    let parsed = parse_source_file(concat!(
+        "type Uppercase<Input extends string> = intrinsic;\n",
+        "type Lowercase<Input extends string> = intrinsic;\n",
+        "type Capitalize<Input extends string> = intrinsic;\n",
+        "type Uncapitalize<Input extends string> = intrinsic;\n",
+        "type U = Uppercase<\"\\uD800\">;\n",
+        "type L = Lowercase<\"A\\uD800B\">;\n",
+        "type C = Capitalize<\"\\uDC00x\">;\n",
+        "type Un = Uncapitalize<\"\\uD834X\">;\n",
+        "type ReplayU = U;\n",
+        "type ReplayL = L;\n",
+        "type ReplayC = C;\n",
+        "type ReplayUn = Un;\n",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(0);
+    let mut context = source_context(&parsed, file);
+    let aliases = [
+        "U", "L", "C", "Un", "ReplayU", "ReplayL", "ReplayC", "ReplayUn",
+    ]
+    .into_iter()
+    .map(|name| (name, source_alias(&parsed, file, &context, name)))
+    .collect::<std::collections::BTreeMap<_, _>>();
+
+    context.check_source_file(file).unwrap();
+    assert!(
+        context.diagnostics().is_empty(),
+        "{:?}",
+        context.diagnostics()
+    );
+    for (original, replay) in [
+        ("U", "ReplayU"),
+        ("L", "ReplayL"),
+        ("C", "ReplayC"),
+        ("Un", "ReplayUn"),
+    ] {
+        assert_eq!(
+            source_alias_type(&context, aliases[original].0),
+            source_alias_type(&context, aliases[replay].0),
+            "{replay} must preserve the cached {original} identity"
+        );
+    }
+
+    let count = context.store().type_len();
+    context.check_source_file(file).unwrap();
+    assert_eq!(context.store().type_len(), count);
+    assert!(context.diagnostics().is_empty());
+}
+
+#[test]
+fn production_checker_reports_excessive_template_unions_without_fatal_invariants() {
+    let parsed = parse_source_file(concat!(
+        "type N = 0 | 1 | 2 | 3;\n",
+        "type TooComplex = `${N}${N}${N}${N}${N}${N}${N}${N}${N}`;\n",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(0);
+    let mut context = source_context(&parsed, file);
+    let (alias, template) = source_alias(&parsed, file, &context, "TooComplex");
+
+    context.check_source_file(file).unwrap();
+
+    let diagnostics = context.diagnostics().as_slice();
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].diagnostic.code(), 2590);
+    assert_eq!(diagnostics[0].node, Some(template));
+    let error = context.store().intrinsic_bootstrap().unwrap().error_type;
+    assert_eq!(source_alias_type(&context, alias), error);
+    assert_eq!(
+        context
+            .store()
+            .type_node_links(template)
+            .and_then(|links| links.resolved_type),
+        Some(error)
+    );
+
+    let count = context.store().type_len();
+    context.check_source_file(file).unwrap();
+    assert_eq!(context.store().type_len(), count);
+    assert_eq!(context.diagnostics().as_slice().len(), 1);
+}
+
+#[test]
 fn source_template_folds_literal_number_boolean_null_and_bigint_spans() {
     let mut store = checker_store();
     let (texts, types) = parsed_template(
