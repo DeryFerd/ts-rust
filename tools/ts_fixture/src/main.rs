@@ -59,6 +59,7 @@ fn parse_arguments(arguments: &[String]) -> Result<Option<RunnerOptions>, String
             "--help" | "-h" => return Ok(None),
             "--diagnostics" => options.diagnostics = true,
             "--canonical-checker" => options.canonical_checker = true,
+            "--semantic-artifacts" => options.semantic_artifacts = true,
             "--manifest" => options.manifest = true,
             "--variant-manifest" => {
                 index += 1;
@@ -126,6 +127,15 @@ fn parse_arguments(arguments: &[String]) -> Result<Option<RunnerOptions>, String
     if options.canonical_checker && options.manifest {
         return Err("--canonical-checker cannot be used with --manifest".to_owned());
     }
+    if options.semantic_artifacts && !options.diagnostics {
+        return Err("--semantic-artifacts requires --diagnostics".to_owned());
+    }
+    if options.semantic_artifacts && !options.canonical_checker {
+        return Err("--semantic-artifacts requires --canonical-checker".to_owned());
+    }
+    if options.semantic_artifacts && options.manifest {
+        return Err("--semantic-artifacts cannot be used with --manifest".to_owned());
+    }
     Ok(Some(options))
 }
 
@@ -139,7 +149,7 @@ fn required_value(arguments: &[String], index: usize, option: &str) -> Result<St
 
 fn print_help() {
     println!(
-        "Usage: ts_fixture_baseline [--diagnostics] [--canonical-checker] [--scorecard-json FILE] [--variant-manifest FILE] [--manifest] [--filter TEXT] [--skip COUNT] [--limit COUNT]"
+        "Usage: ts_fixture_baseline [--diagnostics] [--canonical-checker] [--semantic-artifacts] [--scorecard-json FILE] [--variant-manifest FILE] [--manifest] [--filter TEXT] [--skip COUNT] [--limit COUNT]"
     );
     println!(
         "Reads the pinned typescript-go compiler/conformance corpus and actual baselines below TS_GO_REPO."
@@ -149,6 +159,9 @@ fn print_help() {
     );
     println!(
         "--canonical-checker opts diagnostic runs into the experimental canonical checker without emit or legacy fallback."
+    );
+    println!(
+        "--semantic-artifacts also accounts for configured .types and .symbols baselines without treating unavailable queries as matches."
     );
     println!(
         "--variant-manifest executes an exact validated expanded-variant shard in manifest order."
@@ -170,6 +183,7 @@ mod tests {
             "25".into(),
             "--diagnostics".into(),
             "--canonical-checker".into(),
+            "--semantic-artifacts".into(),
             "--scorecard-json".into(),
             "scorecard.json".into(),
         ])
@@ -180,6 +194,7 @@ mod tests {
         assert_eq!(options.limit, Some(25));
         assert!(options.diagnostics);
         assert!(options.canonical_checker);
+        assert!(options.semantic_artifacts);
         assert_eq!(
             options.scorecard_json.as_deref(),
             Some(std::path::Path::new("scorecard.json"))
@@ -219,6 +234,14 @@ mod tests {
         assert_eq!(
             parse_arguments(&["--canonical-checker".into()]),
             Err("--canonical-checker requires --diagnostics".to_owned())
+        );
+        assert_eq!(
+            parse_arguments(&["--semantic-artifacts".into()]),
+            Err("--semantic-artifacts requires --diagnostics".to_owned())
+        );
+        assert_eq!(
+            parse_arguments(&["--diagnostics".into(), "--semantic-artifacts".into()]),
+            Err("--semantic-artifacts requires --canonical-checker".to_owned())
         );
         assert_eq!(
             parse_arguments(&["--variant-manifest".into(), "checker-smoke-v1.json".into(),]),

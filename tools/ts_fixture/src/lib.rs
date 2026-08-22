@@ -21,7 +21,10 @@ use ts_core::{SourceText, TextRange};
 use ts_vfs::{FileSystem, MemoryFileSystem, decode_utf16_bom};
 use xxhash_rust::xxh3::xxh3_128;
 
+mod artifacts;
 mod oracle;
+
+use artifacts::{SemanticArtifactKind, SemanticArtifactWalk};
 
 pub use oracle::{
     OracleArtifactCounts, UpstreamCaseDisposition, UpstreamCaseManifest, UpstreamManifest,
@@ -144,6 +147,7 @@ pub struct Compilation {
     /// Non-pretty diagnostic header text in the same form as TypeScript error baselines.
     pub diagnostic_text: String,
     pub outputs: BTreeMap<String, String>,
+    semantic_artifact_walk: Option<SemanticArtifactWalk>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -237,6 +241,9 @@ pub struct RunnerOptions {
     /// runs. Unsupported canonical boundaries are retained on each option
     /// variant so a corpus run can continue without falling back to legacy.
     pub canonical_checker: bool,
+    /// Account for configured `.types` and `.symbols` baselines without a
+    /// legacy checker fallback or unsupported semantic matches.
+    pub semantic_artifacts: bool,
     /// Print the discovered corpus/oracle manifest without compiling cases.
     pub manifest: bool,
     /// Write a deterministic machine-readable diagnostic scorecard to this path.
@@ -270,6 +277,8 @@ pub enum DiagnosticCheckerMode {
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticVariantStatus {
     ExactMatch,
+    /// The pinned upstream harness skips this option variant before checking.
+    UpstreamSkipped,
     /// The normalized headers match, but the complete artifacts do not.
     HeaderOnlyMatch,
     CodeMismatch,
@@ -302,6 +311,7 @@ pub enum DiagnosticArtifactMismatchKind {
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticVariantOutcomeClass {
     Exact,
+    UpstreamSkipped,
     HarnessConfig,
     CheckerCapability,
     SupportedMismatch,
@@ -315,6 +325,7 @@ pub struct DiagnosticScorecardSummary {
     pub upstream_skipped_cases: usize,
     pub selected_cases: usize,
     pub executed_variants: usize,
+    pub upstream_skipped_variants: usize,
     /// Byte-for-byte full diagnostic artifact matches.
     pub exact_matches: usize,
     pub header_only_matches: usize,
@@ -404,6 +415,62 @@ pub struct DiagnosticVariantResult {
     pub first_difference: Option<DiagnosticArtifactDifference>,
     pub unsupported_details: Vec<String>,
     pub diagnostics: Vec<DiagnosticScorecardDiagnostic>,
+    /// Type and symbol artifact results when semantic accounting was requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic_artifacts: Option<SemanticVariantArtifacts>,
+}
+
+/// Whether one upstream semantic artifact was proven, skipped, or unavailable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticArtifactStatus {
+    ExactMatch,
+    Mismatch,
+    Unsupported,
+    NotReached,
+    UpstreamSkipped,
+}
+
+/// Accounting for one configured upstream `.types` or `.symbols` baseline.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SemanticArtifactResult {
+    pub expected_baseline: Option<String>,
+    pub status: SemanticArtifactStatus,
+    pub visited_nodes: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unsupported_detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_difference: Option<DiagnosticArtifactDifference>,
+}
+
+/// Per-variant semantic baseline results in stable artifact order.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SemanticVariantArtifacts {
+    pub types: SemanticArtifactResult,
+    pub symbols: SemanticArtifactResult,
+}
+
+/// Explicit denominator and result counts for one semantic artifact kind.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SemanticArtifactSummary {
+    pub expected_baselines: usize,
+    pub missing_baselines: usize,
+    pub exact_matches: usize,
+    pub mismatches: usize,
+    pub unsupported: usize,
+    pub not_reached: usize,
+    pub upstream_skipped: usize,
+}
+
+/// Semantic-artifact accounting independent of diagnostic-only scorecards.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SemanticArtifactScorecard {
+    pub types: SemanticArtifactSummary,
+    pub symbols: SemanticArtifactSummary,
 }
 
 /// The first honest boundary reached by one scorecard variant.
@@ -438,6 +505,9 @@ pub struct DiagnosticScorecard {
     pub full_artifact_comparison: bool,
     pub summary: DiagnosticScorecardSummary,
     pub variants: Vec<DiagnosticVariantResult>,
+    /// Present only when both configured semantic artifacts were requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic_artifacts: Option<SemanticArtifactScorecard>,
 }
 
 /// Git identity for one source tree used by a scorecard run.
@@ -1176,6 +1246,7 @@ pub struct RunnerSummary {
     pub upstream_skipped_cases: usize,
     pub selected_cases: usize,
     pub executed_variants: usize,
+    pub upstream_skipped_variants: usize,
     pub matched: usize,
     pub mismatched: usize,
     pub missing: usize,
@@ -1208,7 +1279,15 @@ impl fmt::Display for RunnerSummary {
             self.missing_sections,
             self.unexpected_sections,
             self.diagnostic_failures,
-        )
+        )?;
+        if self.upstream_skipped_variants != 0 {
+            write!(
+                formatter,
+                " upstream_skipped_variants={}",
+                self.upstream_skipped_variants
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -1338,6 +1417,84 @@ struct DiagnosticVariantPlan {
     scorecard_case: String,
     expected_baseline: Option<String>,
     expected: String,
+    semantic_artifacts: Option<SemanticArtifactPlan>,
+}
+
+#[derive(Clone, Debug)]
+struct SemanticArtifactPlan {
+    types: Option<String>,
+    symbols: Option<String>,
+    upstream_skipped: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SemanticBaselineSet {
+    types: BTreeMap<String, Vec<PathBuf>>,
+    symbols: BTreeMap<String, Vec<PathBuf>>,
+}
+
+impl SemanticBaselineSet {
+    fn discover(root: &Path) -> io::Result<Self> {
+        let baselines = collect_files(root, |path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    artifacts::types::baseline_base(name).is_some()
+                        || artifacts::symbols::baseline_base(name).is_some()
+                })
+        })?;
+        Ok(Self {
+            types: index_baselines_with(baselines.clone(), artifacts::types::baseline_base),
+            symbols: index_baselines_with(baselines, artifacts::symbols::baseline_base),
+        })
+    }
+
+    fn artifact_baseline(
+        &self,
+        repository: &Path,
+        case_path: &Path,
+        case_name: &str,
+        variant: &OptionVariant,
+        axes: &[String],
+        kind: SemanticArtifactKind,
+    ) -> io::Result<Option<String>> {
+        let index = match kind {
+            SemanticArtifactKind::Types => &self.types,
+            SemanticArtifactKind::Symbols => &self.symbols,
+        };
+        let candidates = index
+            .get(case_name)
+            .map_or_else(Vec::new, |paths| paths.iter().collect::<Vec<_>>());
+        let configured_base = configured_baseline_base(case_name, variant, axes);
+        let selected = candidates
+            .into_iter()
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| kind.baseline_base(name))
+                    .is_some_and(|base| base == configured_base)
+            })
+            .collect::<Vec<_>>();
+        if selected.len() > 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "multiple {} baselines match {}{}: {}",
+                    kind.extension(),
+                    case_path.display(),
+                    variant_label(variant, axes),
+                    selected
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            ));
+        }
+        Ok(selected
+            .first()
+            .map(|path| relative_scorecard_path(repository, path)))
+    }
 }
 
 struct FixedDiagnosticCase {
@@ -1350,6 +1507,7 @@ fn prepare_diagnostic_case_variants(
     repository: &Path,
     case_path: &Path,
     baseline_files: &BTreeMap<String, Vec<PathBuf>>,
+    semantic_baselines: Option<&SemanticBaselineSet>,
 ) -> io::Result<Vec<DiagnosticVariantPlan>> {
     let source = fs::read(case_path)?;
     let case = Arc::new(
@@ -1404,6 +1562,44 @@ fn prepare_diagnostic_case_variants(
                 expected_baseline.as_deref(),
                 &expected,
             );
+            let semantic_artifacts = semantic_baselines
+                .map(|baselines| -> io::Result<_> {
+                    let types = baselines.artifact_baseline(
+                        repository,
+                        case_path,
+                        case_name,
+                        &variant,
+                        &axes,
+                        SemanticArtifactKind::Types,
+                    )?;
+                    let symbols = baselines.artifact_baseline(
+                        repository,
+                        case_path,
+                        case_name,
+                        &variant,
+                        &axes,
+                        SemanticArtifactKind::Symbols,
+                    )?;
+                    let upstream_skipped = case
+                        .directive_values("noTypesAndSymbols")
+                        .last()
+                        .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+                    if upstream_skipped && (types.is_some() || symbols.is_some()) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "@noTypesAndSymbols case {} unexpectedly has semantic baselines",
+                                case_path.display()
+                            ),
+                        ));
+                    }
+                    Ok(SemanticArtifactPlan {
+                        types,
+                        symbols,
+                        upstream_skipped,
+                    })
+                })
+                .transpose()?;
             Ok(DiagnosticVariantPlan {
                 case: Arc::clone(&case),
                 axes: Arc::clone(&axes),
@@ -1412,6 +1608,7 @@ fn prepare_diagnostic_case_variants(
                 scorecard_case: scorecard_case.clone(),
                 expected_baseline,
                 expected,
+                semantic_artifacts,
             })
         })
         .collect()
@@ -1538,6 +1735,7 @@ fn resolve_fixed_variant_plans(
     repository: &Path,
     cases: &[(PathBuf, usize)],
     baseline_sets: &[BTreeMap<String, Vec<PathBuf>>],
+    semantic_baseline_sets: &[Option<SemanticBaselineSet>],
     manifest: &FixedVariantManifest,
 ) -> io::Result<Vec<DiagnosticVariantPlan>> {
     let desired = manifest
@@ -1554,6 +1752,7 @@ fn resolve_fixed_variant_plans(
             repository,
             case_path,
             &baseline_sets[*baseline_index],
+            semantic_baseline_sets[*baseline_index].as_ref(),
         )? {
             let Some(&(index, entry)) = desired.get(plan.variant_key.as_str()) else {
                 continue;
@@ -1586,6 +1785,153 @@ fn resolve_fixed_variant_plans(
         .collect())
 }
 
+fn semantic_artifact_result(
+    kind: SemanticArtifactKind,
+    expected_baseline: Option<&str>,
+    upstream_skipped: bool,
+    walk: Option<&SemanticArtifactWalk>,
+) -> SemanticArtifactResult {
+    if upstream_skipped {
+        return SemanticArtifactResult {
+            expected_baseline: None,
+            status: SemanticArtifactStatus::UpstreamSkipped,
+            visited_nodes: 0,
+            unsupported_detail: None,
+            first_difference: None,
+        };
+    }
+
+    let Some(walk) = walk else {
+        return SemanticArtifactResult {
+            expected_baseline: expected_baseline.map(str::to_owned),
+            status: SemanticArtifactStatus::NotReached,
+            visited_nodes: 0,
+            unsupported_detail: None,
+            first_difference: None,
+        };
+    };
+
+    SemanticArtifactResult {
+        expected_baseline: expected_baseline.map(str::to_owned),
+        status: SemanticArtifactStatus::Unsupported,
+        visited_nodes: match kind {
+            SemanticArtifactKind::Types => walk.types.len(),
+            SemanticArtifactKind::Symbols => walk.symbols.len(),
+        },
+        unsupported_detail: Some(kind.unavailable_detail().to_owned()),
+        first_difference: None,
+    }
+}
+
+fn semantic_variant_results(
+    plan: &SemanticArtifactPlan,
+    walk: Option<&SemanticArtifactWalk>,
+) -> SemanticVariantArtifacts {
+    SemanticVariantArtifacts {
+        types: semantic_artifact_result(
+            SemanticArtifactKind::Types,
+            plan.types.as_deref(),
+            plan.upstream_skipped,
+            walk,
+        ),
+        symbols: semantic_artifact_result(
+            SemanticArtifactKind::Symbols,
+            plan.symbols.as_deref(),
+            plan.upstream_skipped,
+            walk,
+        ),
+    }
+}
+
+fn record_semantic_artifact(
+    summary: &mut SemanticArtifactSummary,
+    result: &SemanticArtifactResult,
+) {
+    if result.status == SemanticArtifactStatus::UpstreamSkipped {
+        summary.upstream_skipped += 1;
+        return;
+    }
+    if result.expected_baseline.is_some() {
+        summary.expected_baselines += 1;
+    } else {
+        summary.missing_baselines += 1;
+    }
+    match result.status {
+        SemanticArtifactStatus::ExactMatch => summary.exact_matches += 1,
+        SemanticArtifactStatus::Mismatch => summary.mismatches += 1,
+        SemanticArtifactStatus::Unsupported => summary.unsupported += 1,
+        SemanticArtifactStatus::NotReached => summary.not_reached += 1,
+        SemanticArtifactStatus::UpstreamSkipped => unreachable!(),
+    }
+}
+
+fn record_semantic_variant(
+    scorecard: &mut DiagnosticScorecard,
+    results: &SemanticVariantArtifacts,
+) {
+    let Some(summary) = scorecard.semantic_artifacts.as_mut() else {
+        return;
+    };
+    record_semantic_artifact(&mut summary.types, &results.types);
+    record_semantic_artifact(&mut summary.symbols, &results.symbols);
+}
+
+fn record_upstream_skipped_variant(
+    plan: DiagnosticVariantPlan,
+    reasons: Vec<String>,
+    summary: &mut RunnerSummary,
+    scorecard: &mut DiagnosticScorecard,
+    writer: &mut impl Write,
+) -> io::Result<()> {
+    summary.upstream_skipped_variants += 1;
+    scorecard.summary.upstream_skipped_variants += 1;
+
+    let detail = reasons.join("; ");
+    writeln!(
+        writer,
+        "SKIP {}{}: {detail}",
+        plan.scorecard_case,
+        variant_label(&plan.variant, &plan.axes),
+    )?;
+
+    let semantic_artifacts = plan.semantic_artifacts.as_ref().map(|_| {
+        semantic_variant_results(
+            &SemanticArtifactPlan {
+                types: None,
+                symbols: None,
+                upstream_skipped: true,
+            },
+            None,
+        )
+    });
+    if let Some(artifacts) = semantic_artifacts.as_ref() {
+        record_semantic_variant(scorecard, artifacts);
+    }
+
+    scorecard.variants.push(DiagnosticVariantResult {
+        variant_key: plan.variant_key,
+        case: plan.scorecard_case,
+        options: plan.variant.values,
+        expected_baseline: plan.expected_baseline,
+        comparison_scope: DiagnosticComparisonScope::FullArtifact,
+        status: DiagnosticVariantStatus::UpstreamSkipped,
+        outcome_class: DiagnosticVariantOutcomeClass::UpstreamSkipped,
+        frontier_blocker: Some(DiagnosticFrontierBlocker {
+            outcome_class: DiagnosticVariantOutcomeClass::UpstreamSkipped,
+            code: None,
+            detail,
+        }),
+        expected_header: parse_error_baseline_header(&plan.expected),
+        actual_header: String::new(),
+        mismatch_kinds: Vec::new(),
+        first_difference: None,
+        unsupported_details: reasons,
+        diagnostics: Vec::new(),
+        semantic_artifacts,
+    });
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)] // One shared execution path keeps ordinary and fixed runs exact.
 fn execute_diagnostic_variant(
     mut plan: DiagnosticVariantPlan,
@@ -1595,10 +1941,30 @@ fn execute_diagnostic_variant(
     scorecard: &mut DiagnosticScorecard,
     writer: &mut impl Write,
 ) -> io::Result<()> {
+    let upstream_skip_reasons = pinned_skip_unsupported_details(&plan.case, &plan.variant);
+    if !upstream_skip_reasons.is_empty() {
+        return record_upstream_skipped_variant(
+            plan,
+            upstream_skip_reasons,
+            summary,
+            scorecard,
+            writer,
+        );
+    }
+
     summary.executed_variants += 1;
     let case_path = &plan.case.path;
     let mut checker_frontier = None;
-    let compilation = match compile_case_variant(&plan.case, &mut plan.variant, checker) {
+    let walk_semantic_artifacts = plan
+        .semantic_artifacts
+        .as_ref()
+        .is_some_and(|artifacts| !artifacts.upstream_skipped);
+    let compilation = match compile_case_variant(
+        &plan.case,
+        &mut plan.variant,
+        checker,
+        walk_semantic_artifacts,
+    ) {
         Ok(compilation) => compilation,
         // A fixture filesystem failure makes scorecard persistence itself
         // suspect. Keep it as a fail-closed harness error (CLI exit 2), never
@@ -1636,6 +2002,7 @@ fn execute_diagnostic_variant(
                             scorecard_case: plan.scorecard_case,
                             expected_baseline: plan.expected_baseline,
                             expected: &plan.expected,
+                            semantic_artifacts: plan.semantic_artifacts.as_ref(),
                             invariant_code,
                             detail,
                         },
@@ -1659,6 +2026,7 @@ fn execute_diagnostic_variant(
                     scorecard_case: plan.scorecard_case,
                     expected_baseline: plan.expected_baseline,
                     expected: &plan.expected,
+                    semantic_artifacts: plan.semantic_artifacts.as_ref(),
                     invariant_code: CANONICAL_CHECKER_PANIC_INVARIANT,
                     detail,
                 },
@@ -1670,8 +2038,23 @@ fn execute_diagnostic_variant(
     actual
         .unsupported_details
         .extend(plan.variant.unsupported_details.iter().cloned());
-    let comparison =
+    let mut comparison =
         compare_diagnostic_artifacts(&plan.expected, &actual, &compilation.diagnostics);
+    let semantic_artifacts = plan.semantic_artifacts.as_ref().map(|artifacts| {
+        semantic_variant_results(artifacts, compilation.semantic_artifact_walk.as_ref())
+    });
+    if let Some(artifacts) = semantic_artifacts.as_ref() {
+        record_semantic_variant(scorecard, artifacts);
+        if comparison.is_exact() {
+            actual.unsupported_details.extend(
+                [&artifacts.types, &artifacts.symbols]
+                    .into_iter()
+                    .filter_map(|artifact| artifact.unsupported_detail.clone()),
+            );
+            comparison =
+                compare_diagnostic_artifacts(&plan.expected, &actual, &compilation.diagnostics);
+        }
+    }
     let checker_blocked = checker_frontier.is_some();
     let status = if checker_blocked {
         DiagnosticVariantStatus::UnsupportedDetail
@@ -1691,7 +2074,9 @@ fn execute_diagnostic_variant(
             scorecard.summary.header_mismatches += 1;
         }
         match status {
-            DiagnosticVariantStatus::ExactMatch | DiagnosticVariantStatus::FatalInvariant => {
+            DiagnosticVariantStatus::ExactMatch
+            | DiagnosticVariantStatus::UpstreamSkipped
+            | DiagnosticVariantStatus::FatalInvariant => {
                 unreachable!()
             }
             DiagnosticVariantStatus::HeaderOnlyMatch => {
@@ -1754,6 +2139,7 @@ fn execute_diagnostic_variant(
             .iter()
             .map(DiagnosticScorecardDiagnostic::from)
             .collect(),
+        semantic_artifacts,
     });
     Ok(())
 }
@@ -1779,6 +2165,7 @@ fn run_fixed_variant_diagnostic_baselines(
     let selected_case_sources = select_fixed_diagnostic_cases(&oracle_manifest, &fixed_manifest)?;
     let mut cases = Vec::new();
     let mut baseline_sets = Vec::new();
+    let mut semantic_baseline_sets = Vec::new();
     let mut baseline_indexes = BTreeMap::<PathBuf, usize>::new();
     for selected_case in selected_case_sources {
         let baseline_index = if let Some(index) = baseline_indexes.get(&selected_case.oracle_root) {
@@ -1787,12 +2174,24 @@ fn run_fixed_variant_diagnostic_baselines(
             let baselines = collect_files(&selected_case.oracle_root, is_error_baseline_file)?;
             let index = baseline_sets.len();
             baseline_sets.push(index_baselines_with(baselines, error_baseline_base));
+            semantic_baseline_sets.push(
+                options
+                    .semantic_artifacts
+                    .then(|| SemanticBaselineSet::discover(&selected_case.oracle_root))
+                    .transpose()?,
+            );
             baseline_indexes.insert(selected_case.oracle_root, index);
             index
         };
         cases.push((selected_case.path, baseline_index));
     }
-    let plans = resolve_fixed_variant_plans(repository, &cases, &baseline_sets, &fixed_manifest)?;
+    let plans = resolve_fixed_variant_plans(
+        repository,
+        &cases,
+        &baseline_sets,
+        &semantic_baseline_sets,
+        &fixed_manifest,
+    )?;
     let selected_cases = plans
         .iter()
         .map(|plan| plan.scorecard_case.as_str())
@@ -1827,6 +2226,9 @@ fn run_fixed_variant_diagnostic_baselines(
             ..DiagnosticScorecardSummary::default()
         },
         variants: Vec::with_capacity(plans.len()),
+        semantic_artifacts: options
+            .semantic_artifacts
+            .then(SemanticArtifactScorecard::default),
     };
     for plan in plans {
         execute_diagnostic_variant(
@@ -1887,10 +2289,17 @@ pub fn run_upstream_diagnostic_baselines(
     let provenance = scorecard_provenance(repository, options, &oracle_digest, None)?;
     let mut cases = Vec::new();
     let mut baseline_sets = Vec::new();
+    let mut semantic_baseline_sets = Vec::new();
     for suite in &manifest.suites {
         let baselines = collect_files(&suite.oracle_root, is_error_baseline_file)?;
         let baseline_index = baseline_sets.len();
         baseline_sets.push(index_baselines_with(baselines, error_baseline_base));
+        semantic_baseline_sets.push(
+            options
+                .semantic_artifacts
+                .then(|| SemanticBaselineSet::discover(&suite.oracle_root))
+                .transpose()?,
+        );
         for case in &suite.cases {
             if case.disposition == UpstreamCaseDisposition::Runnable {
                 cases.push((case.path.clone(), baseline_index));
@@ -1936,12 +2345,16 @@ pub fn run_upstream_diagnostic_baselines(
             ..DiagnosticScorecardSummary::default()
         },
         variants: Vec::new(),
+        semantic_artifacts: options
+            .semantic_artifacts
+            .then(SemanticArtifactScorecard::default),
     };
     for (case_path, baseline_index) in cases {
         for plan in prepare_diagnostic_case_variants(
             repository,
             &case_path,
             &baseline_sets[baseline_index],
+            semantic_baseline_sets[baseline_index].as_ref(),
         )? {
             execute_diagnostic_variant(
                 plan,
@@ -2040,6 +2453,7 @@ struct FatalVariantRecord<'a> {
     scorecard_case: String,
     expected_baseline: Option<String>,
     expected: &'a str,
+    semantic_artifacts: Option<&'a SemanticArtifactPlan>,
     invariant_code: &'a str,
     detail: String,
 }
@@ -2065,6 +2479,12 @@ fn retain_fatal_variant(
         "FATAL {display_path}{label}: {}: {}",
         record.invariant_code, record.detail
     )?;
+    let semantic_artifacts = record
+        .semantic_artifacts
+        .map(|artifacts| semantic_variant_results(artifacts, None));
+    if let Some(artifacts) = semantic_artifacts.as_ref() {
+        record_semantic_variant(scorecard, artifacts);
+    }
     scorecard.variants.push(DiagnosticVariantResult {
         variant_key: record.variant_key,
         case: record.scorecard_case,
@@ -2084,6 +2504,7 @@ fn retain_fatal_variant(
         first_difference: None,
         unsupported_details: record.variant.unsupported_details.clone(),
         diagnostics: Vec::new(),
+        semantic_artifacts,
     });
     Ok(())
 }
@@ -3694,7 +4115,7 @@ pub fn compile_case(case: &Case) -> std::io::Result<Compilation> {
         .into_iter()
         .next()
         .unwrap_or_default();
-    compile_case_variant(case, &mut variant, FixtureChecker::Legacy)
+    compile_case_variant(case, &mut variant, FixtureChecker::Legacy, false)
         .map_err(FixtureCompilationFailure::into_io_error)
 }
 
@@ -3791,7 +4212,7 @@ fn compile_case_matrix_with_checker(
     expand_option_matrix(case)
         .into_iter()
         .map(
-            |mut variant| match compile_case_variant(case, &mut variant, checker) {
+            |mut variant| match compile_case_variant(case, &mut variant, checker, false) {
                 Ok(compilation) => Ok((variant, compilation)),
                 Err(FixtureCompilationFailure::Canonical(error))
                     if matches!(
@@ -3841,6 +4262,7 @@ fn compile_case_variant(
     case: &Case,
     variant: &mut OptionVariant,
     checker: FixtureChecker,
+    walk_semantic_artifacts: bool,
 ) -> Result<Compilation, FixtureCompilationFailure> {
     let file_system = MemoryFileSystem::new(true);
     let project_directory = project_config_unit(case).and_then(|(path, _)| {
@@ -4033,10 +4455,17 @@ fn compile_case_variant(
             .collect(),
         FixtureChecker::Canonical => BTreeMap::new(),
     };
+    let semantic_artifact_walk = walk_semantic_artifacts
+        .then(|| {
+            artifacts::walk_program(case, &program)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        })
+        .transpose()?;
     Ok(Compilation {
         diagnostics,
         diagnostic_text,
         outputs,
+        semantic_artifact_walk,
     })
 }
 
@@ -4939,6 +5368,34 @@ mod tests {
     }
 
     #[test]
+    fn checked_in_milestone_manifest_is_a_balanced_smoke_superset() {
+        let smoke: FixedVariantManifest =
+            serde_json::from_str(include_str!("../manifests/checker-smoke-v1.json")).unwrap();
+        let milestone: FixedVariantManifest =
+            serde_json::from_str(include_str!("../manifests/checker-milestone-v1.json")).unwrap();
+
+        validate_fixed_variant_manifest_structure(&milestone).unwrap();
+        assert_eq!(milestone.variants.len(), 512);
+        assert_eq!(milestone.policy.quota_per_family, 64);
+        assert_eq!(milestone.policy.expected_diagnostics_per_family.clean, 32);
+        assert_eq!(milestone.policy.expected_diagnostics_per_family.error, 32);
+        assert_eq!(
+            fixed_variant_manifest_digest(&milestone.variants),
+            "850c826e464cfb77a725af8b4fec7468"
+        );
+        assert!(smoke.variants.iter().all(|entry| {
+            milestone
+                .variants
+                .iter()
+                .any(|candidate| candidate.variant_key == entry.variant_key)
+        }));
+        assert!(milestone.variants.iter().any(|entry| {
+            entry.case == "_submodules/TypeScript/tests/cases/compiler/asyncFunctionsAcrossFiles.ts"
+                && entry.tags.iter().any(|tag| tag == "relative_import_cycle")
+        }));
+    }
+
+    #[test]
     fn capability_registry_covers_every_typed_checker_code() {
         let metadata = capability_registry_metadata().unwrap();
         assert_eq!(metadata.version, 1);
@@ -5061,6 +5518,7 @@ mod tests {
             full_artifact_comparison: true,
             summary: DiagnosticScorecardSummary::default(),
             variants: Vec::new(),
+            semantic_artifacts: None,
         };
         let variant = OptionVariant::default();
         let mut writer = Vec::new();
@@ -5078,6 +5536,7 @@ mod tests {
                 scorecard_case: "input.ts".to_owned(),
                 expected_baseline: None,
                 expected: "",
+                semantic_artifacts: None,
                 invariant_code: "INV.PROGRAM.DIAGNOSTIC_FORMAT",
                 detail: "typed fatal detail".to_owned(),
             },
@@ -5235,8 +5694,13 @@ mod tests {
     #[test]
     fn canonical_checker_retains_typed_failures_as_variant_unsupported_details() {
         let case = Case::parse(
-            "unsupported.tsx",
-            "// @noLib: true\nconst value: number = 1;\n",
+            "unsupported.ts",
+            concat!(
+                "// @allowJs: true\n",
+                "// @outDir: out\n",
+                "// @filename: unsupported.js\n",
+                "const value = 1;\n",
+            ),
         )
         .unwrap();
         let legacy = compile_case(&case).unwrap();
@@ -5252,7 +5716,7 @@ mod tests {
         assert_eq!(variant.unsupported_details.len(), 1);
         assert!(
             variant.unsupported_details[0]
-                .contains("canonical checking does not support Tsx source '/.src/unsupported.tsx'"),
+                .contains("canonical checking does not support Js source '/.src/unsupported.js'"),
             "{:?}",
             variant.unsupported_details
         );

@@ -141,10 +141,13 @@ fn canonical_scorecard_retains_capabilities_then_continues_to_exact_case() {
         ),
         None,
     );
-    repository.write_case_with_extension(
-        "tsxUnsupported",
-        "tsx",
-        "// @noLib: true\nconst value: number = 1;\n",
+    repository.write_case(
+        "javascriptUnsupported",
+        concat!(
+            "// @allowJs: true\n",
+            "// @filename: unsupported.js\n",
+            "const value = 1;\n",
+        ),
         None,
     );
     repository.write_case("zzExact", "const value: number = 1;\n", None);
@@ -191,7 +194,7 @@ fn canonical_scorecard_retains_capabilities_then_continues_to_exact_case() {
     assert_eq!(variants[0]["frontierBlocker"]["code"], "E00.SOURCE_SYNTAX");
     assert_eq!(
         variants[1]["case"],
-        "testdata/tests/cases/compiler/tsxUnsupported.tsx"
+        "testdata/tests/cases/compiler/javascriptUnsupported.ts"
     );
     assert_eq!(variants[1]["status"], "unsupported_detail");
     assert_eq!(variants[1]["outcomeClass"], "checker_capability");
@@ -790,6 +793,230 @@ fn canonical_checker_matches_related_information_artifact_and_scorecard_exactly(
 }
 
 #[test]
+fn semantic_artifact_mode_never_counts_unavailable_queries_as_exact() {
+    let repository = TestRepository::new();
+    repository.write_case(
+        "semanticArtifacts",
+        "// @noLib: true\nconst value: number = 1;\n",
+        None,
+    );
+    repository.write_baseline("semanticArtifacts.types", "expected type baseline\n");
+    repository.write_baseline("semanticArtifacts.symbols", "expected symbol baseline\n");
+    let scorecard_path = repository.0.join("semantic-scorecard.json");
+
+    let output = run(
+        &repository.0,
+        &[
+            "--diagnostics",
+            "--canonical-checker",
+            "--semantic-artifacts",
+            "--scorecard-json",
+            scorecard_path.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let scorecard: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(scorecard_path).unwrap()).unwrap();
+
+    assert_eq!(scorecard["summary"]["executedVariants"], 1);
+    assert_eq!(scorecard["summary"]["exactMatches"], 0);
+    assert_eq!(scorecard["summary"]["unsupportedDetails"], 1);
+    assert_eq!(scorecard["variants"][0]["status"], "unsupported_detail");
+    assert_eq!(scorecard["variants"][0]["outcomeClass"], "harness_config");
+    for kind in ["types", "symbols"] {
+        assert_eq!(scorecard["semanticArtifacts"][kind]["expectedBaselines"], 1);
+        assert_eq!(scorecard["semanticArtifacts"][kind]["missingBaselines"], 0);
+        assert_eq!(scorecard["semanticArtifacts"][kind]["exactMatches"], 0);
+        assert_eq!(scorecard["semanticArtifacts"][kind]["unsupported"], 1);
+        assert_eq!(
+            scorecard["variants"][0]["semanticArtifacts"][kind]["status"],
+            "unsupported"
+        );
+        assert!(
+            scorecard["variants"][0]["semanticArtifacts"][kind]["visitedNodes"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert!(
+            scorecard["variants"][0]["semanticArtifacts"][kind]["expectedBaseline"]
+                .as_str()
+                .unwrap()
+                .ends_with(kind)
+        );
+    }
+}
+
+#[test]
+fn semantic_artifact_mode_does_not_assume_missing_baselines_are_empty_matches() {
+    let repository = TestRepository::new();
+    repository.write_case(
+        "missingSemanticBaselines",
+        "// @noLib: true\nconst value: number = 1;\n",
+        None,
+    );
+    let scorecard_path = repository.0.join("missing-semantic-scorecard.json");
+
+    let output = run(
+        &repository.0,
+        &[
+            "--diagnostics",
+            "--canonical-checker",
+            "--semantic-artifacts",
+            "--scorecard-json",
+            scorecard_path.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let scorecard: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(scorecard_path).unwrap()).unwrap();
+    assert_eq!(scorecard["summary"]["exactMatches"], 0);
+    for kind in ["types", "symbols"] {
+        assert_eq!(scorecard["semanticArtifacts"][kind]["expectedBaselines"], 0);
+        assert_eq!(scorecard["semanticArtifacts"][kind]["missingBaselines"], 1);
+        assert_eq!(scorecard["semanticArtifacts"][kind]["unsupported"], 1);
+        assert!(scorecard["variants"][0]["semanticArtifacts"][kind]["expectedBaseline"].is_null());
+    }
+}
+
+#[test]
+fn semantic_artifact_mode_preserves_the_upstream_no_types_and_symbols_skip() {
+    let repository = TestRepository::new();
+    repository.write_case(
+        "skipSemanticBaselines",
+        concat!(
+            "// @noTypesAndSymbols: true\n",
+            "const value: number = 1;\n",
+        ),
+        None,
+    );
+    let scorecard_path = repository.0.join("skipped-semantic-scorecard.json");
+
+    let output = run(
+        &repository.0,
+        &[
+            "--diagnostics",
+            "--canonical-checker",
+            "--semantic-artifacts",
+            "--scorecard-json",
+            scorecard_path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let scorecard: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(scorecard_path).unwrap()).unwrap();
+    assert_eq!(scorecard["summary"]["exactMatches"], 1);
+    for kind in ["types", "symbols"] {
+        assert_eq!(scorecard["semanticArtifacts"][kind]["upstreamSkipped"], 1);
+        assert_eq!(scorecard["semanticArtifacts"][kind]["unsupported"], 0);
+        assert_eq!(
+            scorecard["variants"][0]["semanticArtifacts"][kind]["status"],
+            "upstream_skipped"
+        );
+    }
+}
+
+#[test]
+fn semantic_artifacts_follow_configured_option_matrix_baselines() {
+    let repository = TestRepository::new();
+    repository.write_case(
+        "configuredSemanticBaselines",
+        concat!(
+            "// @target: es2015, esnext\n",
+            "// @noLib: true\n",
+            "const value: number = 1;\n",
+        ),
+        None,
+    );
+    for target in ["es2015", "esnext"] {
+        repository.write_baseline(
+            &format!("configuredSemanticBaselines(target={target}).types"),
+            "configured types\n",
+        );
+        repository.write_baseline(
+            &format!("configuredSemanticBaselines(target={target}).symbols"),
+            "configured symbols\n",
+        );
+    }
+    let scorecard_path = repository.0.join("configured-semantic-scorecard.json");
+
+    let output = run(
+        &repository.0,
+        &[
+            "--diagnostics",
+            "--canonical-checker",
+            "--semantic-artifacts",
+            "--scorecard-json",
+            scorecard_path.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let scorecard: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(scorecard_path).unwrap()).unwrap();
+    let variants = scorecard["variants"].as_array().unwrap();
+    assert_eq!(variants.len(), 2);
+    for variant in variants {
+        let target = variant["options"]["target"].as_str().unwrap();
+        for kind in ["types", "symbols"] {
+            let baseline = variant["semanticArtifacts"][kind]["expectedBaseline"]
+                .as_str()
+                .unwrap();
+            assert!(baseline.ends_with(&format!("(target={target}).{kind}")));
+        }
+    }
+}
+
+#[test]
+fn semantic_artifacts_remain_not_reached_after_a_checker_capability() {
+    let repository = TestRepository::new();
+    repository.write_case(
+        "unsupportedSemanticSource",
+        concat!(
+            "// @allowJs: true\n",
+            "// @filename: unsupported.js\n",
+            "const value = 1;\n",
+        ),
+        None,
+    );
+    let scorecard_path = repository.0.join("not-reached-semantic-scorecard.json");
+
+    let output = run(
+        &repository.0,
+        &[
+            "--diagnostics",
+            "--canonical-checker",
+            "--semantic-artifacts",
+            "--scorecard-json",
+            scorecard_path.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let scorecard: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(scorecard_path).unwrap()).unwrap();
+    assert_eq!(
+        scorecard["variants"][0]["outcomeClass"],
+        "checker_capability"
+    );
+    assert_eq!(
+        scorecard["variants"][0]["frontierBlocker"]["code"],
+        "C00.SOURCE_KIND"
+    );
+    for kind in ["types", "symbols"] {
+        assert_eq!(scorecard["semanticArtifacts"][kind]["notReached"], 1);
+        assert_eq!(scorecard["semanticArtifacts"][kind]["unsupported"], 0);
+        assert_eq!(
+            scorecard["variants"][0]["semanticArtifacts"][kind]["status"],
+            "not_reached"
+        );
+    }
+}
+
+#[test]
 fn canonical_checker_cli_rejects_non_diagnostic_modes() {
     let repository = TestRepository::new();
     let artifact = run(&repository.0, &["--canonical-checker"]);
@@ -894,6 +1121,57 @@ fn upstream_skips_are_visible_but_never_executed() {
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         "summary: discovered_cases=1 upstream_skipped_cases=1 selected_cases=0 executed_variants=0 matched=0 mismatched=0 missing=0 content=0 missing_sections=0 unexpected_sections=0 diagnostics=0 diagnostic_comparison=full-artifact exact_matches=0 header_only_matches=0 code_mismatches=0 span_mismatches=0 message_mismatches=0 order_mismatches=0 unsupported_details=0 header_mismatches=0 artifact_mismatches=0 fatal_invariants=0\n"
+    );
+}
+
+#[test]
+fn upstream_skipped_option_variants_are_not_executed_or_counted_as_matches() {
+    let repository = TestRepository::new();
+    repository.write_case(
+        "classicResolutionSkip",
+        concat!(
+            "// @moduleResolution: classic\n",
+            "// @strict: true\n",
+            "const value: string = undefined;\n",
+        ),
+        None,
+    );
+    let scorecard_path = repository.0.join("skipped-option-scorecard.json");
+
+    let output = run(
+        &repository.0,
+        &[
+            "--diagnostics",
+            "--canonical-checker",
+            "--scorecard-json",
+            scorecard_path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let scorecard: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(scorecard_path).unwrap()).unwrap();
+    assert_eq!(scorecard["summary"]["selectedCases"], 1);
+    assert_eq!(scorecard["summary"]["executedVariants"], 0);
+    assert_eq!(scorecard["summary"]["upstreamSkippedVariants"], 1);
+    assert_eq!(scorecard["summary"]["exactMatches"], 0);
+    assert_eq!(scorecard["summary"]["actualDiagnostics"], 0);
+    assert_eq!(scorecard["variants"][0]["status"], "upstream_skipped");
+    assert_eq!(scorecard["variants"][0]["outcomeClass"], "upstream_skipped");
+    assert_eq!(
+        scorecard["variants"][0]["diagnostics"],
+        serde_json::json!([])
+    );
+    assert!(
+        scorecard["variants"][0]["frontierBlocker"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("classic module resolution")
     );
 }
 
