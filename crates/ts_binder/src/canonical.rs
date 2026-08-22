@@ -1144,6 +1144,7 @@ impl CanonicalBinder {
         self.bind_declaration_slice(arena, file, true)
     }
 
+    #[allow(clippy::too_many_lines)] // Preserve upstream preflight and declaration order.
     fn bind_declaration_slice(
         &mut self,
         arena: &NodeArena,
@@ -1400,7 +1401,7 @@ impl CanonicalBinder {
         let Some(exports) = self
             .symbols
             .symbol(source)
-            .and_then(|source| source.exports())
+            .and_then(crate::semantic::Symbol::exports)
         else {
             return;
         };
@@ -1416,15 +1417,15 @@ impl CanonicalBinder {
             .symbol_table(exports)
             .expect("CommonJS exports belong to this store")
             .iter()
-            .filter_map(|(name, symbol)| {
-                (name != InternalSymbolName::ExportEquals.as_ref()
-                    && self.symbols.symbol(symbol).is_some_and(|record| {
+            .filter(|(name, symbol)| {
+                *name != InternalSymbolName::ExportEquals.as_ref()
+                    && self.symbols.symbol(*symbol).is_some_and(|record| {
                         record
                             .flags()
                             .intersects(SymbolFlags::TYPE | SymbolFlags::NAMESPACE)
-                    }))
-                .then(|| (name.to_owned(), symbol))
+                    })
             })
+            .map(|(name, symbol)| (name.to_owned(), symbol))
             .collect::<Vec<_>>();
         if promoted.is_empty() {
             return;
@@ -3213,6 +3214,7 @@ impl CanonicalBinder {
         })
     }
 
+    #[allow(clippy::too_many_lines)] // Keep upstream declaration-name cases together.
     fn get_declaration_name(
         &mut self,
         arena: &NodeArena,
