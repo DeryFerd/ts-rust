@@ -14804,7 +14804,11 @@ mod tests {
                 Ok(regular)
             );
             assert_eq!(
-                context.store().type_payload(declared).unwrap().object_flags(),
+                context
+                    .store()
+                    .type_payload(declared)
+                    .unwrap()
+                    .object_flags(),
                 ObjectFlags::PRIMITIVE_UNION,
             );
             assert!(context.diagnostics().is_empty());
