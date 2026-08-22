@@ -17,6 +17,7 @@ use ts_binder::{
 use super::{
     ArrayTypeError, CanonicalGlobalTypes,
     array_types::CanonicalArrayTargets,
+    bootstrap::LiteralTypeCacheError,
     ids::TypeId,
     links::ValueSymbolLinks,
     mapper::TypeMapper,
@@ -210,6 +211,10 @@ enum WidenPlan {
         element: WidenTransform,
         readonly: bool,
     },
+    Union {
+        source: TypeId,
+        constituents: Vec<WidenTransform>,
+    },
 }
 
 impl SemanticStore<TypeRecord, TypeMapper> {
@@ -331,8 +336,14 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             .iter()
             .filter(|plan| matches!(plan, WidenPlan::Array { .. }))
             .count();
+        let union_count = plans
+            .iter()
+            .filter(|plan| matches!(plan, WidenPlan::Union { .. }))
+            .count();
         let clone_count = plans.iter().try_fold(0usize, |count, plan| match plan {
-            WidenPlan::Existing { .. } | WidenPlan::Array { .. } => Some(count),
+            WidenPlan::Existing { .. } | WidenPlan::Array { .. } | WidenPlan::Union { .. } => {
+                Some(count)
+            }
             WidenPlan::Object { properties, .. } => count.checked_add(
                 properties
                     .iter()
@@ -343,7 +354,11 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         let Some(clone_count) = clone_count else {
             return Err(DerivedTypeError::Capacity(type_));
         };
-        let Some(type_count) = object_count.checked_add(array_count) else {
+        let Some(type_count) = object_count.checked_add(array_count).and_then(|count| {
+            union_count
+                .checked_mul(2)
+                .and_then(|unions| count.checked_add(unions))
+        }) else {
             return Err(DerivedTypeError::Capacity(type_));
         };
         if !self.derived_types.try_reserve_widened(plans.len())
@@ -385,6 +400,20 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     return Err(DerivedTypeError::Capacity(type_));
                 }
             }
+        }
+        if union_count != 0 {
+            let result = match global_types {
+                Some(global_types) => self.prepare_type_query_types_with_global_types(
+                    &[],
+                    &[],
+                    &[],
+                    union_count,
+                    0,
+                    global_types,
+                ),
+                None => self.prepare_type_query_types(&[], &[], &[], union_count, 0),
+            };
+            result.map_err(|error| widening_union_error(type_, error))?;
         }
 
         for plan in plans {
@@ -597,6 +626,49 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             return Ok(WidenTransform::Cached(source));
         }
 
+        if let TypeData::Union(union) = record.data() {
+            let members = union.union.types.clone();
+            if members.iter().any(|member| {
+                self.type_payload(*member).is_some_and(|record| {
+                    record.object_flags().contains(ObjectFlags::OBJECT_LITERAL)
+                        && record
+                            .object_flags()
+                            .intersects(ObjectFlags::REQUIRES_WIDENING)
+                })
+            }) {
+                return Err(DerivedTypeError::UnsupportedWideningType(source));
+            }
+            let validation = match global_types {
+                Some(global_types) => {
+                    self.validate_union_constituent_with_global_types(global_types, source)
+                }
+                None => self.validate_union_constituent(source),
+            };
+            validation.map_err(|error| widening_union_error(source, error))?;
+            if !visiting.insert(source) {
+                return Err(DerivedTypeError::RecursiveWideningType(source));
+            }
+            let mut constituents = Vec::with_capacity(members.len());
+            for member in members {
+                let member_record = self
+                    .type_payload(member)
+                    .ok_or(DerivedTypeError::Type(member))?;
+                let transform = if member_record.flags().intersects(TypeFlags::NULLABLE) {
+                    WidenTransform::Identity(member)
+                } else {
+                    self.plan_widened_type(member, global_types, plans, visiting, planned)?
+                };
+                constituents.push(transform);
+            }
+            debug_assert!(visiting.remove(&source));
+            planned.insert(source);
+            plans.push(WidenPlan::Union {
+                source,
+                constituents,
+            });
+            return Ok(WidenTransform::Cached(source));
+        }
+
         if let Some(global_types) = global_types
             && let Some(array) = self.canonical_array_reference(global_types, source)?
         {
@@ -792,6 +864,47 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         readonly,
                     )
                     .expect("the widening plan preflighted its canonical array target");
+                assert_eq!(
+                    self.derived_types.widened_types.insert(source, widened),
+                    None
+                );
+                if self.relation_derived_cache_source_is_observable(source)
+                    || self.relation_derived_cache_target_is_observable(widened)
+                {
+                    self.mark_relation_inputs_dirty();
+                }
+            }
+            WidenPlan::Union {
+                source,
+                constituents,
+            } => {
+                let members = constituents
+                    .into_iter()
+                    .map(|constituent| match constituent {
+                        WidenTransform::Identity(type_) => type_,
+                        WidenTransform::Cached(source) => *self
+                            .derived_types
+                            .widened_types
+                            .get(&source)
+                            .expect("widened union members are published before their parent"),
+                    })
+                    .collect::<Vec<_>>();
+                let widened = match global_types {
+                    Some(global_types) => self
+                        .expression_union_type_with_global_types(
+                            global_types,
+                            &members,
+                            super::bootstrap::UnionReduction::Literal,
+                        )
+                        .expect("preflighted widened union members remain canonical"),
+                    None => {
+                        let mut prepared = self
+                            .prepare_type_query_types(&[], &[], &[], 1, 0)
+                            .expect("widened union preparation was preflighted");
+                        self.literal_union_type_prepared(&members, None, &mut prepared)
+                            .expect("preflighted widened union members remain canonical")
+                    }
+                };
                 assert_eq!(
                     self.derived_types.widened_types.insert(source, widened),
                     None
@@ -1139,6 +1252,15 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 .intrinsic_bootstrap()
                 .is_some_and(|bootstrap| target == bootstrap.any_type);
         }
+        if matches!(source_record.data(), TypeData::Union(_)) {
+            return self.widened_union_cache_entry_is_valid(
+                source,
+                target,
+                visiting,
+                regular_visiting,
+                array_targets,
+            );
+        }
         if let Some(array_targets) = array_targets {
             let source_array =
                 match self.canonical_array_reference_with_targets(array_targets, source) {
@@ -1197,6 +1319,77 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             return valid;
         }
         self.widened_object_cache_entry_is_valid(source, target, visiting, regular_visiting, None)
+    }
+
+    fn widened_union_cache_entry_is_valid(
+        &self,
+        source: TypeId,
+        target: TypeId,
+        visiting: &mut HashSet<TypeId>,
+        regular_visiting: &mut HashSet<TypeId>,
+        array_targets: Option<CanonicalArrayTargets>,
+    ) -> bool {
+        let Some(TypeData::Union(source_union)) = self.type_payload(source).map(TypeRecord::data)
+        else {
+            return false;
+        };
+        let source_valid = match array_targets {
+            Some(targets) => self.validate_union_constituent_with_array_targets(targets, source),
+            None => self.validate_union_constituent(source),
+        };
+        if source_valid.is_err() || !visiting.insert(source) {
+            return false;
+        }
+
+        let valid = (|| {
+            let mut expected = Vec::with_capacity(source_union.union.types.len());
+            for constituent in &source_union.union.types {
+                let record = self.type_payload(*constituent)?;
+                let widened = if !record.flags().intersects(TypeFlags::NULLABLE)
+                    && record
+                        .object_flags()
+                        .intersects(ObjectFlags::REQUIRES_WIDENING)
+                {
+                    let cached = *self.derived_types.widened_types.get(constituent)?;
+                    if !self.widened_cache_entry_is_valid(
+                        *constituent,
+                        cached,
+                        visiting,
+                        regular_visiting,
+                        array_targets,
+                    ) {
+                        return None;
+                    }
+                    cached
+                } else {
+                    *constituent
+                };
+                if !expected.contains(&widened) {
+                    expected.push(widened);
+                }
+            }
+
+            let target_valid = match array_targets {
+                Some(targets) => {
+                    self.validate_cached_union_result_with_array_targets(targets, target, None)
+                }
+                None => self.validate_cached_union_result(target, None),
+            };
+            if target_valid.is_err() {
+                return None;
+            }
+            match self.type_payload(target)?.data() {
+                TypeData::Union(union) => (union.union.types.len() == expected.len()
+                    && expected
+                        .iter()
+                        .all(|constituent| union.union.types.contains(constituent)))
+                .then_some(()),
+                _ => (expected.as_slice() == [target]).then_some(()),
+            }
+        })()
+        .is_some();
+        debug_assert!(visiting.remove(&source));
+        valid
     }
 
     fn widened_object_cache_entry_is_valid(
@@ -1314,6 +1507,29 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             && target_record.exports().is_none()
             && target_record.export_symbol().is_none()
             && self.value_symbol_links(target) == Some(&expected_links)
+    }
+}
+
+fn widening_union_error(source: TypeId, error: LiteralTypeCacheError) -> DerivedTypeError {
+    match error {
+        LiteralTypeCacheError::BootstrapUninitialized => DerivedTypeError::BootstrapUninitialized,
+        LiteralTypeCacheError::Capacity => DerivedTypeError::Capacity(source),
+        LiteralTypeCacheError::ArrayType { error, .. } => DerivedTypeError::ArrayType(error),
+        LiteralTypeCacheError::UnsupportedUnionConstituent(type_) => {
+            DerivedTypeError::UnsupportedWideningType(type_)
+        }
+        LiteralTypeCacheError::InvalidCachedLiteral(cached)
+        | LiteralTypeCacheError::InvalidCachedUnion(cached) => {
+            DerivedTypeError::InvalidWidenedTypeCache { source, cached }
+        }
+        LiteralTypeCacheError::InvalidValue
+        | LiteralTypeCacheError::InvalidUnionAlias(_)
+        | LiteralTypeCacheError::InvalidPreparedQuery => {
+            DerivedTypeError::InvalidWidenedTypeCache {
+                source,
+                cached: source,
+            }
+        }
     }
 }
 
@@ -1688,6 +1904,88 @@ mod tests {
             widened_nested,
             "the successful retry must retain the already-published child identity"
         );
+    }
+
+    #[test]
+    fn logical_array_unions_widen_each_member_and_reuse_the_canonical_result() {
+        let library = parsed("interface Array<T> {}");
+        let source =
+            parsed("let condition = 123; var value = condition && [1, 2] || condition && [3, 4];");
+        let library_file = FileId::new(40);
+        let file = FileId::new(41);
+        let mut context = checker_context(&[(library_file, &library), (file, &source)]);
+        let initializer = variable_initializer(&source, file, "value");
+        context.check_source_file(file).unwrap();
+
+        let union = resolved_expression_type(&context, initializer);
+        let global_types = context.global_types().clone();
+        let widened = context
+            .store_mut_for_test()
+            .get_widened_type_with_global_types(union, &global_types)
+            .unwrap();
+        let Some(TypeData::Union(result)) =
+            context.store().type_payload(widened).map(TypeRecord::data)
+        else {
+            panic!("the widened logical result must remain a union");
+        };
+        let zero = context.store().intrinsic_bootstrap().unwrap().zero_type;
+        assert_eq!(result.union.types.len(), 2);
+        assert!(result.union.types.contains(&zero));
+        let array = result
+            .union
+            .types
+            .iter()
+            .copied()
+            .find(|type_| *type_ != zero)
+            .unwrap();
+        let reference = context
+            .store()
+            .canonical_array_reference(&global_types, array)
+            .unwrap()
+            .unwrap();
+        assert!(!reference.array_literal);
+        assert_eq!(
+            reference.element_type,
+            context.store().intrinsic_bootstrap().unwrap().number_type,
+        );
+
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .derived_types
+                .widened_types
+                .insert(union, number),
+            Some(widened),
+        );
+        let poisoned = observable_state(context.store());
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .get_widened_type_with_global_types(union, &global_types),
+            Err(DerivedTypeError::InvalidWidenedTypeCache {
+                source: union,
+                cached: number,
+            }),
+        );
+        assert_eq!(observable_state(context.store()), poisoned);
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .derived_types
+                .widened_types
+                .insert(union, widened),
+            Some(number),
+        );
+
+        let warm = observable_state(context.store());
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .get_widened_type_with_global_types(union, &global_types),
+            Ok(widened),
+        );
+        assert_eq!(observable_state(context.store()), warm);
     }
 
     #[test]
