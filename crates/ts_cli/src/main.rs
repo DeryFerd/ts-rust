@@ -8,9 +8,12 @@ use ts_cli::{
     BuildOptions, Command, CompilerOptions as CliOptions, ExitStatus, VERSION, parse_command_line,
 };
 use ts_compiler::{Program, ProgramDiagnostic, ProgramOptionsOverride};
-use ts_diagnostic_writer::{Diagnostic, DiagnosticCategory, FormattingOptions, format_diagnostics};
+use ts_diagnostic_writer::{
+    Diagnostic, DiagnosticCategory, FormattingOptions, format_diagnostic_with_related,
+    format_diagnostics,
+};
 use ts_module::ResolutionOptions;
-use ts_project::{CompiledProject, ProjectDiagnostic, build_projects};
+use ts_project::{CompiledProject, ProjectDiagnostic, build_projects, load_project_graph};
 use ts_scanner::Scanner;
 use ts_vfs::OsFileSystem;
 use ts_watch::{
@@ -72,14 +75,23 @@ fn build(options: &BuildOptions) -> ExitCode {
         options.projects.clone()
     };
     let file_system = OsFileSystem::default();
+    let overrides = ProgramOptionsOverride {
+        no_check: options.no_check,
+        no_emit: options.no_emit.then_some(true),
+        ..ProgramOptionsOverride::default()
+    };
+    if options.force
+        && let Err(error) =
+            invalidate_project_build_info(&file_system, &current_directory_text, &roots, overrides)
+    {
+        eprintln!("{error}");
+        return exit(ExitStatus::DiagnosticsPresentOutputsSkipped);
+    }
     let result = build_projects(
         &file_system,
         &current_directory_text,
         &roots,
-        ProgramOptionsOverride {
-            no_emit: options.no_emit.then_some(true),
-            ..ProgramOptionsOverride::default()
-        },
+        overrides,
         options.incremental,
     );
     let pretty = options.pretty.unwrap_or(false);
@@ -114,13 +126,22 @@ fn build(options: &BuildOptions) -> ExitCode {
                 eprintln!("{error}");
                 return exit(ExitStatus::DiagnosticsPresentOutputsSkipped);
             }
+            if options.list_emitted_files {
+                println!("TSFILE:  {}", output.file_name);
+            }
             generated_output = true;
         }
-        if let Some(build_info) = build_info
-            && let Err(error) = write_output(&build_info.file_name, build_info.text)
-        {
-            eprintln!("{error}");
-            return exit(ExitStatus::DiagnosticsPresentOutputsSkipped);
+        if let Some(build_info) = build_info {
+            if let Err(error) = write_output(&build_info.file_name, build_info.text) {
+                eprintln!("{error}");
+                return exit(ExitStatus::DiagnosticsPresentOutputsSkipped);
+            }
+            if options.list_emitted_files {
+                println!("TSFILE:  {}", build_info.file_name);
+            }
+        }
+        if options.list_files {
+            print_source_files(&program);
         }
     }
     diagnostic_exit(had_diagnostics, generated_output)
@@ -156,16 +177,15 @@ fn compile(options: &CliOptions) -> ExitCode {
     }
 
     let file_system = OsFileSystem::default();
-    let overrides = ProgramOptionsOverride {
-        no_check: options.no_check.then_some(true),
-        no_emit: options.no_emit.then_some(true),
-        no_lib: options.no_lib.then_some(true),
+    let overrides = compiler_options_overrides(options);
+    let project_path = if let Some(project) = options.project.as_deref() {
+        match resolve_project_path(&current_directory, project, pretty) {
+            Ok(path) => Some(path),
+            Err(status) => return status,
+        }
+    } else {
+        discovered_config
     };
-    let project_path = options
-        .project
-        .as_deref()
-        .map(|path| resolve_project_path(&current_directory, path))
-        .or(discovered_config);
     if options.files.is_empty() && project_path.is_none() {
         print_help();
         return exit(ExitStatus::DiagnosticsPresentOutputsSkipped);
@@ -181,11 +201,16 @@ fn compile(options: &CliOptions) -> ExitCode {
             &options.specified_options,
         )
     } else {
+        let mut compiler_options = options.compiler_options.clone();
+        if options.list_files_only {
+            compiler_options.no_check = true;
+            compiler_options.no_emit = true;
+        }
         Program::new_with_options(
             &file_system,
             &current_directory_text,
             &options.files,
-            options.compiler_options.clone(),
+            compiler_options,
         )
     };
 
@@ -195,6 +220,10 @@ fn compile(options: &CliOptions) -> ExitCode {
         &current_directory_text,
         pretty,
     );
+    if options.list_files_only {
+        print_source_files(&program);
+        return diagnostic_exit(!program.diagnostics().is_empty(), false);
+    }
     let emitted = program.emit();
     print_diagnostics(
         &program,
@@ -209,9 +238,23 @@ fn compile(options: &CliOptions) -> ExitCode {
             eprintln!("{error}");
             return exit(ExitStatus::DiagnosticsPresentOutputsSkipped);
         }
+        if options.list_emitted_files {
+            println!("TSFILE:  {}", output.file_name);
+        }
         generated_output = true;
     }
+    if options.list_files {
+        print_source_files(&program);
+    }
     diagnostic_exit(had_diagnostics, generated_output)
+}
+
+fn compiler_options_overrides(options: &CliOptions) -> ProgramOptionsOverride {
+    ProgramOptionsOverride {
+        no_check: (options.no_check || options.list_files_only).then_some(true),
+        no_emit: (options.no_emit || options.list_files_only).then_some(true),
+        no_lib: options.no_lib.then_some(true),
+    }
 }
 
 struct FileWatchCompiler {
@@ -224,11 +267,7 @@ impl WatchCompiler for FileWatchCompiler {
     fn compile(&mut self) -> Result<CompileCycle, WatchError> {
         let file_system = OsFileSystem::default();
         let current_directory = self.current_directory.to_string_lossy();
-        let overrides = ProgramOptionsOverride {
-            no_check: self.options.no_check.then_some(true),
-            no_emit: self.options.no_emit.then_some(true),
-            no_lib: self.options.no_lib.then_some(true),
-        };
+        let overrides = compiler_options_overrides(&self.options);
         let program = if let Some(config_path) = &self.project_path {
             Program::from_config_with_command_line_options(
                 &file_system,
@@ -291,11 +330,14 @@ fn watch_compile(options: CliOptions) -> ExitCode {
         );
         return exit(ExitStatus::DiagnosticsPresentOutputsSkipped);
     }
-    let project_path = options
-        .project
-        .as_deref()
-        .map(|path| resolve_project_path(&current_directory, path))
-        .or(discovered_config);
+    let project_path = if let Some(project) = options.project.as_deref() {
+        match resolve_project_path(&current_directory, project, options.pretty.unwrap_or(false)) {
+            Ok(path) => Some(path),
+            Err(status) => return status,
+        }
+    } else {
+        discovered_config
+    };
     if options.files.is_empty() && project_path.is_none() {
         print_help();
         return exit(ExitStatus::DiagnosticsPresentOutputsSkipped);
@@ -319,9 +361,15 @@ impl WatchCompiler for BuildWatchCompiler {
         let file_system = OsFileSystem::default();
         let current_directory = self.current_directory.to_string_lossy();
         let overrides = ProgramOptionsOverride {
+            no_check: self.options.no_check,
             no_emit: self.options.no_emit.then_some(true),
             ..ProgramOptionsOverride::default()
         };
+        if self.options.force {
+            invalidate_project_build_info(&file_system, &current_directory, &self.roots, overrides)
+                .map_err(WatchError::Compile)?;
+            self.options.force = false;
+        }
         let result = build_projects(
             &file_system,
             &current_directory,
@@ -440,12 +488,67 @@ fn find_config_file(start: &Path) -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
-fn resolve_project_path(current_directory: &Path, project: &str) -> PathBuf {
+fn resolve_project_path(
+    current_directory: &Path,
+    project: &str,
+    pretty: bool,
+) -> Result<PathBuf, ExitCode> {
     let path = current_directory.join(project);
     if path.is_dir() {
-        path.join("tsconfig.json")
+        let config_path = path.join("tsconfig.json");
+        if config_path.is_file() {
+            return Ok(config_path);
+        }
+        print_command_line_diagnostic(
+            5081,
+            &format!(
+                "Cannot find a tsconfig.json file at the current directory: {}.",
+                config_path.display()
+            ),
+            current_directory,
+            pretty,
+        );
+    } else if path.is_file() {
+        return Ok(path);
     } else {
-        path
+        print_command_line_diagnostic(
+            5058,
+            &format!("The specified path does not exist: '{}'.", path.display()),
+            current_directory,
+            pretty,
+        );
+    }
+    Err(exit(ExitStatus::DiagnosticsPresentOutputsSkipped))
+}
+
+fn invalidate_project_build_info(
+    file_system: &OsFileSystem,
+    current_directory: &str,
+    roots: &[String],
+    overrides: ProgramOptionsOverride,
+) -> Result<(), String> {
+    let graph = load_project_graph(file_system, current_directory, roots);
+    for config_path in graph.projects {
+        let program = Program::from_config_with_options(file_system, &config_path, overrides);
+        let build_info_path = program.options().ts_build_info_file.as_ref().map_or_else(
+            || Path::new(&config_path).with_extension("tsbuildinfo"),
+            PathBuf::from,
+        );
+        if let Err(error) = fs::remove_file(&build_info_path)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            return Err(format!(
+                "error: could not remove '{}': {error}",
+                build_info_path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn print_source_files(program: &Program) {
+    for source_file in program.source_files() {
+        println!("{}", source_file.file_name);
     }
 }
 
@@ -576,35 +679,59 @@ fn print_diagnostics(
             })
             .then_with(|| left.code.cmp(&right.code))
     });
-    let diagnostics: Vec<_> = ordered
-        .into_iter()
-        .map(|diagnostic| {
-            let source_text = diagnostic
-                .file_name
-                .as_deref()
-                .and_then(|file_name| program.source_file(file_name))
-                .map(|source_file| source_file.source_text.as_str());
-            Diagnostic {
-                file_name: diagnostic.file_name.as_deref(),
-                source_text,
-                range: diagnostic.range,
-                code: diagnostic.code,
-                category: DiagnosticCategory::Error,
-                message: &diagnostic.message,
-            }
-        })
-        .collect();
-    print!(
-        "{}",
-        format_diagnostics(
-            &diagnostics,
-            FormattingOptions {
-                current_directory,
-                pretty,
-                ..FormattingOptions::default()
-            }
-        )
-    );
+    let options = FormattingOptions {
+        current_directory,
+        pretty,
+        ..FormattingOptions::default()
+    };
+    for diagnostic in ordered {
+        print!(
+            "{}",
+            format_program_diagnostic(program, diagnostic, options)
+        );
+    }
+}
+
+fn format_program_diagnostic(
+    program: &Program,
+    diagnostic: &ProgramDiagnostic,
+    options: FormattingOptions<'_>,
+) -> String {
+    let related_information = diagnostic
+        .related_information
+        .iter()
+        .map(|related| writer_diagnostic(program, related))
+        .collect::<Vec<_>>();
+    format_diagnostic_with_related(
+        writer_diagnostic(program, diagnostic),
+        &related_information,
+        options,
+    )
+}
+
+fn writer_diagnostic<'source>(
+    program: &'source Program,
+    diagnostic: &'source ProgramDiagnostic,
+) -> Diagnostic<'source> {
+    let source_text = diagnostic
+        .file_name
+        .as_deref()
+        .and_then(|file_name| program.source_file(file_name))
+        .map(|source_file| source_file.source_text.as_str());
+    let category = match diagnostic.category.name() {
+        "warning" => DiagnosticCategory::Warning,
+        "suggestion" => DiagnosticCategory::Suggestion,
+        "message" => DiagnosticCategory::Message,
+        _ => DiagnosticCategory::Error,
+    };
+    Diagnostic {
+        file_name: diagnostic.file_name.as_deref(),
+        source_text,
+        range: diagnostic.range,
+        code: diagnostic.code,
+        category,
+        message: &diagnostic.message,
+    }
 }
 
 fn parse(path: Option<&String>) -> ExitCode {
@@ -700,9 +827,14 @@ fn print_help() {
     println!("  -v, --version      Print the compiler version");
     println!("  -p, --project PATH Compile the project at PATH");
     println!("  -b, --build PATH   Build a project and its references");
+    println!("  -f, --force        Rebuild projects even when they are up to date");
     println!("  -w, --watch        Watch input files and rebuild on changes");
     println!("      --incremental  Reuse project build information");
     println!("      --ignoreConfig Ignore tsconfig.json when compiling files");
+    println!("      --listFiles    Print all files included in the compilation");
+    println!("      --listFilesOnly Print included files without checking or emitting");
+    println!("      --listEmittedFiles Print the paths of generated output files");
+    println!("      --maxNodeModuleJsDepth NUMBER Limit JavaScript node_modules traversal");
     println!("      --noCheck      Skip semantic type checking");
     println!("      --noEmit       Do not write output files");
     println!("      --noLib        Do not include the default library");
@@ -728,9 +860,12 @@ mod tests {
     use std::{fs, path::PathBuf};
 
     use ts_cli::BuildOptions;
+    use ts_compiler::{Program, ProgramDiagnostic};
+    use ts_diagnostic_writer::FormattingOptions;
+    use ts_vfs::OsFileSystem;
     use ts_watch::WatchCompiler;
 
-    use super::BuildWatchCompiler;
+    use super::{BuildWatchCompiler, format_program_diagnostic};
 
     struct TestDirectory(PathBuf);
 
@@ -805,5 +940,87 @@ mod tests {
                 source_directory.display()
             );
         }
+    }
+
+    #[test]
+    fn pretty_diagnostics_include_cross_file_related_source() {
+        let directory = TestDirectory(
+            std::env::temp_dir().join(format!("tsgo-related-diagnostic-{}", std::process::id())),
+        );
+        fs::create_dir_all(&directory.0).unwrap();
+        fs::write(
+            directory.0.join("target.ts"),
+            "export function pair(left: string, right: number): number { return right; }\n",
+        )
+        .unwrap();
+        fs::write(
+            directory.0.join("importer.ts"),
+            "import { pair } from './target';\npair('left');\n",
+        )
+        .unwrap();
+        let current_directory = directory.0.to_string_lossy();
+        let program = Program::new_with_options(
+            &OsFileSystem::default(),
+            &current_directory,
+            &["importer.ts".to_owned(), "target.ts".to_owned()],
+            ts_options::CompilerOptions {
+                no_lib: true,
+                ..ts_options::CompilerOptions::default()
+            },
+        );
+        let mut diagnostic = program
+            .diagnostics()
+            .iter()
+            .find(|diagnostic| diagnostic.code == Some(2554))
+            .cloned()
+            .unwrap();
+        let target_path = directory.0.join("target.ts");
+        let target_source = program.source_file(&target_path.to_string_lossy()).unwrap();
+        let related_range = target_source
+            .parse
+            .arena
+            .iter()
+            .find_map(|(_, node)| {
+                matches!(
+                    &node.data,
+                    ts_ast::NodeData::Identifier(identifier) if identifier.text == "right"
+                )
+                .then_some(node.range)
+            })
+            .unwrap();
+        diagnostic.related_information.push(ProgramDiagnostic {
+            file_name: Some(target_source.file_name.clone()),
+            range: Some(related_range),
+            code: Some(6210),
+            category: diagnostic.category,
+            message: "An argument for 'right' was not provided.".to_owned(),
+            related_information: Vec::new(),
+        });
+
+        let pretty = format_program_diagnostic(
+            &program,
+            &diagnostic,
+            FormattingOptions {
+                current_directory: &current_directory,
+                pretty: true,
+                ..FormattingOptions::default()
+            },
+        );
+        assert!(pretty.contains("importer.ts"));
+        assert!(pretty.contains("target.ts"));
+        assert!(pretty.contains("An argument for 'right' was not provided."));
+        assert!(pretty.contains("export function pair(left: string, right: number)"));
+
+        let plain = format_program_diagnostic(
+            &program,
+            &diagnostic,
+            FormattingOptions {
+                current_directory: &current_directory,
+                ..FormattingOptions::default()
+            },
+        );
+        assert!(plain.contains("importer.ts"));
+        assert!(!plain.contains("target.ts"));
+        assert!(!plain.contains("An argument for 'right' was not provided."));
     }
 }

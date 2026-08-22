@@ -94,6 +94,63 @@ fn build_no_emit_writes_no_outputs() {
 }
 
 #[test]
+fn build_no_check_skips_semantic_diagnostics() {
+    let directory = TestDirectory::new("no-check");
+    fs::write(
+        directory.0.join("tsconfig.json"),
+        r#"{"files":["main.ts"],"compilerOptions":{"noLib":true,"outDir":"dist"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        directory.0.join("main.ts"),
+        "export const value: string = 1;\n",
+    )
+    .unwrap();
+
+    let output = run(&directory.0, &["--build", "--noCheck", "--pretty", "false"]);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(directory.0.join("dist/main.js").is_file());
+}
+
+#[test]
+fn build_force_rebuilds_an_up_to_date_project() {
+    let directory = TestDirectory::new("force");
+    fs::write(
+        directory.0.join("tsconfig.json"),
+        r#"{"files":["main.ts"],"compilerOptions":{"composite":true,"noLib":true,"outDir":"dist","tsBuildInfoFile":"cache/state.tsbuildinfo"}}"#,
+    )
+    .unwrap();
+    fs::write(directory.0.join("main.ts"), "export const value = 1;\n").unwrap();
+    let ordinary = ["--build", "--pretty", "false"];
+    assert!(run(&directory.0, &ordinary).status.success());
+
+    let output_path = directory.0.join("dist/main.js");
+    fs::write(&output_path, "up-to-date sentinel").unwrap();
+    assert!(run(&directory.0, &ordinary).status.success());
+    assert_eq!(
+        fs::read_to_string(&output_path).unwrap(),
+        "up-to-date sentinel"
+    );
+
+    let forced = run(&directory.0, &["--build", "--force", "--pretty", "false"]);
+    assert!(
+        forced.status.success(),
+        "{}",
+        String::from_utf8_lossy(&forced.stdout)
+    );
+    assert_ne!(
+        fs::read_to_string(&output_path).unwrap(),
+        "up-to-date sentinel"
+    );
+    assert!(directory.0.join("cache/state.tsbuildinfo").is_file());
+}
+
+#[test]
 fn build_reports_reference_cycles_with_status_four() {
     let directory = TestDirectory::new("cycle");
     fs::create_dir_all(directory.0.join("child")).unwrap();

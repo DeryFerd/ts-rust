@@ -255,15 +255,109 @@ fn extended_compiler_options_match_oracle() {
 }
 
 #[test]
+fn numeric_compiler_options_match_oracle() {
+    let directory = TestDirectory::new("numeric-options");
+    fs::write(directory.0.join("main.ts"), "export const answer = 42;\n").unwrap();
+    for value in ["0", "2", "+2"] {
+        assert_matches_oracle(
+            &directory.0,
+            &[
+                "main.ts",
+                "--ignoreConfig",
+                "--noCheck",
+                "--noEmit",
+                "--maxNodeModuleJsDepth",
+                value,
+                "--pretty",
+                "false",
+            ],
+        );
+    }
+}
+
+#[test]
+fn invalid_numeric_compiler_options_match_oracle() {
+    let directory = TestDirectory::new("invalid-numeric-options");
+    for arguments in [
+        &["--maxNodeModuleJsDepth"][..],
+        &["--maxNodeModuleJsDepth", "nope"][..],
+        &["--maxNodeModuleJsDepth", "2.5"][..],
+        &["--maxNodeModuleJsDepth", "-1"][..],
+    ] {
+        assert_matches_oracle(&directory.0, arguments);
+    }
+}
+
+#[test]
+fn missing_explicit_project_diagnostics_match_oracle() {
+    let directory = TestDirectory::new("missing-project");
+    fs::create_dir_all(directory.0.join("without-config")).unwrap();
+    for arguments in [
+        &["--project", "missing.json", "--pretty", "false"][..],
+        &["--project", "without-config", "--pretty", "false"][..],
+    ] {
+        assert_matches_oracle(&directory.0, arguments);
+    }
+}
+
+#[test]
+fn list_files_only_matches_oracle_and_skips_checking_and_emit() {
+    let directory = TestDirectory::new("list-files-only");
+    fs::write(directory.0.join("main.ts"), "const answer: string = 42;\n").unwrap();
+    assert_matches_oracle(
+        &directory.0,
+        &[
+            "main.ts",
+            "--ignoreConfig",
+            "--noLib",
+            "--listFilesOnly",
+            "--pretty",
+            "false",
+        ],
+    );
+    assert!(!directory.0.join("main.js").exists());
+}
+
+#[test]
+fn list_emitted_files_matches_oracle() {
+    let directory = TestDirectory::new("list-emitted-files");
+    fs::write(directory.0.join("main.ts"), "export const answer = 42;\n").unwrap();
+    assert_matches_oracle(
+        &directory.0,
+        &[
+            "main.ts",
+            "--ignoreConfig",
+            "--noCheck",
+            "--target",
+            "esnext",
+            "--module",
+            "esnext",
+            "--outDir",
+            "dist",
+            "--listEmittedFiles",
+            "--pretty",
+            "false",
+        ],
+    );
+    assert!(directory.0.join("dist/main.js").is_file());
+}
+
+#[test]
 fn command_line_option_diagnostics_match_oracle() {
     let directory = TestDirectory::new("option-diagnostics");
     for arguments in [
         &["--project"][..],
         &["-p"][..],
         &["--lib"][..],
+        &["--help", "--wat"][..],
+        &["--version", "--wat"][..],
+        &["--force"][..],
+        &["--dry"][..],
+        &["--clean"][..],
         &["--pretty=false"][..],
         &["--build", "--wat"][..],
         &["--build", "--pretty=false"][..],
+        &["--build", "--listFilesOnly"][..],
     ] {
         assert_matches_oracle(&directory.0, arguments);
     }

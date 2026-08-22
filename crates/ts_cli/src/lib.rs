@@ -30,9 +30,14 @@ pub enum Command {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[allow(clippy::struct_excessive_bools)] // Build switches are independently composable.
 pub struct BuildOptions {
     pub projects: Vec<String>,
+    pub force: bool,
     pub incremental: bool,
+    pub list_emitted_files: bool,
+    pub list_files: bool,
+    pub no_check: Option<bool>,
     pub no_emit: bool,
     pub pretty: Option<bool>,
     pub watch: bool,
@@ -48,6 +53,9 @@ pub struct CompilerOptions {
     pub no_emit: bool,
     pub no_lib: bool,
     pub ignore_config: bool,
+    pub list_emitted_files: bool,
+    pub list_files: bool,
+    pub list_files_only: bool,
     pub project: Option<String>,
     pub pretty: Option<bool>,
     pub watch: bool,
@@ -91,16 +99,28 @@ fn parse_expanded(args: &[String]) -> Result<Command, CommandLineError> {
     }
     let mut options = CompilerOptions::default();
     let mut compiler_options = BTreeMap::new();
+    let mut requested_command = None;
     let mut index = 0;
     while index < args.len() {
         let argument = &args[index];
         let lower = argument.to_ascii_lowercase();
         match lower.as_str() {
-            "--help" | "-h" | "-?" => return Ok(Command::Help),
+            "--help" | "-h" | "-?" => {
+                if requested_command.is_none() {
+                    requested_command = Some(Command::Help);
+                }
+            }
             "--lsp" => return Ok(Command::Lsp),
-            "--version" | "-v" => return Ok(Command::Version),
+            "--version" | "-v" => requested_command = Some(Command::Version),
             "--watch" | "-w" => options.watch = optional_boolean_value(args, &mut index),
             "--ignoreconfig" => options.ignore_config = optional_boolean_value(args, &mut index),
+            "--listemittedfiles" => {
+                options.list_emitted_files = optional_boolean_value(args, &mut index);
+            }
+            "--listfiles" => options.list_files = optional_boolean_value(args, &mut index),
+            "--listfilesonly" => {
+                options.list_files_only = optional_boolean_value(args, &mut index);
+            }
             "--pretty" => options.pretty = Some(optional_boolean_value(args, &mut index)),
             "--project" | "-p" => {
                 index += 1;
@@ -135,6 +155,27 @@ fn parse_expanded(args: &[String]) -> Result<Command, CommandLineError> {
                     .collect();
                 compiler_options.insert(name.to_owned(), JsonValue::Array(values));
             }
+            "--maxnodemodulejsdepth" => {
+                index += 1;
+                let name = "maxnodemodulejsdepth";
+                let value = args
+                    .get(index)
+                    .and_then(|value| value.parse::<i64>().ok())
+                    .ok_or_else(|| missing_option_value_error(name))?;
+                if value < 0 {
+                    return Err(CommandLineError {
+                        code: 5002,
+                        message: format!(
+                            "Option '{}' requires value to be greater than '0'.",
+                            option_display_name(name)
+                        ),
+                    });
+                }
+                let number = ts_config::parse_jsonc("<command line>", &value.to_string())
+                    .value
+                    .expect("a normalized integer is valid JSON");
+                compiler_options.insert(name.to_owned(), number);
+            }
             "--paths" | "--rootdirs" => {
                 let name = lower.trim_start_matches('-');
                 index += 1;
@@ -161,6 +202,14 @@ fn parse_expanded(args: &[String]) -> Result<Command, CommandLineError> {
                     message: "Option '--build' must be the first command line argument.".to_owned(),
                 });
             }
+            "--clean" | "--dry" | "--force" => {
+                return Err(CommandLineError {
+                    code: 5093,
+                    message: format!(
+                        "Compiler option '{argument}' may only be used with '--build'."
+                    ),
+                });
+            }
             _ if argument.starts_with('-') => {
                 return Err(CommandLineError {
                     code: 5023,
@@ -179,6 +228,9 @@ fn parse_expanded(args: &[String]) -> Result<Command, CommandLineError> {
                 .render()
                 .unwrap_or_else(|error| error.to_string()),
         });
+    }
+    if let Some(command) = requested_command {
+        return Ok(command);
     }
     options.no_check = parsed.options.no_check;
     options.no_emit = parsed.options.no_emit;
@@ -308,9 +360,15 @@ fn parse_build_options(args: &[String]) -> Result<BuildOptions, CommandLineError
         let argument = &args[index];
         let lower = argument.to_ascii_lowercase();
         match lower.as_str() {
+            "--force" | "-f" => options.force = optional_boolean_value(args, &mut index),
             "--incremental" | "-i" => {
                 options.incremental = optional_boolean_value(args, &mut index);
             }
+            "--listemittedfiles" => {
+                options.list_emitted_files = optional_boolean_value(args, &mut index);
+            }
+            "--listfiles" => options.list_files = optional_boolean_value(args, &mut index),
+            "--nocheck" => options.no_check = Some(optional_boolean_value(args, &mut index)),
             "--noemit" => options.no_emit = optional_boolean_value(args, &mut index),
             "--watch" | "-w" => options.watch = optional_boolean_value(args, &mut index),
             "--pretty" => options.pretty = Some(optional_boolean_value(args, &mut index)),
@@ -318,7 +376,14 @@ fn parse_build_options(args: &[String]) -> Result<BuildOptions, CommandLineError
                 && (compiler_boolean_name(&lower).is_some()
                     || compiler_string_name(&lower).is_some()
                     || compiler_list_name(&lower).is_some()
-                    || matches!(lower.as_str(), "--project" | "--paths" | "--rootdirs")) =>
+                    || matches!(
+                        lower.as_str(),
+                        "--listfilesonly"
+                            | "--maxnodemodulejsdepth"
+                            | "--project"
+                            | "--paths"
+                            | "--rootdirs"
+                    )) =>
             {
                 return Err(CommandLineError {
                     code: 5094,
@@ -348,13 +413,17 @@ fn required_option_value(
     args.get(index)
         .filter(|value| !value.starts_with('-'))
         .cloned()
-        .ok_or_else(|| CommandLineError {
-            code: 6044,
-            message: format!(
-                "Compiler option '{}' expects an argument.",
-                option_display_name(option)
-            ),
-        })
+        .ok_or_else(|| missing_option_value_error(option))
+}
+
+fn missing_option_value_error(option: &str) -> CommandLineError {
+    CommandLineError {
+        code: 6044,
+        message: format!(
+            "Compiler option '{}' expects an argument.",
+            option_display_name(option)
+        ),
+    }
 }
 
 fn option_display_name(name: &str) -> &str {
@@ -367,6 +436,7 @@ fn option_display_name(name: &str) -> &str {
         "jsxfragmentfactory" => "jsxFragmentFactory",
         "jsximportsource" => "jsxImportSource",
         "maproot" => "mapRoot",
+        "maxnodemodulejsdepth" => "maxNodeModuleJsDepth",
         "moduledetection" => "moduleDetection",
         "moduleresolution" => "moduleResolution",
         "modulesuffixes" => "moduleSuffixes",
@@ -513,6 +583,15 @@ mod tests {
     }
 
     #[test]
+    fn validates_all_arguments_before_help_or_version() {
+        assert_eq!(parse(&["--help", "--wat"]).unwrap_err().code, 5023);
+        assert_eq!(parse(&["--version", "--wat"]).unwrap_err().code, 5023);
+        assert_eq!(parse(&["--version", "--project"]).unwrap_err().code, 6044);
+        assert_eq!(parse(&["--help", "--version"]), Ok(Command::Version));
+        assert_eq!(parse(&["--version", "--help"]), Ok(Command::Version));
+    }
+
+    #[test]
     fn reports_canonical_option_names_for_missing_values() {
         assert_eq!(
             parse(&["-p"]).unwrap_err().render(),
@@ -526,6 +605,57 @@ mod tests {
             parse(&["--lib"]).unwrap_err().render(),
             "error TS6044: Compiler option 'lib' expects an argument."
         );
+        assert_eq!(
+            parse(&["--maxNodeModuleJsDepth"]).unwrap_err().render(),
+            "error TS6044: Compiler option 'maxNodeModuleJsDepth' expects an argument."
+        );
+    }
+
+    #[test]
+    fn parses_numeric_compiler_options() {
+        let Command::Compile(options) = parse(&["--maxNodeModuleJsDepth", "2", "main.ts"]).unwrap()
+        else {
+            panic!("expected compile command");
+        };
+
+        assert_eq!(options.compiler_options.max_node_module_js_depth, Some(2));
+        assert!(options.specified_options.contains("maxnodemodulejsdepth"));
+        assert_eq!(options.files, ["main.ts"]);
+    }
+
+    #[test]
+    fn rejects_invalid_numeric_compiler_options_like_typescript() {
+        assert_eq!(
+            parse(&["--maxNodeModuleJsDepth", "nope"])
+                .unwrap_err()
+                .render(),
+            "error TS6044: Compiler option 'maxNodeModuleJsDepth' expects an argument."
+        );
+        assert_eq!(
+            parse(&["--maxNodeModuleJsDepth", "-1"])
+                .unwrap_err()
+                .render(),
+            "error TS5002: Option 'maxNodeModuleJsDepth' requires value to be greater than '0'."
+        );
+    }
+
+    #[test]
+    fn parses_file_listing_compiler_options() {
+        let Command::Compile(options) = parse(&[
+            "--listFiles",
+            "--listFilesOnly",
+            "false",
+            "--listEmittedFiles",
+            "main.ts",
+        ])
+        .unwrap() else {
+            panic!("expected compile command");
+        };
+
+        assert!(options.list_files);
+        assert!(!options.list_files_only);
+        assert!(options.list_emitted_files);
+        assert_eq!(options.files, ["main.ts"]);
     }
 
     #[test]
@@ -961,7 +1091,7 @@ mod tests {
                 incremental: true,
                 no_emit: true,
                 pretty: Some(false),
-                watch: false,
+                ..BuildOptions::default()
             }))
         );
     }
@@ -975,9 +1105,31 @@ mod tests {
                 incremental: false,
                 no_emit: false,
                 pretty: None,
-                watch: false,
+                ..BuildOptions::default()
             }))
         );
+    }
+
+    #[test]
+    fn parses_supported_build_overrides_and_force_alias() {
+        let Command::Build(options) = parse(&[
+            "--build",
+            "project",
+            "--noCheck",
+            "false",
+            "--listFiles",
+            "--listEmittedFiles",
+            "-f",
+        ])
+        .unwrap() else {
+            panic!("expected build command");
+        };
+
+        assert_eq!(options.projects, ["project"]);
+        assert_eq!(options.no_check, Some(false));
+        assert!(options.list_files);
+        assert!(options.list_emitted_files);
+        assert!(options.force);
     }
 
     #[test]
