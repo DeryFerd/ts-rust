@@ -640,6 +640,8 @@ impl CompilerOptions {
             resolve_package_json_exports: self.resolve_package_json_exports,
             resolve_package_json_imports: self.resolve_package_json_imports,
             prefer_types: true,
+            custom_conditions: self.custom_conditions.clone().unwrap_or_default(),
+            module_suffixes: self.module_suffixes.clone().unwrap_or_default(),
             base_url: self.base_url.clone(),
             paths: self.paths.clone(),
             root_dirs: self.root_dirs.clone(),
@@ -2279,6 +2281,32 @@ mod tests {
         );
         assert!(!defaults.resolve_package_json_exports);
         assert!(!defaults.resolve_package_json_imports);
+    }
+
+    #[test]
+    fn passes_custom_conditions_and_ordered_suffixes_to_module_resolution() {
+        let config = parse_config_text(
+            "/repo/tsconfig.json",
+            r#"{
+                "compilerOptions": {
+                    "moduleResolution": "bundler",
+                    "customConditions": ["development", "browser"],
+                    "moduleSuffixes": [".native", ""]
+                }
+            }"#,
+        )
+        .value
+        .unwrap();
+        let parsed = parse_project_options(&config);
+        assert!(parsed.is_ok(), "{:?}", parsed.diagnostics);
+
+        let resolution = parsed.options.module_resolution_options();
+        assert_eq!(resolution.custom_conditions, ["development", "browser"]);
+        assert_eq!(resolution.module_suffixes, [".native", ""]);
+
+        let defaults = CompilerOptions::default().module_resolution_options();
+        assert!(defaults.custom_conditions.is_empty());
+        assert!(defaults.module_suffixes.is_empty());
     }
 
     #[test]

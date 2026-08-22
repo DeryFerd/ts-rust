@@ -30,6 +30,8 @@ pub struct ResolutionOptions {
     pub resolve_package_json_exports: bool,
     pub resolve_package_json_imports: bool,
     pub prefer_types: bool,
+    pub custom_conditions: Vec<String>,
+    pub module_suffixes: Vec<String>,
     pub base_url: Option<String>,
     pub paths: BTreeMap<String, Vec<String>>,
     pub root_dirs: Vec<String>,
@@ -47,6 +49,8 @@ impl Default for ResolutionOptions {
             resolve_package_json_exports: true,
             resolve_package_json_imports: true,
             prefer_types: true,
+            custom_conditions: Vec::new(),
+            module_suffixes: Vec::new(),
             base_url: None,
             paths: BTreeMap::new(),
             root_dirs: Vec::new(),
@@ -73,6 +77,7 @@ pub struct FailedLookup {
 pub struct ResolvedModule {
     pub resolved_file_name: String,
     pub extension: Option<FileExtension>,
+    pub resolved_using_ts_extension: bool,
     pub is_external_library_import: bool,
     pub package_json: Option<String>,
 }
@@ -132,6 +137,8 @@ impl<'a, F: FileSystem + ?Sized> Resolver<'a, F> {
             failed_lookups: Vec::new(),
             import_condition: false,
             extension_priority: ExtensionPriority::All,
+            specifier_uses_ts_extension: is_typescript_extension(specifier),
+            candidate_ending_is_from_config: false,
         };
         state.import_condition = state.use_import_condition(containing_file);
         let containing_directory = directory_path(containing_file);
@@ -181,6 +188,8 @@ impl<'a, F: FileSystem + ?Sized> Resolver<'a, F> {
             failed_lookups: Vec::new(),
             import_condition: false,
             extension_priority: ExtensionPriority::Types,
+            specifier_uses_ts_extension: is_typescript_extension(name),
+            candidate_ending_is_from_config: false,
         };
         state.import_condition = state.use_import_condition(containing_file);
         let containing_directory = directory_path(containing_file);
@@ -206,6 +215,8 @@ struct ResolutionState<'a, 'fs, F: FileSystem + ?Sized> {
     failed_lookups: Vec<FailedLookup>,
     import_condition: bool,
     extension_priority: ExtensionPriority,
+    specifier_uses_ts_extension: bool,
+    candidate_ending_is_from_config: bool,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -238,11 +249,10 @@ impl<F: FileSystem + ?Sized> ResolutionState<'_, '_, F> {
         match self.resolver.options.mode {
             ResolutionMode::Bundler => true,
             ResolutionMode::Node16 | ResolutionMode::NodeNext => {
-                if containing_file.ends_with(".mts") || containing_file.ends_with(".mjs") {
-                    return true;
-                }
-                if containing_file.ends_with(".cts") || containing_file.ends_with(".cjs") {
-                    return false;
+                match source_extension(containing_file) {
+                    Some(".mts" | ".mjs" | ".d.mts") => return true,
+                    Some(".cts" | ".cjs" | ".d.cts") => return false,
+                    _ => {}
                 }
                 ancestors(&directory_path(containing_file))
                     .into_iter()
@@ -271,12 +281,17 @@ impl<F: FileSystem + ?Sized> ResolutionState<'_, '_, F> {
                 ResolutionMode::Node16 | ResolutionMode::NodeNext
             ),
             _ => {
-                self.resolver.options.prefer_types
-                    && condition
-                        .strip_prefix("types@")
-                        .and_then(|range| VersionRange::parse(range).ok())
-                        .zip(Version::parse(env!("CARGO_PKG_VERSION")).ok())
-                        .is_some_and(|(range, version)| range.test(&version))
+                self.resolver
+                    .options
+                    .custom_conditions
+                    .iter()
+                    .any(|custom| custom == condition)
+                    || (self.resolver.options.prefer_types
+                        && condition
+                            .strip_prefix("types@")
+                            .and_then(|range| VersionRange::parse(range).ok())
+                            .zip(Version::parse(env!("CARGO_PKG_VERSION")).ok())
+                            .is_some_and(|(range, version)| range.test(&version)))
             }
         }
     }
@@ -294,7 +309,11 @@ impl<F: FileSystem + ?Sized> ResolutionState<'_, '_, F> {
             for substitution in substitutions {
                 let mapped = substitution.replace('*', &capture);
                 let candidate = resolve_path(&base, &[&mapped]);
-                if let Some(resolved) = self.resolve_candidate(&candidate, false) {
+                let previous_ending = self.candidate_ending_is_from_config;
+                self.candidate_ending_is_from_config = source_extension(&substitution).is_some();
+                let resolved = self.resolve_candidate(&candidate, false);
+                self.candidate_ending_is_from_config = previous_ending;
+                if let Some(resolved) = resolved {
                     return Some(resolved);
                 }
             }
@@ -606,6 +625,9 @@ impl<F: FileSystem + ?Sized> ResolutionState<'_, '_, F> {
                 self.resolve_candidate_with_package(&candidate, package_json, external)
                     .map_or(PackageTargetResolution::NotMatched, |mut resolved| {
                         resolved.is_external_library_import = external;
+                        resolved.resolved_using_ts_extension = is_pattern
+                            && target.ends_with('*')
+                            && is_typescript_extension(&candidate);
                         PackageTargetResolution::Resolved(resolved)
                     })
             }
@@ -752,18 +774,36 @@ impl<F: FileSystem + ?Sized> ResolutionState<'_, '_, F> {
         package_json: Option<&str>,
     ) -> Option<ResolvedModule> {
         for path in self.file_candidates(candidate) {
-            if self.resolver.file_system.file_exists(&path) {
-                let resolved_file_name = self.resolver.file_system.realpath(&path);
-                return Some(ResolvedModule {
-                    extension: ts_path::extension_from_path(&resolved_file_name),
-                    resolved_file_name,
-                    is_external_library_import: external,
-                    package_json: package_json.map(str::to_owned),
-                });
+            for candidate in self.module_suffix_candidates(&path) {
+                if self.resolver.file_system.file_exists(&candidate) {
+                    let resolved_file_name = self.resolver.file_system.realpath(&candidate);
+                    return Some(ResolvedModule {
+                        extension: ts_path::extension_from_path(&resolved_file_name),
+                        resolved_file_name,
+                        resolved_using_ts_extension: self.specifier_uses_ts_extension
+                            && !self.candidate_ending_is_from_config,
+                        is_external_library_import: external,
+                        package_json: package_json.map(str::to_owned),
+                    });
+                }
+                self.failed(FailedLookupKind::File, &candidate);
             }
-            self.failed(FailedLookupKind::File, &path);
         }
         None
+    }
+
+    fn module_suffix_candidates(&self, path: &str) -> Vec<String> {
+        if self.resolver.options.module_suffixes.is_empty() {
+            return vec![path.to_owned()];
+        }
+        let extension = source_extension(path).unwrap_or("");
+        let stem = &path[..path.len() - extension.len()];
+        self.resolver
+            .options
+            .module_suffixes
+            .iter()
+            .map(|suffix| format!("{stem}{suffix}{extension}"))
+            .collect()
     }
 
     fn file_candidates(&self, candidate: &str) -> Vec<String> {
@@ -1079,6 +1119,13 @@ fn source_extension(path: &str) -> Option<&'static str> {
     .find(|extension| path.ends_with(extension))
 }
 
+fn is_typescript_extension(path: &str) -> bool {
+    matches!(
+        source_extension(path),
+        Some(".ts" | ".tsx" | ".mts" | ".cts" | ".d.ts" | ".d.mts" | ".d.cts")
+    )
+}
+
 fn parse_package_name(specifier: &str) -> Option<(&str, &str)> {
     if specifier.starts_with('#') {
         return None;
@@ -1161,6 +1208,35 @@ mod tests {
         assert_eq!(resolved.resolved_file_name, "/src/lib.ts");
         assert_eq!(resolved.extension, Some(FileExtension::Ts));
         assert!(!resolved.is_external_library_import);
+        assert!(!resolved.resolved_using_ts_extension);
+    }
+
+    #[test]
+    fn records_typescript_extensions_written_in_relative_specifiers() {
+        let fs = fs(&[("/src/lib.ts", ""), ("/src/types.d.ts", "")]);
+        let resolver = Resolver::new(&fs, ResolutionOptions::default());
+
+        assert!(
+            resolver
+                .resolve("./lib.ts", "/src/main.ts")
+                .resolved
+                .unwrap()
+                .resolved_using_ts_extension
+        );
+        assert!(
+            resolver
+                .resolve("./types.d.ts", "/src/main.ts")
+                .resolved
+                .unwrap()
+                .resolved_using_ts_extension
+        );
+        assert!(
+            !resolver
+                .resolve("./lib.js", "/src/main.ts")
+                .resolved
+                .unwrap()
+                .resolved_using_ts_extension
+        );
     }
 
     #[test]
@@ -1351,6 +1427,27 @@ mod tests {
                 .resolved_file_name,
             "/repo/src/plain.ts"
         );
+    }
+
+    #[test]
+    fn configured_path_extensions_do_not_count_as_imported_typescript_extensions() {
+        let fs = fs(&[("/repo/some-path/index.d.ts", "")]);
+        let resolver = Resolver::new(
+            &fs,
+            ResolutionOptions {
+                mode: ResolutionMode::Bundler,
+                base_url: Some("/repo".into()),
+                paths: BTreeMap::from([("some-path".into(), vec!["./some-path/index.ts".into()])]),
+                ..ResolutionOptions::default()
+            },
+        );
+        let target = resolver
+            .resolve("some-path", "/repo/named-import.ts")
+            .resolved
+            .unwrap();
+
+        assert_eq!(target.resolved_file_name, "/repo/some-path/index.d.ts");
+        assert!(!target.resolved_using_ts_extension);
     }
 
     #[test]
@@ -1565,6 +1662,52 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn custom_package_conditions_follow_package_json_order() {
+        let fs = fs(&[
+            (
+                "/app/node_modules/pkg/package.json",
+                r#"{"exports":{".":{"development":"./development.d.ts","browser":"./browser.d.ts","default":"./default.d.ts"}}}"#,
+            ),
+            ("/app/node_modules/pkg/development.d.ts", ""),
+            ("/app/node_modules/pkg/browser.d.ts", ""),
+            ("/app/node_modules/pkg/default.d.ts", ""),
+        ]);
+
+        let configured = Resolver::new(
+            &fs,
+            ResolutionOptions {
+                mode: ResolutionMode::Bundler,
+                custom_conditions: vec!["browser".into(), "development".into()],
+                ..ResolutionOptions::default()
+            },
+        );
+        assert_eq!(
+            configured
+                .resolve("pkg", "/app/main.ts")
+                .resolved
+                .unwrap()
+                .resolved_file_name,
+            "/app/node_modules/pkg/development.d.ts"
+        );
+
+        let defaults = Resolver::new(
+            &fs,
+            ResolutionOptions {
+                mode: ResolutionMode::Bundler,
+                ..ResolutionOptions::default()
+            },
+        );
+        assert_eq!(
+            defaults
+                .resolve("pkg", "/app/main.ts")
+                .resolved
+                .unwrap()
+                .resolved_file_name,
+            "/app/node_modules/pkg/default.d.ts"
+        );
     }
 
     #[test]
@@ -1921,6 +2064,38 @@ mod tests {
     }
 
     #[test]
+    fn wildcard_package_imports_record_typescript_extensions_from_captures() {
+        let fs = fs(&[
+            (
+                "/repo/package.json",
+                r##"{"type":"module","imports":{"#/*.omg":"./src/*","#generated/*":"./src/*.ts"}}"##,
+            ),
+            ("/repo/src/foo.ts", ""),
+        ]);
+        let resolver = Resolver::new(
+            &fs,
+            ResolutionOptions {
+                mode: ResolutionMode::NodeNext,
+                ..ResolutionOptions::default()
+            },
+        );
+
+        let captured = resolver
+            .resolve("#/foo.ts.omg", "/repo/src/index.ts")
+            .resolved
+            .unwrap();
+        assert_eq!(captured.resolved_file_name, "/repo/src/foo.ts");
+        assert!(captured.resolved_using_ts_extension);
+
+        let generated = resolver
+            .resolve("#generated/foo", "/repo/src/index.ts")
+            .resolved
+            .unwrap();
+        assert_eq!(generated.resolved_file_name, "/repo/src/foo.ts");
+        assert!(!generated.resolved_using_ts_extension);
+    }
+
+    #[test]
     fn disabled_package_imports_do_not_resolve_internal_specifiers() {
         let fs = fs(&[
             (
@@ -2092,6 +2267,93 @@ mod tests {
                 .resolve("./other.cjs", "/src/main.ts")
                 .resolved
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn module_suffixes_select_matching_files_in_configured_order() {
+        let fs = fs(&[
+            ("/app/feature.ts", ""),
+            ("/app/feature.native.ts", ""),
+            ("/app/feature.ios.ts", ""),
+            ("/app/ordinary.ts", ""),
+        ]);
+        let resolver = Resolver::new(
+            &fs,
+            ResolutionOptions {
+                module_suffixes: vec![".android".into(), ".native".into(), String::new()],
+                ..ResolutionOptions::default()
+            },
+        );
+
+        assert_eq!(
+            resolver
+                .resolve("./feature.js", "/app/main.ts")
+                .resolved
+                .unwrap()
+                .resolved_file_name,
+            "/app/feature.native.ts"
+        );
+        assert_eq!(
+            resolver
+                .resolve("./ordinary", "/app/main.ts")
+                .resolved
+                .unwrap()
+                .resolved_file_name,
+            "/app/ordinary.ts"
+        );
+
+        let required_suffix = Resolver::new(
+            &fs,
+            ResolutionOptions {
+                module_suffixes: vec![".android".into()],
+                ..ResolutionOptions::default()
+            },
+        );
+        assert!(
+            required_suffix
+                .resolve("./ordinary", "/app/main.ts")
+                .resolved
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn module_suffixes_apply_to_package_declarations_and_export_targets() {
+        let fs = fs(&[
+            ("/app/node_modules/legacy/index.d.ts", ""),
+            ("/app/node_modules/legacy/index.ios.d.ts", ""),
+            (
+                "/app/node_modules/modern/package.json",
+                r#"{"exports":{".":"./entry.js"}}"#,
+            ),
+            ("/app/node_modules/modern/entry.d.ts", ""),
+            ("/app/node_modules/modern/entry.ios.d.ts", ""),
+        ]);
+        let resolver = Resolver::new(
+            &fs,
+            ResolutionOptions {
+                mode: ResolutionMode::Bundler,
+                module_suffixes: vec![".ios".into()],
+                ..ResolutionOptions::default()
+            },
+        );
+
+        assert_eq!(
+            resolver
+                .resolve("legacy", "/app/main.ts")
+                .resolved
+                .unwrap()
+                .resolved_file_name,
+            "/app/node_modules/legacy/index.ios.d.ts"
+        );
+        assert_eq!(
+            resolver
+                .resolve("modern", "/app/main.ts")
+                .resolved
+                .unwrap()
+                .resolved_file_name,
+            "/app/node_modules/modern/entry.ios.d.ts"
         );
     }
 
