@@ -277,6 +277,40 @@ mod tests {
     }
 
     #[test]
+    fn newly_exposed_checker_and_option_diagnostics_match_typescript() {
+        let cases: &[(u32, &[&str], &str)] = &[
+            (2349, &[], "This expression is not callable."),
+            (
+                5052,
+                &["checkJs", "allowJs"],
+                "Option 'checkJs' cannot be specified without specifying option 'allowJs'.",
+            ),
+            (
+                6504,
+                &["src/caf\u{00e9}.js"],
+                "File 'src/caf\u{00e9}.js' is a JavaScript file. Did you mean to enable the 'allowJs' option?",
+            ),
+            (
+                2874,
+                &["React"],
+                "This JSX tag requires 'React' to be in scope, but it could not be found.",
+            ),
+            (
+                2875,
+                &["react/jsx-runtime"],
+                "This JSX tag requires the module path 'react/jsx-runtime' to exist, but none could be found. Make sure you have types for the appropriate package installed.",
+            ),
+        ];
+
+        for &(code, arguments, expected) in cases {
+            let message = message_by_code(code).expect("diagnostic exists in the pinned catalog");
+            assert_eq!(message.category(), Category::Error);
+            let diagnostic = Diagnostic::with_arguments(message, arguments.iter().copied());
+            assert_eq!(diagnostic.render().unwrap(), expected, "TS{code}");
+        }
+    }
+
+    #[test]
     fn diagnostics_render_numbered_arguments() {
         let message = message_by_code(1007).unwrap();
         let diagnostic = Diagnostic::with_arguments(message, ["{", "}"]);

@@ -2,7 +2,7 @@
 
 use std::{
     fmt::Write as _,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 use ts_core::TextRange;
@@ -167,29 +167,48 @@ fn location(
 }
 
 fn relative_file_name(file_name: &str, current_directory: &str) -> String {
-    let current = current_directory.trim_end_matches(['/', '\\']);
-    if !current.is_empty()
-        && let Some(relative) = file_name.strip_prefix(current)
-        && let Some(relative) = relative.strip_prefix(['/', '\\'])
+    let normalized_file = file_name.replace('\\', "/");
+    let normalized_current = current_directory.replace('\\', "/");
+    let file_path = Path::new(&normalized_file);
+    let current_path = Path::new(&normalized_current);
+    if file_path.is_absolute() && current_path.is_absolute() {
+        return relative_disk_path(file_path, current_path).unwrap_or(normalized_file);
+    }
+
+    if let (Some((file_drive, file_path)), Some((current_drive, current_path))) = (
+        windows_drive_path(&normalized_file),
+        windows_drive_path(&normalized_current),
+    ) {
+        if file_drive.eq_ignore_ascii_case(current_drive) {
+            return relative_disk_path(file_path, current_path).unwrap_or(normalized_file);
+        }
+        return normalized_file;
+    }
+
+    file_name.to_owned()
+}
+
+fn windows_drive_path(path: &str) -> Option<(&str, &Path)> {
+    let bytes = path.as_bytes();
+    if bytes.first().is_some_and(u8::is_ascii_alphabetic)
+        && bytes.get(1) == Some(&b':')
+        && bytes.get(2) == Some(&b'/')
     {
-        return relative.to_owned();
+        return Some((&path[..2], Path::new(&path[2..])));
     }
+    None
+}
 
-    let file_path = Path::new(file_name);
-    let current_path = Path::new(current_directory);
-    if !file_path.is_absolute() || !current_path.is_absolute() {
-        return file_name.to_owned();
-    }
-
-    let file_components = file_path.components().collect::<Vec<_>>();
-    let current_components = current_path.components().collect::<Vec<_>>();
+fn relative_disk_path(file_path: &Path, current_path: &Path) -> Option<String> {
+    let file_components = reduced_path_components(file_path);
+    let current_components = reduced_path_components(current_path);
     let common = file_components
         .iter()
         .zip(&current_components)
         .take_while(|(file, current)| file == current)
         .count();
     if common == 0 {
-        return file_name.to_owned();
+        return None;
     }
 
     let mut relative = PathBuf::new();
@@ -199,10 +218,25 @@ fn relative_file_name(file_name: &str, current_directory: &str) -> String {
     for component in &file_components[common..] {
         relative.push(component.as_os_str());
     }
-    if !relative.as_os_str().is_empty() {
-        return relative.to_string_lossy().replace('\\', "/");
+    if relative.as_os_str().is_empty() {
+        return Some(String::new());
     }
-    file_name.to_owned()
+    Some(relative.to_string_lossy().replace('\\', "/"))
+}
+
+fn reduced_path_components(path: &Path) -> Vec<Component<'_>> {
+    let mut reduced = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir if matches!(reduced.last(), Some(Component::Normal(_))) => {
+                reduced.pop();
+            }
+            Component::ParentDir if matches!(reduced.last(), Some(Component::RootDir)) => {}
+            _ => reduced.push(component),
+        }
+    }
+    reduced
 }
 
 fn line_and_utf16_column(source: &str, byte_position: usize) -> (usize, usize) {
@@ -304,7 +338,9 @@ fn write_snippet(output: &mut String, source: &str, range: TextRange, color: &st
 mod tests {
     use ts_core::{TextPos, TextRange};
 
-    use super::{Diagnostic, DiagnosticCategory, FormattingOptions, format_diagnostics};
+    use super::{
+        Diagnostic, DiagnosticCategory, FormattingOptions, format_diagnostics, relative_file_name,
+    };
 
     #[test]
     fn formats_plain_diagnostics_with_relative_utf16_locations() {
@@ -387,6 +423,39 @@ mod tests {
             ),
             "example.ts(1,1): error TS2304: Cannot find name 'missing'.\n"
         );
+    }
+
+    #[test]
+    fn relative_paths_match_upstream_windows_and_unc_rules() {
+        assert_eq!(
+            relative_file_name(
+                r"C:\project\tests\example.ts",
+                r"c:\project\crates\compiler",
+            ),
+            "../../tests/example.ts"
+        );
+        assert_eq!(
+            relative_file_name(r"C:\project\src\example.ts", "C:/project"),
+            "src/example.ts"
+        );
+        assert_eq!(
+            relative_file_name(r"D:\project\example.ts", r"C:\project"),
+            "D:/project/example.ts"
+        );
+        assert_eq!(
+            relative_file_name(r"\\server\share\tests\example.ts", r"\\server\share\src",),
+            "../tests/example.ts"
+        );
+    }
+
+    #[test]
+    fn relative_paths_reduce_dot_and_parent_segments() {
+        assert_eq!(
+            relative_file_name("/project/source/../tests/example.ts", "/project/./src",),
+            "../tests/example.ts"
+        );
+        assert_eq!(relative_file_name("/project", "/project"), "");
+        assert_eq!(relative_file_name("/", "/project"), "..");
     }
 
     #[test]
