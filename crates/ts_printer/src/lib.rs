@@ -10507,9 +10507,7 @@ impl DeclarationPrinter<'_> {
                         self.arena.get(*member).map(|node| &node.data),
                         Some(NodeData::IndexSignatureDeclaration(_))
                     ))
-            ) {
-                self.emit_semantic_type(return_type)?;
-            } else if matches!(
+            ) || matches!(
                 self.arena.get(annotation).map(|node| &node.data),
                 Some(NodeData::UnionTypeNode(_) | NodeData::IntersectionTypeNode(_))
             ) {
@@ -32284,7 +32282,7 @@ impl Printer<'_> {
                     for operation in &dependency.setter_operations {
                         match operation {
                             SystemSetterOperation::Storage(storage) => {
-                                self.emit_system_setter_storage(&dependency.parameter, storage)
+                                self.emit_system_setter_storage(&dependency.parameter, storage);
                             }
                             SystemSetterOperation::StorageExport(storage, exported) => self
                                 .emit_system_setter_storage_export(
