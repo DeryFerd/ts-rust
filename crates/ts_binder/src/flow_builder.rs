@@ -1157,7 +1157,6 @@ impl<'a, 'hooks> FlowBuilder<'a, 'hooks> {
                     self.bind_node(argument);
                 }
             }
-            Some(NodeData::NonNullExpression(_)) => {}
             _ => {}
         }
     }

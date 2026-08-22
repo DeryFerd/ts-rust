@@ -266,7 +266,9 @@ pub struct CanonicalResolvedName {
 /// Structural or capability failure. An ordinary missing name is `Ok(None)`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CanonicalNameResolutionError {
-    WrongArena { file: FileId },
+    WrongArena {
+        file: FileId,
+    },
     ArenaRevisionMismatch {
         file: FileId,
         expected: NodeArenaRevision,
@@ -531,7 +533,7 @@ pub fn resolve_global_name<H: CanonicalNameResolverHost>(
     Ok(result)
 }
 
-/// Exact non-JavaScript lexical/module name resolver over one bound file.
+/// Lexical/module name resolver over one completed ordinary source file.
 pub struct CanonicalNameResolver<'a, H> {
     arena: &'a NodeArena,
     bound: &'a BoundFile,
@@ -560,7 +562,7 @@ impl<'a, H: CanonicalNameResolverHost> CanonicalNameResolver<'a, H> {
         let Some(facts) = bound.source_facts() else {
             return Err(CanonicalNameResolutionError::MissingSourceFileFacts(file));
         };
-        if facts.is_javascript_file() {
+        if facts.is_javascript_file() && bound.phase() != BindingPhase::Declarations {
             return Err(CanonicalNameResolutionError::JavaScriptDeferred(file));
         }
         if facts.is_common_js_module() {
@@ -3550,9 +3552,7 @@ class C {
             .parsed
             .arena
             .iter()
-            .filter_map(|(node, record)| {
-                (record.kind == SyntaxKind::Constructor).then_some(node)
-            })
+            .filter_map(|(node, record)| (record.kind == SyntaxKind::Constructor).then_some(node))
             .collect::<Vec<_>>();
         assert_eq!(constructors.len(), 2);
         let constructor_body = |constructor| {
@@ -3828,6 +3828,44 @@ export { remote } from "pkg";
         assert!(host.referenced.is_empty());
         assert!(host.failed.is_empty());
         assert!(host.succeeded.is_empty());
+    }
+
+    #[test]
+    fn completed_javascript_scripts_resolve_ordinary_lexical_names() {
+        let parsed = parse_javascript_source_file(
+            "/** @type {number} */ const value = 1; function read() { return value; }",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                FILE,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/name-resolver.js\""),
+                    CanonicalSourceLanguage::JavaScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_javascript_declaration_slice(&parsed.arena, FILE)
+            .unwrap();
+        let source = BoundSource {
+            parsed,
+            bindings: binder.finish(),
+        };
+        let location = identifier_in(&source, "return value", "value");
+        let locals = bound(&source).locals(bound(&source).source_file()).unwrap();
+        let expected = table_symbol(&source, locals, "value");
+        let mut host = TestHost::for_source(&source);
+
+        assert_eq!(
+            resolve(&source, &mut host, location, "value", SymbolFlags::VALUE),
+            Ok(Some(expected))
+        );
     }
 
     #[test]

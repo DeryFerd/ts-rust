@@ -5,8 +5,8 @@
 //! equivalent of those node slots. This slice freezes the traversal, container,
 //! locals, and flow contracts and provides complete TypeScript-family
 //! declaration dispatch. Callers can observe the traversal/declaration boundary
-//! through [`BindingPhase`]. JavaScript, `CommonJS`, and JSON remain separate
-//! source-kind closures.
+//! through [`BindingPhase`]. Ordinary JavaScript declarations share the same
+//! dispatch. `CommonJS`, JavaScript expandos, and JSON remain separate.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -30,7 +30,7 @@ pub enum BindingPhase {
     /// Symbol declaration and merge behavior has not run yet.
     Traversal,
     /// Declaration symbols and merge diagnostics are complete.
-    /// Produced only by successful full TypeScript-family dispatch.
+    /// Produced by successful TypeScript or ordinary JavaScript dispatch.
     Declarations,
 }
 
@@ -1110,6 +1110,37 @@ impl CanonicalBinder {
         arena: &NodeArena,
         file: FileId,
     ) -> Result<&BoundFile, CanonicalDeclarationError> {
+        self.bind_declaration_slice(arena, file, false)
+    }
+
+    /// Binds ordinary JavaScript script and ES-module declarations.
+    ///
+    /// Functions, variables, classes, imports, and exports use the same
+    /// declaration rules as TypeScript. `CommonJS`, JavaScript assignment
+    /// declarations, and synthetic `JSDoc` aliases stay unsupported.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid source provenance, duplicate dispatch,
+    /// unsupported JavaScript declaration families, or `CommonJS` modules.
+    ///
+    /// # Panics
+    ///
+    /// Panics if preflighted captured binder state disappears during dispatch.
+    pub fn bind_javascript_declaration_slice(
+        &mut self,
+        arena: &NodeArena,
+        file: FileId,
+    ) -> Result<&BoundFile, CanonicalDeclarationError> {
+        self.bind_declaration_slice(arena, file, true)
+    }
+
+    fn bind_declaration_slice(
+        &mut self,
+        arena: &NodeArena,
+        file: FileId,
+        allow_javascript: bool,
+    ) -> Result<&BoundFile, CanonicalDeclarationError> {
         let Some(bound) = self.files.get(&file) else {
             return Err(CanonicalDeclarationError::UnboundFile(file));
         };
@@ -1135,7 +1166,7 @@ impl CanonicalBinder {
         let Some(facts) = bound.source_facts.clone() else {
             return Err(CanonicalDeclarationError::MissingSourceFileFacts(file));
         };
-        if facts.is_javascript_file() {
+        if facts.is_javascript_file() && !allow_javascript {
             return Err(CanonicalDeclarationError::JavaScriptDeclarationsDeferred(
                 file,
             ));
@@ -1149,6 +1180,9 @@ impl CanonicalBinder {
         if let Some(node) = order.iter().copied().find(|node| {
             !declaration_family_supported(arena, *node)
                 || declaration_name_shape_unsupported(arena, *node)
+                || (facts.is_javascript_file()
+                    && (is_typescript_expando_property_assignment(arena, *node)
+                        || assignment_name_requires_javascript_file_kind(arena, *node)))
         }) {
             return Err(CanonicalDeclarationError::UnsupportedDeclarationFamily(
                 NodeRef::new(arena.id(), file, node),
@@ -4699,7 +4733,9 @@ mod tests {
     use std::{collections::BTreeSet, panic::AssertUnwindSafe};
 
     use ts_ast::{FileId, NodeData, NodeFlags, NodeId, NodeRef, SyntaxKind};
-    use ts_parser::{ParseResult, parse_jsx_source_file, parse_source_file};
+    use ts_parser::{
+        ParseResult, parse_javascript_source_file, parse_jsx_source_file, parse_source_file,
+    };
 
     use super::{
         BindingPhase, CanonicalBindError, CanonicalBinder, CanonicalDeclarationError,
@@ -8372,10 +8408,16 @@ Merged.fresh = 1;
     }
 
     #[test]
-    fn javascript_expandos_remain_deferred_without_partial_declaration_writes() {
-        let parsed = parse_source_file("F.staticName = 1; F[dynamic] = 2; function F() {}");
+    fn javascript_expandos_remain_unsupported_without_partial_declaration_writes() {
+        let parsed =
+            parse_javascript_source_file("F.staticName = 1; F[dynamic] = 2; function F() {}");
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let file = FileId::new(69);
+        let assignment = node_with_source(
+            &parsed.arena,
+            SyntaxKind::BinaryExpression,
+            "F.staticName = 1",
+        );
         let mut binder = CanonicalBinder::new();
         binder
             .bind_source_file_with_facts(
@@ -8396,6 +8438,12 @@ Merged.fresh = 1;
                 file
             ))
         );
+        assert_eq!(
+            binder.bind_javascript_declaration_slice(&parsed.arena, file),
+            Err(CanonicalDeclarationError::UnsupportedDeclarationFamily(
+                node_ref(&parsed.arena, file, assignment)
+            ))
+        );
 
         let bound = binder.file(file).unwrap();
         assert_eq!(bound.phase(), BindingPhase::Traversal);
@@ -8409,6 +8457,156 @@ Merged.fresh = 1;
         );
         assert_eq!(binder.symbol_store().symbol_len(), 0);
         assert_eq!(binder.symbol_store().symbol_table_len(), 0);
+    }
+
+    #[test]
+    fn javascript_scripts_bind_ordinary_declarations_with_jsdoc_comments() {
+        let parsed = parse_javascript_source_file(concat!(
+            "/** @param {number} value */\n",
+            "function read(value) { return value; }\n",
+            "/** @type {number} */\n",
+            "const input = 1;\n",
+            "class Box { value = input; }",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(70);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/input.js\""),
+                    CanonicalSourceLanguage::JavaScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_javascript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+
+        let bound = binder.file(file).unwrap();
+        assert_eq!(bound.phase(), BindingPhase::Declarations);
+        assert!(bound.diagnostics().is_empty(), "{:?}", bound.diagnostics());
+        let source_locals = binder
+            .symbol_store()
+            .symbol_table(bound.locals(bound.source_file()).unwrap())
+            .unwrap();
+        for name in ["read", "input", "Box"] {
+            assert!(source_locals.get_source(name).is_some(), "{name}");
+        }
+
+        let function = nodes_of_kind(&parsed.arena, SyntaxKind::FunctionDeclaration)[0];
+        let function_locals = binder
+            .symbol_store()
+            .symbol_table(
+                bound
+                    .locals(node_ref(&parsed.arena, file, function))
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(function_locals.get_source("value").is_some());
+
+        let class = source_locals.get_source("Box").unwrap();
+        let members = binder
+            .symbol_store()
+            .symbol_table(
+                binder
+                    .symbol_store()
+                    .symbol(class)
+                    .unwrap()
+                    .members()
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(members.get_source("value").is_some());
+    }
+
+    #[test]
+    fn javascript_es_modules_share_program_symbols_with_typescript() {
+        let javascript = parse_javascript_source_file(
+            "import { seed } from './dep.js'; export const value = seed; export function read(input) { return input; }",
+        );
+        let typescript = parse_source_file("export const typed = 1;");
+        assert!(
+            javascript.diagnostics.is_empty(),
+            "{:?}",
+            javascript.diagnostics
+        );
+        assert!(
+            typescript.diagnostics.is_empty(),
+            "{:?}",
+            typescript.diagnostics
+        );
+        let javascript_file = FileId::new(71);
+        let typescript_file = FileId::new(72);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &javascript.arena,
+                javascript.source_file,
+                javascript_file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/input.js\""),
+                    CanonicalSourceLanguage::JavaScript,
+                    false,
+                    CanonicalModuleState::External,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_source_file_with_facts(
+                &typescript.arena,
+                typescript.source_file,
+                typescript_file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/input.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::External,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_javascript_declaration_slice(&javascript.arena, javascript_file)
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&typescript.arena, typescript_file)
+            .unwrap();
+
+        let javascript_bound = binder.file(javascript_file).unwrap();
+        let source = javascript_bound
+            .symbol(javascript_bound.source_file())
+            .unwrap();
+        let exports = binder
+            .symbol_store()
+            .symbol_table(
+                binder
+                    .symbol_store()
+                    .symbol(source)
+                    .unwrap()
+                    .exports()
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(exports.get_source("value").is_some());
+        assert!(exports.get_source("read").is_some());
+        let locals = binder
+            .symbol_store()
+            .symbol_table(
+                javascript_bound
+                    .locals(javascript_bound.source_file())
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(locals.get_source("seed").is_some());
+
+        let program = binder.finish();
+        assert!(program.declarations_complete());
+        assert_eq!(program.try_into_parts().unwrap().1.len(), 2);
     }
 
     #[test]
