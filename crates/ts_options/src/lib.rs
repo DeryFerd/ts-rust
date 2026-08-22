@@ -103,6 +103,8 @@ pub struct CompilerOptions {
     pub check_js: bool,
     pub composite: bool,
     pub declaration: bool,
+    /// Whether `declaration` was explicitly supplied instead of implied by `composite`.
+    pub declaration_specified: bool,
     pub declaration_map: bool,
     pub deduplicate_packages: bool,
     pub disable_size_limit: bool,
@@ -209,6 +211,9 @@ pub struct CompilerOptions {
     pub map_root: Option<String>,
     pub source_root: Option<String>,
     pub incremental: bool,
+    /// Whether `incremental` was explicitly supplied instead of implied by `composite`.
+    pub incremental_specified: bool,
+    pub trace_resolution: bool,
     pub out_file: Option<String>,
     pub out_dir: Option<String>,
     pub root_dir: Option<String>,
@@ -233,11 +238,12 @@ impl Default for CompilerOptions {
             allow_umd_global_access: false,
             allow_unreachable_code: None,
             allow_unused_labels: None,
-            allow_synthetic_default_imports: false,
+            allow_synthetic_default_imports: true,
             assume_changes_only_affect_direct_dependencies: false,
             check_js: false,
             composite: false,
             declaration: false,
+            declaration_specified: false,
             declaration_map: false,
             deduplicate_packages: true,
             disable_size_limit: false,
@@ -249,7 +255,7 @@ impl Default for CompilerOptions {
             experimental_decorators: false,
             es_module_interop: true,
             exact_optional_property_types: false,
-            force_consistent_casing_in_file_names: false,
+            force_consistent_casing_in_file_names: true,
             isolated_modules: false,
             isolated_declarations: false,
             import_helpers: false,
@@ -324,6 +330,8 @@ impl Default for CompilerOptions {
             map_root: None,
             source_root: None,
             incremental: false,
+            incremental_specified: false,
+            trace_resolution: false,
             out_file: None,
             out_dir: None,
             root_dir: None,
@@ -509,15 +517,21 @@ impl CompilerOptions {
                 }
                 "composite" => {
                     self.composite = overrides.composite;
-                    if !names.contains("declaration") {
+                    if !names.contains("declaration") && !self.declaration_specified {
                         self.declaration = overrides.declaration;
+                    }
+                    if !names.contains("incremental") && !self.incremental_specified {
+                        self.incremental = overrides.incremental;
                     }
                 }
                 "customconditions" => {
                     self.custom_conditions
                         .clone_from(&overrides.custom_conditions);
                 }
-                "declaration" => self.declaration = overrides.declaration,
+                "declaration" => {
+                    self.declaration = overrides.declaration;
+                    self.declaration_specified = true;
+                }
                 "declarationdir" => self.declaration_dir.clone_from(&overrides.declaration_dir),
                 "declarationmap" => self.declaration_map = overrides.declaration_map,
                 "deduplicatepackages" => self.deduplicate_packages = overrides.deduplicate_packages,
@@ -559,7 +573,10 @@ impl CompilerOptions {
                         .clone_from(&overrides.ignore_deprecations);
                 }
                 "importhelpers" => self.import_helpers = overrides.import_helpers,
-                "incremental" => self.incremental = overrides.incremental,
+                "incremental" => {
+                    self.incremental = overrides.incremental;
+                    self.incremental_specified = true;
+                }
                 "jsx" => self.jsx = overrides.jsx,
                 "jsxfactory" => self.jsx_factory.clone_from(&overrides.jsx_factory),
                 "jsxfragmentfactory" => self
@@ -732,6 +749,7 @@ impl CompilerOptions {
                     self.ts_build_info_file
                         .clone_from(&overrides.ts_build_info_file);
                 }
+                "traceresolution" => self.trace_resolution = overrides.trace_resolution,
                 "typeroots" => self.type_roots.clone_from(&overrides.type_roots),
                 "types" => self.types.clone_from(&overrides.types),
                 "target" => self.target = overrides.target,
@@ -786,7 +804,7 @@ impl CompilerOptions {
             module: self.module,
             jsx: self.jsx,
             emit_javascript: !self.no_emit && !self.emit_declaration_only,
-            emit_declarations: !self.no_emit && self.declaration,
+            emit_declarations: !self.no_emit && (self.declaration || self.composite),
             source_map: (self.source_map || self.inline_source_map)
                 && !self.no_emit
                 && !self.emit_declaration_only,
@@ -1130,6 +1148,9 @@ pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> Pars
             "tsbuildinfofile" => {
                 parsed.ts_build_info_file = string(original_name, value, &mut diagnostics);
             }
+            "traceresolution" => {
+                parsed.trace_resolution = boolean(original_name, value, &mut diagnostics);
+            }
             "baseurl" => parsed.base_url = string(original_name, value, &mut diagnostics),
             "paths" => parsed.paths = paths(original_name, value, &mut diagnostics),
             "rootdirs" => parsed.root_dirs = string_array(original_name, value, &mut diagnostics),
@@ -1252,6 +1273,7 @@ struct PartialOptions {
     map_root: Option<String>,
     source_root: Option<String>,
     incremental: Option<bool>,
+    trace_resolution: Option<bool>,
     out_file: Option<String>,
     out_dir: Option<String>,
     root_dir: Option<String>,
@@ -1269,6 +1291,8 @@ impl PartialOptions {
     fn normalize(self) -> CompilerOptions {
         let check_js = self.check_js.unwrap_or(false);
         let allow_js_specified = self.allow_js.is_some();
+        let declaration_specified = self.declaration.is_some();
+        let incremental_specified = self.incremental.is_some();
         let no_implicit_any_specified = self.no_implicit_any.is_some();
         let no_implicit_this_specified = self.no_implicit_this.is_some();
         let strict_specified = self.strict.is_some();
@@ -1319,6 +1343,7 @@ impl PartialOptions {
             check_js,
             composite,
             declaration: self.declaration.unwrap_or(composite),
+            declaration_specified,
             declaration_map: self.declaration_map.unwrap_or(false),
             deduplicate_packages: self.deduplicate_packages.unwrap_or(true),
             disable_size_limit: self.disable_size_limit.unwrap_or(false),
@@ -1332,7 +1357,7 @@ impl PartialOptions {
             exact_optional_property_types: self.exact_optional_property_types.unwrap_or(false),
             force_consistent_casing_in_file_names: self
                 .force_consistent_casing_in_file_names
-                .unwrap_or(false),
+                .unwrap_or(true),
             isolated_modules: self.isolated_modules.unwrap_or(false),
             isolated_declarations: self.isolated_declarations.unwrap_or(false),
             import_helpers: self.import_helpers.unwrap_or(false),
@@ -1427,7 +1452,9 @@ impl PartialOptions {
             inline_sources: self.inline_sources.unwrap_or(false),
             map_root: self.map_root,
             source_root: self.source_root,
-            incremental: self.incremental.unwrap_or(false),
+            incremental: self.incremental.unwrap_or(composite),
+            incremental_specified,
+            trace_resolution: self.trace_resolution.unwrap_or(false),
             out_file: self.out_file,
             out_dir: self.out_dir,
             root_dir: self.root_dir,
@@ -1480,16 +1507,7 @@ fn validate_options(options: &PartialOptions, diagnostics: &mut Vec<Diagnostic>)
     if options.no_lib == Some(true) && options.lib.is_some() {
         diagnostics.push(diagnostic(5053, ["lib", "noLib"]));
     }
-    if options.exact_optional_property_types == Some(true)
-        && !options
-            .strict_null_checks
-            .unwrap_or(options.strict.unwrap_or(true))
-    {
-        diagnostics.push(diagnostic(
-            5052,
-            ["exactOptionalPropertyTypes", "strictNullChecks"],
-        ));
-    }
+    validate_project_and_strict_options(options, diagnostics);
     if options.allow_importing_ts_extensions == Some(true)
         && options.no_emit != Some(true)
         && options.emit_declaration_only != Some(true)
@@ -1554,6 +1572,36 @@ fn validate_options(options: &PartialOptions, diagnostics: &mut Vec<Diagnostic>)
             diagnostics.push(diagnostic(5110, ["NodeNext", "NodeNext"]));
         }
         _ => {}
+    }
+}
+
+fn validate_project_and_strict_options(
+    options: &PartialOptions,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if options.composite == Some(true) {
+        if options.declaration == Some(false) {
+            diagnostics.push(diagnostic(6304, []));
+        }
+        if options.incremental == Some(false) {
+            diagnostics.push(diagnostic(6379, []));
+        }
+    }
+
+    let strict_null_checks = options
+        .strict_null_checks
+        .unwrap_or(options.strict.unwrap_or(true));
+    if options.strict_property_initialization == Some(true) && !strict_null_checks {
+        diagnostics.push(diagnostic(
+            5052,
+            ["strictPropertyInitialization", "strictNullChecks"],
+        ));
+    }
+    if options.exact_optional_property_types == Some(true) && !strict_null_checks {
+        diagnostics.push(diagnostic(
+            5052,
+            ["exactOptionalPropertyTypes", "strictNullChecks"],
+        ));
     }
 }
 
@@ -1714,22 +1762,60 @@ fn paths(
     };
     let mut result = BTreeMap::new();
     for (pattern, substitutions) in object {
+        if pattern.matches('*').count() > 1 {
+            diagnostics.push(diagnostic(5061, [pattern.as_str()]));
+        }
         let Some(substitutions) = substitutions.as_array() else {
-            diagnostics.push(diagnostic(5024, [name, "object"]));
-            return None;
+            diagnostics.push(diagnostic(5063, [pattern.as_str()]));
+            continue;
         };
-        let values = substitutions
-            .iter()
-            .filter_map(JsonValue::as_str)
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        if values.len() != substitutions.len() {
-            diagnostics.push(diagnostic(5024, [name, "object"]));
-            return None;
+        if substitutions.is_empty() {
+            diagnostics.push(diagnostic(5066, [pattern.as_str()]));
+        }
+        let mut values = Vec::new();
+        for substitution in substitutions {
+            let Some(value) = substitution.as_str() else {
+                let display = json_value_display(substitution);
+                diagnostics.push(diagnostic(
+                    5064,
+                    [
+                        display.as_str(),
+                        pattern.as_str(),
+                        json_value_type(substitution),
+                    ],
+                ));
+                continue;
+            };
+            if value.matches('*').count() > 1 {
+                diagnostics.push(diagnostic(5062, [value, pattern.as_str()]));
+            }
+            values.push(value.to_owned());
         }
         result.insert(pattern.clone(), values);
     }
     Some(result)
+}
+
+fn json_value_display(value: &JsonValue) -> String {
+    match value {
+        JsonValue::Null => "null".to_owned(),
+        JsonValue::Bool(value) => value.to_string(),
+        JsonValue::Number(value) => value.as_str().to_owned(),
+        JsonValue::String(value) => value.clone(),
+        JsonValue::Array(_) => "[object Array]".to_owned(),
+        JsonValue::Object(_) => "[object Object]".to_owned(),
+    }
+}
+
+const fn json_value_type(value: &JsonValue) -> &'static str {
+    match value {
+        JsonValue::Null => "null",
+        JsonValue::Bool(_) => "boolean",
+        JsonValue::Number(_) => "number",
+        JsonValue::String(_) => "string",
+        JsonValue::Array(_) => "array",
+        JsonValue::Object(_) => "object",
+    }
 }
 
 fn validate_plugins(name: &str, value: &JsonValue, diagnostics: &mut Vec<Diagnostic>) {
@@ -2096,6 +2182,115 @@ mod tests {
         .printer_settings();
         assert!(!no_emit.emit_javascript);
         assert!(!no_emit.emit_declarations);
+    }
+
+    #[test]
+    fn composite_projects_infer_declarations_and_incremental_builds() {
+        let composite = parse_compiler_options(&object([("composite", JsonValue::Bool(true))]));
+        assert!(composite.is_ok(), "{:?}", composite.diagnostics);
+        assert!(composite.options.declaration);
+        assert!(composite.options.incremental);
+        assert!(!composite.options.declaration_specified);
+        assert!(!composite.options.incremental_specified);
+        assert!(composite.options.printer_settings().emit_declarations);
+
+        let direct = CompilerOptions {
+            composite: true,
+            ..CompilerOptions::default()
+        };
+        assert!(direct.printer_settings().emit_declarations);
+
+        let invalid = parse_compiler_options(&object([
+            ("composite", JsonValue::Bool(true)),
+            ("declaration", JsonValue::Bool(false)),
+            ("incremental", JsonValue::Bool(false)),
+        ]));
+        assert_eq!(
+            invalid
+                .diagnostics
+                .iter()
+                .map(ts_diagnostics::Diagnostic::code)
+                .collect::<Vec<_>>(),
+            [6304, 6379]
+        );
+        assert!(!invalid.options.declaration);
+        assert!(!invalid.options.incremental);
+        assert!(invalid.options.declaration_specified);
+        assert!(invalid.options.incremental_specified);
+    }
+
+    #[test]
+    fn composite_overrides_preserve_explicit_declaration_and_incremental_options() {
+        let enabled =
+            parse_compiler_options(&object([("composite", JsonValue::Bool(true))])).options;
+        let mut inferred = CompilerOptions::default();
+        inferred.apply_overrides(&enabled, &BTreeSet::from(["composite".to_owned()]));
+        assert!(inferred.composite);
+        assert!(inferred.declaration);
+        assert!(inferred.incremental);
+
+        let mut explicit = parse_compiler_options(&object([
+            ("declaration", JsonValue::Bool(false)),
+            ("incremental", JsonValue::Bool(false)),
+        ]))
+        .options;
+        explicit.apply_overrides(&enabled, &BTreeSet::from(["composite".to_owned()]));
+        assert!(explicit.composite);
+        assert!(!explicit.declaration);
+        assert!(!explicit.incremental);
+    }
+
+    #[test]
+    fn explicit_strict_property_initialization_requires_strict_null_checks() {
+        let invalid = parse_compiler_options(&object([
+            ("strict", JsonValue::Bool(false)),
+            ("strictPropertyInitialization", JsonValue::Bool(true)),
+        ]));
+        assert_eq!(invalid.diagnostics.len(), 1);
+        assert_eq!(invalid.diagnostics[0].code(), 5052);
+        assert_eq!(
+            invalid.diagnostics[0].render().unwrap(),
+            "Option 'strictPropertyInitialization' cannot be specified without specifying option 'strictNullChecks'."
+        );
+
+        let valid = parse_compiler_options(&object([
+            ("strict", JsonValue::Bool(false)),
+            ("strictNullChecks", JsonValue::Bool(true)),
+            ("strictPropertyInitialization", JsonValue::Bool(true)),
+        ]));
+        assert!(valid.is_ok(), "{:?}", valid.diagnostics);
+    }
+
+    #[test]
+    fn compiler_defaults_match_pinned_interoperability_and_casing_options() {
+        let defaults = CompilerOptions::default();
+        assert!(defaults.allow_synthetic_default_imports);
+        assert!(defaults.force_consistent_casing_in_file_names);
+
+        let parsed = parse_compiler_options(&object([]));
+        assert!(parsed.options.allow_synthetic_default_imports);
+        assert!(parsed.options.force_consistent_casing_in_file_names);
+
+        let disabled = parse_compiler_options(&object([(
+            "forceConsistentCasingInFileNames",
+            JsonValue::Bool(false),
+        )]));
+        assert!(disabled.is_ok(), "{:?}", disabled.diagnostics);
+        assert!(!disabled.options.force_consistent_casing_in_file_names);
+    }
+
+    #[test]
+    fn parses_trace_resolution_and_preserves_command_line_overrides() {
+        let enabled = parse_compiler_options(&object([("traceResolution", JsonValue::Bool(true))]));
+        assert!(enabled.is_ok(), "{:?}", enabled.diagnostics);
+        assert!(enabled.options.trace_resolution);
+
+        let mut options = CompilerOptions::default();
+        options.apply_overrides(
+            &enabled.options,
+            &BTreeSet::from(["traceresolution".to_owned()]),
+        );
+        assert!(options.trace_resolution);
     }
 
     #[test]
@@ -2889,6 +3084,94 @@ mod tests {
                 types: Some(vec!["node".into(), "jest".into()]),
                 ..ResolutionOptions::default()
             }
+        );
+    }
+
+    #[test]
+    fn validates_path_mapping_patterns_and_substitutions_with_upstream_codes() {
+        let config = parse_config_text(
+            "/repo/tsconfig.json",
+            r#"{
+                "compilerOptions": {
+                    "paths": {
+                        "*broken*": ["./src/*/nested/*"],
+                        "empty": [],
+                        "number": [1],
+                        "scalar": "./src/*",
+                        "valid/*": ["./src/*"]
+                    }
+                }
+            }"#,
+        )
+        .value
+        .unwrap();
+        let result = parse_project_options(&config);
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(ts_diagnostics::Diagnostic::code)
+                .collect::<Vec<_>>(),
+            [5061, 5062, 5066, 5064, 5063]
+        );
+        assert_eq!(
+            result.diagnostics[0].render().unwrap(),
+            "Pattern '*broken*' can have at most one '*' character."
+        );
+        assert_eq!(
+            result.diagnostics[1].render().unwrap(),
+            "Substitution './src/*/nested/*' in pattern '*broken*' can have at most one '*' character."
+        );
+        assert_eq!(
+            result.diagnostics[2].render().unwrap(),
+            "Substitutions for pattern 'empty' shouldn't be an empty array."
+        );
+        assert_eq!(
+            result.diagnostics[3].render().unwrap(),
+            "Substitution '1' for pattern 'number' has incorrect type, expected 'string', got 'number'."
+        );
+        assert_eq!(
+            result.diagnostics[4].render().unwrap(),
+            "Substitutions for pattern 'scalar' should be an array."
+        );
+        assert_eq!(
+            result.options.paths.get("valid/*"),
+            Some(&vec!["./src/*".to_owned()])
+        );
+        assert!(!result.options.paths.contains_key("scalar"));
+    }
+
+    #[test]
+    fn path_mapping_type_diagnostics_preserve_valid_sibling_entries() {
+        let config = parse_config_text(
+            "/repo/tsconfig.json",
+            r#"{
+                "compilerOptions": {
+                    "paths": {
+                        "mixed": [true, "./valid.ts", null],
+                        "valid": ["./other.ts"]
+                    }
+                }
+            }"#,
+        )
+        .value
+        .unwrap();
+        let result = parse_project_options(&config);
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(ts_diagnostics::Diagnostic::code)
+                .collect::<Vec<_>>(),
+            [5064, 5064]
+        );
+        assert_eq!(
+            result.options.paths.get("mixed"),
+            Some(&vec!["./valid.ts".to_owned()])
+        );
+        assert_eq!(
+            result.options.paths.get("valid"),
+            Some(&vec!["./other.ts".to_owned()])
         );
     }
 
