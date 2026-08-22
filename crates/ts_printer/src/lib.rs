@@ -263,11 +263,6 @@ pub fn emit_source_file_with_context(
     if !settings.emit_javascript {
         return Ok(EmitResult::default());
     }
-    let lower_source_name = source_name.to_ascii_lowercase();
-    let source_uses_tabs = [".js", ".jsx", ".mjs", ".cjs"]
-        .iter()
-        .any(|extension| lower_source_name.ends_with(extension))
-        && source_text.lines().any(|line| line.starts_with('\t'));
     let automatic_jsx = AutomaticJsxUsage::analyze(arena, settings.jsx);
     let enum_access_fallbacks = const_enum_access_fallbacks(
         arena,
@@ -277,10 +272,7 @@ pub fn emit_source_file_with_context(
     );
     let mut printer = Printer {
         arena,
-        writer: Writer {
-            use_tabs: source_uses_tabs,
-            ..Writer::default()
-        },
+        writer: Writer::default(),
         settings,
         source_map: settings.source_map.then(SourceMapBuilder::new),
         source_text,
@@ -4334,6 +4326,7 @@ pub fn emit_declaration_file_with_semantics_and_options(
         rewrite_relative_import_extensions,
         semantic_infer_count: 0,
         jsdoc_typedefs_emitted: false,
+        emitted_jsdoc_declaration_comments: HashSet::new(),
     };
     let node = printer.node(source_file)?.clone();
     let NodeData::SourceFile(data) = &node.data else {
@@ -4488,6 +4481,9 @@ pub fn emit_declaration_file_with_semantics_and_options(
             }
         }
     }
+    if printer.javascript_source {
+        printer.emit_jsdoc_typedefs();
+    }
     if !remove_comments {
         let trailing_start = data
             .statements
@@ -4496,9 +4492,6 @@ pub fn emit_declaration_file_with_semantics_and_options(
             .and_then(|statement| arena.get(*statement))
             .map_or(0, |node| node.range.end.get());
         printer.emit_trailing_jsdoc_comments(trailing_start);
-    }
-    if printer.javascript_source {
-        printer.emit_jsdoc_typedefs();
     }
     if printer.scope_needs_seal(source_file)
         || (printer.module_file
@@ -4547,6 +4540,14 @@ struct DeclarationPrinter<'a> {
     rewrite_relative_import_extensions: bool,
     semantic_infer_count: usize,
     jsdoc_typedefs_emitted: bool,
+    emitted_jsdoc_declaration_comments: HashSet<usize>,
+}
+
+struct JsDocProperty {
+    name: String,
+    type_text: String,
+    description: String,
+    optional: bool,
 }
 
 #[derive(Clone)]
@@ -5838,6 +5839,9 @@ impl DeclarationPrinter<'_> {
         {
             return Ok(());
         }
+        if self.javascript_source {
+            self.emit_leading_jsdoc_declarations(id);
+        }
         if self.javascript_source
             && let NodeData::ClassDeclaration(class) = &node.data
             && let Some(name) = class.name
@@ -5860,13 +5864,7 @@ impl DeclarationPrinter<'_> {
             self.writer.newline();
         }
         if self.javascript_source
-            && self.emit_javascript_overload_statement(
-                id,
-                &node,
-                in_namespace,
-                namespace_export,
-                exported,
-            )?
+            && self.emit_javascript_overload_statement(id, &node, in_namespace, namespace_export)?
         {
             self.writer.newline();
             return Ok(());
@@ -5941,7 +5939,7 @@ impl DeclarationPrinter<'_> {
                 if synthesized_default_namespace && !in_namespace {
                     self.writer.write("declare ");
                 } else if !in_namespace {
-                    self.emit_declaration_prefix(&node, !(self.javascript_source && exported));
+                    self.emit_declaration_prefix(&node, true);
                 } else if namespace_export
                     || (exported
                         && declaration_has_modifier(self.arena, &node, SyntaxKind::DefaultKeyword))
@@ -5957,6 +5955,21 @@ impl DeclarationPrinter<'_> {
                 }
                 self.emit_type_parameters(data.type_parameters.as_ref())?;
                 let semantic_signature = self.semantic_function_signature(id);
+                let jsdoc_return_type = self
+                    .javascript_source
+                    .then(|| self.leading_jsdoc_comment(id))
+                    .flatten()
+                    .filter(|comment| {
+                        !comment.lines().any(|line| {
+                            let tag = Self::jsdoc_tag_line(line);
+                            tag.starts_with("@typedef") || tag.starts_with("@callback")
+                        })
+                    })
+                    .and_then(|comment| {
+                        comment
+                            .lines()
+                            .find_map(|line| Self::jsdoc_return_type(Self::jsdoc_tag_line(line)))
+                    });
                 if let Some(signature) = &semantic_signature {
                     self.emit_declaration_parameters(&data.parameters, signature, id)?;
                 } else {
@@ -5966,7 +5979,9 @@ impl DeclarationPrinter<'_> {
                     && let Some(signature) = semantic_signature
                 {
                     self.writer.write(": ");
-                    if self.javascript_source
+                    if let Some(return_type) = jsdoc_return_type {
+                        self.emit_jsdoc_type_hint(&return_type);
+                    } else if self.javascript_source
                         && data.name.is_some_and(|name| {
                             declaration_name_text(self.arena, name).is_some_and(|name| {
                                 data.body.is_some_and(|body| {
@@ -5979,6 +5994,11 @@ impl DeclarationPrinter<'_> {
                     } else {
                         self.emit_function_semantic_return_type(data, signature.return_type)?;
                     }
+                } else if data.type_.is_none()
+                    && let Some(return_type) = jsdoc_return_type
+                {
+                    self.writer.write(": ");
+                    self.emit_jsdoc_type_hint(&return_type);
                 } else {
                     self.emit_return_type(data.type_)?;
                 }
@@ -6007,14 +6027,18 @@ impl DeclarationPrinter<'_> {
                         })
                         .collect::<Vec<_>>();
                     self.writer.newline();
-                    if exported && !synthesized_default_namespace {
+                    if !synthesized_default_namespace
+                        && ((!in_namespace && exported) || namespace_export)
+                    {
                         self.writer.write("export ");
                     }
                     let javascript_default_export_target = data
                         .name
                         .is_some_and(|name| self.javascript_class_is_default_export_target(name));
                     self.writer.write(
-                        if self.javascript_source && !javascript_default_export_target {
+                        if in_namespace
+                            || (self.javascript_source && !javascript_default_export_target)
+                        {
                             "namespace "
                         } else {
                             "declare namespace "
@@ -16152,7 +16176,6 @@ impl DeclarationPrinter<'_> {
         node: &Node,
         in_namespace: bool,
         namespace_export: bool,
-        exported: bool,
     ) -> Result<bool, EmitError> {
         let (name, variable_function) = match &node.data {
             NodeData::FunctionDeclaration(function) => (function.name, false),
@@ -16204,7 +16227,7 @@ impl DeclarationPrinter<'_> {
             }
             self.emit_jsdoc_comment_text(&overload.comment);
             if !in_namespace {
-                self.emit_declaration_prefix(node, !(self.javascript_source && exported));
+                self.emit_declaration_prefix(node, true);
             } else if namespace_export {
                 self.writer.write("export ");
             }
@@ -16630,11 +16653,46 @@ impl DeclarationPrinter<'_> {
         Some(&prefix[start..])
     }
 
+    fn emit_leading_jsdoc_declarations(&mut self, node: NodeId) {
+        for (start, comment) in self.leading_jsdoc_comments(node) {
+            if self.emitted_jsdoc_declaration_comments.contains(&start) {
+                continue;
+            }
+            let typedef = comment
+                .lines()
+                .any(|line| Self::jsdoc_tag_line(line).starts_with("@typedef"));
+            let callback = comment
+                .lines()
+                .any(|line| Self::jsdoc_tag_line(line).starts_with("@callback"));
+            let emitted = if typedef {
+                let preserve_comment = !Self::jsdoc_property_tags(&comment).is_empty();
+                self.emit_jsdoc_typedef_comment(&comment, preserve_comment)
+            } else if callback {
+                self.emit_jsdoc_callback_comment(&comment)
+            } else {
+                false
+            };
+            if emitted {
+                self.emitted_jsdoc_declaration_comments.insert(start);
+            }
+        }
+    }
+
     fn emit_leading_jsdoc(&mut self, node: NodeId) {
         if self.remove_comments {
             return;
         }
-        let comments = self.leading_jsdoc_comments(node);
+        let comments = self
+            .leading_jsdoc_comments(node)
+            .into_iter()
+            .filter(|(start, comment)| {
+                !self.emitted_jsdoc_declaration_comments.contains(start)
+                    || !comment
+                        .lines()
+                        .any(|line| Self::jsdoc_tag_line(line).starts_with("@typedef"))
+                    || Self::jsdoc_property_tags(comment).is_empty()
+            })
+            .collect::<Vec<_>>();
         if comments.is_empty() {
             return;
         }
@@ -16684,7 +16742,6 @@ impl DeclarationPrinter<'_> {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     fn emit_jsdoc_typedefs(&mut self) {
         if self.jsdoc_typedefs_emitted {
             return;
@@ -16699,133 +16756,128 @@ impl DeclarationPrinter<'_> {
             let comment_end = comment_start + 3 + relative_end + 2;
             let comment = &self.source_text[comment_start..comment_end];
             cursor = comment_end;
-            let Some(tag_start) = comment.find("@typedef") else {
+            if self
+                .emitted_jsdoc_declaration_comments
+                .contains(&comment_start)
+            {
                 continue;
+            }
+            let typedef = comment
+                .lines()
+                .any(|line| Self::jsdoc_tag_line(line).starts_with("@typedef"));
+            let callback = comment
+                .lines()
+                .any(|line| Self::jsdoc_tag_line(line).starts_with("@callback"));
+            let emitted = if typedef {
+                self.emit_jsdoc_typedef_comment(comment, false)
+            } else if callback {
+                self.emit_jsdoc_callback_comment(comment)
+            } else {
+                false
             };
-            let tag = comment[tag_start + "@typedef".len()..].trim_start();
-            let typedef_line = tag.lines().next().unwrap_or_default().trim();
-            if !typedef_line.contains('{') {
-                let Some(name) = typedef_line
-                    .split_whitespace()
-                    .next()
-                    .filter(|name| !name.is_empty())
-                else {
-                    continue;
-                };
+            if emitted {
+                self.emitted_jsdoc_declaration_comments
+                    .insert(comment_start);
+            }
+        }
+    }
+
+    fn emit_jsdoc_typedef_comment(&mut self, comment: &str, preserve_comment: bool) -> bool {
+        let Some(tag_start) = comment.find("@typedef") else {
+            return false;
+        };
+        let tag = comment[tag_start + "@typedef".len()..].trim_start();
+        let typedef_line = tag.lines().next().unwrap_or_default().trim();
+        if !typedef_line.contains('{') {
+            let Some(name) = typedef_line
+                .split_whitespace()
+                .next()
+                .filter(|name| !name.is_empty())
+            else {
+                return false;
+            };
+            if preserve_comment {
+                self.emit_jsdoc_comment_text(comment);
+            } else {
                 let description_start =
                     tag.find(name).map_or(tag.len(), |start| start + name.len());
                 self.emit_jsdoc_tag_description(tag, description_start);
-                if self.module_file {
-                    self.writer.write("export ");
-                }
-                self.writer.write("type ");
-                self.writer.write(name);
-                self.writer.write(" = {");
-                self.writer.newline();
-                self.writer.indent += 1;
-                for line in comment.lines() {
-                    let line = line
-                        .trim()
-                        .trim_start_matches('*')
-                        .trim()
-                        .trim_end_matches("*/")
-                        .trim();
-                    let Some(property) = line.strip_prefix("@property").map(str::trim) else {
-                        continue;
-                    };
-                    let Some(type_end) = property.find('}') else {
-                        continue;
-                    };
-                    let type_text = property
-                        .strip_prefix('{')
-                        .map_or("any", |property| &property[..type_end.saturating_sub(1)]);
-                    let raw_name = property[type_end + 1..]
-                        .split_whitespace()
-                        .next()
-                        .unwrap_or("property");
-                    let optional = raw_name.starts_with('[');
-                    let property_name = raw_name.trim_matches(['[', ']']);
-                    self.emit_semantic_property_name(property_name);
-                    if optional {
-                        self.writer.write("?");
-                    }
-                    self.writer.write(": ");
-                    self.emit_jsdoc_type_hint(type_text);
-                    self.writer.write(";");
-                    self.writer.newline();
-                }
-                self.writer.indent -= 1;
-                self.writer.write("};");
-                self.writer.newline();
-                continue;
             }
-            let Some(type_start) = tag.find('{') else {
-                continue;
-            };
-            let mut depth = 0_u32;
-            let Some(type_end) = tag[type_start..]
-                .char_indices()
-                .find_map(|(index, character)| match character {
-                    '{' => {
-                        depth += 1;
-                        None
-                    }
-                    '}' => {
-                        depth = depth.saturating_sub(1);
-                        (depth == 0).then_some(type_start + index)
-                    }
-                    _ => None,
-                })
-            else {
-                continue;
-            };
-            let after_type = &tag[type_end + 1..];
-            let leading = after_type.len() - after_type.trim_start().len();
-            let Some(name) = after_type[leading..].split_whitespace().next() else {
-                continue;
-            };
-            let name = name.trim_end_matches("*/");
-            if name.is_empty() {
-                continue;
-            }
-            self.emit_jsdoc_tag_description(tag, type_end + 1 + leading + name.len());
             if self.module_file {
                 self.writer.write("export ");
             }
             self.writer.write("type ");
             self.writer.write(name);
             self.writer.write(" = ");
-            let type_text = tag[type_start + 1..type_end].trim();
-            let properties = Self::jsdoc_property_tags(comment);
-            if type_text.eq_ignore_ascii_case("Object") && !properties.is_empty() {
-                self.writer.write("{");
-                self.writer.newline();
-                self.writer.indent += 1;
-                for (property, property_type, optional) in properties {
-                    self.emit_semantic_property_name(&property);
-                    if optional {
-                        self.writer.write("?");
-                    }
-                    self.writer.write(": ");
-                    self.emit_jsdoc_type_hint(&property_type);
-                    if optional {
-                        self.writer.write(" | undefined");
-                    }
-                    self.writer.write(";");
-                    self.writer.newline();
-                }
-                self.writer.indent -= 1;
-                self.writer.write("}");
-            } else {
-                self.emit_jsdoc_typedef_type(type_text);
+            self.emit_jsdoc_property_type(&Self::jsdoc_property_tags(comment), false);
+            self.writer.write(";");
+            self.writer.newline();
+            return true;
+        }
+        let Some(type_start) = tag.find('{') else {
+            return false;
+        };
+        let Some((type_text, after_type)) = Self::jsdoc_braced_type(&tag[type_start..]) else {
+            return false;
+        };
+        let Some(name) = after_type.split_whitespace().next() else {
+            return false;
+        };
+        let name = name.trim_end_matches("*/");
+        if name.is_empty() {
+            return false;
+        }
+        if preserve_comment {
+            self.emit_jsdoc_comment_text(comment);
+        } else {
+            let description_start = tag
+                .find(after_type)
+                .map_or(tag.len(), |start| start + name.len());
+            self.emit_jsdoc_tag_description(tag, description_start);
+        }
+        if self.module_file {
+            self.writer.write("export ");
+        }
+        self.writer.write("type ");
+        self.writer.write(name);
+        self.writer.write(" = ");
+        let properties = Self::jsdoc_property_tags(comment);
+        if type_text.eq_ignore_ascii_case("Object") && !properties.is_empty() {
+            self.emit_jsdoc_property_type(&properties, true);
+        } else {
+            self.emit_jsdoc_typedef_type(type_text);
+        }
+        self.writer.write(";");
+        self.writer.newline();
+        true
+    }
+
+    fn emit_jsdoc_property_type(&mut self, properties: &[JsDocProperty], include_undefined: bool) {
+        self.writer.write("{");
+        self.writer.newline();
+        self.writer.indent += 1;
+        for property in properties {
+            self.emit_jsdoc_tag_description(&property.description, 0);
+            self.emit_semantic_property_name(&property.name);
+            if property.optional {
+                self.writer.write("?");
+            }
+            self.writer.write(": ");
+            self.emit_jsdoc_type_hint(&property.type_text);
+            if include_undefined && property.optional && !property.type_text.contains("undefined") {
+                self.writer.write(" | undefined");
             }
             self.writer.write(";");
             self.writer.newline();
         }
-        self.emit_jsdoc_callbacks();
+        self.writer.indent -= 1;
+        self.writer.write("}");
     }
 
     fn emit_jsdoc_tag_description(&mut self, tag: &str, first_line_start: usize) {
+        if self.remove_comments {
+            return;
+        }
         let mut description = Vec::new();
         let first = tag
             .get(first_line_start..)
@@ -16862,114 +16914,88 @@ impl DeclarationPrinter<'_> {
         self.writer.newline();
     }
 
-    fn jsdoc_property_tags(comment: &str) -> Vec<(String, String, bool)> {
+    fn jsdoc_property_tags(comment: &str) -> Vec<JsDocProperty> {
         comment
             .lines()
             .filter_map(|line| {
-                let line = line
-                    .trim()
-                    .trim_start_matches('*')
-                    .trim()
-                    .trim_end_matches("*/")
-                    .trim();
-                let property = line.strip_prefix("@property")?.trim();
-                let type_end = property.find('}')?;
-                let property_type = property
-                    .strip_prefix('{')?
-                    .get(..type_end.saturating_sub(1))?
-                    .to_owned();
-                let raw_name = property[type_end + 1..].split_whitespace().next()?;
-                let optional = raw_name.starts_with('[');
-                Some((
-                    raw_name.trim_matches(['[', ']']).to_owned(),
-                    property_type,
-                    optional,
-                ))
+                let property = Self::jsdoc_tag_line(line).strip_prefix("@property")?.trim();
+                let (type_text, rest) = Self::jsdoc_braced_type(property)?;
+                let raw_name = rest.split_whitespace().next()?;
+                Some(JsDocProperty {
+                    name: raw_name.trim_matches(['[', ']']).to_owned(),
+                    type_text: type_text.to_owned(),
+                    description: rest[raw_name.len()..].trim().to_owned(),
+                    optional: raw_name.starts_with('['),
+                })
             })
             .collect()
     }
 
-    fn emit_jsdoc_callbacks(&mut self) {
-        let mut callbacks = Vec::new();
-        let mut cursor = 0;
-        while let Some(relative_start) = self.source_text[cursor..].find("/**") {
-            let start = cursor + relative_start;
-            let Some(relative_end) = self.source_text[start + 3..].find("*/") else {
-                break;
-            };
-            let end = start + 3 + relative_end + 2;
-            let comment = &self.source_text[start..end];
-            cursor = end;
-            let Some(callback_line) = comment.lines().find(|line| line.contains("@callback"))
-            else {
-                continue;
-            };
-            let Some(after_tag) = callback_line
-                .split_once("@callback")
-                .map(|(_, rest)| rest.trim())
-            else {
-                continue;
-            };
-            let mut parts = after_tag.splitn(2, char::is_whitespace);
-            let Some(name) = parts.next().filter(|name| !name.is_empty()) else {
-                continue;
-            };
-            let signature = parts.next().unwrap_or("function ()").trim().to_owned();
-            let mut description = Vec::new();
-            let mut parameters = Vec::new();
-            let mut after_callback = false;
-            for line in comment.lines() {
-                if line.contains("@callback") {
-                    after_callback = true;
-                    continue;
-                }
-                if !after_callback {
-                    continue;
-                }
-                let text = line
-                    .trim()
-                    .trim_start_matches('*')
-                    .trim()
-                    .trim_end_matches("*/")
-                    .trim();
-                if let Some(parameter) = text.strip_prefix("@param").map(str::trim) {
-                    if let Some(parameter) = parameter.split_whitespace().next() {
-                        parameters.push(parameter.to_owned());
+    fn emit_jsdoc_callback_comment(&mut self, comment: &str) -> bool {
+        let Some(tag) = comment
+            .lines()
+            .map(Self::jsdoc_tag_line)
+            .find_map(|line| line.strip_prefix("@callback").map(str::trim))
+        else {
+            return false;
+        };
+        let Some(name) = tag.split_whitespace().next() else {
+            return false;
+        };
+        let parameters = comment
+            .lines()
+            .flat_map(|line| {
+                line.match_indices("@param")
+                    .map(move |(start, _)| &line[start..])
+            })
+            .filter_map(|tag| Self::jsdoc_overload_parameter(Self::jsdoc_tag_line(tag)))
+            .collect::<Vec<_>>();
+        let return_type = comment
+            .lines()
+            .find_map(|line| {
+                line.find("@returns")
+                    .or_else(|| line.find("@return"))
+                    .and_then(|start| Self::jsdoc_return_type(Self::jsdoc_tag_line(&line[start..])))
+            })
+            .unwrap_or_else(|| "any".to_owned());
+        if self.module_file {
+            self.writer.write("export ");
+        }
+        self.writer.write("type ");
+        self.writer.write(name);
+        self.writer.write(" = (");
+        for (index, parameter) in parameters.iter().enumerate() {
+            if index != 0 {
+                self.writer.write(", ");
+            }
+            let name = parameter
+                .name
+                .chars()
+                .enumerate()
+                .map(|(index, character)| {
+                    if character == '_'
+                        || character == '$'
+                        || (index == 0 && character.is_alphabetic())
+                        || (index != 0 && character.is_alphanumeric())
+                    {
+                        character
+                    } else {
+                        '_'
                     }
-                } else if text.starts_with('@') {
-                    break;
-                } else if !text.is_empty() {
-                    description.push(text.to_owned());
-                }
-            }
-            callbacks.push((name.to_owned(), signature, description, parameters));
-        }
-        for (name, signature, description, parameters) in callbacks {
-            self.writer.write("/**");
-            self.writer.newline();
-            self.writer.write(" * ");
-            self.writer.write(&signature);
-            self.writer.newline();
-            for line in description {
-                self.writer.write(" *     ");
-                self.writer.write(&line);
-                self.writer.newline();
-            }
-            self.writer.write(" */");
-            self.writer.newline();
-            self.writer.write("type ");
+                })
+                .collect::<String>();
             self.writer.write(&name);
-            self.writer.write(" = (");
-            for (index, parameter) in parameters.iter().enumerate() {
-                if index != 0 {
-                    self.writer.write(", ");
-                }
-                self.writer.write(parameter);
-                self.writer.write(": any");
+            if parameter.optional {
+                self.writer.write("?");
             }
-            self.writer.write(") => any;");
-            self.writer.newline();
+            self.writer.write(": ");
+            self.emit_jsdoc_type_hint(&parameter.type_text);
         }
+        self.writer.write(") => ");
+        self.emit_jsdoc_type_hint(&return_type);
+        self.writer.write(";");
+        self.writer.newline();
+        true
     }
 
     fn emit_jsdoc_typedef_type(&mut self, type_text: &str) {
@@ -18813,11 +18839,11 @@ impl DeclarationPrinter<'_> {
             if !comment.contains("@typedef") {
                 continue;
             }
-            if let Some((_, property_type, optional)) = Self::jsdoc_property_tags(comment)
+            if let Some(property) = Self::jsdoc_property_tags(comment)
                 .into_iter()
-                .find(|(property, _, _)| property == name)
+                .find(|property| property.name == name)
             {
-                return Some((property_type, optional));
+                return Some((property.type_text, property.optional));
             }
         }
         None
@@ -26847,7 +26873,6 @@ fn is_es5_reserved_binding_name(text: &str) -> bool {
 struct Writer {
     output: String,
     indent: usize,
-    use_tabs: bool,
     line_start: bool,
     line: u32,
     column: u32,
@@ -26861,18 +26886,15 @@ impl Writer {
     fn write(&mut self, text: &str) {
         if self.line_start {
             for _ in 0..self.indent {
-                if self.use_tabs {
-                    self.output.push('\t');
-                    self.column += 1;
-                } else {
-                    self.output.push_str("    ");
-                    self.column += 4;
-                }
+                self.output.push_str("    ");
+                self.column += 4;
             }
             self.line_start = false;
         }
         self.output.push_str(text);
-        self.column += u32::try_from(text.len()).unwrap_or(u32::MAX);
+        self.column = self
+            .column
+            .saturating_add(u32::try_from(text.encode_utf16().count()).unwrap_or(u32::MAX));
     }
 
     fn write_comment_continuation(&mut self, text: &str, source_comment_column: usize) {
@@ -26909,7 +26931,9 @@ impl Writer {
             return false;
         }
         self.output.pop();
-        self.column = self.column.saturating_sub(1);
+        self.column = self
+            .column
+            .saturating_sub(u32::try_from(character.len_utf16()).unwrap_or(u32::MAX));
         true
     }
 
@@ -26930,7 +26954,9 @@ impl Writer {
         self.column = u32::try_from(
             self.output
                 .rsplit_once('\n')
-                .map_or(self.output.len(), |(_, line)| line.len()),
+                .map_or(self.output.as_str(), |(_, line)| line)
+                .encode_utf16()
+                .count(),
         )
         .unwrap_or(u32::MAX);
     }
@@ -39259,6 +39285,7 @@ impl Printer<'_> {
                     None,
                     &mut emitted,
                     true,
+                    None,
                 )?;
             }
             if !emitted {
@@ -39301,18 +39328,20 @@ impl Printer<'_> {
         initializer: Option<NodeId>,
         emitted: &mut bool,
         inline_single_leaf_nested: bool,
+        target_container: Option<&str>,
     ) -> Result<(), EmitError> {
         let name_node = self.node(name)?.clone();
         if let Some(initializer) = initializer
             && matches!(name_node.data, NodeData::Identifier(_))
         {
             let temp = self.generated_names.generate_temp();
-            self.emit_downlevel_declarator_start(emitted);
+            self.start_downlevel_binding_temporary(emitted, target_container);
             self.writer.write(&temp);
             self.writer.write(" = ");
             self.emit_downlevel_binding_value(&value)?;
+            self.finish_downlevel_binding_temporary(emitted, target_container);
             self.emit_downlevel_declarator_start(emitted);
-            self.emit_expression(name, 0)?;
+            self.emit_downlevel_binding_target(name, target_container)?;
             self.writer.write(" = ");
             self.writer.write(&temp);
             self.writer.write(" === void 0 ? ");
@@ -39326,14 +39355,15 @@ impl Printer<'_> {
                 temp.clone()
             } else {
                 let temp = self.generated_names.generate_temp();
-                self.emit_downlevel_declarator_start(emitted);
+                self.start_downlevel_binding_temporary(emitted, target_container);
                 self.writer.write(&temp);
                 self.writer.write(" = ");
                 self.emit_downlevel_binding_value(&value)?;
+                self.finish_downlevel_binding_temporary(emitted, target_container);
                 temp
             };
             let defaulted = self.generated_names.generate_temp();
-            self.emit_downlevel_declarator_start(emitted);
+            self.start_downlevel_binding_temporary(emitted, target_container);
             self.writer.write(&defaulted);
             self.writer.write(" = ");
             self.writer.write(&temp);
@@ -39341,6 +39371,7 @@ impl Printer<'_> {
             self.emit_expression(initializer, 2)?;
             self.writer.write(" : ");
             self.writer.write(&temp);
+            self.finish_downlevel_binding_temporary(emitted, target_container);
             DownlevelBindingValue::Name(defaulted)
         } else {
             value
@@ -39353,7 +39384,7 @@ impl Printer<'_> {
                 if let Some(exported) = system_export.as_deref() {
                     self.emit_system_export_call_start(exported);
                 }
-                self.emit_expression(name, 0)?;
+                self.emit_downlevel_binding_target(name, target_container)?;
                 self.writer.write(" = ");
                 self.emit_downlevel_binding_value(&value)?;
                 if system_export.is_some() {
@@ -39396,10 +39427,11 @@ impl Printer<'_> {
                                 && self.binding_pattern_value_needs_temp(element_name)))
                     {
                         let temp = self.generated_names.generate_temp();
-                        self.emit_downlevel_declarator_start(emitted);
+                        self.start_downlevel_binding_temporary(emitted, target_container);
                         self.writer.write(&temp);
                         self.writer.write(" = ");
                         self.emit_downlevel_binding_value(&element_value)?;
+                        self.finish_downlevel_binding_temporary(emitted, target_container);
                         element_value = DownlevelBindingValue::Name(temp);
                     }
                     self.emit_downlevel_binding_declarators(
@@ -39408,6 +39440,7 @@ impl Printer<'_> {
                         element.initializer,
                         emitted,
                         inline_single_leaf_nested,
+                        target_container,
                     )?;
                     previous_end = element_node.range.end.get();
                 }
@@ -39421,6 +39454,7 @@ impl Printer<'_> {
                         &value,
                         emitted,
                         inline_single_leaf_nested,
+                        target_container,
                     )?;
                 }
             }
@@ -39435,6 +39469,7 @@ impl Printer<'_> {
         value: &DownlevelBindingValue,
         emitted: &mut bool,
         inline_single_leaf_nested: bool,
+        target_container: Option<&str>,
     ) -> Result<(), EmitError> {
         let element_node = self.node(element_id)?.clone();
         let NodeData::BindingElement(element) = &element_node.data else {
@@ -39447,7 +39482,7 @@ impl Printer<'_> {
             return Err(Self::unsupported(element_id, element_node.kind));
         }
         let property = element.property_name.unwrap_or(element_name);
-        let index = self.downlevel_binding_property_index(property, emitted)?;
+        let index = self.downlevel_binding_property_index(property, emitted, target_container)?;
         let mut element_value = DownlevelBindingValue::Element(Box::new(value.clone()), index);
         if element.initializer.is_none()
             && matches!(
@@ -39457,10 +39492,11 @@ impl Printer<'_> {
             && self.binding_pattern_value_needs_temp(element_name)
         {
             let temp = self.generated_names.generate_temp();
-            self.emit_downlevel_declarator_start(emitted);
+            self.start_downlevel_binding_temporary(emitted, target_container);
             self.writer.write(&temp);
             self.writer.write(" = ");
             self.emit_downlevel_binding_value(&element_value)?;
+            self.finish_downlevel_binding_temporary(emitted, target_container);
             element_value = DownlevelBindingValue::Name(temp);
         }
         self.emit_downlevel_binding_declarators(
@@ -39469,7 +39505,52 @@ impl Printer<'_> {
             element.initializer,
             emitted,
             inline_single_leaf_nested,
+            target_container,
         )
+    }
+
+    fn emit_downlevel_binding_target(
+        &mut self,
+        name: NodeId,
+        target_container: Option<&str>,
+    ) -> Result<(), EmitError> {
+        if let Some(container) = target_container
+            && let Some(identifier) = declaration_name_text(self.arena, name)
+        {
+            self.writer.write(container);
+            self.writer.write(".");
+            self.write_source_identifier(name, identifier);
+            return Ok(());
+        }
+        self.emit_expression(name, 0)
+    }
+
+    fn start_downlevel_binding_temporary(
+        &mut self,
+        emitted: &mut bool,
+        target_container: Option<&str>,
+    ) {
+        if target_container.is_some() {
+            if *emitted {
+                self.writer.write(";");
+                self.writer.newline();
+            }
+            self.writer.write("var ");
+        } else {
+            self.emit_downlevel_declarator_start(emitted);
+        }
+    }
+
+    fn finish_downlevel_binding_temporary(
+        &mut self,
+        emitted: &mut bool,
+        target_container: Option<&str>,
+    ) {
+        if target_container.is_some() {
+            self.writer.write(";");
+            self.writer.newline();
+            *emitted = false;
+        }
     }
 
     fn array_binding_comma_count(&self, start: u32, end: u32) -> usize {
@@ -43140,6 +43221,7 @@ impl Printer<'_> {
                     },
                     &mut emitted,
                     true,
+                    None,
                 )?;
                 self.writer.write(";");
                 self.writer.newline();
@@ -53445,6 +53527,7 @@ impl Printer<'_> {
                 None,
                 &mut emitted,
                 true,
+                None,
             )?;
             self.writer.write(";");
             self.writer.newline();
@@ -53899,6 +53982,7 @@ impl Printer<'_> {
                     None,
                     &mut emitted,
                     false,
+                    None,
                 )?;
                 if !emitted {
                     let temp = self.generated_names.generate_temp();
@@ -54230,6 +54314,7 @@ impl Printer<'_> {
                     &ordinary_value,
                     emitted,
                     false,
+                    None,
                 )?;
             }
         } else {
@@ -54345,7 +54430,7 @@ impl Printer<'_> {
                 continue;
             };
             let property = element.property_name.unwrap_or(element_name);
-            let index = self.downlevel_binding_property_index(property, emitted)?;
+            let index = self.downlevel_binding_property_index(property, emitted, None)?;
             let nested_value = DownlevelBindingValue::Element(Box::new(initializer.clone()), index);
             let temp = self.object_rest_scoped_temp(element_name);
             self.emit_downlevel_declarator_start(emitted);
@@ -54365,15 +54450,17 @@ impl Printer<'_> {
         &mut self,
         property: NodeId,
         emitted: &mut bool,
+        target_container: Option<&str>,
     ) -> Result<DownlevelBindingIndex, EmitError> {
         match &self.node(property)?.data {
             NodeData::ComputedPropertyName(computed) => {
                 let expression = computed.expression;
                 let temp = self.generated_names.generate_temp();
-                self.emit_downlevel_declarator_start(emitted);
+                self.start_downlevel_binding_temporary(emitted, target_container);
                 self.writer.write(&temp);
                 self.writer.write(" = ");
                 self.emit_expression(expression, 1)?;
+                self.finish_downlevel_binding_temporary(emitted, target_container);
                 Ok(DownlevelBindingIndex::Name(temp))
             }
             NodeData::Identifier(identifier) => {
@@ -65248,6 +65335,7 @@ impl Printer<'_> {
                         None,
                         &mut emitted,
                         false,
+                        None,
                     )?;
                 } else {
                     let exported_bindings = std::mem::take(&mut self.system_exported_bindings);
@@ -65257,6 +65345,7 @@ impl Printer<'_> {
                         None,
                         &mut emitted,
                         false,
+                        None,
                     );
                     self.system_exported_bindings = exported_bindings;
                     result?;
@@ -65406,6 +65495,21 @@ impl Printer<'_> {
             Some(NodeData::BindingPattern(_))
         ) {
             self.install_commonjs_binding_rewrites(declaration.name);
+            if self.settings.target >= ScriptTarget::Es2015 {
+                let object_pattern =
+                    self.node(declaration.name)?.kind == SyntaxKind::ObjectBindingPattern;
+                if object_pattern {
+                    self.writer.write("(");
+                }
+                self.emit_exported_binding_assignment_pattern(declaration.name, "exports")?;
+                self.writer.write(" = ");
+                self.emit_expression(initializer, 1)?;
+                if object_pattern {
+                    self.writer.write(")");
+                }
+                self.writer.write(";");
+                return Ok(true);
+            }
             let reusable_initializer = !self.binding_pattern_value_needs_temp(declaration.name)
                 || matches!(
                     &self.node(initializer)?.data,
@@ -65425,6 +65529,9 @@ impl Printer<'_> {
                 self.writer.write(&temp);
                 self.writer.write(" = ");
                 self.emit_expression(initializer, 1)?;
+                self.writer.write(";");
+                self.writer.newline();
+                emitted = false;
                 DownlevelBindingValue::Name(temp)
             };
             self.emit_downlevel_binding_declarators(
@@ -65433,6 +65540,7 @@ impl Printer<'_> {
                 None,
                 &mut emitted,
                 false,
+                Some("exports"),
             )?;
             self.writer.write(";");
             return Ok(true);
@@ -65464,6 +65572,69 @@ impl Printer<'_> {
         Ok(true)
     }
 
+    fn emit_exported_binding_assignment_pattern(
+        &mut self,
+        name: NodeId,
+        container: &str,
+    ) -> Result<(), EmitError> {
+        let node = self.node(name)?.clone();
+        match &node.data {
+            NodeData::Identifier(_) => self.emit_downlevel_binding_target(name, Some(container)),
+            NodeData::BindingPattern(pattern) => {
+                let object = node.kind == SyntaxKind::ObjectBindingPattern;
+                self.writer.write(if object { "{" } else { "[" });
+                if object && !pattern.elements.nodes.is_empty() {
+                    self.writer.write(" ");
+                }
+                for (index, element_id) in pattern.elements.nodes.iter().enumerate() {
+                    if index != 0 {
+                        self.writer.write(", ");
+                    }
+                    let element_node = self.node(*element_id)?.clone();
+                    if matches!(element_node.data, NodeData::OmittedExpression(_)) {
+                        continue;
+                    }
+                    let NodeData::BindingElement(element) = &element_node.data else {
+                        return Err(Self::unsupported(*element_id, element_node.kind));
+                    };
+                    let Some(element_name) = element.name else {
+                        continue;
+                    };
+                    if element.dot_dot_dot_token.is_some() {
+                        self.writer.write("...");
+                    } else if object {
+                        let property = element.property_name.unwrap_or(element_name);
+                        if let Some(identifier) = declaration_name_text(self.arena, property)
+                            && matches!(
+                                self.arena.get(property).map(|node| &node.data),
+                                Some(NodeData::Identifier(_))
+                            )
+                        {
+                            self.write_source_identifier(property, identifier);
+                        } else {
+                            self.emit_expression(property, 0)?;
+                        }
+                        self.writer.write(": ");
+                    }
+                    self.emit_exported_binding_assignment_pattern(element_name, container)?;
+                    if let Some(initializer) = element.initializer {
+                        self.writer.write(" = ");
+                        self.emit_expression(initializer, 1)?;
+                    }
+                }
+                if pattern.elements.has_trailing_comma {
+                    self.writer.write(",");
+                }
+                if object && !pattern.elements.nodes.is_empty() {
+                    self.writer.write(" ");
+                }
+                self.writer.write(if object { "}" } else { "]" });
+                Ok(())
+            }
+            _ => Err(Self::unsupported(name, node.kind)),
+        }
+    }
+
     fn single_object_binding_element(&self, pattern: NodeId) -> Option<(NodeId, NodeId, NodeId)> {
         let node = self.arena.get(pattern)?;
         if node.kind != SyntaxKind::ObjectBindingPattern {
@@ -65478,6 +65649,9 @@ impl Printer<'_> {
         let NodeData::BindingElement(element) = &self.arena.get(*element_id)?.data else {
             return None;
         };
+        if element.initializer.is_some() || element.dot_dot_dot_token.is_some() {
+            return None;
+        }
         let name = element.name?;
         matches!(
             self.arena.get(name).map(|node| &node.data),
@@ -65570,7 +65744,14 @@ impl Printer<'_> {
             } else {
                 DownlevelBindingValue::Node(initializer)
             };
-            self.emit_downlevel_binding_declarators(name, value, None, &mut emitted, false)?;
+            self.emit_downlevel_binding_declarators(
+                name,
+                value,
+                None,
+                &mut emitted,
+                false,
+                Some(&container),
+            )?;
             self.writer.write(";");
             return Ok(true);
         }
@@ -70802,7 +70983,7 @@ impl Printer<'_> {
         let node = self.node(child)?.clone();
         match &node.data {
             NodeData::JsxText(text) => {
-                write_quoted(&mut self.writer, &normalize_jsx_text(&text.text));
+                write_jsx_quoted_with(&mut self.writer, &normalize_jsx_text(&text.text), '"');
             }
             NodeData::JsxExpression(expression) => {
                 if let Some(expression) = expression.expression {
@@ -71141,7 +71322,7 @@ impl Printer<'_> {
             .and_then(|raw| raw.chars().next())
             .filter(|quote| matches!(quote, '\'' | '"'))
             .unwrap_or('"');
-        write_quoted_with(&mut self.writer, text, quote);
+        write_jsx_quoted_with(&mut self.writer, &decode_jsx_entities(text), quote);
     }
 
     fn jsx_namespaced_name_text(&self, name: NodeId) -> Option<String> {
@@ -71160,7 +71341,7 @@ impl Printer<'_> {
         match &node.data {
             NodeData::JsxText(text) if preserve => self.writer.write(&text.text),
             NodeData::JsxText(text) => {
-                write_quoted(&mut self.writer, &normalize_jsx_text(&text.text));
+                write_jsx_quoted_with(&mut self.writer, &normalize_jsx_text(&text.text), '"');
             }
             NodeData::JsxExpression(expression) if preserve => {
                 self.writer.write("{");
@@ -75121,7 +75302,7 @@ fn conflict_marker_trivia_end(source: &str, start: usize) -> Option<usize> {
 
 fn normalize_jsx_text(text: &str) -> String {
     if !text.contains(['\n', '\r']) {
-        return text.to_owned();
+        return decode_jsx_entities(text);
     }
     let lines = text.split('\n').collect::<Vec<_>>();
     let last = lines.len().saturating_sub(1);
@@ -75139,8 +75320,311 @@ fn normalize_jsx_text(text: &str) -> String {
             }
         })
         .filter(|line| !line.is_empty())
+        .map(decode_jsx_entities)
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn decode_jsx_entities(text: &str) -> String {
+    let mut decoded = String::with_capacity(text.len());
+    let mut remaining = text;
+    while let Some(start) = remaining.find('&') {
+        decoded.push_str(&remaining[..start]);
+        remaining = &remaining[start..];
+        let Some(end) = remaining.find(';') else {
+            break;
+        };
+        let entity = &remaining[1..end];
+        if entity.contains('&') {
+            decoded.push('&');
+            remaining = &remaining[1..];
+            continue;
+        }
+        let value = if let Some(number) = entity.strip_prefix('#') {
+            let (digits, radix) = number
+                .strip_prefix('x')
+                .map_or((number, 10), |digits| (digits, 16));
+            (!digits.is_empty())
+                .then(|| u32::from_str_radix(digits, radix).ok())
+                .flatten()
+        } else {
+            jsx_named_entity_value(entity)
+        };
+        if let Some(character) = value.and_then(char::from_u32) {
+            decoded.push(character);
+        } else if let Some(unit) = value
+            .filter(|value| (0xd800..=0xdfff).contains(value))
+            .and_then(|value| u16::try_from(value).ok())
+        {
+            let mut string = ts_ast::decode_js_string("");
+            string.push_unit(unit);
+            decoded.push_str(&ts_ast::encode_js_string(&string));
+        } else {
+            decoded.push_str(&remaining[..=end]);
+        }
+        remaining = &remaining[end + 1..];
+    }
+    decoded.push_str(remaining);
+    decoded
+}
+
+fn jsx_named_entity_value(entity: &str) -> Option<u32> {
+    Some(match entity {
+        "quot" => 0x0022,
+        "amp" => 0x0026,
+        "apos" => 0x0027,
+        "lt" => 0x003c,
+        "gt" => 0x003e,
+        "nbsp" => 0x00a0,
+        "iexcl" => 0x00a1,
+        "cent" => 0x00a2,
+        "pound" => 0x00a3,
+        "curren" => 0x00a4,
+        "yen" => 0x00a5,
+        "brvbar" => 0x00a6,
+        "sect" => 0x00a7,
+        "uml" => 0x00a8,
+        "copy" => 0x00a9,
+        "ordf" => 0x00aa,
+        "laquo" => 0x00ab,
+        "not" => 0x00ac,
+        "shy" => 0x00ad,
+        "reg" => 0x00ae,
+        "macr" => 0x00af,
+        "deg" => 0x00b0,
+        "plusmn" => 0x00b1,
+        "sup2" => 0x00b2,
+        "sup3" => 0x00b3,
+        "acute" => 0x00b4,
+        "micro" => 0x00b5,
+        "para" => 0x00b6,
+        "middot" => 0x00b7,
+        "cedil" => 0x00b8,
+        "sup1" => 0x00b9,
+        "ordm" => 0x00ba,
+        "raquo" => 0x00bb,
+        "frac14" => 0x00bc,
+        "frac12" => 0x00bd,
+        "frac34" => 0x00be,
+        "iquest" => 0x00bf,
+        "Agrave" => 0x00c0,
+        "Aacute" => 0x00c1,
+        "Acirc" => 0x00c2,
+        "Atilde" => 0x00c3,
+        "Auml" => 0x00c4,
+        "Aring" => 0x00c5,
+        "AElig" => 0x00c6,
+        "Ccedil" => 0x00c7,
+        "Egrave" => 0x00c8,
+        "Eacute" => 0x00c9,
+        "Ecirc" => 0x00ca,
+        "Euml" => 0x00cb,
+        "Igrave" => 0x00cc,
+        "Iacute" => 0x00cd,
+        "Icirc" => 0x00ce,
+        "Iuml" => 0x00cf,
+        "ETH" => 0x00d0,
+        "Ntilde" => 0x00d1,
+        "Ograve" => 0x00d2,
+        "Oacute" => 0x00d3,
+        "Ocirc" => 0x00d4,
+        "Otilde" => 0x00d5,
+        "Ouml" => 0x00d6,
+        "times" => 0x00d7,
+        "Oslash" => 0x00d8,
+        "Ugrave" => 0x00d9,
+        "Uacute" => 0x00da,
+        "Ucirc" => 0x00db,
+        "Uuml" => 0x00dc,
+        "Yacute" => 0x00dd,
+        "THORN" => 0x00de,
+        "szlig" => 0x00df,
+        "agrave" => 0x00e0,
+        "aacute" => 0x00e1,
+        "acirc" => 0x00e2,
+        "atilde" => 0x00e3,
+        "auml" => 0x00e4,
+        "aring" => 0x00e5,
+        "aelig" => 0x00e6,
+        "ccedil" => 0x00e7,
+        "egrave" => 0x00e8,
+        "eacute" => 0x00e9,
+        "ecirc" => 0x00ea,
+        "euml" => 0x00eb,
+        "igrave" => 0x00ec,
+        "iacute" => 0x00ed,
+        "icirc" => 0x00ee,
+        "iuml" => 0x00ef,
+        "eth" => 0x00f0,
+        "ntilde" => 0x00f1,
+        "ograve" => 0x00f2,
+        "oacute" => 0x00f3,
+        "ocirc" => 0x00f4,
+        "otilde" => 0x00f5,
+        "ouml" => 0x00f6,
+        "divide" => 0x00f7,
+        "oslash" => 0x00f8,
+        "ugrave" => 0x00f9,
+        "uacute" => 0x00fa,
+        "ucirc" => 0x00fb,
+        "uuml" => 0x00fc,
+        "yacute" => 0x00fd,
+        "thorn" => 0x00fe,
+        "yuml" => 0x00ff,
+        "OElig" => 0x0152,
+        "oelig" => 0x0153,
+        "Scaron" => 0x0160,
+        "scaron" => 0x0161,
+        "Yuml" => 0x0178,
+        "fnof" => 0x0192,
+        "circ" => 0x02c6,
+        "tilde" => 0x02dc,
+        "Alpha" => 0x0391,
+        "Beta" => 0x0392,
+        "Gamma" => 0x0393,
+        "Delta" => 0x0394,
+        "Epsilon" => 0x0395,
+        "Zeta" => 0x0396,
+        "Eta" => 0x0397,
+        "Theta" => 0x0398,
+        "Iota" => 0x0399,
+        "Kappa" => 0x039a,
+        "Lambda" => 0x039b,
+        "Mu" => 0x039c,
+        "Nu" => 0x039d,
+        "Xi" => 0x039e,
+        "Omicron" => 0x039f,
+        "Pi" => 0x03a0,
+        "Rho" => 0x03a1,
+        "Sigma" => 0x03a3,
+        "Tau" => 0x03a4,
+        "Upsilon" => 0x03a5,
+        "Phi" => 0x03a6,
+        "Chi" => 0x03a7,
+        "Psi" => 0x03a8,
+        "Omega" => 0x03a9,
+        "alpha" => 0x03b1,
+        "beta" => 0x03b2,
+        "gamma" => 0x03b3,
+        "delta" => 0x03b4,
+        "epsilon" => 0x03b5,
+        "zeta" => 0x03b6,
+        "eta" => 0x03b7,
+        "theta" => 0x03b8,
+        "iota" => 0x03b9,
+        "kappa" => 0x03ba,
+        "lambda" => 0x03bb,
+        "mu" => 0x03bc,
+        "nu" => 0x03bd,
+        "xi" => 0x03be,
+        "omicron" => 0x03bf,
+        "pi" => 0x03c0,
+        "rho" => 0x03c1,
+        "sigmaf" => 0x03c2,
+        "sigma" => 0x03c3,
+        "tau" => 0x03c4,
+        "upsilon" => 0x03c5,
+        "phi" => 0x03c6,
+        "chi" => 0x03c7,
+        "psi" => 0x03c8,
+        "omega" => 0x03c9,
+        "thetasym" => 0x03d1,
+        "upsih" => 0x03d2,
+        "piv" => 0x03d6,
+        "ensp" => 0x2002,
+        "emsp" => 0x2003,
+        "thinsp" => 0x2009,
+        "zwnj" => 0x200c,
+        "zwj" => 0x200d,
+        "lrm" => 0x200e,
+        "rlm" => 0x200f,
+        "ndash" => 0x2013,
+        "mdash" => 0x2014,
+        "lsquo" => 0x2018,
+        "rsquo" => 0x2019,
+        "sbquo" => 0x201a,
+        "ldquo" => 0x201c,
+        "rdquo" => 0x201d,
+        "bdquo" => 0x201e,
+        "dagger" => 0x2020,
+        "Dagger" => 0x2021,
+        "bull" => 0x2022,
+        "hellip" => 0x2026,
+        "permil" => 0x2030,
+        "prime" => 0x2032,
+        "Prime" => 0x2033,
+        "lsaquo" => 0x2039,
+        "rsaquo" => 0x203a,
+        "oline" => 0x203e,
+        "frasl" => 0x2044,
+        "euro" => 0x20ac,
+        "image" => 0x2111,
+        "weierp" => 0x2118,
+        "real" => 0x211c,
+        "trade" => 0x2122,
+        "alefsym" => 0x2135,
+        "larr" => 0x2190,
+        "uarr" => 0x2191,
+        "rarr" => 0x2192,
+        "darr" => 0x2193,
+        "harr" => 0x2194,
+        "crarr" => 0x21b5,
+        "lArr" => 0x21d0,
+        "uArr" => 0x21d1,
+        "rArr" => 0x21d2,
+        "dArr" => 0x21d3,
+        "hArr" => 0x21d4,
+        "forall" => 0x2200,
+        "part" => 0x2202,
+        "exist" => 0x2203,
+        "empty" => 0x2205,
+        "nabla" => 0x2207,
+        "isin" => 0x2208,
+        "notin" => 0x2209,
+        "ni" => 0x220b,
+        "prod" => 0x220f,
+        "sum" => 0x2211,
+        "minus" => 0x2212,
+        "lowast" => 0x2217,
+        "radic" => 0x221a,
+        "prop" => 0x221d,
+        "infin" => 0x221e,
+        "ang" => 0x2220,
+        "and" => 0x2227,
+        "or" => 0x2228,
+        "cap" => 0x2229,
+        "cup" => 0x222a,
+        "int" => 0x222b,
+        "there4" => 0x2234,
+        "sim" => 0x223c,
+        "cong" => 0x2245,
+        "asymp" => 0x2248,
+        "ne" => 0x2260,
+        "equiv" => 0x2261,
+        "le" => 0x2264,
+        "ge" => 0x2265,
+        "sub" => 0x2282,
+        "sup" => 0x2283,
+        "nsub" => 0x2284,
+        "sube" => 0x2286,
+        "supe" => 0x2287,
+        "oplus" => 0x2295,
+        "otimes" => 0x2297,
+        "perp" => 0x22a5,
+        "sdot" => 0x22c5,
+        "lceil" => 0x2308,
+        "rceil" => 0x2309,
+        "lfloor" => 0x230a,
+        "rfloor" => 0x230b,
+        "lang" => 0x2329,
+        "rang" => 0x232a,
+        "loz" => 0x25ca,
+        "spades" => 0x2660,
+        "clubs" => 0x2663,
+        "hearts" => 0x2665,
+        "diams" => 0x2666,
+        _ => return None,
+    })
 }
 
 fn generated_temp_name(count: u32) -> Option<String> {
@@ -75292,20 +75776,56 @@ fn write_quoted(writer: &mut Writer, text: &str) {
     write_quoted_with(writer, text, '"');
 }
 
+fn write_jsx_quoted_with(writer: &mut Writer, text: &str, quote: char) {
+    let mut literal = Writer::default();
+    write_quoted_with(&mut literal, text, quote);
+    for character in literal.output.chars() {
+        if character.is_ascii() {
+            writer.write(&character.to_string());
+        } else {
+            let mut units = [0; 2];
+            for unit in character.encode_utf16(&mut units) {
+                writer.write(&format!("\\u{unit:04X}"));
+            }
+        }
+    }
+}
+
 fn write_quoted_with(writer: &mut Writer, text: &str, quote: char) {
     writer.write(&quote.to_string());
-    for ch in text.chars() {
-        match ch {
-            '\\' => writer.write("\\\\"),
-            ch if ch == quote => {
-                writer.write("\\");
-                writer.write(&ch.to_string());
+    let decoded = ts_ast::decode_js_string(text);
+    let mut characters = char::decode_utf16(decoded.as_units().iter().copied()).peekable();
+    while let Some(character) = characters.next() {
+        let character = match character {
+            Ok(character) => character,
+            Err(surrogate) => {
+                writer.write(&format!("\\u{:04X}", surrogate.unpaired_surrogate()));
+                continue;
             }
+        };
+        match character {
+            '\\' => writer.write("\\\\"),
+            character if character == quote => {
+                writer.write("\\");
+                writer.write(&character.to_string());
+            }
+            '\0' if matches!(characters.peek(), Some(Ok(next)) if next.is_ascii_digit()) => {
+                writer.write("\\x00");
+            }
+            '\0' => writer.write("\\0"),
             '\n' => writer.write("\\n"),
             '\r' => writer.write("\\r"),
             '\t' => writer.write("\\t"),
-            ch if ch.is_control() => writer.write(&format!("\\u{:04x}", u32::from(ch))),
-            ch => writer.write(&ch.to_string()),
+            '\u{000b}' => writer.write("\\v"),
+            '\u{000c}' => writer.write("\\f"),
+            '\u{0008}' => writer.write("\\b"),
+            character
+                if character.is_control()
+                    || matches!(character, '\u{0085}' | '\u{2028}' | '\u{2029}') =>
+            {
+                writer.write(&format!("\\u{:04X}", u32::from(character)));
+            }
+            character => writer.write(&character.to_string()),
         }
     }
     writer.write(&quote.to_string());
@@ -78297,6 +78817,39 @@ mod tests {
         assert_eq!(
             emit_jsx("const view = <Panel />;", JsxEmit::None),
             "const view = <Panel />;\n"
+        );
+    }
+
+    #[test]
+    fn jsx_transforms_decode_named_and_numeric_entities() {
+        assert_eq!(
+            super::decode_jsx_entities("&alpha;&rarr;&ne;&hearts;"),
+            "α→≠♥"
+        );
+        let source = concat!(
+            "const view = <p title=\"a &amp; b\">",
+            "&lt;&gt;&amp;&quot;&apos;&nbsp; &#65; &#x1F600; &unknown;",
+            "</p>;",
+        );
+        assert_eq!(emit_jsx(source, JsxEmit::Preserve), format!("{source}\n"));
+        assert_eq!(
+            emit_jsx(source, JsxEmit::React),
+            concat!(
+                "const view = React.createElement(\"p\", { title: \"a & b\" }, ",
+                "\"<>&\\\"'\\u00A0 A \\uD83D\\uDE00 &unknown;\");\n",
+            )
+        );
+        assert_eq!(
+            emit_jsx(source, JsxEmit::ReactJsx),
+            concat!(
+                "import { jsx as _jsx } from \"react/jsx-runtime\";\n",
+                "const view = _jsx(\"p\", { title: \"a & b\", children: ",
+                "\"<>&\\\"'\\u00A0 A \\uD83D\\uDE00 &unknown;\" });\n",
+            )
+        );
+        assert!(
+            emit_jsx("const value = <p>&#xD800;</p>;", JsxEmit::ReactJsx)
+                .contains("children: \"\\uD800\""),
         );
     }
 
@@ -85767,6 +86320,64 @@ class Board {
     }
 
     #[test]
+    fn commonjs_destructured_exports_assign_exported_bindings() {
+        for (source, expected) in [
+            (
+                "export const { a, b: renamed } = { a: 1, b: 2 };",
+                "({ a: exports.a, b: exports.renamed } = { a: 1, b: 2 });",
+            ),
+            (
+                "export const [first, second] = [1, 2];",
+                "[exports.first, exports.second] = [1, 2];",
+            ),
+            (
+                "export const { item: { x, y } } = { item: { x: 1, y: 2 } };",
+                "({ item: { x: exports.x, y: exports.y } } = { item: { x: 1, y: 2 } });",
+            ),
+            (
+                "export const { a = 1, b: renamed = 2 } = {} as any;",
+                "({ a: exports.a = 1, b: exports.renamed = 2 } = {});",
+            ),
+        ] {
+            let output = emit_with(source, ScriptTarget::Es2015, ModuleKind::CommonJs).code;
+            assert!(output.contains(expected), "{source}\n{output}");
+        }
+    }
+
+    #[test]
+    fn downlevel_commonjs_destructured_exports_declare_generated_temporaries() {
+        for source in [
+            "export const { item: { x, y } } = { item: { x: 1, y: 2 } };",
+            "export const { a = 1, b: renamed = 2 } = {} as any;",
+            "const key = 'x'; export const { [key]: value, y } = { x: 1, y: 2 };",
+        ] {
+            let output = emit_with(source, ScriptTarget::Es5, ModuleKind::CommonJs).code;
+            assert!(output.contains("var _a ="), "{source}\n{output}");
+            assert!(
+                output
+                    .lines()
+                    .filter(|line| line.starts_with("var "))
+                    .all(|line| !line.contains(", exports.")),
+                "{source}\n{output}"
+            );
+        }
+    }
+
+    #[test]
+    fn namespace_destructured_exports_assign_namespace_members() {
+        let output = emit_with(
+            "namespace N { export const { a, b: renamed } = { a: 1, b: 2 }; } N.a;",
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            output.contains("_a = { a: 1, b: 2 }, N.a = _a.a, N.renamed = _a.b;"),
+            "{output}"
+        );
+    }
+
+    #[test]
     fn emits_commonjs_export_equals_after_runtime_declarations() {
         let source = "export = B;\nexport class C {\n}\n";
         assert_eq!(
@@ -85882,6 +86493,15 @@ class Board {
     #[test]
     fn source_map_columns_use_utf16_code_units() {
         assert_eq!(original_position("😀 value", &[0], 5), (0, 3));
+
+        let mut writer = super::Writer::default();
+        writer.write("😀");
+        assert_eq!(writer.position(), (0, 2));
+        writer.newline();
+        writer.remove_trailing_newline();
+        assert_eq!(writer.position(), (0, 2));
+        assert!(writer.remove_trailing_char('😀'));
+        assert_eq!(writer.position(), (0, 0));
     }
 
     #[test]
@@ -86166,6 +86786,25 @@ class Board {
     }
 
     #[test]
+    fn declaration_emit_escapes_unpaired_utf16_surrogates() {
+        let output = emit_declarations_with_semantics(concat!(
+            "export const paired = \"\\ud83d\\ude03\" as const;\n",
+            "export const high = \"\\ud83d\" as const;\n",
+            "export const low = \"\\ude03\" as const;\n",
+            "export const swapped = \"\\ude03\\ud83d\" as const;\n",
+        ));
+        assert_eq!(
+            output,
+            concat!(
+                "export declare const paired: \"😃\";\n",
+                "export declare const high: \"\\uD83D\";\n",
+                "export declare const low: \"\\uDE03\";\n",
+                "export declare const swapped: \"\\uDE03\\uD83D\";\n",
+            )
+        );
+    }
+
+    #[test]
     fn declaration_emit_merges_inaccessible_computed_class_names() {
         let output = emit_declarations_with_semantics(concat!(
             "export function make() { ",
@@ -86259,6 +86898,34 @@ class Board {
                 "};",
             )),
             "{output}"
+        );
+    }
+
+    #[test]
+    fn declaration_emit_nests_expando_namespaces_without_top_level_modifiers() {
+        let output = emit_declarations_with_semantics(concat!(
+            "namespace NS { export function f(): void {} f.a = ''; }\n",
+            "namespace Outer { export namespace Inner { ",
+            "export function g(): void {} g.b = 0; } }\n",
+        ));
+        assert_eq!(
+            output,
+            concat!(
+                "declare namespace NS {\n",
+                "    function f(): void;\n",
+                "    namespace f {\n",
+                "        var a: string;\n",
+                "    }\n",
+                "}\n",
+                "declare namespace Outer {\n",
+                "    namespace Inner {\n",
+                "        function g(): void;\n",
+                "        namespace g {\n",
+                "            var b: number;\n",
+                "        }\n",
+                "    }\n",
+                "}\n",
+            )
         );
     }
 
@@ -86737,6 +87404,91 @@ class Board {
             "{output}"
         );
         assert!(output.contains("export default _default;"), "{output}");
+    }
+
+    #[test]
+    fn javascript_emit_normalizes_tab_indentation_to_spaces() {
+        let output = emit_javascript_with(
+            "function test(value) {\n\t// retained\n\treturn value;\n}",
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert_eq!(
+            output,
+            "function test(value) {\n    // retained\n    return value;\n}\n"
+        );
+    }
+
+    #[test]
+    fn javascript_declaration_emit_preserves_jsdoc_typedef_properties_and_callbacks() {
+        let source = concat!(
+            "/**\n",
+            " * @typedef {Object} Props\n",
+            " * @property {string} label Label docs\n",
+            " * @property {string | null | undefined} [data-name] Data docs\n",
+            " */\n\n",
+            "/**\n",
+            " * @param {Props} props\n",
+            " * @returns {Props}\n",
+            " */\n",
+            "export function read(props) { return props; }\n\n",
+            "/**\n",
+            " * @callback Handler\n",
+            " * @param {Props} [props-like]\n",
+            " * @returns {Props}\n",
+            " */\n",
+        );
+        let output = emit_javascript_declarations_with_semantics(source);
+        assert_eq!(
+            output,
+            concat!(
+                "/**\n",
+                " * @typedef {Object} Props\n",
+                " * @property {string} label Label docs\n",
+                " * @property {string | null | undefined} [data-name] Data docs\n",
+                " */\n",
+                "export type Props = {\n",
+                "    /**\n",
+                "     * Label docs\n",
+                "     */\n",
+                "    label: string;\n",
+                "    /**\n",
+                "     * Data docs\n",
+                "     */\n",
+                "    \"data-name\"?: string | null | undefined;\n",
+                "};\n",
+                "/**\n",
+                " * @param {Props} props\n",
+                " * @returns {Props}\n",
+                " */\n",
+                "export declare function read(props: Props): Props;\n",
+                "export type Handler = (props_like?: Props) => Props;\n",
+                "/**\n",
+                " * @callback Handler\n",
+                " * @param {Props} [props-like]\n",
+                " * @returns {Props}\n",
+                " */\n",
+            )
+        );
+    }
+
+    #[test]
+    fn javascript_declaration_emit_parses_single_line_jsdoc_callbacks() {
+        let source = concat!(
+            "/** @callback Handler @param {string} value @returns {number} */\n",
+            "/** @type {Handler} */\n",
+            "export const handler = value => value.length;\n",
+        );
+        let output = emit_javascript_declarations_with_semantics(source);
+        assert!(
+            output.starts_with(concat!(
+                "export type Handler = (value: string) => number;\n",
+                "/** @callback Handler @param {string} value @returns {number} */\n",
+                "/** @type {Handler} */\n",
+            )),
+            "{output}"
+        );
     }
 
     #[test]
