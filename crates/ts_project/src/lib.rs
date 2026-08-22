@@ -2,10 +2,11 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    io,
     path::Path,
 };
 
-use ts_compiler::{EmitOutput, Program, ProgramOptionsOverride};
+use ts_compiler::{EmitOutput, OutputFile, Program, ProgramOptionsOverride};
 use ts_config::{parse_config_file, resolve_config_file};
 use ts_core::TextRange;
 use ts_diagnostics::message_by_code;
@@ -13,8 +14,8 @@ use ts_incremental::{BuildDecision, BuildInfo, hash_text};
 use ts_path::{
     CaseSensitivity, canonicalize, change_extension, is_absolute, normalize_path, resolve_path,
 };
-use ts_printer::emit_declaration_file;
-use ts_vfs::FileSystem;
+use ts_printer::emit_declaration_file_with_semantics_and_options;
+use ts_vfs::{DirectoryEntries, FileSystem};
 
 /// A diagnostic produced while loading a project graph.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -57,6 +58,102 @@ pub struct BuildResult {
     pub skipped: Vec<String>,
 }
 
+struct BuildFileSystem<'a> {
+    backing: &'a dyn FileSystem,
+    outputs: BTreeMap<String, OutputFile>,
+}
+
+impl<'a> BuildFileSystem<'a> {
+    fn new(backing: &'a dyn FileSystem) -> Self {
+        Self {
+            backing,
+            outputs: BTreeMap::new(),
+        }
+    }
+
+    fn add_outputs(&mut self, outputs: &[OutputFile]) {
+        for output in outputs {
+            let key = canonical_config_path(self.backing, &output.file_name);
+            self.outputs.insert(key, output.clone());
+        }
+    }
+
+    fn output(&self, path: &str) -> Option<&OutputFile> {
+        self.outputs.get(&canonical_config_path(self.backing, path))
+    }
+
+    fn contains_output_directory(&self, path: &str) -> bool {
+        let directory = canonical_config_path(self.backing, path);
+        let prefix = format!("{}/", directory.trim_end_matches('/'));
+        self.outputs
+            .keys()
+            .any(|output| output.starts_with(&prefix))
+    }
+}
+
+impl FileSystem for BuildFileSystem<'_> {
+    fn use_case_sensitive_file_names(&self) -> bool {
+        self.backing.use_case_sensitive_file_names()
+    }
+
+    fn file_exists(&self, path: &str) -> bool {
+        self.output(path).is_some() || self.backing.file_exists(path)
+    }
+
+    fn directory_exists(&self, path: &str) -> bool {
+        self.backing.directory_exists(path) || self.contains_output_directory(path)
+    }
+
+    fn realpath(&self, path: &str) -> String {
+        self.backing.realpath(path)
+    }
+
+    fn modified_time(&self, path: &str) -> Option<u128> {
+        self.backing
+            .modified_time(path)
+            .or_else(|| self.output(path).map(|_| u128::MAX))
+    }
+
+    fn read_file(&self, path: &str) -> io::Result<String> {
+        self.output(path)
+            .map(|output| output.text.clone())
+            .map_or_else(|| self.backing.read_file(path), Ok)
+    }
+
+    fn write_file(&self, path: &str, contents: &str) -> io::Result<()> {
+        self.backing.write_file(path, contents)
+    }
+
+    fn read_directory(&self, path: &str) -> io::Result<DirectoryEntries> {
+        let mut entries = match self.backing.read_directory(path) {
+            Ok(entries) => entries,
+            Err(_) if self.contains_output_directory(path) => DirectoryEntries::default(),
+            Err(error) => return Err(error),
+        };
+        let directory = Path::new(path);
+        for output in self.outputs.values() {
+            let Ok(relative) = Path::new(&output.file_name).strip_prefix(directory) else {
+                continue;
+            };
+            let mut components = relative.components();
+            let Some(component) = components.next() else {
+                continue;
+            };
+            let name = component.as_os_str().to_string_lossy().into_owned();
+            if components.next().is_some() {
+                entries.directories.push(name);
+            } else {
+                entries.files.push(name);
+            }
+        }
+        entries.files.sort();
+        entries.files.dedup();
+        entries.directories.sort();
+        entries.directories.dedup();
+        Ok(entries)
+    }
+}
+
 /// Loads project references recursively and returns dependency-first order.
 #[must_use]
 pub fn load_project_graph(
@@ -92,11 +189,12 @@ pub fn build_projects(
     let mut projects = Vec::new();
     let mut skipped = Vec::new();
     let mut signatures: BTreeMap<String, String> = BTreeMap::new();
+    let mut build_file_system = BuildFileSystem::new(file_system);
     for config_path in &graph.projects {
         if is_solution_project(file_system, &graph, config_path) {
             continue;
         }
-        let program = Program::from_config_with_options(file_system, config_path, overrides);
+        let program = Program::from_config_with_options(&build_file_system, config_path, overrides);
         let enabled = incremental || program.options().incremental || program.options().composite;
         let config_paths = project_config_paths(file_system, config_path);
         let dependencies = graph
@@ -140,6 +238,7 @@ pub fn build_projects(
             continue;
         }
         let emit = program.emit();
+        build_file_system.add_outputs(&emit.files);
         let current = project_build_info(
             &program,
             dependencies,
@@ -309,12 +408,22 @@ fn declaration_signature(program: &Program) -> String {
             let text = if ts_path::is_declaration_file(&source.file_name) {
                 source.source_text.clone()
             } else {
-                emit_declaration_file(
+                emit_declaration_file_with_semantics_and_options(
                     &source.parse.arena,
                     source.parse.source_file,
                     &source.file_name,
                     &source.source_text,
                     false,
+                    Some(&source.checking.declaration_reachability),
+                    Some(&source.checking.import_runtime_meanings),
+                    None,
+                    Some(&source.checking.types),
+                    Some(&source.checking.node_types),
+                    Some(&source.checking.import_type_references),
+                    Some(&source.checking.named_type_references),
+                    program.options().remove_comments,
+                    program.options().rewrite_relative_import_extensions,
+                    program.options().strip_internal,
                 )
                 .map_or_else(|_| source.source_text.clone(), |emitted| emitted.code)
             };
@@ -903,5 +1012,120 @@ mod tests {
         );
         assert_eq!(declaration_change.projects.len(), 2);
         assert!(declaration_change.skipped.is_empty());
+    }
+
+    #[test]
+    fn stripped_internal_declaration_changes_do_not_invalidate_consumers() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/repo/tsconfig.json",
+            r#"{"files":[],"include":[],"references":[{"path":"./app"}]}"#,
+        )
+        .unwrap();
+        fs.write_file(
+            "/repo/lib/tsconfig.json",
+            r#"{"files":["index.ts"],"compilerOptions":{"composite":true,"noLib":true,"outDir":"dist","stripInternal":true}}"#,
+        )
+        .unwrap();
+        fs.write_file(
+            "/repo/lib/index.ts",
+            concat!(
+                "/** @internal */\n",
+                "export function hidden(): number { return 1; }\n",
+                "export function visible(): number { return 1; }\n",
+            ),
+        )
+        .unwrap();
+        fs.write_file(
+            "/repo/app/tsconfig.json",
+            r#"{"files":["index.ts"],"references":[{"path":"../lib"}],"compilerOptions":{"composite":true,"noLib":true,"outDir":"dist"}}"#,
+        )
+        .unwrap();
+        fs.write_file("/repo/app/index.ts", "export const app = true;\n")
+            .unwrap();
+        write_build_outputs(
+            &fs,
+            build_projects(
+                &fs,
+                "/repo",
+                &["tsconfig.json".into()],
+                ProgramOptionsOverride::default(),
+                true,
+            ),
+        );
+
+        fs.write_file(
+            "/repo/lib/index.ts",
+            concat!(
+                "/** @internal */\n",
+                "export function hidden(): string { return 'internal'; }\n",
+                "export function visible(): number { return 1; }\n",
+            ),
+        )
+        .unwrap();
+        let result = build_projects(
+            &fs,
+            "/repo",
+            &["tsconfig.json".into()],
+            ProgramOptionsOverride::default(),
+            true,
+        );
+
+        assert_eq!(
+            result
+                .projects
+                .iter()
+                .map(|project| project.config_path.as_str())
+                .collect::<Vec<_>>(),
+            ["/repo/lib/tsconfig.json"]
+        );
+        assert_eq!(result.skipped, ["/repo/app/tsconfig.json"]);
+    }
+
+    #[test]
+    fn downstream_projects_resolve_declarations_from_the_current_build() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/repo/tsconfig.json",
+            r#"{"files":[],"references":[{"path":"./app"}]}"#,
+        )
+        .unwrap();
+        fs.write_file(
+            "/repo/lib/tsconfig.json",
+            r#"{"files":["index.ts"],"compilerOptions":{"composite":true,"noLib":true,"outDir":"dist"}}"#,
+        )
+        .unwrap();
+        fs.write_file("/repo/lib/index.ts", "export const value = 1;\n")
+            .unwrap();
+        fs.write_file(
+            "/repo/app/tsconfig.json",
+            r#"{"files":["index.ts"],"references":[{"path":"../lib"}],"compilerOptions":{"composite":true,"noLib":true,"outDir":"dist"}}"#,
+        )
+        .unwrap();
+        fs.write_file(
+            "/repo/app/index.ts",
+            "import { value } from '../lib/dist/index'; export const result = value;\n",
+        )
+        .unwrap();
+
+        let result = build_projects(
+            &fs,
+            "/repo",
+            &["tsconfig.json".into()],
+            ProgramOptionsOverride::default(),
+            true,
+        );
+        let application = result
+            .projects
+            .iter()
+            .find(|project| project.config_path == "/repo/app/tsconfig.json")
+            .unwrap();
+
+        assert!(
+            application.program.diagnostics().is_empty(),
+            "{:?}",
+            application.program.diagnostics()
+        );
+        assert!(!fs.file_exists("/repo/lib/dist/index.d.ts"));
     }
 }

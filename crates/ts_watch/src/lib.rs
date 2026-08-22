@@ -64,6 +64,24 @@ pub enum WatchSignal {
     Stop,
 }
 
+#[derive(Clone, Debug)]
+pub struct StopHandle {
+    sender: mpsc::Sender<WatchMessage>,
+}
+
+impl StopHandle {
+    /// Stops a filesystem event source that may be blocked waiting for changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the event source has already been dropped.
+    pub fn stop(&self) -> Result<(), WatchError> {
+        self.sender
+            .send(WatchMessage::Stop)
+            .map_err(|error| WatchError::EventSource(error.to_string()))
+    }
+}
+
 pub trait EventSource {
     /// Replaces the active watch set.
     ///
@@ -221,8 +239,17 @@ impl Error for WatchError {}
 pub struct FsEventSource {
     watcher: Watcher<NotifyBackend>,
     watches: BTreeMap<PathBuf, (WatchMode, Watch)>,
-    sender: mpsc::Sender<WatchBatch>,
-    receiver: mpsc::Receiver<WatchBatch>,
+    sender: mpsc::Sender<WatchMessage>,
+    receiver: mpsc::Receiver<WatchMessage>,
+}
+
+#[derive(Debug)]
+enum WatchMessage {
+    Batch {
+        directory: PathBuf,
+        batch: WatchBatch,
+    },
+    Stop,
 }
 
 impl Default for FsEventSource {
@@ -233,6 +260,15 @@ impl Default for FsEventSource {
             watches: BTreeMap::new(),
             sender,
             receiver,
+        }
+    }
+}
+
+impl FsEventSource {
+    #[must_use]
+    pub fn stop_handle(&self) -> StopHandle {
+        StopHandle {
+            sender: self.sender.clone(),
         }
     }
 }
@@ -253,10 +289,14 @@ impl EventSource for FsEventSource {
                 continue;
             }
             let sender = self.sender.clone();
+            let watched_directory = directory.clone();
             let watch = self
                 .watcher
                 .watch(&directory, mode, move |batch| {
-                    let _ = sender.send(batch);
+                    let _ = sender.send(WatchMessage::Batch {
+                        directory: watched_directory.clone(),
+                        batch,
+                    });
                 })
                 .map_err(|error| WatchError::EventSource(error.to_string()))?;
             self.watches.insert(directory, (mode, watch));
@@ -265,12 +305,19 @@ impl EventSource for FsEventSource {
     }
 
     fn next(&mut self) -> Result<WatchSignal, WatchError> {
-        let batch = self
+        let message = self
             .receiver
             .recv()
             .map_err(|error| WatchError::EventSource(error.to_string()))?;
+        let WatchMessage::Batch { directory, batch } = message else {
+            self.watches.clear();
+            return Ok(WatchSignal::Stop);
+        };
         if let Some(error @ ts_fswatch::WatchError::Backend(_)) = &batch.error {
             return Err(WatchError::EventSource(error.to_string()));
+        }
+        if matches!(batch.error, Some(ts_fswatch::WatchError::Terminated(_))) {
+            self.watches.remove(&directory);
         }
         let mut changes = ChangeSet {
             overflow: matches!(
@@ -282,16 +329,40 @@ impl EventSource for FsEventSource {
         for event in batch.events {
             match event {
                 Event::Create(path) | Event::Change(path) | Event::Delete(path) => {
-                    changes.paths.insert(path);
+                    if !should_ignore_watch_path(&path) {
+                        changes.paths.insert(path);
+                    }
                 }
                 Event::Rename { from, to } => {
-                    changes.paths.insert(from);
-                    changes.paths.insert(to);
+                    for path in [from, to] {
+                        if !should_ignore_watch_path(&path) {
+                            changes.paths.insert(path);
+                        }
+                    }
                 }
             }
         }
         Ok(WatchSignal::Changed(changes))
     }
+}
+
+fn should_ignore_watch_path(path: &Path) -> bool {
+    let mut parent_is_node_modules = false;
+    for component in path.components() {
+        let std::path::Component::Normal(component) = component else {
+            parent_is_node_modules = false;
+            continue;
+        };
+        let component = component.to_string_lossy();
+        if component == ".git"
+            || component.starts_with(".#")
+            || parent_is_node_modules && component.starts_with('.')
+        {
+            return true;
+        }
+        parent_is_node_modules = component == "node_modules";
+    }
+    false
 }
 
 fn resolve_watch_paths(paths: &[WatchPath]) -> BTreeMap<PathBuf, WatchMode> {
@@ -488,6 +559,96 @@ mod tests {
         };
         let mut coordinator = Coordinator::new(compiler, events, |_| {});
         assert_eq!(coordinator.run().unwrap().completed_cycles, 1);
+    }
+
+    #[test]
+    fn stop_handle_interrupts_a_blocked_filesystem_event_source() {
+        let directory = TestDirectory::new();
+        let mut source = FsEventSource::default();
+        source
+            .reconcile(&[WatchPath::new(&directory.0, WatchMode::NonRecursive)])
+            .unwrap();
+        let stop = source.stop_handle();
+        let (ready_sender, ready_receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            ready_sender.send(()).unwrap();
+            let signal = source.next().unwrap();
+            (signal, source.watches.len())
+        });
+        ready_receiver.recv().unwrap();
+
+        stop.stop().unwrap();
+
+        assert_eq!(worker.join().unwrap(), (WatchSignal::Stop, 0));
+    }
+
+    #[test]
+    fn filesystem_events_ignore_git_and_editor_artifacts() {
+        let mut source = FsEventSource::default();
+        source
+            .sender
+            .send(WatchMessage::Batch {
+                directory: "/project".into(),
+                batch: WatchBatch {
+                    events: vec![
+                        Event::Change("/project/.git/index".into()),
+                        Event::Create("/project/node_modules/.cache/state".into()),
+                        Event::Delete("/project/.#index.ts".into()),
+                        Event::Rename {
+                            from: "/project/.#source.ts".into(),
+                            to: "/project/source.ts".into(),
+                        },
+                        Event::Change("/project/node_modules/pkg/index.d.ts".into()),
+                    ],
+                    error: None,
+                },
+            })
+            .unwrap();
+
+        assert_eq!(
+            source.next().unwrap(),
+            WatchSignal::Changed(ChangeSet {
+                paths: BTreeSet::from([
+                    PathBuf::from("/project/node_modules/pkg/index.d.ts"),
+                    PathBuf::from("/project/source.ts")
+                ]),
+                overflow: false,
+            })
+        );
+    }
+
+    #[test]
+    fn terminated_watches_are_recreated_after_a_rescan() {
+        let directory = TestDirectory::new();
+        let watched_directory = fs::canonicalize(&directory.0).unwrap();
+        let paths = [WatchPath::new(&directory.0, WatchMode::NonRecursive)];
+        let mut source = FsEventSource::default();
+        source.reconcile(&paths).unwrap();
+        source
+            .sender
+            .send(WatchMessage::Batch {
+                directory: watched_directory.clone(),
+                batch: WatchBatch {
+                    events: Vec::new(),
+                    error: Some(ts_fswatch::WatchError::Terminated(
+                        "watch closed".to_owned(),
+                    )),
+                },
+            })
+            .unwrap();
+
+        assert_eq!(
+            source.next().unwrap(),
+            WatchSignal::Changed(ChangeSet {
+                overflow: true,
+                ..ChangeSet::default()
+            })
+        );
+        assert!(!source.watches.contains_key(&watched_directory));
+
+        source.reconcile(&paths).unwrap();
+
+        assert!(source.watches.contains_key(&watched_directory));
     }
 
     #[test]

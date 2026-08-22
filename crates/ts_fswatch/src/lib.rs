@@ -436,7 +436,14 @@ fn canonical_event_path(root: &Path, path: &Path) -> PathBuf {
     } else {
         root.join(path)
     };
-    fs::canonicalize(&absolute).unwrap_or_else(|_| normalize_path(&absolute))
+    let absolute = normalize_path(&absolute);
+    let Some(parent) = absolute.parent() else {
+        return absolute;
+    };
+    let Some(file_name) = absolute.file_name() else {
+        return absolute;
+    };
+    fs::canonicalize(parent).map_or(absolute.clone(), |canonical| canonical.join(file_name))
 }
 
 fn normalize_path(path: &Path) -> PathBuf {
@@ -859,6 +866,40 @@ mod tests {
             Some(WatchError::Overflow("queue full".to_owned()))
         );
         assert_eq!(backend.registration().1, WatchMode::Recursive);
+        watch.close().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preserves_symlink_paths_in_nonrecursive_watch_events() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new();
+        let external = TestDirectory::new();
+        let target = external.0.join("target.ts");
+        fs::write(&target, "export const target = 1;\n").unwrap();
+        let link = directory.0.join("linked.ts");
+        symlink(&target, &link).unwrap();
+
+        let backend = FakeBackend::default();
+        let (sender, receiver) = mpsc::channel();
+        let mut watch = Watcher::new(backend.clone())
+            .with_debounce(DebounceConfig {
+                min_wait: Duration::ZERO,
+                max_wait: Duration::ZERO,
+            })
+            .watch(&directory.0, WatchMode::NonRecursive, move |batch| {
+                sender.send(batch).unwrap();
+            })
+            .unwrap();
+
+        backend.emit(BackendBatch {
+            events: vec![Event::Create(link.clone())],
+            error: None,
+        });
+
+        let batch = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(batch.events, [Event::Create(link)]);
         watch.close().unwrap();
     }
 }
