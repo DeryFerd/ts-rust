@@ -2828,7 +2828,12 @@ impl<'a> ProgramChecker<'a> {
         value_is_referenced: bool,
     ) -> Option<TypeDescriptor> {
         let symbol = source.bindings.symbols.get(symbol_id)?;
-        let core_name = is_core_library_name(&symbol.name);
+        let core_name = is_core_library_name(&symbol.name)
+            && (value_is_referenced
+                || !matches!(
+                    symbol.name.as_str(),
+                    "Function" | "CallableFunction" | "NewableFunction"
+                ));
         let preserve = symbol.declarations.iter().any(|declaration| {
             match source.arena.get(*declaration).map(|node| &node.data) {
                 Some(NodeData::TypeAliasDeclaration(_)) => core_name,
@@ -29433,6 +29438,54 @@ mod tests {
         assert_eq!(
             checked.files()[1].type_of_symbol(x),
             Some(checked.files()[1].types.number())
+        );
+    }
+
+    #[test]
+    fn preserves_explicitly_referenced_default_library_function_interface() {
+        let library = parse_source_file("interface Function { marker: number }");
+        let consumer =
+            parse_source_file("declare const callback: Function; const marker = callback.marker;");
+        let library_bindings = bind_source_file(&library.arena, library.source_file);
+        let consumer_bindings = bind_source_file(&consumer.arena, consumer.source_file);
+        let no_modules = BTreeMap::new();
+        let checked = check_program(&[
+            ProgramSource {
+                arena: &library.arena,
+                source_file: library.source_file,
+                bindings: &library_bindings,
+                resolved_modules: &no_modules,
+                is_default_library: true,
+                skip_diagnostics: true,
+                checker_options: CheckerOptions {
+                    is_declaration_file: true,
+                    ..CheckerOptions::default()
+                },
+            },
+            ProgramSource {
+                arena: &consumer.arena,
+                source_file: consumer.source_file,
+                bindings: &consumer_bindings,
+                resolved_modules: &no_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+        ]);
+        assert!(
+            checked.files()[1].diagnostics.is_empty(),
+            "{:?}",
+            checked.files()[1].diagnostics
+        );
+        let marker = consumer_bindings
+            .root_scope()
+            .unwrap()
+            .symbols
+            .get("marker")
+            .unwrap();
+        assert_eq!(
+            checked.files()[1].type_of_symbol(marker),
+            Some(checked.files()[1].types.number()),
         );
     }
 
