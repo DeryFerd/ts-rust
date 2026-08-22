@@ -8044,10 +8044,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         else {
             return fallback;
         };
-        syntax
-            .name_type
-            .map(|name| NodeRef::new(declaration.arena, declaration.file, name))
-            .unwrap_or(declaration)
+        syntax.name_type.map_or(declaration, |name| {
+            NodeRef::new(declaration.arena, declaration.file, name)
+        })
     }
 
     fn cached_keyof_operand_type(

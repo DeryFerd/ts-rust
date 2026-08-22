@@ -5793,7 +5793,8 @@ fn conditional_scalar_operand_plan_is_supported(expression: &PlannedExpression) 
         PlannedExpressionKind::String(_)
         | PlannedExpressionKind::Number { .. }
         | PlannedExpressionKind::BigInt { .. }
-        | PlannedExpressionKind::Boolean(_) => true,
+        | PlannedExpressionKind::Boolean(_)
+        | PlannedExpressionKind::Conditional(_) => true,
         PlannedExpressionKind::Identifier(read) => matches!(
             read.kind,
             PlannedIdentifierReadKind::Variable | PlannedIdentifierReadKind::Unresolved
@@ -5801,7 +5802,6 @@ fn conditional_scalar_operand_plan_is_supported(expression: &PlannedExpression) 
         PlannedExpressionKind::Parenthesized(inner) => {
             conditional_scalar_operand_plan_is_supported(inner)
         }
-        PlannedExpressionKind::Conditional(_) => true,
         PlannedExpressionKind::Null
         | PlannedExpressionKind::GlobalUndefined
         | PlannedExpressionKind::TypeImportValueUse(_)
@@ -11994,12 +11994,12 @@ mod tests {
         .unwrap()
     }
 
-    fn context_with_declaration_facts<'arena>(
+    fn context_with_declaration_facts(
         file: FileId,
-        source: &'arena ParseResult,
+        source: &ParseResult,
         module_state: CanonicalModuleState,
         is_declaration_file: bool,
-    ) -> CanonicalCheckerContext<'arena> {
+    ) -> CanonicalCheckerContext<'_> {
         let extension = if is_declaration_file { "d.ts" } else { "ts" };
         let mut binder = CanonicalBinder::new();
         binder

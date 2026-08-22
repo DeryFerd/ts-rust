@@ -179,16 +179,14 @@ fn declaration_symbol(
         .ok_or(SourceCheckError::Provenance(
             SourceCheckProvenanceError::MissingDeclarationSymbol(declaration),
         ))?;
-    let symbol = store.get_merged_symbol(raw).ok_or_else(|| {
-        SourceCheckError::DeclaredType(DeclaredTypeError::Unavailable(
-            DeclaredTypeUnavailable::SymbolNotOwned(raw),
-        ))
-    })?;
-    let record = store.symbol(symbol).ok_or_else(|| {
-        SourceCheckError::DeclaredType(DeclaredTypeError::Unavailable(
-            DeclaredTypeUnavailable::SymbolNotOwned(symbol),
-        ))
-    })?;
+    let symbol = store
+        .get_merged_symbol(raw)
+        .ok_or(SourceCheckError::DeclaredType(
+            DeclaredTypeError::Unavailable(DeclaredTypeUnavailable::SymbolNotOwned(raw)),
+        ))?;
+    let record = store.symbol(symbol).ok_or(SourceCheckError::DeclaredType(
+        DeclaredTypeError::Unavailable(DeclaredTypeUnavailable::SymbolNotOwned(symbol)),
+    ))?;
     if !record.flags().intersects(expected_flags)
         || record
             .declarations()
@@ -261,11 +259,9 @@ fn validate_symbol_parent(
     symbol: SemanticSymbolId,
     expected_parent: Option<SemanticSymbolId>,
 ) -> Result<(), SourceCheckError> {
-    let record = store.symbol(symbol).ok_or_else(|| {
-        SourceCheckError::DeclaredType(DeclaredTypeError::Unavailable(
-            DeclaredTypeUnavailable::SymbolNotOwned(symbol),
-        ))
-    })?;
+    let record = store.symbol(symbol).ok_or(SourceCheckError::DeclaredType(
+        DeclaredTypeError::Unavailable(DeclaredTypeUnavailable::SymbolNotOwned(symbol)),
+    ))?;
     if record.parent().is_none() {
         return Ok(());
     }
@@ -637,23 +633,23 @@ fn plan_namespace(
             });
         }
     }
-    if let NodeData::StringLiteral(module_name) = &name_record.data {
-        if !is_external_augmentation {
-            if parent.node == bound.source_file() && !facts.is_external_or_common_js_module() {
-                if ts_path::is_relative(&module_name.text)
-                    || ts_path::is_rooted_disk_path(&module_name.text)
-                {
-                    diagnostics.push(NamespaceDiagnosticPlan {
-                        node: name,
-                        code: AMBIENT_MODULE_NAME_CANNOT_BE_RELATIVE,
-                    });
-                }
-            } else {
+    if let NodeData::StringLiteral(module_name) = &name_record.data
+        && !is_external_augmentation
+    {
+        if parent.node == bound.source_file() && !facts.is_external_or_common_js_module() {
+            if ts_path::is_relative(&module_name.text)
+                || ts_path::is_rooted_disk_path(&module_name.text)
+            {
                 diagnostics.push(NamespaceDiagnosticPlan {
                     node: name,
-                    code: AMBIENT_MODULES_CANNOT_BE_NESTED,
+                    code: AMBIENT_MODULE_NAME_CANNOT_BE_RELATIVE,
                 });
             }
+        } else {
+            diagnostics.push(NamespaceDiagnosticPlan {
+                node: name,
+                code: AMBIENT_MODULES_CANNOT_BE_NESTED,
+            });
         }
     }
 
@@ -879,18 +875,8 @@ pub(super) fn execute_source_namespace(
     for declaration in declarations {
         session.reset_query();
         match declaration {
-            SourceNamespaceMemberPlan::TypeAlias { symbol, .. } => {
-                CanonicalTypeQuery::new_with_global_types_and_session(
-                    store,
-                    host,
-                    global_types,
-                    options,
-                    session,
-                    diagnostics,
-                )?
-                .get_declared_type_of_symbol(*symbol)?;
-            }
-            SourceNamespaceMemberPlan::Interface { symbol, .. } => {
+            SourceNamespaceMemberPlan::TypeAlias { symbol, .. }
+            | SourceNamespaceMemberPlan::Interface { symbol, .. } => {
                 CanonicalTypeQuery::new_with_global_types_and_session(
                     store,
                     host,

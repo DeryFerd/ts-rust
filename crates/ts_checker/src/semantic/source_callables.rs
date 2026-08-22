@@ -47,6 +47,7 @@ const NODE_FLAG_JSDOC: u32 = 1 << 22;
 
 /// One identifier parameter and its explicit or implicit type identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(clippy::struct_excessive_bools)] // Preserve the flat upstream parameter state.
 pub(super) struct SourceCallableParameterPlan {
     pub(super) declaration: NodeRef,
     pub(super) symbol: SemanticSymbolId,

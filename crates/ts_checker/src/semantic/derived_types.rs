@@ -889,21 +889,19 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                             .expect("widened union members are published before their parent"),
                     })
                     .collect::<Vec<_>>();
-                let widened = match global_types {
-                    Some(global_types) => self
-                        .expression_union_type_with_global_types(
-                            global_types,
-                            &members,
-                            super::bootstrap::UnionReduction::Literal,
-                        )
-                        .expect("preflighted widened union members remain canonical"),
-                    None => {
-                        let mut prepared = self
-                            .prepare_type_query_types(&[], &[], &[], 1, 0)
-                            .expect("widened union preparation was preflighted");
-                        self.literal_union_type_prepared(&members, None, &mut prepared)
-                            .expect("preflighted widened union members remain canonical")
-                    }
+                let widened = if let Some(global_types) = global_types {
+                    self.expression_union_type_with_global_types(
+                        global_types,
+                        &members,
+                        super::bootstrap::UnionReduction::Literal,
+                    )
+                    .expect("preflighted widened union members remain canonical")
+                } else {
+                    let mut prepared = self
+                        .prepare_type_query_types(&[], &[], &[], 1, 0)
+                        .expect("widened union preparation was preflighted");
+                    self.literal_union_type_prepared(&members, None, &mut prepared)
+                        .expect("preflighted widened union members remain canonical")
                 };
                 assert_eq!(
                     self.derived_types.widened_types.insert(source, widened),

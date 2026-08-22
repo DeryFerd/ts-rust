@@ -2258,8 +2258,7 @@ fn plan_direct_exported_type_target(
         ))
     })?;
     let commonjs_javascript = facts.is_javascript_file() && facts.is_common_js_module();
-    if (facts.is_javascript_file() && !commonjs_javascript)
-        || (facts.is_common_js_module() && !commonjs_javascript)
+    if (facts.is_common_js_module() || facts.is_javascript_file()) && !commonjs_javascript
         || !facts.is_external_or_common_js_module()
         || !host.symbol_matches(store, declaration, target)
     {
@@ -2352,7 +2351,7 @@ fn plan_direct_exported_type_target(
         };
         store
             .symbol(module)
-            .and_then(|module| module.exports())
+            .and_then(ts_binder::semantic::Symbol::exports)
             .and_then(|exports| store.symbol_table(exports))
             .and_then(|exports| exports.get(target_record.name()))
             == Some(target)

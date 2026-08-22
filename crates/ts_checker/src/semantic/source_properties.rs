@@ -469,63 +469,54 @@ pub(super) fn check_direct_source_property(
                 }),
             )
         }
-    } else {
-        match store.resolved_own_property(receiver_type, &plan.name)? {
-            Some(property) => {
-                if property.optional {
-                    if !plan.is_read() {
-                        return Err(SourcePropertyError::Unsupported(
-                            SourcePropertyUnsupported::OptionalProperty {
-                                node: plan.node,
-                                property: property.symbol,
-                            },
-                        ));
-                    }
-                    let bootstrap = store
-                        .intrinsic_bootstrap()
-                        .ok_or(RelationUnavailable::MissingBootstrap)?;
-                    if bootstrap.options.strict_null_checks {
-                        let sentinel = bootstrap.undefined_or_missing_type;
-                        let type_ = property_union_type(
-                            store,
-                            global_types,
-                            plan.node,
-                            &[property.type_, sentinel],
-                            Some(property.symbol),
-                        )?;
-                        (type_, Some(property.symbol), None)
-                    } else {
-                        (property.type_, Some(property.symbol), None)
-                    }
-                } else {
-                    (property.type_, Some(property.symbol), None)
-                }
+    } else if let Some(property) = store.resolved_own_property(receiver_type, &plan.name)? {
+        if property.optional {
+            if !plan.is_read() {
+                return Err(SourcePropertyError::Unsupported(
+                    SourcePropertyUnsupported::OptionalProperty {
+                        node: plan.node,
+                        property: property.symbol,
+                    },
+                ));
             }
-            None => {
-                if !plan.is_read() {
-                    return Err(SourcePropertyError::Unsupported(
-                        SourcePropertyUnsupported::MissingOwnProperty {
-                            node: plan.node,
-                            receiver_type,
-                        },
-                    ));
-                }
-                (
-                    error_type,
-                    None,
-                    Some(SourcePropertyDiagnostic {
-                        name_node: plan.name_node,
-                        receiver_type,
-                        missing_type: None,
-                        suggestion: direct_property_spelling_suggestion(
-                            store,
-                            plan,
-                            receiver_type,
-                        )?,
-                    }),
-                )
+            let bootstrap = store
+                .intrinsic_bootstrap()
+                .ok_or(RelationUnavailable::MissingBootstrap)?;
+            if bootstrap.options.strict_null_checks {
+                let sentinel = bootstrap.undefined_or_missing_type;
+                let type_ = property_union_type(
+                    store,
+                    global_types,
+                    plan.node,
+                    &[property.type_, sentinel],
+                    Some(property.symbol),
+                )?;
+                (type_, Some(property.symbol), None)
+            } else {
+                (property.type_, Some(property.symbol), None)
             }
+        } else {
+            (property.type_, Some(property.symbol), None)
         }
+    } else {
+        if !plan.is_read() {
+            return Err(SourcePropertyError::Unsupported(
+                SourcePropertyUnsupported::MissingOwnProperty {
+                    node: plan.node,
+                    receiver_type,
+                },
+            ));
+        }
+        (
+            error_type,
+            None,
+            Some(SourcePropertyDiagnostic {
+                name_node: plan.name_node,
+                receiver_type,
+                missing_type: None,
+                suggestion: direct_property_spelling_suggestion(store, plan, receiver_type)?,
+            }),
+        )
     };
 
     let type_ = if propagate_undefined && type_ != any && type_ != error_type {

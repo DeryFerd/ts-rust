@@ -2344,10 +2344,10 @@ mod tests {
     #[test]
     fn unsupported_and_poisoned_enum_queries_are_atomic() {
         let mut fixture = fixture(
-            r#"
+            r"
                 enum Computed { A = runtime }
                 enum Good { A }
-            "#,
+            ",
         );
         let computed = symbol(&fixture, SyntaxKind::EnumDeclaration, "Computed");
         let good = symbol(&fixture, SyntaxKind::EnumDeclaration, "Good");

@@ -743,7 +743,7 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
         )?;
         let exports = store
             .symbol(module)
-            .and_then(|module| module.exports())
+            .and_then(ts_binder::semantic::Symbol::exports)
             .and_then(|exports| store.symbol_table(exports))
             .ok_or(CanonicalAliasTargetUnavailable::MalformedModuleSymbol {
                 declaration,
@@ -875,7 +875,7 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
                     module,
                 })?;
         let modes = (resolved.usage_mode(), resolved.target_mode());
-        if !matches!(
+        let matching_modes = matches!(
             modes,
             (
                 CanonicalModuleResolutionMode::Esm,
@@ -884,7 +884,8 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
                 CanonicalModuleResolutionMode::CommonJs,
                 CanonicalModuleResolutionMode::CommonJs
             )
-        ) && !(allow_mixed_module_modes
+        );
+        let allowed_mixed_modes = allow_mixed_module_modes
             && matches!(
                 modes,
                 (
@@ -894,8 +895,8 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
                     CanonicalModuleResolutionMode::Esm,
                     CanonicalModuleResolutionMode::CommonJs
                 )
-            ))
-        {
+            );
+        if !(matching_modes || allowed_mixed_modes) {
             if resolved.usage_mode() == CanonicalModuleResolutionMode::CommonJs
                 || resolved.target_mode() == CanonicalModuleResolutionMode::CommonJs
             {
@@ -1896,16 +1897,16 @@ mod tests {
             ("exposed", direct, direct),
         ] {
             let declaration = alias_declaration_named(&importer, importer_file, name);
-            let imported = alias(&bound_files, declaration);
+            let alias_symbol = alias(&bound_files, declaration);
             assert_eq!(
                 CanonicalAliasResolver::new(&mut store, &mut host)
-                    .get_immediate_aliased_symbol(imported)
+                    .get_immediate_aliased_symbol(alias_symbol)
                     .unwrap(),
                 Some(immediate)
             );
             assert_eq!(
                 CanonicalAliasResolver::new(&mut store, &mut host)
-                    .resolve_alias(imported)
+                    .resolve_alias(alias_symbol)
                     .unwrap()
                     .target,
                 AliasTargetState::Resolved(final_target)
@@ -2034,7 +2035,7 @@ mod tests {
                 ProductionAliasTargetHost::new(&store, sources(&files, &bound_files), &manifest)
                     .unwrap();
             let declaration = alias_declaration_named(&importer, importer_file, name);
-            let imported = alias(&bound_files, declaration);
+            let alias_symbol = alias(&bound_files, declaration);
             let class = target
                 .arena
                 .iter()
@@ -2053,7 +2054,7 @@ mod tests {
 
             assert_eq!(
                 CanonicalAliasResolver::new(&mut store, &mut host)
-                    .resolve_alias(imported)
+                    .resolve_alias(alias_symbol)
                     .unwrap()
                     .target,
                 AliasTargetState::Resolved(expected),

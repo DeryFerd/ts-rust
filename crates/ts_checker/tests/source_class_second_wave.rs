@@ -84,8 +84,10 @@ fn class_constructor(parsed: &ParseResult, file: FileId, expected: &str) -> Node
                 .get(**member)
                 .is_some_and(|record| record.kind == SyntaxKind::Constructor)
         })
-        .map(|member| NodeRef::new(parsed.arena.id(), file, *member))
-        .unwrap_or_else(|| panic!("missing constructor in {expected}"))
+        .map_or_else(
+            || panic!("missing constructor in {expected}"),
+            |member| NodeRef::new(parsed.arena.id(), file, *member),
+        )
 }
 
 fn first_new_expression(parsed: &ParseResult, file: FileId) -> NodeRef {

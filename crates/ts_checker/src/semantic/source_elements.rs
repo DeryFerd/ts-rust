@@ -28,7 +28,7 @@ use super::{
     member_resolution::UnionPropertyError,
     source::PlannedExpression,
     store::SourceNodeParent,
-    type_records::{LiteralValue, TypeCacheState, TypeData},
+    type_records::{LiteralValue, TypeCacheState, TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
 };
 
@@ -468,7 +468,7 @@ fn optional_element_receiver(
     for constituent in constituents.iter().copied() {
         let flags = store
             .type_payload(constituent)
-            .map(|record| record.flags())
+            .map(TypeRecord::flags)
             .ok_or(SourceElementError::InvalidType(constituent))?;
         if !flags.intersects(TypeFlags::NULLABLE) {
             retained.push(constituent);

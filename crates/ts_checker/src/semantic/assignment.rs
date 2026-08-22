@@ -748,6 +748,7 @@ impl AssignmentPlanner<'_, '_> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)] // Each assignment-target family has distinct provenance.
     fn validate_variable_declaration(
         &self,
         left: NodeRef,

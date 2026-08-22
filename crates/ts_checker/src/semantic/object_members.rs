@@ -4343,17 +4343,19 @@ mod generic_publication_tests {
         (plan, target, vec![parameter, string])
     }
 
-    fn state(
-        store: &CanonicalTypeMapperStore,
-        plan: &PropertyObjectPlan,
-        target: TypeId,
-    ) -> (
+    type GenericPublicationState = (
         ObjectFlags,
         InterfaceTypeData,
         Vec<(CheckFlags, Option<ValueSymbolLinks>)>,
         usize,
         [usize; 26],
-    ) {
+    );
+
+    fn state(
+        store: &CanonicalTypeMapperStore,
+        plan: &PropertyObjectPlan,
+        target: TypeId,
+    ) -> GenericPublicationState {
         let record = store.type_payload(target).unwrap();
         let TypeData::Interface(interface) = record.data() else {
             panic!("generic declaration must retain its interface target")

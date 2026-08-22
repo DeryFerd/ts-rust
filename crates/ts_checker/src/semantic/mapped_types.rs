@@ -1146,10 +1146,7 @@ fn substitute_name_type_worker(
                 for (index, placeholder) in template.types.iter().enumerate() {
                     let candidates =
                         substitute_name_type_worker(store, parameter, key, *placeholder, visiting)?;
-                    let size = names
-                        .len()
-                        .checked_mul(candidates.len())
-                        .unwrap_or(usize::MAX);
+                    let size = names.len().saturating_mul(candidates.len());
                     if size >= MAX_TEMPLATE_UNION_SIZE {
                         return Err(MappedTypeError::CrossProductTooLarge {
                             size,
@@ -1241,7 +1238,7 @@ fn validate_warm_mapped_members(
         .symbol_table(members)
         .ok_or(MappedTypeError::InvalidCachedMembers(shape.type_))?;
     if properties.len() != expected.len()
-        || structured.properties.is_some() != !expected.is_empty()
+        || structured.properties.is_some() == expected.is_empty()
         || table.len() != expected.len()
         || structured.signatures.is_some()
         || structured.call_signature_count != 0
