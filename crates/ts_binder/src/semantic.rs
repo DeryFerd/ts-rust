@@ -795,7 +795,10 @@ mod tests {
     use ts_ast::{FileId, NodeRef, SyntaxKind};
     use ts_parser::parse_source_file;
 
-    use super::{AstScope, CheckFlags, SymbolData, SymbolStore, should_replace_value_declaration};
+    use super::{
+        AstScope, CheckFlags, PreparedSymbolTable, SymbolData, SymbolStore,
+        should_replace_value_declaration,
+    };
     use crate::{EscapedName, InternalSymbolName, SymbolFlags};
 
     fn source_scope(store: &mut SymbolStore, file: u32, text: &str) -> (AstScope, NodeRef) {
