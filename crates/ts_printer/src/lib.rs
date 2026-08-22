@@ -37050,34 +37050,36 @@ impl Printer<'_> {
                 else {
                     return false;
                 };
-                clause.phase_modifier.is_none() && clause.named_bindings.is_none_or(|bindings| {
-                    let Some(NodeData::NamedImports(imports)) =
-                        self.arena.get(bindings).map(|node| &node.data)
-                    else {
-                        return true;
-                    };
-                    imports.elements.nodes.iter().all(|specifier| {
+                clause.phase_modifier.is_none()
+                    && clause.named_bindings.is_none_or(|bindings| {
+                        let Some(NodeData::NamedImports(imports)) =
+                            self.arena.get(bindings).map(|node| &node.data)
+                        else {
+                            return true;
+                        };
+                        imports.elements.nodes.iter().all(|specifier| {
                         matches!(
                             self.arena.get(*specifier).map(|node| &node.data),
                             Some(NodeData::ImportSpecifier(specifier)) if !specifier.is_type_only
                         )
                     })
-                })
+                    })
             }),
             NodeData::ExportDeclaration(export) => {
-                !export.is_type_only && export.export_clause.is_none_or(|clause| {
-                    let Some(NodeData::NamedExports(exports)) =
-                        self.arena.get(clause).map(|node| &node.data)
-                    else {
-                        return true;
-                    };
-                    exports.elements.nodes.iter().all(|specifier| {
+                !export.is_type_only
+                    && export.export_clause.is_none_or(|clause| {
+                        let Some(NodeData::NamedExports(exports)) =
+                            self.arena.get(clause).map(|node| &node.data)
+                        else {
+                            return true;
+                        };
+                        exports.elements.nodes.iter().all(|specifier| {
                         matches!(
                             self.arena.get(*specifier).map(|node| &node.data),
                             Some(NodeData::ExportSpecifier(specifier)) if !specifier.is_type_only
                         )
                     })
-                })
+                    })
             }
             NodeData::ExportAssignment(export) => {
                 !export.is_export_equals
