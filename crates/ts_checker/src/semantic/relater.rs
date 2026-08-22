@@ -27,7 +27,7 @@ use super::{
     classes::{ClassHeritageMembersValidation, validate_class_heritage_members},
     derived_types::DerivedObjectLiteralValidation,
     enums,
-    ids::{SignatureId, TypeId},
+    ids::{IndexInfoId, SignatureId, TypeId},
     instantiated_members::{GenericInterfaceMemberError, validate_generic_interface_members},
     intersection_types::IntersectionTypeProjection,
     links::{MembersOrExportsResolutionKind, ValueSymbolLinks},
@@ -37,12 +37,14 @@ use super::{
         RelationComparisonResult, RelationKeyUnavailable, RelationKind, SignatureCheckMode,
     },
     signatures::Ternary,
-    store::{RelationObservationToken, SemanticStore},
+    store::{RelationObservationToken, SemanticStore, SourceNodeParent},
     structured_members::{
         InterfaceHeritageMembersValidation, validate_interface_heritage_members,
         validate_planned_interface_heritage_members,
     },
-    type_records::{CacheHashKey, ConstrainedTypeData, TypeCacheState, TypeData, TypeRecord},
+    type_records::{
+        CacheHashKey, ConstrainedTypeData, StructuredTypeData, TypeCacheState, TypeData, TypeRecord,
+    },
     types::{ObjectFlags, TypeFlags},
 };
 
@@ -346,6 +348,7 @@ const PINNED_EXPANDING_DEPTH: usize = 3;
 struct ResolvedObjectMembers {
     members: Option<SymbolTableId>,
     properties: Vec<SemanticSymbolId>,
+    index_infos: Vec<IndexInfoId>,
     property_origin: ObjectPropertyOrigin,
     call_signature: Option<ValidatedSingleCallable>,
     exact_callable: bool,
@@ -1305,6 +1308,9 @@ impl<'store> RelaterSession<'store> {
                     intersection_state,
                 );
             }
+            if self.callable_tuple_relation(source, target)? {
+                return Ok(Ternary::False);
+            }
             if let Some(arguments) = self.canonical_array_reference_arguments(source, target)? {
                 return match arguments {
                     CanonicalArrayReferenceArguments::Related { source, target } => self
@@ -1380,6 +1386,31 @@ impl<'store> RelaterSession<'store> {
             });
         }
         Ok(Ternary::False)
+    }
+
+    /// A property-free function cannot satisfy a canonical tuple, and a tuple
+    /// cannot satisfy a required call signature.
+    fn callable_tuple_relation(
+        &self,
+        source: TypeId,
+        target: TypeId,
+    ) -> Result<bool, RelationUnavailable> {
+        let source_callable = matches!(
+            validate_stored_single_callable(self.store, source),
+            StoredSingleCallableValidation::Valid { .. }
+        );
+        let target_callable = matches!(
+            validate_stored_single_callable(self.store, target),
+            StoredSingleCallableValidation::Valid { .. }
+        );
+        if !source_callable && !target_callable {
+            return Ok(false);
+        }
+        let tuple = if source_callable { target } else { source };
+        self.store
+            .canonical_tuple_shape(tuple)
+            .map(|shape| shape.is_some())
+            .map_err(|_| RelationUnavailable::InvalidStructuredMembers(tuple))
     }
 
     fn recursive_type_related_to(
@@ -1625,6 +1656,15 @@ impl<'store> RelaterSession<'store> {
                 target,
                 source_members.call_signature.as_ref(),
                 target_members.call_signature.as_ref(),
+                intersection_state,
+            )?;
+        }
+        if result != Ternary::False {
+            result &= self.index_signatures_related_to(
+                source,
+                target,
+                &source_members,
+                &target_members,
                 intersection_state,
             )?;
         }
@@ -2024,19 +2064,18 @@ impl<'store> RelaterSession<'store> {
         // Pinned `hasExcessProperties` treats the empty object as an open
         // target and exempts the global Object target only for assignable and
         // comparable relations. Subtype relations retain fresh-literal excess
-        // checking against those targets. Index signatures and
-        // Union targets remain outside this property-only slice; admitted
-        // intersections expose their already-validated combined property table.
+        // checking against those targets. A validated index signature accepts
+        // every property name in its key domain.
         if matches!(
             self.relation,
             RelationKind::Assignable | RelationKind::Comparable
-        ) && (target_members.properties.is_empty()
+        ) && (target_members.properties.is_empty() && target_members.index_infos.is_empty()
             || self.is_direct_global_object_type(target)?)
         {
             return Ok(false);
         }
         let source_members = self.resolved_object_property_surface(source, true)?;
-        if target_members.properties.is_empty() {
+        if target_members.properties.is_empty() && target_members.index_infos.is_empty() {
             return Ok(!source_members.properties.is_empty());
         }
         let target_members_id = target_members.members;
@@ -2052,7 +2091,13 @@ impl<'store> RelaterSession<'store> {
             .and_then(|members| self.store.symbol_table(members))
             .ok_or(RelationUnavailable::InvalidStructuredMembers(target))?;
         for name in source_names {
-            if target_table.get(name.as_ref()).is_none() {
+            if target_table.get(name.as_ref()).is_none()
+                && !self.index_signature_accepts_name(
+                    target,
+                    &target_members.index_infos,
+                    name.as_ref(),
+                )?
+            {
                 return Ok(true);
             }
         }
@@ -2342,6 +2387,129 @@ impl<'store> RelaterSession<'store> {
                 return Ok(Ternary::False);
             }
             result &= related;
+        }
+        Ok(result)
+    }
+
+    fn index_signature_accepts_name(
+        &self,
+        owner: TypeId,
+        indexes: &[IndexInfoId],
+        name: ts_binder::EscapedNameRef<'_>,
+    ) -> Result<bool, RelationUnavailable> {
+        let Some(name) = name.as_utf8() else {
+            return Ok(false);
+        };
+        for index in indexes {
+            let info = self
+                .store
+                .index_info(*index)
+                .ok_or(RelationUnavailable::InvalidStructuredMembers(owner))?;
+            if info.key_type() == self.bootstrap.string_type
+                || info.key_type() == self.bootstrap.number_type
+                    && ts_jsnum::from_string(name).to_string() == name
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn index_signatures_related_to(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        source_members: &ResolvedObjectMembers,
+        target_members: &ResolvedObjectMembers,
+        intersection_state: IntersectionState,
+    ) -> Result<Ternary, RelationUnavailable> {
+        if self.relation.is_identity()
+            && source_members.index_infos.len() != target_members.index_infos.len()
+        {
+            return Ok(Ternary::False);
+        }
+
+        let mut result = Ternary::True;
+        for target_index in &target_members.index_infos {
+            let target_info = self
+                .store
+                .index_info(*target_index)
+                .ok_or(RelationUnavailable::InvalidStructuredMembers(target))?;
+            let target_key = target_info.key_type();
+            let target_value = target_info.value_type();
+            let target_readonly = target_info.is_readonly();
+            if !self.relation.is_identity()
+                && self.relation != RelationKind::StrictSubtype
+                && target_key == self.bootstrap.string_type
+                && self
+                    .store
+                    .type_flags(target_value)?
+                    .intersects(TypeFlags::ANY)
+            {
+                continue;
+            }
+
+            let source_index = source_members.index_infos.iter().find_map(|index| {
+                let info = self.store.index_info(*index)?;
+                (info.key_type() == target_key
+                    || !self.relation.is_identity()
+                        && info.key_type() == self.bootstrap.string_type
+                        && target_key == self.bootstrap.number_type)
+                    .then_some((info.value_type(), info.is_readonly()))
+            });
+            if let Some((source_value, source_readonly)) = source_index {
+                if self.relation.is_identity() && source_readonly != target_readonly {
+                    return Ok(Ternary::False);
+                }
+                let related = self.is_related_to_ex(
+                    source_value,
+                    target_value,
+                    RecursionFlags::BOTH,
+                    intersection_state,
+                )?;
+                if related == Ternary::False {
+                    return Ok(Ternary::False);
+                }
+                result &= related;
+                continue;
+            }
+            if self.relation.is_identity()
+                || intersection_state.intersects(IntersectionState::SOURCE)
+                || self.relation == RelationKind::StrictSubtype
+                    && !self.is_fresh_object_literal(source)?
+                || !self
+                    .store
+                    .type_payload(source)
+                    .and_then(TypeRecord::symbol)
+                    .and_then(|owner| self.store.symbol(owner))
+                    .is_some_and(|owner| {
+                        owner
+                            .flags()
+                            .intersects(SymbolFlags::OBJECT_LITERAL | SymbolFlags::TYPE_LITERAL)
+                    })
+            {
+                return Ok(Ternary::False);
+            }
+
+            for property in &source_members.properties {
+                let name = self
+                    .property_symbol(*property, source_members.property_origin)?
+                    .name()
+                    .to_owned();
+                if !self.index_signature_accepts_name(target, &[*target_index], name.as_ref())? {
+                    continue;
+                }
+                let related = self.is_related_to_ex(
+                    self.property_type(*property)?,
+                    target_value,
+                    RecursionFlags::BOTH,
+                    intersection_state,
+                )?;
+                if related == Ternary::False {
+                    return Ok(Ternary::False);
+                }
+                result &= related;
+            }
         }
         Ok(result)
     }
@@ -2963,6 +3131,18 @@ impl<'store> RelaterSession<'store> {
             ObjectPropertyOrigin::GenericReference(reference)
                 if record.flags().contains(SymbolFlags::TRANSIENT) =>
             {
+                let Some(validated) = validate_generic_interface_members(
+                    self.store,
+                    reference,
+                    self.global_types.map(|globals| globals.array_targets),
+                )
+                .map_err(|_| RelationUnavailable::UnsupportedProperty(symbol))?
+                else {
+                    return Err(RelationUnavailable::UnresolvedStructuredMembers(reference));
+                };
+                if !validated.properties().contains(&symbol) {
+                    return Err(RelationUnavailable::UnsupportedProperty(symbol));
+                }
                 let Some(links) = self.store.value_symbol_links(symbol) else {
                     return Err(RelationUnavailable::UnsupportedProperty(symbol));
                 };
@@ -2972,11 +3152,16 @@ impl<'store> RelaterSession<'store> {
                 let Some(target_record) = self.store.symbol(target) else {
                     return Err(RelationUnavailable::UnsupportedProperty(symbol));
                 };
-                let mapper_valid = links
-                    .mapper
-                    .is_some_and(|mapper| self.store.mapper_payload(mapper).is_some());
-                let expected_checks =
-                    CheckFlags::INSTANTIATED | (target_record.check_flags() & CheckFlags::READONLY);
+                let mapper_valid = links.mapper == validated.mapper()
+                    && links
+                        .mapper
+                        .is_some_and(|mapper| self.store.mapper_payload(mapper).is_some());
+                let expected_checks = CheckFlags::INSTANTIATED
+                    | (target_record.check_flags()
+                        & (CheckFlags::READONLY
+                            | CheckFlags::LATE
+                            | CheckFlags::OPTIONAL_PARAMETER
+                            | CheckFlags::REST_PARAMETER));
                 let reference_owner = self
                     .store
                     .type_payload(reference)
@@ -2992,6 +3177,17 @@ impl<'store> RelaterSession<'store> {
                     && record.exports().is_none()
                     && record.export_symbol().is_none()
                     && mapper_valid
+                    && links
+                        == &(ValueSymbolLinks {
+                            resolved_type: links.resolved_type,
+                            target: Some(target),
+                            mapper: validated.mapper(),
+                            name_type: self
+                                .store
+                                .value_symbol_links(target)
+                                .and_then(|links| links.name_type),
+                            ..ValueSymbolLinks::default()
+                        })
                     && self.store.get_merged_symbol(symbol) == Some(symbol)
                 {
                     Ok(record)
@@ -3472,6 +3668,7 @@ impl<'store> RelaterSession<'store> {
             return Ok(ResolvedObjectMembers {
                 members: None,
                 properties: Vec::new(),
+                index_infos: Vec::new(),
                 property_origin: ObjectPropertyOrigin::Declared,
                 call_signature: None,
                 exact_callable: true,
@@ -3524,6 +3721,92 @@ impl<'store> RelaterSession<'store> {
         }))
     }
 
+    fn validated_declared_index_infos(
+        &mut self,
+        type_id: TypeId,
+        owner: Option<SemanticSymbolId>,
+        structured: &StructuredTypeData,
+        properties: &[SemanticSymbolId],
+    ) -> Result<Vec<IndexInfoId>, RelationUnavailable> {
+        let indexes = structured.index_infos.as_deref().unwrap_or_default();
+        if indexes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let [index] = indexes else {
+            return Err(RelationUnavailable::StructuredIndexInfos(type_id));
+        };
+        let Some(owner) = owner else {
+            return Err(RelationUnavailable::StructuredIndexInfos(type_id));
+        };
+        let (key_type, value_type, declaration, has_index_symbol, has_components) = {
+            let info = self
+                .store
+                .index_info(*index)
+                .ok_or(RelationUnavailable::InvalidStructuredMembers(type_id))?;
+            let declaration = info
+                .declaration()
+                .ok_or(RelationUnavailable::StructuredIndexInfos(type_id))?;
+            (
+                info.key_type(),
+                info.value_type(),
+                declaration,
+                info.index_symbol().is_some(),
+                !info.components().is_empty(),
+            )
+        };
+        let (owner_flags, owner_members, owner_declaration) = {
+            let owner_record = self
+                .store
+                .symbol(owner)
+                .ok_or(RelationUnavailable::InvalidStructuredMembers(type_id))?;
+            let Some([declaration]) = owner_record.declarations() else {
+                return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
+            };
+            (owner_record.flags(), owner_record.members(), *declaration)
+        };
+        let members = structured
+            .members
+            .ok_or(RelationUnavailable::InvalidStructuredMembers(type_id))?;
+        self.observe_symbol_table(members);
+        let table = self
+            .store
+            .symbol_table(members)
+            .ok_or(RelationUnavailable::InvalidStructuredMembers(type_id))?;
+        let index_symbol = table
+            .get(InternalSymbolName::Index.as_ref())
+            .ok_or(RelationUnavailable::InvalidStructuredMembers(type_id))?;
+        let index_record = self
+            .store
+            .symbol(index_symbol)
+            .ok_or(RelationUnavailable::InvalidStructuredMembers(type_id))?;
+        if !properties.is_empty()
+            || owner_flags != SymbolFlags::TYPE_LITERAL && owner_flags != SymbolFlags::INTERFACE
+            || owner_members != Some(members)
+            || self.store.source_node_kind(declaration) != Some(SyntaxKind::IndexSignature)
+            || self.store.source_node_parent(declaration)
+                != Some(SourceNodeParent::Parent(owner_declaration))
+            || key_type != self.bootstrap.string_type && key_type != self.bootstrap.number_type
+            || self.store.type_payload(value_type).is_none()
+            || has_index_symbol
+            || has_components
+            || index_record.flags() != SymbolFlags::SIGNATURE
+            || index_record.check_flags() != CheckFlags::NONE
+            || index_record.name() != InternalSymbolName::Index.as_ref()
+            || index_record
+                .declarations()
+                .is_none_or(|declarations| !declarations.contains(&declaration))
+            || index_record.value_declaration().is_some()
+            || index_record.parent() != Some(owner)
+            || index_record.members().is_some()
+            || index_record.exports().is_some()
+            || index_record.export_symbol().is_some()
+            || self.store.get_merged_symbol(index_symbol) != Some(index_symbol)
+        {
+            return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
+        }
+        Ok(vec![*index])
+    }
+
     fn resolved_object_members(
         &mut self,
         type_id: TypeId,
@@ -3538,6 +3821,7 @@ impl<'store> RelaterSession<'store> {
             return Ok(ResolvedObjectMembers {
                 members: Some(projection.members),
                 properties: projection.properties,
+                index_infos: Vec::new(),
                 property_origin: ObjectPropertyOrigin::Intersection(type_id),
                 call_signature: None,
                 exact_callable: false,
@@ -3564,6 +3848,7 @@ impl<'store> RelaterSession<'store> {
             return Ok(ResolvedObjectMembers {
                 members,
                 properties: Vec::new(),
+                index_infos: Vec::new(),
                 property_origin: ObjectPropertyOrigin::Declared,
                 call_signature: Some(call_signature),
                 exact_callable: true,
@@ -3622,14 +3907,9 @@ impl<'store> RelaterSession<'store> {
         {
             return Err(RelationUnavailable::StructuredSignatures(type_id));
         }
-        if structured
-            .index_infos
-            .as_ref()
-            .is_some_and(|values| !values.is_empty())
-        {
-            return Err(RelationUnavailable::StructuredIndexInfos(type_id));
-        }
         let properties = structured.properties.clone().unwrap_or_default();
+        let index_infos =
+            self.validated_declared_index_infos(type_id, record_symbol, &structured, &properties)?;
         let class_members = if property_origin.is_declared() {
             validate_class_heritage_members(self.store, type_id)
         } else {
@@ -3749,10 +4029,13 @@ impl<'store> RelaterSession<'store> {
                     .store
                     .symbol_table(members)
                     .ok_or(RelationUnavailable::InvalidStructuredMembers(type_id))?;
-                if table.len() != properties.len() {
+                if table.len() != properties.len() + usize::from(!index_infos.is_empty()) {
                     return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
                 }
                 for (name, property) in table.iter() {
+                    if !index_infos.is_empty() && name == InternalSymbolName::Index.as_ref() {
+                        continue;
+                    }
                     if property_names
                         .get(&property)
                         .is_none_or(|property_name| property_name.as_ref() != name)
@@ -3774,6 +4057,7 @@ impl<'store> RelaterSession<'store> {
         Ok(ResolvedObjectMembers {
             members: structured.members,
             properties,
+            index_infos,
             property_origin,
             call_signature: None,
             exact_callable: false,
@@ -6060,6 +6344,132 @@ mod tests {
     }
 
     #[test]
+    fn generic_interface_relations_revalidate_proxy_mappers_and_cached_types() {
+        let mut fixture =
+            function_relation_fixture("interface Box<T> { value: T; readonly label: string }");
+        let owner = {
+            let globals = fixture.store.intrinsic_bootstrap().unwrap().globals;
+            fixture
+                .store
+                .symbol_table(globals)
+                .unwrap()
+                .get_source("Box")
+                .unwrap()
+        };
+        let target = {
+            let host = relation_host(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            );
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_declared_type_of_symbol(owner)
+            .unwrap()
+        };
+        let (parameter, string, number) = {
+            let TypeData::Interface(interface) = fixture.store.type_payload(target).unwrap().data()
+            else {
+                panic!("Box must retain its generic interface target")
+            };
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            (
+                interface
+                    .reference
+                    .resolved_type_arguments
+                    .as_ref()
+                    .unwrap()[0],
+                bootstrap.string_type,
+                bootstrap.number_type,
+            )
+        };
+        let plan = {
+            let host = relation_host(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            );
+            super::super::object_members::plan_generic_interface(&fixture.store, &host, owner)
+                .unwrap()
+        };
+        assert!(fixture.store.publish_interface_no_base_resolution(target));
+        super::super::object_members::publish_generic_interface_declared_members(
+            &mut fixture.store,
+            &plan,
+            target,
+            &[parameter, string],
+        )
+        .unwrap();
+        fixture
+            .store
+            .resolve_generic_interface_members(target, None)
+            .unwrap();
+        let reference = fixture
+            .store
+            .create_direct_generic_reference_type(target, &[string])
+            .unwrap();
+        let proxy = fixture
+            .store
+            .resolve_generic_interface_property(reference, "value", None)
+            .unwrap()
+            .unwrap()
+            .symbol();
+        let value = alloc_typed_property(&mut fixture.store, "value", string, false);
+        let label = alloc_typed_property(&mut fixture.store, "label", string, false);
+        let expected = alloc_property_object(&mut fixture.store, vec![value, label]);
+        assert_eq!(
+            fixture.store.is_type_assignable_to(reference, expected),
+            Ok(true)
+        );
+
+        let original = fixture.store.value_symbol_links(proxy).unwrap().clone();
+        let wrong_mapper = fixture
+            .store
+            .new_type_mapper(vec![parameter], vec![number])
+            .unwrap();
+        assert!(fixture.store.set_value_symbol_links(
+            proxy,
+            ValueSymbolLinks {
+                mapper: Some(wrong_mapper),
+                ..original.clone()
+            },
+        ));
+        let before = fixture.store.relation_state_snapshot();
+        assert_eq!(
+            fixture.store.is_type_assignable_to(reference, expected),
+            Err(RelationUnavailable::InvalidStructuredMembers(reference))
+        );
+        assert_eq!(fixture.store.relation_state_snapshot(), before);
+
+        assert!(
+            fixture
+                .store
+                .set_value_symbol_links(proxy, original.clone())
+        );
+        assert_eq!(
+            fixture.store.is_type_assignable_to(reference, expected),
+            Ok(true)
+        );
+        assert!(fixture.store.set_value_symbol_links(
+            proxy,
+            ValueSymbolLinks {
+                resolved_type: Some(number),
+                ..original
+            },
+        ));
+        let before = fixture.store.relation_state_snapshot();
+        assert_eq!(
+            fixture.store.is_type_assignable_to(reference, expected),
+            Err(RelationUnavailable::InvalidStructuredMembers(reference))
+        );
+        assert_eq!(fixture.store.relation_state_snapshot(), before);
+    }
+
+    #[test]
     fn warmed_large_union_observes_validator_only_constituents_after_a_match() {
         let mut store = initialized(true);
         let literals = ["alpha", "beta", "gamma", "delta"]
@@ -6261,6 +6671,38 @@ mod tests {
                     .is_type_assignable_to_with_strict_function_types(source, target, true),
                 Ok(expected)
             );
+        }
+    }
+
+    #[test]
+    fn canonical_tuples_and_property_free_functions_are_never_related() {
+        let mut fixture = function_relation_fixture(
+            "type Callable = () => void; type Single = [string]; type Empty = [];",
+        );
+        let (callable, _) = query_function_alias(&mut fixture, "Callable");
+        let single = query_type_alias(&mut fixture, "Single");
+        let empty = query_type_alias(&mut fixture, "Empty");
+
+        for tuple in [single, empty] {
+            for relation in [
+                RelationKind::Assignable,
+                RelationKind::Subtype,
+                RelationKind::StrictSubtype,
+                RelationKind::Comparable,
+            ] {
+                assert_eq!(
+                    fixture.store.is_type_related_to_with_strict_function_types(
+                        callable, tuple, relation, true,
+                    ),
+                    Ok(false)
+                );
+                assert_eq!(
+                    fixture.store.is_type_related_to_with_strict_function_types(
+                        tuple, callable, relation, true,
+                    ),
+                    Ok(false)
+                );
+            }
         }
     }
 
@@ -8992,6 +9434,71 @@ mod tests {
         let missing = alloc_property_object(&mut store, vec![missing_z]);
         assert_eq!(store.is_type_assignable_to(source, missing), Ok(false));
         assert_eq!(store.relation_cache_size(RelationKind::Assignable), 3);
+    }
+
+    #[test]
+    fn source_declared_index_signatures_compare_inferred_properties_and_value_types() {
+        let mut fixture = function_relation_fixture(concat!(
+            "type Numbers = { [key: string]: number }; ",
+            "type Strings = { [key: string]: string }; ",
+            "type ReadonlyNumbers = { readonly [key: string]: number }; ",
+            "type NumericKeys = { [key: number]: number }; ",
+            "type NumberProperty = { value: number };",
+        ));
+        let numbers = query_type_alias(&mut fixture, "Numbers");
+        let strings = query_type_alias(&mut fixture, "Strings");
+        let readonly_numbers = query_type_alias(&mut fixture, "ReadonlyNumbers");
+        let numeric_keys = query_type_alias(&mut fixture, "NumericKeys");
+        let declared = query_type_alias(&mut fixture, "NumberProperty");
+        let (number, string, any) = {
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.number_type,
+                bootstrap.string_type,
+                bootstrap.any_type,
+            )
+        };
+        let value = alloc_typed_property(&mut fixture.store, "value", number, false);
+        let fresh_number = alloc_fresh_property_object(&mut fixture.store, vec![value]);
+        let wrong = alloc_typed_property(&mut fixture.store, "value", string, false);
+        let fresh_string = alloc_fresh_property_object(&mut fixture.store, vec![wrong]);
+        let dynamic = alloc_typed_property(&mut fixture.store, "value", any, false);
+        let fresh_any = alloc_fresh_property_object(&mut fixture.store, vec![dynamic]);
+
+        assert_eq!(
+            fixture.store.is_type_assignable_to(fresh_number, numbers),
+            Ok(true)
+        );
+        assert_eq!(
+            fixture.store.is_type_assignable_to(fresh_string, numbers),
+            Ok(false)
+        );
+        assert_eq!(
+            fixture.store.is_type_assignable_to(fresh_any, numbers),
+            Ok(true)
+        );
+        assert_eq!(
+            fixture.store.is_type_assignable_to(declared, numbers),
+            Ok(true)
+        );
+        assert_eq!(
+            fixture.store.is_type_assignable_to(numbers, strings),
+            Ok(false)
+        );
+        assert_eq!(
+            fixture.store.is_type_assignable_to(numbers, numeric_keys),
+            Ok(true)
+        );
+        assert_eq!(
+            fixture.store.is_type_assignable_to(numeric_keys, numbers),
+            Ok(false)
+        );
+        assert_eq!(
+            fixture
+                .store
+                .is_type_identical_to(numbers, readonly_numbers),
+            Ok(false)
+        );
     }
 
     #[test]
