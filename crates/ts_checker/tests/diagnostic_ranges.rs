@@ -5,7 +5,7 @@ use ts_binder::{
 };
 use ts_checker::semantic::{
     CanonicalCheckerContext, CanonicalCheckerDiagnosticRange, CanonicalCheckerDiagnostics,
-    CanonicalCheckerOptions,
+    CanonicalCheckerOptions, IntrinsicBootstrapOptions,
 };
 use ts_core::{TextPos, TextRange};
 use ts_diagnostics::{Diagnostic, message_by_code};
@@ -148,6 +148,95 @@ fn discriminated_union_excess_properties_keep_exact_names_in_both_orders() {
         let start = usize::try_from(node.range.start.get()).unwrap();
         let end = usize::try_from(node.range.end.get()).unwrap();
         assert_eq!(&text[start..end], "subkind");
+        assert_eq!(diagnostic.range_override, None);
+        assert!(diagnostic.related_information.is_empty());
+    }
+
+    let published = context.diagnostics().clone();
+    context.check_source_file(file).unwrap();
+    assert_eq!(context.diagnostics(), &published);
+}
+
+#[test]
+fn exact_optional_assignments_emit_complete_property_relation_chains() {
+    let text = concat!(
+        "type Optional = { value?: string };\n",
+        "declare let uncertain: string | undefined;\n",
+        "const direct: Optional = { value: undefined };\n",
+        "const union: Optional = { value: uncertain };\n",
+    );
+    let parsed = parse_source_file(text);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+
+    let file = FileId::new(10);
+    let mut binder = CanonicalBinder::new();
+    binder
+        .bind_source_file_with_facts(
+            &parsed.arena,
+            parsed.source_file,
+            file,
+            CanonicalSourceFileFacts::new(
+                EscapedName::source("\"/project/exact-optional-assignment.ts\""),
+                CanonicalSourceLanguage::TypeScript,
+                false,
+                CanonicalModuleState::Script,
+            ),
+        )
+        .unwrap();
+    binder
+        .bind_typescript_declaration_slice(&parsed.arena, file)
+        .unwrap();
+    let mut context = CanonicalCheckerContext::new(
+        binder.finish(),
+        [(file, &parsed.arena)].into_iter().collect(),
+        CanonicalCheckerOptions {
+            intrinsic: IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                exact_optional_property_types: true,
+            },
+            ..CanonicalCheckerOptions::default()
+        },
+    )
+    .unwrap();
+
+    context.check_source_file(file).unwrap();
+
+    let diagnostics = context.diagnostics().as_slice();
+    assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+    for (diagnostic, name, expected) in [
+        (
+            &diagnostics[0],
+            "direct",
+            concat!(
+                "Type '{ value: undefined; }' is not assignable to type 'Optional' ",
+                "with 'exactOptionalPropertyTypes: true'. Consider adding 'undefined' ",
+                "to the types of the target's properties.\n",
+                "  Types of property 'value' are incompatible.\n",
+                "    Type 'undefined' is not assignable to type 'string'.",
+            ),
+        ),
+        (
+            &diagnostics[1],
+            "union",
+            concat!(
+                "Type '{ value: string | undefined; }' is not assignable to type ",
+                "'Optional' with 'exactOptionalPropertyTypes: true'. Consider ",
+                "adding 'undefined' to the types of the target's properties.\n",
+                "  Types of property 'value' are incompatible.\n",
+                "    Type 'string | undefined' is not assignable to type 'string'.\n",
+                "      Type 'undefined' is not assignable to type 'string'.",
+            ),
+        ),
+    ] {
+        assert_eq!(diagnostic.diagnostic.code(), 2375);
+        assert_eq!(diagnostic.diagnostic.render().unwrap(), expected);
+        let node = parsed
+            .arena
+            .get(diagnostic.node.expect("assignment has an anchor").node)
+            .unwrap();
+        let start = usize::try_from(node.range.start.get()).unwrap();
+        let end = usize::try_from(node.range.end.get()).unwrap();
+        assert_eq!(&text[start..end], name);
         assert_eq!(diagnostic.range_override, None);
         assert!(diagnostic.related_information.is_empty());
     }

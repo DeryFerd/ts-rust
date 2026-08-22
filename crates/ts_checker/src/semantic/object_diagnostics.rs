@@ -14,6 +14,7 @@
 use std::collections::HashSet;
 
 use ts_ast::{NodeData, NodeRef, SyntaxKind};
+use ts_binder::SymbolFlags;
 use ts_diagnostics::{Diagnostic, message_by_code};
 
 use super::{
@@ -139,6 +140,35 @@ fn diagnostics_for_failed_assignment_once(
 ) -> Result<Vec<CanonicalCheckerDiagnostic>, SourceCheckError> {
     validate_checked_expression_shape(expression, checked)?;
     let flags = display_flags(options);
+    if options.intrinsic.exact_optional_property_types
+        && matches!(
+            expression.unparenthesized().kind,
+            PlannedExpressionKind::Object { .. }
+        )
+    {
+        let details = exact_optional_property_mismatch_details(
+            store,
+            host,
+            global_types,
+            checked.result,
+            target_type,
+            flags,
+        )?;
+        if !details.is_empty() {
+            let AssignabilityErrorDisplay { source, target } =
+                get_type_names_for_assignability_error_with_host_global_types_and_flags(
+                    store,
+                    host,
+                    global_types,
+                    checked.result,
+                    target_type,
+                    flags,
+                )?;
+            let mut diagnostic = primary(2375, fallback_node, vec![source, target])?;
+            diagnostic.diagnostic.details = details;
+            return Ok(vec![diagnostic]);
+        }
+    }
     let mut elaborated = elaborate_expression(
         store,
         host,
@@ -811,33 +841,155 @@ pub(super) fn declared_property_mismatch_details(
         {
             return Ok(Vec::new());
         }
-        let property_message = Diagnostic::with_arguments(
-            message_by_code(2326).ok_or(SourceCheckError::MissingDiagnostic(2326))?,
-            [name],
-        )
-        .render()
-        .expect("TS2326 has one formatting argument");
+        return scalar_property_mismatch_details(
+            store,
+            host,
+            global_types,
+            name,
+            source_property.type_,
+            target_property.type_,
+            None,
+            flags,
+        );
+    }
+    Ok(Vec::new())
+}
+
+/// Returns the exact property relation chain for an optional value that
+/// contains `undefined` when its target property does not permit it.
+#[allow(clippy::too_many_arguments)] // Call and assignment diagnostics share these exact inputs.
+pub(super) fn exact_optional_property_mismatch_details(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source_type: TypeId,
+    target_type: TypeId,
+    flags: CanonicalTypeFormatFlags,
+) -> Result<Vec<String>, SourceCheckError> {
+    let undefined = store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| bootstrap.undefined_type)
+        .ok_or(RelationUnavailable::MissingBootstrap)?;
+    let source_record = store
+        .type_payload(source_type)
+        .ok_or(RelationUnavailable::Type(source_type))?;
+    let Some(source_members) = source_record
+        .data()
+        .structured()
+        .and_then(|structured| structured.members)
+        .and_then(|members| store.symbol_table(members))
+    else {
+        return Ok(Vec::new());
+    };
+    let target_record = store
+        .type_payload(target_type)
+        .ok_or(RelationUnavailable::Type(target_type))?;
+    let Some(target_properties) = target_record
+        .data()
+        .structured()
+        .and_then(|structured| structured.properties.as_deref())
+    else {
+        return Ok(Vec::new());
+    };
+
+    for target_property in target_properties {
+        let target_symbol = store
+            .symbol(*target_property)
+            .ok_or_else(|| invalid_structure(target_type))?;
+        if !target_symbol.flags().contains(SymbolFlags::OPTIONAL) {
+            continue;
+        }
+        let Some(source_property) = source_members.get(target_symbol.name()) else {
+            continue;
+        };
+        let source_property_type = store
+            .value_symbol_links(source_property)
+            .and_then(|links| links.resolved_type)
+            .ok_or_else(|| invalid_structure(source_type))?;
+        let target_property_type = store
+            .value_symbol_links(*target_property)
+            .and_then(|links| links.resolved_type)
+            .ok_or_else(|| invalid_structure(target_type))?;
+        if !contains_undefined(store, source_property_type, undefined)?
+            || contains_undefined(store, target_property_type, undefined)?
+            || !is_terminal_scalar_relation_leaf(store, target_property_type)
+        {
+            continue;
+        }
+
+        let name = target_symbol
+            .name()
+            .as_utf8()
+            .ok_or(RelationUnavailable::UnsupportedProperty(*target_property))?;
+        let nested = (source_property_type != undefined).then_some(undefined);
+        return scalar_property_mismatch_details(
+            store,
+            host,
+            global_types,
+            name,
+            source_property_type,
+            target_property_type,
+            nested,
+            flags,
+        );
+    }
+    Ok(Vec::new())
+}
+
+fn contains_undefined(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    undefined: TypeId,
+) -> Result<bool, SourceCheckError> {
+    if type_ == undefined {
+        return Ok(true);
+    }
+    let record = store
+        .type_payload(type_)
+        .ok_or(RelationUnavailable::Type(type_))?;
+    Ok(matches!(record.data(), TypeData::Union(union) if union.union.types.contains(&undefined)))
+}
+
+#[allow(clippy::too_many_arguments)] // Preserve the source, target, and nested relation identities.
+fn scalar_property_mismatch_details(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    name: &str,
+    source_type: TypeId,
+    target_type: TypeId,
+    nested_source: Option<TypeId>,
+    flags: CanonicalTypeFormatFlags,
+) -> Result<Vec<String>, SourceCheckError> {
+    let property_message = Diagnostic::with_arguments(
+        message_by_code(2326).ok_or(SourceCheckError::MissingDiagnostic(2326))?,
+        [name],
+    )
+    .render()
+    .expect("TS2326 has one formatting argument");
+    let mut details = vec![format!("  {property_message}")];
+    for (source, indentation) in [(source_type, "    ")]
+        .into_iter()
+        .chain(nested_source.map(|source| (source, "      ")))
+    {
         let AssignabilityErrorDisplay { source, target } =
             get_type_names_for_assignability_error_with_host_global_types_and_flags(
                 store,
                 host,
                 global_types,
-                source_property.type_,
-                target_property.type_,
+                source,
+                target_type,
                 flags,
             )?;
-        let nested_message = Diagnostic::with_arguments(
+        let message = Diagnostic::with_arguments(
             message_by_code(2322).ok_or(SourceCheckError::MissingDiagnostic(2322))?,
             [source, target],
         )
         .render()
         .expect("TS2322 has two formatting arguments");
-        return Ok(vec![
-            format!("  {property_message}"),
-            format!("    {nested_message}"),
-        ]);
+        details.push(format!("{indentation}{message}"));
     }
-    Ok(Vec::new())
+    Ok(details)
 }
 
 fn is_terminal_scalar_relation_leaf(store: &CanonicalTypeMapperStore, type_: TypeId) -> bool {
