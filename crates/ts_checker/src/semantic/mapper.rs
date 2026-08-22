@@ -1,16 +1,14 @@
 //! Store-owned canonical type mappers.
 //!
 //! This is the dependency-closed portion of pinned `checker/mapper.go`.
-//! Simple, array, array-to-single, and merged mappers only need canonical
-//! `TypeId` identity, so they can be represented and evaluated directly.
-//! Composite mappers delegate recursive substitution to `instantiateType`, so
-//! their graph is represented here and executed by the private `instantiate`
-//! module.
-//! `DeferredTypeMapper` and `FunctionTypeMapper` retain executable callbacks;
-//! `InferenceTypeMapper` mutates an `InferenceContext`. Their constructors are
-//! intentionally absent until those owning algorithms land. Treating any of
-//! them as an identity mapper would make an unsupported semantic path look
-//! successful.
+//! Direct and callback-backed mappers are represented here. Deferred targets
+//! are called only when their source matches, and callback results are checked
+//! against their owning store before they become visible. Composite mappers
+//! delegate recursive substitution to the private `instantiate` module.
+//! `InferenceTypeMapper` remains with its owning inference algorithm because
+//! mapping can mutate an `InferenceContext`.
+
+use std::sync::Arc;
 
 use super::{
     ids::{TypeId, TypeMapperId},
@@ -53,16 +51,54 @@ enum TypeMapperData {
         sources: Vec<TypeId>,
         target: TypeId,
     },
+    Deferred {
+        sources: Vec<TypeId>,
+        targets: Vec<DeferredTypeTarget>,
+    },
+    Function(FunctionTypeMapping),
     Merged {
         first: TypeMapperId,
         second: TypeMapperId,
     },
-    #[allow(dead_code)] // Constructed by the generic signature/inference consumer.
     Composite {
         first: TypeMapperId,
         second: TypeMapperId,
     },
 }
+
+#[derive(Clone)]
+struct DeferredTypeTarget(Arc<dyn Fn() -> TypeId + Send + Sync>);
+
+impl std::fmt::Debug for DeferredTypeTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("DeferredTypeTarget(..)")
+    }
+}
+
+impl PartialEq for DeferredTypeTarget {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for DeferredTypeTarget {}
+
+#[derive(Clone)]
+struct FunctionTypeMapping(Arc<dyn Fn(TypeId) -> TypeId + Send + Sync>);
+
+impl std::fmt::Debug for FunctionTypeMapping {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("FunctionTypeMapping(..)")
+    }
+}
+
+impl PartialEq for FunctionTypeMapping {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for FunctionTypeMapping {}
 
 /// One dependency-closed mapper operation exposed to the instantiation
 /// engine. Direct mappings need no semantic recursion. Merged and composite
@@ -99,13 +135,24 @@ impl TypeMapper {
         }
     }
 
+    fn deferred(sources: Vec<TypeId>, targets: Vec<DeferredTypeTarget>) -> Self {
+        Self {
+            data: TypeMapperData::Deferred { sources, targets },
+        }
+    }
+
+    fn function(mapping: FunctionTypeMapping) -> Self {
+        Self {
+            data: TypeMapperData::Function(mapping),
+        }
+    }
+
     const fn merged(first: TypeMapperId, second: TypeMapperId) -> Self {
         Self {
             data: TypeMapperData::Merged { first, second },
         }
     }
 
-    #[allow(dead_code)] // Constructed by the generic signature/inference consumer.
     const fn composite(first: TypeMapperId, second: TypeMapperId) -> Self {
         Self {
             data: TypeMapperData::Composite { first, second },
@@ -120,9 +167,10 @@ impl TypeMapper {
             TypeMapperData::Simple { .. } => TypeMapperKind::Simple,
             TypeMapperData::Array { .. } => TypeMapperKind::Array,
             TypeMapperData::Merged { .. } => TypeMapperKind::Merged,
-            TypeMapperData::ArrayToSingle { .. } | TypeMapperData::Composite { .. } => {
-                TypeMapperKind::Unknown
-            }
+            TypeMapperData::ArrayToSingle { .. }
+            | TypeMapperData::Deferred { .. }
+            | TypeMapperData::Function(_)
+            | TypeMapperData::Composite { .. } => TypeMapperKind::Unknown,
         }
     }
 }
@@ -205,6 +253,8 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     && targets == actual_targets.as_slice()
             }
             TypeMapperData::ArrayToSingle { .. }
+            | TypeMapperData::Deferred { .. }
+            | TypeMapperData::Function(_)
             | TypeMapperData::Merged { .. }
             | TypeMapperData::Composite { .. } => false,
         };
@@ -238,6 +288,55 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         Some(self.alloc_mapper(TypeMapper::array_to_single(sources, target)))
     }
 
+    /// Creates pinned `DeferredTypeMapper` without demanding its targets.
+    ///
+    /// A target is called for each matching lookup, as in upstream. Its result
+    /// must belong to this store or the lookup fails.
+    pub fn new_deferred_type_mapper<F>(
+        &mut self,
+        sources: Vec<TypeId>,
+        targets: Vec<F>,
+    ) -> Option<TypeMapperId>
+    where
+        F: Fn() -> TypeId + Send + Sync + 'static,
+    {
+        if sources.len() != targets.len() || !self.mapper_types_are_owned(&sources) {
+            return None;
+        }
+        let targets = targets
+            .into_iter()
+            .map(|target| DeferredTypeTarget(Arc::new(target)))
+            .collect();
+        Some(self.alloc_mapper(TypeMapper::deferred(sources, targets)))
+    }
+
+    /// Creates pinned `FunctionTypeMapper` with store-validated results.
+    pub fn new_function_type_mapper<F>(&mut self, mapping: F) -> TypeMapperId
+    where
+        F: Fn(TypeId) -> TypeId + Send + Sync + 'static,
+    {
+        self.alloc_mapper(TypeMapper::function(FunctionTypeMapping(Arc::new(mapping))))
+    }
+
+    /// Maps forward type-parameter references to the canonical unknown type.
+    ///
+    /// `index` is the first unresolved inference, matching pinned
+    /// `newBackreferenceMapper`.
+    pub fn new_backreference_mapper(
+        &mut self,
+        type_parameters: &[TypeId],
+        index: usize,
+        unknown_type: TypeId,
+    ) -> Option<TypeMapperId> {
+        if index > type_parameters.len()
+            || !self.mapper_types_are_owned(type_parameters)
+            || self.type_payload(unknown_type).is_none()
+        {
+            return None;
+        }
+        self.new_array_to_single_type_mapper(type_parameters[index..].to_vec(), unknown_type)
+    }
+
     /// Pinned `mergeTypeMappers`. A nil first mapper returns `second` without
     /// allocating; otherwise mapping applies `first` and then `second`.
     pub fn merge_type_mappers(
@@ -260,7 +359,6 @@ impl SemanticStore<TypeRecord, TypeMapper> {
     /// without allocating. Otherwise a composite mapper first applies
     /// `first`; when that changes the input, the changed result is recursively
     /// instantiated through `second` rather than merely mapped as a whole.
-    #[allow(dead_code)] // Installed ahead of the generic signature/inference consumer.
     pub(super) fn combine_type_mappers(
         &mut self,
         first: Option<TypeMapperId>,
@@ -354,6 +452,19 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     type_id
                 })
             }
+            TypeMapperData::Deferred { sources, targets } => {
+                let mapped = sources
+                    .iter()
+                    .position(|source| *source == type_id)
+                    .map_or(type_id, |index| (targets[index].0)());
+                self.type_payload(mapped)?;
+                TypeMapperApplication::Direct(mapped)
+            }
+            TypeMapperData::Function(mapping) => {
+                let mapped = (mapping.0)(type_id);
+                self.type_payload(mapped)?;
+                TypeMapperApplication::Direct(mapped)
+            }
             TypeMapperData::Merged { first, second } => TypeMapperApplication::Merged {
                 first: *first,
                 second: *second,
@@ -381,12 +492,15 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             TypeMapperData::Simple { source, .. } => Some(*source),
             TypeMapperData::Array { sources, .. }
             | TypeMapperData::ArrayToSingle { sources, .. }
+            | TypeMapperData::Deferred { sources, .. }
                 if sources.len() == 1 =>
             {
                 Some(sources[0])
             }
             TypeMapperData::Array { .. }
             | TypeMapperData::ArrayToSingle { .. }
+            | TypeMapperData::Deferred { .. }
+            | TypeMapperData::Function(_)
             | TypeMapperData::Merged { .. }
             | TypeMapperData::Composite { .. } => None,
         };
@@ -432,6 +546,17 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     Some(type_id)
                 }
             }
+            TypeMapperData::Deferred { sources, targets } => {
+                let mapped = sources
+                    .iter()
+                    .position(|source| *source == type_id)
+                    .map_or(type_id, |index| (targets[index].0)());
+                self.type_payload(mapped).map(|_| mapped)
+            }
+            TypeMapperData::Function(mapping) => {
+                let mapped = (mapping.0)(type_id);
+                self.type_payload(mapped).map(|_| mapped)
+            }
             TypeMapperData::Merged { first, second } => {
                 let intermediate = self.map_type_without_instantiation(*first, type_id)?;
                 self.map_type_without_instantiation(*second, intermediate)
@@ -443,6 +568,11 @@ impl SemanticStore<TypeRecord, TypeMapper> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
     use super::*;
     use crate::semantic::{
         type_records::CacheHashKey,
@@ -594,6 +724,122 @@ mod tests {
     }
 
     #[test]
+    fn deferred_mapper_demands_only_the_first_matching_target() {
+        type DeferredTarget = Box<dyn Fn() -> TypeId + Send + Sync>;
+
+        let mut store = CanonicalTypeMapperStore::new();
+        let a = type_(&mut store, "a");
+        let b = type_(&mut store, "b");
+        let c = type_(&mut store, "c");
+        let first_calls = Arc::new(AtomicUsize::new(0));
+        let second_calls = Arc::new(AtomicUsize::new(0));
+        let first_counter = Arc::clone(&first_calls);
+        let second_counter = Arc::clone(&second_calls);
+        let targets: Vec<DeferredTarget> = vec![
+            Box::new(move || {
+                first_counter.fetch_add(1, Ordering::Relaxed);
+                b
+            }),
+            Box::new(move || {
+                second_counter.fetch_add(1, Ordering::Relaxed);
+                c
+            }),
+        ];
+        let mapper = store.new_deferred_type_mapper(vec![a, a], targets).unwrap();
+
+        assert_eq!(store.mapper_kind(mapper), Some(TypeMapperKind::Unknown));
+        assert_eq!(store.map_type(mapper, c), Some(c));
+        assert_eq!(first_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(second_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(store.map_type(mapper, a), Some(b));
+        assert_eq!(store.map_type(mapper, a), Some(b));
+        assert_eq!(first_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(second_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            store.mapper_application(mapper, a),
+            Some(TypeMapperApplication::Direct(b))
+        );
+        assert_eq!(first_calls.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn callback_mappers_reject_foreign_results_without_eager_demand() {
+        let mut store = CanonicalTypeMapperStore::new();
+        let local = type_(&mut store, "local");
+        let unchanged = type_(&mut store, "unchanged");
+        let mut foreign_store = CanonicalTypeMapperStore::new();
+        let foreign = type_(&mut foreign_store, "foreign");
+
+        let deferred = store
+            .new_deferred_type_mapper(vec![local], vec![move || foreign])
+            .unwrap();
+        assert_eq!(store.map_type(deferred, unchanged), Some(unchanged));
+        assert_eq!(store.map_type(deferred, local), None);
+        assert_eq!(store.mapper_application(deferred, local), None);
+
+        let function = store.new_function_type_mapper(
+            move |type_| {
+                if type_ == local { foreign } else { type_ }
+            },
+        );
+        assert_eq!(store.mapper_kind(function), Some(TypeMapperKind::Unknown));
+        assert_eq!(store.mapper_maps_this_only(function), Some(false));
+        assert_eq!(store.map_type(function, unchanged), Some(unchanged));
+        assert_eq!(store.map_type(function, local), None);
+        assert_eq!(store.mapper_application(function, local), None);
+    }
+
+    #[test]
+    fn function_mapper_composes_without_changing_callback_order() {
+        let mut store = CanonicalTypeMapperStore::new();
+        let a = type_(&mut store, "a");
+        let b = type_(&mut store, "b");
+        let c = type_(&mut store, "c");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let function = store.new_function_type_mapper(move |type_| {
+            counter.fetch_add(1, Ordering::Relaxed);
+            if type_ == a { b } else { type_ }
+        });
+        let second = store.new_simple_type_mapper(b, c).unwrap();
+        let merged = store.merge_type_mappers(Some(function), second).unwrap();
+
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert_eq!(store.map_type(merged, a), Some(c));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(store.map_type(merged, c), Some(c));
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn backreference_mapper_maps_only_unresolved_forward_parameters() {
+        let mut store = CanonicalTypeMapperStore::new();
+        let first = store.alloc_type_parameter(None).unwrap();
+        let second = store.alloc_type_parameter(None).unwrap();
+        let third = store.alloc_type_parameter(None).unwrap();
+        let unknown = type_(&mut store, "unknown");
+        let mapper = store
+            .new_backreference_mapper(&[first, second, third], 1, unknown)
+            .unwrap();
+
+        assert_eq!(store.mapper_kind(mapper), Some(TypeMapperKind::Unknown));
+        assert_eq!(store.map_type(mapper, first), Some(first));
+        assert_eq!(store.map_type(mapper, second), Some(unknown));
+        assert_eq!(store.map_type(mapper, third), Some(unknown));
+
+        let before = store.mapper_len();
+        assert_eq!(
+            store.new_backreference_mapper(&[first, second, third], 4, unknown),
+            None
+        );
+        assert_eq!(store.mapper_len(), before);
+        let empty = store
+            .new_backreference_mapper(&[first, second, third], 3, unknown)
+            .unwrap();
+        assert_eq!(store.map_type(empty, third), Some(third));
+    }
+
+    #[test]
     fn maps_this_only_uses_the_canonical_marker_and_not_shape() {
         let mut store = CanonicalTypeMapperStore::new();
         let ordinary = store.alloc_type_parameter(None).unwrap();
@@ -621,6 +867,9 @@ mod tests {
         let to_single = store
             .new_array_to_single_type_mapper(vec![this_type], target)
             .unwrap();
+        let deferred = store
+            .new_deferred_type_mapper(vec![this_type], vec![move || target])
+            .unwrap();
         let merged = store
             .merge_type_mappers(Some(simple_this), simple_ordinary)
             .unwrap();
@@ -630,6 +879,7 @@ mod tests {
         assert_eq!(store.mapper_maps_this_only(array_this), Some(true));
         assert_eq!(store.mapper_maps_this_only(array_many), Some(false));
         assert_eq!(store.mapper_maps_this_only(to_single), Some(true));
+        assert_eq!(store.mapper_maps_this_only(deferred), Some(true));
         assert_eq!(store.mapper_maps_this_only(merged), Some(false));
     }
 
@@ -654,6 +904,21 @@ mod tests {
         );
         assert_eq!(first.mapper_len(), before);
         assert_eq!(first.new_simple_type_mapper(second_a, first_b), None);
+        assert_eq!(first.mapper_len(), before);
+        assert_eq!(
+            first.new_deferred_type_mapper(vec![second_a], vec![move || first_b]),
+            None
+        );
+        assert_eq!(first.mapper_len(), before);
+        assert_eq!(
+            first.new_deferred_type_mapper(vec![first_a], Vec::<fn() -> TypeId>::new()),
+            None
+        );
+        assert_eq!(first.mapper_len(), before);
+        assert_eq!(
+            first.new_backreference_mapper(&[first_a, second_a], 1, first_b),
+            None
+        );
         assert_eq!(first.mapper_len(), before);
         assert_eq!(
             first.new_array_to_single_type_mapper(vec![first_a], second_b),

@@ -3,11 +3,20 @@
 //! Values are pinned to typescript-go `internal/checker/types.go` at
 //! `dc37b5249ab60e2bbce936f71b883e6c8136167e`.
 
-use ts_ast::NodeRef;
+use std::collections::HashSet;
 
-use super::ids::{
-    IndexInfoId, SemanticStoreId, SemanticSymbolId, SignatureId, TypeId, TypeMapperId,
-    TypePredicateId, TypedArena,
+use ts_ast::NodeRef;
+use ts_binder::{CheckFlags, SymbolData, SymbolFlags};
+
+use super::{
+    ids::{
+        IndexInfoId, SemanticStoreId, SemanticSymbolId, SignatureId, TypeId, TypeMapperId,
+        TypePredicateId, TypedArena,
+    },
+    links::ValueSymbolLinks,
+    mapper::CanonicalTypeMapperStore,
+    type_records::TypeData,
+    types::{ObjectFlags, TypeFlags},
 };
 
 macro_rules! impl_flag_operators {
@@ -362,6 +371,527 @@ impl Signature {
     #[must_use]
     pub const fn has_rest_parameter(&self) -> bool {
         self.flags.contains(SignatureFlags::HAS_REST_PARAMETER)
+    }
+}
+
+/// Invalid canonical input or exhausted storage during signature creation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SignatureInstantiationError {
+    InvalidSignature(SignatureId),
+    InvalidMapper(TypeMapperId),
+    InvalidTypeParameter(TypeId),
+    InvalidSymbol(SemanticSymbolId),
+    InvalidInstantiatedSymbol(SemanticSymbolId),
+    Capacity(SignatureId),
+}
+
+impl std::fmt::Display for SignatureInstantiationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidSignature(signature) => {
+                write!(
+                    formatter,
+                    "cannot instantiate invalid signature {signature:?}"
+                )
+            }
+            Self::InvalidMapper(mapper) => {
+                write!(
+                    formatter,
+                    "cannot instantiate with invalid mapper {mapper:?}"
+                )
+            }
+            Self::InvalidTypeParameter(type_parameter) => write!(
+                formatter,
+                "signature has an invalid type parameter {type_parameter:?}"
+            ),
+            Self::InvalidSymbol(symbol) => {
+                write!(formatter, "signature has an invalid symbol {symbol:?}")
+            }
+            Self::InvalidInstantiatedSymbol(symbol) => write!(
+                formatter,
+                "instantiated symbol {symbol:?} has invalid target or mapper links"
+            ),
+            Self::Capacity(signature) => write!(
+                formatter,
+                "signature instantiation exhausted storage for {signature:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SignatureInstantiationError {}
+
+struct SignatureTypeParameterPlan {
+    type_: TypeId,
+    symbol: Option<SemanticSymbolId>,
+}
+
+enum SignatureSymbolPlan {
+    Reuse(SemanticSymbolId),
+    Instantiate {
+        target: SemanticSymbolId,
+        previous_mapper: Option<TypeMapperId>,
+        data: SymbolData,
+        name_type: Option<TypeId>,
+    },
+}
+
+struct SignatureInstantiationPlan {
+    flags: SignatureFlags,
+    declaration: Option<NodeRef>,
+    min_argument_count: i32,
+    type_parameters: Vec<SignatureTypeParameterPlan>,
+    this_parameter: Option<SignatureSymbolPlan>,
+    parameters: Vec<SignatureSymbolPlan>,
+    new_symbol_count: usize,
+    combined_symbol_mapper_count: usize,
+}
+
+impl CanonicalTypeMapperStore {
+    /// Instantiates a signature while retaining fresh generic parameters.
+    ///
+    /// Parameter symbols, predicates, and return types stay unresolved until
+    /// their owning checker operation demands them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an input belongs to another store, an existing
+    /// signature or symbol is malformed, or storage cannot be reserved.
+    pub fn instantiate_signature(
+        &mut self,
+        signature: SignatureId,
+        mapper: TypeMapperId,
+    ) -> Result<SignatureId, SignatureInstantiationError> {
+        self.instantiate_signature_ex(signature, mapper, false)
+    }
+
+    /// Mirrors pinned `instantiateSignatureEx`, including fresh parameters,
+    /// mapper composition, symbol metadata, and lazy return/predicate slots.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an input belongs to another store, an existing
+    /// signature or symbol is malformed, or storage cannot be reserved.
+    pub fn instantiate_signature_ex(
+        &mut self,
+        signature: SignatureId,
+        mapper: TypeMapperId,
+        erase_type_parameters: bool,
+    ) -> Result<SignatureId, SignatureInstantiationError> {
+        if self.mapper_payload(mapper).is_none() {
+            return Err(SignatureInstantiationError::InvalidMapper(mapper));
+        }
+        let plan = self.prepare_signature_instantiation(signature, erase_type_parameters)?;
+        let new_type_parameter_count = plan.type_parameters.len();
+        let fresh_mapper_count = usize::from(new_type_parameter_count != 0) * 2;
+        if !self.try_reserve_types(new_type_parameter_count)
+            || !self.try_reserve_mappers(fresh_mapper_count + plan.combined_symbol_mapper_count)
+            || !self.try_reserve_checker_symbol_allocations(plan.new_symbol_count, 0)
+            || !self.try_reserve_value_symbol_links(plan.new_symbol_count)
+            || !self.try_reserve_signatures(1)
+        {
+            return Err(SignatureInstantiationError::Capacity(signature));
+        }
+
+        let mut effective_mapper = mapper;
+        let mut fresh_type_parameters = Vec::with_capacity(new_type_parameter_count);
+        if !plan.type_parameters.is_empty() {
+            let mut original_type_parameters = Vec::with_capacity(new_type_parameter_count);
+            for type_parameter in &plan.type_parameters {
+                let fresh = self
+                    .alloc_type_parameter(type_parameter.symbol)
+                    .expect("reserved type parameter allocation must succeed");
+                assert!(self.set_type_parameter_resolution(
+                    fresh,
+                    None,
+                    Some(type_parameter.type_),
+                    None,
+                    None,
+                ));
+                original_type_parameters.push(type_parameter.type_);
+                fresh_type_parameters.push(fresh);
+            }
+            let fresh_mapper = self
+                .new_type_mapper(original_type_parameters, fresh_type_parameters.clone())
+                .expect("fresh type parameters remain owned by this store");
+            effective_mapper = self
+                .combine_type_mappers(Some(fresh_mapper), mapper)
+                .expect("fresh and original mappers remain owned by this store");
+            for (fresh, original) in fresh_type_parameters
+                .iter()
+                .copied()
+                .zip(&plan.type_parameters)
+            {
+                assert!(self.set_type_parameter_resolution(
+                    fresh,
+                    None,
+                    Some(original.type_),
+                    Some(effective_mapper),
+                    None,
+                ));
+            }
+        }
+
+        let this_parameter = plan.this_parameter.map(|parameter| {
+            self.publish_instantiated_signature_symbol(parameter, effective_mapper)
+        });
+        let parameters = plan
+            .parameters
+            .into_iter()
+            .map(|parameter| {
+                self.publish_instantiated_signature_symbol(parameter, effective_mapper)
+            })
+            .collect();
+        let instantiated = self
+            .alloc_signature(
+                plan.flags,
+                plan.declaration,
+                fresh_type_parameters,
+                this_parameter,
+                parameters,
+                None,
+                None,
+                plan.min_argument_count,
+            )
+            .expect("reserved signature allocation must succeed");
+        assert!(self.set_signature_target_and_mapper(
+            instantiated,
+            Some(signature),
+            Some(effective_mapper),
+        ));
+        Ok(instantiated)
+    }
+
+    /// Mirrors pinned `cloneSignature` without demanding lazy result fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the signature is not owned by this store or
+    /// storage cannot be reserved.
+    pub fn clone_signature(
+        &mut self,
+        signature: SignatureId,
+    ) -> Result<SignatureId, SignatureInstantiationError> {
+        let source = self
+            .signature(signature)
+            .ok_or(SignatureInstantiationError::InvalidSignature(signature))?;
+        let flags = source.flags() & SignatureFlags::PROPAGATING_FLAGS;
+        let declaration = source.declaration();
+        let type_parameters = source.type_parameters().to_vec();
+        let this_parameter = source.this_parameter();
+        let parameters = source.parameters().to_vec();
+        let min_argument_count = source.min_argument_count();
+        let target = source.target();
+        let mapper = source.mapper();
+        let composite = source.composite().cloned();
+        if !self.try_reserve_signatures(1) {
+            return Err(SignatureInstantiationError::Capacity(signature));
+        }
+        let clone = self
+            .alloc_signature(
+                flags,
+                declaration,
+                type_parameters,
+                this_parameter,
+                parameters,
+                None,
+                None,
+                min_argument_count,
+            )
+            .expect("reserved signature allocation must succeed");
+        assert!(self.set_signature_target_and_mapper(clone, target, mapper));
+        assert!(self.set_signature_composite(clone, composite));
+        Ok(clone)
+    }
+
+    fn prepare_signature_instantiation(
+        &self,
+        signature: SignatureId,
+        erase_type_parameters: bool,
+    ) -> Result<SignatureInstantiationPlan, SignatureInstantiationError> {
+        let source = self
+            .signature(signature)
+            .ok_or(SignatureInstantiationError::InvalidSignature(signature))?;
+        if source.min_argument_count() < 0
+            || usize::try_from(source.min_argument_count())
+                .is_ok_and(|minimum| minimum > source.parameters().len())
+            || source.has_rest_parameter() && source.parameters().is_empty()
+        {
+            return Err(SignatureInstantiationError::InvalidSignature(signature));
+        }
+        let type_parameters = if erase_type_parameters {
+            Vec::new()
+        } else {
+            let mut seen = HashSet::with_capacity(source.type_parameters().len());
+            source
+                .type_parameters()
+                .iter()
+                .copied()
+                .map(|type_parameter| {
+                    let Some(record) = self.type_payload(type_parameter) else {
+                        return Err(SignatureInstantiationError::InvalidTypeParameter(
+                            type_parameter,
+                        ));
+                    };
+                    if !matches!(record.data(), TypeData::TypeParameter(_))
+                        || !seen.insert(type_parameter)
+                    {
+                        return Err(SignatureInstantiationError::InvalidTypeParameter(
+                            type_parameter,
+                        ));
+                    }
+                    Ok(SignatureTypeParameterPlan {
+                        type_: type_parameter,
+                        symbol: record.symbol(),
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        };
+
+        let this_parameter = source
+            .this_parameter()
+            .map(|parameter| self.prepare_instantiated_signature_symbol(parameter))
+            .transpose()?;
+        let parameters = source
+            .parameters()
+            .iter()
+            .copied()
+            .map(|parameter| self.prepare_instantiated_signature_symbol(parameter))
+            .collect::<Result<Vec<_>, _>>()?;
+        let new_symbol_count = this_parameter
+            .iter()
+            .chain(&parameters)
+            .filter(|parameter| matches!(parameter, SignatureSymbolPlan::Instantiate { .. }))
+            .count();
+        let combined_symbol_mapper_count = this_parameter
+            .iter()
+            .chain(&parameters)
+            .filter(|parameter| {
+                matches!(
+                    parameter,
+                    SignatureSymbolPlan::Instantiate {
+                        previous_mapper: Some(_),
+                        ..
+                    }
+                )
+            })
+            .count();
+        Ok(SignatureInstantiationPlan {
+            flags: source.flags() & SignatureFlags::PROPAGATING_FLAGS,
+            declaration: source.declaration(),
+            min_argument_count: source.min_argument_count(),
+            type_parameters,
+            this_parameter,
+            parameters,
+            new_symbol_count,
+            combined_symbol_mapper_count,
+        })
+    }
+
+    fn prepare_instantiated_signature_symbol(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> Result<SignatureSymbolPlan, SignatureInstantiationError> {
+        let source = self
+            .symbol(symbol)
+            .ok_or(SignatureInstantiationError::InvalidSymbol(symbol))?;
+        let links = self.value_symbol_links(symbol);
+        if let Some(resolved_type) = links.and_then(|links| links.resolved_type)
+            && !self.signature_type_could_contain_variables(resolved_type, &mut HashSet::new())?
+            && (!source.flags().contains(SymbolFlags::SET_ACCESSOR)
+                || links
+                    .and_then(|links| links.write_type)
+                    .map(|write_type| {
+                        self.signature_type_could_contain_variables(write_type, &mut HashSet::new())
+                    })
+                    .transpose()?
+                    == Some(false))
+        {
+            return Ok(SignatureSymbolPlan::Reuse(symbol));
+        }
+
+        let (target, previous_mapper) = if source.check_flags().contains(CheckFlags::INSTANTIATED) {
+            let links = links.ok_or(SignatureInstantiationError::InvalidInstantiatedSymbol(
+                symbol,
+            ))?;
+            let target =
+                links
+                    .target
+                    .ok_or(SignatureInstantiationError::InvalidInstantiatedSymbol(
+                        symbol,
+                    ))?;
+            let mapper =
+                links
+                    .mapper
+                    .ok_or(SignatureInstantiationError::InvalidInstantiatedSymbol(
+                        symbol,
+                    ))?;
+            if self.symbol(target).is_none() || self.mapper_payload(mapper).is_none() {
+                return Err(SignatureInstantiationError::InvalidInstantiatedSymbol(
+                    symbol,
+                ));
+            }
+            (target, Some(mapper))
+        } else {
+            (symbol, None)
+        };
+        let target_record = self
+            .symbol(target)
+            .ok_or(SignatureInstantiationError::InvalidSymbol(target))?;
+        let mut data = SymbolData::new(
+            target_record.flags() | SymbolFlags::TRANSIENT,
+            target_record.name().to_owned(),
+        );
+        data.check_flags = CheckFlags::INSTANTIATED
+            | (target_record.check_flags()
+                & (CheckFlags::READONLY
+                    | CheckFlags::LATE
+                    | CheckFlags::OPTIONAL_PARAMETER
+                    | CheckFlags::REST_PARAMETER));
+        data.declarations = target_record.declarations().map(<[_]>::to_vec);
+        data.value_declaration = target_record.value_declaration();
+        data.parent = target_record.parent();
+        Ok(SignatureSymbolPlan::Instantiate {
+            target,
+            previous_mapper,
+            data,
+            name_type: links.and_then(|links| links.name_type),
+        })
+    }
+
+    fn publish_instantiated_signature_symbol(
+        &mut self,
+        parameter: SignatureSymbolPlan,
+        mapper: TypeMapperId,
+    ) -> SemanticSymbolId {
+        match parameter {
+            SignatureSymbolPlan::Reuse(symbol) => symbol,
+            SignatureSymbolPlan::Instantiate {
+                target,
+                previous_mapper,
+                data,
+                name_type,
+            } => {
+                let mapper = match previous_mapper {
+                    None => mapper,
+                    Some(previous_mapper) => self
+                        .combine_type_mappers(Some(previous_mapper), mapper)
+                        .expect("validated symbol mappers remain owned by this store"),
+                };
+                let instantiated = self
+                    .alloc_symbol(data)
+                    .expect("reserved instantiated-symbol allocation must succeed");
+                assert!(self.set_value_symbol_links(
+                    instantiated,
+                    ValueSymbolLinks {
+                        resolved_type: None,
+                        target: Some(target),
+                        mapper: Some(mapper),
+                        name_type,
+                        ..ValueSymbolLinks::default()
+                    },
+                ));
+                instantiated
+            }
+        }
+    }
+
+    fn signature_type_could_contain_variables(
+        &self,
+        type_: TypeId,
+        active: &mut HashSet<TypeId>,
+    ) -> Result<bool, SignatureInstantiationError> {
+        let record = self
+            .type_payload(type_)
+            .ok_or(SignatureInstantiationError::InvalidTypeParameter(type_))?;
+        if !record
+            .flags()
+            .intersects(TypeFlags::STRUCTURED_OR_INSTANTIABLE)
+        {
+            return Ok(false);
+        }
+        if record.flags().intersects(TypeFlags::INSTANTIABLE) || !active.insert(type_) {
+            return Ok(true);
+        }
+        let result = match record.data() {
+            TypeData::Union(data) if !record.flags().intersects(TypeFlags::ENUM_LITERAL) => data
+                .union
+                .types
+                .iter()
+                .copied()
+                .try_fold(false, |contains, constituent| {
+                    Ok(contains
+                        || self.signature_type_could_contain_variables(constituent, active)?)
+                }),
+            TypeData::Intersection(data) => {
+                data.intersection
+                    .types
+                    .iter()
+                    .copied()
+                    .try_fold(false, |contains, constituent| {
+                        Ok(contains
+                            || self.signature_type_could_contain_variables(constituent, active)?)
+                    })
+            }
+            TypeData::TypeReference(data) => self.signature_reference_could_contain_variables(
+                data.node,
+                data.resolved_type_arguments.as_deref(),
+                active,
+            ),
+            TypeData::Interface(data) => self.signature_reference_could_contain_variables(
+                data.reference.node,
+                data.reference.resolved_type_arguments.as_deref(),
+                active,
+            ),
+            TypeData::Tuple(data) => self.signature_reference_could_contain_variables(
+                data.interface.reference.node,
+                data.interface.reference.resolved_type_arguments.as_deref(),
+                active,
+            ),
+            TypeData::Object(_) => {
+                let generic_object_flags = ObjectFlags::MAPPED
+                    | ObjectFlags::REVERSE_MAPPED
+                    | ObjectFlags::OBJECT_REST_TYPE
+                    | ObjectFlags::INSTANTIATION_EXPRESSION_TYPE;
+                let anonymous_with_declarations =
+                    record.object_flags().contains(ObjectFlags::ANONYMOUS)
+                        && record
+                            .symbol()
+                            .and_then(|symbol| self.symbol(symbol))
+                            .is_some_and(|symbol| {
+                                symbol.flags().intersects(
+                                    SymbolFlags::FUNCTION
+                                        | SymbolFlags::METHOD
+                                        | SymbolFlags::CLASS
+                                        | SymbolFlags::TYPE_LITERAL
+                                        | SymbolFlags::OBJECT_LITERAL,
+                                ) && symbol.declarations().is_some()
+                            });
+                Ok(record.object_flags().intersects(generic_object_flags)
+                    || anonymous_with_declarations)
+            }
+            _ => Ok(true),
+        };
+        active.remove(&type_);
+        result
+    }
+
+    fn signature_reference_could_contain_variables(
+        &self,
+        node: Option<NodeRef>,
+        arguments: Option<&[TypeId]>,
+        active: &mut HashSet<TypeId>,
+    ) -> Result<bool, SignatureInstantiationError> {
+        if node.is_some() {
+            return Ok(true);
+        }
+        arguments
+            .unwrap_or_default()
+            .iter()
+            .copied()
+            .try_fold(false, |contains, argument| {
+                Ok(contains || self.signature_type_could_contain_variables(argument, active)?)
+            })
     }
 }
 
@@ -893,9 +1423,477 @@ impl TupleMetadata {
 mod tests {
     use std::mem::size_of;
 
+    use ts_binder::{CheckFlags, EscapedName, SymbolData, SymbolFlags};
+
     use super::{
-        ElementFlags, IndexFlags, SignatureFlags, SignatureKind, Ternary, TypePredicateKind,
+        CanonicalTypeMapperStore, ElementFlags, IndexFlags, SignatureFlags,
+        SignatureInstantiationError, SignatureKind, Ternary, TypePredicateKind,
     };
+    use crate::semantic::{
+        SemanticSymbolId, TypeId, instantiate::instantiate_type, links::ValueSymbolLinks,
+        mapper::TypeMapperKind, type_records::TypeData, types::TypeFlags,
+    };
+
+    fn intrinsic(store: &mut CanonicalTypeMapperStore, flags: TypeFlags, name: &str) -> TypeId {
+        store.alloc_intrinsic_type(flags, name).unwrap()
+    }
+
+    fn parameter(
+        store: &mut CanonicalTypeMapperStore,
+        name: &str,
+        flags: CheckFlags,
+        type_: Option<TypeId>,
+    ) -> SemanticSymbolId {
+        let symbol_flags = if flags == CheckFlags::NONE {
+            SymbolFlags::FUNCTION_SCOPED_VARIABLE
+        } else {
+            SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::TRANSIENT
+        };
+        let mut data = SymbolData::new(symbol_flags, EscapedName::source(name));
+        data.check_flags = flags;
+        let symbol = store.alloc_symbol(data).unwrap();
+        if type_.is_some() {
+            assert!(store.set_value_symbol_links(
+                symbol,
+                ValueSymbolLinks {
+                    resolved_type: type_,
+                    ..ValueSymbolLinks::default()
+                },
+            ));
+        }
+        symbol
+    }
+
+    fn counts(store: &CanonicalTypeMapperStore) -> (usize, usize, usize, usize) {
+        (
+            store.type_len(),
+            store.mapper_len(),
+            store.symbol_len(),
+            store.signature_len(),
+        )
+    }
+
+    #[test]
+    fn instantiated_signatures_freshen_type_parameters_and_preserve_lazy_metadata() {
+        let mut store = CanonicalTypeMapperStore::new();
+        let string = intrinsic(&mut store, TypeFlags::STRING, "string");
+        let number = intrinsic(&mut store, TypeFlags::NUMBER, "number");
+        let outer = store.alloc_type_parameter(None).unwrap();
+        let type_parameter_symbol = store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::TYPE_PARAMETER,
+                EscapedName::source("T"),
+            ))
+            .unwrap();
+        let original_type_parameter = store
+            .alloc_type_parameter(Some(type_parameter_symbol))
+            .unwrap();
+        let mapper = store.new_simple_type_mapper(outer, number).unwrap();
+        let this = parameter(&mut store, "this", CheckFlags::NONE, Some(string));
+        let required = parameter(
+            &mut store,
+            "required",
+            CheckFlags::NONE,
+            Some(original_type_parameter),
+        );
+        let optional = parameter(
+            &mut store,
+            "optional",
+            CheckFlags::OPTIONAL_PARAMETER | CheckFlags::READONLY,
+            Some(original_type_parameter),
+        );
+        let rest = parameter(
+            &mut store,
+            "rest",
+            CheckFlags::REST_PARAMETER | CheckFlags::LATE,
+            Some(outer),
+        );
+        assert!(store.set_value_symbol_links(
+            optional,
+            ValueSymbolLinks {
+                resolved_type: Some(original_type_parameter),
+                name_type: Some(string),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        let predicate = store
+            .alloc_type_predicate(
+                TypePredicateKind::Identifier,
+                0,
+                "required",
+                Some(original_type_parameter),
+            )
+            .unwrap();
+        let flags = SignatureFlags::HAS_REST_PARAMETER
+            | SignatureFlags::HAS_LITERAL_TYPES
+            | SignatureFlags::CONSTRUCT
+            | SignatureFlags::IS_INNER_CALL_CHAIN
+            | SignatureFlags::IS_NON_INFERRABLE;
+        let source = store
+            .alloc_signature(
+                flags,
+                None,
+                vec![original_type_parameter],
+                Some(this),
+                vec![required, optional, rest],
+                Some(original_type_parameter),
+                Some(predicate),
+                1,
+            )
+            .unwrap();
+        assert!(store.set_signature_resolved_min_argument_count(source, 0));
+        assert!(store.set_signature_isolated_type(source, Some(string)));
+        let before = counts(&store);
+
+        let instantiated = store.instantiate_signature(source, mapper).unwrap();
+        let record = store.signature(instantiated).unwrap();
+        let fresh = record.type_parameters()[0];
+        let effective_mapper = record.mapper().unwrap();
+        let parameters = record.parameters().to_vec();
+        assert_eq!(record.flags(), flags & SignatureFlags::PROPAGATING_FLAGS);
+        assert_eq!(record.target(), Some(source));
+        assert_eq!(record.this_parameter(), Some(this));
+        assert_eq!(record.min_argument_count(), 1);
+        assert_eq!(record.resolved_min_argument_count(), -1);
+        assert_eq!(record.resolved_return_type(), None);
+        assert_eq!(record.resolved_type_predicate(), None);
+        assert_eq!(record.isolated_signature_type(), None);
+        assert_eq!(record.composite(), None);
+        assert_ne!(fresh, original_type_parameter);
+        assert_eq!(
+            counts(&store),
+            (before.0 + 1, before.1 + 2, before.2 + 3, before.3 + 1)
+        );
+
+        let fresh_record = store.type_payload(fresh).unwrap();
+        assert_eq!(fresh_record.symbol(), Some(type_parameter_symbol));
+        let TypeData::TypeParameter(fresh_data) = fresh_record.data() else {
+            unreachable!();
+        };
+        assert_eq!(fresh_data.target, Some(original_type_parameter));
+        assert_eq!(fresh_data.mapper, Some(effective_mapper));
+        assert_eq!(fresh_data.constraint, None);
+        assert_eq!(
+            store.mapper_kind(effective_mapper),
+            Some(TypeMapperKind::Unknown)
+        );
+        assert_eq!(
+            instantiate_type(&mut store, original_type_parameter, effective_mapper),
+            Ok(fresh)
+        );
+        assert_eq!(
+            instantiate_type(&mut store, outer, effective_mapper),
+            Ok(number)
+        );
+
+        for (instantiated, target) in parameters.into_iter().zip([required, optional, rest]) {
+            let symbol = store.symbol(instantiated).unwrap();
+            let original = store.symbol(target).unwrap();
+            let expected_flags = CheckFlags::INSTANTIATED
+                | (original.check_flags()
+                    & (CheckFlags::READONLY
+                        | CheckFlags::LATE
+                        | CheckFlags::OPTIONAL_PARAMETER
+                        | CheckFlags::REST_PARAMETER));
+            assert_eq!(symbol.flags(), original.flags() | SymbolFlags::TRANSIENT);
+            assert_eq!(symbol.check_flags(), expected_flags);
+            assert_eq!(symbol.name(), original.name());
+            assert_eq!(symbol.declarations(), original.declarations());
+            let links = store.value_symbol_links(instantiated).unwrap();
+            assert_eq!(links.resolved_type, None);
+            assert_eq!(links.target, Some(target));
+            assert_eq!(links.mapper, Some(effective_mapper));
+            assert_eq!(links.name_type, (target == optional).then_some(string));
+        }
+    }
+
+    #[test]
+    fn erased_signature_instantiation_reuses_invariant_parameter_symbols() {
+        let mut store = CanonicalTypeMapperStore::new();
+        let string = intrinsic(&mut store, TypeFlags::STRING, "string");
+        let type_parameter = store.alloc_type_parameter(None).unwrap();
+        let mapper = store
+            .new_simple_type_mapper(type_parameter, string)
+            .unwrap();
+        let invariant = parameter(&mut store, "fixed", CheckFlags::NONE, Some(string));
+        let generic = parameter(
+            &mut store,
+            "generic",
+            CheckFlags::NONE,
+            Some(type_parameter),
+        );
+        let source = store
+            .alloc_signature(
+                SignatureFlags::NONE,
+                None,
+                vec![type_parameter],
+                None,
+                vec![invariant, generic],
+                Some(type_parameter),
+                None,
+                2,
+            )
+            .unwrap();
+        let before = counts(&store);
+
+        let instantiated = store
+            .instantiate_signature_ex(source, mapper, true)
+            .unwrap();
+        let record = store.signature(instantiated).unwrap();
+        assert!(record.type_parameters().is_empty());
+        assert_eq!(record.mapper(), Some(mapper));
+        assert_eq!(record.parameters()[0], invariant);
+        assert_ne!(record.parameters()[1], generic);
+        assert_eq!(
+            counts(&store),
+            (before.0, before.1, before.2 + 1, before.3 + 1)
+        );
+        assert_eq!(
+            store.value_symbol_links(record.parameters()[1]),
+            Some(&ValueSymbolLinks {
+                resolved_type: None,
+                target: Some(generic),
+                mapper: Some(mapper),
+                ..ValueSymbolLinks::default()
+            })
+        );
+    }
+
+    #[test]
+    fn nested_instantiated_parameter_symbols_compose_their_original_mapper() {
+        let mut store = CanonicalTypeMapperStore::new();
+        let string = intrinsic(&mut store, TypeFlags::STRING, "string");
+        let first = store.alloc_type_parameter(None).unwrap();
+        let second = store.alloc_type_parameter(None).unwrap();
+        let first_mapper = store.new_simple_type_mapper(first, second).unwrap();
+        let second_mapper = store.new_simple_type_mapper(second, string).unwrap();
+        let original = parameter(
+            &mut store,
+            "value",
+            CheckFlags::OPTIONAL_PARAMETER,
+            Some(first),
+        );
+        let mut proxy_data = SymbolData::new(
+            SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::TRANSIENT,
+            EscapedName::source("value"),
+        );
+        proxy_data.check_flags = CheckFlags::INSTANTIATED | CheckFlags::OPTIONAL_PARAMETER;
+        let proxy = store.alloc_symbol(proxy_data).unwrap();
+        assert!(store.set_value_symbol_links(
+            proxy,
+            ValueSymbolLinks {
+                target: Some(original),
+                mapper: Some(first_mapper),
+                name_type: Some(string),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        let source = store
+            .alloc_signature(
+                SignatureFlags::NONE,
+                None,
+                Vec::new(),
+                None,
+                vec![proxy],
+                Some(first),
+                None,
+                0,
+            )
+            .unwrap();
+        let before = counts(&store);
+
+        let instantiated = store.instantiate_signature(source, second_mapper).unwrap();
+        let record = store.signature(instantiated).unwrap();
+        assert_eq!(record.mapper(), Some(second_mapper));
+        let symbol = record.parameters()[0];
+        let links = store.value_symbol_links(symbol).unwrap();
+        let combined = links.mapper.unwrap();
+        assert_eq!(links.target, Some(original));
+        assert_eq!(links.name_type, Some(string));
+        assert_ne!(links.target, Some(proxy));
+        assert_eq!(
+            store.symbol(symbol).unwrap().check_flags(),
+            CheckFlags::INSTANTIATED | CheckFlags::OPTIONAL_PARAMETER
+        );
+        assert_eq!(
+            counts(&store),
+            (before.0, before.1 + 1, before.2 + 1, before.3 + 1)
+        );
+        assert_eq!(instantiate_type(&mut store, first, combined), Ok(string));
+    }
+
+    #[test]
+    fn cloned_signatures_preserve_provenance_and_clear_lazy_result_fields() {
+        let mut store = CanonicalTypeMapperStore::new();
+        let string = intrinsic(&mut store, TypeFlags::STRING, "string");
+        let type_parameter = store.alloc_type_parameter(None).unwrap();
+        let mapper = store
+            .new_simple_type_mapper(type_parameter, string)
+            .unwrap();
+        let this = parameter(&mut store, "this", CheckFlags::NONE, Some(string));
+        let value = parameter(&mut store, "value", CheckFlags::NONE, Some(type_parameter));
+        let target = store
+            .alloc_signature(
+                SignatureFlags::NONE,
+                None,
+                Vec::new(),
+                None,
+                Vec::new(),
+                None,
+                None,
+                0,
+            )
+            .unwrap();
+        let predicate = store
+            .alloc_type_predicate(TypePredicateKind::Identifier, 0, "value", Some(string))
+            .unwrap();
+        let flags = SignatureFlags::HAS_LITERAL_TYPES | SignatureFlags::IS_OUTER_CALL_CHAIN;
+        let source = store
+            .alloc_signature(
+                flags,
+                None,
+                vec![type_parameter],
+                Some(this),
+                vec![value],
+                Some(string),
+                Some(predicate),
+                1,
+            )
+            .unwrap();
+        assert!(store.set_signature_target_and_mapper(source, Some(target), Some(mapper)));
+        let composite = store
+            .create_composite_signature(true, vec![target])
+            .unwrap();
+        assert!(store.set_signature_composite(source, Some(composite.clone())));
+        assert!(store.set_signature_isolated_type(source, Some(string)));
+        assert!(store.set_signature_resolved_min_argument_count(source, 0));
+        let before = counts(&store);
+
+        let clone = store.clone_signature(source).unwrap();
+        let record = store.signature(clone).unwrap();
+        assert_eq!(record.flags(), SignatureFlags::HAS_LITERAL_TYPES);
+        assert_eq!(record.type_parameters(), &[type_parameter]);
+        assert_eq!(record.this_parameter(), Some(this));
+        assert_eq!(record.parameters(), &[value]);
+        assert_eq!(record.target(), Some(target));
+        assert_eq!(record.mapper(), Some(mapper));
+        assert_eq!(record.composite(), Some(&composite));
+        assert_eq!(record.min_argument_count(), 1);
+        assert_eq!(record.resolved_min_argument_count(), -1);
+        assert_eq!(record.resolved_return_type(), None);
+        assert_eq!(record.resolved_type_predicate(), None);
+        assert_eq!(record.isolated_signature_type(), None);
+        assert_eq!(counts(&store), (before.0, before.1, before.2, before.3 + 1));
+    }
+
+    #[test]
+    fn invalid_signature_instantiation_inputs_fail_before_publication() {
+        let mut store = CanonicalTypeMapperStore::new();
+        let string = intrinsic(&mut store, TypeFlags::STRING, "string");
+        let mapper = store.new_simple_type_mapper(string, string).unwrap();
+        let signature = store
+            .alloc_signature(
+                SignatureFlags::NONE,
+                None,
+                Vec::new(),
+                None,
+                Vec::new(),
+                None,
+                None,
+                0,
+            )
+            .unwrap();
+        let invalid_type_parameter_signature = store
+            .alloc_signature(
+                SignatureFlags::NONE,
+                None,
+                vec![string],
+                None,
+                Vec::new(),
+                None,
+                None,
+                0,
+            )
+            .unwrap();
+        let invalid_rest_signature = store
+            .alloc_signature(
+                SignatureFlags::HAS_REST_PARAMETER,
+                None,
+                Vec::new(),
+                None,
+                Vec::new(),
+                None,
+                None,
+                0,
+            )
+            .unwrap();
+        let invalid_proxy = parameter(&mut store, "proxy", CheckFlags::INSTANTIATED, None);
+        let invalid_proxy_signature = store
+            .alloc_signature(
+                SignatureFlags::NONE,
+                None,
+                Vec::new(),
+                None,
+                vec![invalid_proxy],
+                None,
+                None,
+                0,
+            )
+            .unwrap();
+
+        let mut foreign = CanonicalTypeMapperStore::new();
+        let foreign_string = intrinsic(&mut foreign, TypeFlags::STRING, "string");
+        let foreign_mapper = foreign
+            .new_simple_type_mapper(foreign_string, foreign_string)
+            .unwrap();
+        let foreign_signature = foreign
+            .alloc_signature(
+                SignatureFlags::NONE,
+                None,
+                Vec::new(),
+                None,
+                Vec::new(),
+                None,
+                None,
+                0,
+            )
+            .unwrap();
+        let before = counts(&store);
+
+        assert_eq!(
+            store.instantiate_signature(signature, foreign_mapper),
+            Err(SignatureInstantiationError::InvalidMapper(foreign_mapper))
+        );
+        assert_eq!(
+            store.instantiate_signature(foreign_signature, mapper),
+            Err(SignatureInstantiationError::InvalidSignature(
+                foreign_signature
+            ))
+        );
+        assert_eq!(
+            store.instantiate_signature(invalid_type_parameter_signature, mapper),
+            Err(SignatureInstantiationError::InvalidTypeParameter(string))
+        );
+        assert_eq!(
+            store.instantiate_signature(invalid_rest_signature, mapper),
+            Err(SignatureInstantiationError::InvalidSignature(
+                invalid_rest_signature
+            ))
+        );
+        assert_eq!(
+            store.instantiate_signature(invalid_proxy_signature, mapper),
+            Err(SignatureInstantiationError::InvalidInstantiatedSymbol(
+                invalid_proxy
+            ))
+        );
+        assert_eq!(
+            store.clone_signature(foreign_signature),
+            Err(SignatureInstantiationError::InvalidSignature(
+                foreign_signature
+            ))
+        );
+        assert_eq!(counts(&store), before);
+    }
 
     #[test]
     fn signature_kinds_match_upstream_repr_and_values() {
