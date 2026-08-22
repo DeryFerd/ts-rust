@@ -89,33 +89,39 @@ fn canonical_program_rejects_unsupported_class_construction_as_a_typed_boundary(
 }
 
 #[test]
-fn canonical_program_rejects_uninitialized_instance_field_as_a_typed_boundary() {
+fn canonical_program_reports_uninitialized_instance_field() {
     let fs = MemoryFileSystem::new(true);
-    fs.write_file(
-        "/project/main.ts",
-        concat!(
-            "class Unsafe {\n",
-            "  value: string;\n",
-            "  static count: number;\n",
-            "}\n",
-        ),
-    )
-    .unwrap();
+    let source = concat!(
+        "class Unsafe {\n",
+        "  value: string;\n",
+        "  static count: number;\n",
+        "}\n",
+    );
+    fs.write_file("/project/main.ts", source).unwrap();
 
-    let error = Program::try_new_with_canonical_checker(
+    let program = Program::try_new_with_canonical_checker(
         &fs,
         "/project",
         &["main.ts".to_owned()],
         canonical_options(),
     )
-    .unwrap_err();
+    .unwrap();
 
+    let [diagnostic] = program.diagnostics() else {
+        panic!(
+            "expected one field initialization diagnostic: {:?}",
+            program.diagnostics()
+        );
+    };
+    assert_eq!(diagnostic.code, Some(2564));
+    assert_eq!(diagnostic.file_name.as_deref(), Some("/project/main.ts"));
     assert_eq!(
-        error.failure_class(),
-        CanonicalProgramCheckFailureClass::Unsupported {
-            capability_code: "E00.SOURCE_SYNTAX",
-        }
+        diagnostic.message,
+        "Property 'value' has no initializer and is not definitely assigned in the constructor."
     );
+    let start = u32::try_from(source.find("value").unwrap()).unwrap();
+    let range = diagnostic.range.expect("field name range");
+    assert_eq!((range.start.get(), range.end.get()), (start, start + 5));
 }
 
 #[test]

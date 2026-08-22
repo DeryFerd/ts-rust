@@ -3255,16 +3255,20 @@ impl Program {
         source: &SourceFile,
         allow_declaration_file: bool,
     ) -> Result<(), CanonicalProgramCheckError> {
-        let plain_typescript = matches!(
-            ts_path::script_kind_from_path(&source.file_name),
+        let source_kind = ts_path::script_kind_from_path(&source.file_name);
+        let supported_source = (matches!(
+            source_kind,
             ts_path::ScriptKind::Ts | ts_path::ScriptKind::Tsx
-        )
+        ) || (self.options.allow_js
+            && matches!(source_kind, ts_path::ScriptKind::Js | ts_path::ScriptKind::Jsx)))
             && (allow_declaration_file || !ts_path::is_declaration_file(&source.file_name))
             && Path::new(&source.file_name)
                 .extension()
                 .and_then(|extension| extension.to_str())
                 .is_some_and(|extension| {
-                    extension.eq_ignore_ascii_case("ts") || extension.eq_ignore_ascii_case("tsx")
+                    ["ts", "tsx", "js", "jsx"]
+                        .iter()
+                        .any(|candidate| extension.eq_ignore_ascii_case(candidate))
                 });
         let esm_emit = matches!(
             self.options.module,
@@ -3274,7 +3278,7 @@ impl Program {
                 | ModuleKind::EsNext
                 | ModuleKind::Preserve
         );
-        if plain_typescript
+        if supported_source
             && esm_emit
             && self.options.module_resolution == ModuleResolutionKind::Bundler
         {
@@ -3316,12 +3320,15 @@ impl Program {
         }
 
         for source in &self.source_files {
-            binder
-                .bind_typescript_declaration_slice(&source.parse.arena, source.id)
-                .map_err(|error| CanonicalProgramCheckError::DeclarationBind {
-                    file_name: source.file_name.clone(),
-                    error,
-                })?;
+            let result = if is_javascript_file_name(&source.file_name) {
+                binder.bind_javascript_declaration_slice(&source.parse.arena, source.id)
+            } else {
+                binder.bind_typescript_declaration_slice(&source.parse.arena, source.id)
+            };
+            result.map_err(|error| CanonicalProgramCheckError::DeclarationBind {
+                file_name: source.file_name.clone(),
+                error,
+            })?;
         }
 
         let mut diagnostics = Vec::new();
@@ -3375,6 +3382,7 @@ impl Program {
                     source.id,
                     source.file_name.clone(),
                     ts_path::is_declaration_file(&source.file_name),
+                    is_javascript_file_name(&source.file_name),
                 )
             })
             .collect::<Vec<_>>();
@@ -3402,7 +3410,7 @@ impl Program {
         )
         .map_err(CanonicalProgramCheckError::Context)?;
 
-        for (file, file_name, is_declaration_file) in check_files {
+        for (file, file_name, is_declaration_file, is_javascript_file) in check_files {
             if is_declaration_file {
                 if self.options.skip_lib_check {
                     continue;
@@ -3410,6 +3418,9 @@ impl Program {
                 return Err(
                     CanonicalProgramCheckError::DeclarationFileCheckingUnsupported { file_name },
                 );
+            }
+            if is_javascript_file && !self.options.check_js {
+                continue;
             }
             context
                 .check_source_file(file)
@@ -4231,15 +4242,16 @@ fn canonical_source_file_facts(
     options: &CompilerOptions,
 ) -> Result<CanonicalSourceFileFacts, CanonicalProgramCheckError> {
     let script_kind = ts_path::script_kind_from_path(&source.file_name);
-    if !matches!(
-        script_kind,
-        ts_path::ScriptKind::Ts | ts_path::ScriptKind::Tsx
-    ) {
-        return Err(CanonicalProgramCheckError::UnsupportedSourceKind {
-            file_name: source.file_name.clone(),
-            script_kind,
-        });
-    }
+    let language = match script_kind {
+        ts_path::ScriptKind::Ts | ts_path::ScriptKind::Tsx => CanonicalSourceLanguage::TypeScript,
+        ts_path::ScriptKind::Js | ts_path::ScriptKind::Jsx => CanonicalSourceLanguage::JavaScript,
+        _ => {
+            return Err(CanonicalProgramCheckError::UnsupportedSourceKind {
+                file_name: source.file_name.clone(),
+                script_kind,
+            });
+        }
+    };
 
     let is_declaration_file = ts_path::is_declaration_file(&source.file_name);
     let extension = Path::new(&source.file_name)
@@ -4278,9 +4290,6 @@ fn canonical_source_file_facts(
         });
     }
 
-    // The pinned binder only records CommonJS indicators for JavaScript-family
-    // sources. Those source kinds are rejected above, so this admitted slice
-    // has no CommonJS state; in particular, a `.cts` suffix is not evidence.
     let is_external_module = source_file_is_external_module(&source.parse)
         || (!is_declaration_file && options.module_detection == ModuleDetectionKind::Force);
     let module_state = if is_external_module {
@@ -4290,7 +4299,7 @@ fn canonical_source_file_facts(
     };
     Ok(CanonicalSourceFileFacts::new_with_default_library(
         EscapedName::source(format!("\"{}\"", remove_file_extension(&source.file_name))),
-        CanonicalSourceLanguage::TypeScript,
+        language,
         is_declaration_file,
         source.is_default_library,
         module_state,
