@@ -1,9 +1,10 @@
 //! Production syntax and module-resolution host for canonical alias targets.
 //!
-//! This host accepts direct TypeScript ESM namespace imports, explicit default
-//! imports, named imports, and named re-exports with a module specifier. It
-//! returns immediate symbols and never follows an alias target. Live recursion
-//! and transitive type-only propagation belong to the canonical alias kernel.
+//! This host accepts TypeScript namespace imports, explicit default imports,
+//! named imports, named exports, and external import-equals declarations. ESM
+//! and `CommonJS` emit modes retain the same direct module symbols when both
+//! sides agree. Alias recursion and type-only propagation belong to the
+//! canonical alias kernel.
 
 use std::collections::BTreeMap;
 
@@ -177,6 +178,14 @@ enum SupportedAliasDeclaration {
     NamedModuleMember {
         specifier: NodeRef,
         name: String,
+        type_only: bool,
+    },
+    ExternalImportEquals {
+        specifier: NodeRef,
+        type_only: bool,
+    },
+    LocalModuleMember {
+        target: SemanticSymbolId,
         type_only: bool,
     },
 }
@@ -488,6 +497,13 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
                     type_only: clause.phase_modifier == Some(SyntaxKind::TypeKeyword),
                 })
             }
+            (SyntaxKind::ImportEqualsDeclaration, NodeData::ImportEqualsDeclaration(import)) => {
+                let specifier = import_equals_context(source.arena, declaration)?;
+                Ok(SupportedAliasDeclaration::ExternalImportEquals {
+                    specifier,
+                    type_only: import.is_type_only,
+                })
+            }
             (SyntaxKind::ImportSpecifier, NodeData::ImportSpecifier(import)) => {
                 let (specifier, clause) = import_specifier_context(source.arena, declaration)?;
                 let name =
@@ -513,20 +529,19 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
             (SyntaxKind::ExportSpecifier, NodeData::ExportSpecifier(export)) => {
                 let (specifier, declaration_type_only) =
                     export_specifier_context(source.arena, declaration)?;
-                let Some(specifier) = specifier else {
-                    return Err(CanonicalAliasTargetUnavailable::UnsupportedLocalExport(
-                        declaration,
-                    ));
-                };
                 module_export_name(source.arena, export.name).ok_or(
                     CanonicalAliasTargetUnavailable::MalformedDeclaration(declaration),
                 )?;
-                let name =
-                    module_export_name(source.arena, export.property_name.unwrap_or(export.name))
-                        .ok_or(CanonicalAliasTargetUnavailable::MalformedDeclaration(
-                        declaration,
-                    ))?;
+                let imported_name = export.property_name.unwrap_or(export.name);
+                let name = module_export_name(source.arena, imported_name).ok_or(
+                    CanonicalAliasTargetUnavailable::MalformedDeclaration(declaration),
+                )?;
                 let type_only = export.is_type_only || declaration_type_only;
+                let Some(specifier) = specifier else {
+                    let target =
+                        Self::local_module_member(store, source, declaration, imported_name)?;
+                    return Ok(SupportedAliasDeclaration::LocalModuleMember { target, type_only });
+                };
                 if name == "default" {
                     Ok(SupportedAliasDeclaration::DefaultModuleMember {
                         specifier,
@@ -540,8 +555,49 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
                     })
                 }
             }
+            (SyntaxKind::ExportAssignment, NodeData::ExportAssignment(export)) => {
+                let target =
+                    Self::local_module_member(store, source, declaration, export.expression)?;
+                Ok(SupportedAliasDeclaration::LocalModuleMember {
+                    target,
+                    type_only: false,
+                })
+            }
             _ => Err(CanonicalAliasTargetUnavailable::UnsupportedAliasDeclaration(declaration)),
         }
+    }
+
+    fn local_module_member<MapperPayload>(
+        store: &CanonicalSemanticStore<MapperPayload>,
+        source: ProductionAliasTargetSource<'_>,
+        declaration: NodeRef,
+        name: NodeId,
+    ) -> Result<SemanticSymbolId, CanonicalAliasTargetUnavailable> {
+        let Some(Node {
+            kind: SyntaxKind::Identifier,
+            data: NodeData::Identifier(identifier),
+            ..
+        }) = source.arena.get(name)
+        else {
+            return Err(CanonicalAliasTargetUnavailable::UnsupportedLocalExport(
+                declaration,
+            ));
+        };
+        let Some(locals) = source.bound.locals(source.bound.source_file()) else {
+            return Err(CanonicalAliasTargetUnavailable::UnsupportedLocalExport(
+                declaration,
+            ));
+        };
+        let Some(target) = store
+            .symbol_table(locals)
+            .and_then(|locals| locals.get_source(&identifier.text))
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+        else {
+            return Err(CanonicalAliasTargetUnavailable::UnsupportedLocalExport(
+                declaration,
+            ));
+        };
+        Ok(target)
     }
 
     fn resolved_module<MapperPayload>(
@@ -577,7 +633,7 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
         }
     }
 
-    fn plain_esm_module<MapperPayload>(
+    fn direct_source_module<MapperPayload>(
         &self,
         store: &CanonicalSemanticStore<MapperPayload>,
         declaration: NodeRef,
@@ -608,10 +664,7 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
                 },
             );
         }
-        if facts.is_common_js_module()
-            || resolved.usage_mode() == CanonicalModuleResolutionMode::CommonJs
-            || resolved.target_mode() == CanonicalModuleResolutionMode::CommonJs
-        {
+        if facts.is_common_js_module() {
             return Err(CanonicalAliasTargetUnavailable::CommonJsModuleUnsupported {
                 declaration,
                 file: resolved.target_file(),
@@ -640,9 +693,32 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
                     declaration,
                     module,
                 })?;
-        if resolved.usage_mode() != CanonicalModuleResolutionMode::Esm
-            || resolved.target_mode() != CanonicalModuleResolutionMode::Esm
-            || !module_record.flags().intersects(SymbolFlags::MODULE)
+        if !matches!(
+            (resolved.usage_mode(), resolved.target_mode()),
+            (
+                CanonicalModuleResolutionMode::Esm,
+                CanonicalModuleResolutionMode::Esm
+            ) | (
+                CanonicalModuleResolutionMode::CommonJs,
+                CanonicalModuleResolutionMode::CommonJs
+            )
+        ) {
+            if resolved.usage_mode() == CanonicalModuleResolutionMode::CommonJs
+                || resolved.target_mode() == CanonicalModuleResolutionMode::CommonJs
+            {
+                return Err(CanonicalAliasTargetUnavailable::CommonJsModuleUnsupported {
+                    declaration,
+                    file: resolved.target_file(),
+                });
+            }
+            return Err(
+                CanonicalAliasTargetUnavailable::SyntheticModuleResolutionUnsupported {
+                    declaration,
+                    module,
+                },
+            );
+        }
+        if !module_record.flags().intersects(SymbolFlags::MODULE)
             || module_record
                 .flags()
                 .intersects(SymbolFlags::MODULE_EXPORTS)
@@ -654,26 +730,41 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
                 },
             );
         }
-        if let Some(exports) = module_record.exports() {
-            let exports = store.symbol_table(exports).ok_or(
-                CanonicalAliasTargetUnavailable::MalformedModuleSymbol {
+        Ok(module)
+    }
+
+    fn export_equals_target<MapperPayload>(
+        store: &CanonicalSemanticStore<MapperPayload>,
+        declaration: NodeRef,
+        module: SemanticSymbolId,
+    ) -> Result<Option<SemanticSymbolId>, CanonicalAliasTargetUnavailable> {
+        let module_record =
+            store
+                .symbol(module)
+                .ok_or(CanonicalAliasTargetUnavailable::MalformedModuleSymbol {
                     declaration,
                     module,
-                },
-            )?;
-            if exports
-                .get(InternalSymbolName::ExportEquals.as_ref())
-                .is_some()
-            {
-                return Err(
-                    CanonicalAliasTargetUnavailable::ExportEqualsResolutionUnsupported {
-                        declaration,
-                        module,
-                    },
-                );
-            }
-        }
-        Ok(module)
+                })?;
+        let Some(exports) = module_record.exports() else {
+            return Ok(None);
+        };
+        let exports = store.symbol_table(exports).ok_or(
+            CanonicalAliasTargetUnavailable::MalformedModuleSymbol {
+                declaration,
+                module,
+            },
+        )?;
+        let Some(target) = exports.get(InternalSymbolName::ExportEquals.as_ref()) else {
+            return Ok(None);
+        };
+        store
+            .symbol(target)
+            .is_some()
+            .then_some(Some(target))
+            .ok_or(CanonicalAliasTargetUnavailable::MalformedModuleSymbol {
+                declaration,
+                module,
+            })
     }
 
     fn direct_export<MapperPayload>(
@@ -794,26 +885,47 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
         }
         let declaration = self.alias_declaration(store, alias)?;
         let supported = self.supported_declaration(store, declaration)?;
-        let (specifier, type_only) = match &supported {
-            SupportedAliasDeclaration::NamespaceImport {
-                specifier,
-                type_only,
-            }
-            | SupportedAliasDeclaration::DefaultModuleMember {
-                specifier,
-                type_only,
-            }
-            | SupportedAliasDeclaration::NamedModuleMember {
-                specifier,
-                type_only,
-                ..
-            } => (*specifier, *type_only),
+        let type_only = match &supported {
+            SupportedAliasDeclaration::NamespaceImport { type_only, .. }
+            | SupportedAliasDeclaration::DefaultModuleMember { type_only, .. }
+            | SupportedAliasDeclaration::NamedModuleMember { type_only, .. }
+            | SupportedAliasDeclaration::ExternalImportEquals { type_only, .. }
+            | SupportedAliasDeclaration::LocalModuleMember { type_only, .. } => *type_only,
         };
         if type_only {
             Self::mark_type_only(store, alias, declaration)?;
         }
+        if let SupportedAliasDeclaration::LocalModuleMember { target, .. } = &supported {
+            return Ok((
+                CanonicalImmediateAliasTarget::Resolved(*target),
+                type_only.then_some(declaration),
+            ));
+        }
+        let specifier = match &supported {
+            SupportedAliasDeclaration::NamespaceImport { specifier, .. }
+            | SupportedAliasDeclaration::DefaultModuleMember { specifier, .. }
+            | SupportedAliasDeclaration::NamedModuleMember { specifier, .. }
+            | SupportedAliasDeclaration::ExternalImportEquals { specifier, .. } => *specifier,
+            SupportedAliasDeclaration::LocalModuleMember { .. } => {
+                unreachable!("local aliases return before resolving an external module")
+            }
+        };
         let resolved = self.resolved_module(declaration, specifier, store)?;
-        let module = self.plain_esm_module(store, declaration, resolved)?;
+        let module = self.direct_source_module(store, declaration, resolved)?;
+        let export_equals = Self::export_equals_target(store, declaration, module)?;
+        if export_equals.is_some()
+            && !matches!(
+                supported,
+                SupportedAliasDeclaration::ExternalImportEquals { .. }
+            )
+        {
+            return Err(
+                CanonicalAliasTargetUnavailable::ExportEqualsResolutionUnsupported {
+                    declaration,
+                    module,
+                },
+            );
+        }
         let target = match &supported {
             SupportedAliasDeclaration::NamespaceImport { .. } => {
                 Self::direct_namespace_target(store, declaration, module)?
@@ -823,6 +935,12 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
             }
             SupportedAliasDeclaration::NamedModuleMember { name, .. } => {
                 Self::direct_export(store, declaration, module, name)?
+            }
+            SupportedAliasDeclaration::ExternalImportEquals { .. } => {
+                export_equals.unwrap_or(module)
+            }
+            SupportedAliasDeclaration::LocalModuleMember { .. } => {
+                unreachable!("local aliases return before resolving an external module")
             }
         };
         Ok((
@@ -979,6 +1097,51 @@ fn default_import_context(
     Ok((
         NodeRef::new(declaration.arena, declaration.file, import.module_specifier),
         clause,
+    ))
+}
+
+fn import_equals_context(
+    arena: &NodeArena,
+    declaration: NodeRef,
+) -> Result<NodeRef, CanonicalAliasTargetUnavailable> {
+    let Some(Node {
+        kind: SyntaxKind::ImportEqualsDeclaration,
+        data: NodeData::ImportEqualsDeclaration(import),
+        ..
+    }) = arena.get(declaration.node)
+    else {
+        return Err(CanonicalAliasTargetUnavailable::MalformedDeclaration(
+            declaration,
+        ));
+    };
+    let Some(Node {
+        kind: SyntaxKind::ExternalModuleReference,
+        data: NodeData::ExternalModuleReference(reference),
+        parent: Some(parent),
+        ..
+    }) = arena.get(import.module_reference)
+    else {
+        return Err(CanonicalAliasTargetUnavailable::UnsupportedAliasDeclaration(declaration));
+    };
+    if *parent != declaration.node {
+        return Err(CanonicalAliasTargetUnavailable::MalformedDeclaration(
+            declaration,
+        ));
+    }
+    let Some(specifier) = arena.get(reference.expression) else {
+        return Err(CanonicalAliasTargetUnavailable::MalformedDeclaration(
+            declaration,
+        ));
+    };
+    if specifier.parent != Some(import.module_reference) {
+        return Err(CanonicalAliasTargetUnavailable::MalformedDeclaration(
+            declaration,
+        ));
+    }
+    Ok(NodeRef::new(
+        declaration.arena,
+        declaration.file,
+        reference.expression,
     ))
 }
 
@@ -1195,6 +1358,18 @@ mod tests {
             .filter_map(|(_, node)| match &node.data {
                 NodeData::ImportDeclaration(import) => Some(import.module_specifier),
                 NodeData::ExportDeclaration(export) => export.module_specifier,
+                NodeData::ImportEqualsDeclaration(import) => {
+                    match parsed
+                        .arena
+                        .get(import.module_reference)
+                        .map(|node| &node.data)
+                    {
+                        Some(NodeData::ExternalModuleReference(reference)) => {
+                            Some(reference.expression)
+                        }
+                        _ => None,
+                    }
+                }
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -1209,6 +1384,7 @@ mod tests {
             .find_map(|(node, data)| {
                 let name_node = match &data.data {
                     NodeData::ImportClause(clause) => clause.name,
+                    NodeData::ImportEqualsDeclaration(import) => Some(import.name),
                     NodeData::ImportSpecifier(specifier) => Some(specifier.name),
                     NodeData::ExportSpecifier(specifier) => Some(specifier.name),
                     NodeData::NamespaceImport(namespace) => Some(namespace.name),
@@ -1802,7 +1978,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_default_local_star_export_equals_commonjs_and_synthetic_paths() {
+    fn resolves_local_exports_and_rejects_unsupported_module_paths() {
         let importer = parsed(
             r#"
                 import DefaultThing from "./plain";
@@ -1857,15 +2033,25 @@ mod tests {
         let mut host =
             ProductionAliasTargetHost::new(&store, sources(&files, &bound_files), &manifest)
                 .unwrap();
-        let declarations = [
-            "DefaultThing",
-            "value",
-            "missing",
-            "legacy",
-            "cjs",
-            "synthetic",
-        ]
-        .map(|name| alias_declaration_named(&importer, importer_file, name));
+        let local_declaration = alias_declaration_named(&importer, importer_file, "value");
+        let local_alias = alias(&bound_files, local_declaration);
+        let importer_bound = bound_files.get(&importer_file).unwrap();
+        let locals = importer_bound.locals(importer_bound.source_file()).unwrap();
+        let local_target = store
+            .symbol_table(locals)
+            .unwrap()
+            .get_source("value")
+            .unwrap();
+        assert_eq!(
+            CanonicalAliasResolver::new(&mut store, &mut host)
+                .resolve_alias(local_alias)
+                .unwrap()
+                .target,
+            AliasTargetState::Resolved(local_target)
+        );
+
+        let declarations = ["DefaultThing", "missing", "legacy", "cjs", "synthetic"]
+            .map(|name| alias_declaration_named(&importer, importer_file, name));
         let aliases = declarations.map(|declaration| alias(&bound_files, declaration));
 
         let expected = [
@@ -1873,21 +2059,20 @@ mod tests {
                 declaration: declarations[0],
                 module: source_module(&bound_files, plain_file),
             },
-            CanonicalAliasTargetUnavailable::UnsupportedLocalExport(declarations[1]),
             CanonicalAliasTargetUnavailable::ExportStarResolutionUnsupported {
-                declaration: declarations[2],
+                declaration: declarations[1],
                 module: source_module(&bound_files, star_file),
             },
             CanonicalAliasTargetUnavailable::ExportEqualsResolutionUnsupported {
-                declaration: declarations[3],
+                declaration: declarations[2],
                 module: source_module(&bound_files, equals_file),
             },
             CanonicalAliasTargetUnavailable::CommonJsModuleUnsupported {
-                declaration: declarations[4],
+                declaration: declarations[3],
                 file: plain_file,
             },
             CanonicalAliasTargetUnavailable::SyntheticModuleResolutionUnsupported {
-                declaration: declarations[5],
+                declaration: declarations[4],
                 module: source_module(&bound_files, plain_file),
             },
         ];
