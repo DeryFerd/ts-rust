@@ -33,7 +33,7 @@ pub(super) struct SimpleAssignmentPlan {
     pub left: NodeRef,
     pub right: NodeRef,
     pub target_symbol: SemanticSymbolId,
-    pub target_type_node: NodeRef,
+    pub target_type_node: Option<NodeRef>,
 }
 
 /// The syntactic position at which the assignment slice ended.
@@ -370,6 +370,10 @@ impl AssignmentPlanner<'_, '_> {
         let export_local = routed.export_local;
         let ambient_target = self.ambient_targets.contains(&target);
         let uninitialized_target = self.uninitialized_targets.contains(&target);
+        let javascript_target = self
+            .bound
+            .source_facts()
+            .is_some_and(ts_binder::CanonicalSourceFileFacts::is_javascript_file);
         if ambient_target && uninitialized_target {
             return Err(AssignmentInvariant::InvalidSymbolShape(target).into());
         }
@@ -389,6 +393,7 @@ impl AssignmentPlanner<'_, '_> {
         if flags.intersects(SymbolFlags::BLOCK_SCOPED_VARIABLE)
             && !ambient_target
             && !uninitialized_target
+            && !javascript_target
         {
             return Err(AssignmentPlanError::Unsupported(
                 AssignmentUnsupported::BlockScopedTarget {
@@ -461,6 +466,7 @@ impl AssignmentPlanner<'_, '_> {
             &name,
             ambient_target.then_some((target, flags)),
             uninitialized_target.then_some((target, flags)),
+            javascript_target.then_some((target, flags)),
         )?;
         Ok(SimpleAssignmentPlan {
             expression,
@@ -719,7 +725,8 @@ impl AssignmentPlanner<'_, '_> {
         reference_name: &str,
         ambient_target: Option<(SemanticSymbolId, SymbolFlags)>,
         uninitialized_target: Option<(SemanticSymbolId, SymbolFlags)>,
-    ) -> Result<NodeRef, AssignmentPlanError> {
+        javascript_target: Option<(SemanticSymbolId, SymbolFlags)>,
+    ) -> Result<Option<NodeRef>, AssignmentPlanError> {
         let declaration_node = self.node(declaration)?;
         let NodeData::VariableDeclaration(variable) = &declaration_node.data else {
             return Err(Self::unsupported(
@@ -765,11 +772,15 @@ impl AssignmentPlanner<'_, '_> {
             ));
         }
 
-        let type_node = variable.type_.map(|node| self.reference(node)).ok_or(
-            AssignmentPlanError::Unsupported(AssignmentUnsupported::MissingTargetType(declaration)),
-        )?;
-        self.require_parent(type_node, Some(declaration.node))?;
-        self.node(type_node)?;
+        let type_node = variable.type_.map(|node| self.reference(node));
+        if let Some(type_node) = type_node {
+            self.require_parent(type_node, Some(declaration.node))?;
+            self.node(type_node)?;
+        } else if javascript_target.is_none() {
+            return Err(AssignmentPlanError::Unsupported(
+                AssignmentUnsupported::MissingTargetType(declaration),
+            ));
+        }
         if let Some((ambient_target, ambient_flags)) = ambient_target {
             self.validate_ambient_variable_statement(
                 left,
@@ -785,12 +796,12 @@ impl AssignmentPlanner<'_, '_> {
                 self.require_parent(initializer, Some(declaration.node))?;
                 self.node(initializer)?;
             }
-            (None, Some(_)) => {}
-            (None, None) => {
+            (None, None) if javascript_target.is_none() => {
                 return Err(AssignmentPlanError::Unsupported(
                     AssignmentUnsupported::MissingTargetInitializer(declaration),
                 ));
             }
+            (None, _) => {}
             (Some(_), Some(_)) => {
                 return Err(AssignmentPlanError::Unsupported(
                     AssignmentUnsupported::NonOrdinaryVariable(declaration),
@@ -806,7 +817,7 @@ impl AssignmentPlanner<'_, '_> {
         let NodeData::VariableDeclarationList(list_data) = &list_node.data else {
             return Err(AssignmentInvariant::InvalidDeclarationList(list).into());
         };
-        let expected_list_flags = match uninitialized_target {
+        let expected_list_flags = match uninitialized_target.or(javascript_target) {
             None => 0,
             Some((_, flags)) if flags == SymbolFlags::FUNCTION_SCOPED_VARIABLE => 0,
             Some((_, flags)) if flags == SymbolFlags::BLOCK_SCOPED_VARIABLE => NODE_FLAG_LET,
@@ -818,7 +829,7 @@ impl AssignmentPlanner<'_, '_> {
             return Err(AssignmentPlanError::Unsupported(
                 AssignmentUnsupported::BlockScopedTarget {
                     node: left,
-                    symbol: uninitialized_target.map_or_else(
+                    symbol: uninitialized_target.or(javascript_target).map_or_else(
                         || {
                             self.bound
                                 .symbol(declaration)
@@ -1296,7 +1307,7 @@ mod tests {
                     .bound
                     .symbol(declaration)
                     .expect("target declaration symbol"),
-                target_type_node: variable_type(&fixture.parsed, declaration),
+                target_type_node: Some(variable_type(&fixture.parsed, declaration)),
             })
         );
         assert_eq!(observable_state(&fixture.store), before);

@@ -65,6 +65,10 @@ use super::{
         get_type_names_for_assignability_error_with_host_global_types_and_flags,
     },
     instantiate::InstantiationSession,
+    jsdoc::{
+        PlannedJavaScriptJsDoc, PlannedJsDocType, append_javascript_jsdoc_diagnostics,
+        plan_javascript_source_jsdoc, preflight_planned_jsdoc_type, resolve_planned_jsdoc_type,
+    },
     logical_operators::{
         LogicalBinaryError, LogicalBinaryInvariant, LogicalBinaryRequest, LogicalBinaryUnsupported,
         check_logical_binary, narrow_logical_right_operand,
@@ -701,6 +705,7 @@ struct PlannedVariable {
     symbol: SemanticSymbolId,
     binding: VariableBindingKind,
     type_node: Option<NodeRef>,
+    jsdoc_type: Option<PlannedJsDocType>,
     initializer: PlannedVariableInitializer,
 }
 
@@ -710,6 +715,7 @@ enum PlannedVariableInitializer {
     Expression(PlannedExpression),
     Jsx(NodeRef),
     AbsentAnnotated,
+    AbsentJavaScript,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -867,7 +873,7 @@ struct PlannedAssignment {
     expression: NodeRef,
     left: NodeRef,
     target_symbol: SemanticSymbolId,
-    target_type_node: NodeRef,
+    target_type_node: Option<NodeRef>,
     right: PlannedExpression,
 }
 
@@ -879,6 +885,7 @@ struct DeferredAssertion {
 }
 
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)] // Keeps source class and expression plans inline.
 enum PlannedStatement {
     TypeAlias(SemanticSymbolId),
     Interface(SemanticSymbolId),
@@ -913,6 +920,7 @@ struct SourceCheckPlan {
     contextual_arrows: Vec<PlannedContextualArrow>,
     identifier_reads: Vec<(NodeRef, SemanticSymbolId)>,
     default_news: Vec<SourceDefaultNewPlan>,
+    javascript_jsdoc: Option<PlannedJavaScriptJsDoc>,
     strings: Vec<String>,
     numbers: Vec<Number>,
     bigints: Vec<PseudoBigInt>,
@@ -933,6 +941,7 @@ struct SourcePlanner<'arena, 'semantic, 'sources> {
     bigints: Vec<PseudoBigInt>,
     identifier_reads: Vec<(NodeRef, SemanticSymbolId)>,
     default_news: Vec<SourceDefaultNewPlan>,
+    javascript_jsdoc: Option<PlannedJavaScriptJsDoc>,
     value_import_bindings: HashMap<SemanticSymbolId, SourceImportBindingPlan>,
     type_import_bindings: HashMap<SemanticSymbolId, SourceImportBindingPlan>,
     import_reads: Vec<PlannedSourceImportRead>,
@@ -967,6 +976,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             bigints: Vec::new(),
             identifier_reads: Vec::new(),
             default_news: Vec::new(),
+            javascript_jsdoc: None,
             value_import_bindings: HashMap::new(),
             type_import_bindings: HashMap::new(),
             import_reads: Vec::new(),
@@ -1002,6 +1012,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             bigints: Vec::new(),
             identifier_reads: Vec::new(),
             default_news: Vec::new(),
+            javascript_jsdoc: None,
             value_import_bindings: HashMap::new(),
             type_import_bindings: HashMap::new(),
             import_reads: Vec::new(),
@@ -1044,6 +1055,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 SourceSyntaxRole::SourceFile,
             ));
         };
+        let source_statements = source_data.statements.nodes.clone();
         let facts = self
             .bound
             .source_facts()
@@ -1053,12 +1065,15 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         let is_javascript_file = facts.is_javascript_file();
         let is_external_module = facts.is_external_module();
         if is_javascript_file {
-            return Err(SourceCheckError::Unsupported(
-                UnsupportedSourceSyntax::JavaScriptSource(self.source),
-            ));
+            self.javascript_jsdoc = Some(
+                plan_javascript_source_jsdoc(self.arena, self.source.node_ref()).map_err(|_| {
+                    SourceCheckError::Unsupported(UnsupportedSourceSyntax::JsDoc(
+                        self.source.node_ref(),
+                    ))
+                })?,
+            );
         }
 
-        let source_statements = source_data.statements.nodes.clone();
         let mut value_imports = Vec::new();
         let mut type_imports = Vec::new();
         let mut leading_import_prefix = true;
@@ -1109,6 +1124,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         UnsupportedSourceSyntax::Import(statement),
                     ));
                 }
+                SyntaxKind::EmptyStatement => {}
                 _ => leading_import_prefix = false,
             }
         }
@@ -1212,6 +1228,27 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             let statement = self.reference(statement);
             match self.node(statement)?.kind {
                 SyntaxKind::ImportDeclaration => {}
+                SyntaxKind::EmptyStatement => {
+                    let node = self.node(statement)?;
+                    let NodeData::EmptyStatement(empty) = &node.data else {
+                        return Err(SourceCheckError::Provenance(
+                            SourceCheckProvenanceError::MismatchedNodeData {
+                                node: statement,
+                                kind: node.kind,
+                            },
+                        ));
+                    };
+                    if node.flags.0 != 0
+                        || empty.flow_node.is_some()
+                        || !self.source_spelling_matches(statement, ";")
+                    {
+                        return Err(self.unsupported(
+                            statement,
+                            node.kind,
+                            SourceSyntaxRole::Statement,
+                        ));
+                    }
+                }
                 SyntaxKind::TypeAliasDeclaration => {
                     let node = self.node(statement)?;
                     let NodeData::TypeAliasDeclaration(alias) = &node.data else {
@@ -1547,13 +1584,14 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             ),
                         ));
                     }
-                    if self
-                        .type_import_references
-                        .iter()
-                        .any(|reference| reference.root == assignment.target_type_node)
+                    if let Some(target_type_node) = assignment.target_type_node
+                        && self
+                            .type_import_references
+                            .iter()
+                            .any(|reference| reference.root == target_type_node)
                     {
                         return Err(SourceCheckError::Unsupported(
-                            UnsupportedSourceSyntax::Import(assignment.target_type_node),
+                            UnsupportedSourceSyntax::Import(target_type_node),
                         ));
                     }
                     self.primitive_binary_position_roots
@@ -1593,6 +1631,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             contextual_arrows,
             identifier_reads: self.identifier_reads,
             default_news: self.default_news,
+            javascript_jsdoc: self.javascript_jsdoc,
             strings: self.strings,
             numbers: self.numbers,
             bigints: self.bigints,
@@ -3188,6 +3227,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             symbol: syntax.symbol,
             binding: syntax.binding,
             type_node: syntax.type_node,
+            jsdoc_type: None,
             initializer: PlannedVariableInitializer::Expression(initializer),
         })
     }
@@ -3940,6 +3980,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             None if type_node.is_some() && !binding.is_const() && !exported => {
                 PlannedVariableInitializer::AbsentAnnotated
             }
+            None if self.javascript_jsdoc.is_some() && !binding.is_const() && !exported => {
+                PlannedVariableInitializer::AbsentJavaScript
+            }
             None => {
                 return Err(SourceCheckError::Unsupported(
                     UnsupportedSourceSyntax::MissingVariableInitializer(declaration),
@@ -3971,6 +4014,12 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             symbol: variable_symbol,
             binding,
             type_node,
+            jsdoc_type: self
+                .javascript_jsdoc
+                .as_ref()
+                .and_then(|plan| plan.declaration(declaration))
+                .and_then(|declaration| declaration.type_())
+                .cloned(),
             initializer,
         })
     }
@@ -7592,7 +7641,7 @@ fn check_deferred_assertions(
         session.reset_query();
         let (operand, widened) =
             assertion_operand_types(store, global_types, assertion.operand_type)?;
-        if store.is_type_comparable_to_with_global_types(
+        if store.are_types_comparable_with_global_types(
             assertion.target_type,
             widened,
             global_types,
@@ -7688,6 +7737,41 @@ fn check_planned_assignment(
     .get_type_from_type_node(target_type_node);
     merge_retry_diagnostics(diagnostics, statement_diagnostics);
     let target = target?;
+    check_assignment_to_type(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        session,
+        diagnostics,
+        flow_types,
+        preflighted_type_import_value_uses,
+        deferred,
+        target,
+        expression,
+        fallback_node,
+        assignment_expression,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // Shares exact assignment checks across TS and JSDoc types.
+fn check_assignment_to_type(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source: SourceFileRef,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    flow_types: &HashMap<SemanticSymbolId, TypeId>,
+    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    deferred: &mut Vec<DeferredAssertion>,
+    target: TypeId,
+    expression: &PlannedExpression,
+    fallback_node: NodeRef,
+    assignment_expression: Option<NodeRef>,
+) -> Result<CheckedAssignment, SourceCheckError> {
     if assignment_expression.is_some() {
         publish_expression_type(store, fallback_node, target)?;
     }
@@ -9714,6 +9798,7 @@ pub(super) fn check_source_file(
         contextual_arrows,
         identifier_reads,
         default_news,
+        javascript_jsdoc,
         strings,
         numbers,
         bigints,
@@ -9726,6 +9811,36 @@ pub(super) fn check_source_file(
         global_types,
     )
     .finish()?;
+    if let Some(jsdoc) = &javascript_jsdoc {
+        for declaration in jsdoc.declarations() {
+            let annotations = declaration
+                .type_()
+                .into_iter()
+                .chain(declaration.return_type())
+                .chain(
+                    declaration
+                        .parameters()
+                        .iter()
+                        .filter_map(super::jsdoc::PlannedJsDocParameter::type_),
+                )
+                .chain(
+                    declaration
+                        .typedefs()
+                        .iter()
+                        .filter_map(super::jsdoc::PlannedJsDocTypedef::type_),
+                );
+            for annotation in annotations {
+                preflight_planned_jsdoc_type(store, global_types, options, annotation).map_err(
+                    |_| {
+                        SourceCheckError::Unsupported(UnsupportedSourceSyntax::JsDoc(
+                            declaration.node(),
+                        ))
+                    },
+                )?;
+            }
+        }
+        append_javascript_jsdoc_diagnostics(jsdoc, diagnostics);
+    }
     preflight_inferred_function_return_dependencies(&functions)?;
 
     let mut reexport_aliases = HashSet::new();
@@ -10548,6 +10663,53 @@ pub(super) fn check_source_file(
                                 )?,
                             )
                         }
+                        (PlannedVariableInitializer::Expression(initializer), None)
+                            if variable.jsdoc_type.is_some() =>
+                        {
+                            let annotation = variable
+                                .jsdoc_type
+                                .as_ref()
+                                .expect("the match guard checked the JSDoc annotation");
+                            let declared_type = resolve_planned_jsdoc_type(
+                                store,
+                                global_types,
+                                options,
+                                annotation,
+                            )
+                            .map_err(|_| {
+                                SourceCheckError::Unsupported(UnsupportedSourceSyntax::JsDoc(
+                                    variable.declaration,
+                                ))
+                            })?;
+                            let assignment = check_assignment_to_type(
+                                store,
+                                host,
+                                global_types,
+                                source,
+                                options,
+                                session,
+                                diagnostics,
+                                &current_flow_types,
+                                &preflighted_type_import_value_uses,
+                                &mut deferred,
+                                declared_type,
+                                initializer,
+                                variable.name,
+                                None,
+                            )?;
+                            (
+                                assignment.declared_type,
+                                current_flow_type_after_assignment(
+                                    store,
+                                    host,
+                                    global_types,
+                                    options,
+                                    session,
+                                    diagnostics,
+                                    assignment,
+                                )?,
+                            )
+                        }
                         (PlannedVariableInitializer::Expression(initializer), None) => {
                             let initializer = check_expression_type(
                                 store,
@@ -10700,7 +10862,26 @@ pub(super) fn check_source_file(
                             let declared_type = declared_type?;
                             (declared_type, declared_type)
                         }
-                        (PlannedVariableInitializer::AbsentAnnotated, None) => {
+                        (PlannedVariableInitializer::AbsentJavaScript, None) => {
+                            let declared_type = if let Some(annotation) = &variable.jsdoc_type {
+                                resolve_planned_jsdoc_type(store, global_types, options, annotation)
+                                    .map_err(|_| {
+                                        SourceCheckError::Unsupported(
+                                            UnsupportedSourceSyntax::JsDoc(variable.declaration),
+                                        )
+                                    })?
+                            } else {
+                                store
+                                    .intrinsic_bootstrap()
+                                    .ok_or(SourceCheckError::LiteralCache(
+                                        SourceLiteralCacheError::BootstrapUninitialized,
+                                    ))?
+                                    .any_type
+                            };
+                            (declared_type, declared_type)
+                        }
+                        (PlannedVariableInitializer::AbsentAnnotated, None)
+                        | (PlannedVariableInitializer::AbsentJavaScript, Some(_)) => {
                             return Err(SourceCheckError::Variable(
                                 VariableInvariant::InvalidSymbolShape(variable.symbol),
                             ));
@@ -10747,23 +10928,41 @@ pub(super) fn check_source_file(
                         VariableInvariant::MissingCurrentFlowType(assignment.target_symbol),
                     ));
                 }
-                let checked = check_planned_assignment(
-                    store,
-                    host,
-                    global_types,
-                    source,
-                    options,
-                    session,
-                    diagnostics,
-                    &current_flow_types,
-                    &preflighted_type_import_value_uses,
-                    &mut deferred,
-                    assignment.target_type_node,
-                    &[],
-                    &assignment.right,
-                    assignment.left,
-                    Some(assignment.expression),
-                )?;
+                let checked = match assignment.target_type_node {
+                    Some(type_node) => check_planned_assignment(
+                        store,
+                        host,
+                        global_types,
+                        source,
+                        options,
+                        session,
+                        diagnostics,
+                        &current_flow_types,
+                        &preflighted_type_import_value_uses,
+                        &mut deferred,
+                        type_node,
+                        &[],
+                        &assignment.right,
+                        assignment.left,
+                        Some(assignment.expression),
+                    ),
+                    None => check_assignment_to_type(
+                        store,
+                        host,
+                        global_types,
+                        source,
+                        options,
+                        session,
+                        diagnostics,
+                        &current_flow_types,
+                        &preflighted_type_import_value_uses,
+                        &mut deferred,
+                        staged_declared_type,
+                        &assignment.right,
+                        assignment.left,
+                        Some(assignment.expression),
+                    ),
+                }?;
                 if checked.declared_type != staged_declared_type {
                     return Err(SourceCheckError::Variable(
                         VariableInvariant::AssignmentDeclaredTypeMismatch {
