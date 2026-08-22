@@ -6,9 +6,9 @@
 //! validated fixed tuple elements,
 //! required own and shared union properties selected by string or number
 //! literals, primitive string indexing, resolved anonymous string/number index
-//! signatures, and finite unions of valid literal keys. Optional chains,
-//! writes, tuples, generic indexed access types, and apparent/global property
-//! lookup stay typed boundaries.
+//! signatures, finite unions of valid literal keys, optional properties, and
+//! optional chains. Writes, generic indexed access types, and apparent/global
+//! property lookup stay typed boundaries.
 
 use std::collections::HashSet;
 
@@ -129,6 +129,7 @@ pub(super) struct DirectSourceElementSyntax {
     node: NodeRef,
     receiver: NodeRef,
     index: NodeRef,
+    optional: bool,
 }
 
 impl DirectSourceElementSyntax {
@@ -147,6 +148,7 @@ pub(super) struct SourceElementPlan {
     pub(super) node: NodeRef,
     pub(super) receiver: PlannedExpression,
     pub(super) index: PlannedExpression,
+    optional: bool,
 }
 
 /// Exact result and retryable diagnostic publication for one element read.
@@ -156,8 +158,8 @@ pub(super) struct CheckedSourceElement {
     pub(super) diagnostic: Option<CanonicalCheckerDiagnostic>,
 }
 
-/// Proves a non-optional, read-only element-access AST and its existing cache
-/// shape before recursive source planning begins.
+/// Proves a read-only element-access AST and its existing cache shape before
+/// recursive source planning begins.
 pub(super) fn plan_direct_source_element_syntax(
     arena: &NodeArena,
     store: &CanonicalTypeMapperStore,
@@ -172,7 +174,6 @@ pub(super) fn plan_direct_source_element_syntax(
     if record.kind != SyntaxKind::ElementAccessExpression
         || record.flags.0 != 0
         || access.flow_node.is_some()
-        || access.question_dot_token.is_some()
         || access.facts != 0
     {
         return Err(unsupported_access(node));
@@ -202,21 +203,38 @@ pub(super) fn plan_direct_source_element_syntax(
 
     let receiver = NodeRef::new(node.arena, node.file, access.expression);
     let index = NodeRef::new(node.arena, node.file, access.argument_expression);
-    if arena
-        .get(receiver.node)
-        .is_none_or(|child| child.parent != Some(node.node))
-        || arena
-            .get(index.node)
-            .is_none_or(|child| child.parent != Some(node.node))
-    {
+    let Some(receiver_record) = arena.get(receiver.node) else {
+        return Err(unsupported_access(node));
+    };
+    let Some(index_record) = arena.get(index.node) else {
+        return Err(unsupported_access(node));
+    };
+    if receiver_record.parent != Some(node.node) || index_record.parent != Some(node.node) {
         return Err(unsupported_access(node));
     }
+    let optional = if let Some(token_id) = access.question_dot_token {
+        let Some(token) = arena.get(token_id) else {
+            return Err(unsupported_access(node));
+        };
+        if token.kind != SyntaxKind::QuestionDotToken
+            || token.parent != Some(node.node)
+            || token.flags.0 != 0
+            || token.range.start < receiver_record.range.end
+            || token.range.end > index_record.range.start
+        {
+            return Err(unsupported_access(node));
+        }
+        true
+    } else {
+        receiver_continues_optional_chain(arena, receiver_record)
+    };
 
     preflight_element_links(store, node)?;
     Ok(DirectSourceElementSyntax {
         node,
         receiver,
         index,
+        optional,
     })
 }
 
@@ -240,6 +258,7 @@ pub(super) fn finish_direct_source_element_plan(
         node: syntax.node,
         receiver,
         index,
+        optional: syntax.optional,
     })
 }
 
@@ -311,6 +330,11 @@ fn check_direct_source_element_worker(
     let error = bootstrap.error_type;
     let string = bootstrap.string_type;
     let undefined = bootstrap.undefined_type;
+    let (receiver_type, propagate_undefined) = if plan.optional && receiver_type != any {
+        optional_element_receiver(store, global_types, plan, receiver_type)?
+    } else {
+        (receiver_type, false)
+    };
 
     let mut resolutions = Vec::with_capacity(indices.len());
     for index in &indices {
@@ -363,6 +387,22 @@ fn check_direct_source_element_worker(
         ElementResolution::success(type_, None)
     };
 
+    let type_ = if propagate_undefined
+        && resolution.type_ != any
+        && resolution.type_ != error
+        && resolution.type_ != undefined
+    {
+        element_union_type(
+            store,
+            global_types,
+            plan.node,
+            &[resolution.type_, undefined],
+            resolution.property,
+        )?
+    } else {
+        resolution.type_
+    };
+
     let diagnostic = prepare_element_diagnostic(
         store,
         host,
@@ -373,11 +413,81 @@ fn check_direct_source_element_worker(
         index_type,
         resolution.diagnostic,
     )?;
-    publish_element_links(store, plan.node, resolution.property, resolution.type_)?;
-    Ok(CheckedSourceElement {
-        type_: resolution.type_,
-        diagnostic,
-    })
+    publish_element_links(store, plan.node, resolution.property, type_)?;
+    Ok(CheckedSourceElement { type_, diagnostic })
+}
+
+fn receiver_continues_optional_chain(arena: &NodeArena, receiver: &ts_ast::Node) -> bool {
+    match &receiver.data {
+        NodeData::PropertyAccessExpression(access) => {
+            access.question_dot_token.is_some()
+                || arena
+                    .get(access.expression)
+                    .is_some_and(|parent| receiver_continues_optional_chain(arena, parent))
+        }
+        NodeData::ElementAccessExpression(access) => {
+            access.question_dot_token.is_some()
+                || arena
+                    .get(access.expression)
+                    .is_some_and(|parent| receiver_continues_optional_chain(arena, parent))
+        }
+        _ => false,
+    }
+}
+
+fn optional_element_receiver(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    plan: &SourceElementPlan,
+    receiver_type: TypeId,
+) -> Result<(TypeId, bool), SourceElementError> {
+    let strict = store
+        .intrinsic_bootstrap()
+        .ok_or(RelationUnavailable::MissingBootstrap)?
+        .options
+        .strict_null_checks;
+    if !strict {
+        return Ok((receiver_type, false));
+    }
+    let Some(record) = store.type_payload(receiver_type) else {
+        return Err(SourceElementError::InvalidType(receiver_type));
+    };
+    if !record.flags().intersects(TypeFlags::UNION) {
+        if record.flags().intersects(TypeFlags::NULLABLE) {
+            return Err(SourceElementError::Unsupported(
+                SourceElementUnsupported::Receiver(plan.receiver.node),
+            ));
+        }
+        return Ok((receiver_type, false));
+    }
+    let TypeData::Union(union) = record.data() else {
+        return Err(SourceElementError::InvalidType(receiver_type));
+    };
+    let constituents = union.union.types.clone();
+    let mut retained = Vec::with_capacity(constituents.len());
+    for constituent in constituents.iter().copied() {
+        let flags = store
+            .type_payload(constituent)
+            .map(|record| record.flags())
+            .ok_or(SourceElementError::InvalidType(constituent))?;
+        if !flags.intersects(TypeFlags::NULLABLE) {
+            retained.push(constituent);
+        }
+    }
+    if retained.len() == constituents.len() {
+        return Ok((receiver_type, false));
+    }
+    let Some(first) = retained.first().copied() else {
+        return Err(SourceElementError::Unsupported(
+            SourceElementUnsupported::Receiver(plan.receiver.node),
+        ));
+    };
+    let receiver = if retained.len() == 1 {
+        first
+    } else {
+        element_union_type(store, global_types, plan.node, &retained, None)?
+    };
+    Ok((receiver, true))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -777,28 +887,46 @@ fn optional_element_read_type(
     if !optional || !bootstrap.options.strict_null_checks {
         return Ok(type_);
     }
+    if global_types.is_none() && bootstrap.options.exact_optional_property_types {
+        return Err(SourceElementError::Unsupported(
+            SourceElementUnsupported::OptionalProperty { node, property },
+        ));
+    }
     let undefined = bootstrap.undefined_or_missing_type;
+    element_union_type(
+        store,
+        global_types,
+        node,
+        &[type_, undefined],
+        Some(property),
+    )
+}
+
+fn element_union_type(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    node: NodeRef,
+    types: &[TypeId],
+    property: Option<SemanticSymbolId>,
+) -> Result<TypeId, SourceElementError> {
     if let Some(global_types) = global_types {
         return store
-            .expression_union_type_with_global_types(
-                global_types,
-                &[type_, undefined],
-                UnionReduction::Literal,
-            )
+            .expression_union_type_with_global_types(global_types, types, UnionReduction::Literal)
             .map_err(Into::into);
     }
     #[cfg(test)]
     {
         let _ = (node, property);
         store
-            .expression_union_type(&[type_, undefined], UnionReduction::Literal)
+            .expression_union_type(types, UnionReduction::Literal)
             .map_err(Into::into)
     }
     #[cfg(not(test))]
     {
-        Err(SourceElementError::Unsupported(
-            SourceElementUnsupported::OptionalProperty { node, property },
-        ))
+        Err(SourceElementError::Unsupported(match property {
+            Some(property) => SourceElementUnsupported::OptionalProperty { node, property },
+            None => SourceElementUnsupported::Access(node),
+        }))
     }
 }
 
@@ -1556,6 +1684,53 @@ mod tests {
     }
 
     #[test]
+    fn optional_element_chains_remove_nullish_receivers_and_restore_undefined() {
+        let parsed = parse_fixture("const result = object?.[\"value\"];");
+        let file = FileId::new(615);
+        let mut store = registered_store(&parsed, file);
+        let (string, undefined) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.undefined_type)
+        };
+        let index = store.regular_string_literal_type("value".into()).unwrap();
+        let (object, property) = property_object(&mut store, "value", string, false);
+        let nullable = store
+            .alloc_union_type(ObjectFlags::NONE, vec![undefined, object])
+            .unwrap();
+        let receiver_symbol =
+            alloc_symbol(&mut store, SymbolFlags::BLOCK_SCOPED_VARIABLE, "object");
+        let plan = source_plan(
+            &parsed,
+            file,
+            &store,
+            PlannedExpressionKind::String("value".into()),
+            receiver_symbol,
+        );
+
+        let checked = check_direct_source_element_with_array_targets(
+            &mut store,
+            &empty_host(),
+            CanonicalArrayTargets::for_single_target_validation(object),
+            strict_options(),
+            &plan,
+            nullable,
+            index,
+        )
+        .unwrap();
+        let TypeData::Union(union) = store.type_payload(checked.type_).unwrap().data() else {
+            panic!("optional element access must preserve undefined")
+        };
+        assert!(union.union.types.contains(&string));
+        assert!(union.union.types.contains(&undefined));
+        assert_eq!(
+            store
+                .symbol_node_links(plan.node)
+                .and_then(|links| links.resolved_symbol),
+            Some(property),
+        );
+    }
+
+    #[test]
     fn array_number_reads_return_the_element_and_wrong_strings_emit_ts7015() {
         let parsed = parse_fixture("const first = array[0];");
         let file = FileId::new(602);
@@ -1695,30 +1870,22 @@ mod tests {
 
     #[test]
     fn fixed_tuple_out_of_bounds_indices_emit_ts2493_without_no_implicit_any() {
-        let parsed = parse_fixture("const result = tuple[2];");
+        let parsed = parse_fixture("const result = tuple[0];");
         let file = FileId::new(613);
         let mut store = registered_store(&parsed, file);
-        let (string, undefined) = {
-            let bootstrap = store.intrinsic_bootstrap().unwrap();
-            (bootstrap.string_type, bootstrap.undefined_type)
-        };
-        let info = store
-            .create_tuple_element_info(ElementFlags::REQUIRED, None)
-            .unwrap();
-        let tuple = store
-            .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(&[string], &[info], false))
-            .unwrap();
+        let undefined = store.intrinsic_bootstrap().unwrap().undefined_type;
+        let tuple = store.create_canonical_empty_tuple_type().unwrap();
         let array_target = canonical_array_target(&mut store);
         let receiver_symbol = alloc_symbol(&mut store, SymbolFlags::BLOCK_SCOPED_VARIABLE, "tuple");
-        let two = store
-            .regular_number_literal_type(ts_jsnum::Number::new(2.0))
+        let zero = store
+            .regular_number_literal_type(ts_jsnum::Number::new(0.0))
             .unwrap();
         let plan = source_plan(
             &parsed,
             file,
             &store,
             PlannedExpressionKind::Number {
-                value: ts_jsnum::Number::new(2.0),
+                value: ts_jsnum::Number::new(0.0),
                 unary_operand: None,
             },
             receiver_symbol,
@@ -1731,13 +1898,17 @@ mod tests {
             CanonicalCheckerOptions::default(),
             &plan,
             tuple,
-            two,
+            zero,
         )
         .unwrap();
         assert_eq!(checked.type_, undefined);
         let diagnostic = checked.diagnostic.unwrap();
         assert_eq!(diagnostic.node, Some(plan.index.node));
         assert_eq!(diagnostic.diagnostic.code(), 2493);
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "Tuple type '[]' of length '0' has no element at index '0'.",
+        );
     }
 
     #[test]
@@ -1919,18 +2090,7 @@ mod tests {
     }
 
     #[test]
-    fn optional_chains_member_calls_and_poisoned_links_fail_closed() {
-        let optional = parse_fixture("const result = object?.[\"known\"];");
-        let optional_file = FileId::new(609);
-        let optional_access = element_access(&optional, optional_file);
-        let optional_store = registered_store(&optional, optional_file);
-        assert_eq!(
-            plan_direct_source_element_syntax(&optional.arena, &optional_store, optional_access,),
-            Err(SourceElementError::Unsupported(
-                SourceElementUnsupported::Access(optional_access),
-            ))
-        );
-
+    fn member_calls_and_poisoned_links_fail_closed() {
         let call = parse_fixture("const result = object[\"known\"]();");
         let call_file = FileId::new(610);
         let call_access = element_access(&call, call_file);
