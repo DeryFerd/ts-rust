@@ -1,12 +1,13 @@
 //! Exact source planning for TypeScript ESM imports and named reexports.
 //!
-//! This slice accepts leading, top-level default imports and named imports,
-//! including explicit named `default` bindings. Imports and reexports must
-//! use identifier names and cannot have attributes. Alias discovery belongs
-//! to the production alias host. A successful alias may traverse named and
-//! explicit default reexports before reaching one unique exported declaration
-//! in another retained TypeScript ESM source. Value preparation supports
-//! initialized annotated `const` declarations, exact
+//! This slice accepts leading, top-level side-effect imports, default imports,
+//! namespace imports, and named imports, including explicit named `default`
+//! bindings. Imports and reexports must use identifier names and cannot have
+//! attributes. Alias discovery belongs to the production alias host. A
+//! successful alias may traverse named and explicit default reexports before
+//! reaching one unique exported declaration in another retained TypeScript
+//! source. Value preparation supports initialized annotated `const`
+//! declarations, exact
 //! `export declare const` declarations in retained declaration files, and
 //! annotated `FunctionDeclaration`s. Declaration-file bodies are never source
 //! checked by this leaf; only the final imported annotation is queried.
@@ -201,7 +202,6 @@ pub(super) enum SourceImportUnsupported {
     ImportClause(NodeRef),
     ExportClause(NodeRef),
     NamedBindings(NodeRef),
-    EmptyNamedBindings(NodeRef),
     EmptyNamedExports(NodeRef),
     Binding(NodeRef),
     ExportBinding(NodeRef),
@@ -311,7 +311,6 @@ impl SourceImportError {
                 | SourceImportUnsupported::ImportClause(node)
                 | SourceImportUnsupported::ExportClause(node)
                 | SourceImportUnsupported::NamedBindings(node)
-                | SourceImportUnsupported::EmptyNamedBindings(node)
                 | SourceImportUnsupported::EmptyNamedExports(node)
                 | SourceImportUnsupported::Binding(node)
                 | SourceImportUnsupported::ExportBinding(node)
@@ -564,10 +563,21 @@ fn plan_top_level_named_import(
         )));
     }
 
-    let clause = import
+    let Some(clause) = import
         .import_clause
         .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
-        .ok_or_else(|| unsupported(SourceImportUnsupported::ImportClause(declaration)))?;
+    else {
+        if phase != SourceImportPhase::Value {
+            return Err(unsupported(SourceImportUnsupported::ImportClause(
+                declaration,
+            )));
+        }
+        return Ok(SourceImportPlan {
+            declaration,
+            module_specifier,
+            bindings: Vec::new(),
+        });
+    };
     let clause_record = checked_node(arena, bound, store, clause)?;
     let NodeData::ImportClause(clause_data) = &clause_record.data else {
         return Err(unsupported(SourceImportUnsupported::ImportClause(clause)));
@@ -603,6 +613,7 @@ fn plan_top_level_named_import(
     let named_count = match named {
         Some(named) => match &checked_node(arena, bound, store, named)?.data {
             NodeData::NamedImports(named) => named.elements.nodes.len(),
+            NodeData::NamespaceImport(_) => 1,
             _ => 0,
         },
         None => 0,
@@ -641,7 +652,64 @@ fn plan_top_level_named_import(
         });
     }
 
-    if let Some(named) = named {
+    if let Some(namespace) = named.filter(|named| {
+        checked_node(arena, bound, store, *named)
+            .is_ok_and(|record| matches!(record.data, NodeData::NamespaceImport(_)))
+    }) {
+        let namespace_record = checked_node(arena, bound, store, namespace)?;
+        let NodeData::NamespaceImport(namespace_data) = &namespace_record.data else {
+            return Err(unsupported(SourceImportUnsupported::NamedBindings(
+                namespace,
+            )));
+        };
+        if phase != SourceImportPhase::Value {
+            return Err(unsupported(SourceImportUnsupported::TypeOnly(namespace)));
+        }
+        if namespace_record.kind != SyntaxKind::NamespaceImport
+            || namespace_record.parent != Some(clause.node)
+            || namespace_record.flags.0 != 0
+            || !range_contains(clause_record, namespace_record)
+            || namespace_data.local_symbol.is_some()
+            || namespace_data.symbol.is_some()
+        {
+            return Err(unsupported(SourceImportUnsupported::NamedBindings(
+                namespace,
+            )));
+        }
+
+        let local_name = NodeRef::new(declaration.arena, declaration.file, namespace_data.name);
+        let local_text = exact_identifier(
+            arena,
+            bound,
+            store,
+            local_name,
+            namespace,
+            SourceImportUnsupported::NonIdentifierLocalName(local_name),
+        )?;
+        let alias_symbol = bound
+            .symbol(namespace)
+            .ok_or_else(|| invariant(SourceImportInvariant::MissingAliasSymbol(namespace)))?;
+        validate_alias_symbol(store, alias_symbol, namespace, local_name, &local_text)?;
+        if !aliases.insert(alias_symbol) {
+            return Err(invariant(SourceImportInvariant::DuplicateAlias(
+                alias_symbol,
+            )));
+        }
+        if !local_names.insert(local_text.clone()) {
+            return Err(invariant(SourceImportInvariant::DuplicateLocalName(
+                local_name,
+            )));
+        }
+        preflight_alias_value_links(store, alias_symbol)?;
+        bindings.push(SourceImportBindingPlan {
+            declaration: namespace,
+            imported_name: local_name,
+            local_name,
+            imported_text: "*".to_owned(),
+            local_text,
+            alias_symbol,
+        });
+    } else if let Some(named) = named {
         let named_record = checked_node(arena, bound, store, named)?;
         let NodeData::NamedImports(named_data) = &named_record.data else {
             return Err(unsupported(SourceImportUnsupported::NamedBindings(named)));
@@ -656,12 +724,6 @@ fn plan_top_level_named_import(
         {
             return Err(unsupported(SourceImportUnsupported::NamedBindings(named)));
         }
-        if named_data.elements.nodes.is_empty() && bindings.is_empty() {
-            return Err(unsupported(SourceImportUnsupported::EmptyNamedBindings(
-                named,
-            )));
-        }
-
         for &binding in &named_data.elements.nodes {
             let binding = NodeRef::new(declaration.arena, declaration.file, binding);
             let binding_record = checked_node(arena, bound, store, binding)?;
@@ -3493,6 +3555,66 @@ mod tests {
             .unwrap()
             .get_source(name)
             .unwrap()
+    }
+
+    #[test]
+    fn side_effect_and_empty_named_imports_do_not_allocate_alias_state() {
+        for (source, type_only) in [
+            (r#"import "./target";"#, false),
+            (r#"import {} from "./target";"#, false),
+            (r#"import type {} from "./target";"#, true),
+        ] {
+            let fixture = fixture(
+                &[source, "export type Model = number;"],
+                &[Route {
+                    source: 0,
+                    specifier: 0,
+                    target: Some(1),
+                }],
+            );
+            let before = store_state(&fixture.store);
+            let plan = if type_only {
+                fixture.plan_type_import(0, 0)
+            } else {
+                fixture.plan_import(0, 0)
+            };
+            assert!(plan.bindings.is_empty());
+            assert_eq!(plan.module_specifier.file, fixture.files[0].file);
+            assert_eq!(store_state(&fixture.store), before);
+        }
+    }
+
+    #[test]
+    fn unused_namespace_imports_resolve_without_querying_module_values() {
+        let mut fixture = fixture(
+            &[
+                r#"import * as namespace from "./target";"#,
+                "export const value: number = 1;",
+            ],
+            &[Route {
+                source: 0,
+                specifier: 0,
+                target: Some(1),
+            }],
+        );
+        let plan = fixture.plan_import(0, 0);
+        assert_eq!(plan.bindings.len(), 1);
+        assert_eq!(plan.bindings[0].imported_text, "*");
+        assert_eq!(plan.bindings[0].local_text, "namespace");
+
+        let target_bound = fixture.bound.get(&fixture.files[1].file).unwrap();
+        let module = target_bound.symbol(target_bound.source_file()).unwrap();
+        let resolved = resolve_all(&mut fixture, &plan.bindings).unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].immediate_target_symbol, module);
+        assert_eq!(resolved[0].target_symbol, module);
+        assert!(
+            fixture
+                .store
+                .value_symbol_links(plan.bindings[0].alias_symbol)
+                .is_none()
+        );
+        assert!(fixture.store.value_symbol_links(module).is_none());
     }
 
     #[test]

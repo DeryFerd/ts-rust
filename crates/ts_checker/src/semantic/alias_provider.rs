@@ -171,6 +171,10 @@ enum SupportedAliasDeclaration {
         specifier: NodeRef,
         type_only: bool,
     },
+    NamespaceExport {
+        specifier: NodeRef,
+        type_only: bool,
+    },
     DefaultModuleMember {
         specifier: NodeRef,
         type_only: bool,
@@ -497,12 +501,42 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
                     type_only: clause.phase_modifier == Some(SyntaxKind::TypeKeyword),
                 })
             }
-            (SyntaxKind::ImportEqualsDeclaration, NodeData::ImportEqualsDeclaration(import)) => {
-                let specifier = import_equals_context(source.arena, declaration)?;
-                Ok(SupportedAliasDeclaration::ExternalImportEquals {
+            (SyntaxKind::NamespaceExport, NodeData::NamespaceExport(_)) => {
+                let (specifier, type_only) = namespace_export_context(source.arena, declaration)?;
+                Ok(SupportedAliasDeclaration::NamespaceExport {
                     specifier,
-                    type_only: import.is_type_only,
+                    type_only,
                 })
+            }
+            (SyntaxKind::ImportEqualsDeclaration, NodeData::ImportEqualsDeclaration(import)) => {
+                match source
+                    .arena
+                    .get(import.module_reference)
+                    .map(|node| &node.data)
+                {
+                    Some(NodeData::ExternalModuleReference(_)) => {
+                        let specifier = import_equals_context(source.arena, declaration)?;
+                        Ok(SupportedAliasDeclaration::ExternalImportEquals {
+                            specifier,
+                            type_only: import.is_type_only,
+                        })
+                    }
+                    Some(NodeData::Identifier(_)) => {
+                        let target = Self::local_module_member(
+                            store,
+                            source,
+                            declaration,
+                            import.module_reference,
+                        )?;
+                        Ok(SupportedAliasDeclaration::LocalModuleMember {
+                            target,
+                            type_only: import.is_type_only,
+                        })
+                    }
+                    _ => Err(
+                        CanonicalAliasTargetUnavailable::UnsupportedAliasDeclaration(declaration),
+                    ),
+                }
             }
             (SyntaxKind::ImportSpecifier, NodeData::ImportSpecifier(import)) => {
                 let (specifier, clause) = import_specifier_context(source.arena, declaration)?;
@@ -638,6 +672,7 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
         store: &CanonicalSemanticStore<MapperPayload>,
         declaration: NodeRef,
         resolved: CanonicalResolvedModule,
+        allow_commonjs_import_of_esm: bool,
     ) -> Result<SemanticSymbolId, CanonicalAliasTargetUnavailable> {
         let target = self.sources.get(resolved.target_file()).ok_or(
             CanonicalAliasTargetUnavailable::ForeignModuleTarget {
@@ -693,8 +728,9 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
                     declaration,
                     module,
                 })?;
+        let modes = (resolved.usage_mode(), resolved.target_mode());
         if !matches!(
-            (resolved.usage_mode(), resolved.target_mode()),
+            modes,
             (
                 CanonicalModuleResolutionMode::Esm,
                 CanonicalModuleResolutionMode::Esm
@@ -702,7 +738,13 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
                 CanonicalModuleResolutionMode::CommonJs,
                 CanonicalModuleResolutionMode::CommonJs
             )
-        ) {
+        ) && !(allow_commonjs_import_of_esm
+            && modes
+                == (
+                    CanonicalModuleResolutionMode::CommonJs,
+                    CanonicalModuleResolutionMode::Esm,
+                ))
+        {
             if resolved.usage_mode() == CanonicalModuleResolutionMode::CommonJs
                 || resolved.target_mode() == CanonicalModuleResolutionMode::CommonJs
             {
@@ -887,6 +929,7 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
         let supported = self.supported_declaration(store, declaration)?;
         let type_only = match &supported {
             SupportedAliasDeclaration::NamespaceImport { type_only, .. }
+            | SupportedAliasDeclaration::NamespaceExport { type_only, .. }
             | SupportedAliasDeclaration::DefaultModuleMember { type_only, .. }
             | SupportedAliasDeclaration::NamedModuleMember { type_only, .. }
             | SupportedAliasDeclaration::ExternalImportEquals { type_only, .. }
@@ -903,6 +946,7 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
         }
         let specifier = match &supported {
             SupportedAliasDeclaration::NamespaceImport { specifier, .. }
+            | SupportedAliasDeclaration::NamespaceExport { specifier, .. }
             | SupportedAliasDeclaration::DefaultModuleMember { specifier, .. }
             | SupportedAliasDeclaration::NamedModuleMember { specifier, .. }
             | SupportedAliasDeclaration::ExternalImportEquals { specifier, .. } => *specifier,
@@ -911,7 +955,16 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
             }
         };
         let resolved = self.resolved_module(declaration, specifier, store)?;
-        let module = self.direct_source_module(store, declaration, resolved)?;
+        let allow_commonjs_import_of_esm = matches!(
+            supported,
+            SupportedAliasDeclaration::ExternalImportEquals { .. }
+                | SupportedAliasDeclaration::NamedModuleMember {
+                    type_only: true,
+                    ..
+                }
+        );
+        let module =
+            self.direct_source_module(store, declaration, resolved, allow_commonjs_import_of_esm)?;
         let export_equals = Self::export_equals_target(store, declaration, module)?;
         if export_equals.is_some()
             && !matches!(
@@ -930,6 +983,7 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
             SupportedAliasDeclaration::NamespaceImport { .. } => {
                 Self::direct_namespace_target(store, declaration, module)?
             }
+            SupportedAliasDeclaration::NamespaceExport { .. } => module,
             SupportedAliasDeclaration::DefaultModuleMember { .. } => {
                 Self::direct_export(store, declaration, module, "default")?
             }
@@ -1187,6 +1241,37 @@ fn namespace_import_context(
     ))
 }
 
+fn namespace_export_context(
+    arena: &NodeArena,
+    declaration: NodeRef,
+) -> Result<(NodeRef, bool), CanonicalAliasTargetUnavailable> {
+    let export_id = exact_parent(arena, declaration)?;
+    let Some(Node {
+        kind: SyntaxKind::ExportDeclaration,
+        data: NodeData::ExportDeclaration(export),
+        ..
+    }) = arena.get(export_id)
+    else {
+        return Err(CanonicalAliasTargetUnavailable::MalformedDeclaration(
+            declaration,
+        ));
+    };
+    if export.export_clause != Some(declaration.node) {
+        return Err(CanonicalAliasTargetUnavailable::MalformedDeclaration(
+            declaration,
+        ));
+    }
+    let Some(specifier) = export.module_specifier else {
+        return Err(CanonicalAliasTargetUnavailable::MalformedDeclaration(
+            declaration,
+        ));
+    };
+    Ok((
+        NodeRef::new(declaration.arena, declaration.file, specifier),
+        export.is_type_only,
+    ))
+}
+
 fn import_specifier_context(
     arena: &NodeArena,
     declaration: NodeRef,
@@ -1388,6 +1473,7 @@ mod tests {
                     NodeData::ImportSpecifier(specifier) => Some(specifier.name),
                     NodeData::ExportSpecifier(specifier) => Some(specifier.name),
                     NodeData::NamespaceImport(namespace) => Some(namespace.name),
+                    NodeData::NamespaceExport(namespace) => Some(namespace.name),
                     _ => None,
                 }?;
                 (module_export_name(&parsed.arena, name_node) == Some(name))
@@ -1561,6 +1647,262 @@ mod tests {
                 .unwrap();
             assert_eq!(found, Some(expected));
         }
+    }
+
+    #[test]
+    fn namespace_reexports_keep_module_identity_and_type_only_markers() {
+        let exporter = parsed(
+            r#"
+                export * as values from "./target";
+                export type * as Types from "./target";
+            "#,
+        );
+        let target = parsed("export const value = 1; export default value;");
+        let exporter_file = FileId::new(3);
+        let target_file = FileId::new(4);
+        let files = [
+            (exporter_file, &exporter, CanonicalModuleState::External),
+            (target_file, &target, CanonicalModuleState::External),
+        ];
+        let entries = module_specifiers(&exporter)
+            .into_iter()
+            .map(|specifier| {
+                CanonicalModuleResolutionEntry::resolved(
+                    node_ref(&exporter, exporter_file, specifier),
+                    esm(target_file),
+                )
+            })
+            .collect::<Vec<_>>();
+        let (mut store, bound_files, manifest) =
+            fixture(&files, CanonicalModuleResolutionManifestInput::new(entries));
+        let mut host =
+            ProductionAliasTargetHost::new(&store, sources(&files, &bound_files), &manifest)
+                .unwrap();
+        let module = source_module(&bound_files, target_file);
+
+        for (name, type_only) in [("values", false), ("Types", true)] {
+            let declaration = alias_declaration_named(&exporter, exporter_file, name);
+            let namespace = alias(&bound_files, declaration);
+            assert_eq!(
+                CanonicalAliasResolver::new(&mut store, &mut host)
+                    .resolve_alias(namespace)
+                    .unwrap()
+                    .target,
+                AliasTargetState::Resolved(module)
+            );
+            assert_eq!(
+                store
+                    .alias_symbol_links(namespace)
+                    .unwrap()
+                    .type_only_declaration,
+                type_only.then_some(declaration)
+            );
+        }
+    }
+
+    #[test]
+    fn local_import_equals_chains_preserve_module_identity_and_type_only_markers() {
+        let importer = parsed(
+            r#"
+                import Required = require("./target");
+                import Forwarded = Required;
+                import Again = Forwarded;
+                import type * as TypeNamespace from "./target";
+                import TypeAlias = TypeNamespace;
+            "#,
+        );
+        let target = parsed("export const value = 1;");
+        let importer_file = FileId::new(9);
+        let target_file = FileId::new(10);
+        let files = [
+            (importer_file, &importer, CanonicalModuleState::External),
+            (target_file, &target, CanonicalModuleState::External),
+        ];
+        let specifiers = module_specifiers(&importer);
+        let entries = [
+            CanonicalModuleResolutionEntry::resolved(
+                node_ref(&importer, importer_file, specifiers[0]),
+                CanonicalResolvedModuleInput::new(
+                    target_file,
+                    CanonicalModuleResolutionMode::CommonJs,
+                    CanonicalModuleResolutionMode::CommonJs,
+                ),
+            ),
+            CanonicalModuleResolutionEntry::resolved(
+                node_ref(&importer, importer_file, specifiers[1]),
+                esm(target_file),
+            ),
+        ];
+        let (mut store, bound_files, manifest) =
+            fixture(&files, CanonicalModuleResolutionManifestInput::new(entries));
+        let mut host =
+            ProductionAliasTargetHost::new(&store, sources(&files, &bound_files), &manifest)
+                .unwrap();
+        let module = source_module(&bound_files, target_file);
+        let required_declaration = alias_declaration_named(&importer, importer_file, "Required");
+        let forwarded_declaration = alias_declaration_named(&importer, importer_file, "Forwarded");
+        let repeated_declaration = alias_declaration_named(&importer, importer_file, "Again");
+        let type_namespace_declaration =
+            alias_declaration_named(&importer, importer_file, "TypeNamespace");
+        let type_alias_declaration = alias_declaration_named(&importer, importer_file, "TypeAlias");
+        let required = alias(&bound_files, required_declaration);
+        let forwarded = alias(&bound_files, forwarded_declaration);
+        let repeated = alias(&bound_files, repeated_declaration);
+        let type_alias = alias(&bound_files, type_alias_declaration);
+
+        assert_eq!(
+            CanonicalAliasResolver::new(&mut store, &mut host)
+                .get_immediate_aliased_symbol(forwarded)
+                .unwrap(),
+            Some(required)
+        );
+        assert_eq!(
+            CanonicalAliasResolver::new(&mut store, &mut host)
+                .get_immediate_aliased_symbol(repeated)
+                .unwrap(),
+            Some(forwarded)
+        );
+        assert_eq!(
+            CanonicalAliasResolver::new(&mut store, &mut host)
+                .resolve_alias(repeated)
+                .unwrap()
+                .target,
+            AliasTargetState::Resolved(module)
+        );
+        assert_eq!(
+            CanonicalAliasResolver::new(&mut store, &mut host)
+                .resolve_alias(type_alias)
+                .unwrap()
+                .target,
+            AliasTargetState::Resolved(module)
+        );
+        assert_eq!(
+            store
+                .alias_symbol_links(type_alias)
+                .unwrap()
+                .type_only_declaration,
+            Some(type_namespace_declaration)
+        );
+    }
+
+    #[test]
+    fn require_and_type_only_imports_can_resolve_an_esm_target() {
+        let importer = parsed(
+            r#"
+                import Required = require("./target");
+                import type { Model as TypeOnlyModel } from "./target";
+                import { Model as ValueModel } from "./target";
+            "#,
+        );
+        let target = parsed("export interface Model { value: number }");
+        let importer_file = FileId::new(12);
+        let target_file = FileId::new(13);
+        let files = [
+            (importer_file, &importer, CanonicalModuleState::External),
+            (target_file, &target, CanonicalModuleState::External),
+        ];
+        let entries = module_specifiers(&importer)
+            .into_iter()
+            .map(|specifier| {
+                CanonicalModuleResolutionEntry::resolved(
+                    node_ref(&importer, importer_file, specifier),
+                    CanonicalResolvedModuleInput::new(
+                        target_file,
+                        CanonicalModuleResolutionMode::CommonJs,
+                        CanonicalModuleResolutionMode::Esm,
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        let (mut store, bound_files, manifest) =
+            fixture(&files, CanonicalModuleResolutionManifestInput::new(entries));
+        let mut host =
+            ProductionAliasTargetHost::new(&store, sources(&files, &bound_files), &manifest)
+                .unwrap();
+        let module = source_module(&bound_files, target_file);
+        let model = direct_export(&store, &bound_files, target_file, "Model");
+
+        let require_declaration = alias_declaration_named(&importer, importer_file, "Required");
+        let require_alias = alias(&bound_files, require_declaration);
+        assert_eq!(
+            CanonicalAliasResolver::new(&mut store, &mut host)
+                .resolve_alias(require_alias)
+                .unwrap()
+                .target,
+            AliasTargetState::Resolved(module)
+        );
+
+        let type_declaration = alias_declaration_named(&importer, importer_file, "TypeOnlyModel");
+        let type_alias = alias(&bound_files, type_declaration);
+        assert_eq!(
+            CanonicalAliasResolver::new(&mut store, &mut host)
+                .resolve_alias(type_alias)
+                .unwrap()
+                .target,
+            AliasTargetState::Resolved(model)
+        );
+        assert_eq!(
+            store
+                .alias_symbol_links(type_alias)
+                .unwrap()
+                .type_only_declaration,
+            Some(type_declaration)
+        );
+
+        let value_declaration = alias_declaration_named(&importer, importer_file, "ValueModel");
+        let value_alias = alias(&bound_files, value_declaration);
+        assert_eq!(
+            unavailable_reason(
+                CanonicalAliasResolver::new(&mut store, &mut host)
+                    .resolve_alias(value_alias)
+                    .unwrap_err()
+            ),
+            CanonicalAliasTargetUnavailable::CommonJsModuleUnsupported {
+                declaration: value_declaration,
+                file: target_file,
+            }
+        );
+    }
+
+    #[test]
+    fn circular_local_import_equals_aliases_keep_canonical_cycle_events() {
+        let source = parsed("import First = Second; import Second = First; export {};");
+        let file = FileId::new(11);
+        let files = [(file, &source, CanonicalModuleState::External)];
+        let (mut store, bound_files, manifest) =
+            fixture(&files, CanonicalModuleResolutionManifestInput::new([]));
+        let mut host =
+            ProductionAliasTargetHost::new(&store, sources(&files, &bound_files), &manifest)
+                .unwrap();
+        let first = alias(
+            &bound_files,
+            alias_declaration_named(&source, file, "First"),
+        );
+        let second = alias(
+            &bound_files,
+            alias_declaration_named(&source, file, "Second"),
+        );
+
+        let resolution = CanonicalAliasResolver::new(&mut store, &mut host)
+            .resolve_alias(first)
+            .unwrap();
+        assert_eq!(resolution.target, AliasTargetState::Unknown);
+        assert!(!resolution.events.is_empty());
+        assert!(
+            resolution
+                .events
+                .iter()
+                .all(|event| event.diagnostic_code() == 2303)
+        );
+        assert_eq!(
+            store.alias_symbol_links(first).unwrap().alias_target,
+            AliasTargetState::Unknown
+        );
+        assert_eq!(
+            store.alias_symbol_links(second).unwrap().alias_target,
+            AliasTargetState::Unknown
+        );
+        assert!(store.type_resolution_is_empty());
     }
 
     #[test]
