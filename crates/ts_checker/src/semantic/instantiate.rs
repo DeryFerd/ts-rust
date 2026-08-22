@@ -3,10 +3,10 @@
 //! This is the first exact slice of pinned `instantiateTypeWorker`. It covers
 //! primitive and literal leaves, direct type-parameter mapping, canonical
 //! Array/ReadonlyArray references under an explicit target capability, direct
-//! full-arity generic class/interface references, and anonymous origin-free
-//! unions whose constituents remain inside the installed canonical union
-//! domain. Other object, signature, alias, and origin instantiation needs its
-//! owning caches and is rejected instead of identity.
+//! full-arity generic class/interface references, template literals, intrinsic
+//! string mappings, and anonymous origin-free unions. Other object, signature,
+//! alias, and origin instantiation needs its owning caches and is rejected
+//! instead of identity.
 
 use std::collections::{HashMap, HashSet};
 
@@ -19,6 +19,7 @@ use super::{
         DirectGenericReferenceError, create_direct_generic_reference,
         validate_direct_generic_reference,
     },
+    template_types::TemplateTypeError,
     type_records::{TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
 };
@@ -62,6 +63,7 @@ pub(super) enum InstantiationError {
     UnsupportedUnionConstituent(TypeId),
     Array(ArrayTypeError),
     Reference(DirectGenericReferenceError),
+    Template(TemplateTypeError),
     Union(LiteralTypeCacheError),
 }
 
@@ -114,6 +116,7 @@ impl std::fmt::Display for InstantiationError {
             ),
             Self::Array(error) => error.fmt(formatter),
             Self::Reference(error) => error.fmt(formatter),
+            Self::Template(error) => error.fmt(formatter),
             Self::Union(error) => error.fmt(formatter),
         }
     }
@@ -124,6 +127,7 @@ impl std::error::Error for InstantiationError {
         match self {
             Self::Array(error) => Some(error),
             Self::Reference(error) => Some(error),
+            Self::Template(error) => Some(error),
             Self::Union(error) => Some(error),
             _ => None,
         }
@@ -145,6 +149,12 @@ impl From<ArrayTypeError> for InstantiationError {
 impl From<DirectGenericReferenceError> for InstantiationError {
     fn from(error: DirectGenericReferenceError) -> Self {
         Self::Reference(error)
+    }
+}
+
+impl From<TemplateTypeError> for InstantiationError {
+    fn from(error: TemplateTypeError) -> Self {
+        Self::Template(error)
     }
 }
 
@@ -585,6 +595,36 @@ fn could_contain_installed_type_variables_worker(
         .ok_or(InstantiationError::InvalidType(type_))?;
     let result = match record.data() {
         TypeData::Intrinsic(_) | TypeData::Literal(_) | TypeData::UniqueEsSymbol(_) => Ok(false),
+        TypeData::TemplateLiteral(template) => {
+            if template.types.is_empty() || template.texts.len() != template.types.len() + 1 {
+                Err(TemplateTypeError::InvalidTemplate(type_).into())
+            } else {
+                template
+                    .types
+                    .iter()
+                    .try_fold(false, |contains, placeholder| {
+                        Ok(contains
+                            || could_contain_installed_type_variables_worker(
+                                store,
+                                *placeholder,
+                                array_targets,
+                                seen,
+                            )?)
+                    })
+            }
+        }
+        TypeData::StringMapping(mapping) => {
+            if record.symbol().is_none() {
+                Err(InstantiationError::UnsupportedType(type_))
+            } else {
+                could_contain_installed_type_variables_worker(
+                    store,
+                    mapping.target,
+                    array_targets,
+                    seen,
+                )
+            }
+        }
         TypeData::Union(data) => {
             // Preserve the installed slice's typed alias/origin boundaries.
             // Their eventual implementations will inspect alias arguments and
@@ -1042,6 +1082,14 @@ fn mapped_member_union_type_is_redundant(
 enum InstantiationWork {
     TypeParameter,
     Identity,
+    TemplateLiteral {
+        texts: Vec<String>,
+        types: Vec<TypeId>,
+    },
+    StringMapping {
+        symbol: SemanticSymbolId,
+        target: TypeId,
+    },
     Union {
         aliased: bool,
         has_origin: bool,
@@ -1067,6 +1115,16 @@ fn instantiate_type_worker(
             TypeData::Intrinsic(_) | TypeData::Literal(_) | TypeData::UniqueEsSymbol(_) => {
                 InstantiationWork::Identity
             }
+            TypeData::TemplateLiteral(template) => InstantiationWork::TemplateLiteral {
+                texts: template.texts.clone(),
+                types: template.types.clone(),
+            },
+            TypeData::StringMapping(mapping) => InstantiationWork::StringMapping {
+                symbol: record
+                    .symbol()
+                    .ok_or(InstantiationError::UnsupportedType(type_))?,
+                target: mapping.target,
+            },
             TypeData::Union(data) => InstantiationWork::Union {
                 aliased: record.alias().is_some(),
                 has_origin: data.origin.is_some(),
@@ -1091,6 +1149,24 @@ fn instantiate_type_worker(
             apply_mapping(store, type_, mapping, array_targets, session)
         }
         InstantiationWork::Identity => Ok(type_),
+        InstantiationWork::TemplateLiteral { texts, types } => instantiate_template_literal(
+            store,
+            type_,
+            &texts,
+            &types,
+            mapping,
+            array_targets,
+            session,
+        ),
+        InstantiationWork::StringMapping { symbol, target } => instantiate_string_mapping(
+            store,
+            type_,
+            symbol,
+            target,
+            mapping,
+            array_targets,
+            session,
+        ),
         InstantiationWork::Union {
             aliased,
             has_origin,
@@ -1109,6 +1185,56 @@ fn instantiate_type_worker(
         }
         InstantiationWork::Unsupported => Err(InstantiationError::UnsupportedType(type_)),
     }
+}
+
+fn instantiate_template_literal(
+    store: &mut CanonicalTypeMapperStore,
+    source: TypeId,
+    texts: &[String],
+    types: &[TypeId],
+    mapping: InstantiationMapping<'_>,
+    array_targets: Option<CanonicalArrayTargets>,
+    session: &mut InstantiationSession,
+) -> Result<TypeId, InstantiationError> {
+    if types.is_empty() || texts.len() != types.len() + 1 {
+        return Err(TemplateTypeError::InvalidTemplate(source).into());
+    }
+    let mut placeholders = Vec::with_capacity(types.len());
+    let mut changed = false;
+    for type_ in types {
+        let instantiated =
+            instantiate_type_with_alias(store, *type_, mapping, array_targets, None, session)?;
+        changed |= instantiated != *type_;
+        placeholders.push(instantiated);
+    }
+    if !changed {
+        return Ok(source);
+    }
+    store
+        .get_template_literal_type(texts, &placeholders)
+        .map_err(Into::into)
+}
+
+fn instantiate_string_mapping(
+    store: &mut CanonicalTypeMapperStore,
+    source: TypeId,
+    symbol: SemanticSymbolId,
+    target: TypeId,
+    mapping: InstantiationMapping<'_>,
+    array_targets: Option<CanonicalArrayTargets>,
+    session: &mut InstantiationSession,
+) -> Result<TypeId, InstantiationError> {
+    let target = instantiate_type_with_alias(store, target, mapping, array_targets, None, session)?;
+    let Some(TypeData::StringMapping(original)) = store.type_payload(source).map(TypeRecord::data)
+    else {
+        return Err(InstantiationError::UnsupportedType(source));
+    };
+    if target == original.target {
+        return Ok(source);
+    }
+    store
+        .get_string_mapping_type(symbol, target)
+        .map_err(Into::into)
 }
 
 fn instantiate_reference(
@@ -1258,7 +1384,7 @@ fn instantiate_union(
 ) -> Result<TypeId, InstantiationError> {
     let mut mapped_types = Vec::with_capacity(constituents.len());
     let mut changed = false;
-    let mut contains_type_parameter = false;
+    let mut contains_type_variable = false;
     for constituent in constituents {
         let record = store
             .type_payload(*constituent)
@@ -1269,14 +1395,17 @@ fn instantiate_union(
                 | TypeData::Literal(_)
                 | TypeData::UniqueEsSymbol(_)
                 | TypeData::TypeParameter(_)
+                | TypeData::TemplateLiteral(_)
+                | TypeData::StringMapping(_)
         ) {
             return Err(InstantiationError::UnsupportedUnionConstituent(
                 *constituent,
             ));
         }
-        contains_type_parameter |= matches!(record.data(), TypeData::TypeParameter(_));
+        contains_type_variable |=
+            could_contain_installed_type_variables(store, *constituent, array_targets)?;
     }
-    if !contains_type_parameter {
+    if !contains_type_variable {
         return Ok(source);
     }
     for constituent in constituents {
@@ -1294,7 +1423,18 @@ fn instantiate_union(
     if !changed {
         return Ok(source);
     }
-    canonical_anonymous_union(store, &mapped_types).map_err(Into::into)
+    if mapped_types.iter().any(|type_| {
+        matches!(
+            store.type_payload(*type_).map(TypeRecord::data),
+            Some(TypeData::TemplateLiteral(_) | TypeData::StringMapping(_))
+        )
+    }) {
+        store
+            .template_result_union(&mapped_types)
+            .map_err(Into::into)
+    } else {
+        canonical_anonymous_union(store, &mapped_types).map_err(Into::into)
+    }
 }
 
 pub(super) fn canonical_anonymous_union(
@@ -1309,10 +1449,16 @@ pub(super) fn canonical_anonymous_union(
 mod tests {
     use super::*;
     use crate::semantic::{
-        DeclaredTypeLinks, IntrinsicBootstrapOptions, SemanticStore, declared::type_list_key,
-        mapper::TypeMapper, type_records::TypeRecord, types::ObjectFlags,
+        DeclaredTypeLinks, IntrinsicBootstrapOptions, SemanticStore,
+        declared::type_list_key,
+        mapper::TypeMapper,
+        template_types::MAX_TEMPLATE_UNION_SIZE,
+        type_records::{LiteralValue, TypeRecord},
+        types::ObjectFlags,
     };
+    use ts_ast::{decode_js_string, encode_js_string};
     use ts_binder::{EscapedName, SymbolData, SymbolFlags};
+    use ts_core::JsString;
 
     fn initialized_store() -> CanonicalTypeMapperStore {
         let mut store = SemanticStore::<TypeRecord, TypeMapper>::new();
@@ -1376,6 +1522,219 @@ mod tests {
 
         assert_eq!(instantiate_type(&mut store, parameter, mapper), Ok(number));
         assert_eq!(instantiate_type(&mut store, string, mapper), Ok(string));
+    }
+
+    #[test]
+    fn instantiates_template_literals_to_canonical_string_identities() {
+        let mut store = initialized_store();
+        let parameter = store.alloc_type_parameter(None).unwrap();
+        let value = store
+            .get_template_literal_type(&["value".to_owned()], &[])
+            .unwrap();
+        let expected = store
+            .get_template_literal_type(&["before-value-after".to_owned()], &[])
+            .unwrap();
+        let template = store
+            .get_template_literal_type(&["before-".to_owned(), "-after".to_owned()], &[parameter])
+            .unwrap();
+        let mapper = store.new_simple_type_mapper(parameter, value).unwrap();
+
+        assert_eq!(instantiate_type(&mut store, template, mapper), Ok(expected));
+        assert_eq!(
+            instantiate_type_with_vector(&mut store, template, &[parameter], &[value]),
+            Ok(expected)
+        );
+    }
+
+    #[test]
+    fn instantiates_template_literals_distributively_over_mapped_unions() {
+        let mut store = initialized_store();
+        let parameter = store.alloc_type_parameter(None).unwrap();
+        let first = store
+            .get_template_literal_type(&["first".to_owned()], &[])
+            .unwrap();
+        let second = store
+            .get_template_literal_type(&["second".to_owned()], &[])
+            .unwrap();
+        let replacement = canonical_anonymous_union(&mut store, &[first, second]).unwrap();
+        let template = store
+            .get_template_literal_type(&["id-".to_owned(), String::new()], &[parameter])
+            .unwrap();
+        let mapper = store
+            .new_simple_type_mapper(parameter, replacement)
+            .unwrap();
+
+        let result = instantiate_type(&mut store, template, mapper).unwrap();
+        let TypeData::Union(union) = store.type_payload(result).unwrap().data() else {
+            panic!("a union replacement must distribute through the template")
+        };
+        let values = union
+            .union
+            .types
+            .iter()
+            .map(|type_| match store.type_payload(*type_).unwrap().data() {
+                TypeData::Literal(literal) => match &literal.value {
+                    LiteralValue::String(value) => value.as_str(),
+                    _ => panic!("distributed templates must produce string literals"),
+                },
+                _ => panic!("distributed templates must produce string literals"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, ["id-first", "id-second"]);
+    }
+
+    #[test]
+    fn instantiates_template_literals_with_utf16_surrogate_boundaries() {
+        let mut store = initialized_store();
+        let parameter = store.alloc_type_parameter(None).unwrap();
+        let high = encode_js_string(&JsString::from_units(vec![0xd83d]));
+        let low = encode_js_string(&JsString::from_units(vec![0xde00]));
+        let replacement = store.get_template_literal_type(&[low], &[]).unwrap();
+        let expected = store
+            .get_template_literal_type(&["\u{1f600}".to_owned()], &[])
+            .unwrap();
+        let template = store
+            .get_template_literal_type(&[high, String::new()], &[parameter])
+            .unwrap();
+        let mapper = store
+            .new_simple_type_mapper(parameter, replacement)
+            .unwrap();
+
+        let result = instantiate_type(&mut store, template, mapper).unwrap();
+        assert_eq!(result, expected);
+        let TypeData::Literal(literal) = store.type_payload(result).unwrap().data() else {
+            panic!("the instantiated surrogate pair must become a string literal")
+        };
+        let LiteralValue::String(value) = &literal.value else {
+            panic!("the instantiated surrogate pair must become a string literal")
+        };
+        assert_eq!(decode_js_string(value).as_units(), &[0xd83d, 0xde00]);
+    }
+
+    #[test]
+    fn instantiates_intrinsic_string_mappings_and_nested_templates() {
+        let mut store = initialized_store();
+        let parameter = store.alloc_type_parameter(None).unwrap();
+        let symbol = store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::TYPE_ALIAS,
+                EscapedName::source("Uppercase"),
+            ))
+            .unwrap();
+        let value = store
+            .get_template_literal_type(&["\u{00df}foo".to_owned()], &[])
+            .unwrap();
+        let expected = store
+            .get_template_literal_type(&["SSFOO".to_owned()], &[])
+            .unwrap();
+        let mapping = store.get_string_mapping_type(symbol, parameter).unwrap();
+        let mapper = store.new_simple_type_mapper(parameter, value).unwrap();
+
+        assert_eq!(instantiate_type(&mut store, mapping, mapper), Ok(expected));
+
+        let nested = store
+            .get_template_literal_type(&["value:".to_owned(), String::new()], &[mapping])
+            .unwrap();
+        let nested_expected = store
+            .get_template_literal_type(&["value:SSFOO".to_owned()], &[])
+            .unwrap();
+        assert_eq!(
+            instantiate_type(&mut store, nested, mapper),
+            Ok(nested_expected)
+        );
+    }
+
+    #[test]
+    fn unchanged_template_and_string_mapping_instantiations_preserve_identity() {
+        let mut store = initialized_store();
+        let parameter = store.alloc_type_parameter(None).unwrap();
+        let unrelated = store.alloc_type_parameter(None).unwrap();
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let symbol = store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::TYPE_ALIAS,
+                EscapedName::source("Lowercase"),
+            ))
+            .unwrap();
+        let template = store
+            .get_template_literal_type(&["prefix".to_owned(), String::new()], &[parameter])
+            .unwrap();
+        let mapping = store.get_string_mapping_type(symbol, parameter).unwrap();
+        let mapper = store.new_simple_type_mapper(unrelated, string).unwrap();
+        let before = store.type_len();
+
+        assert_eq!(instantiate_type(&mut store, template, mapper), Ok(template));
+        assert_eq!(instantiate_type(&mut store, mapping, mapper), Ok(mapping));
+        assert_eq!(store.type_len(), before);
+    }
+
+    #[test]
+    fn template_instantiation_reports_cross_product_overflow_without_allocating() {
+        let mut store = initialized_store();
+        let parameter = store.alloc_type_parameter(None).unwrap();
+        let values = (0..10)
+            .map(|index| {
+                store
+                    .get_template_literal_type(&[index.to_string()], &[])
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let replacement = canonical_anonymous_union(&mut store, &values).unwrap();
+        let template = store
+            .get_template_literal_type(&vec![String::new(); 6], &[parameter; 5])
+            .unwrap();
+        let mapper = store
+            .new_simple_type_mapper(parameter, replacement)
+            .unwrap();
+        let before = store.type_len();
+
+        assert_eq!(
+            instantiate_type(&mut store, template, mapper),
+            Err(InstantiationError::Template(
+                TemplateTypeError::CrossProductTooLarge {
+                    size: MAX_TEMPLATE_UNION_SIZE,
+                    limit: MAX_TEMPLATE_UNION_SIZE,
+                }
+            ))
+        );
+        assert_eq!(store.type_len(), before);
+    }
+
+    #[test]
+    fn instantiates_unions_containing_generic_template_literals() {
+        let mut store = initialized_store();
+        let parameter = store.alloc_type_parameter(None).unwrap();
+        let value = store
+            .get_template_literal_type(&["value".to_owned()], &[])
+            .unwrap();
+        let first = store
+            .get_template_literal_type(&["a-".to_owned(), String::new()], &[parameter])
+            .unwrap();
+        let second = store
+            .get_template_literal_type(&["b-".to_owned(), String::new()], &[parameter])
+            .unwrap();
+        let union = store
+            .alloc_union_type(ObjectFlags::NONE, vec![first, second])
+            .unwrap();
+        let mapper = store.new_simple_type_mapper(parameter, value).unwrap();
+
+        let result = instantiate_type(&mut store, union, mapper).unwrap();
+        let TypeData::Union(union) = store.type_payload(result).unwrap().data() else {
+            panic!("different instantiated templates must remain a union")
+        };
+        let values = union
+            .union
+            .types
+            .iter()
+            .map(|type_| match store.type_payload(*type_).unwrap().data() {
+                TypeData::Literal(literal) => match &literal.value {
+                    LiteralValue::String(value) => value.as_str(),
+                    _ => panic!("instantiated templates must produce string literals"),
+                },
+                _ => panic!("instantiated templates must produce string literals"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, ["a-value", "b-value"]);
     }
 
     #[test]

@@ -719,7 +719,10 @@ impl CanonicalTypeMapperStore {
             .ok_or(TemplateTypeError::Capacity)
     }
 
-    fn template_result_union(&mut self, types: &[TypeId]) -> Result<TypeId, TemplateTypeError> {
+    pub(super) fn template_result_union(
+        &mut self,
+        types: &[TypeId],
+    ) -> Result<TypeId, TemplateTypeError> {
         let never = self
             .intrinsic_bootstrap()
             .ok_or(TemplateTypeError::BootstrapUninitialized)?
@@ -821,5 +824,125 @@ impl CanonicalTypeMapperStore {
             }
         }
         left.get().cmp(&right.get())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ts_ast::{decode_js_string, encode_js_string};
+    use ts_binder::{CheckFlags, EscapedName, SymbolFlags};
+    use ts_core::JsString;
+
+    use super::{
+        CanonicalTypeMapperStore, MAX_TEMPLATE_UNION_SIZE, StringMappingKind, TemplateTypeError,
+    };
+    use crate::semantic::{
+        IntrinsicBootstrapOptions,
+        type_records::{LiteralValue, TypeData, TypeRecord},
+        types::ObjectFlags,
+    };
+
+    fn initialized_store() -> CanonicalTypeMapperStore {
+        let mut store = CanonicalTypeMapperStore::new();
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        store
+    }
+
+    #[test]
+    fn intrinsic_casing_preserves_surrogate_units_and_unicode_special_cases() {
+        let high = encode_js_string(&JsString::from_units(vec![0xd800]));
+        let surrounded = encode_js_string(&JsString::from_units(vec![
+            u16::from(b'A'),
+            0xd800,
+            u16::from(b'B'),
+        ]));
+        let low_prefix = encode_js_string(&JsString::from_units(vec![0xdc00, u16::from(b'x')]));
+
+        assert_eq!(
+            decode_js_string(&StringMappingKind::Uppercase.apply(&high)).as_units(),
+            &[0xd800]
+        );
+        assert_eq!(
+            decode_js_string(&StringMappingKind::Lowercase.apply(&surrounded)).as_units(),
+            &[u16::from(b'a'), 0xd800, u16::from(b'b')]
+        );
+        assert_eq!(
+            decode_js_string(&StringMappingKind::Capitalize.apply(&low_prefix)).as_units(),
+            &[0xdc00, u16::from(b'x')]
+        );
+        assert_eq!(StringMappingKind::Uppercase.apply("\u{00df}foo"), "SSFOO");
+        assert_eq!(StringMappingKind::Uppercase.apply("\u{fb01}oo"), "FIOO");
+        assert_eq!(
+            StringMappingKind::Lowercase.apply("\u{0130}SPANYOL"),
+            "i\u{0307}spanyol"
+        );
+        assert_eq!(
+            StringMappingKind::Lowercase.apply("\u{039f}\u{03a3}"),
+            "\u{03bf}\u{03c2}"
+        );
+        assert_eq!(
+            StringMappingKind::Lowercase.apply("\u{1c89}\u{03a3}"),
+            "\u{1c89}\u{03c3}"
+        );
+    }
+
+    #[test]
+    fn intrinsic_union_mapping_removes_duplicate_transformed_literals() {
+        let mut store = initialized_store();
+        let upper = store
+            .get_template_literal_type(&["A".to_owned()], &[])
+            .unwrap();
+        let lower = store
+            .get_template_literal_type(&["a".to_owned()], &[])
+            .unwrap();
+        let union = store
+            .alloc_union_type(ObjectFlags::PRIMITIVE_UNION, vec![upper, lower])
+            .unwrap();
+        let symbol = store.alloc_transient_symbol(
+            SymbolFlags::TYPE_ALIAS,
+            EscapedName::source("Uppercase"),
+            CheckFlags::NONE,
+        );
+
+        let result = store.get_string_mapping_type(symbol, union).unwrap();
+        assert_eq!(result, upper);
+        let Some(TypeData::Literal(literal)) = store.type_payload(result).map(TypeRecord::data)
+        else {
+            panic!("duplicate uppercase results must reduce to one canonical literal")
+        };
+        assert_eq!(literal.value, LiteralValue::String("A".to_owned()));
+    }
+
+    #[test]
+    fn large_template_products_saturate_before_expansion_or_allocation() {
+        let mut store = initialized_store();
+        let constituents = (0..10)
+            .map(|index| {
+                store
+                    .get_template_literal_type(&[index.to_string()], &[])
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let union = store
+            .alloc_union_type(ObjectFlags::PRIMITIVE_UNION, constituents)
+            .unwrap();
+        let placeholders = vec![union; 32];
+        let texts = vec![String::new(); placeholders.len() + 1];
+        let before = store.type_len();
+
+        assert_eq!(
+            store.get_template_cross_product_union_size(&placeholders),
+            Ok(usize::MAX)
+        );
+        assert_eq!(
+            store.get_template_literal_type(&texts, &placeholders),
+            Err(TemplateTypeError::CrossProductTooLarge {
+                size: usize::MAX,
+                limit: MAX_TEMPLATE_UNION_SIZE,
+            })
+        );
+        assert_eq!(store.type_len(), before);
     }
 }
