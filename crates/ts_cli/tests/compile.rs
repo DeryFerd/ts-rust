@@ -49,9 +49,13 @@ fn assert_matches_oracle(directory: &Path, arguments: &[&str]) {
         return;
     };
     let expected = run(&oracle.to_string_lossy(), directory, arguments);
-    assert_eq!(actual.status.code(), expected.status.code());
-    assert_eq!(actual.stdout, expected.stdout);
-    assert_eq!(actual.stderr, expected.stderr);
+    assert_eq!(
+        actual.status.code(),
+        expected.status.code(),
+        "arguments: {arguments:?}"
+    );
+    assert_eq!(actual.stdout, expected.stdout, "arguments: {arguments:?}");
+    assert_eq!(actual.stderr, expected.stderr, "arguments: {arguments:?}");
 }
 
 fn oracle_path() -> Option<PathBuf> {
@@ -153,6 +157,107 @@ fn project_no_emit_matches_oracle() {
             "false",
         ],
     );
+}
+
+#[test]
+fn no_arguments_compile_the_implicit_project_like_the_oracle() {
+    let directory = TestDirectory::new("implicit-project");
+    fs::write(directory.0.join("main.ts"), "export const answer = 42;\n").unwrap();
+    fs::write(
+        directory.0.join("tsconfig.json"),
+        r#"{"compilerOptions":{"noEmit":true},"files":["main.ts"]}"#,
+    )
+    .unwrap();
+
+    assert_matches_oracle(&directory.0, &[]);
+}
+
+#[test]
+fn side_effect_import_diagnostics_match_oracle_defaults_and_overrides() {
+    let directory = TestDirectory::new("side-effect-imports");
+    fs::write(
+        directory.0.join("main.ts"),
+        "import './missing-style.css';\nimport './missing-module';\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.0.join("tsconfig.json"),
+        r#"{"files":["main.ts"],"compilerOptions":{"noEmit":true}}"#,
+    )
+    .unwrap();
+
+    assert_matches_oracle(
+        &directory.0,
+        &["main.ts", "--ignoreConfig", "--noEmit", "--pretty", "false"],
+    );
+    assert_matches_oracle(
+        &directory.0,
+        &[
+            "main.ts",
+            "--ignoreConfig",
+            "--noEmit",
+            "--noUncheckedSideEffectImports",
+            "false",
+            "--pretty",
+            "false",
+        ],
+    );
+    assert_matches_oracle(
+        &directory.0,
+        &["--project", "tsconfig.json", "--pretty", "false"],
+    );
+
+    fs::write(
+        directory.0.join("tsconfig.json"),
+        r#"{"files":["main.ts"],"compilerOptions":{"noEmit":true,"noUncheckedSideEffectImports":false}}"#,
+    )
+    .unwrap();
+    assert_matches_oracle(
+        &directory.0,
+        &["--project", "tsconfig.json", "--pretty", "false"],
+    );
+}
+
+#[test]
+fn response_files_match_oracle_quoting_quiet_and_read_diagnostics() {
+    let directory = TestDirectory::new("response-files");
+    fs::write(
+        directory.0.join("with spaces.ts"),
+        "const value: string = 1;\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.0.join("quoted.rsp"),
+        "--ignoreConfig --noEmit --pretty false \"with spaces.ts\"",
+    )
+    .unwrap();
+    fs::write(
+        directory.0.join("utf8-bom.rsp"),
+        "\u{feff}--ignoreConfig --noEmit --pretty false \"with spaces.ts\"",
+    )
+    .unwrap();
+    let mut utf16 = vec![0xff, 0xfe];
+    for unit in "--ignoreConfig --noEmit --pretty false \"with spaces.ts\"".encode_utf16() {
+        utf16.extend_from_slice(&unit.to_le_bytes());
+    }
+    fs::write(directory.0.join("utf16.rsp"), utf16).unwrap();
+    fs::write(directory.0.join("quiet.rsp"), "--quiet --wat\n").unwrap();
+    fs::write(
+        directory.0.join("unterminated.rsp"),
+        "--ignoreConfig \"with spaces.ts",
+    )
+    .unwrap();
+
+    for arguments in [
+        &["@quoted.rsp"][..],
+        &["@utf8-bom.rsp"][..],
+        &["@utf16.rsp"][..],
+        &["@quiet.rsp"][..],
+        &["@missing.rsp"][..],
+        &["@unterminated.rsp"][..],
+    ] {
+        assert_matches_oracle(&directory.0, arguments);
+    }
 }
 
 #[test]
@@ -334,6 +439,12 @@ fn missing_explicit_project_diagnostics_match_oracle() {
     for arguments in [
         &["--project", "missing.json", "--pretty", "false"][..],
         &["--project", "without-config", "--pretty", "false"][..],
+        &[
+            "--project",
+            "./without-config/../missing.json",
+            "--pretty",
+            "false",
+        ][..],
     ] {
         assert_matches_oracle(&directory.0, arguments);
     }

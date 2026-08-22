@@ -118,6 +118,32 @@ fn build_no_check_skips_semantic_diagnostics() {
 }
 
 #[test]
+fn build_checks_side_effect_imports_by_default_and_honors_explicit_false() {
+    let directory = TestDirectory::new("side-effect-imports");
+    fs::write(
+        directory.0.join("tsconfig.json"),
+        r#"{"files":["main.ts"],"compilerOptions":{"noEmit":true}}"#,
+    )
+    .unwrap();
+    fs::write(directory.0.join("main.ts"), "import './missing.css';\n").unwrap();
+
+    let checked = run(&directory.0, &["--build", "--pretty", "false"]);
+    assert_eq!(checked.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&checked.stdout).contains(
+        "error TS2882: Cannot find module or type declarations for side-effect import of './missing.css'."
+    ));
+
+    fs::write(
+        directory.0.join("tsconfig.json"),
+        r#"{"files":["main.ts"],"compilerOptions":{"noEmit":true,"noUncheckedSideEffectImports":false}}"#,
+    )
+    .unwrap();
+    let disabled = run(&directory.0, &["--build", "--pretty", "false"]);
+    assert!(disabled.status.success());
+    assert!(disabled.stdout.is_empty());
+}
+
+#[test]
 fn build_force_rebuilds_an_up_to_date_project() {
     let directory = TestDirectory::new("force");
     fs::write(

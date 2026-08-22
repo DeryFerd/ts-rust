@@ -5,7 +5,8 @@ use std::{
 };
 
 use ts_cli::{
-    BuildOptions, Command, CompilerOptions as CliOptions, ExitStatus, VERSION, parse_command_line,
+    BuildOptions, Command, CompilerOptions as CliOptions, ExitStatus, VERSION, expand_command_line,
+    parse_command_line,
 };
 use ts_compiler::{Program, ProgramDiagnostic, ProgramOptionsOverride};
 use ts_diagnostic_writer::{
@@ -15,7 +16,7 @@ use ts_diagnostic_writer::{
 use ts_module::ResolutionOptions;
 use ts_project::{CompiledProject, ProjectDiagnostic, build_projects, load_project_graph};
 use ts_scanner::Scanner;
-use ts_vfs::OsFileSystem;
+use ts_vfs::{FileSystem, OsFileSystem, normalize_path};
 use ts_watch::{
     CompileCycle, Coordinator, FsEventSource, WatchCompiler, WatchError, WatchMode, WatchPath,
     watch_paths_for_program,
@@ -38,8 +39,11 @@ fn main() -> ExitCode {
     {
         return compile_development(&args[1..]);
     }
-    let quiet = quiet_requested(&args);
-    match parse_command_line(&args, |path| fs::read_to_string(path)) {
+    let expanded = expand_command_line(&args, read_response_file);
+    let quiet = expanded
+        .as_ref()
+        .map_or_else(|_| quiet_requested(&args), |args| quiet_requested(args));
+    match expanded.and_then(|arguments| parse_command_line(&arguments, read_response_file)) {
         Ok(Command::Version) => {
             println!("Version {VERSION}");
             ExitCode::SUCCESS
@@ -69,6 +73,10 @@ fn main() -> ExitCode {
             ExitCode::from(ExitStatus::DiagnosticsPresentOutputsSkipped as u8)
         }
     }
+}
+
+fn read_response_file(path: &Path) -> io::Result<String> {
+    OsFileSystem::default().read_file(&path.to_string_lossy())
 }
 
 fn quiet_requested(args: &[String]) -> bool {
@@ -657,7 +665,9 @@ fn resolve_project_path(
     pretty: bool,
     quiet: bool,
 ) -> Result<PathBuf, ExitCode> {
-    let path = current_directory.join(project);
+    let path = PathBuf::from(normalize_path(
+        &current_directory.join(project).to_string_lossy(),
+    ));
     if path.is_dir() {
         let config_path = path.join("tsconfig.json");
         if config_path.is_file() {

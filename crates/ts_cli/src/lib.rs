@@ -2,7 +2,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use ts_config::JsonValue;
@@ -87,19 +87,33 @@ impl CommandLineError {
 /// unreadable response files, or recursive response-file inclusion.
 pub fn parse_command_line(
     args: &[String],
-    mut read_file: impl FnMut(&Path) -> std::io::Result<String>,
+    read_file: impl FnMut(&Path) -> std::io::Result<String>,
 ) -> Result<Command, CommandLineError> {
+    let expanded = expand_command_line(args, read_file)?;
+    parse_expanded(&expanded)
+}
+
+/// Expands TypeScript response files using normalized absolute paths.
+///
+/// # Errors
+///
+/// Returns the pinned command-line diagnostic for unreadable, recursive, or
+/// unterminated response files.
+pub fn expand_command_line(
+    args: &[String],
+    mut read_file: impl FnMut(&Path) -> std::io::Result<String>,
+) -> Result<Vec<String>, CommandLineError> {
     let mut expanded = Vec::new();
     expand_response_files(args, &mut read_file, &mut HashSet::new(), &mut expanded)?;
-    parse_expanded(&expanded)
+    Ok(expanded)
 }
 
 #[allow(clippy::too_many_lines)] // Preserve TypeScript's ordered command-line option dispatch.
 fn parse_expanded(args: &[String]) -> Result<Command, CommandLineError> {
-    if args.is_empty() {
-        return Ok(Command::Help);
-    }
-    if matches!(args[0].to_ascii_lowercase().as_str(), "--build" | "-b") {
+    if args
+        .first()
+        .is_some_and(|argument| matches!(argument.to_ascii_lowercase().as_str(), "--build" | "-b"))
+    {
         return parse_build_options(&args[1..]).map(Command::Build);
     }
     let mut options = CompilerOptions::default();
@@ -510,54 +524,78 @@ fn expand_response_files(
 ) -> Result<(), CommandLineError> {
     for argument in args {
         let Some(path) = argument.strip_prefix('@') else {
-            output.push(argument.clone());
+            if !argument.is_empty() {
+                output.push(argument.clone());
+            }
             continue;
         };
-        if !active.insert(path.to_owned()) {
+        let path = absolute_response_file_path(path);
+        let display_path = path.display().to_string();
+        if !active.insert(display_path.clone()) {
             return Err(CommandLineError {
                 code: 5083,
-                message: format!("Cannot read file '{path}': Circular response file inclusion."),
+                message: format!(
+                    "Cannot read file '{display_path}': Circular response file inclusion."
+                ),
             });
         }
-        let contents = read_file(Path::new(path)).map_err(|error| CommandLineError {
+        let contents = read_file(&path).map_err(|_| CommandLineError {
             code: 5083,
-            message: format!("Cannot read file '{path}': {error}."),
+            message: format!("Cannot read file '{display_path}'."),
         })?;
-        let nested = tokenize_response_file(&contents)?;
+        let nested = tokenize_response_file(&contents, &path)?;
         expand_response_files(&nested, read_file, active, output)?;
-        active.remove(path);
+        active.remove(&display_path);
     }
     Ok(())
 }
 
-fn tokenize_response_file(source: &str) -> Result<Vec<String>, CommandLineError> {
+fn absolute_response_file_path(path: &str) -> PathBuf {
+    let path = Path::new(path);
+    let absolute = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        std::env::current_dir().map_or_else(|_| path.to_owned(), |directory| directory.join(path))
+    };
+    PathBuf::from(ts_vfs::normalize_path(&absolute.to_string_lossy()))
+}
+
+fn tokenize_response_file(source: &str, path: &Path) -> Result<Vec<String>, CommandLineError> {
     let mut arguments = Vec::new();
-    let mut current = String::new();
-    let mut quote = None;
     let mut chars = source.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match (quote, ch) {
-            (Some(expected), ch) if ch == expected => quote = None,
-            (Some(_), '\\') if chars.peek().is_some_and(|next| matches!(next, '\'' | '"')) => {
-                current.push(chars.next().expect("peeked response-file character"));
-            }
-            (None, '\'' | '"') => quote = Some(ch),
-            (None, ch) if ch.is_whitespace() => {
-                if !current.is_empty() {
-                    arguments.push(std::mem::take(&mut current));
+    while chars.peek().is_some() {
+        while chars.peek().is_some_and(|character| *character <= ' ') {
+            chars.next();
+        }
+        let Some(character) = chars.peek().copied() else {
+            break;
+        };
+        if character == '"' {
+            chars.next();
+            let mut argument = String::new();
+            loop {
+                match chars.next() {
+                    Some('"') => break,
+                    Some(character) => argument.push(character),
+                    None => {
+                        return Err(CommandLineError {
+                            code: 6045,
+                            message: format!(
+                                "Unterminated quoted string in response file '{}'.",
+                                path.display()
+                            ),
+                        });
+                    }
                 }
             }
-            (Some(_) | None, ch) => current.push(ch),
+            arguments.push(argument);
+        } else {
+            let mut argument = String::new();
+            while chars.peek().is_some_and(|character| *character > ' ') {
+                argument.push(chars.next().expect("peeked response-file character"));
+            }
+            arguments.push(argument);
         }
-    }
-    if quote.is_some() {
-        return Err(CommandLineError {
-            code: 5074,
-            message: "Unterminated quoted string in response file.".to_owned(),
-        });
-    }
-    if !current.is_empty() {
-        arguments.push(current);
     }
     Ok(arguments)
 }
@@ -594,6 +632,30 @@ mod tests {
         assert!(options.no_lib);
         assert!(options.ignore_config);
         assert_eq!(options.files, ["source.ts"]);
+    }
+
+    #[test]
+    fn no_arguments_select_implicit_project_compilation() {
+        let Command::Compile(options) = parse(&[]).unwrap() else {
+            panic!("expected implicit project compilation");
+        };
+        assert!(options.files.is_empty());
+        assert!(options.project.is_none());
+    }
+
+    #[test]
+    fn side_effect_import_checks_default_to_enabled() {
+        let Command::Compile(defaults) = parse(&["main.ts"]).unwrap() else {
+            panic!("expected compile command");
+        };
+        assert!(defaults.compiler_options.no_unchecked_side_effect_imports);
+
+        let Command::Compile(disabled) =
+            parse(&["--noUncheckedSideEffectImports", "false", "main.ts"]).unwrap()
+        else {
+            panic!("expected compile command");
+        };
+        assert!(!disabled.compiler_options.no_unchecked_side_effect_imports);
     }
 
     #[test]
@@ -1239,10 +1301,10 @@ mod tests {
     #[test]
     fn expands_nested_response_files_and_quotes() {
         let args = vec!["@outer.rsp".to_owned()];
-        let command = parse_command_line(&args, |path: &Path| match path.to_str() {
-            Some("outer.rsp") => Ok("--noEmit @inner.rsp".to_owned()),
-            Some("inner.rsp") => {
-                Ok("--project 'with spaces/tsconfig.json' src/index.ts".to_owned())
+        let command = parse_command_line(&args, |path: &Path| match path.file_name() {
+            Some(name) if name == "outer.rsp" => Ok("--noEmit @inner.rsp".to_owned()),
+            Some(name) if name == "inner.rsp" => {
+                Ok("--project \"with spaces/tsconfig.json\" src/index.ts".to_owned())
             }
             _ => unreachable!(),
         })
@@ -1256,6 +1318,38 @@ mod tests {
             Some("with spaces/tsconfig.json")
         );
         assert_eq!(options.files, ["src/index.ts"]);
+    }
+
+    #[test]
+    fn response_files_treat_single_quotes_as_filename_characters() {
+        let args = vec!["@args.rsp".to_owned()];
+        let command =
+            parse_command_line(&args, |_| Ok("--ignoreConfig 'with-quotes.ts'".to_owned()))
+                .unwrap();
+        let Command::Compile(options) = command else {
+            panic!("expected compile command");
+        };
+
+        assert_eq!(options.files, ["'with-quotes.ts'"]);
+    }
+
+    #[test]
+    fn response_file_errors_use_normalized_absolute_paths() {
+        let expected = std::env::current_dir()
+            .unwrap()
+            .join("missing.rsp")
+            .display()
+            .to_string();
+        let missing = parse(&["@./nested/../missing.rsp"]).unwrap_err();
+        assert_eq!(missing.code, 5083);
+        assert_eq!(missing.message, format!("Cannot read file '{expected}'."));
+
+        let unterminated = parse_command_line(&["@broken.rsp".to_owned()], |_| {
+            Ok("\"unterminated".to_owned())
+        })
+        .unwrap_err();
+        assert_eq!(unterminated.code, 6045);
+        assert!(unterminated.message.contains("/broken.rsp'"));
     }
 
     #[test]
