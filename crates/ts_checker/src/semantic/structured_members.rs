@@ -1,9 +1,8 @@
 //! Structured-member publication for one direct, nongeneric interface base.
 //!
-//! The first heritage capability is intentionally narrow: one base, no base
-//! heritage, property-only surfaces, and disjoint own/base names. This avoids
-//! claiming support for override and conflict diagnostics before their pinned
-//! TS2430/TS2320 paths exist.
+//! The first heritage capability supports one base with property-only members.
+//! Compatible derived properties replace inherited properties. Incompatible
+//! overrides remain an explicit unsupported boundary until TS2430 is ported.
 
 use std::collections::HashSet;
 
@@ -107,6 +106,37 @@ pub(super) fn resolve_direct_interface_members(
         return Err(invalid(plan, type_));
     }
 
+    for (index, property) in plan.properties.iter().enumerate() {
+        let base_property = base_surface.properties.iter().copied().find(|base| {
+            store
+                .symbol(*base)
+                .is_some_and(|record| record.name().as_utf8() == Some(property.name.as_str()))
+        });
+        let Some(base_property) = base_property else {
+            continue;
+        };
+        let own_type = *property_types
+            .get(index)
+            .ok_or_else(|| invalid(plan, type_))?;
+        let base_type = store
+            .value_symbol_links(base_property)
+            .and_then(|links| links.resolved_type)
+            .ok_or_else(|| invalid(plan, type_))?;
+        let base_optional = store
+            .symbol(base_property)
+            .is_some_and(|record| record.flags().contains(SymbolFlags::OPTIONAL));
+        if property.optional && !base_optional
+            || store.is_type_assignable_to(own_type, base_type) != Ok(true)
+        {
+            return Err(PropertyObjectError::UnsupportedMember {
+                node: property.declaration,
+                kind: store
+                    .source_node_kind(property.declaration)
+                    .unwrap_or(SyntaxKind::PropertySignature),
+            });
+        }
+    }
+
     let declared_state =
         prepare_direct_interface_declared_properties(store, plan, type_, property_types)?;
     let total_properties = plan
@@ -147,10 +177,7 @@ pub(super) fn resolve_direct_interface_members(
         let record = store.symbol(property).ok_or_else(|| invalid(plan, type_))?;
         let name = record.name().to_owned();
         if !seen_names.insert(name.clone()) {
-            return Err(PropertyObjectError::UnsupportedMember {
-                node: planned_base.node,
-                kind: SyntaxKind::ExpressionWithTypeArguments,
-            });
+            continue;
         }
         expected_entries.push((name, property));
         expected_properties.push(property);
@@ -431,12 +458,18 @@ fn validate_property_interface(
         .checked_add(base_properties.len())?;
     let mut expected = Vec::with_capacity(total);
     let mut seen_names = HashSet::with_capacity(total);
-    for property in declared_properties.iter().chain(&base_properties) {
+    for property in &declared_properties {
         let record = store.symbol(*property)?;
         if !seen_names.insert(record.name().to_owned()) {
             return None;
         }
         expected.push(*property);
+    }
+    for property in &base_properties {
+        let record = store.symbol(*property)?;
+        if seen_names.insert(record.name().to_owned()) {
+            expected.push(*property);
+        }
     }
     let actual = structured.properties.as_deref().unwrap_or_default();
     if actual.is_empty() != structured.properties.is_none()

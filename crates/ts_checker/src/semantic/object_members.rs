@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use ts_ast::{NodeData, NodeList, NodeRef, SyntaxKind};
 use ts_binder::{
     CheckFlags, EscapedName, InternalSymbolName, SemanticSymbolId, SymbolData, SymbolFlags,
-    SymbolTableId,
+    SymbolTableId, semantic::PreparedSymbolTable,
 };
 
 use super::{
@@ -45,6 +45,7 @@ pub(super) enum PropertyObjectKind {
 enum TypeLiteralMemberPolicy {
     General,
     ConcreteIndexedAccess,
+    GenericInterface,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -864,18 +865,42 @@ pub(super) fn plan_interface(
                 kind: SyntaxKind::HeritageClause,
             });
         }
-        if let Some(property) = plan.properties.iter().find(|property| {
-            base_plan
+        for property in &plan.properties {
+            let Some(base_property) = base_plan
                 .properties
                 .iter()
-                .any(|base_property| base_property.name == property.name)
-        }) {
-            return Err(PropertyObjectError::UnsupportedMember {
-                node: property.declaration,
-                kind: store
-                    .source_node_kind(property.declaration)
-                    .unwrap_or(SyntaxKind::PropertySignature),
-            });
+                .find(|base| base.name == property.name)
+            else {
+                continue;
+            };
+            let own_kind = store.source_node_kind(property.type_node);
+            let base_kind = store.source_node_kind(base_property.type_node);
+            let same_primitive = own_kind == base_kind
+                && matches!(
+                    own_kind,
+                    Some(
+                        SyntaxKind::AnyKeyword
+                            | SyntaxKind::UnknownKeyword
+                            | SyntaxKind::StringKeyword
+                            | SyntaxKind::NumberKeyword
+                            | SyntaxKind::BooleanKeyword
+                            | SyntaxKind::BigIntKeyword
+                            | SyntaxKind::SymbolKeyword
+                            | SyntaxKind::VoidKeyword
+                            | SyntaxKind::NeverKeyword
+                    )
+                );
+            let compatible = same_primitive
+                || own_kind == Some(SyntaxKind::AnyKeyword)
+                    && base_kind != Some(SyntaxKind::NeverKeyword);
+            if !compatible || property.optional && !base_property.optional {
+                return Err(PropertyObjectError::UnsupportedMember {
+                    node: property.declaration,
+                    kind: store
+                        .source_node_kind(property.declaration)
+                        .unwrap_or(SyntaxKind::PropertySignature),
+                });
+            }
         }
     }
     if !value_declarations.is_empty() && !plan.call_signatures.is_empty() {
@@ -883,6 +908,118 @@ pub(super) fn plan_interface(
             declaration,
             symbol,
         });
+    }
+    Ok(plan)
+}
+
+/// Plans the property declarations of one direct, local generic interface.
+///
+/// The bound member table also contains the interface's type parameters. The
+/// publication step creates a separate declared-property table instead of
+/// replacing that binder-owned table.
+pub(super) fn plan_generic_interface(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+) -> Result<PropertyObjectPlan, PropertyObjectError> {
+    let symbol = store
+        .get_merged_symbol(symbol)
+        .ok_or(PropertyObjectError::InvalidInterfaceSymbol(symbol))?;
+    let symbol_record = store
+        .symbol(symbol)
+        .ok_or(PropertyObjectError::InvalidInterfaceSymbol(symbol))?;
+    let [declaration] = symbol_record.declarations().unwrap_or_default() else {
+        return Err(PropertyObjectError::InvalidInterfaceSymbol(symbol));
+    };
+    let declaration = *declaration;
+    let invalid = || PropertyObjectError::InvalidInterface {
+        declaration,
+        symbol,
+    };
+    let record = preflight_node(store, host, declaration).map_err(|_| invalid())?;
+    let NodeData::InterfaceDeclaration(interface) = &record.data else {
+        return Err(invalid());
+    };
+    let Some(parameters) = interface.type_parameters.as_ref() else {
+        return Err(invalid());
+    };
+    let raw_members = symbol_record.members().ok_or_else(invalid)?;
+    let raw_table = store.symbol_table(raw_members).ok_or_else(invalid)?;
+    let name = NodeRef::new(declaration.arena, declaration.file, interface.name);
+    let name_record = preflight_node(store, host, name).map_err(|_| invalid())?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(invalid());
+    };
+    if record.kind != SyntaxKind::InterfaceDeclaration
+        || record.flags.0 != 0
+        || parameters.nodes.is_empty()
+        || !host.symbol_matches(store, declaration, symbol)
+        || symbol_record.flags() != SymbolFlags::INTERFACE
+        || symbol_record.check_flags() != CheckFlags::NONE
+        || symbol_record.name().as_utf8() != Some(identifier.text.as_str())
+        || symbol_record.value_declaration().is_some()
+        || symbol_record.parent().is_some()
+        || symbol_record.exports().is_some()
+        || symbol_record.export_symbol().is_some()
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.parent != Some(declaration.node)
+        || interface.modifiers.is_some()
+        || interface.flow_node.is_some()
+        || interface.local_symbol.is_some()
+        || interface.symbol.is_some()
+        || interface.heritage_clauses.is_some()
+        || interface.members.has_trailing_comma
+        || interface.members.range.start < record.range.start
+        || interface.members.range.end != record.range.end
+    {
+        return Err(invalid());
+    }
+
+    let mut parameter_symbols = HashSet::with_capacity(parameters.nodes.len());
+    for parameter in &parameters.nodes {
+        let parameter = NodeRef::new(declaration.arena, declaration.file, *parameter);
+        let parameter_record = preflight_node(store, host, parameter).map_err(|_| invalid())?;
+        if parameter_record.kind != SyntaxKind::TypeParameter
+            || parameter_record.parent != Some(declaration.node)
+        {
+            return Err(invalid());
+        }
+        let parameter_symbol = bound_symbol(store, host, parameter).ok_or_else(invalid)?;
+        let parameter_symbol_record = store.symbol(parameter_symbol).ok_or_else(invalid)?;
+        if parameter_symbol_record.flags() != SymbolFlags::TYPE_PARAMETER
+            || parameter_symbol_record.parent() != Some(symbol)
+            || raw_table.get(parameter_symbol_record.name()) != Some(parameter_symbol)
+            || !parameter_symbols.insert(parameter_symbol)
+        {
+            return Err(invalid());
+        }
+    }
+
+    let plan = plan_members(
+        store,
+        host,
+        PropertyObjectKind::Interface,
+        declaration,
+        symbol,
+        Some(raw_members),
+        &interface.members,
+        None,
+        TypeLiteralMemberPolicy::GenericInterface,
+    )?;
+    if let Some(index) = plan.indexes.first() {
+        return Err(PropertyObjectError::UnsupportedMember {
+            node: index.declaration,
+            kind: SyntaxKind::IndexSignature,
+        });
+    }
+    if let Some(call) = plan.call_signatures.first() {
+        return Err(PropertyObjectError::UnsupportedMember {
+            node: call.declaration,
+            kind: SyntaxKind::CallSignature,
+        });
+    }
+    if raw_table.len() != parameter_symbols.len() + plan.properties.len() {
+        return Err(invalid());
     }
     Ok(plan)
 }
@@ -1051,7 +1188,9 @@ fn plan_members(
         heritage: None,
     };
     if kind != PropertyObjectKind::ObjectLiteral && member_nodes.has_trailing_comma
-        || members.is_some() == member_nodes.nodes.is_empty()
+        || policy != TypeLiteralMemberPolicy::GenericInterface
+            && members.is_some() == member_nodes.nodes.is_empty()
+        || policy == TypeLiteralMemberPolicy::GenericInterface && members.is_none()
     {
         return Err(invalid_plan(&provisional));
     }
@@ -1291,11 +1430,24 @@ fn plan_members(
     let reserved_index_count = usize::from(!indexes.is_empty());
     let reserved_call_count = usize::from(!call_signatures.is_empty());
     if table.is_some_and(|table| {
+        let parameter_count = if policy == TypeLiteralMemberPolicy::GenericInterface {
+            table
+                .iter()
+                .filter(|(_, member)| {
+                    store
+                        .symbol(*member)
+                        .is_some_and(|record| record.flags() == SymbolFlags::TYPE_PARAMETER)
+                })
+                .count()
+        } else {
+            0
+        };
         table.len()
             != properties
                 .len()
                 .saturating_add(reserved_index_count)
                 .saturating_add(reserved_call_count)
+                .saturating_add(parameter_count)
             || match indexes.first() {
                 Some(index) => table.get(InternalSymbolName::Index.as_ref()) != Some(index.symbol),
                 None => table.get(InternalSymbolName::Index.as_ref()).is_some(),
@@ -3556,6 +3708,142 @@ pub(super) fn publish_declared_members(
         }
     }
     Ok(type_)
+}
+
+/// Publishes a generic interface's declared properties without resolving its
+/// lazy instantiated member table.
+pub(super) fn publish_generic_interface_declared_members(
+    store: &mut CanonicalTypeMapperStore,
+    plan: &PropertyObjectPlan,
+    target: TypeId,
+    property_types: &[TypeId],
+) -> Result<TypeId, PropertyObjectError> {
+    let invalid = || PropertyObjectError::InvalidCachedInterface {
+        symbol: plan.symbol,
+        type_: target,
+    };
+    if plan.kind != PropertyObjectKind::Interface
+        || plan.heritage.is_some()
+        || !plan.indexes.is_empty()
+        || !plan.call_signatures.is_empty()
+        || plan.properties.len() != property_types.len()
+        || property_types
+            .iter()
+            .any(|type_| store.type_payload(*type_).is_none())
+    {
+        return Err(invalid());
+    }
+
+    let record = store.type_payload(target).ok_or_else(invalid)?;
+    let TypeData::Interface(interface) = record.data() else {
+        return Err(invalid());
+    };
+    if record.flags() != TypeFlags::OBJECT
+        || !record
+            .object_flags()
+            .contains(ObjectFlags::INTERFACE | ObjectFlags::REFERENCE)
+        || record.symbol() != Some(plan.symbol)
+        || record.alias().is_some()
+        || store
+            .symbol(plan.symbol)
+            .is_none_or(|symbol| symbol.members() != plan.members)
+        || interface
+            .all_type_parameters
+            .as_ref()
+            .is_none_or(|parameters| parameters.len() < 2)
+        || interface.this_type.is_none()
+        || interface.reference.object.target != Some(target)
+        || interface.resolved_base_constructor_type.is_some()
+        || interface.resolved_base_types.is_some()
+        || interface.declared_call_signatures.is_some()
+        || interface.declared_construct_signatures.is_some()
+        || interface.declared_index_infos.is_some()
+    {
+        return Err(invalid());
+    }
+
+    if interface.declared_members_resolved {
+        let declared_members = interface.declared_members;
+        if !interface.base_types_resolved
+            || declared_members == plan.members
+            || declared_members.is_some() != !plan.properties.is_empty()
+            || declared_members
+                .and_then(|members| store.symbol_table(members))
+                .is_some_and(|table| table.len() != plan.properties.len())
+            || !plan
+                .properties
+                .iter()
+                .zip(property_types)
+                .all(|(property, property_type)| {
+                    declared_members
+                        .and_then(|members| store.symbol_table(members))
+                        .and_then(|members| members.get_source(&property.name))
+                        == Some(property.symbol)
+                        && store.value_symbol_links(property.symbol)
+                            == Some(&ValueSymbolLinks {
+                                resolved_type: Some(*property_type),
+                                ..ValueSymbolLinks::default()
+                            })
+                        && store.symbol(property.symbol).is_some_and(|record| {
+                            record.check_flags() == source_property_check_flags(property.readonly)
+                        })
+                })
+        {
+            return Err(invalid());
+        }
+        return Ok(target);
+    }
+
+    if record
+        .object_flags()
+        .contains(ObjectFlags::MEMBERS_RESOLVED)
+        || interface.reference.object.structured != StructuredTypeData::default()
+        || interface.base_types_resolved
+        || interface.declared_members.is_some()
+        || !unresolved_property_links(store, plan)
+    {
+        return Err(invalid());
+    }
+    let prepared = if plan.properties.is_empty() {
+        None
+    } else {
+        Some(
+            PreparedSymbolTable::new(plan.properties.len())
+                .ok_or(PropertyObjectError::Capacity(plan.node))?,
+        )
+    };
+    let missing_links = plan
+        .properties
+        .iter()
+        .filter(|property| store.value_symbol_links(property.symbol).is_none())
+        .count();
+    if !store.try_reserve_checker_symbol_allocations(0, usize::from(prepared.is_some()))
+        || !store.try_reserve_value_symbol_links(missing_links)
+    {
+        return Err(PropertyObjectError::Capacity(plan.node));
+    }
+    let declared_members = prepared.map(|table| store.alloc_prepared_symbol_table(table));
+    for (property, property_type) in plan.properties.iter().zip(property_types) {
+        assert!(store.set_source_property_readonly(property.symbol, property.readonly));
+        assert!(store.set_value_symbol_links(
+            property.symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(*property_type),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        assert_eq!(
+            store.insert_symbol(
+                declared_members.expect("a generic property owns a declared member table"),
+                EscapedName::source(&property.name),
+                property.symbol,
+            ),
+            Some(None)
+        );
+    }
+    assert!(store.set_interface_base_resolution(target, true, None, None));
+    assert!(store.set_interface_declared_members(target, true, declared_members, None, None, None));
+    Ok(target)
 }
 
 pub(super) fn publish_object_literal(

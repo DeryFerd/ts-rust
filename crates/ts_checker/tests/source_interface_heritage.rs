@@ -431,6 +431,88 @@ fn forward_base_with_recursive_derived_property_resolves_cold_and_warm() {
 }
 
 #[test]
+fn compatible_interface_overrides_replace_inherited_properties() {
+    for (index, source) in [
+        concat!(
+            "interface Base { value: number; inherited: string }\n",
+            "interface Derived extends Base { value: number }\n",
+            "function read(value: Derived): number { return value.value; }\n",
+        ),
+        concat!(
+            "interface Base { value: {} }\n",
+            "interface Derived extends Base { value: any }\n",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let parsed = parse_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(u32::try_from(index + 100).unwrap());
+        let mut context = checker_context(&parsed, file, "/project/interface-override.ts");
+
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let base = interface_symbol(&parsed, file, &context, "Base");
+        let derived = interface_symbol(&parsed, file, &context, "Derived");
+        let base_type = declared_type(&context, base);
+        let derived_type = declared_type(&context, derived);
+        assert_eq!(
+            context.is_type_assignable_to(derived_type, base_type),
+            Ok(true)
+        );
+
+        let TypeData::Interface(derived_data) =
+            context.store().type_payload(derived_type).unwrap().data()
+        else {
+            panic!("derived declaration must retain its interface payload")
+        };
+        let own_property = context
+            .store()
+            .symbol_table(derived_data.declared_members.unwrap())
+            .unwrap()
+            .get_source("value")
+            .unwrap();
+        assert_eq!(
+            context
+                .store()
+                .symbol_table(derived_data.reference.object.structured.members.unwrap())
+                .unwrap()
+                .get_source("value"),
+            Some(own_property)
+        );
+        assert_eq!(
+            derived_data
+                .reference
+                .object
+                .structured
+                .properties
+                .as_deref()
+                .unwrap()
+                .iter()
+                .filter(|property| **property == own_property)
+                .count(),
+            1
+        );
+
+        let warm = (
+            context.store().type_len(),
+            context.store().symbol_store().symbol_table_len(),
+            context.store().relation_state_snapshot(),
+        );
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_store().symbol_table_len(),
+                context.store().relation_state_snapshot(),
+            ),
+            warm
+        );
+    }
+}
+
+#[test]
 fn unsupported_interface_heritage_shapes_fail_before_semantic_publication() {
     let cases = [
         (
@@ -460,11 +542,11 @@ fn unsupported_interface_heritage_shapes_fail_before_semantic_publication() {
             ),
         ),
         (
-            "collision",
+            "incompatible-override",
             concat!(
                 "interface Base { value: number }\n",
-                "interface Derived extends Base { value: number }\n",
-                "function read(value: Derived): number { return value.value; }\n",
+                "interface Derived extends Base { value: string }\n",
+                "function read(value: Derived): string { return value.value; }\n",
             ),
         ),
         (

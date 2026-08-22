@@ -180,6 +180,43 @@ fn named_declared_union_read_publishes_synthetic_property_and_replays_warm() {
 }
 
 #[test]
+fn interface_and_type_literal_union_read_publishes_a_shared_literal_property() {
+    let parsed = parse_source_file(concat!(
+        "interface Left { kind: \"left\" }\n",
+        "type Right = { kind: \"right\" };\n",
+        "type Both = Left | Right;\n",
+        "function read(input: Both): \"left\" | \"right\" { return input.kind; }\n",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(6);
+    let (access, receiver, _) = access_parts(&parsed, file);
+    let mut context = context(&parsed, file);
+
+    context.check_source_file(file).unwrap();
+
+    assert!(context.diagnostics().is_empty());
+    let union = resolved_type(&context, receiver);
+    let property_type = resolved_type(&context, access);
+    assert_eq!(
+        context.type_to_string(property_type).unwrap(),
+        "\"left\" | \"right\""
+    );
+    let property = cached_union_property(&context, union, "kind")
+        .expect("the shared literal property must be cached");
+    assert_eq!(
+        context.store().symbol(property).unwrap().check_flags(),
+        CheckFlags::SYNTHETIC_PROPERTY
+            | CheckFlags::CONTAINS_PUBLIC
+            | CheckFlags::HAS_NON_UNIFORM_TYPE
+            | CheckFlags::HAS_LITERAL_TYPE
+    );
+
+    let warm = observable_state(&context, access);
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(observable_state(&context, access), warm);
+}
+
+#[test]
 fn partial_declared_union_read_emits_first_missing_ts2339_and_replays_warm() {
     let parsed = parse_source_file(concat!(
         "type Left = { value: string };\n",

@@ -4,10 +4,10 @@
 //! `getPropertyOfUnionOrIntersectionType` and
 //! `createUnionOrIntersectionProperty`. The receiver has exactly two
 //! already-resolved property-only constituents: either the original anonymous,
-//! declaration-free raw objects or two source-declared type literals. The leaf
-//! intentionally does not project apparent `Object`/`Function` members, index
-//! signatures, callables, interfaces, intersections, or deferred (>2 source
-//! symbol) property types.
+//! declaration-free raw objects or two source-declared interfaces and type
+//! literals. The leaf intentionally does not project apparent
+//! `Object`/`Function` members, index signatures, callables, intersections, or
+//! deferred property types.
 //!
 //! The existing `UnionOrIntersectionTypeData` cache is authoritative. A cold
 //! query allocates its augmented property-cache table before synthesizing a
@@ -298,7 +298,7 @@ struct SyntheticPropertyPlan {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UnionMemberMode {
     Raw,
-    DeclaredTypeLiteral,
+    Declared,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -515,7 +515,7 @@ fn validate_union_shell(
     {
         return Err(UnionPropertyError::InvalidCache(union));
     }
-    if mode == UnionMemberMode::DeclaredTypeLiteral {
+    if mode == UnionMemberMode::Declared {
         let expected_alias = match record.alias() {
             Some(alias) => Some(
                 store
@@ -544,11 +544,10 @@ fn classify_union_constituent(
         return Ok(UnionMemberMode::Raw);
     }
     match validate_resolved_declared_property_object(store, type_) {
-        DeclaredPropertyObjectValidation::Valid(DeclaredPropertyObjectProof::TypeLiteral) => {
-            Ok(UnionMemberMode::DeclaredTypeLiteral)
-        }
-        DeclaredPropertyObjectValidation::Valid(DeclaredPropertyObjectProof::Interface)
-        | DeclaredPropertyObjectValidation::NotDeclared => {
+        DeclaredPropertyObjectValidation::Valid(
+            DeclaredPropertyObjectProof::TypeLiteral | DeclaredPropertyObjectProof::Interface,
+        ) => Ok(UnionMemberMode::Declared),
+        DeclaredPropertyObjectValidation::NotDeclared => {
             Err(UnionPropertyError::UnsupportedConstituent(type_))
         }
         DeclaredPropertyObjectValidation::Malformed => Err(UnionPropertyError::InvalidUnion(union)),
@@ -632,7 +631,7 @@ fn validate_source_property(
             }
             (None, None, None)
         }
-        UnionMemberMode::DeclaredTypeLiteral => {
+        UnionMemberMode::Declared => {
             let (declaration, parent) =
                 validate_declared_property_provenance(store, constituent, property.symbol)?;
             (Some(declaration), Some(declaration), Some(parent))
@@ -661,8 +660,10 @@ fn validate_declared_property_provenance(
     let record = store
         .type_payload(constituent)
         .ok_or(UnionPropertyError::InvalidProperty(property))?;
-    let TypeData::Object(object) = record.data() else {
-        return Err(UnionPropertyError::InvalidProperty(property));
+    let (structured, interface) = match record.data() {
+        TypeData::Object(object) => (&object.structured, false),
+        TypeData::Interface(interface) => (&interface.reference.object.structured, true),
+        _ => return Err(UnionPropertyError::InvalidProperty(property)),
     };
     let owner = record
         .symbol()
@@ -679,20 +680,26 @@ fn validate_declared_property_provenance(
     let [declaration] = property_record.declarations().unwrap_or_default() else {
         return Err(UnionPropertyError::InvalidProperty(property));
     };
-    let members = object
-        .structured
+    let members = structured
         .members
         .ok_or(UnionPropertyError::InvalidProperty(property))?;
-    if owner_record.flags() != SymbolFlags::TYPE_LITERAL
+    let owner_matches = if interface {
+        owner_record.flags() == SymbolFlags::INTERFACE
+            && owner_record.name().as_utf8().is_some()
+            && store.source_node_kind(*owner_declaration) == Some(SyntaxKind::InterfaceDeclaration)
+    } else {
+        owner_record.flags() == SymbolFlags::TYPE_LITERAL
+            && owner_record.name() == InternalSymbolName::Type.as_ref()
+            && store.source_node_kind(*owner_declaration) == Some(SyntaxKind::TypeLiteral)
+    };
+    if !owner_matches
         || owner_record.check_flags() != CheckFlags::NONE
-        || owner_record.name() != InternalSymbolName::Type.as_ref()
         || owner_record.value_declaration().is_some()
         || owner_record.members() != Some(members)
         || owner_record.exports().is_some()
         || owner_record.parent().is_some()
         || owner_record.export_symbol().is_some()
         || store.get_merged_symbol(owner) != Some(owner)
-        || store.source_node_kind(*owner_declaration) != Some(SyntaxKind::TypeLiteral)
         || property_record.value_declaration() != Some(*declaration)
         || property_record.parent() != Some(owner)
         || !matches!(
@@ -701,8 +708,7 @@ fn validate_declared_property_provenance(
         )
         || store.source_node_parent(*declaration)
             != Some(SourceNodeParent::Parent(*owner_declaration))
-        || object
-            .structured
+        || structured
             .properties
             .as_deref()
             .is_none_or(|properties| !properties.contains(&property))
@@ -717,14 +723,14 @@ fn validate_declared_property_provenance(
 }
 
 fn supported_terminal_property_type(store: &CanonicalTypeMapperStore, type_: TypeId) -> bool {
-    store.intrinsic_bootstrap().is_some_and(|bootstrap| {
-        [
-            bootstrap.string_type,
-            bootstrap.number_type,
-            bootstrap.bigint_type,
-            bootstrap.es_symbol_type,
-        ]
-        .contains(&type_)
+    store.type_payload(type_).is_some_and(|record| {
+        record.flags().intersects(
+            TypeFlags::PRIMITIVE
+                | TypeFlags::ANY_OR_UNKNOWN
+                | TypeFlags::NEVER
+                | TypeFlags::NON_PRIMITIVE
+                | TypeFlags::UNION,
+        )
     })
 }
 
@@ -835,7 +841,7 @@ fn publish_synthetic_property(
     prepared: &mut PreparedTypeQueryTypes,
 ) -> ResolvedUnionProperty {
     let effective = materialize_effective_types(store, synthetic, prepared);
-    let check_flags = synthetic_check_flags(synthetic, effective.as_slice());
+    let check_flags = synthetic_check_flags(store, synthetic, effective.as_slice());
     let flags = SymbolFlags::PROPERTY
         | if synthetic.optional {
             SymbolFlags::OPTIONAL
@@ -931,7 +937,11 @@ fn materialize_source_read_type(
     }
 }
 
-fn synthetic_check_flags(synthetic: &SyntheticPropertyPlan, effective: &[TypeId]) -> CheckFlags {
+fn synthetic_check_flags(
+    store: &CanonicalTypeMapperStore,
+    synthetic: &SyntheticPropertyPlan,
+    effective: &[TypeId],
+) -> CheckFlags {
     let mut flags = CheckFlags::SYNTHETIC_PROPERTY | CheckFlags::CONTAINS_PUBLIC;
     if synthetic.readonly {
         flags |= CheckFlags::READONLY;
@@ -944,6 +954,25 @@ fn synthetic_check_flags(synthetic: &SyntheticPropertyPlan, effective: &[TypeId]
         .is_some_and(|first| effective.iter().any(|type_| type_ != first))
     {
         flags |= CheckFlags::HAS_NON_UNIFORM_TYPE;
+    }
+    if effective.iter().any(|type_| {
+        store.type_payload(*type_).is_some_and(|record| {
+            record
+                .flags()
+                .intersects(TypeFlags::UNIT | TypeFlags::BOOLEAN)
+                || matches!(record.data(), TypeData::Union(union) if union.union.types.iter().all(|constituent| {
+                    store.type_payload(*constituent).is_some_and(|record| record.flags().intersects(TypeFlags::UNIT))
+                }))
+        })
+    }) {
+        flags |= CheckFlags::HAS_LITERAL_TYPE;
+    }
+    if effective.iter().any(|type_| {
+        store
+            .type_payload(*type_)
+            .is_some_and(|record| record.flags().intersects(TypeFlags::NEVER))
+    }) {
+        flags |= CheckFlags::HAS_NEVER_TYPE;
     }
     flags
 }
@@ -977,7 +1006,8 @@ fn validate_cached_property(
                 .symbol(cached)
                 .ok_or(UnionPropertyError::InvalidCache(plan.union))?;
             if record.flags() != expected_flags
-                || record.check_flags() != synthetic_check_flags(synthetic, effective.as_slice())
+                || record.check_flags()
+                    != synthetic_check_flags(store, synthetic, effective.as_slice())
                 || record.name() != plan.name.as_ref()
                 || record.declarations() != synthetic.declarations.as_deref()
                 || record.value_declaration() != synthetic.value_declaration

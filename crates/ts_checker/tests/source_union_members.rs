@@ -4,8 +4,8 @@ use ts_binder::{
     CheckFlags, EscapedName, SemanticSymbolId, SymbolFlags,
 };
 use ts_checker::semantic::{
-    CanonicalCheckerContext, CanonicalCheckerOptions, CanonicalUnionPropertyError,
-    ResolvedUnionProperty, TypeData, TypeId, ValueSymbolLinks,
+    CanonicalCheckerContext, CanonicalCheckerOptions, ResolvedUnionProperty, TypeData, TypeId,
+    ValueSymbolLinks,
 };
 use ts_parser::{ParseResult, parse_source_file};
 
@@ -359,7 +359,7 @@ fn declared_left_right_both_properties_preserve_identity_provenance_and_warm_cac
 }
 
 #[test]
-fn declared_interface_and_type_literal_interface_mixes_are_rejected_without_writes() {
+fn declared_interfaces_and_type_literal_interface_mixes_synthesize_shared_properties() {
     let parsed = parse_source_file(concat!(
         "interface InterfaceLeft { both: string }\n",
         "interface InterfaceRight { both: number }\n",
@@ -377,10 +377,10 @@ fn declared_interface_and_type_literal_interface_mixes_are_rejected_without_writ
     let interfaces_symbol = declaration_symbol(&parsed, file, &context, "Interfaces", false);
     let mixed_symbol = declaration_symbol(&parsed, file, &context, "Mixed", false);
 
-    let interface_left = context
+    context
         .get_declared_type_of_symbol(interface_left_symbol)
         .unwrap();
-    let interface_right = context
+    context
         .get_declared_type_of_symbol(interface_right_symbol)
         .unwrap();
     let _shape = context.get_declared_type_of_symbol(shape_symbol).unwrap();
@@ -394,29 +394,99 @@ fn declared_interface_and_type_literal_interface_mixes_are_rejected_without_writ
         context.store().symbol_store().symbol_table_len(),
     );
 
-    assert!(matches!(
+    let interface_property = context
+        .get_union_property(interfaces, "both")
+        .unwrap()
+        .expect("both interfaces contain the shared property");
+    assert_eq!(
+        context
+            .type_to_string(interface_property.type_id())
+            .unwrap(),
+        "string | number"
+    );
+    let mixed_property = context
+        .get_union_property(mixed, "both")
+        .unwrap()
+        .expect("the interface and type literal contain the shared property");
+    assert_eq!(
+        context.type_to_string(mixed_property.type_id()).unwrap(),
+        "string"
+    );
+    assert_eq!(
+        context
+            .store()
+            .symbol(interface_property.symbol())
+            .unwrap()
+            .check_flags(),
+        CheckFlags::SYNTHETIC_PROPERTY
+            | CheckFlags::CONTAINS_PUBLIC
+            | CheckFlags::HAS_NON_UNIFORM_TYPE
+    );
+    assert_eq!(
+        context
+            .store()
+            .symbol(mixed_property.symbol())
+            .unwrap()
+            .check_flags(),
+        CheckFlags::SYNTHETIC_PROPERTY | CheckFlags::CONTAINS_PUBLIC
+    );
+    let cold = (
+        context.store().type_len(),
+        context.store().symbol_store().checker_created_symbol_len(),
+        context.store().symbol_store().symbol_table_len(),
+    );
+    assert_eq!(cold.0, before.0);
+    assert_eq!(cold.1, before.1 + 2);
+    assert_eq!(cold.2, before.2 + 2);
+    assert_eq!(
         context.get_union_property(interfaces, "both"),
-        Err(CanonicalUnionPropertyError::UnsupportedConstituent(type_))
-            if type_ == interface_left || type_ == interface_right
-    ));
+        Ok(Some(interface_property))
+    );
     assert_eq!(
         context.get_union_property(mixed, "both"),
-        Err(CanonicalUnionPropertyError::UnsupportedConstituent(
-            interface_left
-        ))
+        Ok(Some(mixed_property))
     );
-    for union in [interfaces, mixed] {
-        let TypeData::Union(data) = context.store().type_payload(union).unwrap().data() else {
-            panic!("fixture alias must remain a union")
-        };
-        assert!(data.union.property_cache.is_none());
-    }
     assert_eq!(
         (
             context.store().type_len(),
             context.store().symbol_store().checker_created_symbol_len(),
             context.store().symbol_store().symbol_table_len(),
         ),
-        before
+        cold
     );
+}
+
+#[test]
+fn declared_literal_members_keep_discriminant_flags_and_literal_union_identity() {
+    let parsed = parse_source_file(concat!(
+        "interface First { kind: \"first\" }\n",
+        "type Second = { kind: \"second\" };\n",
+        "type Both = First | Second;\n",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(2);
+    let mut context = context(&parsed, file);
+    let both_symbol = declaration_symbol(&parsed, file, &context, "Both", false);
+    let both = context.get_declared_type_of_symbol(both_symbol).unwrap();
+
+    let property = context
+        .get_union_property(both, "kind")
+        .unwrap()
+        .expect("both constituents define the discriminant");
+    assert_eq!(
+        context.type_to_string(property.type_id()).unwrap(),
+        "\"first\" | \"second\""
+    );
+    assert_eq!(
+        context
+            .store()
+            .symbol(property.symbol())
+            .unwrap()
+            .check_flags(),
+        CheckFlags::SYNTHETIC_PROPERTY
+            | CheckFlags::CONTAINS_PUBLIC
+            | CheckFlags::HAS_NON_UNIFORM_TYPE
+            | CheckFlags::HAS_LITERAL_TYPE
+    );
+    assert_eq!(context.get_union_property(both, "kind"), Ok(Some(property)));
 }
