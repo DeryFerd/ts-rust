@@ -396,7 +396,7 @@ fn shape_or_generic_diagnostic(
     options: CanonicalCheckerOptions,
 ) -> Result<CanonicalCheckerDiagnostic, SourceCheckError> {
     let expression = expression.unparenthesized();
-    let PlannedExpressionKind::Object { plan, .. } = &expression.kind else {
+    let PlannedExpressionKind::Object { plan, properties } = &expression.kind else {
         return generic_assignability_diagnostic(
             store,
             host,
@@ -408,6 +408,17 @@ fn shape_or_generic_diagnostic(
             options,
         );
     };
+    if let Some(diagnostic) = discriminated_union_excess_property_diagnostic(
+        store,
+        host,
+        global_types,
+        plan,
+        properties,
+        target_type,
+        flags,
+    )? {
+        return Ok(diagnostic);
+    }
     let Some(target) = store.resolved_declared_property_object(host, target_type)? else {
         return generic_assignability_diagnostic(
             store,
@@ -472,6 +483,163 @@ fn shape_or_generic_diagnostic(
         flags,
         options,
     )
+}
+
+#[allow(clippy::too_many_arguments)] // Preserve the existing immutable diagnostic inputs.
+fn discriminated_union_excess_property_diagnostic(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    plan: &PropertyObjectPlan,
+    properties: &[PlannedExpression],
+    target_type: TypeId,
+    flags: CanonicalTypeFormatFlags,
+) -> Result<Option<CanonicalCheckerDiagnostic>, SourceCheckError> {
+    let Some(record) = store.type_payload(target_type) else {
+        return Err(RelationUnavailable::Type(target_type).into());
+    };
+    let TypeData::Union(union) = record.data() else {
+        return Ok(None);
+    };
+    let constituents = union.union.types.clone();
+    let mut targets = Vec::with_capacity(constituents.len());
+    for constituent in constituents {
+        match validate_resolved_declared_property_type_graph(store, constituent) {
+            DeclaredPropertyTypeGraphValidation::Traversable(_) => {}
+            DeclaredPropertyTypeGraphValidation::Opaque => return Ok(None),
+            DeclaredPropertyTypeGraphValidation::Malformed => {
+                return Err(invalid_structure(constituent));
+            }
+        }
+        let Some(target) = store.resolved_declared_property_object(host, constituent)? else {
+            return Ok(None);
+        };
+        targets.push((constituent, target));
+    }
+    if targets.len() < 2 {
+        return Ok(None);
+    }
+
+    let mut included = vec![true; targets.len()];
+    for (source_property, expression) in plan.properties.iter().zip(properties) {
+        let Some(source_type) = literal_discriminant_type(store, expression) else {
+            continue;
+        };
+        if !is_discriminant_property(store, &targets, &source_property.name)? {
+            continue;
+        }
+
+        let mut matched = false;
+        let mut mismatched = Vec::new();
+        for (index, (_, target)) in targets.iter().enumerate() {
+            if !included[index] {
+                continue;
+            }
+            let Some(property) = target.get_source(&source_property.name) else {
+                continue;
+            };
+            if store.is_type_assignable_to_with_global_types(
+                source_type,
+                property.type_,
+                global_types,
+            )? {
+                matched = true;
+            } else {
+                mismatched.push(index);
+            }
+        }
+        if matched {
+            for index in mismatched {
+                included[index] = false;
+            }
+        }
+    }
+
+    let mut selected = targets
+        .iter()
+        .zip(included)
+        .filter_map(|(target, included)| included.then_some(target));
+    let Some((selected_type, selected_target)) = selected.next() else {
+        return Ok(None);
+    };
+    if selected.next().is_some() {
+        return Ok(None);
+    }
+    let Some(excess) = plan
+        .properties
+        .iter()
+        .find(|property| selected_target.get_source(&property.name).is_none())
+    else {
+        return Ok(None);
+    };
+
+    excess_property_diagnostic(
+        store,
+        host,
+        global_types,
+        selected_target,
+        *selected_type,
+        excess,
+        flags,
+    )
+    .map(Some)
+}
+
+fn literal_discriminant_type(
+    store: &CanonicalTypeMapperStore,
+    expression: &PlannedExpression,
+) -> Option<TypeId> {
+    let expression = expression.unparenthesized();
+    if !matches!(
+        expression.kind,
+        PlannedExpressionKind::String(_)
+            | PlannedExpressionKind::Number { .. }
+            | PlannedExpressionKind::BigInt { .. }
+            | PlannedExpressionKind::Boolean(_)
+            | PlannedExpressionKind::Null
+            | PlannedExpressionKind::GlobalUndefined
+    ) {
+        return None;
+    }
+    let type_ = store.type_node_links(expression.node)?.resolved_type?;
+    store
+        .type_payload(type_)
+        .filter(|record| record.flags().intersects(TypeFlags::UNIT))
+        .map(|_| type_)
+}
+
+fn is_discriminant_property(
+    store: &CanonicalTypeMapperStore,
+    targets: &[(TypeId, ResolvedDeclaredPropertyObject)],
+    name: &str,
+) -> Result<bool, SourceCheckError> {
+    let mut first_type = None;
+    let mut first_symbol = None;
+    let mut non_uniform = false;
+    let mut distinct_symbols = false;
+    let mut literal = false;
+    for (_, target) in targets {
+        let Some(property) = target.get_source(name) else {
+            continue;
+        };
+        let record = store
+            .type_payload(property.type_)
+            .ok_or(RelationUnavailable::Type(property.type_))?;
+        literal |= record
+            .flags()
+            .intersects(TypeFlags::UNIT | TypeFlags::BOOLEAN);
+        if let Some(first) = first_type {
+            non_uniform |= first != property.type_;
+        } else {
+            first_type = Some(property.type_);
+        }
+        if let Some(first) = first_symbol {
+            distinct_symbols |= first != property.symbol;
+        } else {
+            first_symbol = Some(property.symbol);
+        }
+    }
+    Ok(non_uniform && distinct_symbols && literal)
 }
 
 fn excess_property_diagnostic(

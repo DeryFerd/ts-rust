@@ -25,12 +25,14 @@ use super::{
         ValidatedSingleCallSignatureDisplay, single_callable_display_projection,
         single_callable_family, validate_stored_single_callable,
     },
+    declared::cached_ordinary_type_parameter_owner,
     derived_types::DerivedObjectLiteralValidation,
     enums,
     functions::{FunctionTypeDisplayError, FunctionTypeUnsupported},
     keyof_types,
     links::ValueSymbolLinks,
     object_members,
+    reference_types::validate_direct_generic_reference,
     signatures::IndexFlags,
     source_callables::{SourceCallableDisplayError, SourceCallableUnsupported},
     structured_members::{InterfaceHeritageMembersValidation, validate_interface_heritage_members},
@@ -711,6 +713,13 @@ fn display_type_worker(
         state.add(6);
         return Ok("object".to_owned());
     }
+    if type_flags.intersects(TypeFlags::TYPE_PARAMETER) {
+        require_data_kind(type_id, record, TypeDataKind::TypeParameter)?;
+        let symbol = cached_ordinary_type_parameter_owner(store, type_id)
+            .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+        return display_symbol_name(store, type_id, symbol, state)
+            .ok_or(TypeDisplayUnavailable::MalformedType(type_id));
+    }
     if type_flags.intersects(TypeFlags::INDEX) {
         return display_index_type(store, host, global_types, type_id, flags, state, visiting);
     }
@@ -869,6 +878,23 @@ fn display_object_type(
         }
         return display_alias_name(store, type_id, alias, state);
     }
+    if let Some(host) = host
+        && record.object_flags().contains(ObjectFlags::REFERENCE)
+        && matches!(
+            record.data(),
+            TypeData::TypeReference(_) | TypeData::Interface(_)
+        )
+    {
+        return display_direct_generic_reference(
+            store,
+            host,
+            global_types,
+            type_id,
+            flags,
+            state,
+            visiting,
+        );
+    }
 
     if let Some(projection) = validated_single_callable_display(store, host, global_types, type_id)?
     {
@@ -917,6 +943,79 @@ fn display_object_type(
         state,
         visiting,
     );
+    visiting.remove(&type_id);
+    result
+}
+
+#[allow(clippy::too_many_arguments)] // Keep recursive formatter state explicit.
+fn display_direct_generic_reference(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: Option<&CanonicalGlobalTypes>,
+    type_id: TypeId,
+    flags: CanonicalTypeFormatFlags,
+    state: &mut DisplayState,
+    visiting: &mut HashSet<TypeId>,
+) -> Result<String, TypeDisplayUnavailable> {
+    let reference = validate_direct_generic_reference(store, type_id)
+        .map_err(|_| TypeDisplayUnavailable::MalformedType(type_id))?;
+    let target = store
+        .type_payload(reference.target)
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let symbol = target
+        .symbol()
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let symbol_record = store
+        .symbol(symbol)
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let [declaration] = symbol_record.declarations().unwrap_or_default() else {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    };
+    let declaration_record = host
+        .node(*declaration)
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let name_node = match &declaration_record.data {
+        NodeData::ClassDeclaration(class) => class
+            .name
+            .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?,
+        NodeData::InterfaceDeclaration(interface) => interface.name,
+        _ => return Err(TypeDisplayUnavailable::MalformedType(type_id)),
+    };
+    let name_node = NodeRef::new(declaration.arena, declaration.file, name_node);
+    if !host.symbol_matches(store, *declaration, symbol)
+        || !host.node(name_node).is_some_and(|node| {
+            matches!(&node.data, NodeData::Identifier(name)
+                if symbol_record.name().as_utf8() == Some(name.text.as_str()))
+        })
+    {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
+    if !visiting.insert(type_id) {
+        return Err(TypeDisplayUnavailable::CyclicType(type_id));
+    }
+    let result = (|| {
+        let mut result = display_symbol_name(store, type_id, symbol, state)
+            .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+        result.push('<');
+        state.add(2);
+        for (index, argument) in reference.type_arguments.iter().enumerate() {
+            if index != 0 {
+                result.push_str(", ");
+                state.add(2);
+            }
+            result.push_str(&display_type_worker(
+                store,
+                Some(host),
+                global_types,
+                *argument,
+                flags,
+                state,
+                visiting,
+            )?);
+        }
+        result.push('>');
+        Ok(result)
+    })();
     visiting.remove(&type_id);
     result
 }
@@ -3608,6 +3707,66 @@ mod tests {
         assert_eq!(
             type_to_string(&store, object).unwrap(),
             "{ a: string; b?: number; child: { value: string; }; }",
+        );
+    }
+
+    #[test]
+    fn direct_generic_references_format_target_names_and_ordered_arguments() {
+        let parsed = parse_source_file(concat!(
+            "interface Box<T> {} ",
+            "class Pair<Left, Right> {} ",
+            "type Plain = Box<string>; ",
+            "type Nested = Box<Box<string>>; ",
+            "type Mixed = Pair<string, number>; ",
+            "type UnionArgument = Box<string | number>;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(196);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+
+        for (alias, expected) in [
+            ("Plain", "Box<string>"),
+            ("Nested", "Box<Box<string>>"),
+            ("Mixed", "Pair<string, number>"),
+            ("UnionArgument", "Box<string | number>"),
+        ] {
+            let node = type_alias_body(&parsed, file, alias);
+            let reference = context.get_type_from_type_node(node).unwrap();
+            assert_eq!(context.type_to_string(reference).unwrap(), expected);
+        }
+
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::InterfaceDeclaration).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        let target = context
+            .store()
+            .declared_type_links(symbol)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        assert_eq!(context.type_to_string(target).unwrap(), "Box<T>");
+
+        let warm = (
+            context.store().type_len(),
+            context.store().mapper_len(),
+            context.store().relation_state_snapshot(),
+        );
+        assert_eq!(context.type_to_string(target).unwrap(), "Box<T>");
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().mapper_len(),
+                context.store().relation_state_snapshot(),
+            ),
+            warm
         );
     }
 
