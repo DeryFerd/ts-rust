@@ -1986,7 +1986,15 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             SyntaxKind::IntrinsicKeyword => Some(bootstrap.intrinsic_marker_type),
             _ => None,
         };
-        Ok(keyword.or_else(|| {
+        let inferred = self.plan.infer_parameters.get(&node).and_then(|symbol| {
+            self.store
+                .declared_type_links(*symbol)
+                .and_then(|links| links.declared_type)
+                .filter(|type_| {
+                    cached_ordinary_type_parameter_owner(self.store, *type_) == Some(*symbol)
+                })
+        });
+        Ok(keyword.or(inferred).or_else(|| {
             self.store
                 .type_node_links(node)
                 .and_then(|links| links.resolved_type)
@@ -21306,6 +21314,12 @@ mod tests {
                 .map(TypeRecord::data),
             Some(TypeData::TypeParameter(_)),
         ));
+        let warm = store_state(&fixture.store);
+        assert_eq!(
+            query_global_node(&mut fixture, &global_types, variadic, &mut diagnostics),
+            Ok(variadic_type),
+        );
+        assert_eq!(store_state(&fixture.store), warm);
         assert!(diagnostics.is_empty());
     }
 

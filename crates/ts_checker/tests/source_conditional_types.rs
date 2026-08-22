@@ -223,3 +223,48 @@ fn naked_infer_parameters_resolve_only_through_the_true_branch() {
         .count();
     assert_eq!(infer_nodes, 1);
 }
+
+#[test]
+fn short_variadic_tuple_inference_preserves_warm_tuple_cache_identity() {
+    let parsed = parse_source_file(concat!(
+        "interface Array<T> {}\n",
+        "interface ReadonlyArray<T> {}\n",
+        "type Middle<T> = T extends [unknown, ...infer X, unknown] ? X : never;\n",
+        "type Example = Middle<[1]>;\n",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(3);
+    let mut context = context(&parsed, file);
+
+    context.check_source_file(file).unwrap();
+    assert!(
+        context.diagnostics().is_empty(),
+        "{:?}",
+        context.diagnostics()
+    );
+
+    let example = alias_symbol(&parsed, file, &context, "Example");
+    assert_eq!(
+        context
+            .type_to_string(alias_type(&context, example))
+            .unwrap(),
+        "never"
+    );
+
+    let warm = (
+        context.store().type_len(),
+        context.store().conditional_root_len(),
+        context.store().mapper_len(),
+        context.diagnostics().clone(),
+    );
+    context.check_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().conditional_root_len(),
+            context.store().mapper_len(),
+            context.diagnostics().clone(),
+        ),
+        warm
+    );
+}
