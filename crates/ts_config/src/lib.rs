@@ -204,10 +204,10 @@ impl ProjectConfig {
         self.references
             .iter()
             .map(|reference| {
-                let mut path = if is_relative_path(&reference.path) {
-                    resolve_relative(directory, &reference.path)
-                } else {
+                let mut path = if is_rooted_path(&reference.path) {
                     normalize_path(&reference.path)
+                } else {
+                    resolve_relative(directory, &reference.path)
                 };
                 if file_system.directory_exists(&path) {
                     path = resolve_relative(&path, "tsconfig.json");
@@ -238,9 +238,145 @@ pub fn parse_config_text(file_name: &str, source: &str) -> ParseResult<ProjectCo
             diagnostics: vec![diagnostic(file_name, 0, 1136, std::iter::empty::<String>())],
         };
     };
+    let mut diagnostics = parsed.diagnostics;
+    validate_project_fields(file_name, &raw, &mut diagnostics);
     ParseResult {
         value: Some(ProjectConfig::from_json(normalize_path(file_name), raw)),
-        diagnostics: parsed.diagnostics,
+        diagnostics,
+    }
+}
+
+fn validate_project_fields(
+    file_name: &str,
+    fields: &BTreeMap<String, JsonValue>,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) {
+    if fields.contains_key("excludes") {
+        diagnostics.push(diagnostic(file_name, 0, 6114, std::iter::empty::<String>()));
+    }
+
+    if let Some(value) = fields.get("compilerOptions")
+        && !matches!(value, JsonValue::Null | JsonValue::Object(_))
+    {
+        diagnostics.push(diagnostic(
+            file_name,
+            0,
+            5024,
+            ["compilerOptions".to_owned(), "object".to_owned()],
+        ));
+    }
+
+    if let Some(value) = fields.get("extends") {
+        validate_extends_field(file_name, value, diagnostics);
+    }
+
+    for name in ["files", "include", "exclude"] {
+        validate_string_list_field(file_name, fields, name, diagnostics);
+    }
+
+    if let Some(value) = fields.get("references")
+        && !matches!(value, JsonValue::Null)
+    {
+        let Some(references) = value.as_array() else {
+            diagnostics.push(diagnostic(
+                file_name,
+                0,
+                5024,
+                ["references".to_owned(), "Array".to_owned()],
+            ));
+            return;
+        };
+        for reference in references {
+            let Some(reference) = reference.as_object() else {
+                diagnostics.push(diagnostic(
+                    file_name,
+                    0,
+                    5024,
+                    ["references".to_owned(), "object".to_owned()],
+                ));
+                continue;
+            };
+            if reference
+                .get("path")
+                .and_then(JsonValue::as_str)
+                .is_none_or(str::is_empty)
+            {
+                diagnostics.push(diagnostic(
+                    file_name,
+                    0,
+                    5024,
+                    ["reference.path".to_owned(), "string".to_owned()],
+                ));
+            }
+        }
+    }
+}
+
+fn validate_extends_field(
+    file_name: &str,
+    value: &JsonValue,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) {
+    match value {
+        JsonValue::Null => {}
+        JsonValue::String(path) => validate_extends_path(file_name, path, diagnostics),
+        JsonValue::Array(paths) => {
+            for path in paths {
+                if let Some(path) = path.as_str() {
+                    validate_extends_path(file_name, path, diagnostics);
+                } else {
+                    diagnostics.push(diagnostic(
+                        file_name,
+                        0,
+                        5024,
+                        ["extends".to_owned(), "string".to_owned()],
+                    ));
+                }
+            }
+        }
+        _ => diagnostics.push(diagnostic(
+            file_name,
+            0,
+            5024,
+            ["extends".to_owned(), "string or Array".to_owned()],
+        )),
+    }
+}
+
+fn validate_extends_path(file_name: &str, path: &str, diagnostics: &mut Vec<ConfigDiagnostic>) {
+    if path.is_empty() {
+        diagnostics.push(diagnostic(file_name, 0, 18_051, ["extends".to_owned()]));
+    }
+}
+
+fn validate_string_list_field(
+    file_name: &str,
+    fields: &BTreeMap<String, JsonValue>,
+    name: &str,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) {
+    let Some(value) = fields.get(name) else {
+        return;
+    };
+    if matches!(value, JsonValue::Null) {
+        return;
+    }
+    let Some(values) = value.as_array() else {
+        diagnostics.push(diagnostic(
+            file_name,
+            0,
+            5024,
+            [name.to_owned(), "Array".to_owned()],
+        ));
+        return;
+    };
+    if values.iter().any(|value| value.as_str().is_none()) {
+        diagnostics.push(diagnostic(
+            file_name,
+            0,
+            5024,
+            [name.to_owned(), "string".to_owned()],
+        ));
     }
 }
 
@@ -298,7 +434,13 @@ struct ConfigResolutionState<'a> {
 impl ConfigResolutionState<'_> {
     fn resolve(&mut self, file_name: &str) -> Option<ProjectConfig> {
         let file_name = normalize_path(file_name);
-        if let Some(index) = self.stack.iter().position(|path| path == &file_name) {
+        if let Some(index) = self.stack.iter().position(|path| {
+            if self.file_system.use_case_sensitive_file_names() {
+                path == &file_name
+            } else {
+                path.eq_ignore_ascii_case(&file_name)
+            }
+        }) {
             let mut cycle = self.stack[index..].to_vec();
             cycle.push(file_name.clone());
             self.diagnostics
@@ -329,7 +471,7 @@ impl ConfigResolutionState<'_> {
                     self.diagnostics.push(diagnostic(
                         &config.path,
                         0,
-                        5_083,
+                        6_053,
                         [extends_path.to_owned()],
                     ));
                     continue;
@@ -400,7 +542,7 @@ fn resolve_config_patterns(mut config: ProjectConfig) -> ProjectConfig {
         .flatten()
     {
         for value in values {
-            if !Path::new(value).is_absolute() && config_dir_suffix(value).is_none() {
+            if !is_rooted_path(value) && config_dir_suffix(value).is_none() {
                 *value = resolve_relative(directory, value);
             }
         }
@@ -410,7 +552,7 @@ fn resolve_config_patterns(mut config: ProjectConfig) -> ProjectConfig {
             "baseurl" | "outfile" | "outdir" | "rootdir" | "declarationdir" | "tsbuildinfofile"
             | "maproot" => {
                 if let JsonValue::String(path) = value
-                    && !Path::new(path.as_str()).is_absolute()
+                    && !is_rooted_path(path)
                     && config_dir_suffix(path).is_none()
                 {
                     *path = resolve_relative(directory, path);
@@ -420,7 +562,7 @@ fn resolve_config_patterns(mut config: ProjectConfig) -> ProjectConfig {
                 if let JsonValue::Array(paths) = value {
                     for path in paths {
                         if let JsonValue::String(path) = path
-                            && !Path::new(path.as_str()).is_absolute()
+                            && !is_rooted_path(path)
                             && config_dir_suffix(path).is_none()
                         {
                             *path = resolve_relative(directory, path);
@@ -434,7 +576,7 @@ fn resolve_config_patterns(mut config: ProjectConfig) -> ProjectConfig {
                         if let JsonValue::Array(substitutions) = substitutions {
                             for substitution in substitutions {
                                 if let JsonValue::String(substitution) = substitution
-                                    && !Path::new(substitution.as_str()).is_absolute()
+                                    && !is_rooted_path(substitution)
                                     && config_dir_suffix(substitution).is_none()
                                 {
                                     *substitution = resolve_relative(directory, substitution);
@@ -519,11 +661,12 @@ fn config_dir_suffix(value: &str) -> Option<&str> {
 
 fn parse_extends(value: &JsonValue) -> Option<Extends> {
     match value {
-        JsonValue::String(path) => Some(Extends::Single(path.clone())),
+        JsonValue::String(path) if !path.is_empty() => Some(Extends::Single(path.clone())),
         JsonValue::Array(values) => Some(Extends::Multiple(
             values
                 .iter()
                 .filter_map(JsonValue::as_str)
+                .filter(|path| !path.is_empty())
                 .map(ToOwned::to_owned)
                 .collect(),
         )),
@@ -592,7 +735,7 @@ fn resolve_base_config_path(
     config_path: &str,
     extends_path: &str,
 ) -> Option<String> {
-    if is_relative_path(extends_path) || Path::new(extends_path).is_absolute() {
+    if is_relative_path(extends_path) || is_rooted_path(extends_path) {
         let candidate = if is_relative_path(extends_path) {
             resolve_relative(config_directory(config_path), extends_path)
         } else {
@@ -641,7 +784,9 @@ fn existing_config_candidate(file_system: &dyn FileSystem, candidate: &str) -> O
                 .and_then(JsonValue::as_str)
         {
             let configured = resolve_relative(&candidate, tsconfig);
-            if file_system.file_exists(&configured) {
+            if configured != candidate
+                && let Some(configured) = existing_config_candidate(file_system, &configured)
+            {
                 return Some(configured);
             }
         }
@@ -667,6 +812,13 @@ fn resolve_relative(directory: &str, path: &str) -> String {
 
 fn is_relative_path(path: &str) -> bool {
     path == "." || path == ".." || path.starts_with("./") || path.starts_with("../")
+}
+
+fn is_rooted_path(path: &str) -> bool {
+    Path::new(path).is_absolute()
+        || path.starts_with('\\')
+        || (path.as_bytes().get(1) == Some(&b':')
+            && path.as_bytes().first().is_some_and(u8::is_ascii_alphabetic))
 }
 
 pub(crate) fn diagnostic(
@@ -775,6 +927,75 @@ mod tests {
         assert_eq!(
             config.resolved_extends(&file_system),
             ["/repo/base.json", "/repo/app/shared.json", "@scope/config"]
+        );
+    }
+
+    #[test]
+    fn reports_invalid_project_field_types_without_discarding_valid_fields() {
+        let result = parse_config_text(
+            "/repo/tsconfig.json",
+            r#"{
+                "compilerOptions": [],
+                "extends": ["./base", 1, ""],
+                "files": ["index.ts", false],
+                "include": "src",
+                "exclude": ["dist", null],
+                "references": [{ "path": "./lib" }, {}, 1]
+            }"#,
+        );
+
+        let config = result.value.unwrap();
+        assert_eq!(config.files, Some(vec!["index.ts".into()]));
+        assert_eq!(config.references.len(), 1);
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(super::ConfigDiagnostic::code)
+                .collect::<Vec<_>>(),
+            [5024, 5024, 18_051, 5024, 5024, 5024, 5024, 5024]
+        );
+        assert_eq!(
+            result.diagnostics[0].render(),
+            "Compiler option 'compilerOptions' requires a value of type object."
+        );
+        assert_eq!(
+            result.diagnostics[2].render(),
+            "Compiler option 'extends' cannot be given an empty string."
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_top_level_reference_and_extends_values() {
+        let result = parse_config_text(
+            "/repo/tsconfig.json",
+            r#"{ "extends": true, "references": "./lib" }"#,
+        );
+        assert_eq!(result.diagnostics.len(), 2);
+        assert_eq!(
+            result.diagnostics[0].render(),
+            "Compiler option 'extends' requires a value of type string or Array."
+        );
+        assert_eq!(
+            result.diagnostics[1].render(),
+            "Compiler option 'references' requires a value of type Array."
+        );
+
+        let empty = parse_config_text("/repo/tsconfig.json", r#"{ "extends": "" }"#);
+        assert_eq!(empty.diagnostics.len(), 1);
+        assert_eq!(empty.diagnostics[0].code(), 18_051);
+        assert!(empty.value.unwrap().extends.is_none());
+    }
+
+    #[test]
+    fn reports_the_common_excludes_typo_with_the_upstream_diagnostic() {
+        let result = parse_config_text("/repo/tsconfig.json", r#"{ "excludes": ["dist"] }"#);
+        assert!(result.value.is_some());
+        assert_eq!(result.diagnostics.len(), 1);
+        assert_eq!(result.diagnostics[0].code(), 6114);
+        assert_eq!(
+            result.diagnostics[0].render(),
+            "Unknown option 'excludes'. Did you mean 'exclude'?"
         );
     }
 
@@ -953,6 +1174,53 @@ mod tests {
         assert_eq!(
             config.compiler_options.get("strict"),
             Some(&JsonValue::Bool(true))
+        );
+        assert_eq!(
+            config.compiler_options.get("declaration"),
+            Some(&JsonValue::Bool(true))
+        );
+    }
+
+    #[test]
+    fn resolves_extensionless_and_directory_package_config_entries() {
+        let file_system = MemoryFileSystem::default();
+        file_system
+            .write_file(
+                "/repo/node_modules/@scope/base/package.json",
+                r#"{ "tsconfig": "configs/base" }"#,
+            )
+            .unwrap();
+        file_system
+            .write_file(
+                "/repo/node_modules/@scope/base/configs/base.json",
+                r#"{ "compilerOptions": { "strict": false } }"#,
+            )
+            .unwrap();
+        file_system
+            .write_file(
+                "/repo/node_modules/preset/package.json",
+                r#"{ "tsconfig": "configs" }"#,
+            )
+            .unwrap();
+        file_system
+            .write_file(
+                "/repo/node_modules/preset/configs/tsconfig.json",
+                r#"{ "compilerOptions": { "declaration": true } }"#,
+            )
+            .unwrap();
+        file_system
+            .write_file(
+                "/repo/app/tsconfig.json",
+                r#"{ "extends": ["@scope/base", "preset"] }"#,
+            )
+            .unwrap();
+
+        let result = resolve_config_file(&file_system, "/repo/app/tsconfig.json");
+        assert!(result.is_ok(), "{:?}", result.diagnostics);
+        let config = result.value.unwrap();
+        assert_eq!(
+            config.compiler_options.get("strict"),
+            Some(&JsonValue::Bool(false))
         );
         assert_eq!(
             config.compiler_options.get("declaration"),
@@ -1193,9 +1461,66 @@ mod tests {
                 .iter()
                 .map(super::ConfigDiagnostic::code)
                 .collect::<Vec<_>>(),
-            [18_000, 5_083]
+            [18_000, 6_053]
         );
         assert!(result.diagnostics[0].render().contains("/repo/a.json"));
+    }
+
+    #[test]
+    fn detects_case_only_config_cycles_on_case_insensitive_file_systems() {
+        let file_system = MemoryFileSystem::new(false);
+        file_system
+            .write_file("/repo/base.json", r#"{ "extends": "./BASE.json" }"#)
+            .unwrap();
+
+        let result = resolve_config_file(&file_system, "/repo/base.json");
+        assert!(result.value.is_some());
+        assert_eq!(result.diagnostics.len(), 1);
+        assert_eq!(result.diagnostics[0].code(), 18_000);
+    }
+
+    #[test]
+    fn resolves_bare_and_windows_rooted_reference_paths() {
+        let file_system = MemoryFileSystem::new(false);
+        file_system
+            .write_file("C:/repo/app/lib/tsconfig.json", "{}")
+            .unwrap();
+        file_system
+            .write_file("D:/shared/types/tsconfig.json", "{}")
+            .unwrap();
+        let config = parse_config_text(
+            "C:/repo/app/tsconfig.json",
+            r#"{
+                "references": [
+                    { "path": "lib" },
+                    { "path": "D:/shared/types" }
+                ],
+                "compilerOptions": { "outDir": "D:/build" }
+            }"#,
+        )
+        .value
+        .unwrap();
+
+        let references = config.resolved_references(&file_system);
+        assert_eq!(references[0].path, "C:/repo/app/lib/tsconfig.json");
+        assert_eq!(references[1].path, "D:/shared/types/tsconfig.json");
+
+        file_system
+            .write_file(
+                "C:/repo/app/tsconfig.json",
+                r#"{ "compilerOptions": { "outDir": "D:/build" } }"#,
+            )
+            .unwrap();
+        let resolved = resolve_config_file(&file_system, "C:/repo/app/tsconfig.json")
+            .value
+            .unwrap();
+        assert_eq!(
+            resolved
+                .compiler_options
+                .get("outDir")
+                .and_then(JsonValue::as_str),
+            Some("D:/build")
+        );
     }
 
     #[test]
