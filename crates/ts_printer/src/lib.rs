@@ -75363,6 +75363,7 @@ fn decode_jsx_entities(text: &str) -> String {
     decoded
 }
 
+#[allow(clippy::too_many_lines)] // Keep the complete upstream JSX entity table together.
 fn jsx_named_entity_value(entity: &str) -> Option<u32> {
     Some(match entity {
         "quot" => 0x0022,
