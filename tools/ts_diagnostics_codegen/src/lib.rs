@@ -59,13 +59,13 @@ impl fmt::Display for GenerateError {
 impl Error for GenerateError {}
 
 /// Reads TypeScript diagnosticMessages.json inputs. Later files replace an
-/// earlier entry with the same English message, matching the Go generator.
+/// earlier entry with the same diagnostic code, matching the Go generator.
 ///
 /// # Errors
 ///
-/// Returns errors for unreadable files, malformed JSON, categories, or duplicate codes.
+/// Returns errors for unreadable files, malformed JSON, or unknown categories.
 pub fn read_json_catalog(paths: &[impl AsRef<Path>]) -> Result<Vec<Entry>, GenerateError> {
-    let mut messages = BTreeMap::<String, JsonEntry>::new();
+    let mut messages = BTreeMap::<u32, (String, JsonEntry)>::new();
     for path in paths {
         let path = path.as_ref();
         let source = fs::read_to_string(path).map_err(|error| {
@@ -75,11 +75,15 @@ pub fn read_json_catalog(paths: &[impl AsRef<Path>]) -> Result<Vec<Entry>, Gener
             serde_json::from_str(&source).map_err(|error| {
                 GenerateError(format!("failed to parse {}: {error}", path.display()))
             })?;
-        messages.extend(input);
+        messages.extend(
+            input
+                .into_iter()
+                .map(|(text, entry)| (entry.code, (text, entry))),
+        );
     }
 
     let entries = messages
-        .into_iter()
+        .into_values()
         .map(|(text, input)| {
             Ok(Entry {
                 code: input.code,
@@ -345,6 +349,36 @@ mod tests {
         let entries = read_json_catalog(&[input]).unwrap();
         assert_eq!(entries[0].key, "_0_expected_1005");
         assert_eq!(entries[1].key, "Asterisk_Slash_expected_1010");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn later_json_inputs_replace_messages_with_the_same_code() {
+        let directory = temp_dir("ts-diagnostics-code-override");
+        fs::create_dir_all(&directory).unwrap();
+        let original = directory.join("diagnosticMessages.json");
+        let extra = directory.join("extraDiagnosticMessages.json");
+        fs::write(
+            &original,
+            r#"{
+                "Original message.": { "category": "Error", "code": 5074 },
+                "Preserved message.": { "category": "Warning", "code": 5075 }
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            &extra,
+            r#"{"Replacement message.": {"category": "Message", "code": 5074}}"#,
+        )
+        .unwrap();
+
+        let entries = read_json_catalog(&[original, extra]).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].code, 5074);
+        assert_eq!(entries[0].category, Category::Message);
+        assert_eq!(entries[0].text, "Replacement message.");
+        assert_eq!(entries[0].key, "Replacement_message_5074");
+        assert_eq!(entries[1].text, "Preserved message.");
         fs::remove_dir_all(directory).unwrap();
     }
 

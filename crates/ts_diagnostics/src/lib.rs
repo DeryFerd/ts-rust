@@ -118,15 +118,16 @@ impl Message {
         let mut remaining = self.text;
         while let Some(open) = remaining.find('{') {
             output.push_str(&remaining[..open]);
-            remaining = &remaining[open..];
-            let Some(close) = remaining.find('}') else {
-                output.push_str(remaining);
-                return Ok(output);
-            };
-            let index_text = &remaining[1..close];
+            remaining = &remaining[open + 1..];
+            let digits = remaining.bytes().take_while(u8::is_ascii_digit).count();
+            if digits == 0 || remaining.as_bytes().get(digits) != Some(&b'}') {
+                output.push('{');
+                continue;
+            }
+
+            let index_text = &remaining[..digits];
             let Ok(index) = index_text.parse::<usize>() else {
-                output.push_str(&remaining[..=close]);
-                remaining = &remaining[close + 1..];
+                output.push('{');
                 continue;
             };
             let Some(argument) = arguments.get(index) else {
@@ -136,7 +137,7 @@ impl Message {
                 });
             };
             output.push_str(argument);
-            remaining = &remaining[close + 1..];
+            remaining = &remaining[digits + 1..];
         }
         output.push_str(remaining);
         Ok(output)
@@ -284,6 +285,24 @@ mod tests {
             "The parser expected to find a '}' to match the '{' token here."
         );
         assert_eq!(diagnostic.code(), 1007);
+    }
+
+    #[test]
+    fn diagnostics_render_placeholders_inside_literal_braces() {
+        let diagnostic =
+            Diagnostic::with_arguments(message_by_code(2613).unwrap(), ["./module", "namedExport"]);
+        assert_eq!(
+            diagnostic.render().unwrap(),
+            "Module './module' has no default export. Did you mean to use 'import { namedExport } from ./module' instead?"
+        );
+    }
+
+    #[test]
+    fn diagnostics_report_missing_numbered_arguments() {
+        let diagnostic = Diagnostic::with_arguments(message_by_code(1007).unwrap(), ["{"]);
+        let error = diagnostic.render().unwrap_err();
+        assert_eq!(error.code, 1007);
+        assert_eq!(error.argument_index, 1);
     }
 
     #[test]

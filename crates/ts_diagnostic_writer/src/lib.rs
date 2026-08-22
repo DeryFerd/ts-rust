@@ -5,6 +5,7 @@ use std::fmt::Write as _;
 use ts_core::TextRange;
 
 const RESET: &str = "\u{1b}[0m";
+const GUTTER: &str = "\u{1b}[7m";
 const GREY: &str = "\u{1b}[90m";
 const RED: &str = "\u{1b}[91m";
 const YELLOW: &str = "\u{1b}[93m";
@@ -100,7 +101,9 @@ fn format_pretty(output: &mut String, diagnostic: &Diagnostic<'_>, options: Form
         );
     }
     write_message(output, diagnostic, true);
-    if let (Some(source), Some(range)) = (diagnostic.source_text, diagnostic.range) {
+    if let (Some(source), Some(range)) = (diagnostic.source_text, diagnostic.range)
+        && diagnostic.code != Some(1490)
+    {
         output.push_str(options.new_line);
         write_snippet(
             output,
@@ -109,6 +112,7 @@ fn format_pretty(output: &mut String, diagnostic: &Diagnostic<'_>, options: Form
             diagnostic.category.color(),
             options.new_line,
         );
+        output.push_str(options.new_line);
     }
     output.push_str(options.new_line);
 }
@@ -127,7 +131,7 @@ fn write_message(output: &mut String, diagnostic: &Diagnostic<'_>, color: bool) 
     }
     if let Some(code) = diagnostic.code {
         if color {
-            let _ = write!(output, "{GREY} TS{code}:{RESET} ");
+            let _ = write!(output, "{GREY} TS{code}: {RESET}");
         } else {
             let _ = write!(output, " TS{code}: ");
         }
@@ -160,41 +164,98 @@ fn relative_file_name(file_name: &str, current_directory: &str) -> String {
 }
 
 fn line_and_utf16_column(source: &str, byte_position: usize) -> (usize, usize) {
-    let position = byte_position.min(source.len());
-    let prefix = &source[..position];
-    let line = prefix.bytes().filter(|byte| *byte == b'\n').count();
-    let line_start = prefix.rfind('\n').map_or(0, |index| index + 1);
-    let column = prefix[line_start..].encode_utf16().count();
+    line_and_utf16_column_at(source, &ecma_line_starts(source), byte_position)
+}
+
+fn line_and_utf16_column_at(
+    source: &str,
+    line_starts: &[usize],
+    byte_position: usize,
+) -> (usize, usize) {
+    let mut position = byte_position.min(source.len());
+    while !source.is_char_boundary(position) {
+        position -= 1;
+    }
+    let line = line_starts
+        .partition_point(|line_start| *line_start <= position)
+        .saturating_sub(1);
+    let column = source[line_starts[line]..position].encode_utf16().count();
     (line, column)
 }
 
+fn ecma_line_starts(source: &str) -> Vec<usize> {
+    let mut starts = vec![0];
+    let mut characters = source.char_indices().peekable();
+    while let Some((index, character)) = characters.next() {
+        match character {
+            '\r' => {
+                if let Some(&(next_index, '\n')) = characters.peek() {
+                    characters.next();
+                    starts.push(next_index + 1);
+                } else {
+                    starts.push(index + 1);
+                }
+            }
+            '\n' => starts.push(index + 1),
+            '\u{2028}' | '\u{2029}' => starts.push(index + character.len_utf8()),
+            _ => {}
+        }
+    }
+    starts
+}
+
 fn write_snippet(output: &mut String, source: &str, range: TextRange, color: &str, new_line: &str) {
+    let starts = ecma_line_starts(source);
     let start = range.start.get() as usize;
-    let end = (range.end.get() as usize).max(start.saturating_add(1));
-    let (line, column) = line_and_utf16_column(source, start);
-    let line_start = source[..start.min(source.len())]
-        .rfind('\n')
-        .map_or(0, |index| index + 1);
-    let line_end = source[line_start..]
-        .find(['\r', '\n'])
-        .map_or(source.len(), |index| line_start + index);
-    let content = source[line_start..line_end].replace('\t', " ");
-    let marked_end = end.min(line_end);
-    let (_, end_column) = line_and_utf16_column(source, marked_end);
-    let mark_len = end_column.saturating_sub(column).max(1);
-    let gutter_width = (line + 1).to_string().len();
-    let _ = write!(
-        output,
-        "{GREY}{:>gutter_width$}{RESET} {content}{new_line}",
-        line + 1
-    );
-    let _ = write!(
-        output,
-        "{GREY}{:>gutter_width$}{RESET} {color}{}{}{RESET}",
-        "",
-        " ".repeat(column),
-        "~".repeat(mark_len)
-    );
+    let end = (range.end.get() as usize).max(start);
+    let (first_line, first_column) = line_and_utf16_column_at(source, &starts, start);
+    let (last_line, mut last_column) = line_and_utf16_column_at(source, &starts, end);
+    if start == end {
+        last_column += 1;
+    }
+
+    let abbreviated = last_line.saturating_sub(first_line) >= 4;
+    let gutter_width = if abbreviated {
+        (last_line + 1).to_string().len().max(3)
+    } else {
+        (last_line + 1).to_string().len()
+    };
+
+    let mut line = first_line;
+    while line <= last_line {
+        output.push_str(new_line);
+        if abbreviated && line > first_line + 1 && line < last_line - 1 {
+            let _ = write!(output, "{GUTTER}{:>gutter_width$}{RESET} {new_line}", "...");
+            line = last_line - 1;
+        }
+
+        let line_start = starts[line];
+        let line_end = starts.get(line + 1).copied().unwrap_or(source.len());
+        let content = source[line_start..line_end].trim_end().replace('\t', " ");
+        let _ = write!(
+            output,
+            "{GUTTER}{:>gutter_width$}{RESET} {content}{new_line}",
+            line + 1
+        );
+        let _ = write!(output, "{GUTTER}{:>gutter_width$}{RESET} {color}", "");
+
+        if line == first_line {
+            let marked_end = if line == last_line {
+                last_column
+            } else {
+                content.encode_utf16().count()
+            };
+            output.push_str(&" ".repeat(first_column));
+            output.push_str(&"~".repeat(marked_end.saturating_sub(first_column)));
+        } else if line == last_line {
+            output.push_str(&"~".repeat(last_column));
+        } else {
+            output.push_str(&"~".repeat(content.encode_utf16().count()));
+        }
+
+        output.push_str(RESET);
+        line += 1;
+    }
 }
 
 #[cfg(test)]
@@ -260,5 +321,143 @@ mod tests {
         assert!(formatted.contains("~~"));
         assert!(formatted.contains("global warning"));
         assert!(formatted.contains("\u{1b}[91m"));
+    }
+
+    #[test]
+    fn pretty_diagnostics_match_upstream_spacing_and_gutters() {
+        let source = "let answer: string = 42;\n";
+        let diagnostic = Diagnostic {
+            file_name: Some("main.ts"),
+            source_text: Some(source),
+            range: Some(TextRange::new(TextPos::new(21), TextPos::new(23))),
+            code: Some(2322),
+            category: DiagnosticCategory::Error,
+            message: "Type 'number' is not assignable to type 'string'.",
+        };
+
+        assert_eq!(
+            format_diagnostics(
+                &[diagnostic],
+                FormattingOptions {
+                    pretty: true,
+                    ..FormattingOptions::default()
+                },
+            ),
+            concat!(
+                "\u{1b}[96mmain.ts\u{1b}[0m:\u{1b}[93m1\u{1b}[0m:",
+                "\u{1b}[93m22\u{1b}[0m - ",
+                "\u{1b}[91merror\u{1b}[0m\u{1b}[90m TS2322: \u{1b}[0m",
+                "Type 'number' is not assignable to type 'string'.\n\n",
+                "\u{1b}[7m1\u{1b}[0m let answer: string = 42;\n",
+                "\u{1b}[7m \u{1b}[0m \u{1b}[91m                     ~~\u{1b}[0m\n\n",
+            )
+        );
+    }
+
+    #[test]
+    fn diagnostics_use_ecmascript_line_breaks_and_utf16_columns() {
+        let source = "first\rsecond\r\n😀third\u{2028}fourth\u{2029}last";
+        let start = source.find("third").unwrap();
+        let diagnostic = Diagnostic {
+            file_name: Some("main.ts"),
+            source_text: Some(source),
+            range: Some(TextRange::new(
+                TextPos::new(u32::try_from(start).unwrap()),
+                TextPos::new(u32::try_from(start + "third".len()).unwrap()),
+            )),
+            code: Some(2304),
+            category: DiagnosticCategory::Error,
+            message: "Cannot find name 'third'.",
+        };
+
+        assert_eq!(
+            format_diagnostics(&[diagnostic], FormattingOptions::default()),
+            "main.ts(3,3): error TS2304: Cannot find name 'third'.\n"
+        );
+
+        let last_start = source.find("last").unwrap();
+        let last_diagnostic = Diagnostic {
+            range: Some(TextRange::new(
+                TextPos::new(u32::try_from(last_start).unwrap()),
+                TextPos::new(u32::try_from(last_start + "last".len()).unwrap()),
+            )),
+            message: "Cannot find name 'last'.",
+            ..diagnostic
+        };
+        assert_eq!(
+            format_diagnostics(&[last_diagnostic], FormattingOptions::default()),
+            "main.ts(5,1): error TS2304: Cannot find name 'last'.\n"
+        );
+    }
+
+    #[test]
+    fn pretty_diagnostics_abbreviate_spans_over_five_lines() {
+        let source = "one\ntwo\nthree\nfour\nfive\nsix\nseven";
+        let diagnostic = Diagnostic {
+            file_name: Some("main.ts"),
+            source_text: Some(source),
+            range: Some(TextRange::new(TextPos::new(1), TextPos::new(30))),
+            code: Some(1005),
+            category: DiagnosticCategory::Error,
+            message: "Expected token.",
+        };
+        let formatted = format_diagnostics(
+            &[diagnostic],
+            FormattingOptions {
+                pretty: true,
+                ..FormattingOptions::default()
+            },
+        );
+
+        assert!(formatted.contains("\u{1b}[7m  1\u{1b}[0m one"));
+        assert!(formatted.contains("\u{1b}[7m  2\u{1b}[0m two"));
+        assert!(formatted.contains("\u{1b}[7m...\u{1b}[0m"));
+        assert!(!formatted.contains("three"));
+        assert!(!formatted.contains("four"));
+        assert!(formatted.contains("\u{1b}[7m  6\u{1b}[0m six"));
+        assert!(formatted.contains("\u{1b}[7m  7\u{1b}[0m seven"));
+    }
+
+    #[test]
+    fn pretty_diagnostics_do_not_render_binary_file_contents() {
+        let diagnostic = Diagnostic {
+            file_name: Some("main.ts"),
+            source_text: Some("binary data"),
+            range: Some(TextRange::new(TextPos::new(0), TextPos::new(6))),
+            code: Some(1490),
+            category: DiagnosticCategory::Error,
+            message: "File appears to be binary.",
+        };
+        let formatted = format_diagnostics(
+            &[diagnostic],
+            FormattingOptions {
+                pretty: true,
+                ..FormattingOptions::default()
+            },
+        );
+
+        assert!(!formatted.contains("binary data"));
+        assert!(formatted.ends_with("File appears to be binary.\n"));
+    }
+
+    #[test]
+    fn pretty_diagnostics_mark_zero_length_ranges() {
+        let diagnostic = Diagnostic {
+            file_name: Some("main.ts"),
+            source_text: Some("value"),
+            range: Some(TextRange::new(TextPos::new(2), TextPos::new(2))),
+            code: Some(1005),
+            category: DiagnosticCategory::Error,
+            message: "Expected token.",
+        };
+        let formatted = format_diagnostics(
+            &[diagnostic],
+            FormattingOptions {
+                pretty: true,
+                ..FormattingOptions::default()
+            },
+        );
+
+        assert!(formatted.contains("\u{1b}[91m  ~\u{1b}[0m"));
     }
 }
