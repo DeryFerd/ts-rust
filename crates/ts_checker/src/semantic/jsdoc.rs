@@ -32,6 +32,10 @@ pub enum JsDocTagKind {
     Return,
     Typedef,
     Callback,
+    Property,
+    Template,
+    Satisfies,
+    This,
     Augments,
 }
 
@@ -59,9 +63,16 @@ pub enum JsDocIntrinsicType {
 pub enum JsDocType {
     Intrinsic(JsDocIntrinsicType),
     Named(String),
+    BoundTypeParameter(TypeId),
+    GenericReference { name: String, arguments: Vec<Self> },
+    Import(JsDocImportType),
     StringLiteral(String),
     NumberLiteral(String),
     BigIntLiteral(String),
+    ObjectLiteral(Vec<JsDocObjectProperty>),
+    Function(Box<JsDocFunctionType>),
+    IndexedAccess { object: Box<Self>, index: Box<Self> },
+    KeyOf(Box<Self>),
     Parenthesized(Box<Self>),
     Nullable(Box<Self>),
     NonNullable(Box<Self>),
@@ -71,6 +82,118 @@ pub enum JsDocType {
     ReadonlyArray(Box<Self>),
     Union(Vec<Self>),
     Unsupported(SyntaxKind),
+}
+
+/// One property in an inline `JSDoc` object type.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JsDocObjectProperty {
+    name: String,
+    type_: JsDocType,
+    optional: bool,
+    readonly: bool,
+}
+
+impl JsDocObjectProperty {
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[must_use]
+    pub const fn type_(&self) -> &JsDocType {
+        &self.type_
+    }
+
+    #[must_use]
+    pub const fn is_optional(&self) -> bool {
+        self.optional
+    }
+
+    #[must_use]
+    pub const fn is_readonly(&self) -> bool {
+        self.readonly
+    }
+}
+
+/// One parameter in a `JSDoc` function type expression.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JsDocFunctionParameter {
+    name: String,
+    type_: Option<JsDocType>,
+    optional: bool,
+    rest: bool,
+}
+
+impl JsDocFunctionParameter {
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[must_use]
+    pub const fn type_(&self) -> Option<&JsDocType> {
+        self.type_.as_ref()
+    }
+
+    #[must_use]
+    pub const fn is_optional(&self) -> bool {
+        self.optional
+    }
+
+    #[must_use]
+    pub const fn is_rest(&self) -> bool {
+        self.rest
+    }
+}
+
+/// The structural contents of a `JSDoc` function type expression.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JsDocFunctionType {
+    parameters: Vec<JsDocFunctionParameter>,
+    return_type: JsDocType,
+}
+
+impl JsDocFunctionType {
+    #[must_use]
+    pub fn parameters(&self) -> &[JsDocFunctionParameter] {
+        &self.parameters
+    }
+
+    #[must_use]
+    pub const fn return_type(&self) -> &JsDocType {
+        &self.return_type
+    }
+}
+
+/// One `import("module").Name` reference retained for later module resolution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JsDocImportType {
+    specifier: String,
+    qualifier: Option<String>,
+    type_arguments: Vec<JsDocType>,
+    is_type_of: bool,
+}
+
+impl JsDocImportType {
+    #[must_use]
+    pub fn specifier(&self) -> &str {
+        &self.specifier
+    }
+
+    #[must_use]
+    pub fn qualifier(&self) -> Option<&str> {
+        self.qualifier.as_deref()
+    }
+
+    #[must_use]
+    pub fn type_arguments(&self) -> &[JsDocType] {
+        &self.type_arguments
+    }
+
+    #[must_use]
+    pub const fn is_type_of(&self) -> bool {
+        self.is_type_of
+    }
 }
 
 /// The original source text and exact UTF-8 range of one parsed type.
@@ -115,6 +238,30 @@ pub struct PlannedJsDocType {
     resolved_type: Option<Box<JsDocType>>,
 }
 
+/// A checked canonical type-parameter identity for one `@template` name.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JsDocTypeParameterBinding<'name> {
+    name: &'name str,
+    type_: TypeId,
+}
+
+impl<'name> JsDocTypeParameterBinding<'name> {
+    #[must_use]
+    pub const fn new(name: &'name str, type_: TypeId) -> Self {
+        Self { name, type_ }
+    }
+
+    #[must_use]
+    pub const fn name(self) -> &'name str {
+        self.name
+    }
+
+    #[must_use]
+    pub const fn type_(self) -> TypeId {
+        self.type_
+    }
+}
+
 impl PlannedJsDocType {
     #[must_use]
     pub const fn range(&self) -> TextRange {
@@ -150,6 +297,31 @@ impl<'source> JsDocTagName<'source> {
     }
 }
 
+/// One parsed `@template` parameter and its optional constraint or default.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JsDocTemplateParameter<'source> {
+    name: JsDocTagName<'source>,
+    constraint: Option<JsDocTypeExpression<'source>>,
+    default_type: Option<JsDocTypeExpression<'source>>,
+}
+
+impl<'source> JsDocTemplateParameter<'source> {
+    #[must_use]
+    pub const fn name(&self) -> JsDocTagName<'source> {
+        self.name
+    }
+
+    #[must_use]
+    pub const fn constraint(&self) -> Option<&JsDocTypeExpression<'source>> {
+        self.constraint.as_ref()
+    }
+
+    #[must_use]
+    pub const fn default_type(&self) -> Option<&JsDocTypeExpression<'source>> {
+        self.default_type.as_ref()
+    }
+}
+
 /// One supported `JSDoc` tag and its exact source-owned arguments.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct JsDocTag<'source> {
@@ -158,6 +330,7 @@ pub struct JsDocTag<'source> {
     range: TextRange,
     name: Option<JsDocTagName<'source>>,
     type_expression: Option<JsDocTypeExpression<'source>>,
+    template_parameters: Vec<JsDocTemplateParameter<'source>>,
     name_first: bool,
     optional: bool,
 }
@@ -186,6 +359,11 @@ impl<'source> JsDocTag<'source> {
     #[must_use]
     pub const fn type_expression(&self) -> Option<&JsDocTypeExpression<'source>> {
         self.type_expression.as_ref()
+    }
+
+    #[must_use]
+    pub fn template_parameters(&self) -> &[JsDocTemplateParameter<'source>] {
+        &self.template_parameters
     }
 
     #[must_use]
@@ -283,12 +461,95 @@ impl PlannedJsDocParameter {
     }
 }
 
+/// One source-owned `@template` parameter.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlannedJsDocTemplateParameter {
+    name: String,
+    range: TextRange,
+    constraint: Option<PlannedJsDocType>,
+    default_type: Option<PlannedJsDocType>,
+}
+
+impl PlannedJsDocTemplateParameter {
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[must_use]
+    pub const fn range(&self) -> TextRange {
+        self.range
+    }
+
+    #[must_use]
+    pub const fn constraint(&self) -> Option<&PlannedJsDocType> {
+        self.constraint.as_ref()
+    }
+
+    #[must_use]
+    pub const fn default_type(&self) -> Option<&PlannedJsDocType> {
+        self.default_type.as_ref()
+    }
+}
+
+/// One source-owned `@property` declaration in an object typedef.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlannedJsDocProperty {
+    name: String,
+    range: TextRange,
+    type_: Option<PlannedJsDocType>,
+    optional: bool,
+}
+
+impl PlannedJsDocProperty {
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[must_use]
+    pub const fn range(&self) -> TextRange {
+        self.range
+    }
+
+    #[must_use]
+    pub const fn type_(&self) -> Option<&PlannedJsDocType> {
+        self.type_.as_ref()
+    }
+
+    #[must_use]
+    pub const fn is_optional(&self) -> bool {
+        self.optional
+    }
+}
+
+/// A source-owned `@satisfies` annotation and its exact diagnostic location.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlannedJsDocSatisfies {
+    range: TextRange,
+    type_: PlannedJsDocType,
+}
+
+impl PlannedJsDocSatisfies {
+    #[must_use]
+    pub const fn range(&self) -> TextRange {
+        self.range
+    }
+
+    #[must_use]
+    pub const fn type_(&self) -> &PlannedJsDocType {
+        &self.type_
+    }
+}
+
 /// A `JSDoc` typedef retained before its synthetic binder declaration exists.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlannedJsDocTypedef {
     name: String,
     range: TextRange,
     type_: Option<PlannedJsDocType>,
+    properties: Vec<PlannedJsDocProperty>,
+    template_parameters: Vec<PlannedJsDocTemplateParameter>,
 }
 
 /// One synthetic `JSDoc` callback signature, separate from its host function.
@@ -298,6 +559,8 @@ pub struct PlannedJsDocCallback {
     range: TextRange,
     parameters: Vec<PlannedJsDocParameter>,
     return_type: Option<PlannedJsDocType>,
+    this_type: Option<PlannedJsDocType>,
+    template_parameters: Vec<PlannedJsDocTemplateParameter>,
 }
 
 impl PlannedJsDocCallback {
@@ -320,6 +583,16 @@ impl PlannedJsDocCallback {
     pub const fn return_type(&self) -> Option<&PlannedJsDocType> {
         self.return_type.as_ref()
     }
+
+    #[must_use]
+    pub const fn this_type(&self) -> Option<&PlannedJsDocType> {
+        self.this_type.as_ref()
+    }
+
+    #[must_use]
+    pub fn template_parameters(&self) -> &[PlannedJsDocTemplateParameter] {
+        &self.template_parameters
+    }
 }
 
 impl PlannedJsDocTypedef {
@@ -337,6 +610,16 @@ impl PlannedJsDocTypedef {
     pub const fn type_(&self) -> Option<&PlannedJsDocType> {
         self.type_.as_ref()
     }
+
+    #[must_use]
+    pub fn properties(&self) -> &[PlannedJsDocProperty] {
+        &self.properties
+    }
+
+    #[must_use]
+    pub fn template_parameters(&self) -> &[PlannedJsDocTemplateParameter] {
+        &self.template_parameters
+    }
 }
 
 /// Source-owned `JSDoc` annotations for one JavaScript declaration.
@@ -348,6 +631,9 @@ pub struct PlannedJavaScriptDeclaration {
     return_type: Option<PlannedJsDocType>,
     typedefs: Vec<PlannedJsDocTypedef>,
     callbacks: Vec<PlannedJsDocCallback>,
+    template_parameters: Vec<PlannedJsDocTemplateParameter>,
+    satisfies: Option<PlannedJsDocSatisfies>,
+    this_type: Option<PlannedJsDocType>,
     augments_type: Option<PlannedJsDocType>,
 }
 
@@ -387,6 +673,21 @@ impl PlannedJavaScriptDeclaration {
     #[must_use]
     pub fn callbacks(&self) -> &[PlannedJsDocCallback] {
         &self.callbacks
+    }
+
+    #[must_use]
+    pub fn template_parameters(&self) -> &[PlannedJsDocTemplateParameter] {
+        &self.template_parameters
+    }
+
+    #[must_use]
+    pub const fn satisfies(&self) -> Option<&PlannedJsDocSatisfies> {
+        self.satisfies.as_ref()
+    }
+
+    #[must_use]
+    pub const fn this_type(&self) -> Option<&PlannedJsDocType> {
+        self.this_type.as_ref()
     }
 
     #[must_use]
@@ -820,44 +1121,16 @@ pub fn plan_javascript_source_jsdoc(
                     return_type: None,
                     typedefs: Vec::new(),
                     callbacks: Vec::new(),
+                    template_parameters: Vec::new(),
+                    satisfies: None,
+                    this_type: None,
                     augments_type: None,
                 };
                 for comment in comments {
                     for diagnostic in comment.diagnostics() {
                         diagnostics.push(canonical_parser_diagnostic(source, diagnostic)?);
                     }
-                    let mut active_callback = None;
-                    for tag in comment.tags() {
-                        match (active_callback, tag.kind()) {
-                            (Some(index), JsDocTagKind::Parameter | JsDocTagKind::Return) => {
-                                let is_return = tag.kind() == JsDocTagKind::Return;
-                                apply_callback_signature_tag(&mut planned, index, tag);
-                                if is_return {
-                                    active_callback = None;
-                                }
-                            }
-                            (_, JsDocTagKind::Callback) => {
-                                apply_jsdoc_tag(
-                                    arena,
-                                    source,
-                                    &mut planned,
-                                    tag,
-                                    &mut diagnostics,
-                                )?;
-                                active_callback = planned.callbacks.len().checked_sub(1);
-                            }
-                            _ => {
-                                active_callback = None;
-                                apply_jsdoc_tag(
-                                    arena,
-                                    source,
-                                    &mut planned,
-                                    tag,
-                                    &mut diagnostics,
-                                )?;
-                            }
-                        }
-                    }
+                    apply_comment_tags(arena, source, &mut planned, &comment, &mut diagnostics)?;
                 }
                 append_unmatched_parameter_diagnostics(arena, source, &planned, &mut diagnostics)?;
                 declarations.push(planned);
@@ -1112,9 +1385,16 @@ fn substitute_local_typedefs(
             changed.then_some(JsDocType::Union(resolved))
         }
         JsDocType::Intrinsic(_)
+        | JsDocType::BoundTypeParameter(_)
+        | JsDocType::GenericReference { .. }
+        | JsDocType::Import(_)
         | JsDocType::StringLiteral(_)
         | JsDocType::NumberLiteral(_)
         | JsDocType::BigIntLiteral(_)
+        | JsDocType::ObjectLiteral(_)
+        | JsDocType::Function(_)
+        | JsDocType::IndexedAccess { .. }
+        | JsDocType::KeyOf(_)
         | JsDocType::Unsupported(_) => None,
     }
 }
@@ -1182,6 +1462,126 @@ fn javascript_jsdoc_owner(arena: &NodeArena, node: NodeRef) -> Result<NodeRef, J
     Ok(NodeRef::new(node.arena, node.file, first))
 }
 
+#[derive(Clone, Copy)]
+enum ActiveJsDocDefinition {
+    Typedef(usize),
+    Callback(usize),
+}
+
+fn apply_comment_tags(
+    arena: &NodeArena,
+    source: NodeRef,
+    declaration: &mut PlannedJavaScriptDeclaration,
+    comment: &ParsedJsDocComment<'_>,
+    diagnostics: &mut Vec<CanonicalCheckerDiagnostic>,
+) -> Result<(), JsDocCommentError> {
+    let has_unhosted_definition = comment
+        .tags()
+        .iter()
+        .any(|tag| matches!(tag.kind(), JsDocTagKind::Typedef | JsDocTagKind::Callback));
+    let mut pending_templates = Vec::new();
+    let mut active = None;
+    let mut saw_definition = false;
+
+    for tag in comment.tags() {
+        match (active, tag.kind()) {
+            (_, JsDocTagKind::Template) => {
+                if saw_definition {
+                    diagnostics.push(canonical_jsdoc_diagnostic(
+                        source,
+                        jsdoc_tag_name_range(tag)?,
+                        8039,
+                        std::iter::empty::<String>(),
+                    )?);
+                } else if has_unhosted_definition {
+                    pending_templates.extend(planned_template_parameters(tag));
+                } else {
+                    declaration
+                        .template_parameters
+                        .extend(planned_template_parameters(tag));
+                }
+            }
+            (_, JsDocTagKind::Callback) => {
+                let before = declaration.callbacks.len();
+                apply_jsdoc_tag(arena, source, declaration, tag, diagnostics)?;
+                if declaration.callbacks.len() != before {
+                    let callback = &mut declaration.callbacks[before];
+                    callback
+                        .template_parameters
+                        .extend(pending_templates.iter().cloned());
+                    active = Some(ActiveJsDocDefinition::Callback(before));
+                    saw_definition = true;
+                }
+            }
+            (_, JsDocTagKind::Typedef) => {
+                let before = declaration.typedefs.len();
+                apply_jsdoc_tag(arena, source, declaration, tag, diagnostics)?;
+                if declaration.typedefs.len() != before {
+                    let alias = &mut declaration.typedefs[before];
+                    alias
+                        .template_parameters
+                        .extend(pending_templates.iter().cloned());
+                    active = Some(ActiveJsDocDefinition::Typedef(before));
+                    saw_definition = true;
+                }
+            }
+            (
+                Some(ActiveJsDocDefinition::Callback(index)),
+                JsDocTagKind::Parameter | JsDocTagKind::Return | JsDocTagKind::This,
+            ) => {
+                let is_return = tag.kind() == JsDocTagKind::Return;
+                apply_callback_signature_tag(declaration, index, tag);
+                if is_return {
+                    active = None;
+                }
+            }
+            (Some(ActiveJsDocDefinition::Typedef(index)), JsDocTagKind::Property) => {
+                apply_typedef_property_tag(declaration, index, tag);
+            }
+            (Some(ActiveJsDocDefinition::Typedef(index)), JsDocTagKind::Type) => {
+                let alias = &mut declaration.typedefs[index];
+                if alias.type_.is_some() {
+                    diagnostics.push(canonical_jsdoc_diagnostic(
+                        source,
+                        jsdoc_tag_name_range(tag)?,
+                        8033,
+                        std::iter::empty::<String>(),
+                    )?);
+                } else {
+                    alias.type_ = tag.type_expression().map(JsDocTypeExpression::planned);
+                }
+            }
+            _ => {
+                active = None;
+                apply_jsdoc_tag(arena, source, declaration, tag, diagnostics)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn planned_template_parameters(tag: &JsDocTag<'_>) -> Vec<PlannedJsDocTemplateParameter> {
+    tag.template_parameters()
+        .iter()
+        .map(|parameter| PlannedJsDocTemplateParameter {
+            name: parameter.name().text().to_owned(),
+            range: parameter.name().range(),
+            constraint: parameter.constraint().map(JsDocTypeExpression::planned),
+            default_type: parameter.default_type().map(JsDocTypeExpression::planned),
+        })
+        .collect()
+}
+
+fn jsdoc_tag_name_range(tag: &JsDocTag<'_>) -> Result<TextRange, JsDocCommentError> {
+    let start = (tag.range().start.get() as usize)
+        .checked_add(1)
+        .ok_or(JsDocCommentError::SourcePositionOverflow)?;
+    let end = start
+        .checked_add(tag.tag_name().len())
+        .ok_or(JsDocCommentError::SourcePositionOverflow)?;
+    checked_range(start, end)
+}
+
 fn apply_jsdoc_tag(
     arena: &NodeArena,
     source: NodeRef,
@@ -1223,6 +1623,8 @@ fn apply_jsdoc_tag(
                     name: name.text().to_owned(),
                     range: name.range(),
                     type_: tag.type_expression().map(JsDocTypeExpression::planned),
+                    properties: Vec::new(),
+                    template_parameters: Vec::new(),
                 });
             }
         }
@@ -1233,8 +1635,22 @@ fn apply_jsdoc_tag(
                     range: name.range(),
                     parameters: Vec::new(),
                     return_type: None,
+                    this_type: None,
+                    template_parameters: Vec::new(),
                 });
             }
+        }
+        JsDocTagKind::Property | JsDocTagKind::Template => {}
+        JsDocTagKind::Satisfies => {
+            if let Some(annotation) = tag.type_expression() {
+                declaration.satisfies = Some(PlannedJsDocSatisfies {
+                    range: jsdoc_tag_name_range(tag)?,
+                    type_: annotation.planned(),
+                });
+            }
+        }
+        JsDocTagKind::This => {
+            declaration.this_type = tag.type_expression().map(JsDocTypeExpression::planned);
         }
         JsDocTagKind::Augments => {
             if let Some(annotation) = tag.type_expression() {
@@ -1269,8 +1685,30 @@ fn apply_callback_signature_tag(
         JsDocTagKind::Return => {
             callback.return_type = tag.type_expression().map(JsDocTypeExpression::planned);
         }
+        JsDocTagKind::This => {
+            callback.this_type = tag.type_expression().map(JsDocTypeExpression::planned);
+        }
         _ => {}
     }
+}
+
+fn apply_typedef_property_tag(
+    declaration: &mut PlannedJavaScriptDeclaration,
+    index: usize,
+    tag: &JsDocTag<'_>,
+) {
+    let Some(alias) = declaration.typedefs.get_mut(index) else {
+        return;
+    };
+    let Some(name) = tag.name() else {
+        return;
+    };
+    alias.properties.push(PlannedJsDocProperty {
+        name: name.text().to_owned(),
+        range: name.range(),
+        type_: tag.type_expression().map(JsDocTypeExpression::planned),
+        optional: tag.is_optional(),
+    });
 }
 
 fn append_unmatched_parameter_diagnostics(
@@ -1519,9 +1957,13 @@ fn tag_kind(name: &str) -> Option<JsDocTagKind> {
     match name {
         "type" => Some(JsDocTagKind::Type),
         "param" | "arg" | "argument" => Some(JsDocTagKind::Parameter),
+        "property" | "prop" => Some(JsDocTagKind::Property),
         "return" | "returns" => Some(JsDocTagKind::Return),
         "typedef" => Some(JsDocTagKind::Typedef),
         "callback" => Some(JsDocTagKind::Callback),
+        "template" => Some(JsDocTagKind::Template),
+        "satisfies" => Some(JsDocTagKind::Satisfies),
+        "this" => Some(JsDocTagKind::This),
         "extends" | "augments" => Some(JsDocTagKind::Augments),
         _ => None,
     }
@@ -1550,7 +1992,7 @@ fn recover_keyword_tags<'source>(comment: &'source str, tags: &mut Vec<ScannedTa
         let Some(name) = rest.get(..name_length) else {
             continue;
         };
-        if !matches!(name, "type" | "return" | "extends")
+        if !matches!(name, "type" | "return" | "extends" | "satisfies" | "this")
             || tags.iter().any(|existing| existing.start == start)
         {
             continue;
@@ -1607,6 +2049,7 @@ fn parse_supported_tag<'source>(
         .ok_or(JsDocCommentError::SourcePositionOverflow)?;
     let mut cursor = skip_doc_whitespace(source, body_start, absolute_end);
     let mut type_expression = None;
+    let mut template_parameters = Vec::new();
     let mut name = None;
     let mut name_first = false;
     let mut bracketed = false;
@@ -1617,20 +2060,41 @@ fn parse_supported_tag<'source>(
         cursor = skip_doc_whitespace(source, next, absolute_end);
     } else if matches!(
         kind,
-        JsDocTagKind::Parameter | JsDocTagKind::Typedef | JsDocTagKind::Callback
+        JsDocTagKind::Parameter
+            | JsDocTagKind::Property
+            | JsDocTagKind::Typedef
+            | JsDocTagKind::Callback
+            | JsDocTagKind::Template
     ) {
-        name_first = kind == JsDocTagKind::Parameter;
+        name_first = matches!(kind, JsDocTagKind::Parameter | JsDocTagKind::Property);
     } else if cursor < absolute_end {
         let type_end = unbraced_type_end(source, cursor, absolute_end);
         type_expression = parse_type_expression(source, cursor, type_end, diagnostics)?;
         cursor = skip_doc_whitespace(source, type_end, absolute_end);
-    } else if matches!(kind, JsDocTagKind::Type | JsDocTagKind::Augments) {
+    } else if matches!(
+        kind,
+        JsDocTagKind::Type | JsDocTagKind::Augments | JsDocTagKind::Satisfies | JsDocTagKind::This
+    ) {
         diagnostics.push(type_expected_diagnostic(source, cursor, absolute_end)?);
     }
 
-    if matches!(
+    if kind == JsDocTagKind::Template {
+        template_parameters = parse_template_parameters(
+            source,
+            cursor,
+            absolute_end,
+            type_expression.as_ref(),
+            diagnostics,
+        )?;
+        name = template_parameters
+            .first()
+            .map(JsDocTemplateParameter::name);
+    } else if matches!(
         kind,
-        JsDocTagKind::Parameter | JsDocTagKind::Typedef | JsDocTagKind::Callback
+        JsDocTagKind::Parameter
+            | JsDocTagKind::Property
+            | JsDocTagKind::Typedef
+            | JsDocTagKind::Callback
     ) {
         let (parsed_name, next, optional) = parse_tag_name(source, cursor, absolute_end)?;
         name = parsed_name;
@@ -1652,6 +2116,7 @@ fn parse_supported_tag<'source>(
         range: checked_range(absolute_start, absolute_end)?,
         name,
         type_expression,
+        template_parameters,
         name_first,
         optional,
     })
@@ -1748,6 +2213,130 @@ fn parse_tag_name(
         name_end
     };
     Ok((name, next, bracketed))
+}
+
+fn parse_template_parameters<'source>(
+    source: &'source str,
+    mut cursor: usize,
+    end: usize,
+    constraint: Option<&JsDocTypeExpression<'source>>,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Result<Vec<JsDocTemplateParameter<'source>>, JsDocCommentError> {
+    let mut parameters = Vec::new();
+    loop {
+        cursor = skip_doc_whitespace(source, cursor, end);
+        if cursor >= end {
+            break;
+        }
+        let bracketed = source.as_bytes().get(cursor) == Some(&b'[');
+        let content_start = if bracketed {
+            skip_doc_whitespace(source, cursor + 1, end)
+        } else {
+            cursor
+        };
+        let mut name_start = content_start;
+        if source
+            .get(name_start..end)
+            .is_some_and(|remaining| remaining.starts_with("const "))
+        {
+            name_start = skip_doc_whitespace(source, name_start + "const".len(), end);
+        }
+        let name_end = template_name_end(source, name_start, end);
+        if name_start == name_end {
+            diagnostics.push(expected_diagnostic(source, name_start, end, 1003, &[])?);
+            break;
+        }
+        let name = JsDocTagName {
+            text: source
+                .get(name_start..name_end)
+                .ok_or(JsDocCommentError::SourcePositionOverflow)?,
+            range: checked_range(name_start, name_end)?,
+        };
+        let mut default_type = None;
+        cursor = name_end;
+        if bracketed {
+            cursor = skip_doc_whitespace(source, cursor, end);
+            if source.as_bytes().get(cursor) != Some(&b'=') {
+                diagnostics.push(expected_token_diagnostic(source, cursor, end, "=")?);
+                break;
+            }
+            let default_start = skip_doc_whitespace(source, cursor + 1, end);
+            let Some(close) =
+                matching_template_bracket(source, content_start.saturating_sub(1), end)
+            else {
+                diagnostics.push(expected_token_diagnostic(source, end, end, "]")?);
+                break;
+            };
+            let (default_start, default_end) = trimmed_range(source, default_start, close);
+            if default_start == default_end {
+                diagnostics.push(type_expected_diagnostic(source, close, end)?);
+                break;
+            }
+            default_type = parse_type_expression(source, default_start, default_end, diagnostics)?;
+            cursor = close + 1;
+        }
+        parameters.push(JsDocTemplateParameter {
+            name,
+            constraint: (parameters.is_empty())
+                .then(|| constraint.cloned())
+                .flatten(),
+            default_type,
+        });
+        let next = skip_doc_whitespace(source, cursor, end);
+        if source.as_bytes().get(next) != Some(&b',') {
+            break;
+        }
+        cursor = next + 1;
+    }
+    Ok(parameters)
+}
+
+fn template_name_end(source: &str, start: usize, end: usize) -> usize {
+    let Some(remaining) = source.get(start..end) else {
+        return start;
+    };
+    let mut result = start;
+    for character in remaining.chars() {
+        if !character.is_alphanumeric() && !matches!(character, '_' | '$') {
+            break;
+        }
+        result += character.len_utf8();
+    }
+    result
+}
+
+fn matching_template_bracket(source: &str, open: usize, end: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    if bytes.get(open) != Some(&b'[') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    for (offset, byte) in bytes.get(open..end)?.iter().enumerate() {
+        if let Some(current) = quote {
+            if escaped {
+                escaped = false;
+            } else if *byte == b'\\' {
+                escaped = true;
+            } else if *byte == current {
+                quote = None;
+            }
+            continue;
+        }
+        match *byte {
+            b'\'' | b'"' | b'`' => quote = Some(*byte),
+            b'[' => depth = depth.checked_add(1)?,
+            b']' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(open + offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn parse_type_expression<'source>(
@@ -1981,6 +2570,31 @@ fn resolve_intrinsic_type(
             name: name.clone(),
             range,
         }),
+        JsDocType::BoundTypeParameter(type_) => Ok(*type_),
+        JsDocType::GenericReference { .. } => Err(JsDocTypeResolutionError::UnsupportedType {
+            kind: SyntaxKind::TypeReference,
+            range,
+        }),
+        JsDocType::Import(_) => Err(JsDocTypeResolutionError::UnsupportedType {
+            kind: SyntaxKind::ImportType,
+            range,
+        }),
+        JsDocType::ObjectLiteral(_) => Err(JsDocTypeResolutionError::UnsupportedType {
+            kind: SyntaxKind::TypeLiteral,
+            range,
+        }),
+        JsDocType::Function(_) => Err(JsDocTypeResolutionError::UnsupportedType {
+            kind: SyntaxKind::FunctionType,
+            range,
+        }),
+        JsDocType::IndexedAccess { .. } => Err(JsDocTypeResolutionError::UnsupportedType {
+            kind: SyntaxKind::IndexedAccessType,
+            range,
+        }),
+        JsDocType::KeyOf(_) => Err(JsDocTypeResolutionError::UnsupportedType {
+            kind: SyntaxKind::TypeOperator,
+            range,
+        }),
         JsDocType::StringLiteral(_) | JsDocType::NumberLiteral(_) | JsDocType::BigIntLiteral(_) => {
             Err(JsDocTypeResolutionError::UnsupportedType {
                 kind: SyntaxKind::LiteralType,
@@ -2031,8 +2645,42 @@ fn validate_resolvable_type(
     range: TextRange,
 ) -> Result<(), JsDocTypeResolutionError> {
     match type_ {
-        JsDocType::Intrinsic(_) => Ok(()),
-        JsDocType::StringLiteral(_) => Ok(()),
+        JsDocType::Intrinsic(_) | JsDocType::StringLiteral(_) => Ok(()),
+        JsDocType::BoundTypeParameter(type_) => {
+            if store.type_payload(*type_).is_some_and(|record| {
+                record
+                    .flags()
+                    .contains(super::types::TypeFlags::TYPE_PARAMETER)
+            }) {
+                Ok(())
+            } else {
+                Err(JsDocTypeResolutionError::InvalidGlobalType(*type_))
+            }
+        }
+        JsDocType::GenericReference { .. } => Err(JsDocTypeResolutionError::UnsupportedType {
+            kind: SyntaxKind::TypeReference,
+            range,
+        }),
+        JsDocType::Import(_) => Err(JsDocTypeResolutionError::UnsupportedType {
+            kind: SyntaxKind::ImportType,
+            range,
+        }),
+        JsDocType::ObjectLiteral(_) => Err(JsDocTypeResolutionError::UnsupportedType {
+            kind: SyntaxKind::TypeLiteral,
+            range,
+        }),
+        JsDocType::Function(_) => Err(JsDocTypeResolutionError::UnsupportedType {
+            kind: SyntaxKind::FunctionType,
+            range,
+        }),
+        JsDocType::IndexedAccess { .. } => Err(JsDocTypeResolutionError::UnsupportedType {
+            kind: SyntaxKind::IndexedAccessType,
+            range,
+        }),
+        JsDocType::KeyOf(_) => Err(JsDocTypeResolutionError::UnsupportedType {
+            kind: SyntaxKind::TypeOperator,
+            range,
+        }),
         JsDocType::NumberLiteral(value) => {
             let number = ts_jsnum::from_string(value);
             if number.is_nan() {
@@ -2094,6 +2742,31 @@ fn resolve_complete_type(
 ) -> Result<TypeId, JsDocTypeResolutionError> {
     match type_ {
         JsDocType::Intrinsic(_) => resolve_intrinsic_type(store, options, type_, range),
+        JsDocType::BoundTypeParameter(type_) => Ok(*type_),
+        JsDocType::GenericReference { .. } => Err(JsDocTypeResolutionError::UnsupportedType {
+            kind: SyntaxKind::TypeReference,
+            range,
+        }),
+        JsDocType::Import(_) => Err(JsDocTypeResolutionError::UnsupportedType {
+            kind: SyntaxKind::ImportType,
+            range,
+        }),
+        JsDocType::ObjectLiteral(_) => Err(JsDocTypeResolutionError::UnsupportedType {
+            kind: SyntaxKind::TypeLiteral,
+            range,
+        }),
+        JsDocType::Function(_) => Err(JsDocTypeResolutionError::UnsupportedType {
+            kind: SyntaxKind::FunctionType,
+            range,
+        }),
+        JsDocType::IndexedAccess { .. } => Err(JsDocTypeResolutionError::UnsupportedType {
+            kind: SyntaxKind::IndexedAccessType,
+            range,
+        }),
+        JsDocType::KeyOf(_) => Err(JsDocTypeResolutionError::UnsupportedType {
+            kind: SyntaxKind::TypeOperator,
+            range,
+        }),
         JsDocType::StringLiteral(value) => store
             .regular_string_literal_type(value.clone())
             .map_err(|_| JsDocTypeResolutionError::LiteralConstruction(range)),
