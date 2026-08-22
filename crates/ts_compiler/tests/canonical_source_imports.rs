@@ -268,19 +268,10 @@ fn canonical_program_fails_closed_on_declaration_import_near_misses() {
             "import { value } from './target'; const copy = value;",
         ),
         (
-            "namespace export",
+            "type-only namespace import",
             "target.d.ts",
-            "export declare namespace value {}",
-            "import { value } from './target'; const copy = value;",
-        ),
-        (
-            "generic type export",
-            "target.d.ts",
-            "export interface Model<T> { value: T; }",
-            concat!(
-                "import type { Model } from './target'; ",
-                "const model: Model = { value: 1 };",
-            ),
+            "export declare const value: number;",
+            "import type * as value from './target'; const copy = value;",
         ),
     ] {
         let fs = MemoryFileSystem::new(true);
@@ -299,6 +290,49 @@ fn canonical_program_fails_closed_on_declaration_import_near_misses() {
         };
         assert!(error.is_unsupported_boundary(), "{case}: {error:?}");
     }
+}
+
+#[test]
+fn canonical_program_reports_missing_imported_interface_type_arguments() {
+    let fs = MemoryFileSystem::new(true);
+    fs.write_file(
+        "/project/target.d.ts",
+        "export interface Model<T> { value: T; }",
+    )
+    .unwrap();
+    fs.write_file(
+        "/project/importer.ts",
+        "import type { Model } from './target'; const model: Model = { value: 1 };",
+    )
+    .unwrap();
+
+    let program = Program::try_new_with_canonical_checker(
+        &fs,
+        "/project",
+        &["importer.ts".to_owned()],
+        CompilerOptions {
+            module: ModuleKind::EsNext,
+            module_specified: true,
+            module_resolution: ModuleResolutionKind::Bundler,
+            lib: Some(vec!["es5".to_owned()]),
+            skip_lib_check: true,
+            strict: true,
+            ..CompilerOptions::default()
+        },
+    )
+    .unwrap_or_else(|error| panic!("generic declaration import failed: {error:?}"));
+
+    let [diagnostic] = program.diagnostics() else {
+        panic!(
+            "expected one generic arity diagnostic: {:?}",
+            program.diagnostics()
+        );
+    };
+    assert_eq!(
+        diagnostic.file_name.as_deref(),
+        Some("/project/importer.ts")
+    );
+    assert_eq!(diagnostic.code, Some(2314));
 }
 
 #[test]

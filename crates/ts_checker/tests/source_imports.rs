@@ -579,6 +579,37 @@ fn exported_simple_interfaces_work_target_first_and_importer_first() {
 }
 
 #[test]
+fn imported_generic_interfaces_report_missing_type_arguments() {
+    let importer = parse_source_file(concat!(
+        "import type { Model } from './target'; ",
+        "const model: Model = { value: 1 };",
+    ));
+    let target = parse_source_file("export interface Model<T> { value: T; }");
+    let importer_file = FileId::new(22);
+    let target_file = FileId::new(23);
+    let (mut context, _) = make_context(&importer, &target, importer_file, target_file);
+
+    context.check_source_file(importer_file).unwrap();
+
+    let [diagnostic] = context.diagnostics().as_slice() else {
+        panic!(
+            "expected one generic arity diagnostic: {:?}",
+            context.diagnostics()
+        );
+    };
+    assert_eq!(diagnostic.diagnostic.code(), 2314);
+    assert_eq!(
+        diagnostic.diagnostic.arguments,
+        ["Model<T>".to_owned(), "1".to_owned()]
+    );
+    assert!(source_is_checked(&context, importer_file));
+    assert!(!source_is_checked(&context, target_file));
+
+    context.check_source_file(importer_file).unwrap();
+    assert_eq!(context.diagnostics().as_slice().len(), 1);
+}
+
+#[test]
 fn imported_values_feed_property_and_call_expression_verticals() {
     let importer = parse_source_file(concat!(
         "import { object, take } from './target'; ",

@@ -4479,6 +4479,11 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 } else {
                     PlannedTypeReferenceArity::NotGeneric
                 }
+            } else if exact_import.is_some() && type_arguments.len() != local_count {
+                PlannedTypeReferenceArity::InvalidGeneric {
+                    minimum: local_count,
+                    maximum: local_count,
+                }
             } else {
                 if exact_import.is_some() {
                     return Err(type_node_unavailable(
