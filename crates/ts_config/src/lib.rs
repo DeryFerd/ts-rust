@@ -166,8 +166,14 @@ impl ProjectConfig {
             .and_then(JsonValue::as_array)
             .map(parse_references)
             .unwrap_or_default();
-        let include = raw.get("include").and_then(string_array);
-        let exclude = raw.get("exclude").and_then(string_array);
+        let include = raw
+            .get("include")
+            .and_then(string_array)
+            .map(|specs| valid_file_specs(specs, true));
+        let exclude = raw
+            .get("exclude")
+            .and_then(string_array)
+            .map(|specs| valid_file_specs(specs, false));
         let files = raw.get("files").and_then(string_array);
         let compiler_options = raw
             .get("compilerOptions")
@@ -378,6 +384,13 @@ fn validate_string_list_field(
             [name.to_owned(), "string".to_owned()],
         ));
     }
+    if matches!(name, "include" | "exclude") {
+        for value in values.iter().filter_map(JsonValue::as_str) {
+            if let Some(code) = invalid_file_spec_code(value, name == "include") {
+                diagnostics.push(diagnostic(file_name, 0, code, [value.to_owned()]));
+            }
+        }
+    }
 }
 
 /// Reads and parses a project configuration through the compiler VFS.
@@ -418,7 +431,8 @@ pub fn resolve_config_file(
     };
     let value = state
         .resolve(&normalize_path(file_name))
-        .map(substitute_config_dir_templates);
+        .map(substitute_config_dir_templates)
+        .map(apply_default_excludes);
     ParseResult {
         value,
         diagnostics: state.diagnostics,
@@ -644,6 +658,27 @@ fn substitute_config_dir_templates(mut config: ProjectConfig) -> ProjectConfig {
     config
 }
 
+fn apply_default_excludes(mut config: ProjectConfig) -> ProjectConfig {
+    if config.exclude.is_some() {
+        return config;
+    }
+
+    let mut exclusions = Vec::new();
+    for option in ["outDir", "declarationDir"] {
+        if let Some(path) = config.compiler_options.iter().find_map(|(name, value)| {
+            name.eq_ignore_ascii_case(option)
+                .then(|| value.as_str())
+                .flatten()
+        }) {
+            exclusions.push(path.to_owned());
+        }
+    }
+    if !exclusions.is_empty() {
+        config.exclude = Some(exclusions);
+    }
+    config
+}
+
 fn substitute_config_dir_template(value: &mut String, directory: &str) {
     if let Some(suffix) = config_dir_suffix(value) {
         let suffix = suffix.trim_start_matches(['/', '\\']);
@@ -684,6 +719,41 @@ fn string_array(value: &JsonValue) -> Option<Vec<String>> {
     })
 }
 
+fn valid_file_specs(specs: Vec<String>, disallow_trailing_recursion: bool) -> Vec<String> {
+    specs
+        .into_iter()
+        .filter(|spec| invalid_file_spec_code(spec, disallow_trailing_recursion).is_none())
+        .collect()
+}
+
+fn invalid_file_spec_code(spec: &str, disallow_trailing_recursion: bool) -> Option<u32> {
+    let normalized = spec.replace('\\', "/");
+    let without_trailing_slash = normalized.strip_suffix('/').unwrap_or(&normalized);
+    if disallow_trailing_recursion
+        && (without_trailing_slash == "**" || without_trailing_slash.ends_with("/**"))
+    {
+        return Some(5010);
+    }
+
+    let recursive_index = if normalized.starts_with("**/") {
+        Some(0)
+    } else {
+        normalized.find("/**/")
+    };
+    let parent_index = if normalized.ends_with("/..") {
+        Some(normalized.len())
+    } else {
+        normalized.rfind("/../")
+    };
+    if recursive_index
+        .zip(parent_index)
+        .is_some_and(|(recursive, parent)| parent > recursive)
+    {
+        return Some(5065);
+    }
+    None
+}
+
 fn parse_references(values: &[JsonValue]) -> Vec<ProjectReference> {
     values
         .iter()
@@ -706,14 +776,7 @@ fn resolve_extends_path(
     if !is_relative_path(extends_path) {
         return normalize_path(extends_path);
     }
-    let directory = config_path
-        .rsplit_once('/')
-        .map_or("", |(directory, _)| directory);
-    let candidate = if directory.is_empty() {
-        normalize_path(extends_path)
-    } else {
-        normalize_path(&format!("{directory}/{extends_path}"))
-    };
+    let candidate = resolve_relative(config_directory(config_path), extends_path);
     if file_system.file_exists(&candidate)
         || Path::new(&candidate)
             .extension()
@@ -750,11 +813,8 @@ fn resolve_base_config_path(
         if let Some(path) = existing_config_candidate(file_system, &candidate) {
             return Some(path);
         }
-        let parent = directory
-            .rsplit_once('/')
-            .map_or("", |(parent, _)| parent)
-            .to_owned();
-        if parent == directory || (parent.is_empty() && directory.is_empty()) {
+        let parent = parent_directory(&directory);
+        if parent == directory {
             break;
         }
         directory = parent;
@@ -799,14 +859,29 @@ fn existing_config_candidate(file_system: &dyn FileSystem, candidate: &str) -> O
 }
 
 fn config_directory(path: &str) -> &str {
-    path.rsplit_once('/').map_or("", |(directory, _)| directory)
+    match path.rsplit_once('/') {
+        Some(("", _)) if path.starts_with('/') => "/",
+        Some((directory, _)) => directory,
+        None => "",
+    }
 }
 
 fn resolve_relative(directory: &str, path: &str) -> String {
     if directory.is_empty() {
         normalize_path(path)
+    } else if directory == "/" {
+        normalize_path(&format!("/{path}"))
     } else {
         normalize_path(&format!("{directory}/{path}"))
+    }
+}
+
+fn parent_directory(directory: &str) -> String {
+    match directory.rsplit_once('/') {
+        Some(("", _)) if directory.starts_with('/') => "/".to_owned(),
+        Some((parent, _)) => parent.to_owned(),
+        None if directory.as_bytes().get(1) == Some(&b':') => directory.to_owned(),
+        None => String::new(),
     }
 }
 
@@ -985,6 +1060,38 @@ mod tests {
         assert_eq!(empty.diagnostics.len(), 1);
         assert_eq!(empty.diagnostics[0].code(), 18_051);
         assert!(empty.value.unwrap().extends.is_none());
+    }
+
+    #[test]
+    fn rejects_invalid_recursive_file_patterns_without_using_them() {
+        let result = parse_config_text(
+            "/repo/tsconfig.json",
+            r#"{
+                "include": ["src/**/*.ts", "generated/**", "**/../outside"],
+                "exclude": ["dist/**", "temp/**/../outside"]
+            }"#,
+        );
+
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(super::ConfigDiagnostic::code)
+                .collect::<Vec<_>>(),
+            [5010, 5065, 5065]
+        );
+        assert_eq!(
+            result.diagnostics[0].render(),
+            "File specification cannot end in a recursive directory wildcard ('**'): 'generated/**'."
+        );
+        assert_eq!(
+            result.diagnostics[1].render(),
+            "File specification cannot contain a parent directory ('..') that appears after a recursive directory wildcard ('**'): '**/../outside'."
+        );
+
+        let config = result.value.unwrap();
+        assert_eq!(config.include, Some(vec!["src/**/*.ts".into()]));
+        assert_eq!(config.exclude, Some(vec!["dist/**".into()]));
     }
 
     #[test]
@@ -1229,6 +1336,53 @@ mod tests {
     }
 
     #[test]
+    fn finds_package_configs_at_the_filesystem_root() {
+        let file_system = MemoryFileSystem::default();
+        file_system
+            .write_file(
+                "/node_modules/preset/tsconfig.json",
+                r#"{ "compilerOptions": { "strict": false } }"#,
+            )
+            .unwrap();
+        file_system
+            .write_file("/project/tsconfig.json", r#"{ "extends": "preset" }"#)
+            .unwrap();
+
+        let result = resolve_config_file(&file_system, "/project/tsconfig.json");
+        assert!(result.is_ok(), "{:?}", result.diagnostics);
+        assert_eq!(
+            result.value.unwrap().compiler_options.get("strict"),
+            Some(&JsonValue::Bool(false))
+        );
+    }
+
+    #[test]
+    fn resolves_relative_extends_from_a_root_level_config() {
+        let file_system = MemoryFileSystem::default();
+        file_system
+            .write_file(
+                "/base.json",
+                r#"{ "compilerOptions": { "declaration": true } }"#,
+            )
+            .unwrap();
+        file_system
+            .write_file("/tsconfig.json", r#"{ "extends": "./base" }"#)
+            .unwrap();
+
+        let parsed = parse_config_file(&file_system, "/tsconfig.json")
+            .value
+            .unwrap();
+        assert_eq!(parsed.resolved_extends(&file_system), ["/base.json"]);
+
+        let result = resolve_config_file(&file_system, "/tsconfig.json");
+        assert!(result.is_ok(), "{:?}", result.diagnostics);
+        assert_eq!(
+            result.value.unwrap().compiler_options.get("declaration"),
+            Some(&JsonValue::Bool(true))
+        );
+    }
+
+    #[test]
     fn resolves_emit_paths_relative_to_their_config() {
         let file_system = MemoryFileSystem::default();
         file_system
@@ -1326,6 +1480,62 @@ mod tests {
             Some(&JsonValue::Array(vec![JsonValue::String(
                 "/repo/config/src/*".into()
             )]))
+        );
+    }
+
+    #[test]
+    fn excludes_output_directories_unless_exclude_was_explicitly_set() {
+        let file_system = MemoryFileSystem::default();
+        file_system
+            .write_file(
+                "/repo/config/base.json",
+                r#"{
+                    "compilerOptions": {
+                        "outDir": "../dist",
+                        "declarationDir": "../types"
+                    }
+                }"#,
+            )
+            .unwrap();
+        file_system
+            .write_file(
+                "/repo/app/tsconfig.json",
+                r#"{ "extends": "../config/base.json" }"#,
+            )
+            .unwrap();
+
+        let inherited = resolve_config_file(&file_system, "/repo/app/tsconfig.json")
+            .value
+            .unwrap();
+        assert_eq!(
+            inherited.exclude,
+            Some(vec!["/repo/dist".into(), "/repo/types".into()])
+        );
+        assert!(!inherited.raw.contains_key("exclude"));
+
+        file_system
+            .write_file(
+                "/repo/app/tsconfig.json",
+                r#"{ "extends": "../config/base.json", "exclude": [] }"#,
+            )
+            .unwrap();
+        let explicit = resolve_config_file(&file_system, "/repo/app/tsconfig.json")
+            .value
+            .unwrap();
+        assert_eq!(explicit.exclude, Some(Vec::new()));
+
+        file_system
+            .write_file(
+                "/repo/app/tsconfig.json",
+                r#"{ "extends": "../config/base.json", "exclude": null }"#,
+            )
+            .unwrap();
+        let cleared = resolve_config_file(&file_system, "/repo/app/tsconfig.json")
+            .value
+            .unwrap();
+        assert_eq!(
+            cleared.exclude,
+            Some(vec!["/repo/dist".into(), "/repo/types".into()])
         );
     }
 

@@ -403,16 +403,44 @@ impl CompilerOptions {
     /// Returns the automatic JSX runtime module selected by the emit mode.
     #[must_use]
     pub fn jsx_runtime_module_specifier(&self) -> Option<String> {
+        self.jsx_runtime_module_specifier_for_source(None, None)
+    }
+
+    /// Returns the JSX runtime selected by compiler options and source pragmas.
+    #[must_use]
+    pub fn jsx_runtime_module_specifier_for_source(
+        &self,
+        runtime_pragma: Option<&str>,
+        import_source_pragma: Option<&str>,
+    ) -> Option<String> {
+        if runtime_pragma == Some("classic") {
+            return None;
+        }
         let runtime = match self.jsx {
-            JsxEmit::ReactJsx => "jsx-runtime",
             JsxEmit::ReactJsxDev => "jsx-dev-runtime",
-            JsxEmit::None | JsxEmit::Preserve | JsxEmit::React | JsxEmit::ReactNative => {
-                return None;
+            JsxEmit::ReactJsx => "jsx-runtime",
+            JsxEmit::None | JsxEmit::Preserve | JsxEmit::React | JsxEmit::ReactNative
+                if runtime_pragma == Some("automatic")
+                    || import_source_pragma.is_some()
+                    || self
+                        .jsx_import_source
+                        .as_deref()
+                        .is_some_and(|source| !source.is_empty()) =>
+            {
+                "jsx-runtime"
             }
+            _ => return None,
         };
         Some(format!(
             "{}/{runtime}",
-            self.jsx_import_source.as_deref().unwrap_or("react")
+            import_source_pragma
+                .filter(|source| !source.is_empty())
+                .or_else(|| {
+                    self.jsx_import_source
+                        .as_deref()
+                        .filter(|source| !source.is_empty())
+                })
+                .unwrap_or("react")
         ))
     }
 
@@ -2604,6 +2632,64 @@ mod tests {
         assert!(namespace.is_ok(), "{:?}", namespace.diagnostics);
         assert_eq!(namespace.options.jsx_factory_namespace(), "Preact");
         assert_eq!(CompilerOptions::default().jsx_factory_namespace(), "React");
+    }
+
+    #[test]
+    fn source_jsx_pragmas_override_configured_runtime_and_import_source() {
+        let classic =
+            parse_compiler_options(&object([("jsx", JsonValue::String("react".into()))])).options;
+        assert_eq!(
+            classic
+                .jsx_runtime_module_specifier_for_source(Some("automatic"), None)
+                .as_deref(),
+            Some("react/jsx-runtime")
+        );
+        assert_eq!(
+            classic
+                .jsx_runtime_module_specifier_for_source(None, Some("@emotion/react"))
+                .as_deref(),
+            Some("@emotion/react/jsx-runtime")
+        );
+
+        let automatic = parse_compiler_options(&object([
+            ("jsx", JsonValue::String("react-jsx".into())),
+            ("jsxImportSource", JsonValue::String("preact".into())),
+        ]))
+        .options;
+        assert!(
+            automatic
+                .jsx_runtime_module_specifier_for_source(Some("classic"), None)
+                .is_none()
+        );
+        assert_eq!(
+            automatic
+                .jsx_runtime_module_specifier_for_source(None, Some("solid-js"))
+                .as_deref(),
+            Some("solid-js/jsx-runtime")
+        );
+
+        let development =
+            parse_compiler_options(&object([("jsx", JsonValue::String("react-jsxdev".into()))]))
+                .options;
+        assert_eq!(
+            development
+                .jsx_runtime_module_specifier_for_source(Some("automatic"), Some("custom"))
+                .as_deref(),
+            Some("custom/jsx-dev-runtime")
+        );
+
+        let preserved = parse_compiler_options(&object([
+            ("jsx", JsonValue::String("preserve".into())),
+            (
+                "jsxImportSource",
+                JsonValue::String("@emotion/react".into()),
+            ),
+        ]))
+        .options;
+        assert_eq!(
+            preserved.jsx_runtime_module_specifier().as_deref(),
+            Some("@emotion/react/jsx-runtime")
+        );
     }
 
     #[test]
