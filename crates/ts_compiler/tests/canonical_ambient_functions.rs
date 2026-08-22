@@ -1,4 +1,4 @@
-use ts_compiler::{CanonicalProgramCheckFailureClass, Program};
+use ts_compiler::Program;
 use ts_options::{CompilerOptions, ModuleKind, ModuleResolutionKind};
 use ts_vfs::{FileSystem, MemoryFileSystem};
 
@@ -71,7 +71,7 @@ fn canonical_program_reports_ambient_function_argument_mismatch() {
 }
 
 #[test]
-fn canonical_program_keeps_optional_generic_ambient_function_as_a_typed_boundary() {
+fn canonical_program_supports_optional_generic_ambient_functions() {
     let fs = MemoryFileSystem::new(true);
     fs.write_file(
         "/project/main.ts",
@@ -79,18 +79,17 @@ fn canonical_program_keeps_optional_generic_ambient_function_as_a_typed_boundary
     )
     .unwrap();
 
-    let error = Program::try_new_with_canonical_checker(
+    let program = Program::try_new_with_canonical_checker(
         &fs,
         "/project",
         &["main.ts".to_owned()],
         canonical_options(),
     )
-    .unwrap_err();
+    .unwrap();
 
-    assert_eq!(
-        error.failure_class(),
-        CanonicalProgramCheckFailureClass::Unsupported {
-            capability_code: "E00.SOURCE_SYNTAX",
-        }
+    assert!(
+        program.diagnostics().is_empty(),
+        "{:?}",
+        program.diagnostics()
     );
 }

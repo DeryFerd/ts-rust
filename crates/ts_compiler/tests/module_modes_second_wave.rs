@@ -144,6 +144,125 @@ fn node_next_resolutions_follow_the_nearest_package_type() {
 }
 
 #[test]
+fn unresolved_url_side_effect_imports_report_ts2882_with_default_options() {
+    const SPECIFIER: &str = "https://deno.land/std@0.208.0/path/mod.ts";
+    for node_modules_exist in [false, true] {
+        let filesystem = MemoryFileSystem::new(true);
+        if node_modules_exist {
+            filesystem
+                .write_file(
+                    "/node_modules/foo/package.json",
+                    r#"{"name":"foo","version":"1.0.0"}"#,
+                )
+                .unwrap();
+            filesystem
+                .write_file(
+                    "/node_modules/foo/index.d.ts",
+                    "export declare function useFoo(): string;\n",
+                )
+                .unwrap();
+        }
+        filesystem
+            .write_file("/src/index.ts", &format!("import \"{SPECIFIER}\"\n"))
+            .unwrap();
+
+        let program = Program::try_new_with_canonical_checker(
+            &filesystem,
+            "/",
+            &["/src/index.ts".to_owned()],
+            CompilerOptions {
+                lib: Some(vec!["es5".to_owned()]),
+                ..CompilerOptions::default()
+            },
+        )
+        .unwrap();
+
+        let [diagnostic] = program.diagnostics() else {
+            panic!(
+                "expected one URL import diagnostic with node_modules={node_modules_exist}: {:?}",
+                program.diagnostics()
+            );
+        };
+        assert_eq!(diagnostic.file_name.as_deref(), Some("/src/index.ts"));
+        assert_eq!(diagnostic.code, Some(2882));
+        assert_eq!(
+            diagnostic.message,
+            format!(
+                "Cannot find module or type declarations for side-effect import of '{SPECIFIER}'."
+            )
+        );
+        let range = diagnostic.range.expect("URL import diagnostic range");
+        assert_eq!(range.start.get(), 7);
+        assert_eq!(
+            range.end.get(),
+            u32::try_from(7 + SPECIFIER.len() + 2).unwrap()
+        );
+    }
+}
+
+#[test]
+fn disabled_side_effect_import_checking_also_suppresses_url_diagnostics() {
+    let filesystem = MemoryFileSystem::new(true);
+    filesystem
+        .write_file(
+            "/src/index.ts",
+            "import \"https://deno.land/std@0.208.0/path/mod.ts\";\n",
+        )
+        .unwrap();
+
+    let program = Program::try_new_with_canonical_checker(
+        &filesystem,
+        "/",
+        &["/src/index.ts".to_owned()],
+        CompilerOptions {
+            lib: Some(vec!["es5".to_owned()]),
+            no_unchecked_side_effect_imports: false,
+            no_unchecked_side_effect_imports_specified: true,
+            ..CompilerOptions::default()
+        },
+    )
+    .unwrap();
+
+    assert!(
+        program.diagnostics().is_empty(),
+        "{:?}",
+        program.diagnostics()
+    );
+}
+
+#[test]
+fn javascript_emission_reports_ts5055_without_overwriting_its_input() {
+    const SOURCE: &str = "export const value = 1;\n";
+    let filesystem = MemoryFileSystem::new(true);
+    filesystem.write_file("/project/input.js", SOURCE).unwrap();
+    let program = Program::new_with_options(
+        &filesystem,
+        "/project",
+        &["input.js".to_owned()],
+        CompilerOptions {
+            allow_js: true,
+            no_lib: true,
+            ..CompilerOptions::default()
+        },
+    );
+
+    let emitted = program.emit();
+    assert!(emitted.files.is_empty(), "{:?}", emitted.files);
+    let [diagnostic] = emitted.diagnostics.as_slice() else {
+        panic!(
+            "expected one output collision diagnostic: {:?}",
+            emitted.diagnostics
+        );
+    };
+    assert_eq!(diagnostic.code, Some(5055));
+    assert_eq!(
+        diagnostic.message,
+        "Cannot write file '/project/input.js' because it would overwrite input file."
+    );
+    assert_eq!(filesystem.read_file("/project/input.js").unwrap(), SOURCE);
+}
+
+#[test]
 fn ordinary_declaration_modules_are_checked_without_skip_lib_check() {
     let filesystem = MemoryFileSystem::new(true);
     filesystem

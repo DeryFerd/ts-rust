@@ -2123,6 +2123,14 @@ impl Program {
                 .javascript
                 .as_deref()
                 .is_some_and(|file_name| self.output_overwrites_input(file_name));
+            if settings.emit_javascript
+                && javascript_output_overwrites_input
+                && let Some(file_name) = paths.javascript.as_deref()
+            {
+                output
+                    .diagnostics
+                    .push(output_overwrites_input_diagnostic(file_name));
+            }
             if settings.emit_javascript && !javascript_output_overwrites_input {
                 let node_module_kind = matches!(
                     settings.module,
@@ -10796,19 +10804,39 @@ mod tests {
     }
 
     #[test]
-    fn checks_unresolved_side_effect_imports_only_when_requested() {
+    fn checks_unresolved_side_effect_imports_by_default_unless_explicitly_disabled() {
         let fs = MemoryFileSystem::new(true);
         fs.write_file(
             "/project/main.ts",
             "import './side-effect'; import { value } from './binding'; value;",
         )
         .unwrap();
+        let defaults = Program::new_with_options(
+            &fs,
+            "/project",
+            &["main.ts".to_owned()],
+            CompilerOptions {
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        assert_eq!(
+            defaults
+                .diagnostics()
+                .iter()
+                .filter_map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [2882, 2307]
+        );
+
         let unchecked = Program::new_with_options(
             &fs,
             "/project",
             &["main.ts".to_owned()],
             CompilerOptions {
                 no_lib: true,
+                no_unchecked_side_effect_imports: false,
+                no_unchecked_side_effect_imports_specified: true,
                 ..CompilerOptions::default()
             },
         );
@@ -10828,6 +10856,7 @@ mod tests {
             CompilerOptions {
                 no_lib: true,
                 no_unchecked_side_effect_imports: true,
+                no_unchecked_side_effect_imports_specified: true,
                 ..CompilerOptions::default()
             },
         );
@@ -14130,8 +14159,8 @@ export function create() { return new M.Value(); }"#,
         assert_eq!(
             declaration.text,
             concat!(
-                "declare function f(x: any, ...args: any[]): void;\n",
-                "declare namespace bar {\n    let arguments: {};\n}\n",
+                "declare function f(x: any): void;\n",
+                "declare const bar: {\n    arguments: {};\n};\n",
                 "declare class A {\n",
                 "    /** @type object */\n",
                 "    arguments: object;\n",
@@ -14141,8 +14170,8 @@ export function create() { return new M.Value(); }"#,
                 "}\n",
                 "declare class B {\n",
                 "    /** @type object */\n",
-                "    foo: object | undefined;\n",
-                "    m(...args: any[]): void;\n",
+                "    foo: object;\n",
+                "    m(): void;\n",
                 "}\n",
             )
         );
