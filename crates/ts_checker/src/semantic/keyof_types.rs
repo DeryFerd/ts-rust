@@ -29,6 +29,7 @@ use super::{
     CanonicalTypeMapperStore, TypeId,
     bootstrap::LiteralTypeCacheError,
     links::ValueSymbolLinks,
+    mapped_types::{MappedTypeError, MappedTypeKey, MappedTypeKeys, plan_mapped_type_keys},
     object_members::{
         DeclaredPropertyObjectProof, DeclaredPropertyObjectValidation,
         validate_resolved_declared_property_object,
@@ -64,6 +65,8 @@ enum KeyofComposition {
     Union(Vec<NongenericKeyofPlan>),
     Intersection(Vec<NongenericKeyofPlan>),
     Intrinsic(TypeId),
+    Mapped(Vec<MappedTypeKey>),
+    MappedOverflow { size: usize, limit: usize },
 }
 
 impl NongenericKeyofPlan {
@@ -89,6 +92,14 @@ impl NongenericKeyofPlan {
 
     pub(super) const fn preserves_origin(&self) -> bool {
         self.preserves_origin
+    }
+
+    /// Preserves the mapped-template overflow for production TS2590 recovery.
+    pub(super) const fn mapped_cross_product_too_large(&self) -> Option<(usize, usize)> {
+        match &self.composition {
+            Some(KeyofComposition::MappedOverflow { size, limit }) => Some((*size, *limit)),
+            _ => None,
+        }
     }
 
     /// Count after pinned literal reduction.
@@ -213,6 +224,7 @@ pub(super) fn plan_nongeneric_keyof_type(
             }
             return plan_composite_keyof_type(store, target, &projection.types, false);
         }
+        TypeData::Mapped(_) => return plan_mapped_keyof_type(store, target),
         _ => {}
     }
 
@@ -256,6 +268,67 @@ pub(super) fn plan_nongeneric_keyof_type(
     })
 }
 
+fn plan_mapped_keyof_type(
+    store: &CanonicalTypeMapperStore,
+    target: TypeId,
+) -> Result<NongenericKeyofPlan, NongenericKeyofError> {
+    let keys = match plan_mapped_type_keys(store, target) {
+        Ok(keys) => keys,
+        Err(MappedTypeError::CrossProductTooLarge { size, limit }) => {
+            return Ok(NongenericKeyofPlan {
+                target,
+                proof: DeclaredPropertyObjectProof::TypeLiteral,
+                property_names: Vec::new(),
+                has_string_index: false,
+                has_number_index: false,
+                preserves_origin: false,
+                composition: Some(KeyofComposition::MappedOverflow { size, limit }),
+            });
+        }
+        Err(error) => {
+            return Err(match error {
+                MappedTypeError::BootstrapUninitialized => NongenericKeyofError::LiteralCache(
+                    LiteralTypeCacheError::BootstrapUninitialized,
+                ),
+                MappedTypeError::Capacity => {
+                    NongenericKeyofError::LiteralCache(LiteralTypeCacheError::Capacity)
+                }
+                MappedTypeError::InvalidMappedType(_)
+                | MappedTypeError::InvalidSource(_)
+                | MappedTypeError::InvalidTypeParameter(_)
+                | MappedTypeError::InvalidCachedMembers(_)
+                | MappedTypeError::InvalidCachedProperty(_) => {
+                    NongenericKeyofError::MalformedObject(target)
+                }
+                _ => NongenericKeyofError::UnsupportedObject(target),
+            });
+        }
+    };
+    match keys {
+        MappedTypeKeys::Constraint(constraint) => Ok(intrinsic_keyof_plan(target, constraint)),
+        MappedTypeKeys::Remapped(keys) => {
+            let mut property_names = Vec::new();
+            for key in &keys {
+                let name = key
+                    .name(store)
+                    .ok_or(NongenericKeyofError::MalformedObject(target))?;
+                if !property_names.contains(&name) {
+                    property_names.push(name);
+                }
+            }
+            Ok(NongenericKeyofPlan {
+                target,
+                proof: DeclaredPropertyObjectProof::TypeLiteral,
+                property_names,
+                has_string_index: false,
+                has_number_index: false,
+                preserves_origin: false,
+                composition: Some(KeyofComposition::Mapped(keys)),
+            })
+        }
+    }
+}
+
 fn intrinsic_keyof_plan(target: TypeId, result: TypeId) -> NongenericKeyofPlan {
     NongenericKeyofPlan {
         target,
@@ -289,7 +362,7 @@ fn plan_composite_keyof_type(
             })?;
         if matches!(
             constituent.composition,
-            Some(KeyofComposition::Intrinsic(_))
+            Some(KeyofComposition::Intrinsic(_) | KeyofComposition::MappedOverflow { .. })
         ) {
             return Err(NongenericKeyofError::UnsupportedObject(target));
         }
@@ -406,6 +479,14 @@ fn resolve_composite_keyof_type(
 ) -> Result<TypeId, NongenericKeyofError> {
     let constituents = match composition {
         KeyofComposition::Intrinsic(result) => return Ok(*result),
+        KeyofComposition::Mapped(keys) => return resolve_mapped_keyof_type(store, plan, keys),
+        KeyofComposition::MappedOverflow { size, limit } => {
+            debug_assert_eq!(plan.mapped_cross_product_too_large(), Some((*size, *limit)),);
+            return store
+                .intrinsic_bootstrap()
+                .map(|bootstrap| bootstrap.error_type)
+                .ok_or_else(|| LiteralTypeCacheError::BootstrapUninitialized.into());
+        }
         KeyofComposition::Union(constituents) | KeyofComposition::Intersection(constituents) => {
             constituents
         }
@@ -460,6 +541,10 @@ fn resolve_composite_keyof_type(
             }
         }
         KeyofComposition::Intrinsic(_) => unreachable!("intrinsic keys return before planning"),
+        KeyofComposition::Mapped(_) => unreachable!("mapped keys return before planning"),
+        KeyofComposition::MappedOverflow { .. } => {
+            unreachable!("mapped overflow returns before planning")
+        }
     }
 }
 
@@ -470,6 +555,13 @@ fn cached_composite_keyof_type(
 ) -> Result<Option<TypeId>, NongenericKeyofError> {
     let constituents = match composition {
         KeyofComposition::Intrinsic(result) => return Ok(Some(*result)),
+        KeyofComposition::Mapped(keys) => return cached_mapped_keyof_type(store, plan, keys),
+        KeyofComposition::MappedOverflow { .. } => {
+            return store
+                .intrinsic_bootstrap()
+                .map(|bootstrap| Some(bootstrap.error_type))
+                .ok_or_else(|| LiteralTypeCacheError::BootstrapUninitialized.into());
+        }
         KeyofComposition::Union(constituents) | KeyofComposition::Intersection(constituents) => {
             constituents
         }
@@ -502,6 +594,96 @@ fn cached_composite_keyof_type(
             &results,
             matches!(composition, KeyofComposition::Intersection(_)),
         ),
+    }
+}
+
+fn resolve_mapped_keyof_type(
+    store: &mut CanonicalTypeMapperStore,
+    plan: &NongenericKeyofPlan,
+    keys: &[MappedTypeKey],
+) -> Result<TypeId, NongenericKeyofError> {
+    let mut pending = Vec::new();
+    for key in keys {
+        if let MappedTypeKey::String(value) = key
+            && key.cached_type(store).is_none()
+            && !pending.contains(value)
+        {
+            pending.push(value.clone());
+        }
+    }
+    let mut prepared =
+        store.prepare_type_query_types(&pending, &[], &[], usize::from(keys.len() > 1), 0)?;
+    let mut resolved = Vec::with_capacity(keys.len());
+    for key in keys {
+        let type_ = match key {
+            MappedTypeKey::Existing(type_) => *type_,
+            MappedTypeKey::String(value) => store.regular_string_literal_type(value.clone())?,
+        };
+        if !resolved.contains(&type_) {
+            resolved.push(type_);
+        }
+    }
+    let result = match resolved.as_slice() {
+        [] => {
+            store
+                .intrinsic_bootstrap()
+                .ok_or(LiteralTypeCacheError::BootstrapUninitialized)?
+                .never_type
+        }
+        [only] => *only,
+        _ => store.literal_union_type_prepared(&resolved, None, &mut prepared)?,
+    };
+    if let Some(TypeData::Mapped(mapped)) = store.type_payload(plan.target).map(TypeRecord::data)
+        && let Some(constraint) = mapped.constraint_type
+        && union_contains_exact_keys(store, constraint, &resolved)
+    {
+        return Ok(constraint);
+    }
+    Ok(result)
+}
+
+fn cached_mapped_keyof_type(
+    store: &CanonicalTypeMapperStore,
+    plan: &NongenericKeyofPlan,
+    keys: &[MappedTypeKey],
+) -> Result<Option<TypeId>, NongenericKeyofError> {
+    let Some(mut resolved) = keys
+        .iter()
+        .map(|key| key.cached_type(store))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Ok(None);
+    };
+    resolved.sort_unstable();
+    resolved.dedup();
+    match resolved.as_slice() {
+        [] => Ok(Some(
+            store
+                .intrinsic_bootstrap()
+                .ok_or(LiteralTypeCacheError::BootstrapUninitialized)?
+                .never_type,
+        )),
+        [only] => Ok(Some(*only)),
+        _ => {
+            if let Some(TypeData::Mapped(mapped)) =
+                store.type_payload(plan.target).map(TypeRecord::data)
+                && let Some(constraint) = mapped.constraint_type
+                && union_contains_exact_keys(store, constraint, &resolved)
+            {
+                return Ok(Some(constraint));
+            }
+            Ok(store.types().find_map(|(type_, record)| {
+                matches!(
+                    record.data(),
+                    TypeData::Union(union)
+                        if record.alias().is_none()
+                            && union.origin.is_none()
+                            && union.union.types.len() == resolved.len()
+                            && resolved.iter().all(|key| union.union.types.contains(key))
+                )
+                .then_some(type_)
+            }))
+        }
     }
 }
 

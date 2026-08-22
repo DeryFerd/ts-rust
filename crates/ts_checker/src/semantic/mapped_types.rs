@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use ts_ast::{NodeData, NodeRef, SyntaxKind};
+use ts_ast::{NodeData, NodeRef, SyntaxKind, append_js_string};
 use ts_binder::{
     CheckFlags, EscapedName, SemanticSymbolId, SymbolData, SymbolFlags, SymbolTableId,
     semantic::PreparedSymbolTable,
@@ -17,7 +17,7 @@ use ts_binder::{
 use super::{
     CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, TypeId, TypeResolutionTarget,
     TypeSystemPropertyName,
-    bootstrap::LiteralTypeCacheError,
+    bootstrap::{LiteralTypeCacheError, PreparedTypeQueryTypes},
     declared::{
         cached_ordinary_type_parameter_owner, preflight_node, preflight_type_parameter_symbol,
     },
@@ -27,6 +27,7 @@ use super::{
     },
     links::{MappedSymbolLinks, TypeNodeLinks, ValueSymbolLinks},
     store::SourceNodeParent,
+    template_types::{MAX_TEMPLATE_UNION_SIZE, StringMappingKind},
     type_records::{LiteralValue, StructuredTypeData, TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
 };
@@ -227,7 +228,9 @@ pub enum MappedTypeError {
     UnsupportedTemplate(TypeId),
     InvalidCachedMembers(TypeId),
     InvalidCachedProperty(SemanticSymbolId),
+    RecursiveMembers(TypeId),
     CircularProperty(SemanticSymbolId),
+    CrossProductTooLarge { size: usize, limit: usize },
     Capacity,
 }
 
@@ -278,8 +281,20 @@ impl std::fmt::Display for MappedTypeError {
                 formatter,
                 "mapped property {symbol:?} has invalid cached links"
             ),
+            Self::RecursiveMembers(type_) => {
+                write!(
+                    formatter,
+                    "mapped type {type_:?} recursively resolves its members"
+                )
+            }
             Self::CircularProperty(symbol) => {
                 write!(formatter, "mapped property {symbol:?} references itself")
+            }
+            Self::CrossProductTooLarge { size, limit } => {
+                write!(
+                    formatter,
+                    "mapped key union size {size} reached the limit {limit}"
+                )
             }
             Self::Capacity => formatter.write_str("mapped type allocation capacity was exhausted"),
         }
@@ -471,12 +486,95 @@ struct MappedShape {
 #[derive(Clone, Debug)]
 struct PlannedMappedProperty {
     name: EscapedName,
-    name_type: TypeId,
-    keys: Vec<TypeId>,
+    name_types: Vec<MappedTypeKey>,
+    keys: Vec<MappedTypeKey>,
     origin: Option<SemanticSymbolId>,
     optional: bool,
     readonly: bool,
     strip_optional: bool,
+}
+
+/// A mapped key preserves an existing numeric or string literal identity.
+/// Generated string literals remain unallocated until cold publication.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(super) enum MappedTypeKey {
+    Existing(TypeId),
+    String(String),
+}
+
+impl MappedTypeKey {
+    fn source_string(store: &CanonicalTypeMapperStore, value: String) -> Self {
+        store
+            .intrinsic_bootstrap()
+            .and_then(|bootstrap| bootstrap.cached_string_literal_type(&value))
+            .map_or(Self::String(value), Self::Existing)
+    }
+
+    pub(super) fn cached_type(&self, store: &CanonicalTypeMapperStore) -> Option<TypeId> {
+        match self {
+            Self::Existing(type_) => store.type_payload(*type_).map(|_| *type_),
+            Self::String(value) => store
+                .intrinsic_bootstrap()
+                .and_then(|bootstrap| bootstrap.cached_string_literal_type(value)),
+        }
+    }
+
+    pub(super) fn name(&self, store: &CanonicalTypeMapperStore) -> Option<String> {
+        match self {
+            Self::Existing(type_) => property_name_from_type(store, *type_),
+            Self::String(value) => Some(value.clone()),
+        }
+    }
+}
+
+/// The pinned fast path returns an unchanged mapped constraint. Remapping
+/// instead computes property names without materializing property symbols.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum MappedTypeKeys {
+    Constraint(TypeId),
+    Remapped(Vec<MappedTypeKey>),
+}
+
+pub(super) fn plan_mapped_type_keys(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Result<MappedTypeKeys, MappedTypeError> {
+    let record = store
+        .type_payload(type_)
+        .ok_or(MappedTypeError::InvalidMappedType(type_))?;
+    let TypeData::Mapped(mapped) = record.data() else {
+        return Err(MappedTypeError::InvalidMappedType(type_));
+    };
+    let constraint = mapped
+        .constraint_type
+        .ok_or(MappedTypeError::InvalidMappedType(type_))?;
+    let parameter = mapped
+        .type_parameter
+        .ok_or(MappedTypeError::InvalidMappedType(type_))?;
+    if store.type_payload(constraint).is_none()
+        || cached_ordinary_type_parameter_owner(store, parameter).is_none()
+    {
+        return Err(MappedTypeError::InvalidMappedType(type_));
+    }
+    let Some(name_type) = mapped.name_type else {
+        return Ok(MappedTypeKeys::Constraint(constraint));
+    };
+    if name_type == parameter {
+        return Ok(MappedTypeKeys::Constraint(constraint));
+    }
+
+    let shape = validate_mapped_shape(store, type_)?;
+    let planned = plan_mapped_properties(store, &shape, MappedTypeModifiers::NONE)?;
+    let mut keys = Vec::new();
+    let mut seen = HashSet::new();
+    for property in planned {
+        for key in property.name_types {
+            if seen.insert(key.clone()) {
+                keys.push(key);
+            }
+        }
+    }
+    Ok(MappedTypeKeys::Remapped(keys))
 }
 
 impl CanonicalTypeMapperStore {
@@ -553,6 +651,7 @@ impl CanonicalTypeMapperStore {
         if !modifiers.valid() {
             return Err(MappedTypeError::InvalidModifiers);
         }
+        validate_mapped_member_dependencies(self, type_, &mut HashSet::new())?;
         let shape = validate_mapped_shape(self, type_)?;
         let properties = plan_mapped_properties(self, &shape, modifiers)?;
         if let Some(cached) = validate_warm_mapped_members(self, &shape, &properties)? {
@@ -640,6 +739,35 @@ impl CanonicalTypeMapperStore {
         }
         Ok(type_)
     }
+}
+
+fn validate_mapped_member_dependencies(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    active: &mut HashSet<TypeId>,
+) -> Result<(), MappedTypeError> {
+    if !active.insert(type_) {
+        return Err(MappedTypeError::RecursiveMembers(type_));
+    }
+    let result = (|| {
+        let record = store
+            .type_payload(type_)
+            .ok_or(MappedTypeError::InvalidMappedType(type_))?;
+        let TypeData::Mapped(mapped) = record.data() else {
+            return Err(MappedTypeError::InvalidMappedType(type_));
+        };
+        if let Some(source) = mapped.modifiers_type
+            && matches!(
+                store.type_payload(source).map(TypeRecord::data),
+                Some(TypeData::Mapped(_))
+            )
+        {
+            validate_mapped_member_dependencies(store, source, active)?;
+        }
+        Ok(())
+    })();
+    active.remove(&type_);
+    result
 }
 
 fn validate_mapped_request(
@@ -835,7 +963,7 @@ fn source_properties(
 }
 
 fn plan_mapped_properties(
-    store: &mut CanonicalTypeMapperStore,
+    store: &CanonicalTypeMapperStore,
     shape: &MappedShape,
     modifiers: MappedTypeModifiers,
 ) -> Result<Vec<PlannedMappedProperty>, MappedTypeError> {
@@ -849,20 +977,25 @@ fn plan_mapped_properties(
     let mut indexes = HashMap::<EscapedName, usize>::new();
 
     for key in keys {
-        let origin = property_name_from_type(store, key).and_then(|name| {
+        let origin = key.name(store).and_then(|name| {
             shape
                 .source_properties
                 .iter()
                 .find(|property| property.name.as_ref().as_utf8() == Some(name.as_str()))
                 .cloned()
         });
-        let names = mapped_name_types(store, shape, key)?;
+        let names = mapped_name_types(store, shape, &key)?;
         for name_type in names {
-            let property_name = property_name_from_type(store, name_type)
-                .ok_or(MappedTypeError::UnsupportedNameType(name_type))?;
+            let property_name =
+                name_type
+                    .name(store)
+                    .ok_or(MappedTypeError::UnsupportedNameType(
+                        shape.name_type.unwrap_or(shape.type_parameter),
+                    ))?;
             let name = EscapedName::source(property_name);
             if let Some(index) = indexes.get(&name).copied() {
-                properties[index].keys.push(key);
+                properties[index].keys.push(key.clone());
+                properties[index].name_types.push(name_type);
                 continue;
             }
             let optional = modifiers.contains(MappedTypeModifiers::INCLUDE_OPTIONAL)
@@ -876,8 +1009,8 @@ fn plan_mapped_properties(
             indexes.insert(name.clone(), properties.len());
             properties.push(PlannedMappedProperty {
                 name,
-                name_type,
-                keys: vec![key],
+                name_types: vec![name_type],
+                keys: vec![key.clone()],
                 origin: origin.as_ref().map(|property| property.symbol),
                 optional,
                 readonly,
@@ -889,9 +1022,9 @@ fn plan_mapped_properties(
 }
 
 fn constraint_keys(
-    store: &mut CanonicalTypeMapperStore,
+    store: &CanonicalTypeMapperStore,
     shape: &MappedShape,
-) -> Result<Vec<TypeId>, MappedTypeError> {
+) -> Result<Vec<MappedTypeKey>, MappedTypeError> {
     let record =
         store
             .type_payload(shape.constraint_type)
@@ -899,33 +1032,29 @@ fn constraint_keys(
                 shape.constraint_type,
             ))?;
     let keys = match record.data() {
-        TypeData::Index(index) if index.target == shape.modifiers_type => {
-            let names = shape
-                .source_properties
-                .iter()
-                .map(|property| {
-                    property
-                        .name
-                        .as_ref()
-                        .as_utf8()
-                        .map(str::to_owned)
-                        .ok_or(MappedTypeError::InvalidSource(shape.modifiers_type))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            store
-                .prepare_regular_literal_types(&names, &[], &[])
-                .map_err(mapped_cache_error)?;
-            names
-                .into_iter()
-                .map(|name| {
-                    store
-                        .regular_string_literal_type(name)
-                        .map_err(mapped_cache_error)
-                })
-                .collect::<Result<Vec<_>, _>>()?
+        TypeData::Index(index) if index.target == shape.modifiers_type => shape
+            .source_properties
+            .iter()
+            .map(|property| {
+                property
+                    .name
+                    .as_ref()
+                    .as_utf8()
+                    .map(str::to_owned)
+                    .map(|name| MappedTypeKey::source_string(store, name))
+                    .ok_or(MappedTypeError::InvalidSource(shape.modifiers_type))
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        TypeData::Union(union) => union
+            .union
+            .types
+            .iter()
+            .copied()
+            .map(MappedTypeKey::Existing)
+            .collect(),
+        TypeData::Literal(_) | TypeData::UniqueEsSymbol(_) => {
+            vec![MappedTypeKey::Existing(shape.constraint_type)]
         }
-        TypeData::Union(union) => union.union.types.clone(),
-        TypeData::Literal(_) | TypeData::UniqueEsSymbol(_) => vec![shape.constraint_type],
         TypeData::Intrinsic(_) if record.flags().contains(TypeFlags::NEVER) => Vec::new(),
         TypeData::TypeParameter(parameter) => {
             let constraint = parameter
@@ -949,8 +1078,10 @@ fn constraint_keys(
         }
     };
     for key in &keys {
-        if property_name_from_type(store, *key).is_none() {
-            return Err(MappedTypeError::UnsupportedConstraint(*key));
+        if key.name(store).is_none() {
+            return Err(MappedTypeError::UnsupportedConstraint(
+                key.cached_type(store).unwrap_or(shape.constraint_type),
+            ));
         }
     }
     Ok(keys)
@@ -959,10 +1090,10 @@ fn constraint_keys(
 fn mapped_name_types(
     store: &CanonicalTypeMapperStore,
     shape: &MappedShape,
-    key: TypeId,
-) -> Result<Vec<TypeId>, MappedTypeError> {
+    key: &MappedTypeKey,
+) -> Result<Vec<MappedTypeKey>, MappedTypeError> {
     let Some(name_type) = shape.name_type else {
-        return Ok(vec![key]);
+        return Ok(vec![key.clone()]);
     };
     substitute_name_type(store, shape.type_parameter, key, name_type)
 }
@@ -970,29 +1101,104 @@ fn mapped_name_types(
 fn substitute_name_type(
     store: &CanonicalTypeMapperStore,
     parameter: TypeId,
-    key: TypeId,
+    key: &MappedTypeKey,
     name_type: TypeId,
-) -> Result<Vec<TypeId>, MappedTypeError> {
+) -> Result<Vec<MappedTypeKey>, MappedTypeError> {
+    substitute_name_type_worker(store, parameter, key, name_type, &mut HashSet::new())
+}
+
+fn substitute_name_type_worker(
+    store: &CanonicalTypeMapperStore,
+    parameter: TypeId,
+    key: &MappedTypeKey,
+    name_type: TypeId,
+    visiting: &mut HashSet<TypeId>,
+) -> Result<Vec<MappedTypeKey>, MappedTypeError> {
     if name_type == parameter {
-        return Ok(vec![key]);
+        return Ok(vec![key.clone()]);
     }
-    let record = store
-        .type_payload(name_type)
-        .ok_or(MappedTypeError::UnsupportedNameType(name_type))?;
-    match record.data() {
-        TypeData::Literal(_) if property_name_from_type(store, name_type).is_some() => {
-            Ok(vec![name_type])
+    if !visiting.insert(name_type) {
+        return Err(MappedTypeError::UnsupportedNameType(name_type));
+    }
+    let result = (|| {
+        let record = store
+            .type_payload(name_type)
+            .ok_or(MappedTypeError::UnsupportedNameType(name_type))?;
+        match record.data() {
+            TypeData::Literal(_) if property_name_from_type(store, name_type).is_some() => {
+                Ok(vec![MappedTypeKey::Existing(name_type)])
+            }
+            TypeData::Intrinsic(_) if record.flags().contains(TypeFlags::NEVER) => Ok(Vec::new()),
+            TypeData::Union(union) => union
+                .union
+                .types
+                .iter()
+                .map(|candidate| {
+                    substitute_name_type_worker(store, parameter, key, *candidate, visiting)
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(|types| types.into_iter().flatten().collect()),
+            TypeData::TemplateLiteral(template) => {
+                if template.texts.len() != template.types.len().saturating_add(1) {
+                    return Err(MappedTypeError::UnsupportedNameType(name_type));
+                }
+                let mut names = vec![template.texts[0].clone()];
+                for (index, placeholder) in template.types.iter().enumerate() {
+                    let candidates =
+                        substitute_name_type_worker(store, parameter, key, *placeholder, visiting)?;
+                    let size = names
+                        .len()
+                        .checked_mul(candidates.len())
+                        .unwrap_or(usize::MAX);
+                    if size >= MAX_TEMPLATE_UNION_SIZE {
+                        return Err(MappedTypeError::CrossProductTooLarge {
+                            size,
+                            limit: MAX_TEMPLATE_UNION_SIZE,
+                        });
+                    }
+                    let mut next = Vec::with_capacity(size);
+                    for prefix in names {
+                        for candidate in &candidates {
+                            let candidate = candidate
+                                .name(store)
+                                .ok_or(MappedTypeError::UnsupportedNameType(*placeholder))?;
+                            let mut name = prefix.clone();
+                            append_js_string(&mut name, &candidate);
+                            append_js_string(&mut name, &template.texts[index + 1]);
+                            next.push(name);
+                        }
+                    }
+                    names = next;
+                }
+                Ok(names
+                    .into_iter()
+                    .map(|name| MappedTypeKey::source_string(store, name))
+                    .collect())
+            }
+            TypeData::StringMapping(mapping) => {
+                let operation = record
+                    .symbol()
+                    .and_then(|symbol| store.symbol(symbol))
+                    .and_then(|symbol| symbol.name().as_utf8())
+                    .and_then(StringMappingKind::from_name)
+                    .ok_or(MappedTypeError::UnsupportedNameType(name_type))?;
+                let targets =
+                    substitute_name_type_worker(store, parameter, key, mapping.target, visiting)?;
+                targets
+                    .into_iter()
+                    .map(|target| {
+                        let name = target
+                            .name(store)
+                            .ok_or(MappedTypeError::UnsupportedNameType(mapping.target))?;
+                        Ok(MappedTypeKey::source_string(store, operation.apply(&name)))
+                    })
+                    .collect()
+            }
+            _ => Err(MappedTypeError::UnsupportedNameType(name_type)),
         }
-        TypeData::Intrinsic(_) if record.flags().contains(TypeFlags::NEVER) => Ok(Vec::new()),
-        TypeData::Union(union) => union
-            .union
-            .types
-            .iter()
-            .map(|type_| substitute_name_type(store, parameter, key, *type_))
-            .collect::<Result<Vec<_>, _>>()
-            .map(|types| types.into_iter().flatten().collect()),
-        _ => Err(MappedTypeError::UnsupportedNameType(name_type)),
-    }
+    })();
+    visiting.remove(&name_type);
+    result
 }
 
 fn property_name_from_type(store: &CanonicalTypeMapperStore, type_: TypeId) -> Option<String> {
@@ -1030,14 +1236,12 @@ fn validate_warm_mapped_members(
     let members = structured
         .members
         .ok_or(MappedTypeError::InvalidCachedMembers(shape.type_))?;
-    let properties = structured
-        .properties
-        .as_deref()
-        .ok_or(MappedTypeError::InvalidCachedMembers(shape.type_))?;
+    let properties = structured.properties.as_deref().unwrap_or_default();
     let table = store
         .symbol_table(members)
         .ok_or(MappedTypeError::InvalidCachedMembers(shape.type_))?;
     if properties.len() != expected.len()
+        || structured.properties.is_some() != !expected.is_empty()
         || table.len() != expected.len()
         || structured.signatures.is_some()
         || structured.call_signature_count != 0
@@ -1076,7 +1280,7 @@ fn validate_warm_mapped_members(
             || mapped.key_type.is_none()
             || !keys_match(store, mapped.key_type, &expected.keys)
             || value.containing_type != Some(shape.type_)
-            || value.name_type != Some(expected.name_type)
+            || !keys_match(store, value.name_type, &expected.name_types)
             || value.target.is_some()
             || value.mapper.is_some()
             || value.write_type.is_some()
@@ -1086,7 +1290,7 @@ fn validate_warm_mapped_members(
                 .is_some_and(|type_| store.type_payload(type_).is_none())
             || property.declarations()
                 != expected.origin.and_then(|origin| {
-                    (shape.name_type.is_none())
+                    should_link_source_declarations(shape)
                         .then(|| store.symbol(origin)?.declarations())
                         .flatten()
                 })
@@ -1104,24 +1308,37 @@ fn validate_warm_mapped_members(
 fn keys_match(
     store: &CanonicalTypeMapperStore,
     cached: Option<TypeId>,
-    expected: &[TypeId],
+    expected: &[MappedTypeKey],
 ) -> bool {
-    match (cached, expected) {
-        (Some(key), [single]) => key == *single,
-        (Some(key), expected) => store
-            .type_payload(key)
+    let Some(cached) = cached else {
+        return false;
+    };
+    let Some(mut expected) = expected
+        .iter()
+        .map(|identity| identity.cached_type(store))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    expected.sort_unstable();
+    expected.dedup();
+    match expected.as_slice() {
+        [single] => cached == *single,
+        _ => store
+            .type_payload(cached)
             .and_then(|record| match record.data() {
                 TypeData::Union(union) => Some(&union.union.types),
                 _ => None,
             })
             .is_some_and(|types| {
-                let mut expected = expected.to_vec();
-                expected.sort_unstable();
-                expected.dedup();
-                types == &expected
+                types.len() == expected.len()
+                    && expected.iter().all(|identity| types.contains(identity))
             }),
-        _ => false,
     }
+}
+
+fn should_link_source_declarations(shape: &MappedShape) -> bool {
+    shape.name_type.is_none() || shape.name_type == Some(shape.type_parameter)
 }
 
 fn expected_check_flags(
@@ -1151,30 +1368,69 @@ fn publish_mapped_members(
     planned: Vec<PlannedMappedProperty>,
 ) -> Result<ResolvedMappedTypeMembers, MappedTypeError> {
     let table = PreparedSymbolTable::new(planned.len()).ok_or(MappedTypeError::Capacity)?;
+    let mut pending_strings = Vec::new();
+    let mut seen_pending = HashSet::new();
+    let mut union_operations = 0usize;
+    for property in &planned {
+        expected_check_flags(store, property)?;
+        for identities in [&property.keys, &property.name_types] {
+            let mut unique = HashSet::new();
+            for identity in identities {
+                unique.insert(identity.clone());
+                if let MappedTypeKey::Existing(type_) = identity {
+                    store
+                        .type_payload(*type_)
+                        .ok_or(MappedTypeError::InvalidMappedType(*type_))?;
+                }
+                if let MappedTypeKey::String(value) = identity
+                    && seen_pending.insert(value.clone())
+                {
+                    pending_strings.push(value.clone());
+                }
+            }
+            if unique.len() > 1 {
+                union_operations = union_operations
+                    .checked_add(1)
+                    .ok_or(MappedTypeError::Capacity)?;
+            }
+        }
+    }
     if !store.try_reserve_checker_symbol_allocations(planned.len(), 1)
         || !store.try_reserve_value_symbol_links(planned.len())
     {
         return Err(MappedTypeError::Capacity);
     }
+    let mut prepared = store
+        .prepare_type_query_types(&pending_strings, &[], &[], union_operations, 0)
+        .map_err(mapped_cache_error)?;
+    if !store.set_structured_type_members(shape.type_, None, None, None, None, None) {
+        return Err(MappedTypeError::InvalidCachedMembers(shape.type_));
+    }
     let mut resolved_keys = Vec::with_capacity(planned.len());
+    let mut resolved_names = Vec::with_capacity(planned.len());
     for property in &planned {
-        let key = match property.keys.as_slice() {
-            [key] => *key,
-            keys => canonical_anonymous_union(store, keys).map_err(mapped_cache_error)?,
-        };
-        resolved_keys.push(key);
+        resolved_keys.push(materialize_mapped_identities(
+            store,
+            &property.keys,
+            &mut prepared,
+        )?);
+        resolved_names.push(materialize_mapped_identities(
+            store,
+            &property.name_types,
+            &mut prepared,
+        )?);
     }
 
     let members = store.alloc_prepared_symbol_table(table);
     let mut properties = Vec::with_capacity(planned.len());
-    for (property, key) in planned.into_iter().zip(resolved_keys) {
+    for ((property, key), name_type) in planned.into_iter().zip(resolved_keys).zip(resolved_names) {
         let mut flags = SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT;
         if property.optional {
             flags |= SymbolFlags::OPTIONAL;
         }
         let mut data = SymbolData::new(flags, property.name.clone());
         data.check_flags = expected_check_flags(store, &property)?;
-        if shape.name_type.is_none()
+        if should_link_source_declarations(shape)
             && let Some(origin) = property.origin
         {
             data.declarations = store
@@ -1187,7 +1443,7 @@ fn publish_mapped_members(
             symbol,
             ValueSymbolLinks {
                 containing_type: Some(shape.type_),
-                name_type: Some(property.name_type),
+                name_type: Some(name_type),
                 ..ValueSymbolLinks::default()
             },
         ));
@@ -1207,7 +1463,7 @@ fn publish_mapped_members(
     assert!(store.set_structured_type_members(
         shape.type_,
         Some(members),
-        Some(properties.clone()),
+        (!properties.is_empty()).then_some(properties.clone()),
         None,
         None,
         None,
@@ -1217,6 +1473,32 @@ fn publish_mapped_members(
         members,
         properties,
     })
+}
+
+fn materialize_mapped_identities(
+    store: &mut CanonicalTypeMapperStore,
+    identities: &[MappedTypeKey],
+    prepared: &mut PreparedTypeQueryTypes,
+) -> Result<TypeId, MappedTypeError> {
+    let mut resolved = Vec::with_capacity(identities.len());
+    for identity in identities {
+        let type_ = match identity {
+            MappedTypeKey::Existing(type_) => *type_,
+            MappedTypeKey::String(value) => store
+                .regular_string_literal_type(value.clone())
+                .map_err(mapped_cache_error)?,
+        };
+        if !resolved.contains(&type_) {
+            resolved.push(type_);
+        }
+    }
+    match resolved.as_slice() {
+        [single] => Ok(*single),
+        [] => Err(MappedTypeError::Capacity),
+        _ => store
+            .literal_union_type_prepared(&resolved, None, prepared)
+            .map_err(mapped_cache_error),
+    }
 }
 
 fn validate_mapped_property_header(
@@ -1491,12 +1773,132 @@ mod tests {
     use ts_ast::{FileId, NodeData, NodeRef, SyntaxKind};
     use ts_binder::{
         CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
-        EscapedName,
+        EscapedName, SemanticSymbolId,
     };
-    use ts_parser::parse_source_file;
+    use ts_parser::{ParseResult, parse_source_file};
 
-    use super::{MappedTypeModifiers, plan_mapped_type_declaration};
-    use crate::semantic::{CanonicalTypeMapperStore, DeclaredTypeHost, IntrinsicBootstrapOptions};
+    use super::{
+        MAX_TEMPLATE_UNION_SIZE, MappedTypeError, MappedTypeKey, MappedTypeKeys,
+        MappedTypeModifiers, plan_mapped_type_declaration, plan_mapped_type_keys,
+    };
+    use crate::semantic::{
+        CanonicalCheckerContext, CanonicalCheckerOptions, CanonicalTypeMapperStore,
+        DeclaredTypeHost, IntrinsicBootstrapOptions, TypeData, TypeId,
+        keyof_types::{cached_nongeneric_keyof_type, plan_nongeneric_keyof_type},
+        type_records::LiteralValue,
+        types::ObjectFlags,
+    };
+
+    fn checker_context(parsed: &ParseResult) -> CanonicalCheckerContext<'_> {
+        let file = FileId::new(0);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/mapped-unit.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap()
+    }
+
+    fn alias_type(
+        parsed: &ParseResult,
+        context: &CanonicalCheckerContext<'_>,
+        expected: &str,
+    ) -> TypeId {
+        let file = FileId::new(0);
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(name) = &parsed.arena.get(alias.name)?.data else {
+                    return None;
+                };
+                (name.text == expected).then_some(NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .unwrap();
+        let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        context
+            .store()
+            .type_alias_links(symbol)
+            .and_then(|links| links.declared_type)
+            .unwrap()
+    }
+
+    fn source_property(
+        parsed: &ParseResult,
+        context: &CanonicalCheckerContext<'_>,
+        expected: &str,
+    ) -> SemanticSymbolId {
+        let file = FileId::new(0);
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let name = match &record.data {
+                    NodeData::PropertyDeclaration(property) => property.name,
+                    NodeData::PropertySignatureDeclaration(property) => property.name,
+                    _ => return None,
+                };
+                let NodeData::Identifier(name) = &parsed.arena.get(name)?.data else {
+                    return None;
+                };
+                (name.text == expected).then_some(NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .unwrap();
+        context.file(file).unwrap().1.symbol(declaration).unwrap()
+    }
+
+    fn cache_state(
+        store: &CanonicalTypeMapperStore,
+    ) -> (usize, usize, usize, usize, usize, usize, [usize; 26]) {
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        (
+            store.type_len(),
+            store.mapper_len(),
+            store.symbol_len(),
+            store.symbol_store().symbol_table_len(),
+            bootstrap.string_literal_cache_len(),
+            bootstrap.union_cache_len(),
+            store.checker_link_allocated_lengths(),
+        )
+    }
+
+    fn replace_mapped_name(store: &mut CanonicalTypeMapperStore, mapped: TypeId, name: TypeId) {
+        let TypeData::Mapped(record) = store.type_payload(mapped).unwrap().data() else {
+            panic!("expected a mapped type");
+        };
+        let record = record.clone();
+        assert!(store.set_mapped_type_resolution(
+            mapped,
+            record.declaration,
+            record.type_parameter,
+            record.constraint_type,
+            Some(name),
+            record.template_type,
+            record.modifiers_type,
+            record.resolved_apparent_type,
+            record.contains_error,
+        ));
+    }
 
     #[test]
     fn mapped_modifier_bits_match_upstream() {
@@ -1607,5 +2009,338 @@ mod tests {
             plan.modifiers(),
             MappedTypeModifiers::EXCLUDE_READONLY | MappedTypeModifiers::EXCLUDE_OPTIONAL,
         );
+    }
+
+    #[test]
+    fn identity_key_remapping_preserves_source_declaration_provenance() {
+        let parsed = parse_source_file(concat!(
+            "interface Shape { value: string }\n",
+            "type Identity = { [K in keyof Shape as K]: Shape[K] };\n",
+            "type Keys = keyof Identity;\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut context = checker_context(&parsed);
+        context.check_source_file(FileId::new(0)).unwrap();
+        let mapped = alias_type(&parsed, &context, "Identity");
+        let keys = alias_type(&parsed, &context, "Keys");
+        let source = source_property(&parsed, &context, "value");
+        let parameter_constraint = match context.store().type_payload(mapped).unwrap().data() {
+            TypeData::Mapped(mapped) => mapped.constraint_type.unwrap(),
+            _ => unreachable!(),
+        };
+        assert_eq!(keys, parameter_constraint);
+
+        let property = context
+            .store_mut_for_test()
+            .resolve_mapped_type_property(mapped, "value", MappedTypeModifiers::NONE)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            context
+                .store()
+                .symbol(property.symbol())
+                .unwrap()
+                .declarations(),
+            context.store().symbol(source).unwrap().declarations(),
+        );
+    }
+
+    #[test]
+    fn empty_mapped_types_keep_the_upstream_nil_property_cache() {
+        let parsed = parse_source_file(concat!(
+            "interface Empty {}\n",
+            "type Result = { [K in keyof Empty]: Empty[K] };\n",
+            "type Keys = keyof Result;\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut context = checker_context(&parsed);
+        context.check_source_file(FileId::new(0)).unwrap();
+        let mapped = alias_type(&parsed, &context, "Result");
+        assert_eq!(
+            alias_type(&parsed, &context, "Keys"),
+            context.store().intrinsic_bootstrap().unwrap().never_type,
+        );
+        let members = context
+            .store_mut_for_test()
+            .resolve_mapped_type_members(mapped, MappedTypeModifiers::NONE)
+            .unwrap();
+        assert!(members.properties().is_empty());
+        let TypeData::Mapped(record) = context.store().type_payload(mapped).unwrap().data() else {
+            unreachable!()
+        };
+        assert!(record.object.structured.members.is_some());
+        assert!(record.object.structured.properties.is_none());
+        let before = cache_state(context.store());
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .resolve_mapped_type_members(mapped, MappedTypeModifiers::NONE)
+                .unwrap(),
+            members,
+        );
+        assert_eq!(cache_state(context.store()), before);
+    }
+
+    #[test]
+    fn template_and_intrinsic_key_remapping_stays_canonical_and_lazy() {
+        let parsed = parse_source_file(concat!(
+            "type Capitalize<S extends string> = intrinsic;\n",
+            "interface Shape { first: string; second: number }\n",
+            "type Getters = { [K in keyof Shape as `get${Capitalize<K>}`]: Shape[K] };\n",
+            "type Keys = keyof Getters;\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut context = checker_context(&parsed);
+        context.check_source_file(FileId::new(0)).unwrap();
+        let mapped = alias_type(&parsed, &context, "Getters");
+        let keys = alias_type(&parsed, &context, "Keys");
+        let TypeData::Union(union) = context.store().type_payload(keys).unwrap().data() else {
+            panic!("mapped keyof should preserve the remapped literal union");
+        };
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        assert!(
+            union
+                .union
+                .types
+                .contains(&bootstrap.cached_string_literal_type("getFirst").unwrap())
+        );
+        assert!(
+            union
+                .union
+                .types
+                .contains(&bootstrap.cached_string_literal_type("getSecond").unwrap())
+        );
+        let before = context.store().symbol_len();
+        let TypeData::Mapped(record) = context.store().type_payload(mapped).unwrap().data() else {
+            unreachable!()
+        };
+        assert!(record.object.structured.members.is_none());
+
+        let members = context
+            .store_mut_for_test()
+            .resolve_mapped_type_members(mapped, MappedTypeModifiers::NONE)
+            .unwrap();
+        assert_eq!(members.properties().len(), 2);
+        assert_eq!(context.store().symbol_len(), before + 2);
+        let warm = cache_state(context.store());
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .resolve_mapped_type_members(mapped, MappedTypeModifiers::NONE)
+                .unwrap(),
+            members,
+        );
+        assert_eq!(cache_state(context.store()), warm);
+    }
+
+    #[test]
+    fn duplicate_numeric_and_string_names_preserve_both_literal_identities() {
+        let parsed = parse_source_file(concat!(
+            "interface Shape { first: string; second: number }\n",
+            "type Combined = { [K in keyof Shape as 1 | \"1\"]: Shape[K] };\n",
+            "type Keys = keyof Combined;\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut context = checker_context(&parsed);
+        context.check_source_file(FileId::new(0)).unwrap();
+        let mapped = alias_type(&parsed, &context, "Combined");
+        let keyof = alias_type(&parsed, &context, "Keys");
+        let mapped_keys = plan_mapped_type_keys(context.store(), mapped).unwrap();
+        let MappedTypeKeys::Remapped(keys) = mapped_keys else {
+            panic!("numeric and string remapping must keep both output identities");
+        };
+        assert_eq!(keys.len(), 2);
+        let mut saw_number = false;
+        let mut saw_string = false;
+        for key in &keys {
+            let MappedTypeKey::Existing(type_) = key else {
+                panic!("source literal names retain canonical identities");
+            };
+            match context.store().type_payload(*type_).unwrap().data() {
+                TypeData::Literal(literal) if matches!(&literal.value, LiteralValue::Number(_)) => {
+                    saw_number = true;
+                }
+                TypeData::Literal(literal) if matches!(&literal.value, LiteralValue::String(value) if value == "1") =>
+                {
+                    saw_string = true;
+                }
+                other => panic!("unexpected remapped key {other:?}"),
+            }
+        }
+        assert!(saw_number && saw_string);
+
+        let TypeData::Union(keyof_union) = context.store().type_payload(keyof).unwrap().data()
+        else {
+            panic!("keyof must preserve both numeric and string key identities");
+        };
+        assert_eq!(keyof_union.union.types.len(), 2);
+        let members = context
+            .store_mut_for_test()
+            .resolve_mapped_type_members(mapped, MappedTypeModifiers::NONE)
+            .unwrap();
+        assert_eq!(members.properties().len(), 1);
+        let property = members.properties()[0];
+        let name_type = context
+            .store()
+            .value_symbol_links(property)
+            .unwrap()
+            .name_type
+            .unwrap();
+        let TypeData::Union(name_union) = context.store().type_payload(name_type).unwrap().data()
+        else {
+            panic!("duplicate numeric/string names must retain their name-type union");
+        };
+        assert_eq!(name_union.union.types.len(), 2);
+    }
+
+    #[test]
+    fn poisoned_warm_members_do_not_intern_pending_template_names() {
+        let parsed = parse_source_file(concat!(
+            "interface Shape { value: string }\n",
+            "type Getters = { [K in keyof Shape as `get${K}`]: Shape[K] };\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut context = checker_context(&parsed);
+        context.check_source_file(FileId::new(0)).unwrap();
+        let mapped = alias_type(&parsed, &context, "Getters");
+        let store = context.store_mut_for_test();
+        assert!(store.set_structured_type_members(mapped, None, None, None, None, None));
+        let before = cache_state(store);
+        assert_eq!(
+            store.resolve_mapped_type_members(mapped, MappedTypeModifiers::NONE),
+            Err(MappedTypeError::InvalidCachedMembers(mapped)),
+        );
+        assert_eq!(cache_state(store), before);
+        assert!(
+            store
+                .intrinsic_bootstrap()
+                .unwrap()
+                .cached_string_literal_type("getvalue")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn recursive_mapped_member_sources_fail_before_any_semantic_mutation() {
+        let parsed = parse_source_file(concat!(
+            "interface Shape { value: string }\n",
+            "type Result = { [K in keyof Shape]: Shape[K] };\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut context = checker_context(&parsed);
+        context.check_source_file(FileId::new(0)).unwrap();
+        let mapped = alias_type(&parsed, &context, "Result");
+        let store = context.store_mut_for_test();
+        let TypeData::Mapped(record) = store.type_payload(mapped).unwrap().data() else {
+            unreachable!()
+        };
+        let record = record.clone();
+        assert!(store.set_mapped_type_resolution(
+            mapped,
+            record.declaration,
+            record.type_parameter,
+            record.constraint_type,
+            record.name_type,
+            record.template_type,
+            Some(mapped),
+            record.resolved_apparent_type,
+            record.contains_error,
+        ));
+        let before = cache_state(store);
+        assert_eq!(
+            store.resolve_mapped_type_members(mapped, MappedTypeModifiers::NONE),
+            Err(MappedTypeError::RecursiveMembers(mapped)),
+        );
+        assert_eq!(cache_state(store), before);
+        assert!(
+            !store
+                .type_payload(mapped)
+                .unwrap()
+                .object_flags()
+                .contains(ObjectFlags::MEMBERS_RESOLVED)
+        );
+    }
+
+    #[test]
+    fn unsupported_later_remap_branch_leaves_all_checker_caches_unchanged() {
+        let parsed = parse_source_file(concat!(
+            "interface Shape { value: string }\n",
+            "type Getters = { [K in keyof Shape as `get${K}`]: Shape[K] };\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut context = checker_context(&parsed);
+        context.check_source_file(FileId::new(0)).unwrap();
+        let mapped = alias_type(&parsed, &context, "Getters");
+        let store = context.store_mut_for_test();
+        let name = match store.type_payload(mapped).unwrap().data() {
+            TypeData::Mapped(record) => record.name_type.unwrap(),
+            _ => unreachable!(),
+        };
+        let boolean = store.intrinsic_bootstrap().unwrap().boolean_type;
+        let invalid = store
+            .alloc_union_type(ObjectFlags::NONE, vec![name, boolean])
+            .unwrap();
+        replace_mapped_name(store, mapped, invalid);
+        let before = cache_state(store);
+        assert!(matches!(
+            store.resolve_mapped_type_members(mapped, MappedTypeModifiers::NONE),
+            Err(MappedTypeError::UnsupportedNameType(_)),
+        ));
+        assert_eq!(cache_state(store), before);
+        assert!(
+            store
+                .intrinsic_bootstrap()
+                .unwrap()
+                .cached_string_literal_type("getvalue")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn excessive_template_key_cross_products_preserve_the_ts2590_failure() {
+        let parsed = parse_source_file(concat!(
+            "interface Shape { value: string }\n",
+            "type Getters = { [K in keyof Shape as `get${K}`]: Shape[K] };\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut context = checker_context(&parsed);
+        context.check_source_file(FileId::new(0)).unwrap();
+        let mapped = alias_type(&parsed, &context, "Getters");
+        let store = context.store_mut_for_test();
+        let mut values = Vec::new();
+        for index in 0..317 {
+            values.push(
+                store
+                    .regular_string_literal_type(format!("key{index}"))
+                    .unwrap(),
+            );
+        }
+        let union = store.literal_union_type(&values, None).unwrap();
+        let template = store
+            .alloc_template_literal_type(
+                vec![String::new(), String::new(), String::new()],
+                vec![union, union],
+            )
+            .unwrap();
+        replace_mapped_name(store, mapped, template);
+        let before = cache_state(store);
+        let keyof = plan_nongeneric_keyof_type(store, mapped).unwrap();
+        assert_eq!(
+            keyof.mapped_cross_product_too_large(),
+            Some((317 * 317, MAX_TEMPLATE_UNION_SIZE)),
+        );
+        assert_eq!(
+            cached_nongeneric_keyof_type(store, &keyof).unwrap(),
+            Some(store.intrinsic_bootstrap().unwrap().error_type),
+        );
+        assert_eq!(cache_state(store), before);
+        assert_eq!(
+            store.resolve_mapped_type_members(mapped, MappedTypeModifiers::NONE),
+            Err(MappedTypeError::CrossProductTooLarge {
+                size: 317 * 317,
+                limit: MAX_TEMPLATE_UNION_SIZE,
+            }),
+        );
+        assert_eq!(cache_state(store), before);
     }
 }
