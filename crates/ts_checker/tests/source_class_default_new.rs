@@ -142,6 +142,7 @@ fn first_new_expression(parsed: &ParseResult, file: FileId) -> NodeRef {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // Constructor identity and warm caches require one source graph.
 fn direct_default_new_publishes_exact_instance_signature_and_warm_caches() {
     let parsed = parse_source_file(SOURCE);
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
@@ -324,7 +325,9 @@ fn derived_default_new_accepts_optional_parentheses_and_reuses_inherited_members
         .get_nongeneric_class_members(derived_symbol)
         .unwrap();
     assert_eq!(
-        derived.base().map(|identities| identities.instance_type()),
+        derived
+            .base()
+            .map(ts_checker::semantic::ClassBaseIdentities::instance_type),
         Some(base.shells().instance_type())
     );
     for construction in [explicit, implicit] {

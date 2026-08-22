@@ -85,17 +85,16 @@ fn union_has_property_cache(context: &CanonicalCheckerContext<'_>, union: TypeId
         .is_some_and(|cache| context.store().symbol_table(cache).is_some())
 }
 
-fn observable_state(
-    context: &CanonicalCheckerContext<'_>,
-    access: NodeRef,
-) -> (
+type ObservableState = (
     usize,
     usize,
     usize,
     Option<TypeId>,
     Option<SemanticSymbolId>,
     Vec<(u32, Option<NodeRef>, String)>,
-) {
+);
+
+fn observable_state(context: &CanonicalCheckerContext<'_>, access: NodeRef) -> ObservableState {
     (
         context.store().type_len(),
         context.store().symbol_store().checker_created_symbol_len(),

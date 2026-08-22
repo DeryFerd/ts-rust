@@ -104,6 +104,7 @@ fn is_type_checked(context: &CanonicalCheckerContext<'_>, file: FileId) -> bool 
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // One scenario checks hoisting, graph identity, and warm replay.
 fn ambient_variables_hoist_exact_types_in_scripts_and_external_modules() {
     for (index, (prefix, module_state)) in [
         ("", CanonicalModuleState::Script),

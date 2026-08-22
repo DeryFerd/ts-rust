@@ -82,6 +82,7 @@ fn resolved_type(context: &CanonicalCheckerContext<'_>, node: NodeRef) -> TypeId
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // One source validates every branch join and its warm identities.
 fn direct_conditional_initializers_join_in_branch_order_and_replay_warm() {
     let parsed = parse_source_file(SOURCE);
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
@@ -220,6 +221,7 @@ fn direct_conditional_initializers_join_in_branch_order_and_replay_warm() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // The complete unsupported-form matrix shares one atomic setup.
 fn unsupported_contextual_narrowed_inferred_and_assigned_forms_fail_before_publication() {
     for (index, source) in [
         concat!(

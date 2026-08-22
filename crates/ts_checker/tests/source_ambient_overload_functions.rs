@@ -331,7 +331,7 @@ fn later_bad_overload_group_rejects_all_overload_publication() {
 
         assert!(matches!(
             context.check_source_file(file),
-            Err(SourceCheckError::Unsupported(_)) | Err(SourceCheckError::DeclaredType(_))
+            Err(SourceCheckError::Unsupported(_) | SourceCheckError::DeclaredType(_))
         ));
 
         assert!(context.store().value_symbol_links(ready_owner).is_none());
@@ -395,9 +395,9 @@ fn later_bad_callable_provider_keeps_the_ready_overload_cold_across_retries() {
             assert!(
                 matches!(
                     context.check_source_file(file),
-                    Err(SourceCheckError::DeclaredType(_))
-                        | Err(SourceCheckError::Unsupported(_))
-                        | Err(SourceCheckError::Arrow(_))
+                    Err(SourceCheckError::DeclaredType(_)
+                        | SourceCheckError::Unsupported(_)
+                        | SourceCheckError::Arrow(_))
                 ),
                 "later provider escaped its typed boundary: {source}",
             );

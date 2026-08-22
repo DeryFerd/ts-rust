@@ -245,7 +245,7 @@ fn generic_call_instantiation_limits_are_lazy_recovering_and_query_scoped() {
     let checked_signature = *selected_signatures.last().unwrap();
     let original_signature = store
         .signature(checked_signature)
-        .and_then(|signature| signature.target())
+        .and_then(ts_checker::semantic::signatures::Signature::target)
         .expect("the successful call selects an instantiated signature");
     let instantiated = store
         .signatures()

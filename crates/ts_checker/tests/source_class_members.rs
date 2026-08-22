@@ -550,6 +550,7 @@ fn anonymous_class_declaration_is_unsupported_before_class_planning() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // Class values, instances, and constructors share one identity.
 fn public_class_member_query_materializes_both_sides_and_default_constructor() {
     let parsed = parse_source_file(SOURCE);
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);

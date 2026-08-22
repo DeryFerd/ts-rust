@@ -178,7 +178,7 @@ fn direct_export_symbol(
     let exports = context
         .store()
         .symbol(module)
-        .and_then(|symbol| symbol.exports())
+        .and_then(ts_binder::semantic::Symbol::exports)
         .expect("external module has an export table");
     context
         .store()
@@ -249,8 +249,8 @@ fn two_hop_renamed_value_and_function_reexports_are_exact_and_warm_stable() {
         "export function originalTake(value: number): number { return value; }",
     ));
     let consumer_file = FileId::new(0);
-    let barrel_b_file = FileId::new(1);
-    let barrel_a_file = FileId::new(2);
+    let public_barrel_file = FileId::new(1);
+    let intermediate_barrel_file = FileId::new(2);
     let base_file = FileId::new(3);
     let sources = [
         Source {
@@ -260,12 +260,12 @@ fn two_hop_renamed_value_and_function_reexports_are_exact_and_warm_stable() {
         },
         Source {
             parsed: &barrel_b,
-            file: barrel_b_file,
+            file: public_barrel_file,
             path: "\"/project/barrel-b.ts\"",
         },
         Source {
             parsed: &barrel_a,
-            file: barrel_a_file,
+            file: intermediate_barrel_file,
             path: "\"/project/barrel-a.ts\"",
         },
         Source {
@@ -305,19 +305,19 @@ fn two_hop_renamed_value_and_function_reexports_are_exact_and_warm_stable() {
     );
     let public_value = bound_symbol(
         &context,
-        named_reexport_binding(&barrel_b, barrel_b_file, "publicValue"),
+        named_reexport_binding(&barrel_b, public_barrel_file, "publicValue"),
     );
     let public_take = bound_symbol(
         &context,
-        named_reexport_binding(&barrel_b, barrel_b_file, "publicTake"),
+        named_reexport_binding(&barrel_b, public_barrel_file, "publicTake"),
     );
     let middle_value = bound_symbol(
         &context,
-        named_reexport_binding(&barrel_a, barrel_a_file, "middleValue"),
+        named_reexport_binding(&barrel_a, intermediate_barrel_file, "middleValue"),
     );
     let middle_take = bound_symbol(
         &context,
-        named_reexport_binding(&barrel_a, barrel_a_file, "middleTake"),
+        named_reexport_binding(&barrel_a, intermediate_barrel_file, "middleTake"),
     );
     let original_value = direct_export_symbol(&context, base_file, "originalValue");
     let original_take = direct_export_symbol(&context, base_file, "originalTake");
@@ -341,8 +341,8 @@ fn two_hop_renamed_value_and_function_reexports_are_exact_and_warm_stable() {
         "Type 'number' is not assignable to type 'string'."
     );
     assert!(source_is_checked(&context, consumer_file));
-    assert!(!source_is_checked(&context, barrel_b_file));
-    assert!(!source_is_checked(&context, barrel_a_file));
+    assert!(!source_is_checked(&context, public_barrel_file));
+    assert!(!source_is_checked(&context, intermediate_barrel_file));
     assert!(!source_is_checked(&context, base_file));
 
     assert_alias_chain(&context, imported_value, public_value, original_value, None);
@@ -352,17 +352,17 @@ fn two_hop_renamed_value_and_function_reexports_are_exact_and_warm_stable() {
     assert_lazy_alias_target(&context, middle_value, original_value, None);
     assert_lazy_alias_target(&context, middle_take, original_take, None);
 
-    context.check_source_file(barrel_b_file).unwrap();
-    assert!(source_is_checked(&context, barrel_b_file));
-    assert!(!source_is_checked(&context, barrel_a_file));
+    context.check_source_file(public_barrel_file).unwrap();
+    assert!(source_is_checked(&context, public_barrel_file));
+    assert!(!source_is_checked(&context, intermediate_barrel_file));
     assert!(!source_is_checked(&context, base_file));
     assert_alias_chain(&context, public_value, middle_value, original_value, None);
     assert_alias_chain(&context, public_take, middle_take, original_take, None);
     assert_lazy_alias_target(&context, middle_value, original_value, None);
     assert_lazy_alias_target(&context, middle_take, original_take, None);
 
-    context.check_source_file(barrel_a_file).unwrap();
-    assert!(source_is_checked(&context, barrel_a_file));
+    context.check_source_file(intermediate_barrel_file).unwrap();
+    assert!(source_is_checked(&context, intermediate_barrel_file));
     assert!(!source_is_checked(&context, base_file));
     assert_alias_chain(&context, middle_value, original_value, original_value, None);
     assert_alias_chain(&context, middle_take, original_take, original_take, None);
@@ -376,7 +376,12 @@ fn two_hop_renamed_value_and_function_reexports_are_exact_and_warm_stable() {
         context.store().mapper_len(),
         context.store().signature_len(),
     );
-    for file in [consumer_file, barrel_b_file, barrel_a_file, base_file] {
+    for file in [
+        consumer_file,
+        public_barrel_file,
+        intermediate_barrel_file,
+        base_file,
+    ] {
         context.check_source_file(file).unwrap();
     }
     assert_eq!(
@@ -403,8 +408,8 @@ fn transitive_type_only_reexport_markers_preserve_annotation_checking() {
     let barrel_a = parse_source_file("export type { Model as IntermediateModel } from './base';");
     let base = parse_source_file("export type Model = { id: number };");
     let consumer_file = FileId::new(10);
-    let barrel_b_file = FileId::new(11);
-    let barrel_a_file = FileId::new(12);
+    let public_barrel_file = FileId::new(11);
+    let intermediate_barrel_file = FileId::new(12);
     let base_file = FileId::new(13);
     let sources = [
         Source {
@@ -414,12 +419,12 @@ fn transitive_type_only_reexport_markers_preserve_annotation_checking() {
         },
         Source {
             parsed: &barrel_b,
-            file: barrel_b_file,
+            file: public_barrel_file,
             path: "\"/project/type-barrel-b.ts\"",
         },
         Source {
             parsed: &barrel_a,
-            file: barrel_a_file,
+            file: intermediate_barrel_file,
             path: "\"/project/type-barrel-a.ts\"",
         },
         Source {
@@ -450,11 +455,13 @@ fn transitive_type_only_reexport_markers_preserve_annotation_checking() {
     );
 
     let consumer_binding = named_import_binding(&consumer, consumer_file, "LocalModel");
-    let barrel_b_binding = named_reexport_binding(&barrel_b, barrel_b_file, "PublicModel");
-    let barrel_a_binding = named_reexport_binding(&barrel_a, barrel_a_file, "IntermediateModel");
+    let public_reexport_binding =
+        named_reexport_binding(&barrel_b, public_barrel_file, "PublicModel");
+    let intermediate_reexport_binding =
+        named_reexport_binding(&barrel_a, intermediate_barrel_file, "IntermediateModel");
     let imported_model = bound_symbol(&context, consumer_binding);
-    let public_model = bound_symbol(&context, barrel_b_binding);
-    let intermediate_model = bound_symbol(&context, barrel_a_binding);
+    let public_model = bound_symbol(&context, public_reexport_binding);
+    let intermediate_model = bound_symbol(&context, intermediate_reexport_binding);
     let model = direct_export_symbol(&context, base_file, "Model");
 
     context.check_source_file(consumer_file).unwrap();
@@ -469,8 +476,8 @@ fn transitive_type_only_reexport_markers_preserve_annotation_checking() {
         [2322]
     );
     assert!(source_is_checked(&context, consumer_file));
-    assert!(!source_is_checked(&context, barrel_b_file));
-    assert!(!source_is_checked(&context, barrel_a_file));
+    assert!(!source_is_checked(&context, public_barrel_file));
+    assert!(!source_is_checked(&context, intermediate_barrel_file));
     assert!(!source_is_checked(&context, base_file));
     assert_alias_chain(
         &context,
@@ -479,8 +486,18 @@ fn transitive_type_only_reexport_markers_preserve_annotation_checking() {
         model,
         Some(consumer_binding),
     );
-    assert_lazy_alias_target(&context, public_model, model, Some(barrel_a_binding));
-    assert_lazy_alias_target(&context, intermediate_model, model, Some(barrel_a_binding));
+    assert_lazy_alias_target(
+        &context,
+        public_model,
+        model,
+        Some(intermediate_reexport_binding),
+    );
+    assert_lazy_alias_target(
+        &context,
+        intermediate_model,
+        model,
+        Some(intermediate_reexport_binding),
+    );
     assert!(context.store().value_symbol_links(imported_model).is_none());
     assert!(context.store().value_symbol_links(public_model).is_none());
     assert!(
@@ -490,28 +507,33 @@ fn transitive_type_only_reexport_markers_preserve_annotation_checking() {
             .is_none()
     );
 
-    context.check_source_file(barrel_b_file).unwrap();
-    assert!(source_is_checked(&context, barrel_b_file));
-    assert!(!source_is_checked(&context, barrel_a_file));
+    context.check_source_file(public_barrel_file).unwrap();
+    assert!(source_is_checked(&context, public_barrel_file));
+    assert!(!source_is_checked(&context, intermediate_barrel_file));
     assert!(!source_is_checked(&context, base_file));
     assert_alias_chain(
         &context,
         public_model,
         intermediate_model,
         model,
-        Some(barrel_a_binding),
+        Some(intermediate_reexport_binding),
     );
-    assert_lazy_alias_target(&context, intermediate_model, model, Some(barrel_a_binding));
+    assert_lazy_alias_target(
+        &context,
+        intermediate_model,
+        model,
+        Some(intermediate_reexport_binding),
+    );
 
-    context.check_source_file(barrel_a_file).unwrap();
-    assert!(source_is_checked(&context, barrel_a_file));
+    context.check_source_file(intermediate_barrel_file).unwrap();
+    assert!(source_is_checked(&context, intermediate_barrel_file));
     assert!(!source_is_checked(&context, base_file));
     assert_alias_chain(
         &context,
         intermediate_model,
         model,
         model,
-        Some(barrel_a_binding),
+        Some(intermediate_reexport_binding),
     );
 
     context.check_source_file(base_file).unwrap();
@@ -521,7 +543,12 @@ fn transitive_type_only_reexport_markers_preserve_annotation_checking() {
         context.store().mapper_len(),
         context.store().signature_len(),
     );
-    for file in [consumer_file, barrel_b_file, barrel_a_file, base_file] {
+    for file in [
+        consumer_file,
+        public_barrel_file,
+        intermediate_barrel_file,
+        base_file,
+    ] {
         context.check_source_file(file).unwrap();
     }
     assert_eq!(
@@ -556,8 +583,8 @@ fn mixed_default_and_named_imports_follow_renamed_default_reexports() {
         "export const originalLabel: string = 'ready';",
     ));
     let consumer_file = FileId::new(30);
-    let barrel_b_file = FileId::new(31);
-    let barrel_a_file = FileId::new(32);
+    let public_barrel_file = FileId::new(31);
+    let intermediate_barrel_file = FileId::new(32);
     let base_file = FileId::new(33);
     let sources = [
         Source {
@@ -567,12 +594,12 @@ fn mixed_default_and_named_imports_follow_renamed_default_reexports() {
         },
         Source {
             parsed: &barrel_b,
-            file: barrel_b_file,
+            file: public_barrel_file,
             path: "\"/project/default-barrel-b.ts\"",
         },
         Source {
             parsed: &barrel_a,
-            file: barrel_a_file,
+            file: intermediate_barrel_file,
             path: "\"/project/default-barrel-a.ts\"",
         },
         Source {
@@ -613,10 +640,10 @@ fn mixed_default_and_named_imports_follow_renamed_default_reexports() {
         &context,
         named_import_binding(&consumer, consumer_file, "value"),
     );
-    let public_default = direct_export_symbol(&context, barrel_b_file, "default");
-    let public_value = direct_export_symbol(&context, barrel_b_file, "forwarded");
-    let middle_default = direct_export_symbol(&context, barrel_a_file, "default");
-    let middle_label = direct_export_symbol(&context, barrel_a_file, "label");
+    let public_default = direct_export_symbol(&context, public_barrel_file, "default");
+    let public_value = direct_export_symbol(&context, public_barrel_file, "forwarded");
+    let middle_default = direct_export_symbol(&context, intermediate_barrel_file, "default");
+    let middle_label = direct_export_symbol(&context, intermediate_barrel_file, "label");
     let original_value = direct_export_symbol(&context, base_file, "originalValue");
     let original_label = direct_export_symbol(&context, base_file, "originalLabel");
 
@@ -630,8 +657,8 @@ fn mixed_default_and_named_imports_follow_renamed_default_reexports() {
             .collect::<Vec<_>>(),
         [2322]
     );
-    assert!(!source_is_checked(&context, barrel_b_file));
-    assert!(!source_is_checked(&context, barrel_a_file));
+    assert!(!source_is_checked(&context, public_barrel_file));
+    assert!(!source_is_checked(&context, intermediate_barrel_file));
     assert!(!source_is_checked(&context, base_file));
     assert_alias_chain(
         &context,
@@ -653,7 +680,7 @@ fn mixed_default_and_named_imports_follow_renamed_default_reexports() {
     assert_lazy_alias_target(&context, middle_default, original_value, None);
     assert_lazy_alias_target(&context, middle_label, original_label, None);
 
-    for file in [barrel_b_file, barrel_a_file, base_file] {
+    for file in [public_barrel_file, intermediate_barrel_file, base_file] {
         context.check_source_file(file).unwrap();
     }
     assert_alias_chain(&context, public_default, middle_label, original_label, None);
@@ -672,7 +699,12 @@ fn mixed_default_and_named_imports_follow_renamed_default_reexports() {
         context.store().mapper_len(),
         context.store().signature_len(),
     );
-    for file in [consumer_file, barrel_b_file, barrel_a_file, base_file] {
+    for file in [
+        consumer_file,
+        public_barrel_file,
+        intermediate_barrel_file,
+        base_file,
+    ] {
         context.check_source_file(file).unwrap();
     }
     assert_eq!(

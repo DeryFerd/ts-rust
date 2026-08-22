@@ -33,6 +33,7 @@ fn context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // One overload graph proves ordering and both relation passes.
 fn declared_call_sets_reorder_literals_and_run_subtype_then_assignable() {
     let parsed = parse_source_file(concat!(
         "interface Ordered { ",

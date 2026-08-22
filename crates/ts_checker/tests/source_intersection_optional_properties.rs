@@ -567,6 +567,7 @@ fn optional_never_discriminants_do_not_reduce_their_intersection() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // One graph compares successful and rejected composite merges.
 fn duplicate_composite_rejection_is_atomic_and_success_cannot_mask_boundaries() {
     let source = concat!(
         "type NestedOne = { leaf: string };\n",

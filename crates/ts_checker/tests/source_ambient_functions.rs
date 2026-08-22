@@ -252,7 +252,7 @@ fn ambient_function_is_one_hoisted_callable_in_scripts_and_external_modules() {
             context
                 .store()
                 .signature(declaration_signature)
-                .and_then(|signature| signature.resolved_return_type()),
+                .and_then(ts_checker::semantic::signatures::Signature::resolved_return_type),
             Some(string)
         );
         for call in [*before, *after] {
@@ -295,7 +295,7 @@ fn ambient_function_is_one_hoisted_callable_in_scripts_and_external_modules() {
             context
                 .store()
                 .signature(declaration_signature)
-                .and_then(|signature| signature.resolved_return_type()),
+                .and_then(ts_checker::semantic::signatures::Signature::resolved_return_type),
             [*before, *after].map(|call| {
                 let callee = call_callee(&parsed, file, call);
                 (
@@ -324,7 +324,7 @@ fn ambient_function_is_one_hoisted_callable_in_scripts_and_external_modules() {
                 context
                     .store()
                     .signature(declaration_signature)
-                    .and_then(|signature| signature.resolved_return_type()),
+                    .and_then(ts_checker::semantic::signatures::Signature::resolved_return_type),
                 [*before, *after].map(|call| {
                     let callee = call_callee(&parsed, file, call);
                     (

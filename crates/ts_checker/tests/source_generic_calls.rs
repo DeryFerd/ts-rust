@@ -99,6 +99,7 @@ fn nested_generic_calls_preserve_inference_and_inner_diagnostics() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // One identity graph proves inference and explicit type arguments.
 fn identity_generic_calls_infer_and_apply_explicit_type_arguments() {
     let parsed = parse_source_file(concat!(
         "type User = { id: number }; ",

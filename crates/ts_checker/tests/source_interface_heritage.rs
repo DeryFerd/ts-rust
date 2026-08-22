@@ -513,6 +513,7 @@ fn compatible_interface_overrides_replace_inherited_properties() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // Every heritage boundary must retain the same cold graph state.
 fn unsupported_interface_heritage_shapes_fail_before_semantic_publication() {
     let cases = [
         (

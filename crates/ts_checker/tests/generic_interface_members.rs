@@ -201,7 +201,7 @@ impl Fixture {
         let raw_members = self
             .store
             .symbol(target.owner)
-            .and_then(|symbol| symbol.members())
+            .and_then(ts_binder::semantic::Symbol::members)
             .expect("generic interface binder target has a raw member table");
         assert!(
             self.store.symbol_table(raw_members).unwrap().len() > interface.members.nodes.len(),
@@ -630,6 +630,7 @@ fn property_only_generic_interfaces_instantiate_recursively_and_replay_warm() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // Cache poisoning cases share one canonical member graph.
 fn poisoned_lazy_property_and_foreign_references_fail_closed() {
     let mut fixture = Fixture::new(
         "interface Box<T> { value: T; maybe?: T; tag: \"object\" }\n",
@@ -752,6 +753,7 @@ fn poisoned_lazy_property_and_foreign_references_fail_closed() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // Composite poison cases must preserve one atomic graph setup.
 fn poisoned_composite_property_caches_fail_before_materialization() {
     for property_name in ["items", "nested", "choice"] {
         let mut fixture = Fixture::new(
@@ -1101,6 +1103,7 @@ fn strict_optional_generic_properties_preserve_the_canonical_optional_sentinel()
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // One source proves member identity, reads, and assignability.
 fn production_source_checks_generic_interface_properties_and_assignability() {
     let parsed = parse_source_file(concat!(
         "interface Box<T> { value: T; readonly label: string }\n",

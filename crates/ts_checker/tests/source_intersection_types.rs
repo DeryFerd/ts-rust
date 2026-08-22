@@ -343,11 +343,11 @@ fn source_intersections_preserve_order_identity_properties_reduction_and_relatio
         .collect::<Vec<_>>();
     assert_eq!(names, ["a", "shared", "stable", "b"]);
 
-    let a_properties = structured_properties(&context, a);
+    let left_properties = structured_properties(&context, a);
     let b_properties = structured_properties(&context, b);
     assert_eq!(
         property_by_name(&context, ab_properties, "a"),
-        property_by_name(&context, &a_properties, "a"),
+        property_by_name(&context, &left_properties, "a"),
     );
     assert_eq!(
         property_by_name(&context, ab_properties, "b"),

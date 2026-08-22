@@ -39,6 +39,7 @@ struct Fixture {
 }
 
 impl Fixture {
+    #[allow(clippy::too_many_lines)] // Build the complete canonical mapped-type fixture together.
     fn new(options: IntrinsicBootstrapOptions) -> Self {
         let parsed = parse_source_file(SOURCE);
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);

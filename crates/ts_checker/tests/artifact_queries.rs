@@ -86,6 +86,7 @@ fn source_checked(context: &CanonicalCheckerContext<'_>, file: FileId) -> bool {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // One end-to-end case proves shared type and symbol identity.
 fn location_queries_check_once_and_reuse_exact_value_and_property_identities() {
     let parsed = parse_source_file(concat!(
         "const value: number = 1;\n",

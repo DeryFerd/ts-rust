@@ -235,6 +235,7 @@ fn whole_source_check_materializes_inherited_surfaces_and_replays_warm() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // Heritage, overloads, and warm replay use one shared class graph.
 fn direct_heritage_composes_with_local_ambient_overloads_and_replays_warm() {
     let parsed = parse_source_file(concat!(
         "class A { base?: string; static count: number; }\n",
@@ -472,6 +473,7 @@ fn forward_direct_base_is_a_repeatable_class_boundary_and_keeps_both_graphs_cold
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // One scenario validates base identities and both member tables.
 fn direct_class_base_materializes_both_identities_and_own_first_surfaces() {
     let parsed = parse_source_file(SOURCE);
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
@@ -731,14 +733,14 @@ fn unsupported_later_derived_annotation_rejects_before_base_or_derived_publicati
     let base_property = context
         .store()
         .symbol(base_symbol)
-        .and_then(|symbol| symbol.members())
+        .and_then(ts_binder::semantic::Symbol::members)
         .and_then(|members| context.store().symbol_table(members))
         .and_then(|members| members.get_source("base"))
         .expect("Base retains its declared property");
     let derived_first = context
         .store()
         .symbol(derived_symbol)
-        .and_then(|symbol| symbol.members())
+        .and_then(ts_binder::semantic::Symbol::members)
         .and_then(|members| context.store().symbol_table(members))
         .and_then(|members| members.get_source("first"))
         .expect("Derived retains its first declared property");

@@ -147,6 +147,7 @@ fn is_type_checked(context: &CanonicalCheckerContext<'_>, file: FileId) -> bool 
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // One operator matrix proves diagnostics and warm cache identity.
 fn source_binary_operators_preserve_types_diagnostics_and_warm_replay() {
     let parsed = parse_source_file(SOURCE);
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
@@ -369,6 +370,7 @@ fn nested_kernel_recoveries_remain_exact_and_clear_after_downstream_resolution()
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // One source proves assignment and call recovery together.
 fn assignment_and_call_roots_preserve_recovery_call_relations_and_warm_replay() {
     let parsed = parse_source_file(POSITION_SOURCE);
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);

@@ -304,6 +304,7 @@ fn inherited_property_call_reuses_the_base_member_cold_and_warm() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // All unsupported call families share one publication check.
 fn unsupported_property_call_families_fail_closed_without_call_publication() {
     let fixtures = [
         (

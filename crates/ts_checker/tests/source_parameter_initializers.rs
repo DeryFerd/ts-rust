@@ -108,6 +108,7 @@ fn resolved_type(context: &CanonicalCheckerContext<'_>, node: NodeRef) -> TypeId
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // One source checks assignment, scope, calls, and warm identity.
 fn default_parameter_initializers_check_assignability_scope_calls_and_warm_state() {
     let parsed = parse_source_file(SOURCE);
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);

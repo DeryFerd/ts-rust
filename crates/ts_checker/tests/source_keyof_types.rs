@@ -147,6 +147,7 @@ fn union_parts(
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // The complete keyof matrix shares one canonical source graph.
 fn source_keyof_aliases_preserve_canonical_keys_origins_and_warm_caches() {
     let parsed = parse_source_file(SOURCE);
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
@@ -245,7 +246,7 @@ fn source_keyof_aliases_preserve_canonical_keys_origins_and_warm_caches() {
     assert_eq!(table.declared_index_infos.as_deref().unwrap().len(), 1);
     assert_eq!(type_of("KN"), next);
 
-    for (_, (alias, rhs)) in &aliases {
+    for (alias, rhs) in aliases.values() {
         assert_eq!(
             context
                 .store()

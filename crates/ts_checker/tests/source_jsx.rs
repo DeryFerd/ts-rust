@@ -136,6 +136,7 @@ const NAMESPACE: &str = concat!(
 );
 
 #[test]
+#[allow(clippy::too_many_lines)] // JSX namespace, property, and attribute links share one graph.
 fn intrinsic_jsx_reuses_namespace_property_signature_and_attribute_links() {
     let source = format!("{NAMESPACE}const view = <div label=\"ok\" enabled />;\n");
     let mut fixture = Fixture::new(&source, FileId::new(3_700));

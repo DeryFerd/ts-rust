@@ -116,6 +116,7 @@ fn assert_direct_reference(
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // One graph proves cold and warm generic reference identities.
 fn local_generic_class_and_interface_references_share_exact_cold_and_warm_identities() {
     let parsed = parse_source_file(concat!(
         "interface Box<T> {}\n",

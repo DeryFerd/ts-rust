@@ -172,7 +172,7 @@ fn declared_left_right_both_properties_preserve_identity_provenance_and_warm_cac
         both_record
             .alias()
             .and_then(|alias| context.store().type_alias(alias))
-            .and_then(|alias| alias.symbol()),
+            .and_then(ts_checker::semantic::type_records::TypeAlias::symbol),
         Some(both_symbol)
     );
 
@@ -328,7 +328,7 @@ fn declared_left_right_both_properties_preserve_identity_provenance_and_warm_cac
         after_record
             .alias()
             .and_then(|alias| context.store().type_alias(alias))
-            .and_then(|alias| alias.symbol()),
+            .and_then(ts_checker::semantic::type_records::TypeAlias::symbol),
         Some(both_symbol)
     );
     assert!(
