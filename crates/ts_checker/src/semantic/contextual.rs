@@ -215,6 +215,23 @@ fn preflight_contextual_type_graph(
                     visiting,
                 );
             }
+            let tuple_elements = store
+                .canonical_tuple_shape(contextual_type)
+                .map_err(|_| RelationUnavailable::InvalidStructuredMembers(contextual_type))?
+                .map(|shape| shape.element_types().to_vec());
+            if let Some(tuple_elements) = tuple_elements {
+                for element in tuple_elements {
+                    preflight_contextual_type_graph(
+                        store,
+                        host,
+                        global_types,
+                        element,
+                        validated,
+                        visiting,
+                    )?;
+                }
+                return Ok(());
+            }
             let contextual = store
                 .resolved_declared_property_object(host, contextual_type)?
                 .ok_or(RelationUnavailable::UnsupportedStructuredType(
@@ -326,15 +343,39 @@ fn prepare_expression(
                 }
                 _ => None,
             };
+            let tuple_context = contextual_type
+                .map(|contextual_type| {
+                    store
+                        .canonical_tuple_shape(contextual_type)
+                        .map_err(|_| RelationUnavailable::InvalidStructuredMembers(contextual_type))
+                        .map(|shape| {
+                            shape.map(|shape| {
+                                (
+                                    shape.element_types().to_vec(),
+                                    shape.element_infos().last().is_some_and(|info| {
+                                        info.flags().contains(super::signatures::ElementFlags::REST)
+                                    }),
+                                )
+                            })
+                        })
+                })
+                .transpose()?
+                .flatten();
             let mut prepared = Vec::with_capacity(elements.len());
-            for element in elements {
+            for (index, element) in elements.iter().enumerate() {
+                let positional_context = tuple_context.as_ref().and_then(|(types, has_rest)| {
+                    types
+                        .get(index)
+                        .copied()
+                        .or_else(|| has_rest.then(|| types.last().copied()).flatten())
+                });
                 prepared.push(prepare_expression(
                     store,
                     host,
                     global_types,
                     current_flow_types,
                     element,
-                    element_context,
+                    positional_context.or(element_context),
                     ExpressionLocation::Mutable,
                 )?);
             }
@@ -742,7 +783,7 @@ mod tests {
     use super::*;
     use crate::semantic::{
         CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions,
-        types::ObjectFlags,
+        signatures::ElementFlags, tuple_types::CanonicalTupleTypeRequest, types::ObjectFlags,
     };
 
     fn initialized() -> CanonicalTypeMapperStore {
@@ -936,6 +977,60 @@ mod tests {
                 store.checker_link_allocated_lengths(),
             ),
             before
+        );
+    }
+
+    #[test]
+    fn tuple_context_preserves_each_array_element_literal_at_its_position() {
+        let mut store = initialized();
+        let host = DeclaredTypeHost::new(std::iter::empty::<(
+            &ts_ast::NodeArena,
+            &ts_binder::BoundFile,
+        )>())
+        .unwrap();
+        let string_literal = store
+            .regular_string_literal_type("expected".into())
+            .unwrap();
+        let number_literal = store
+            .regular_number_literal_type(ts_jsnum::Number::new(2.0))
+            .unwrap();
+        let elements = [string_literal, number_literal];
+        let infos = [
+            store
+                .create_tuple_element_info(ElementFlags::REQUIRED, None)
+                .unwrap(),
+            store
+                .create_tuple_element_info(ElementFlags::REQUIRED, None)
+                .unwrap(),
+        ];
+        let tuple = store
+            .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(&elements, &infos, false))
+            .unwrap();
+        let arena = NodeArena::new();
+        let root = NodeRef::new(arena.id(), FileId::new(0), NodeId::new(0));
+        let expression = PlannedExpression::new(
+            root,
+            PlannedExpressionKind::Array(vec![
+                PlannedExpression::new(
+                    NodeRef::new(arena.id(), FileId::new(0), NodeId::new(1)),
+                    PlannedExpressionKind::String("actual".into()),
+                ),
+                PlannedExpression::new(
+                    NodeRef::new(arena.id(), FileId::new(0), NodeId::new(2)),
+                    PlannedExpressionKind::Number {
+                        value: ts_jsnum::Number::new(5.0),
+                        unary_operand: None,
+                    },
+                ),
+            ]),
+        );
+
+        assert_eq!(
+            prepare_expression_context(&mut store, &host, &expression, tuple),
+            Ok(PreparedExpression::Array(vec![
+                PreparedExpression::Literal(LiteralTreatment::Regular),
+                PreparedExpression::Literal(LiteralTreatment::Regular),
+            ])),
         );
     }
 

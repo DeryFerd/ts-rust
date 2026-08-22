@@ -3,6 +3,7 @@
 //! This is the dependency-closed expression prefix of pinned
 //! `checkElementAccessExpression` plus `getPropertyTypeForIndexType`. It
 //! supports canonical `any`, direct `Array<T>`/`ReadonlyArray<T>` references,
+//! validated fixed tuple elements,
 //! required own and shared union properties selected by string or number
 //! literals, primitive string indexing, resolved anonymous string/number index
 //! signatures, and finite unions of valid literal keys. Optional chains,
@@ -309,11 +310,13 @@ fn check_direct_source_element_worker(
     let any = bootstrap.any_type;
     let error = bootstrap.error_type;
     let string = bootstrap.string_type;
+    let undefined = bootstrap.undefined_type;
 
     let mut resolutions = Vec::with_capacity(indices.len());
     for index in &indices {
         let resolution = resolve_element_index(
             store,
+            global_types,
             array_targets,
             plan,
             receiver_type,
@@ -321,6 +324,7 @@ fn check_direct_source_element_worker(
             any,
             error,
             string,
+            undefined,
         )?;
         if indices.len() != 1 && resolution.diagnostic.is_some() {
             return Err(SourceElementError::Unsupported(
@@ -379,6 +383,7 @@ fn check_direct_source_element_worker(
 #[allow(clippy::too_many_arguments)]
 fn resolve_element_index(
     store: &mut CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
     array_targets: CanonicalArrayTargets,
     plan: &SourceElementPlan,
     receiver_type: TypeId,
@@ -386,6 +391,7 @@ fn resolve_element_index(
     any: TypeId,
     error: TypeId,
     string: TypeId,
+    undefined: TypeId,
 ) -> Result<ElementResolution, SourceElementError> {
     Ok(if matches!(index.shape, IndexShape::Invalid) {
         ElementResolution::diagnostic(error, ElementDiagnostic::InvalidIndexType)
@@ -401,6 +407,8 @@ fn resolve_element_index(
         } else {
             ElementResolution::diagnostic(error, ElementDiagnostic::InvalidIndexType)
         }
+    } else if let Some(tuple) = resolve_tuple_element(store, receiver_type, index, undefined)? {
+        tuple
     } else if is_string_receiver(store, receiver_type)? {
         if index.is_number_applicable() {
             ElementResolution::success(string, None)
@@ -410,7 +418,7 @@ fn resolve_element_index(
             ElementResolution::diagnostic(error, ElementDiagnostic::InvalidIndexType)
         }
     } else {
-        resolve_object_element(store, plan, receiver_type, index, any, error)?
+        resolve_object_element(store, global_types, plan, receiver_type, index, any, error)?
     })
 }
 
@@ -587,6 +595,8 @@ enum ElementDiagnostic {
     InvalidIndexType,
     MissingLiteralProperty,
     MissingBroadIndex,
+    NegativeTupleIndex,
+    TupleIndexOutOfBounds { length: usize, index: usize },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -614,8 +624,56 @@ impl ElementResolution {
     }
 }
 
+fn resolve_tuple_element(
+    store: &CanonicalTypeMapperStore,
+    receiver_type: TypeId,
+    index: &ClassifiedIndex,
+    undefined: TypeId,
+) -> Result<Option<ElementResolution>, SourceElementError> {
+    let Some(shape) = store
+        .canonical_tuple_shape(receiver_type)
+        .map_err(|_| SourceElementError::InvalidType(receiver_type))?
+    else {
+        return Ok(None);
+    };
+    let Some(name) = index.property_name.as_deref() else {
+        return Ok(None);
+    };
+    if !matches!(index.shape, IndexShape::Literal { numeric_name: true }) {
+        return Ok(None);
+    }
+    if name.starts_with('-') {
+        return Ok(Some(ElementResolution::diagnostic(
+            undefined,
+            ElementDiagnostic::NegativeTupleIndex,
+        )));
+    }
+    let Ok(position) = name.parse::<usize>() else {
+        return Ok(None);
+    };
+    if let Some(element) = shape.element_types().get(position).copied() {
+        return Ok(Some(ElementResolution::success(element, None)));
+    }
+    if shape
+        .element_infos()
+        .last()
+        .is_some_and(|info| info.flags().contains(super::signatures::ElementFlags::REST))
+        && let Some(element) = shape.element_types().last().copied()
+    {
+        return Ok(Some(ElementResolution::success(element, None)));
+    }
+    Ok(Some(ElementResolution::diagnostic(
+        undefined,
+        ElementDiagnostic::TupleIndexOutOfBounds {
+            length: shape.element_types().len(),
+            index: position,
+        },
+    )))
+}
+
 fn resolve_object_element(
     store: &mut CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
     plan: &SourceElementPlan,
     receiver_type: TypeId,
     index: &ClassifiedIndex,
@@ -649,18 +707,15 @@ fn resolve_object_element(
         }
         match store.resolved_own_property(receiver_type, name) {
             Ok(Some(property)) => {
-                if property.optional {
-                    return Err(SourceElementError::Unsupported(
-                        SourceElementUnsupported::OptionalProperty {
-                            node: plan.node,
-                            property: property.symbol,
-                        },
-                    ));
-                }
-                return Ok(ElementResolution::success(
+                let type_ = optional_element_read_type(
+                    store,
+                    global_types,
+                    plan.node,
+                    property.symbol,
                     property.type_,
-                    Some(property.symbol),
-                ));
+                    property.optional,
+                )?;
+                return Ok(ElementResolution::success(type_, Some(property.symbol)));
             }
             Ok(None) | Err(RelationUnavailable::StructuredIndexInfos(_)) => {}
             Err(error) => return Err(error.into()),
@@ -706,6 +761,45 @@ fn resolve_object_element(
             ElementDiagnostic::MissingBroadIndex
         },
     ))
+}
+
+fn optional_element_read_type(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    node: NodeRef,
+    property: SemanticSymbolId,
+    type_: TypeId,
+    optional: bool,
+) -> Result<TypeId, SourceElementError> {
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(RelationUnavailable::MissingBootstrap)?;
+    if !optional || !bootstrap.options.strict_null_checks {
+        return Ok(type_);
+    }
+    let undefined = bootstrap.undefined_or_missing_type;
+    if let Some(global_types) = global_types {
+        return store
+            .expression_union_type_with_global_types(
+                global_types,
+                &[type_, undefined],
+                UnionReduction::Literal,
+            )
+            .map_err(Into::into);
+    }
+    #[cfg(test)]
+    {
+        let _ = (node, property);
+        store
+            .expression_union_type(&[type_, undefined], UnionReduction::Literal)
+            .map_err(Into::into)
+    }
+    #[cfg(not(test))]
+    {
+        Err(SourceElementError::Unsupported(
+            SourceElementUnsupported::OptionalProperty { node, property },
+        ))
+    }
 }
 
 fn union_property_error(
@@ -928,7 +1022,14 @@ fn prepare_element_diagnostic(
     let Some(kind) = kind else {
         return Ok(None);
     };
-    if !options.no_implicit_any && !matches!(kind, ElementDiagnostic::InvalidIndexType) {
+    if !options.no_implicit_any
+        && !matches!(
+            kind,
+            ElementDiagnostic::InvalidIndexType
+                | ElementDiagnostic::NegativeTupleIndex
+                | ElementDiagnostic::TupleIndexOutOfBounds { .. }
+        )
+    {
         return Ok(None);
     }
     let diagnostic = match kind {
@@ -952,6 +1053,27 @@ fn prepare_element_diagnostic(
                     options,
                     index_type,
                 )?],
+            ),
+            related_information: Vec::new(),
+        },
+        ElementDiagnostic::NegativeTupleIndex => CanonicalCheckerDiagnostic {
+            node: Some(plan.index.node),
+            range_override: None,
+            diagnostic: Diagnostic::new(
+                message_by_code(2514).ok_or(SourceElementError::MissingDiagnostic(2514))?,
+            ),
+            related_information: Vec::new(),
+        },
+        ElementDiagnostic::TupleIndexOutOfBounds { length, index } => CanonicalCheckerDiagnostic {
+            node: Some(plan.index.node),
+            range_override: None,
+            diagnostic: Diagnostic::with_arguments(
+                message_by_code(2493).ok_or(SourceElementError::MissingDiagnostic(2493))?,
+                [
+                    display_type(store, host, global_types, options, receiver_type)?,
+                    length.to_string(),
+                    index.to_string(),
+                ],
             ),
             related_information: Vec::new(),
         },
@@ -1085,7 +1207,9 @@ mod tests {
         DeclaredTypeLinks, IntrinsicBootstrapOptions, ValueSymbolLinks,
         declared::type_list_key,
         global_types::create_type_from_generic_global_type,
+        signatures::ElementFlags,
         source::{PlannedExpressionKind, PlannedIdentifierRead, PlannedIdentifierReadKind},
+        tuple_types::CanonicalTupleTypeRequest,
     };
 
     fn parse_fixture(text: &str) -> ParseResult {
@@ -1388,6 +1512,50 @@ mod tests {
     }
 
     #[test]
+    fn optional_literal_property_reads_include_undefined_under_strict_null_checks() {
+        let parsed = parse_fixture("const result = object[\"value\"];");
+        let file = FileId::new(614);
+        let mut store = registered_store(&parsed, file);
+        let (string, undefined) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.undefined_or_missing_type)
+        };
+        let index = store.regular_string_literal_type("value".into()).unwrap();
+        let (object, property) = property_object(&mut store, "value", string, true);
+        let receiver_symbol =
+            alloc_symbol(&mut store, SymbolFlags::BLOCK_SCOPED_VARIABLE, "object");
+        let plan = source_plan(
+            &parsed,
+            file,
+            &store,
+            PlannedExpressionKind::String("value".into()),
+            receiver_symbol,
+        );
+
+        let checked = check_direct_source_element_with_array_targets(
+            &mut store,
+            &empty_host(),
+            CanonicalArrayTargets::for_single_target_validation(object),
+            strict_options(),
+            &plan,
+            object,
+            index,
+        )
+        .unwrap();
+        let TypeData::Union(union) = store.type_payload(checked.type_).unwrap().data() else {
+            panic!("strict optional property access must produce a union")
+        };
+        assert!(union.union.types.contains(&string));
+        assert!(union.union.types.contains(&undefined));
+        assert_eq!(
+            store
+                .symbol_node_links(plan.node)
+                .and_then(|links| links.resolved_symbol),
+            Some(property),
+        );
+    }
+
+    #[test]
     fn array_number_reads_return_the_element_and_wrong_strings_emit_ts7015() {
         let parsed = parse_fixture("const first = array[0];");
         let file = FileId::new(602);
@@ -1469,6 +1637,107 @@ mod tests {
             "Element implicitly has an 'any' type because index expression is not of type 'number'."
         );
         assert_eq!(string, store.intrinsic_bootstrap().unwrap().string_type);
+    }
+
+    #[test]
+    fn fixed_tuple_indices_return_the_exact_positional_element() {
+        let parsed = parse_fixture("const result = tuple[1];");
+        let file = FileId::new(612);
+        let mut store = registered_store(&parsed, file);
+        let (string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let elements = [string, number];
+        let infos = [
+            store
+                .create_tuple_element_info(ElementFlags::REQUIRED, None)
+                .unwrap(),
+            store
+                .create_tuple_element_info(ElementFlags::REQUIRED, None)
+                .unwrap(),
+        ];
+        let tuple = store
+            .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(&elements, &infos, false))
+            .unwrap();
+        let array_target = canonical_array_target(&mut store);
+        let receiver_symbol = alloc_symbol(&mut store, SymbolFlags::BLOCK_SCOPED_VARIABLE, "tuple");
+        let one = store
+            .regular_number_literal_type(ts_jsnum::Number::new(1.0))
+            .unwrap();
+        let plan = source_plan(
+            &parsed,
+            file,
+            &store,
+            PlannedExpressionKind::Number {
+                value: ts_jsnum::Number::new(1.0),
+                unary_operand: None,
+            },
+            receiver_symbol,
+        );
+
+        assert_eq!(
+            check_direct_source_element_with_array_targets(
+                &mut store,
+                &empty_host(),
+                CanonicalArrayTargets::for_test(array_target, array_target),
+                strict_options(),
+                &plan,
+                tuple,
+                one,
+            ),
+            Ok(CheckedSourceElement {
+                type_: number,
+                diagnostic: None,
+            }),
+        );
+    }
+
+    #[test]
+    fn fixed_tuple_out_of_bounds_indices_emit_ts2493_without_no_implicit_any() {
+        let parsed = parse_fixture("const result = tuple[2];");
+        let file = FileId::new(613);
+        let mut store = registered_store(&parsed, file);
+        let (string, undefined) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.undefined_type)
+        };
+        let info = store
+            .create_tuple_element_info(ElementFlags::REQUIRED, None)
+            .unwrap();
+        let tuple = store
+            .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(&[string], &[info], false))
+            .unwrap();
+        let array_target = canonical_array_target(&mut store);
+        let receiver_symbol = alloc_symbol(&mut store, SymbolFlags::BLOCK_SCOPED_VARIABLE, "tuple");
+        let two = store
+            .regular_number_literal_type(ts_jsnum::Number::new(2.0))
+            .unwrap();
+        let plan = source_plan(
+            &parsed,
+            file,
+            &store,
+            PlannedExpressionKind::Number {
+                value: ts_jsnum::Number::new(2.0),
+                unary_operand: None,
+            },
+            receiver_symbol,
+        );
+
+        let checked = check_direct_source_element_with_array_targets(
+            &mut store,
+            &empty_host(),
+            CanonicalArrayTargets::for_test(array_target, array_target),
+            CanonicalCheckerOptions::default(),
+            &plan,
+            tuple,
+            two,
+        )
+        .unwrap();
+        assert_eq!(checked.type_, undefined);
+        let diagnostic = checked.diagnostic.unwrap();
+        assert_eq!(diagnostic.node, Some(plan.index.node));
+        assert_eq!(diagnostic.diagnostic.code(), 2493);
     }
 
     #[test]

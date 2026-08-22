@@ -1,6 +1,6 @@
-//! Exact source integration for one direct `identifier.name` read.
+//! Exact source integration for direct and chained property reads.
 //!
-//! The receiver must already have a canonical `any` type or belong to the
+//! The recursively planned receiver must already have a canonical `any` type or belong to the
 //! validated own-property object domain in `relater`. Exact two-constituent
 //! unions of source-declared type literals reuse the canonical union-property
 //! adapter. A property missing from any union constituent recovers with
@@ -21,7 +21,7 @@ use super::{
     SymbolNodeLinks, TypeDisplayUnavailable, TypeId, TypeNodeLinks,
     formatter::type_to_string_with_host_global_types_and_flags,
     member_resolution::UnionPropertyError,
-    source::{PlannedExpression, PlannedExpressionKind},
+    source::PlannedExpression,
     spelling::get_spelling_suggestion,
     type_records::{TypeData, TypeRecord},
     types::TypeFlags,
@@ -173,7 +173,7 @@ impl SourcePropertyPlan {
 pub(super) struct SourcePropertyDiagnostic {
     name_node: NodeRef,
     receiver_type: TypeId,
-    missing_type: TypeId,
+    missing_type: Option<TypeId>,
     suggestion: Option<SemanticSymbolId>,
 }
 
@@ -197,8 +197,8 @@ enum CopiedMissingUnionProperty {
     Missing(TypeId),
 }
 
-/// Proves the exact `identifier.name` syntax and all existing access-cache
-/// shapes before source execution can publish semantic state.
+/// Proves property syntax and existing access caches before recursive receiver
+/// planning can publish semantic state.
 pub(super) fn plan_direct_source_property_syntax(
     arena: &NodeArena,
     store: &CanonicalTypeMapperStore,
@@ -281,11 +281,10 @@ fn plan_direct_source_property_syntax_at(
         return Err(unsupported_access(node));
     };
     if receiver_record.parent != Some(node.node)
-        || receiver_record.kind != SyntaxKind::Identifier
-        || receiver_record.flags.0 != 0
-        || !matches!(
+        || matches!(
             &receiver_record.data,
-            NodeData::Identifier(identifier) if identifier.flow_node.is_none()
+            NodeData::Identifier(identifier)
+                if receiver_record.flags.0 != 0 || identifier.flow_node.is_some()
         )
     {
         return Err(SourcePropertyError::Unsupported(
@@ -323,9 +322,7 @@ pub(super) fn finish_direct_source_property_plan(
     syntax: &DirectSourcePropertySyntax,
     receiver: PlannedExpression,
 ) -> Result<SourcePropertyPlan, SourcePropertyError> {
-    if receiver.node != syntax.receiver
-        || !matches!(receiver.kind, PlannedExpressionKind::Identifier(_))
-    {
+    if receiver.node != syntax.receiver {
         return Err(SourcePropertyError::Unsupported(
             SourcePropertyUnsupported::Receiver(syntax.receiver),
         ));
@@ -347,10 +344,6 @@ pub(super) fn check_direct_source_property(
     plan: &SourcePropertyPlan,
     receiver_type: TypeId,
 ) -> Result<CheckedSourceProperty, SourcePropertyError> {
-    debug_assert!(matches!(
-        plan.receiver.kind,
-        PlannedExpressionKind::Identifier(_)
-    ));
     let (any, error_type) = {
         let bootstrap = store
             .intrinsic_bootstrap()
@@ -438,29 +431,49 @@ pub(super) fn check_direct_source_property(
                 Some(SourcePropertyDiagnostic {
                     name_node: plan.name_node,
                     receiver_type,
-                    missing_type,
+                    missing_type: Some(missing_type),
                     suggestion,
                 }),
             )
         }
     } else {
-        let Some(property) = store.resolved_own_property(receiver_type, &plan.name)? else {
-            return Err(SourcePropertyError::Unsupported(
-                SourcePropertyUnsupported::MissingOwnProperty {
-                    node: plan.node,
-                    receiver_type,
-                },
-            ));
-        };
-        if property.optional {
-            return Err(SourcePropertyError::Unsupported(
-                SourcePropertyUnsupported::OptionalProperty {
-                    node: plan.node,
-                    property: property.symbol,
-                },
-            ));
+        match store.resolved_own_property(receiver_type, &plan.name)? {
+            Some(property) => {
+                if property.optional {
+                    return Err(SourcePropertyError::Unsupported(
+                        SourcePropertyUnsupported::OptionalProperty {
+                            node: plan.node,
+                            property: property.symbol,
+                        },
+                    ));
+                }
+                (property.type_, Some(property.symbol), None)
+            }
+            None => {
+                if !plan.is_read() {
+                    return Err(SourcePropertyError::Unsupported(
+                        SourcePropertyUnsupported::MissingOwnProperty {
+                            node: plan.node,
+                            receiver_type,
+                        },
+                    ));
+                }
+                (
+                    error_type,
+                    None,
+                    Some(SourcePropertyDiagnostic {
+                        name_node: plan.name_node,
+                        receiver_type,
+                        missing_type: None,
+                        suggestion: direct_property_spelling_suggestion(
+                            store,
+                            plan,
+                            receiver_type,
+                        )?,
+                    }),
+                )
+            }
         }
-        (property.type_, Some(property.symbol), None)
     };
 
     publish_property_links(store, plan.node, property, type_)?;
@@ -600,6 +613,38 @@ fn stable_property_spelling_suggestion(
     }
 }
 
+fn direct_property_spelling_suggestion(
+    store: &CanonicalTypeMapperStore,
+    plan: &SourcePropertyPlan,
+    receiver_type: TypeId,
+) -> Result<Option<SemanticSymbolId>, SourcePropertyError> {
+    let Some(members) = store
+        .type_payload(receiver_type)
+        .and_then(|record| record.data().structured())
+        .and_then(|structured| structured.members)
+    else {
+        return Ok(None);
+    };
+    let members = store
+        .symbol_table(members)
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    let mut candidates = Vec::new();
+    candidates
+        .try_reserve_exact(members.len())
+        .map_err(|_| SourcePropertyError::Capacity(plan.node))?;
+    candidates.extend(
+        members
+            .iter()
+            .filter_map(|(name, symbol)| name.as_utf8().map(|_| symbol)),
+    );
+    stable_property_spelling_suggestion(store, &plan.name, &candidates).map_err(|()| {
+        SourcePropertyError::Unsupported(SourcePropertyUnsupported::AmbiguousPropertySuggestion {
+            node: plan.node,
+            receiver_type,
+        })
+    })
+}
+
 fn global_object_affects_missing_property(
     store: &CanonicalTypeMapperStore,
     global_types: &CanonicalGlobalTypes,
@@ -668,20 +713,7 @@ pub(super) fn prepare_source_property_diagnostic(
         deferred.receiver_type,
         flags,
     )?;
-    let missing = type_to_string_with_host_global_types_and_flags(
-        store,
-        host,
-        global_types,
-        deferred.missing_type,
-        flags,
-    )?;
-    let detail = Diagnostic::with_arguments(
-        message_by_code(2339).ok_or(SourcePropertyError::MissingDiagnostic(2339))?,
-        [name, missing.as_str()],
-    )
-    .render()
-    .expect("the pinned property diagnostic detail has complete arguments");
-    let diagnostic = match suggestion {
+    let mut diagnostic = match suggestion {
         Some(suggestion) => Diagnostic::with_arguments(
             message_by_code(2551).ok_or(SourcePropertyError::MissingDiagnostic(2551))?,
             [name, receiver.as_str(), suggestion],
@@ -691,10 +723,26 @@ pub(super) fn prepare_source_property_diagnostic(
             [name, receiver.as_str()],
         ),
     };
+    if let Some(missing_type) = deferred.missing_type {
+        let missing = type_to_string_with_host_global_types_and_flags(
+            store,
+            host,
+            global_types,
+            missing_type,
+            flags,
+        )?;
+        let detail = Diagnostic::with_arguments(
+            message_by_code(2339).ok_or(SourcePropertyError::MissingDiagnostic(2339))?,
+            [name, missing.as_str()],
+        )
+        .render()
+        .expect("the pinned property diagnostic detail has complete arguments");
+        diagnostic = diagnostic.with_details([format!("  {detail}")]);
+    }
     Ok(CanonicalCheckerDiagnostic {
         node: Some(deferred.name_node),
         range_override: None,
-        diagnostic: diagnostic.with_details([format!("  {detail}")]),
+        diagnostic,
         related_information: Vec::new(),
     })
 }
@@ -770,7 +818,7 @@ mod tests {
     use super::*;
     use crate::semantic::{
         IntrinsicBootstrapOptions, ValueSymbolLinks,
-        source::{PlannedIdentifierRead, PlannedIdentifierReadKind},
+        source::{PlannedExpressionKind, PlannedIdentifierRead, PlannedIdentifierReadKind},
         types::ObjectFlags,
     };
 
@@ -940,45 +988,138 @@ mod tests {
     }
 
     #[test]
-    fn missing_and_optional_properties_fail_before_cache_publication() {
-        for (index, optional) in [false, true].into_iter().enumerate() {
-            let parsed = parsed("const result = object.value;");
-            let file = FileId::new(503 + u32::try_from(index).unwrap());
-            let access = property_access(&parsed, file);
-            let mut store = registered_store(&parsed, file);
-            let string = store.intrinsic_bootstrap().unwrap().string_type;
-            let name = if optional { "value" } else { "other" };
-            let (object, property) = property_object(&mut store, name, string, optional);
-            let syntax = plan_direct_source_property_syntax(&parsed.arena, &store, access).unwrap();
-            let plan =
-                finish_direct_source_property_plan(&syntax, identifier_receiver(&syntax, property))
-                    .unwrap();
+    fn missing_own_properties_recover_with_error_type_and_a_deferred_diagnostic() {
+        let parsed = parsed("const result = object.value;");
+        let file = FileId::new(503);
+        let access = property_access(&parsed, file);
+        let mut store = registered_store(&parsed, file);
+        let (string, error) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.error_type)
+        };
+        let (object, property) = property_object(&mut store, "other", string, false);
+        let syntax = plan_direct_source_property_syntax(&parsed.arena, &store, access).unwrap();
+        let plan =
+            finish_direct_source_property_plan(&syntax, identifier_receiver(&syntax, property))
+                .unwrap();
 
-            let result = check_direct_source_property(&mut store, None, &plan, object);
-            if optional {
-                assert_eq!(
-                    result,
-                    Err(SourcePropertyError::Unsupported(
-                        SourcePropertyUnsupported::OptionalProperty {
-                            node: access,
-                            property,
-                        },
-                    ))
-                );
-            } else {
-                assert_eq!(
-                    result,
-                    Err(SourcePropertyError::Unsupported(
-                        SourcePropertyUnsupported::MissingOwnProperty {
-                            node: access,
-                            receiver_type: object,
-                        },
-                    ))
-                );
-            }
-            assert!(store.type_node_links(access).is_none());
-            assert!(store.symbol_node_links(access).is_none());
+        for _ in 0..2 {
+            let checked = check_direct_source_property(&mut store, None, &plan, object).unwrap();
+            assert_eq!(checked.type_, error);
+            let diagnostic = checked.diagnostic.unwrap();
+            assert_eq!(diagnostic.receiver_type, object);
+            assert_eq!(diagnostic.missing_type, None);
+            assert_eq!(diagnostic.suggestion, None);
         }
+        assert_eq!(
+            store
+                .type_node_links(access)
+                .and_then(|links| links.resolved_type),
+            Some(error),
+        );
+        assert!(store.symbol_node_links(access).is_none());
+    }
+
+    #[test]
+    fn optional_properties_still_fail_before_cache_publication() {
+        let parsed = parsed("const result = object.value;");
+        let file = FileId::new(504);
+        let access = property_access(&parsed, file);
+        let mut store = registered_store(&parsed, file);
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let (object, property) = property_object(&mut store, "value", string, true);
+        let syntax = plan_direct_source_property_syntax(&parsed.arena, &store, access).unwrap();
+        let plan =
+            finish_direct_source_property_plan(&syntax, identifier_receiver(&syntax, property))
+                .unwrap();
+
+        assert_eq!(
+            check_direct_source_property(&mut store, None, &plan, object),
+            Err(SourcePropertyError::Unsupported(
+                SourcePropertyUnsupported::OptionalProperty {
+                    node: access,
+                    property,
+                },
+            )),
+        );
+        assert!(store.type_node_links(access).is_none());
+        assert!(store.symbol_node_links(access).is_none());
+    }
+
+    #[test]
+    fn chained_property_receivers_preserve_each_member_identity() {
+        let parsed = parsed("const result = object.inner.value;");
+        let file = FileId::new(512);
+        let mut accesses = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::PropertyAccessExpression).then_some((
+                    record.range.end,
+                    NodeRef::new(parsed.arena.id(), file, node),
+                ))
+            })
+            .collect::<Vec<_>>();
+        accesses.sort_by_key(|(end, _)| *end);
+        let [(_, inner_access), (_, outer_access)] = accesses.as_slice() else {
+            panic!("expected inner and outer property accesses")
+        };
+        let mut store = registered_store(&parsed, file);
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let (inner_object, value_property) = property_object(&mut store, "value", string, false);
+        let (outer_object, inner_property) =
+            property_object(&mut store, "inner", inner_object, false);
+        let receiver_symbol = store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::BLOCK_SCOPED_VARIABLE,
+                EscapedName::source("object"),
+            ))
+            .unwrap();
+
+        let inner_syntax =
+            plan_direct_source_property_syntax(&parsed.arena, &store, *inner_access).unwrap();
+        let inner_plan = finish_direct_source_property_plan(
+            &inner_syntax,
+            identifier_receiver(&inner_syntax, receiver_symbol),
+        )
+        .unwrap();
+        let outer_syntax =
+            plan_direct_source_property_syntax(&parsed.arena, &store, *outer_access).unwrap();
+        let outer_plan = finish_direct_source_property_plan(
+            &outer_syntax,
+            PlannedExpression::new(
+                *inner_access,
+                PlannedExpressionKind::Property(Box::new(inner_plan.clone())),
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            check_direct_source_property(&mut store, None, &inner_plan, outer_object),
+            Ok(CheckedSourceProperty {
+                type_: inner_object,
+                diagnostic: None,
+            }),
+        );
+        assert_eq!(
+            check_direct_source_property(&mut store, None, &outer_plan, inner_object),
+            Ok(CheckedSourceProperty {
+                type_: string,
+                diagnostic: None,
+            }),
+        );
+        assert_eq!(
+            store
+                .symbol_node_links(*inner_access)
+                .and_then(|links| links.resolved_symbol),
+            Some(inner_property),
+        );
+        assert_eq!(
+            store
+                .symbol_node_links(*outer_access)
+                .and_then(|links| links.resolved_symbol),
+            Some(value_property),
+        );
     }
 
     #[test]

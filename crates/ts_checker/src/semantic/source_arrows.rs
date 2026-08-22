@@ -1,11 +1,12 @@
-//! Planning for exact arrow values in direct `const` declarations.
+//! Planning for exact arrow values in direct top-level declarations.
 //!
-//! The installed path proves an unannotated, non-exported, top-level declaration
-//! of the form `const name = (parameters): Return => body`. A separate read-only
-//! contextual planner proves `const name: Context = (parameters) => {}` without
+//! The installed path proves an unannotated top-level declaration of the form
+//! `var|let|const name = (parameters): Return => body`. A separate read-only
+//! contextual planner proves `name: Context = (parameters) => {}` without
 //! resolving `Context` or fabricating parameter types. Both retain the ordinary
-//! block-scoped variable symbol separately from the binder's anonymous FUNCTION
-//! owner. Publication remains deferred to source dispatch.
+//! variable symbol separately from the binder's anonymous FUNCTION owner and
+//! preserve the export route when present. Publication remains deferred to
+//! source dispatch.
 
 use ts_ast::{NodeData, NodeRef, SyntaxKind};
 use ts_binder::{CheckFlags, InternalSymbolName, SemanticSymbolId, SymbolFlags};
@@ -27,6 +28,7 @@ use super::{
     },
 };
 
+const NODE_FLAG_LET: u32 = 1 << 0;
 const NODE_FLAG_CONST: u32 = 1 << 1;
 const NODE_FLAG_JSDOC: u32 = 1 << 22;
 
@@ -491,11 +493,9 @@ pub(super) fn plan_contextual_source_arrow(
             SourceContextualArrowInvariant::InvalidDeclarationList(list),
         ));
     }
-    if list_record.flags.0 != NODE_FLAG_CONST {
-        return Err(contextual_unsupported(
-            SourceContextualArrowUnsupported::NonConstDeclaration(list),
-        ));
-    }
+    let binding = arrow_binding_kind(list_record.flags.0).ok_or_else(|| {
+        contextual_unsupported(SourceContextualArrowUnsupported::NonConstDeclaration(list))
+    })?;
     if list_data.declarations.nodes.len() != 1 {
         return Err(contextual_unsupported(
             SourceContextualArrowUnsupported::NonSingleDeclaration(list),
@@ -534,11 +534,26 @@ pub(super) fn plan_contextual_source_arrow(
             SourceContextualArrowInvariant::InvalidVariableStatement(statement),
         ));
     }
-    if statement_data.modifiers.is_some() {
-        return Err(contextual_unsupported(
-            SourceContextualArrowUnsupported::ModifiedOrExportedDeclaration(statement),
-        ));
-    }
+    let exported = match statement_data.modifiers.as_ref() {
+        None => false,
+        Some(modifiers)
+            if valid_arrow_export_modifier(
+                store,
+                host,
+                statement,
+                statement_record,
+                list_record,
+                modifiers,
+            )? =>
+        {
+            true
+        }
+        Some(_) => {
+            return Err(contextual_unsupported(
+                SourceContextualArrowUnsupported::ModifiedOrExportedDeclaration(statement),
+            ));
+        }
+    };
 
     let bound = host.bound_file(variable_declaration).ok_or_else(|| {
         contextual_invariant(SourceContextualArrowInvariant::InvalidSourceFile(statement))
@@ -696,8 +711,8 @@ pub(super) fn plan_contextual_source_arrow(
         variable_declaration,
         variable_name,
         &identifier.text,
-        VariableBindingKind::Const,
-        false,
+        binding,
+        exported,
     )
     .map_err(map_contextual_variable_error)?;
     let owner_symbol = bound.symbol(initializer).ok_or_else(|| {
@@ -1120,11 +1135,8 @@ pub(super) fn plan_source_arrow(
             list,
         )));
     }
-    if list_record.flags.0 != NODE_FLAG_CONST {
-        return Err(unsupported(SourceArrowUnsupported::NonConstDeclaration(
-            list,
-        )));
-    }
+    let binding = arrow_binding_kind(list_record.flags.0)
+        .ok_or_else(|| unsupported(SourceArrowUnsupported::NonConstDeclaration(list)))?;
     if list_data.declarations.nodes.len() != 1 {
         return Err(unsupported(SourceArrowUnsupported::NonSingleDeclaration(
             list,
@@ -1159,11 +1171,26 @@ pub(super) fn plan_source_arrow(
             statement,
         )));
     }
-    if statement_data.modifiers.is_some() {
-        return Err(unsupported(
-            SourceArrowUnsupported::ModifiedOrExportedDeclaration(statement),
-        ));
-    }
+    let exported = match statement_data.modifiers.as_ref() {
+        None => false,
+        Some(modifiers)
+            if valid_arrow_export_modifier(
+                store,
+                host,
+                statement,
+                statement_record,
+                list_record,
+                modifiers,
+            )? =>
+        {
+            true
+        }
+        Some(_) => {
+            return Err(unsupported(
+                SourceArrowUnsupported::ModifiedOrExportedDeclaration(statement),
+            ));
+        }
+    };
 
     let bound = host
         .bound_file(variable_declaration)
@@ -1269,8 +1296,8 @@ pub(super) fn plan_source_arrow(
         variable_declaration,
         variable_name,
         &identifier.text,
-        VariableBindingKind::Const,
-        false,
+        binding,
+        exported,
     )
     .map_err(map_variable_error)?;
     let owner_symbol = bound
@@ -1424,6 +1451,40 @@ fn is_concise_expression(kind: SyntaxKind) -> bool {
 
 fn range_contains(parent: ts_core::TextRange, child: ts_core::TextRange) -> bool {
     child.start >= parent.start && child.end <= parent.end
+}
+
+const fn arrow_binding_kind(flags: u32) -> Option<VariableBindingKind> {
+    match flags {
+        0 => Some(VariableBindingKind::Var),
+        NODE_FLAG_LET => Some(VariableBindingKind::Let),
+        NODE_FLAG_CONST => Some(VariableBindingKind::Const),
+        _ => None,
+    }
+}
+
+fn valid_arrow_export_modifier(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    statement: NodeRef,
+    statement_record: &ts_ast::Node,
+    list_record: &ts_ast::Node,
+    modifiers: &ts_ast::ModifierList,
+) -> Result<bool, DeclaredTypeError> {
+    let [modifier_id] = modifiers.list.nodes.as_slice() else {
+        return Ok(false);
+    };
+    let modifier = NodeRef::new(statement.arena, statement.file, *modifier_id);
+    let record = preflight_node(store, host, modifier)?;
+    Ok(modifiers.flags.0 == 0
+        && !modifiers.list.has_trailing_comma
+        && modifiers.list.range.start == statement_record.range.start
+        && modifiers.list.range.end < list_record.range.start
+        && record.kind == SyntaxKind::ExportKeyword
+        && matches!(record.data, NodeData::Token(_))
+        && record.flags.0 == 0
+        && record.parent == Some(statement.node)
+        && record.range.start == statement_record.range.start
+        && record.range.end < modifiers.list.range.end)
 }
 
 fn preflight_contextual_child<'a>(
@@ -1669,6 +1730,66 @@ mod tests {
             source_callable_state(&fixture.store, &plan.callable, true).unwrap(),
             SourceCallableState::Cold
         );
+    }
+
+    #[test]
+    fn direct_arrows_preserve_var_let_const_and_exported_variable_ownership() {
+        let fixture = Fixture::new(concat!(
+            "var first = (): string => \"first\"; ",
+            "let second = (): number => 2; ",
+            "const third = (): boolean => true; ",
+            "export const fourth = (): string => \"fourth\";",
+        ));
+
+        for (index, expected_flags, exported) in [
+            (0, SymbolFlags::FUNCTION_SCOPED_VARIABLE, false),
+            (1, SymbolFlags::BLOCK_SCOPED_VARIABLE, false),
+            (2, SymbolFlags::BLOCK_SCOPED_VARIABLE, false),
+            (3, SymbolFlags::BLOCK_SCOPED_VARIABLE, true),
+        ] {
+            let plan = fixture.plan(index).unwrap();
+            assert_eq!(
+                fixture.store.symbol(plan.variable_symbol).unwrap().flags(),
+                expected_flags,
+            );
+            assert_eq!(
+                fixture
+                    .bound
+                    .local_symbol(plan.variable_declaration)
+                    .is_some(),
+                exported,
+            );
+            assert_ne!(plan.variable_symbol, plan.callable.owner_symbol);
+        }
+    }
+
+    #[test]
+    fn contextual_arrows_preserve_var_let_and_exported_variable_ownership() {
+        let fixture = Fixture::new(concat!(
+            "var first: () => void = () => {}; ",
+            "let second: () => void = () => {}; ",
+            "export const third: () => void = () => {};",
+        ));
+
+        for (index, expected_flags, exported) in [
+            (0, SymbolFlags::FUNCTION_SCOPED_VARIABLE, false),
+            (1, SymbolFlags::BLOCK_SCOPED_VARIABLE, false),
+            (2, SymbolFlags::BLOCK_SCOPED_VARIABLE, true),
+        ] {
+            let plan = fixture.contextual_plan(index).unwrap();
+            assert_eq!(
+                fixture.store.symbol(plan.variable_symbol).unwrap().flags(),
+                expected_flags,
+            );
+            assert_eq!(
+                fixture
+                    .bound
+                    .local_symbol(plan.variable_declaration)
+                    .is_some(),
+                exported,
+            );
+            assert_ne!(plan.variable_symbol, plan.owner_symbol);
+        }
     }
 
     #[test]
@@ -1986,28 +2107,12 @@ mod tests {
             ))
         ));
 
-        let mutable = Fixture::new("let f = (x: number): string => \"ok\";");
-        assert!(matches!(
-            mutable.plan(0),
-            Err(SourceArrowError::Unsupported(
-                SourceArrowUnsupported::NonConstDeclaration(_)
-            ))
-        ));
-
         let siblings =
             Fixture::new("const f = (x: number): number => x, g = (x: number): number => x;");
         assert!(matches!(
             siblings.plan(0),
             Err(SourceArrowError::Unsupported(
                 SourceArrowUnsupported::NonSingleDeclaration(_)
-            ))
-        ));
-
-        let exported = Fixture::new("export const f = (x: number): string => \"ok\";");
-        assert!(matches!(
-            exported.plan(0),
-            Err(SourceArrowError::Unsupported(
-                SourceArrowUnsupported::ModifiedOrExportedDeclaration(_)
             ))
         ));
 
