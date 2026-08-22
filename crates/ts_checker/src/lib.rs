@@ -5628,9 +5628,15 @@ impl<'a> Checker<'a> {
                         }
                     }))
                     .unwrap_or_else(|| self.result.types.any());
-                let inferred = self
-                    .established_global_variable_type(node_id, data)
-                    .unwrap_or(inferred);
+                let inferred = match self.established_global_variable_type(node_id, data) {
+                    Some(established)
+                        if established != self.result.types.any()
+                            || inferred == self.result.types.any() =>
+                    {
+                        established
+                    }
+                    _ => inferred,
+                };
                 self.result.node_types.insert(node_id, inferred);
                 if matches!(
                     self.arena.get(data.name).map(|node| &node.data),
@@ -31085,6 +31091,65 @@ mod tests {
     }
 
     #[test]
+    fn repeated_global_initializers_preserve_cross_file_class_names() {
+        let declarations = parse_source_file(concat!(
+            "declare namespace M { ",
+            "declare var x; declare function f(); ",
+            "declare namespace N {} declare class C {} ",
+            "}",
+        ));
+        let first = parse_source_file("var value = new M.C();");
+        let second = parse_source_file("var value = new M.C();");
+        let declaration_bindings = bind_source_file(&declarations.arena, declarations.source_file);
+        let first_bindings = bind_source_file(&first.arena, first.source_file);
+        let second_bindings = bind_source_file(&second.arena, second.source_file);
+        let no_modules = BTreeMap::new();
+        let checked = check_program(&[
+            ProgramSource {
+                arena: &declarations.arena,
+                source_file: declarations.source_file,
+                bindings: &declaration_bindings,
+                resolved_modules: &no_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+            ProgramSource {
+                arena: &first.arena,
+                source_file: first.source_file,
+                bindings: &first_bindings,
+                resolved_modules: &no_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+            ProgramSource {
+                arena: &second.arena,
+                source_file: second.source_file,
+                bindings: &second_bindings,
+                resolved_modules: &no_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+        ]);
+
+        for (index, bindings) in [(1, &first_bindings), (2, &second_bindings)] {
+            let value = bindings.root_scope().unwrap().symbols.get("value").unwrap();
+            let value_type = checked.files()[index].type_of_symbol(value).unwrap();
+            assert_eq!(
+                checked.files()[index]
+                    .named_type_references
+                    .get(&value_type)
+                    .map(|reference| reference.name.as_str()),
+                Some("M.C"),
+                "{}",
+                checked.files()[index].types.display(value_type),
+            );
+        }
+    }
+
+    #[test]
     fn resolves_global_class_values_and_types_across_files() {
         let declarations =
             parse_source_file("class Foo { doThing(x: { a: number }) { return { b: x.a }; } }");
@@ -33401,6 +33466,124 @@ mod tests {
             reference_name(method.return_type),
             Some("imported.Middleware")
         );
+    }
+
+    #[test]
+    fn imported_function_aliases_preserve_indexed_keyof_and_omit_parameters() {
+        let utility = parse_source_file(
+            "type Omit<T, K> = { [P in keyof T as P extends K ? never : P]: T[P] };",
+        );
+        let body = concat!(
+            "type O = { prop: string; prop2: string }; ",
+            "type I = { prop: string }; ",
+            "export const fn = (v: O['prop'], p: Omit<O, 'prop'>, ",
+            "key: keyof O, p2: Omit<O, keyof I>) => {};",
+        );
+        let private_provider = parse_source_file(body);
+        let exported_provider = parse_source_file(
+            &body
+                .replace("type O", "export type O")
+                .replace("type I", "export type I"),
+        );
+        let consumer = parse_source_file(concat!(
+            "import { fn } from './private'; ",
+            "import { fn as fnExp } from './exported'; ",
+            "export const f = fn; export const fExp = fnExp;",
+        ));
+        let utility_bindings = bind_source_file(&utility.arena, utility.source_file);
+        let private_bindings = bind_source_file(&private_provider.arena, private_provider.source_file);
+        let exported_bindings =
+            bind_source_file(&exported_provider.arena, exported_provider.source_file);
+        let consumer_bindings = bind_source_file(&consumer.arena, consumer.source_file);
+        let standalone = check_source_file(
+            &private_provider.arena,
+            private_provider.source_file,
+            &private_bindings,
+        );
+        let standalone_symbol = private_bindings.root_scope().unwrap().symbols.get("fn").unwrap();
+        let standalone_type = standalone.type_of_symbol(standalone_symbol).unwrap();
+        assert!(
+            matches!(standalone.types.get(standalone_type).unwrap().kind, TypeKind::Function(_)),
+            "standalone provider lost its function type: {}; diagnostics: {:?}",
+            standalone.types.display(standalone_type),
+            standalone.diagnostics,
+        );
+        let no_modules = BTreeMap::new();
+        let consumer_modules = BTreeMap::from([
+            ("./private".into(), 1),
+            ("./exported".into(), 2),
+        ]);
+        let checked = check_program(&[
+            ProgramSource {
+                arena: &utility.arena,
+                source_file: utility.source_file,
+                bindings: &utility_bindings,
+                resolved_modules: &no_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+            ProgramSource {
+                arena: &private_provider.arena,
+                source_file: private_provider.source_file,
+                bindings: &private_bindings,
+                resolved_modules: &no_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+            ProgramSource {
+                arena: &exported_provider.arena,
+                source_file: exported_provider.source_file,
+                bindings: &exported_bindings,
+                resolved_modules: &no_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+            ProgramSource {
+                arena: &consumer.arena,
+                source_file: consumer.source_file,
+                bindings: &consumer_bindings,
+                resolved_modules: &consumer_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+        ]);
+        let result = &checked.files()[3];
+        for (index, bindings) in [(1, &private_bindings), (2, &exported_bindings)] {
+            let symbol = bindings.root_scope().unwrap().symbols.get("fn").unwrap();
+            let type_id = checked.files()[index].type_of_symbol(symbol).unwrap();
+            let declaration = bindings.symbols.get(symbol).unwrap().declarations[0];
+            let initializer = match checked.files()[index].type_of_node(declaration) {
+                Some(type_id) => checked.files()[index].types.display(type_id),
+                None => "missing".into(),
+            };
+            assert!(
+                matches!(checked.files()[index].types.get(type_id).unwrap().kind, TypeKind::Function(_)),
+                "provider {index} lost its function type: {}; declaration: {initializer}; diagnostics: {:?}",
+                checked.files()[index].types.display(type_id),
+                checked.files()[index].diagnostics,
+            );
+        }
+        for name in ["fn", "fnExp"] {
+            let symbol = consumer_bindings.root_scope().unwrap().symbols.get(name).unwrap();
+            let type_id = result.type_of_symbol(symbol).unwrap();
+            assert!(
+                matches!(result.types.get(type_id).unwrap().kind, TypeKind::Function(_)),
+                "imported {name} lost its function type: {}",
+                result.types.display(type_id),
+            );
+        }
+        for name in ["f", "fExp"] {
+            let symbol = consumer_bindings.root_scope().unwrap().symbols.get(name).unwrap();
+            let type_id = result.type_of_symbol(symbol).unwrap();
+            let TypeKind::Function(signature) = &result.types.get(type_id).unwrap().kind else {
+                panic!("{name} must retain its function type, got {}", result.types.display(type_id));
+            };
+            assert_eq!(signature.parameters.len(), 4, "{name}");
+        }
     }
 
     #[test]
