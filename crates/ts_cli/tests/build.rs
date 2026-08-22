@@ -151,6 +151,100 @@ fn build_force_rebuilds_an_up_to_date_project() {
 }
 
 #[test]
+fn build_clean_removes_outputs_and_incremental_state() {
+    let directory = TestDirectory::new("clean");
+    fs::write(
+        directory.0.join("tsconfig.json"),
+        r#"{"files":["main.ts"],"compilerOptions":{"composite":true,"noLib":true,"outDir":"dist","tsBuildInfoFile":"cache/state.tsbuildinfo"}}"#,
+    )
+    .unwrap();
+    fs::write(directory.0.join("main.ts"), "export const value = 1;\n").unwrap();
+    assert!(
+        run(&directory.0, &["--build", "--pretty", "false"])
+            .status
+            .success()
+    );
+    assert!(directory.0.join("dist/main.js").is_file());
+    assert!(directory.0.join("cache/state.tsbuildinfo").is_file());
+
+    let cleaned = run(&directory.0, &["--build", "--clean", "--pretty", "false"]);
+
+    assert!(
+        cleaned.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cleaned.stdout)
+    );
+    assert!(!directory.0.join("dist/main.js").exists());
+    assert!(!directory.0.join("cache/state.tsbuildinfo").exists());
+    assert!(directory.0.join("main.ts").is_file());
+}
+
+#[test]
+fn build_dry_run_never_creates_or_removes_outputs() {
+    let directory = TestDirectory::new("dry-run");
+    fs::write(
+        directory.0.join("tsconfig.json"),
+        r#"{"files":["main.ts"],"compilerOptions":{"composite":true,"noLib":true,"outDir":"dist"}}"#,
+    )
+    .unwrap();
+    fs::write(directory.0.join("main.ts"), "export const value = 1;\n").unwrap();
+    let output = directory.0.join("dist/main.js");
+    let build_info = directory.0.join("tsconfig.tsbuildinfo");
+
+    let dry_build = run(
+        &directory.0,
+        &["--build", "--dry", "--quiet", "--pretty", "false"],
+    );
+    assert!(dry_build.status.success());
+    assert!(!output.exists());
+    assert!(!build_info.exists());
+
+    assert!(
+        run(&directory.0, &["--build", "--pretty", "false"])
+            .status
+            .success()
+    );
+    let dry_clean = run(
+        &directory.0,
+        &[
+            "--build", "--clean", "--dry", "--quiet", "--pretty", "false",
+        ],
+    );
+    assert!(dry_clean.status.success());
+    assert!(output.is_file());
+    assert!(build_info.is_file());
+}
+
+#[test]
+fn build_help_exits_successfully() {
+    let directory = TestDirectory::new("help");
+    let output = run(&directory.0, &["--build", "--help"]);
+
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("--build"));
+}
+
+#[test]
+fn quiet_build_preserves_failure_status_without_printing_diagnostics() {
+    let directory = TestDirectory::new("quiet");
+    fs::write(
+        directory.0.join("tsconfig.json"),
+        r#"{"files":["main.ts"],"compilerOptions":{"noLib":true}}"#,
+    )
+    .unwrap();
+    fs::write(directory.0.join("main.ts"), "const value: string = 1;\n").unwrap();
+
+    let output = run(
+        &directory.0,
+        &["--build", "--quiet", "--noEmit", "--pretty", "false"],
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn build_reports_reference_cycles_with_status_four() {
     let directory = TestDirectory::new("cycle");
     fs::create_dir_all(directory.0.join("child")).unwrap();

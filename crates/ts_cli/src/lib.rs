@@ -33,13 +33,17 @@ pub enum Command {
 #[allow(clippy::struct_excessive_bools)] // Build switches are independently composable.
 pub struct BuildOptions {
     pub projects: Vec<String>,
+    pub clean: bool,
+    pub dry: bool,
     pub force: bool,
+    pub help: bool,
     pub incremental: bool,
     pub list_emitted_files: bool,
     pub list_files: bool,
     pub no_check: Option<bool>,
     pub no_emit: bool,
     pub pretty: Option<bool>,
+    pub quiet: bool,
     pub watch: bool,
 }
 
@@ -58,6 +62,7 @@ pub struct CompilerOptions {
     pub list_files_only: bool,
     pub project: Option<String>,
     pub pretty: Option<bool>,
+    pub quiet: bool,
     pub watch: bool,
 }
 
@@ -122,6 +127,7 @@ fn parse_expanded(args: &[String]) -> Result<Command, CommandLineError> {
                 options.list_files_only = optional_boolean_value(args, &mut index);
             }
             "--pretty" => options.pretty = Some(optional_boolean_value(args, &mut index)),
+            "--quiet" | "-q" => options.quiet = optional_boolean_value(args, &mut index),
             "--project" | "-p" => {
                 index += 1;
                 options.project = Some(required_option_value(args, index, "project")?);
@@ -360,7 +366,10 @@ fn parse_build_options(args: &[String]) -> Result<BuildOptions, CommandLineError
         let argument = &args[index];
         let lower = argument.to_ascii_lowercase();
         match lower.as_str() {
+            "--clean" => options.clean = optional_boolean_value(args, &mut index),
+            "--dry" | "-d" => options.dry = optional_boolean_value(args, &mut index),
             "--force" | "-f" => options.force = optional_boolean_value(args, &mut index),
+            "--help" | "-h" | "-?" => options.help = true,
             "--incremental" | "-i" => {
                 options.incremental = optional_boolean_value(args, &mut index);
             }
@@ -372,6 +381,7 @@ fn parse_build_options(args: &[String]) -> Result<BuildOptions, CommandLineError
             "--noemit" => options.no_emit = optional_boolean_value(args, &mut index),
             "--watch" | "-w" => options.watch = optional_boolean_value(args, &mut index),
             "--pretty" => options.pretty = Some(optional_boolean_value(args, &mut index)),
+            "--quiet" | "-q" => options.quiet = optional_boolean_value(args, &mut index),
             _ if argument.starts_with("--")
                 && (compiler_boolean_name(&lower).is_some()
                     || compiler_string_name(&lower).is_some()
@@ -402,7 +412,23 @@ fn parse_build_options(args: &[String]) -> Result<BuildOptions, CommandLineError
         }
         index += 1;
     }
+    if options.clean && options.force {
+        return Err(incompatible_build_options("clean", "force"));
+    }
+    if options.clean && options.watch {
+        return Err(incompatible_build_options("clean", "watch"));
+    }
+    if options.watch && options.dry {
+        return Err(incompatible_build_options("watch", "dry"));
+    }
     Ok(options)
+}
+
+fn incompatible_build_options(first: &str, second: &str) -> CommandLineError {
+    CommandLineError {
+        code: 6370,
+        message: format!("Options '{first}' and '{second}' cannot be combined."),
+    }
 }
 
 fn required_option_value(
@@ -859,6 +885,25 @@ mod tests {
     }
 
     #[test]
+    fn parses_quiet_mode_for_compilation_and_builds() {
+        let Command::Compile(quiet) = parse(&["-q", "main.ts"]).unwrap() else {
+            panic!("expected compile command");
+        };
+        assert!(quiet.quiet);
+
+        let Command::Compile(audible) = parse(&["--quiet", "false", "main.ts"]).unwrap() else {
+            panic!("expected compile command");
+        };
+        assert!(!audible.quiet);
+
+        let Command::Build(build) = parse(&["--build", "-q", "project"]).unwrap() else {
+            panic!("expected build command");
+        };
+        assert!(build.quiet);
+        assert_eq!(build.projects, ["project"]);
+    }
+
+    #[test]
     fn parses_lsp_without_changing_compiler_arguments() {
         assert_eq!(parse(&["--LSP"]), Ok(Command::Lsp));
         let Command::Compile(options) = parse(&["--noEmit", "src/main.ts"]).unwrap() else {
@@ -1130,6 +1175,43 @@ mod tests {
         assert!(options.list_files);
         assert!(options.list_emitted_files);
         assert!(options.force);
+    }
+
+    #[test]
+    fn parses_build_help_cleanup_and_dry_runs() {
+        let Command::Build(help) = parse(&["--build", "--help"]).unwrap() else {
+            panic!("expected build command");
+        };
+        assert!(help.help);
+
+        let Command::Build(clean) = parse(&["-b", "--clean", "-d", "project"]).unwrap() else {
+            panic!("expected build command");
+        };
+        assert!(clean.clean);
+        assert!(clean.dry);
+        assert_eq!(clean.projects, ["project"]);
+    }
+
+    #[test]
+    fn rejects_incompatible_build_modes_like_typescript() {
+        for (arguments, expected) in [
+            (
+                &["--build", "--clean", "--watch"][..],
+                "Options 'clean' and 'watch' cannot be combined.",
+            ),
+            (
+                &["--build", "--clean", "--force"][..],
+                "Options 'clean' and 'force' cannot be combined.",
+            ),
+            (
+                &["--build", "--watch", "--dry"][..],
+                "Options 'watch' and 'dry' cannot be combined.",
+            ),
+        ] {
+            let error = parse(arguments).unwrap_err();
+            assert_eq!(error.code, 6370);
+            assert_eq!(error.message, expected);
+        }
     }
 
     #[test]

@@ -289,6 +289,45 @@ fn invalid_numeric_compiler_options_match_oracle() {
 }
 
 #[test]
+fn quiet_mode_matches_oracle_for_compiler_and_command_errors() {
+    let directory = TestDirectory::new("quiet-mode");
+    fs::write(directory.0.join("main.ts"), "const answer: string = 42;\n").unwrap();
+    for arguments in [
+        &[
+            "main.ts",
+            "--ignoreConfig",
+            "--noEmit",
+            "--quiet",
+            "--pretty",
+            "false",
+        ][..],
+        &[
+            "main.ts",
+            "--ignoreConfig",
+            "--noEmit",
+            "-q",
+            "--pretty",
+            "false",
+        ][..],
+        &[
+            "main.ts",
+            "--ignoreConfig",
+            "--noEmit",
+            "--quiet",
+            "false",
+            "--pretty",
+            "false",
+        ][..],
+        &["--quiet", "--wat"][..],
+        &["--wat", "--quiet"][..],
+        &["--quiet", "--project", "missing.json", "--pretty", "false"][..],
+        &["--build", "--quiet", "missing.json", "--pretty", "false"][..],
+    ] {
+        assert_matches_oracle(&directory.0, arguments);
+    }
+}
+
+#[test]
 fn missing_explicit_project_diagnostics_match_oracle() {
     let directory = TestDirectory::new("missing-project");
     fs::create_dir_all(directory.0.join("without-config")).unwrap();
@@ -358,6 +397,9 @@ fn command_line_option_diagnostics_match_oracle() {
         &["--build", "--wat"][..],
         &["--build", "--pretty=false"][..],
         &["--build", "--listFilesOnly"][..],
+        &["--build", "--clean", "--watch"][..],
+        &["--build", "--clean", "--force"][..],
+        &["--build", "--watch", "--dry"][..],
     ] {
         assert_matches_oracle(&directory.0, arguments);
     }
