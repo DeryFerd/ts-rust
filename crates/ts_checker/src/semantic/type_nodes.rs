@@ -7647,7 +7647,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             | TypeFlags::INDEXED_ACCESS
             | TypeFlags::CONDITIONAL
             | TypeFlags::SUBSTITUTION;
-        if check_flags.intersects(deferred_flags) || extends_flags.intersects(deferred_flags) {
+        if check_flags.intersects(deferred_flags)
+            || extends_flags.intersects(deferred_flags) && !has_inference
+        {
             return Ok(ConditionalBranchDemand::Neither);
         }
         if has_inference

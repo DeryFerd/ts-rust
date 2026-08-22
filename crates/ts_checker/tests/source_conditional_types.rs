@@ -184,7 +184,11 @@ fn naked_infer_parameters_resolve_only_through_the_true_branch() {
     let mut context = context(&parsed, file);
 
     context.check_source_file(file).unwrap();
-    assert!(context.diagnostics().is_empty());
+    assert!(
+        context.diagnostics().is_empty(),
+        "{:?}",
+        context.diagnostics()
+    );
     for (name, expected) in [("Text", "string"), ("Number", "number")] {
         let symbol = alias_symbol(&parsed, file, &context, name);
         assert_eq!(
