@@ -297,6 +297,11 @@ fn explicit_constructor_keeps_strict_field_initialization_diagnostics() {
 fn unsupported_constructor_parameters_and_nonempty_bodies_leave_classes_cold() {
     for (index, source) in [
         "class Model { constructor(value: string) {} }",
+        "class Model { constructor(public value: string) {} }",
+        concat!(
+            "class Base { constructor(public value: string) {} } ",
+            "class Model extends Base { constructor(value: string) { super(value); } }",
+        ),
         "class Model { constructor() { const value = 1; } }",
         "class Base {} class Model extends Base { constructor() {} }",
     ]
@@ -318,4 +323,56 @@ fn unsupported_constructor_parameters_and_nonempty_bodies_leave_classes_cold() {
         assert!(context.store().declared_type_links(owner).is_none());
         assert!(context.store().value_symbol_links(owner).is_none());
     }
+}
+
+#[test]
+fn decorated_constructor_parameter_publishes_its_annotated_signature() {
+    let parsed = parse_source_file(concat!(
+        "declare function decorate(target: any, key: string | symbol | undefined, index: number): void;\n",
+        "class Model { constructor(@decorate value: string) {} }\n",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(2_110);
+    let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+    let owner = class_symbol(&parsed, file, &context, "Model");
+    let constructor = class_constructor(&parsed, file, "Model");
+
+    context.check_source_file(file).unwrap();
+    assert!(
+        context.diagnostics().is_empty(),
+        "{:?}",
+        context.diagnostics()
+    );
+
+    let members = context.get_nongeneric_class_members(owner).unwrap();
+    let signature = context
+        .store()
+        .signature(members.default_construct_signature())
+        .unwrap();
+    assert_eq!(signature.declaration(), Some(constructor));
+    assert_eq!(signature.parameters().len(), 1);
+    assert_eq!(signature.min_argument_count(), 1);
+    let parameter = signature.parameters()[0];
+    assert_eq!(
+        context
+            .store()
+            .value_symbol_links(parameter)
+            .and_then(|links| links.resolved_type),
+        Some(context.store().intrinsic_bootstrap().unwrap().string_type),
+    );
+
+    let warm = (
+        context.store().type_len(),
+        context.store().signature_len(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
 }
