@@ -306,6 +306,138 @@ fn javascript_emission_deduplicates_ts5055_by_canonical_path() {
 }
 
 #[test]
+fn canonical_program_reports_ts5056_for_shared_typescript_outputs() {
+    for (case_sensitive, second_name, expected_output) in [
+        (true, "input.tsx", "/project/input.js"),
+        (false, "INPUT.tsx", "/project/INPUT.js"),
+    ] {
+        let filesystem = MemoryFileSystem::new(case_sensitive);
+        filesystem
+            .write_file("/project/input.ts", "export const first = 1;\n")
+            .unwrap();
+        filesystem
+            .write_file(
+                &format!("/project/{second_name}"),
+                "export const second = 2;\n",
+            )
+            .unwrap();
+
+        for no_emit in [false, true] {
+            let program = Program::try_new_with_canonical_checker(
+                &filesystem,
+                "/project",
+                &["input.ts".to_owned(), second_name.to_owned()],
+                CompilerOptions {
+                    lib: Some(vec!["es5".to_owned()]),
+                    no_emit,
+                    ..CompilerOptions::default()
+                },
+            )
+            .unwrap();
+
+            if no_emit {
+                assert!(
+                    program.diagnostics().is_empty(),
+                    "{:?}",
+                    program.diagnostics()
+                );
+                continue;
+            }
+
+            let [diagnostic] = program.diagnostics() else {
+                panic!(
+                    "expected one output collision with case_sensitive={case_sensitive}: {:?}",
+                    program.diagnostics()
+                );
+            };
+            assert_eq!(diagnostic.code, Some(5056));
+            assert_eq!(
+                diagnostic.message,
+                format!(
+                    "Cannot write file '{expected_output}' because it would be overwritten by multiple input files."
+                )
+            );
+        }
+    }
+}
+
+#[test]
+fn canonical_program_reports_input_overwrites_and_multiple_output_owners() {
+    let filesystem = MemoryFileSystem::new(true);
+    filesystem
+        .write_file("/project/input.ts", "export const typed = 1;\n")
+        .unwrap();
+    filesystem
+        .write_file("/project/input.js", "export const existing = 1;\n")
+        .unwrap();
+
+    for config_file_path in [None, Some("/project/tsconfig.json")] {
+        let program = Program::try_new_with_canonical_checker_with_config_path(
+            &filesystem,
+            "/project",
+            &["input.ts".to_owned(), "input.js".to_owned()],
+            CompilerOptions {
+                allow_js: true,
+                lib: Some(vec!["es5".to_owned()]),
+                ..CompilerOptions::default()
+            },
+            config_file_path,
+        )
+        .unwrap();
+
+        let [overwrite, collision] = program.diagnostics() else {
+            panic!(
+                "expected TS5055 and TS5056 for config {config_file_path:?}: {:?}",
+                program.diagnostics()
+            );
+        };
+        assert_eq!(overwrite.code, Some(5055));
+        let primary =
+            "Cannot write file '/project/input.js' because it would overwrite input file.";
+        let expected = if config_file_path.is_some() {
+            primary.to_owned()
+        } else {
+            format!("{primary}\n  {TSCONFIG_ADVICE}")
+        };
+        assert_eq!(overwrite.message, expected);
+        assert_eq!(collision.code, Some(5056));
+        assert_eq!(
+            collision.message,
+            "Cannot write file '/project/input.js' because it would be overwritten by multiple input files."
+        );
+    }
+}
+
+#[test]
+fn canonical_bundles_do_not_treat_shared_outputs_as_collisions() {
+    let filesystem = MemoryFileSystem::new(true);
+    filesystem
+        .write_file("/project/first.ts", "const first = 1;\n")
+        .unwrap();
+    filesystem
+        .write_file("/project/second.ts", "const second = 2;\n")
+        .unwrap();
+
+    let program = Program::try_new_with_canonical_checker(
+        &filesystem,
+        "/project",
+        &["first.ts".to_owned(), "second.ts".to_owned()],
+        CompilerOptions {
+            lib: Some(vec!["es5".to_owned()]),
+            out_file: Some("/project/bundle.js".to_owned()),
+            ..CompilerOptions::default()
+        },
+    )
+    .unwrap();
+
+    assert!(
+        program.diagnostics().is_empty(),
+        "{:?}",
+        program.diagnostics()
+    );
+}
+
+#[test]
 fn javascript_bundles_without_emittable_sources_do_not_report_ts5055() {
     let filesystem = MemoryFileSystem::new(true);
     filesystem
@@ -559,6 +691,121 @@ fn configuration_created_program_retains_path_without_changing_legacy_emission()
 }
 
 #[test]
+fn configured_programs_preserve_nested_output_paths_without_root_dir() {
+    let filesystem = MemoryFileSystem::new(true);
+    filesystem
+        .write_file(
+            "/project/tsconfig.json",
+            concat!(
+                r#"{"files":["src/nested/input.ts"],"compilerOptions":{"outDir":"dist","#,
+                r#""declaration":true,"declarationMap":true,"sourceMap":true,"noLib":true}}"#,
+            ),
+        )
+        .unwrap();
+    filesystem
+        .write_file("/project/src/nested/input.ts", "export const value = 1;\n")
+        .unwrap();
+
+    let program = Program::from_config(&filesystem, "/project/tsconfig.json");
+    assert!(
+        program.diagnostics().is_empty(),
+        "{:?}",
+        program.diagnostics()
+    );
+    let emitted = program.emit();
+    assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+    for expected in [
+        "/project/dist/src/nested/input.js",
+        "/project/dist/src/nested/input.js.map",
+        "/project/dist/src/nested/input.d.ts",
+        "/project/dist/src/nested/input.d.ts.map",
+    ] {
+        assert!(
+            emitted.files.iter().any(|file| file.file_name == expected),
+            "missing {expected}: {:?}",
+            emitted.files
+        );
+    }
+}
+
+#[test]
+fn canonical_declaration_collisions_ignore_declaration_roots_for_common_directory() {
+    let filesystem = MemoryFileSystem::new(true);
+    filesystem
+        .write_file("/project/src/input.ts", "export const value = 1;\n")
+        .unwrap();
+    filesystem
+        .write_file("/project/types/input.d.ts", "export {};\n")
+        .unwrap();
+
+    let program = Program::try_new_with_canonical_checker(
+        &filesystem,
+        "/project",
+        &["src/input.ts".to_owned(), "types/input.d.ts".to_owned()],
+        CompilerOptions {
+            declaration: true,
+            declaration_dir: Some("/project/types".to_owned()),
+            lib: Some(vec!["es5".to_owned()]),
+            skip_lib_check: true,
+            ..CompilerOptions::default()
+        },
+    )
+    .unwrap();
+
+    let [diagnostic] = program.diagnostics() else {
+        panic!(
+            "expected one declaration collision: {:?}",
+            program.diagnostics()
+        );
+    };
+    assert_eq!(diagnostic.code, Some(5055));
+    assert_eq!(
+        diagnostic.message,
+        format!(
+            "Cannot write file '/project/types/input.d.ts' because it would overwrite input file.\n  {TSCONFIG_ADVICE}"
+        )
+    );
+}
+
+#[test]
+fn configured_canonical_declaration_collisions_use_project_directory() {
+    let filesystem = MemoryFileSystem::new(true);
+    filesystem
+        .write_file("/project/src/input.ts", "export const value = 1;\n")
+        .unwrap();
+    filesystem
+        .write_file("/project/dist/src/input.d.ts", "export {};\n")
+        .unwrap();
+
+    let program = Program::try_new_with_canonical_checker_with_config_path(
+        &filesystem,
+        "/project",
+        &["src/input.ts".to_owned(), "dist/src/input.d.ts".to_owned()],
+        CompilerOptions {
+            declaration: true,
+            lib: Some(vec!["es5".to_owned()]),
+            out_dir: Some("/project/dist".to_owned()),
+            skip_lib_check: true,
+            ..CompilerOptions::default()
+        },
+        Some("/project/tsconfig.json"),
+    )
+    .unwrap();
+
+    let [diagnostic] = program.diagnostics() else {
+        panic!(
+            "expected one declaration collision: {:?}",
+            program.diagnostics()
+        );
+    };
+    assert_eq!(diagnostic.code, Some(5055));
+    assert_eq!(
+        diagnostic.message,
+        "Cannot write file '/project/dist/src/input.d.ts' because it would overwrite input file."
+    );
+}
+
+#[test]
 fn configured_projects_deduplicate_javascript_and_declaration_collisions() {
     let filesystem = MemoryFileSystem::new(true);
     filesystem
@@ -670,13 +917,23 @@ fn canonical_javascript_and_declaration_collisions_follow_emit_options() {
         .write_file("/project/input.d.ts", "export {};\n")
         .unwrap();
 
-    for (no_emit, emit_declaration_only, expected_paths) in [
+    for (no_emit, emit_declaration_only, expected_diagnostics) in [
         (
             false,
             false,
-            ["/project/input.d.ts", "/project/input.js"].as_slice(),
+            [
+                (5055, "/project/input.d.ts"),
+                (5055, "/project/input.js"),
+                (5056, "/project/input.d.ts"),
+                (5056, "/project/input.js"),
+            ]
+            .as_slice(),
         ),
-        (false, true, ["/project/input.d.ts"].as_slice()),
+        (
+            false,
+            true,
+            [(5055, "/project/input.d.ts"), (5056, "/project/input.d.ts")].as_slice(),
+        ),
         (true, false, [].as_slice()),
     ] {
         let program = Program::try_new_with_canonical_checker(
@@ -705,14 +962,20 @@ fn canonical_javascript_and_declaration_collisions_follow_emit_options() {
                 .iter()
                 .map(|diagnostic| (diagnostic.code, diagnostic.message.clone()))
                 .collect::<Vec<_>>(),
-            expected_paths
+            expected_diagnostics
                 .iter()
-                .map(|path| {
+                .map(|(code, path)| {
                     (
-                        Some(5055),
-                        format!(
-                            "Cannot write file '{path}' because it would overwrite input file.\n  {TSCONFIG_ADVICE}"
-                        ),
+                        Some(*code),
+                        if *code == 5055 {
+                            format!(
+                                "Cannot write file '{path}' because it would overwrite input file.\n  {TSCONFIG_ADVICE}"
+                            )
+                        } else {
+                            format!(
+                                "Cannot write file '{path}' because it would be overwritten by multiple input files."
+                            )
+                        },
                     )
                 })
                 .collect::<Vec<_>>(),

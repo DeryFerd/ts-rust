@@ -1906,33 +1906,47 @@ impl Program {
         self.load_module_graph(file_system, resolution_options);
     }
 
-    fn canonical_output_diagnostics(&self) -> Vec<ProgramDiagnostic> {
+    fn common_source_directory(&self) -> String {
+        if let Some(root_directory) = self.options.root_dir.as_deref() {
+            let root_directory = canonicalize(
+                root_directory,
+                &self.current_directory,
+                CaseSensitivity::Sensitive,
+            );
+            return ts_path::ensure_trailing_directory_separator(&root_directory);
+        }
+
+        if let Some(config_file_path) = self.config_file_path.as_deref() {
+            return ts_path::ensure_trailing_directory_separator(&directory_path(config_file_path));
+        }
+
         let source_names = self
             .source_files
             .iter()
             .filter(|source| {
                 !source.is_default_library
+                    && !ts_path::is_declaration_file(&source.file_name)
                     && self.source_should_emit(source)
-                    && (!ts_path::is_declaration_file(&source.file_name)
-                        || self.root_file_names.contains(&canonicalize(
-                            &source.file_name,
-                            &self.current_directory,
-                            self.case_sensitivity,
-                        )))
             })
             .map(|source| source.file_name.clone())
             .collect::<Vec<_>>();
-        let common_source_directory = ts_outputpaths::common_source_directory(
+        ts_outputpaths::common_source_directory(
             &source_names,
             &self.current_directory,
             self.case_sensitivity,
-        );
+        )
+    }
+
+    fn canonical_output_diagnostics(&self) -> Vec<ProgramDiagnostic> {
+        let common_source_directory = self.common_source_directory();
         let bundle_emits_javascript = self.options.out_file.is_none()
             || self.bundle_sources().into_iter().any(|source| {
                 matches!(self.options.module, ModuleKind::Amd | ModuleKind::System)
                     || !source_is_external_module(source)
             });
-        let mut checked_paths = BTreeSet::new();
+        let mut observed_output_paths = BTreeSet::new();
+        let mut reported_input_collisions = BTreeSet::new();
+        let mut reported_output_collisions = BTreeSet::new();
 
         let mut diagnostics = Vec::new();
         for source in self.source_files.iter().filter(|source| {
@@ -1965,7 +1979,10 @@ impl Program {
             {
                 let canonical =
                     canonicalize(&file_name, &self.current_directory, self.case_sensitivity);
-                if self.output_overwrites_input(&file_name) && checked_paths.insert(canonical) {
+                let repeated_output = !observed_output_paths.insert(canonical.clone());
+                if self.output_overwrites_input(&file_name)
+                    && reported_input_collisions.insert(canonical.clone())
+                {
                     let mut diagnostic = output_overwrites_input_diagnostic(&file_name);
                     if self.config_file_path.is_none() {
                         let advice =
@@ -1974,6 +1991,12 @@ impl Program {
                         diagnostic.message.push_str(advice.text());
                     }
                     diagnostics.push(diagnostic);
+                }
+                if repeated_output
+                    && self.options.out_file.is_none()
+                    && reported_output_collisions.insert(canonical)
+                {
+                    diagnostics.push(output_collision_diagnostic(&file_name));
                 }
             }
         }
@@ -2228,26 +2251,7 @@ impl Program {
         if self.options.out_file.is_some() {
             return self.emit_bundle(settings);
         }
-        let source_names = self
-            .source_files
-            .iter()
-            .filter(|source_file| {
-                !source_file.is_default_library
-                    && self.source_should_emit(source_file)
-                    && (!ts_path::is_declaration_file(&source_file.file_name)
-                        || self.root_file_names.contains(&canonicalize(
-                            &source_file.file_name,
-                            &self.current_directory,
-                            self.case_sensitivity,
-                        )))
-            })
-            .map(|source_file| source_file.file_name.clone())
-            .collect::<Vec<_>>();
-        let common_source_directory = ts_outputpaths::common_source_directory(
-            &source_names,
-            &self.current_directory,
-            self.case_sensitivity,
-        );
+        let common_source_directory = self.common_source_directory();
         let mut checked_paths = BTreeSet::new();
         for (source_index, source_file) in self.source_files.iter().enumerate() {
             if source_file.is_default_library
@@ -13001,13 +13005,13 @@ export function create() { return new M.Value(); }"#,
         let program = Program::from_config(&fs, "/project/tsconfig.json");
         assert_eq!(
             program
-                .logical_source_map_path("/project/build/main.js.map")
+                .logical_source_map_path("/project/build/src/main.js.map")
                 .as_deref(),
-            Some("/project/maps/main.js.map")
+            Some("/project/maps/src/main.js.map")
         );
         let emitted = program.emit();
         assert_eq!(emitted.files.len(), 1);
-        assert_eq!(emitted.files[0].file_name, "/project/build/main.js");
+        assert_eq!(emitted.files[0].file_name, "/project/build/src/main.js");
         assert!(
             emitted.files[0]
                 .text
@@ -13401,7 +13405,7 @@ export function create() { return new M.Value(); }"#,
         let program = Program::from_config(&fs, "/project/tsconfig.json");
         let emitted = program.emit();
         assert_eq!(emitted.files.len(), 1);
-        assert_eq!(emitted.files[0].file_name, "/project/types/index.d.ts");
+        assert_eq!(emitted.files[0].file_name, "/project/types/src/index.d.ts");
         assert_eq!(
             emitted.files[0].text,
             "export declare const value: string;\n"
