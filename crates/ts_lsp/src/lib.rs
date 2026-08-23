@@ -375,6 +375,13 @@ pub struct SemanticTokens {
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SemanticTokensRangeParams {
+    pub text_document: TextDocumentIdentifier,
+    pub range: Range,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FoldingRangeParams {
     pub text_document: TextDocumentIdentifier,
 }
@@ -692,6 +699,9 @@ impl Server {
         if method == "textDocument/semanticTokens/full" {
             return vec![self.semantic_tokens_full(id, message.params)];
         }
+        if method == "textDocument/semanticTokens/range" {
+            return vec![self.semantic_tokens_range(id, message.params)];
+        }
         if method == "textDocument/foldingRange" {
             return vec![self.folding_range(id, message.params)];
         }
@@ -763,7 +773,7 @@ impl Server {
                         token_modifiers: Vec::new(),
                     },
                     full: true,
-                    range: false,
+                    range: true,
                 },
                 folding_range_provider: true,
                 selection_range_provider: true,
@@ -1428,6 +1438,48 @@ impl Server {
         ))
     }
 
+    fn semantic_tokens_range(&self, id: Id, params: Option<Value>) -> OutgoingMessage {
+        let Ok(params) = deserialize_params::<SemanticTokensRangeParams>(params) else {
+            return failure(
+                id,
+                CODE_INVALID_PARAMS,
+                "invalid semantic tokens range parameters",
+            );
+        };
+        if (params.range.start.line, params.range.start.character)
+            > (params.range.end.line, params.range.end.character)
+        {
+            return failure(id, CODE_INVALID_PARAMS, "invalid semantic tokens range");
+        }
+        let Some(document) = self.documents.get(&params.text_document.uri) else {
+            return OutgoingMessage::Response(Response::success(
+                id,
+                serde_json::to_value(SemanticTokens { data: Vec::new() }).unwrap_or(Value::Null),
+            ));
+        };
+        let Ok(start) = byte_offset(&document.text, params.range.start) else {
+            return failure(id, CODE_INVALID_PARAMS, "invalid semantic tokens range");
+        };
+        let Ok(end) = byte_offset(&document.text, params.range.end) else {
+            return failure(id, CODE_INVALID_PARAMS, "invalid semantic tokens range");
+        };
+        let Ok(start) = u32::try_from(start) else {
+            return failure(id, CODE_INVALID_PARAMS, "invalid semantic tokens range");
+        };
+        let Ok(end) = u32::try_from(end) else {
+            return failure(id, CODE_INVALID_PARAMS, "invalid semantic tokens range");
+        };
+        let program = self.build_program();
+        let result = program.source_file(&document.file_name).map_or_else(
+            || SemanticTokens { data: Vec::new() },
+            |source| semantic_tokens_in_range(source, Some((start, end))),
+        );
+        OutgoingMessage::Response(Response::success(
+            id,
+            serde_json::to_value(result).unwrap_or(Value::Null),
+        ))
+    }
+
     fn folding_range(&self, id: Id, params: Option<Value>) -> OutgoingMessage {
         let Ok(params) = deserialize_params::<FoldingRangeParams>(params) else {
             return failure(id, CODE_INVALID_PARAMS, "invalid folding range parameters");
@@ -1771,14 +1823,27 @@ const fn semantic_token_types() -> &'static [&'static str] {
 }
 
 fn semantic_tokens(source: &SourceFile) -> SemanticTokens {
+    semantic_tokens_in_range(source, None)
+}
+
+fn semantic_tokens_in_range(source: &SourceFile, range: Option<(u32, u32)>) -> SemanticTokens {
     let mut tokens = source
         .parse
         .arena
         .iter()
         .filter_map(|(node, value)| {
+            let start = range.map_or(value.range.start.get(), |(start, _)| {
+                value.range.start.get().max(start)
+            });
+            let end = range.map_or(value.range.end.get(), |(_, end)| {
+                value.range.end.get().min(end)
+            });
+            if start >= end {
+                return None;
+            }
             let token_type = semantic_token_type(source, node, &value.data, value.kind)?;
-            let start = position_at(&source.source_text, value.range.start.get());
-            let end = position_at(&source.source_text, value.range.end.get());
+            let start = position_at(&source.source_text, start);
+            let end = position_at(&source.source_text, end);
             (start.line == end.line && end.character > start.character).then_some((
                 start.line,
                 start.character,
@@ -4110,6 +4175,7 @@ mod tests {
             true
         );
         assert_eq!(capabilities["semanticTokensProvider"]["full"], true);
+        assert_eq!(capabilities["semanticTokensProvider"]["range"], true);
         assert_eq!(capabilities["foldingRangeProvider"], true);
         assert_eq!(capabilities["selectionRangeProvider"], true);
         assert_eq!(capabilities["documentHighlightProvider"], true);
@@ -4649,6 +4715,168 @@ mod tests {
         assert_eq!(selection["range"]["start"]["line"], 3);
         assert_eq!(selection["range"]["start"]["character"], 11);
         assert!(selection["parent"]["parent"].is_object());
+    }
+
+    #[test]
+    fn semantic_token_ranges_filter_utf16_positions_and_reject_invalid_ranges() {
+        let uri = DocumentUri("file:///workspace/range.ts".to_owned());
+        let unknown = DocumentUri("file:///workspace/missing.ts".to_owned());
+        let source = concat!(
+            "const outside = 1;\n",
+            "const face = '😀'; const inside = face;\n",
+            "const after = 3;\n"
+        );
+        let inside = position_at(
+            source,
+            u32::try_from(source.find("inside").unwrap()).unwrap(),
+        );
+        let emoji = position_at(source, u32::try_from(source.find('😀').unwrap()).unwrap());
+        let requested = Range {
+            start: inside,
+            end: Position {
+                line: inside.line,
+                character: inside.character + 6,
+            },
+        };
+        let write_range = |writer: &mut FramedWriter<Vec<u8>>, id, uri, range| {
+            write(
+                writer,
+                &Request::new(
+                    id,
+                    "textDocument/semanticTokens/range",
+                    Some(SemanticTokensRangeParams {
+                        text_document: TextDocumentIdentifier { uri },
+                        range,
+                    }),
+                ),
+            );
+        };
+
+        let mut input = begin_framed_session();
+        write_open(&mut input, uri.clone(), source);
+        write_range(&mut input, 55_i64, uri.clone(), requested);
+        write_range(
+            &mut input,
+            56_i64,
+            uri.clone(),
+            Range {
+                start: requested.end,
+                end: requested.start,
+            },
+        );
+        write_range(
+            &mut input,
+            57_i64,
+            uri.clone(),
+            Range {
+                start: Position {
+                    line: emoji.line,
+                    character: emoji.character + 1,
+                },
+                end: Position {
+                    line: emoji.line,
+                    character: emoji.character + 2,
+                },
+            },
+        );
+        write_range(&mut input, 58_i64, unknown.clone(), requested);
+        write_range(
+            &mut input,
+            59_i64,
+            unknown,
+            Range {
+                start: requested.end,
+                end: requested.start,
+            },
+        );
+        write(
+            &mut input,
+            &Request::new(
+                60_i64,
+                "textDocument/semanticTokens/range",
+                Some(json!({ "textDocument": { "uri": uri.0 } })),
+            ),
+        );
+
+        let output = finish_framed_session(input);
+        let response = |id| output.iter().find(|message| message["id"] == id).unwrap();
+        assert_eq!(
+            response(55)["result"]["data"],
+            json!([inside.line, inside.character, 6, 8, 0])
+        );
+        assert_eq!(response(56)["error"]["code"], CODE_INVALID_PARAMS);
+        assert_eq!(response(57)["error"]["code"], CODE_INVALID_PARAMS);
+        assert_eq!(response(58)["result"]["data"], json!([]));
+        assert_eq!(response(59)["error"]["code"], CODE_INVALID_PARAMS);
+        assert_eq!(response(60)["error"]["code"], CODE_INVALID_PARAMS);
+    }
+
+    #[test]
+    fn semantic_token_ranges_clip_overlapping_tokens_in_utf16_units() {
+        let uri = DocumentUri("file:///workspace/clipped.ts".to_owned());
+        let source = "const face = '😀'; const inside = face;";
+        let inside = position_at(
+            source,
+            u32::try_from(source.find("inside").unwrap()).unwrap(),
+        );
+        let emoji = position_at(source, u32::try_from(source.find('😀').unwrap()).unwrap());
+        let requests = [
+            (
+                61_i64,
+                Range {
+                    start: Position {
+                        line: inside.line,
+                        character: inside.character + 2,
+                    },
+                    end: Position {
+                        line: inside.line,
+                        character: inside.character + 5,
+                    },
+                },
+                json!([inside.line, inside.character + 2, 3, 8, 0]),
+            ),
+            (
+                62_i64,
+                Range {
+                    start: emoji,
+                    end: Position {
+                        line: emoji.line,
+                        character: emoji.character + 2,
+                    },
+                },
+                json!([emoji.line, emoji.character, 2, 18, 0]),
+            ),
+            (
+                63_i64,
+                Range {
+                    start: inside,
+                    end: inside,
+                },
+                json!([]),
+            ),
+        ];
+
+        let mut input = begin_framed_session();
+        write_open(&mut input, uri.clone(), source);
+        for (id, range, _) in &requests {
+            write(
+                &mut input,
+                &Request::new(
+                    *id,
+                    "textDocument/semanticTokens/range",
+                    Some(SemanticTokensRangeParams {
+                        text_document: TextDocumentIdentifier { uri: uri.clone() },
+                        range: *range,
+                    }),
+                ),
+            );
+        }
+
+        let output = finish_framed_session(input);
+        for (id, _, expected) in requests {
+            let response = output.iter().find(|message| message["id"] == id).unwrap();
+            assert_eq!(response["result"]["data"], expected);
+        }
     }
 
     #[test]
