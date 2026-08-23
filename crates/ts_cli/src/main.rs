@@ -720,10 +720,11 @@ fn invalidate_project_build_info(
 }
 
 fn project_build_info_path(program: &Program, config_path: &str) -> PathBuf {
-    program.options().ts_build_info_file.as_ref().map_or_else(
-        || Path::new(config_path).with_extension("tsbuildinfo"),
-        PathBuf::from,
-    )
+    PathBuf::from(ts_project::project_build_info_path(
+        &OsFileSystem::default(),
+        program,
+        config_path,
+    ))
 }
 
 fn print_source_files(program: &Program) {

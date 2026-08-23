@@ -252,6 +252,9 @@ fn parse_expanded(args: &[String]) -> Result<Command, CommandLineError> {
     if let Some(command) = requested_command {
         return Ok(command);
     }
+    if options.watch && options.list_files_only {
+        return Err(incompatible_build_options("watch", "listFilesOnly"));
+    }
     options.no_check = parsed.options.no_check;
     options.no_emit = parsed.options.no_emit;
     options.no_lib = parsed.options.no_lib;
@@ -1296,6 +1299,76 @@ mod tests {
             panic!("expected build command");
         };
         assert!(options.watch);
+    }
+
+    #[test]
+    fn rejects_watch_with_list_files_only_before_project_resolution() {
+        for arguments in [
+            &["--watch", "--listFilesOnly", "main.ts"][..],
+            &["--watch", "--listFilesOnly"][..],
+            &["--listFilesOnly", "--watch", "main.ts"][..],
+            &["-w", "--listFilesOnly", "--project", "missing.json"][..],
+            &[
+                "--listFilesOnly",
+                "-p",
+                "missing.json",
+                "main.ts",
+                "--watch",
+            ][..],
+        ] {
+            let error = parse(arguments).unwrap_err();
+            assert_eq!(error.code, 6370, "arguments: {arguments:?}");
+            assert_eq!(
+                error.render(),
+                "error TS6370: Options 'watch' and 'listFilesOnly' cannot be combined.",
+                "arguments: {arguments:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_false_disables_watch_and_list_files_only_conflict() {
+        let Command::Compile(disabled_watch) =
+            parse(&["--watch", "false", "--listFilesOnly", "main.ts"]).unwrap()
+        else {
+            panic!("expected compile command");
+        };
+        assert!(!disabled_watch.watch);
+        assert!(disabled_watch.list_files_only);
+
+        let Command::Compile(disabled_listing) =
+            parse(&["--watch", "--listFilesOnly", "false", "main.ts"]).unwrap()
+        else {
+            panic!("expected compile command");
+        };
+        assert!(disabled_listing.watch);
+        assert!(!disabled_listing.list_files_only);
+    }
+
+    #[test]
+    fn option_errors_and_requested_commands_precede_watch_listing_conflict() {
+        for (arguments, expected_code) in [
+            (&["--watch", "--listFilesOnly", "--wat"][..], 5023),
+            (
+                &["--watch", "--listFilesOnly", "--target", "future"][..],
+                6046,
+            ),
+            (&["--watch", "--listFilesOnly", "--project"][..], 6044),
+        ] {
+            assert_eq!(
+                parse(arguments).unwrap_err().code,
+                expected_code,
+                "arguments: {arguments:?}"
+            );
+        }
+        assert_eq!(
+            parse(&["--help", "--watch", "--listFilesOnly"]),
+            Ok(Command::Help)
+        );
+        assert_eq!(
+            parse(&["--watch", "--listFilesOnly", "--version"]),
+            Ok(Command::Version)
+        );
     }
 
     #[test]

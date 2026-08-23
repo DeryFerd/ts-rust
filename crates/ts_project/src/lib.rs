@@ -11,9 +11,7 @@ use ts_config::{parse_config_file, resolve_config_file};
 use ts_core::TextRange;
 use ts_diagnostics::message_by_code;
 use ts_incremental::{BuildDecision, BuildInfo, hash_text};
-use ts_path::{
-    CaseSensitivity, canonicalize, change_extension, is_absolute, normalize_path, resolve_path,
-};
+use ts_path::{CaseSensitivity, canonicalize, is_absolute, normalize_path, resolve_path};
 use ts_printer::emit_declaration_file_with_semantics_and_options;
 use ts_vfs::{DirectoryEntries, FileSystem};
 
@@ -251,8 +249,7 @@ pub fn build_projects(
                     .map(|signature| (path.clone(), signature.clone()))
             })
             .collect::<BTreeMap<_, _>>();
-        let build_info_path = ts_outputpaths::build_info_path(program.options())
-            .unwrap_or_else(|| change_extension(config_path, ".tsbuildinfo"));
+        let build_info_path = project_build_info_path(file_system, &program, config_path);
         let previous = enabled
             .then(|| {
                 file_system
@@ -312,6 +309,21 @@ pub fn build_projects(
         projects,
         skipped,
     }
+}
+
+/// Returns the project build-info path using the host's path comparison rules.
+#[must_use]
+pub fn project_build_info_path(
+    file_system: &dyn FileSystem,
+    program: &Program,
+    config_path: &str,
+) -> String {
+    let case_sensitivity = if file_system.use_case_sensitive_file_names() {
+        CaseSensitivity::Sensitive
+    } else {
+        CaseSensitivity::Insensitive
+    };
+    ts_outputpaths::build_info_path(program.options(), config_path, case_sensitivity)
 }
 
 fn is_solution_project(
@@ -966,7 +978,36 @@ mod tests {
         );
         write_build_outputs(&fs, result);
         assert!(!fs.file_exists("/repo/tsconfig.tsbuildinfo"));
-        assert!(fs.file_exists("/repo/lib/tsconfig.tsbuildinfo"));
+        assert!(fs.file_exists("/repo/lib/dist/tsconfig.tsbuildinfo"));
+    }
+
+    #[test]
+    fn nested_build_info_paths_preserve_config_location_within_root_dir() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/repo/packages/app/tsconfig.app.json",
+            r#"{"files":["index.ts"],"compilerOptions":{"composite":true,"noLib":true,"outDir":"../../dist","rootDir":".."}}"#,
+        )
+        .unwrap();
+        fs.write_file("/repo/packages/app/index.ts", "export const value = 1;\n")
+            .unwrap();
+
+        let result = build_projects(
+            &fs,
+            "/repo",
+            &["packages/app/tsconfig.app.json".into()],
+            ProgramOptionsOverride::default(),
+            true,
+        );
+        let build_info = result.projects[0]
+            .build_info
+            .as_ref()
+            .expect("successful composite build emits build information");
+
+        assert_eq!(
+            build_info.file_name,
+            "/repo/dist/app/tsconfig.app.tsbuildinfo"
+        );
     }
 
     #[test]

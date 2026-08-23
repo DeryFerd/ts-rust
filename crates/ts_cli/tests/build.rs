@@ -215,7 +215,7 @@ fn build_dry_run_never_creates_or_removes_outputs() {
     .unwrap();
     fs::write(directory.0.join("main.ts"), "export const value = 1;\n").unwrap();
     let output = directory.0.join("dist/main.js");
-    let build_info = directory.0.join("tsconfig.tsbuildinfo");
+    let build_info = directory.0.join("dist/tsconfig.tsbuildinfo");
 
     let dry_build = run(
         &directory.0,
@@ -319,8 +319,8 @@ fn incremental_build_skips_unchanged_and_invalidates_consumers() {
     assert!(first.status.success());
     let library_output = directory.0.join("packages/lib/dist/index.js");
     let application_output = directory.0.join("packages/app/dist/index.js");
-    let library_info = directory.0.join("packages/lib/tsconfig.tsbuildinfo");
-    let application_info = directory.0.join("packages/app/tsconfig.tsbuildinfo");
+    let library_info = directory.0.join("packages/lib/dist/tsconfig.tsbuildinfo");
+    let application_info = directory.0.join("packages/app/dist/tsconfig.tsbuildinfo");
     assert!(library_info.is_file());
     assert!(application_info.is_file());
 
@@ -373,6 +373,84 @@ fn composite_project_uses_configured_build_info_path() {
 }
 
 #[test]
+fn default_build_info_in_out_dir_supports_force_and_clean() {
+    let directory = TestDirectory::new("default-build-info");
+    fs::write(
+        directory.0.join("tsconfig.json"),
+        r#"{"files":["main.ts"],"compilerOptions":{"composite":true,"noLib":true,"outDir":"dist"}}"#,
+    )
+    .unwrap();
+    fs::write(directory.0.join("main.ts"), "export const value = 1;\n").unwrap();
+    let arguments = ["--build", "--pretty", "false"];
+    assert!(run(&directory.0, &arguments).status.success());
+
+    let output = directory.0.join("dist/main.js");
+    let build_info = directory.0.join("dist/tsconfig.tsbuildinfo");
+    assert!(build_info.is_file());
+    assert!(!directory.0.join("tsconfig.tsbuildinfo").exists());
+
+    fs::write(&output, "up-to-date sentinel").unwrap();
+    assert!(run(&directory.0, &arguments).status.success());
+    assert_eq!(fs::read_to_string(&output).unwrap(), "up-to-date sentinel");
+
+    let forced = run(&directory.0, &["--build", "--force", "--pretty", "false"]);
+    assert!(forced.status.success());
+    assert_ne!(fs::read_to_string(&output).unwrap(), "up-to-date sentinel");
+    assert!(build_info.is_file());
+
+    let cleaned = run(&directory.0, &["--build", "--clean", "--pretty", "false"]);
+    assert!(cleaned.status.success());
+    assert!(!output.exists());
+    assert!(!build_info.exists());
+}
+
+#[test]
+fn nested_configs_keep_build_info_relative_to_root_dir() {
+    let directory = TestDirectory::new("nested-build-info");
+    let project = directory.0.join("packages/app");
+    fs::create_dir_all(&project).unwrap();
+    fs::write(
+        project.join("tsconfig.app.json"),
+        r#"{"files":["index.ts"],"compilerOptions":{"composite":true,"noLib":true,"outDir":"../../dist","rootDir":".."}}"#,
+    )
+    .unwrap();
+    fs::write(project.join("index.ts"), "export const value = 1;\n").unwrap();
+
+    let arguments = [
+        "--build",
+        "packages/app/tsconfig.app.json",
+        "--pretty",
+        "false",
+    ];
+    let built = run(&directory.0, &arguments);
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stdout)
+    );
+
+    let output = directory.0.join("dist/app/index.js");
+    let build_info = directory.0.join("dist/app/tsconfig.app.tsbuildinfo");
+    assert!(output.is_file());
+    assert!(build_info.is_file());
+    assert!(!project.join("tsconfig.app.tsbuildinfo").exists());
+
+    let cleaned = run(
+        &directory.0,
+        &[
+            "--build",
+            "packages/app/tsconfig.app.json",
+            "--clean",
+            "--pretty",
+            "false",
+        ],
+    );
+    assert!(cleaned.status.success());
+    assert!(!output.exists());
+    assert!(!build_info.exists());
+}
+
+#[test]
 fn implementation_only_changes_do_not_rebuild_consumers() {
     let directory = TestDirectory::new("implementation-signature");
     write_project(&directory.0);
@@ -417,7 +495,7 @@ fn stale_or_missing_outputs_are_rebuilt_with_deterministic_build_info() {
     let arguments = ["--build", "--pretty", "false"];
     assert!(run(&directory.0, &arguments).status.success());
     let output = directory.0.join("dist/main.js");
-    let build_info = directory.0.join("tsconfig.tsbuildinfo");
+    let build_info = directory.0.join("dist/tsconfig.tsbuildinfo");
     let original_build_info = fs::read_to_string(&build_info).unwrap();
 
     fs::remove_file(&output).unwrap();
