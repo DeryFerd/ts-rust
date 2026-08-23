@@ -1698,8 +1698,10 @@ impl Program {
                     );
                     self.resolved_modules
                         .insert((containing, specifier.clone()), target.clone());
-                } else if !self.options.no_check
-                    && (!side_effect_only || self.options.no_unchecked_side_effect_imports)
+                } else if !(self.options.no_check
+                    || side_effect_only && !self.options.no_unchecked_side_effect_imports
+                    || self.options.skip_lib_check
+                        && ts_path::is_declaration_file(&containing_file))
                 {
                     self.diagnostics.push(if side_effect_only {
                         side_effect_import_not_found_diagnostic(&containing_file, range, &specifier)
@@ -11487,6 +11489,117 @@ mod tests {
                 .filter_map(|diagnostic| diagnostic.code)
                 .collect::<Vec<_>>(),
             [2882, 2307]
+        );
+    }
+
+    #[test]
+    fn skip_lib_check_suppresses_only_unresolved_declaration_file_imports() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/main.ts",
+            "import './types'; import { missing } from './missing-user'; missing;",
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/types.d.ts",
+            concat!(
+                "import './missing-side-effect';\n",
+                "import { Missing } from './missing-binding';\n",
+                "import { Present } from './present';\n",
+                "export { Missing, Present };\n",
+            ),
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/present.d.ts",
+            "export interface Present { value: number; }",
+        )
+        .unwrap();
+
+        let checked = Program::new_with_options(
+            &fs,
+            "/project",
+            &["main.ts".to_owned()],
+            CompilerOptions {
+                no_lib: true,
+                no_unchecked_side_effect_imports: true,
+                no_unchecked_side_effect_imports_specified: true,
+                ..CompilerOptions::default()
+            },
+        );
+        assert_eq!(
+            checked
+                .diagnostics()
+                .iter()
+                .filter(|diagnostic| matches!(diagnostic.code, Some(2307 | 2882)))
+                .map(|diagnostic| (diagnostic.file_name.as_deref(), diagnostic.code))
+                .collect::<Vec<_>>(),
+            [
+                (Some("/project/main.ts"), Some(2307)),
+                (Some("/project/types.d.ts"), Some(2882)),
+                (Some("/project/types.d.ts"), Some(2307)),
+            ]
+        );
+        assert!(checked.source_file("/project/present.d.ts").is_some());
+
+        let skipped = Program::new_with_options(
+            &fs,
+            "/project",
+            &["main.ts".to_owned()],
+            CompilerOptions {
+                no_lib: true,
+                no_unchecked_side_effect_imports: true,
+                no_unchecked_side_effect_imports_specified: true,
+                skip_lib_check: true,
+                ..CompilerOptions::default()
+            },
+        );
+        assert_eq!(
+            skipped
+                .diagnostics()
+                .iter()
+                .filter(|diagnostic| matches!(diagnostic.code, Some(2307 | 2882)))
+                .map(|diagnostic| (diagnostic.file_name.as_deref(), diagnostic.code))
+                .collect::<Vec<_>>(),
+            [(Some("/project/main.ts"), Some(2307))]
+        );
+        assert!(skipped.source_file("/project/present.d.ts").is_some());
+    }
+
+    #[test]
+    fn skip_lib_check_preserves_missing_explicit_type_reference_diagnostics() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/types.d.ts",
+            concat!(
+                "/// <reference types=\"missing-types\" />\n",
+                "import { Missing } from './missing-binding';\n",
+                "export { Missing };\n",
+            ),
+        )
+        .unwrap();
+
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["types.d.ts".to_owned()],
+            CompilerOptions {
+                no_lib: true,
+                skip_lib_check: true,
+                ..CompilerOptions::default()
+            },
+        );
+        assert_eq!(
+            program
+                .diagnostics()
+                .iter()
+                .filter_map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [2688]
+        );
+        assert_eq!(
+            program.diagnostics()[0].file_name.as_deref(),
+            Some("/project/types.d.ts")
         );
     }
 
