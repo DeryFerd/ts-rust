@@ -31,7 +31,7 @@ use super::{
         type_to_string_with_host_and_flags,
     },
     indexed_access_types::template_pattern_index_matches_name,
-    production::CanonicalJsxRuntimeEvidence,
+    production::{CanonicalJsxRuntime, CanonicalJsxRuntimeEvidence},
     signatures::SignatureFlags,
     source::merge_retry_diagnostic,
     spelling::get_spelling_suggestion,
@@ -122,6 +122,12 @@ enum JsxScalarPlan {
         node: NodeRef,
         name: String,
     },
+    Property {
+        node: NodeRef,
+        receiver: Box<Self>,
+        name_node: NodeRef,
+        name: String,
+    },
     AnyAssertion {
         node: NodeRef,
         type_node: NodeRef,
@@ -142,7 +148,9 @@ enum JsxScalarPlan {
 
 #[derive(Clone, Debug)]
 enum JsxChildPlan {
-    Text,
+    Text {
+        node: NodeRef,
+    },
     Expression {
         wrapper: NodeRef,
         value: JsxScalarPlan,
@@ -169,6 +177,12 @@ struct JsxIntrinsicResolution {
 #[derive(Clone, Debug)]
 struct CheckedJsxAttribute {
     plan: JsxAttributePlan,
+    type_: TypeId,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CheckedJsxChildren {
+    node: NodeRef,
     type_: TypeId,
 }
 
@@ -894,7 +908,7 @@ fn plan_jsx_children(
                 ) =>
             {
                 if !text.contains_only_trivia_white_spaces {
-                    result.push(JsxChildPlan::Text);
+                    result.push(JsxChildPlan::Text { node: child });
                 }
             }
             NodeData::JsxExpression(expression)
@@ -967,6 +981,40 @@ fn plan_scalar(
             Ok(JsxScalarPlan::Identifier {
                 node,
                 name: identifier.text.clone(),
+            })
+        }
+        NodeData::PropertyAccessExpression(access)
+            if record.kind == SyntaxKind::PropertyAccessExpression
+                && access.question_dot_token.is_none()
+                && access.flow_node.is_none()
+                && access.facts == 0 =>
+        {
+            let receiver_node = child_ref(node, access.expression);
+            let receiver_record = jsx_node(arena, bound, store, receiver_node)?;
+            if receiver_record.kind != SyntaxKind::Identifier
+                || !matches!(&receiver_record.data, NodeData::Identifier(_))
+            {
+                return Err(unsupported(receiver_node, receiver_record.kind));
+            }
+            let receiver = plan_scalar(arena, bound, store, node, receiver_node)?;
+            let name_node = child_ref(node, access.name);
+            let name_record = jsx_node(arena, bound, store, name_node)?;
+            let NodeData::Identifier(name) = &name_record.data else {
+                return Err(unsupported(name_node, name_record.kind));
+            };
+            if name_record.kind != SyntaxKind::Identifier
+                || name_record.parent != Some(node.node)
+                || name_record.flags.0 != 0
+                || name.flow_node.is_some()
+                || name.text.is_empty()
+            {
+                return Err(unsupported(name_node, name_record.kind));
+            }
+            Ok(JsxScalarPlan::Property {
+                node,
+                receiver: Box::new(receiver),
+                name_node,
+                name: name.text.clone(),
             })
         }
         NodeData::AsExpression(assertion) if record.kind == SyntaxKind::AsExpression => {
@@ -1534,6 +1582,7 @@ fn execute_jsx_element(
     options: CanonicalCheckerOptions,
     diagnostics: &mut CanonicalCheckerDiagnostics,
 ) -> Result<TypeId, SourceCheckError> {
+    let mut children_checked = false;
     if plan.expression != plan.opening {
         publish_jsx_links(
             store,
@@ -1653,6 +1702,21 @@ fn execute_jsx_element(
             };
 
             publish_signature_links(store, plan.opening, signature)?;
+            let children = if options.jsx_runtime == CanonicalJsxRuntime::Automatic {
+                check_automatic_jsx_children(
+                    store,
+                    arena,
+                    bound,
+                    namespace,
+                    plan,
+                    attributes,
+                    options,
+                    diagnostics,
+                )?
+            } else {
+                None
+            };
+            children_checked = children.is_some();
             let (checked, actual_attributes) = match attributes {
                 JsxAttributesPlan::Properties(attributes) => {
                     let checked = check_jsx_attributes(
@@ -1664,8 +1728,13 @@ fn execute_jsx_element(
                         options,
                         diagnostics,
                     )?;
-                    let actual =
-                        publish_attribute_object(store, bound, *attributes_node, &checked)?;
+                    let actual = publish_attribute_object(
+                        store,
+                        bound,
+                        *attributes_node,
+                        &checked,
+                        children,
+                    )?;
                     (checked, actual)
                 }
                 JsxAttributesPlan::ObjectSpread(spread) => {
@@ -1689,35 +1758,109 @@ fn execute_jsx_element(
                 tag,
                 (expected_attributes, actual_attributes),
                 &checked,
+                children,
                 diagnostics,
             )?;
         }
     }
 
-    for child in &plan.children {
-        match child {
-            JsxChildPlan::Text => {}
-            JsxChildPlan::Expression { wrapper, value } => {
-                let type_ =
-                    execute_scalar(store, arena, bound, namespace, value, options, diagnostics)?;
-                publish_type_links(store, *wrapper, type_)?;
-            }
-            JsxChildPlan::Element(element) => {
-                execute_jsx_element(
-                    store,
-                    arena,
-                    bound,
-                    namespace,
-                    element,
-                    options,
-                    diagnostics,
-                )?;
+    if !children_checked {
+        for child in &plan.children {
+            match child {
+                JsxChildPlan::Text { .. } => {}
+                JsxChildPlan::Expression { wrapper, value } => {
+                    let type_ = execute_scalar(
+                        store,
+                        arena,
+                        bound,
+                        namespace,
+                        value,
+                        options,
+                        diagnostics,
+                    )?;
+                    publish_type_links(store, *wrapper, type_)?;
+                }
+                JsxChildPlan::Element(element) => {
+                    execute_jsx_element(
+                        store,
+                        arena,
+                        bound,
+                        namespace,
+                        element,
+                        options,
+                        diagnostics,
+                    )?;
+                }
             }
         }
     }
 
     publish_type_links(store, plan.expression, namespace.element_type)?;
     Ok(namespace.element_type)
+}
+
+#[allow(clippy::too_many_arguments)] // JSX child execution retains the enclosing checker state.
+fn check_automatic_jsx_children(
+    store: &mut CanonicalTypeMapperStore,
+    arena: &NodeArena,
+    bound: &BoundFile,
+    namespace: &JsxNamespace,
+    plan: &JsxElementPlan,
+    attributes: &JsxAttributesPlan,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+) -> Result<Option<CheckedJsxChildren>, SourceCheckError> {
+    let [child] = plan.children.as_slice() else {
+        return if plan.children.is_empty() {
+            Ok(None)
+        } else {
+            Err(unsupported(plan.expression, SyntaxKind::JsxElement))
+        };
+    };
+    match attributes {
+        JsxAttributesPlan::Properties(attributes)
+            if attributes
+                .iter()
+                .any(|attribute| attribute.name == "children") =>
+        {
+            return Err(unsupported(plan.opening, SyntaxKind::JsxAttributes));
+        }
+        JsxAttributesPlan::ObjectSpread(spread) => {
+            return Err(unsupported(spread.node, SyntaxKind::JsxSpreadAttribute));
+        }
+        JsxAttributesPlan::Properties(_) => {}
+    }
+
+    let (node, type_) = match child {
+        JsxChildPlan::Text { node } => {
+            let string_type = store
+                .intrinsic_bootstrap()
+                .ok_or(SourceCheckError::LiteralCache(
+                    SourceLiteralCacheError::BootstrapUninitialized,
+                ))?
+                .string_type;
+            (*node, string_type)
+        }
+        JsxChildPlan::Expression { wrapper, value } => {
+            let type_ =
+                execute_scalar(store, arena, bound, namespace, value, options, diagnostics)?;
+            publish_type_links(store, *wrapper, type_)?;
+            (*wrapper, type_)
+        }
+        JsxChildPlan::Element(element) => {
+            let type_ = execute_jsx_element(
+                store,
+                arena,
+                bound,
+                namespace,
+                element,
+                options,
+                diagnostics,
+            )?;
+            (element.expression, type_)
+        }
+    };
+    Ok(Some(CheckedJsxChildren { node, type_ }))
 }
 
 fn check_jsx_closing_tag(
@@ -2155,8 +2298,43 @@ fn jsx_component_value_type(
     let NodeData::VariableDeclaration(variable) = &record.data else {
         return Err(SourceCheckError::Call(location));
     };
-    if variable.initializer.is_some() {
-        return Err(SourceCheckError::Call(location));
+    if let Some(initializer) = variable.initializer {
+        let initializer = child_ref(declaration, initializer);
+        let initializer_record = jsx_node(arena, bound, store, initializer)?;
+        let unavailable = || unsupported(initializer, initializer_record.kind);
+        if initializer_record.kind != SyntaxKind::ArrowFunction
+            || initializer_record.parent != Some(declaration.node)
+        {
+            return Err(unavailable());
+        }
+        let owner = bound
+            .symbol(initializer)
+            .and_then(|owner| store.get_merged_symbol(owner))
+            .ok_or_else(&unavailable)?;
+        let callable = store
+            .source_callable_type_for_declaration(initializer)
+            .or_else(|| store.source_callable_type_for_owner(owner))
+            .or_else(|| {
+                store
+                    .value_symbol_links(owner)
+                    .and_then(|links| links.resolved_type)
+            })
+            .ok_or_else(&unavailable)?;
+        let provenance = store
+            .source_callable_provenance(callable)
+            .ok_or_else(&unavailable)?;
+        if provenance.family != super::store::SourceCallableFamily::ArrowFunction
+            || provenance.declaration != initializer
+            || provenance.owner_symbol != owner
+            || store.source_callable_type_for_owner(owner) != Some(callable)
+            || store
+                .value_symbol_links(owner)
+                .and_then(|links| links.resolved_type)
+                != Some(callable)
+        {
+            return Err(unavailable());
+        }
+        return Ok(callable);
     }
     let annotation = variable
         .type_
@@ -2293,6 +2471,36 @@ fn resolve_source_value_symbol(
                 .symbol(*symbol)
                 .is_some_and(|record| record.flags().intersects(SymbolFlags::VALUE))
         })
+}
+
+fn resolve_scoped_jsx_value_symbol(
+    store: &CanonicalTypeMapperStore,
+    arena: &NodeArena,
+    bound: &BoundFile,
+    location: NodeRef,
+    name: &str,
+) -> Option<SemanticSymbolId> {
+    let mut current = Some(location);
+    while let Some(node) = current {
+        let symbol = bound
+            .locals(node)
+            .and_then(|locals| store.symbol_table(locals))
+            .and_then(|locals| locals.get_source(name))
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            .filter(|symbol| {
+                store
+                    .symbol(*symbol)
+                    .is_some_and(|record| record.flags().intersects(SymbolFlags::VALUE))
+            });
+        if symbol.is_some() {
+            return symbol;
+        }
+        current = arena
+            .get(node.node)
+            .and_then(|record| record.parent)
+            .map(|parent| child_ref(node, parent));
+    }
+    resolve_source_value_symbol(store, bound, name)
 }
 
 fn check_jsx_attributes(
@@ -2511,7 +2719,8 @@ fn execute_scalar(
             (*node, null_type)
         }
         JsxScalarPlan::Identifier { node, name } => {
-            let Some(symbol) = resolve_source_value_symbol(store, bound, name) else {
+            let Some(symbol) = resolve_scoped_jsx_value_symbol(store, arena, bound, *node, name)
+            else {
                 add_diagnostic(diagnostics, *node, 2304, [name.as_str()])?;
                 publish_type_links(store, *node, namespace.error_type)?;
                 return Ok(namespace.error_type);
@@ -2540,6 +2749,49 @@ fn execute_scalar(
                 .ok_or(SourceCheckError::Property(*node))?;
             publish_symbol_links(store, *node, symbol)?;
             (*node, type_)
+        }
+        JsxScalarPlan::Property {
+            node,
+            receiver,
+            name_node,
+            name,
+        } => {
+            let receiver_type = execute_scalar(
+                store,
+                arena,
+                bound,
+                namespace,
+                receiver,
+                options,
+                diagnostics,
+            )?;
+            if receiver_type == namespace.any_type || receiver_type == namespace.error_type {
+                (*node, receiver_type)
+            } else if let Some(property) = store.resolved_own_property(receiver_type, name)? {
+                if property.optional {
+                    return Err(unsupported(*node, SyntaxKind::PropertyAccessExpression));
+                }
+                publish_symbol_links(store, *name_node, property.symbol)?;
+                publish_type_links(store, *name_node, property.type_)?;
+                publish_symbol_links(store, *node, property.symbol)?;
+                (*node, property.type_)
+            } else {
+                let host = DeclaredTypeHost::new([(arena, bound)])
+                    .map_err(super::DeclaredTypeError::from)?;
+                let target = type_to_string_with_host_and_flags(
+                    store,
+                    &host,
+                    receiver_type,
+                    CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+                )?;
+                add_diagnostic(
+                    diagnostics,
+                    *name_node,
+                    2339,
+                    [name.as_str(), target.as_str()],
+                )?;
+                (*node, namespace.error_type)
+            }
         }
         JsxScalarPlan::AnyAssertion {
             node,
@@ -2623,6 +2875,7 @@ fn publish_attribute_object(
     bound: &BoundFile,
     attributes_node: NodeRef,
     attributes: &[CheckedJsxAttribute],
+    children: Option<CheckedJsxChildren>,
 ) -> Result<TypeId, SourceCheckError> {
     let owner = bound
         .symbol(attributes_node)
@@ -2633,18 +2886,19 @@ fn publish_attribute_object(
         .type_node_links(attributes_node)
         .and_then(|links| links.resolved_type)
     {
-        validate_attribute_object(store, type_, owner, attributes, attributes_node)?;
+        validate_attribute_object(store, type_, owner, attributes, children, attributes_node)?;
         return Ok(type_);
     }
-    if !store.try_reserve_checker_symbol_allocations(attributes.len(), 1)
-        || !store.try_reserve_value_symbol_links(attributes.len())
+    let property_count = attributes.len() + usize::from(children.is_some());
+    if !store.try_reserve_checker_symbol_allocations(property_count, 1)
+        || !store.try_reserve_value_symbol_links(property_count)
         || !store.try_reserve_types(1)
         || !store.try_reserve_type_node_links(1)
     {
         return Err(SourceCheckError::Property(attributes_node));
     }
     let members = store.alloc_symbol_table();
-    let mut properties = Vec::with_capacity(attributes.len());
+    let mut properties = Vec::with_capacity(property_count);
     for attribute in attributes {
         let data = {
             let source = store
@@ -2680,6 +2934,27 @@ fn publish_attribute_object(
         }
         properties.push(symbol);
     }
+    if let Some(children) = children {
+        let symbol = store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT,
+                EscapedName::source("children"),
+            ))
+            .ok_or(SourceCheckError::Property(children.node))?;
+        if !store.set_value_symbol_links(
+            symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(children.type_),
+                ..ValueSymbolLinks::default()
+            },
+        ) || store
+            .insert_symbol(members, EscapedName::source("children"), symbol)
+            .is_none()
+        {
+            return Err(SourceCheckError::Property(children.node));
+        }
+        properties.push(symbol);
+    }
     let flags = ObjectFlags::ANONYMOUS
         | ObjectFlags::OBJECT_LITERAL
         | ObjectFlags::FRESH_LITERAL
@@ -2707,6 +2982,7 @@ fn validate_attribute_object(
     type_: TypeId,
     owner: SemanticSymbolId,
     attributes: &[CheckedJsxAttribute],
+    children: Option<CheckedJsxChildren>,
     node: NodeRef,
 ) -> Result<(), SourceCheckError> {
     let record = store
@@ -2731,7 +3007,9 @@ fn validate_attribute_object(
         .members
         .and_then(|members| store.symbol_table(members))
         .ok_or(SourceCheckError::Property(node))?;
-    if structured.properties.as_deref().unwrap_or_default().len() != attributes.len() {
+    if structured.properties.as_deref().unwrap_or_default().len()
+        != attributes.len() + usize::from(children.is_some())
+    {
         return Err(SourceCheckError::Property(node));
     }
     for attribute in attributes {
@@ -2747,9 +3025,35 @@ fn validate_attribute_object(
             return Err(SourceCheckError::Property(node));
         }
     }
+    if let Some(children) = children {
+        let symbol = members
+            .get_source("children")
+            .ok_or(SourceCheckError::Property(node))?;
+        let record = store
+            .symbol(symbol)
+            .ok_or(SourceCheckError::Property(node))?;
+        if record.flags() != SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT
+            || record.check_flags() != CheckFlags::NONE
+            || record.name().as_utf8() != Some("children")
+            || record.declarations().is_some()
+            || record.value_declaration().is_some()
+            || record.members().is_some()
+            || record.exports().is_some()
+            || record.parent().is_some()
+            || record.export_symbol().is_some()
+            || store.value_symbol_links(symbol)
+                != Some(&ValueSymbolLinks {
+                    resolved_type: Some(children.type_),
+                    ..ValueSymbolLinks::default()
+                })
+        {
+            return Err(SourceCheckError::Property(node));
+        }
+    }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)] // Attribute diagnostics retain the implicit child property.
 fn check_attribute_assignability(
     store: &mut CanonicalTypeMapperStore,
     source: (&NodeArena, &BoundFile),
@@ -2757,6 +3061,7 @@ fn check_attribute_assignability(
     tag: &JsxTagPlan,
     (expected, actual): (TypeId, TypeId),
     attributes: &[CheckedJsxAttribute],
+    children: Option<CheckedJsxChildren>,
     diagnostics: &mut CanonicalCheckerDiagnostics,
 ) -> Result<(), SourceCheckError> {
     let expected_record = store
@@ -2807,7 +3112,10 @@ fn check_attribute_assignability(
             .map_err(|_| SourceCheckError::MissingDiagnostic(2339))?;
             let diagnostic = Diagnostic::with_arguments(
                 message_by_code(2322).ok_or(SourceCheckError::MissingDiagnostic(2322))?,
-                [format_attribute_object(store, &host, attributes)?, target],
+                [
+                    format_attribute_object(store, &host, attributes, children)?,
+                    target,
+                ],
             )
             .with_details([format!("  {detail}")]);
             merge_retry_diagnostic(
@@ -2833,6 +3141,26 @@ fn check_attribute_assignability(
         }
     }
 
+    if let Some(children) = children {
+        present.insert("children");
+        if let Some(expected_type) = expected_members
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get_source("children"))
+            .and_then(|symbol| store.value_symbol_links(symbol))
+            .and_then(|links| links.resolved_type)
+            && !store.is_type_assignable_to(children.type_, expected_type)?
+        {
+            let display =
+                get_type_names_for_assignability_error(store, children.type_, expected_type)?;
+            add_diagnostic(
+                diagnostics,
+                children.node,
+                2322,
+                [display.source, display.target],
+            )?;
+        }
+    }
+
     if !has_excess_attribute {
         for property in required {
             let record = store
@@ -2848,14 +3176,57 @@ fn check_attribute_assignability(
             if !present.contains(name) {
                 let host =
                     DeclaredTypeHost::new([source]).map_err(super::DeclaredTypeError::from)?;
-                let source = format_attribute_object(store, &host, attributes)?;
+                let source = format_attribute_object(store, &host, attributes, children)?;
                 let target = type_to_string_with_host_and_flags(
                     store,
                     &host,
                     expected,
                     CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
                 )?;
-                add_diagnostic(diagnostics, tag.node, 2741, [name, &source, &target])?;
+                if children.is_some() {
+                    let declaration = record
+                        .value_declaration()
+                        .or_else(|| {
+                            record
+                                .declarations()
+                                .and_then(|nodes| nodes.first().copied())
+                        })
+                        .ok_or(SourceCheckError::Property(opening))?;
+                    let declaration_record = host
+                        .node(declaration)
+                        .ok_or(SourceCheckError::Property(declaration))?;
+                    let name_node = match &declaration_record.data {
+                        NodeData::PropertyDeclaration(property) => {
+                            child_ref(declaration, property.name)
+                        }
+                        NodeData::PropertySignatureDeclaration(property) => {
+                            child_ref(declaration, property.name)
+                        }
+                        _ => return Err(SourceCheckError::Property(declaration)),
+                    };
+                    merge_retry_diagnostic(
+                        diagnostics,
+                        CanonicalCheckerDiagnostic {
+                            node: Some(tag.node),
+                            range_override: None,
+                            diagnostic: Diagnostic::with_arguments(
+                                message_by_code(2741)
+                                    .ok_or(SourceCheckError::MissingDiagnostic(2741))?,
+                                [name, source.as_str(), target.as_str()],
+                            ),
+                            related_information: vec![CanonicalCheckerRelatedInformation {
+                                node: Some(name_node),
+                                diagnostic: Diagnostic::with_arguments(
+                                    message_by_code(2728)
+                                        .ok_or(SourceCheckError::MissingDiagnostic(2728))?,
+                                    [name],
+                                ),
+                            }],
+                        },
+                    );
+                } else {
+                    add_diagnostic(diagnostics, tag.node, 2741, [name, &source, &target])?;
+                }
             }
         }
     }
@@ -2896,11 +3267,12 @@ fn format_attribute_object(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     attributes: &[CheckedJsxAttribute],
+    children: Option<CheckedJsxChildren>,
 ) -> Result<String, SourceCheckError> {
-    if attributes.is_empty() {
+    if attributes.is_empty() && children.is_none() {
         return Ok("{}".to_owned());
     }
-    let names = attributes
+    let mut names = attributes
         .iter()
         .map(|attribute| -> Result<String, SourceCheckError> {
             let name = if attribute.plan.name.contains(':') {
@@ -2918,9 +3290,19 @@ fn format_attribute_object(
                 )?
             ))
         })
-        .collect::<Result<Vec<_>, _>>()?
-        .join(" ");
-    Ok(format!("{{ {names} }}"))
+        .collect::<Result<Vec<_>, _>>()?;
+    if let Some(children) = children {
+        names.push(format!(
+            "children: {};",
+            type_to_string_with_host_and_flags(
+                store,
+                host,
+                children.type_,
+                CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+            )?
+        ));
+    }
+    Ok(format!("{{ {} }}", names.join(" ")))
 }
 
 fn emit_intrinsic_type_argument_diagnostic(
@@ -4404,6 +4786,52 @@ mod runtime_tests {
     }
 
     #[test]
+    fn unpublished_arrow_component_is_unsupported_instead_of_a_call_invariant() {
+        let fixture = RuntimeFixture::new(
+            concat!(
+                "const Title = (props: { children: string }) => <h1>{props.children}</h1>;\n",
+                "const element = <Title>Hello, world!</Title>;\n",
+            ),
+            FileId::new(8_133),
+        );
+        let component = resolve_source_value_symbol(&fixture.store, &fixture.bound, "Title")
+            .expect("the component declaration must be bound");
+        let initializer = fixture.expression("Title");
+        let expression = fixture.expression("element");
+        let NodeData::JsxElement(element) =
+            &fixture.parsed.arena.get(expression.node).unwrap().data
+        else {
+            unreachable!("the source contains a paired component")
+        };
+        let opening = child_ref(expression, element.opening_element);
+        let NodeData::JsxOpeningElement(element) =
+            &fixture.parsed.arena.get(opening.node).unwrap().data
+        else {
+            unreachable!("the paired component has an opening element")
+        };
+        let tag = child_ref(opening, element.tag_name);
+
+        let result = jsx_component_value_type(
+            &fixture.store,
+            &fixture.parsed.arena,
+            &fixture.bound,
+            component,
+            tag,
+        );
+
+        assert!(matches!(
+            result,
+            Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Syntax {
+                    node,
+                    kind: SyntaxKind::ArrowFunction,
+                    role: SourceSyntaxRole::VariableInitializer,
+                }
+            )) if node == initializer
+        ));
+    }
+
+    #[test]
     fn ambient_component_reads_its_staged_annotation_without_publishing_value_links() {
         let mut fixture = RuntimeFixture::new(
             "declare var Fragment: any;\nconst view = <Fragment></Fragment>;\n",
@@ -4706,6 +5134,258 @@ mod runtime_tests {
                 .and_then(|links| links.resolved_type),
             Some(any),
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One source proves scoped reads and warm child-attribute state.
+    fn automatic_runtime_uses_scoped_property_reads_and_implicit_children() {
+        let source = concat!(
+            "declare namespace JSX {\n",
+            "  interface IntrinsicElements { h1: { children: string }; }\n",
+            "  type Element = string;\n",
+            "}\n",
+            "const Title = (props: { children: string }) => <h1>{props.children}</h1>;\n",
+            "const element = <Title>Hello, world!</Title>;\n",
+        );
+        let parsed = parse_jsx_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(8_131);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/automatic-children.tsx\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = crate::semantic::CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions {
+                jsx_runtime: CanonicalJsxRuntime::Automatic,
+                ..CanonicalCheckerOptions::default()
+            },
+        )
+        .unwrap();
+        let module = context
+            .store_mut_for_test()
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::VALUE_MODULE,
+                EscapedName::source("\"/jsx/jsx-runtime\""),
+            ))
+            .unwrap();
+        let runtime = CanonicalJsxRuntimeEvidence::Automatic {
+            module_specifier: "/jsx/jsx-runtime",
+            resolved_module: Some(module),
+        };
+
+        context
+            .check_source_file_with_jsx_runtime(file, runtime)
+            .unwrap();
+
+        assert!(context.diagnostics().is_empty());
+        let access = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::PropertyAccessExpression).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let NodeData::PropertyAccessExpression(property) =
+            &parsed.arena.get(access.node).unwrap().data
+        else {
+            unreachable!("the source contains one parameter property read")
+        };
+        let receiver = child_ref(access, property.expression);
+        let name = child_ref(access, property.name);
+        let parameter = context
+            .store()
+            .symbol_node_links(receiver)
+            .and_then(|links| links.resolved_symbol)
+            .unwrap();
+        let member = context
+            .store()
+            .symbol_node_links(access)
+            .and_then(|links| links.resolved_symbol)
+            .unwrap();
+        assert_eq!(
+            context.store().symbol(parameter).unwrap().name().as_utf8(),
+            Some("props"),
+        );
+        assert_eq!(
+            context.store().symbol(member).unwrap().name().as_utf8(),
+            Some("children"),
+        );
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(name)
+                .and_then(|links| links.resolved_symbol),
+            Some(member),
+        );
+        let string_type = context.store().intrinsic_bootstrap().unwrap().string_type;
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(access)
+                .and_then(|links| links.resolved_type),
+            Some(string_type),
+        );
+
+        let children_properties = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::JsxAttributes).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .map(|attributes| {
+                let type_ = context
+                    .store()
+                    .type_node_links(attributes)
+                    .and_then(|links| links.resolved_type)
+                    .unwrap();
+                let members = context
+                    .store()
+                    .type_payload(type_)
+                    .and_then(|record| record.data().structured())
+                    .and_then(|structured| structured.members)
+                    .and_then(|members| context.store().symbol_table(members))
+                    .unwrap();
+                let children = members.get_source("children").unwrap();
+                assert_eq!(
+                    context
+                        .store()
+                        .value_symbol_links(children)
+                        .and_then(|links| links.resolved_type),
+                    Some(string_type),
+                );
+                children
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(children_properties.len(), 2);
+        assert_ne!(children_properties[0], children_properties[1]);
+
+        let cold = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().signature_len(),
+            context.store().symbol_store().symbol_table_len(),
+        );
+        context.recheck_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().signature_len(),
+                context.store().symbol_store().symbol_table_len(),
+            ),
+            cold,
+        );
+    }
+
+    #[test]
+    fn automatic_runtime_ignores_the_declared_children_attribute_name() {
+        let source = concat!(
+            "declare namespace JSX {\n",
+            "  interface IntrinsicElements { h1: { children: string }; }\n",
+            "  type Element = string;\n",
+            "  interface ElementChildrenAttribute { offspring: any; }\n",
+            "}\n",
+            "const Title = (props: { children: string }) => <h1>{props.children}</h1>;\n",
+            "const valid = <Title>Hello, world!</Title>;\n",
+            "const Wrong = (props: { offspring: string }) => <h1>{props.offspring}</h1>;\n",
+            "const invalid = <Wrong>Byebye, world!</Wrong>;\n",
+        );
+        let parsed = parse_jsx_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(8_132);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/automatic-child-name.tsx\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = crate::semantic::CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        let module = context
+            .store_mut_for_test()
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::VALUE_MODULE,
+                EscapedName::source("\"/jsx/jsx-runtime\""),
+            ))
+            .unwrap();
+
+        context
+            .check_source_file_with_jsx_runtime(
+                file,
+                CanonicalJsxRuntimeEvidence::Automatic {
+                    module_specifier: "/jsx/jsx-runtime",
+                    resolved_module: Some(module),
+                },
+            )
+            .unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("automatic JSX must report only the missing offspring property")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2741);
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "Property 'offspring' is missing in type '{ children: string; }' \
+             but required in type '{ offspring: string; }'.",
+        );
+        let NodeData::Identifier(tag) = &parsed
+            .arena
+            .get(diagnostic.node.unwrap().node)
+            .unwrap()
+            .data
+        else {
+            unreachable!("the missing property belongs to the component tag")
+        };
+        assert_eq!(tag.text, "Wrong");
+        let [related] = diagnostic.related_information.as_slice() else {
+            panic!("the missing property must point to its declaration")
+        };
+        assert_eq!(related.diagnostic.code(), 2728);
+        let NodeData::Identifier(declaration) =
+            &parsed.arena.get(related.node.unwrap().node).unwrap().data
+        else {
+            unreachable!("the related location belongs to the declared property")
+        };
+        assert_eq!(declaration.text, "offspring");
     }
 
     #[test]
