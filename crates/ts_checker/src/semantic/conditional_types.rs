@@ -20,9 +20,10 @@ use super::{
         instantiate_type_with_session, instantiate_type_with_vector_and_session,
     },
     mapper::CanonicalTypeMapperStore,
-    signatures::{ElementFlags, Signature, TupleElementInfo},
+    object_members::{StoredDeclaredCallSetValidation, validate_stored_declared_call_set},
+    signatures::{ElementFlags, SignatureFlags, TupleElementInfo},
     store::SourceNodeParent,
-    template_types::TemplateTypeError,
+    template_types::{TemplateTypeError, split_first_template_code_point},
     tuple_types::{CanonicalTupleTypeRequest, TupleTypeError},
     type_records::{
         CacheHashKey, ConditionalTypeData, LiteralValue, TypeCacheState, TypeData, TypeRecord,
@@ -422,12 +423,30 @@ pub(super) fn get_constraint_of_distributive_conditional_type(
     };
     let mut result = None;
     if distributive {
-        let constraint = match constraints::get_constraint_of_type(store, data.check_type) {
-            Ok(constraint) => constraint,
-            Err(ConstraintError::UnresolvedTypeParameter(type_)) if type_ == data.check_type => {
-                None
+        let declared_call_set_constraint = store
+            .type_payload(data.check_type)
+            .and_then(|record| match record.data() {
+                TypeData::TypeParameter(parameter) => parameter.constraint,
+                _ => None,
+            })
+            .filter(|constraint| {
+                matches!(
+                    validate_stored_declared_call_set(store, *constraint),
+                    StoredDeclaredCallSetValidation::Valid(_)
+                )
+            });
+        let constraint = if declared_call_set_constraint.is_some() {
+            declared_call_set_constraint
+        } else {
+            match constraints::get_constraint_of_type(store, data.check_type) {
+                Ok(constraint) => constraint,
+                Err(ConstraintError::UnresolvedTypeParameter(type_))
+                    if type_ == data.check_type =>
+                {
+                    None
+                }
+                Err(error) => return Err(error.into()),
             }
-            Err(error) => return Err(error.into()),
         };
         if let Some(constraint) = constraint
             && constraint != data.check_type
@@ -577,7 +596,21 @@ fn conditional_snapshot(
     conditional: TypeId,
 ) -> Result<ConditionalTypeData, ConditionalTypeError> {
     match store.type_payload(conditional).map(TypeRecord::data) {
-        Some(TypeData::Conditional(data)) => Ok(data.clone()),
+        Some(TypeData::Conditional(data)) => {
+            let root = store
+                .conditional_root(data.root)
+                .ok_or(ConditionalTypeError::InvalidRoot(data.root))?;
+            let mut visiting = HashSet::new();
+            for type_ in [
+                data.check_type,
+                data.extends_type,
+                root.check_type(),
+                root.extends_type(),
+            ] {
+                validate_conditional_operand(store, type_, &mut visiting)?;
+            }
+            Ok(data.clone())
+        }
         _ => Err(ConditionalTypeError::InvalidConditional(conditional)),
     }
 }
@@ -619,23 +652,18 @@ fn get_conditional_type_instantiation_with_tail_count(
         });
     }
     validate_branch_types(store, request.branches)?;
-    if let Some(alias) = request.alias
-        && store.type_alias(alias).is_none()
-    {
-        return Err(ConditionalTypeError::InvalidAlias(alias));
+    if let Some(alias) = request.alias {
+        let alias_record = store
+            .type_alias(alias)
+            .ok_or(ConditionalTypeError::InvalidAlias(alias))?;
+        let mut visiting = HashSet::new();
+        for argument in alias_record.type_arguments().unwrap_or_default() {
+            validate_conditional_operand(store, *argument, &mut visiting)?;
+        }
     }
 
-    let (root, existing_mapper) = match store
-        .type_payload(request.conditional_type)
-        .map(TypeRecord::data)
-    {
-        Some(TypeData::Conditional(data)) => (data.root, data.mapper),
-        _ => {
-            return Err(ConditionalTypeError::InvalidConditional(
-                request.conditional_type,
-            ));
-        }
-    };
+    let data = conditional_snapshot(store, request.conditional_type)?;
+    let (root, existing_mapper) = (data.root, data.mapper);
     if let Some(mapper) = existing_mapper
         && store.mapper_payload(mapper).is_none()
     {
@@ -676,8 +704,9 @@ fn get_conditional_type_instantiation_with_tail_count(
             actual: request.type_arguments.len(),
         });
     }
+    let mut visiting = HashSet::new();
     for argument in request.type_arguments {
-        validate_owned_type(store, *argument)?;
+        validate_conditional_operand(store, *argument, &mut visiting)?;
     }
 
     let key = conditional_type_key(
@@ -860,9 +889,14 @@ fn evaluate_conditional(
             store,
             check_type,
             extends_type,
-            &infer_parameters,
+            ConditionalInferenceContext {
+                infer_parameters: &infer_parameters,
+                mapped_parameters,
+                type_arguments,
+                global_types,
+            },
             &mut candidates,
-            global_types,
+            session,
         )?;
         if !matched {
             return map_type(
@@ -915,7 +949,8 @@ fn evaluate_conditional(
         global_types,
         session,
     )?;
-    if contains_type_parameter(store, inferred_extends, &HashSet::new())? {
+    let resolved_parameters = combined_parameters.iter().copied().collect::<HashSet<_>>();
+    if contains_type_parameter(store, inferred_extends, &resolved_parameters)? {
         return deferred_conditional(
             store,
             root,
@@ -1180,13 +1215,17 @@ fn validate_request(
     if !store.contains_node_ref(request.node) {
         return Err(ConditionalTypeError::InvalidNode(request.node));
     }
-    validate_owned_type(store, request.check_type)?;
-    validate_owned_type(store, request.extends_type)?;
+    let mut visiting = HashSet::new();
+    validate_conditional_operand(store, request.check_type, &mut visiting)?;
+    validate_conditional_operand(store, request.extends_type, &mut visiting)?;
     validate_branch_types(store, request.branches)?;
-    if let Some(alias) = request.alias
-        && store.type_alias(alias).is_none()
-    {
-        return Err(ConditionalTypeError::InvalidAlias(alias));
+    if let Some(alias) = request.alias {
+        let alias_record = store
+            .type_alias(alias)
+            .ok_or(ConditionalTypeError::InvalidAlias(alias))?;
+        for argument in alias_record.type_arguments().unwrap_or_default() {
+            validate_conditional_operand(store, *argument, &mut visiting)?;
+        }
     }
     let mut seen = HashSet::new();
     for parameter in request
@@ -1204,6 +1243,125 @@ fn validate_request(
             return Err(ConditionalTypeError::DuplicateTypeParameter(*parameter));
         }
     }
+    Ok(())
+}
+
+fn validate_conditional_operand(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    visiting: &mut HashSet<TypeId>,
+) -> Result<(), ConditionalTypeError> {
+    if !visiting.insert(type_) {
+        return Ok(());
+    }
+    let record = store
+        .type_payload(type_)
+        .ok_or(ConditionalTypeError::InvalidType(type_))?;
+    let mut dependencies = Vec::new();
+    if let Some(alias) = record.alias() {
+        let alias_record = store
+            .type_alias(alias)
+            .ok_or(ConditionalTypeError::InvalidAlias(alias))?;
+        dependencies.extend_from_slice(alias_record.type_arguments().unwrap_or_default());
+    }
+    match validate_stored_declared_call_set(store, type_) {
+        StoredDeclaredCallSetValidation::Malformed => {
+            return Err(RelationUnavailable::MalformedFunctionType(type_).into());
+        }
+        StoredDeclaredCallSetValidation::Valid(edges) => dependencies.extend(edges),
+        StoredDeclaredCallSetValidation::NotDeclaredCallSet => {}
+    }
+
+    if let Some(structured) = record.data().structured() {
+        let signatures = structured.signatures.as_deref().unwrap_or_default();
+        if structured.call_signature_count > signatures.len() {
+            return Err(RelationUnavailable::MalformedStructuredType(type_).into());
+        }
+        let mut unique = HashSet::with_capacity(signatures.len());
+        for (index, signature) in signatures.iter().copied().enumerate() {
+            let signature_record = store
+                .signature(signature)
+                .ok_or(ConditionalTypeError::InvalidSignature(signature))?;
+            if !unique.insert(signature)
+                || signature_record.flags().contains(SignatureFlags::CONSTRUCT)
+                    != (index >= structured.call_signature_count)
+            {
+                return Err(ConditionalTypeError::InvalidSignature(signature));
+            }
+            if matches!(record.data(), TypeData::Object(_) | TypeData::Interface(_))
+                && store
+                    .declared_call_set_type_for_signature(signature)
+                    .is_some_and(|owner| owner != type_)
+            {
+                return Err(RelationUnavailable::MalformedFunctionType(type_).into());
+            }
+            let return_type = signature_record
+                .resolved_return_type()
+                .ok_or(ConditionalTypeError::InvalidSignature(signature))?;
+            dependencies.push(return_type);
+            match store.callable_signature_parameter_types(signature) {
+                Some(parameters) if parameters.len() == signature_record.parameters().len() => {
+                    dependencies.extend_from_slice(parameters);
+                }
+                None if signature_record.parameters().is_empty() => {}
+                _ => return Err(ConditionalTypeError::InvalidSignature(signature)),
+            }
+            if let Some(mapper) = signature_record.mapper()
+                && store.mapper_payload(mapper).is_none()
+            {
+                return Err(ConditionalTypeError::InvalidMapper(mapper));
+            }
+        }
+    }
+
+    match record.data() {
+        TypeData::Union(union) => dependencies.extend_from_slice(&union.union.types),
+        TypeData::Intersection(intersection) => {
+            dependencies.extend_from_slice(&intersection.intersection.types);
+        }
+        TypeData::TypeReference(reference) => {
+            dependencies.extend_from_slice(
+                reference
+                    .resolved_type_arguments
+                    .as_deref()
+                    .unwrap_or_default(),
+            );
+            dependencies.extend(reference.object.target);
+        }
+        TypeData::Interface(interface) => {
+            dependencies.extend_from_slice(
+                interface
+                    .reference
+                    .resolved_type_arguments
+                    .as_deref()
+                    .unwrap_or_default(),
+            );
+            dependencies.extend(interface.reference.object.target);
+        }
+        TypeData::Tuple(tuple) => {
+            dependencies.extend_from_slice(
+                tuple
+                    .interface
+                    .reference
+                    .resolved_type_arguments
+                    .as_deref()
+                    .unwrap_or_default(),
+            );
+            dependencies.extend(tuple.interface.reference.object.target);
+        }
+        TypeData::Object(object) => dependencies.extend(object.target),
+        TypeData::TypeParameter(parameter) => dependencies.extend(parameter.constraint),
+        TypeData::TemplateLiteral(template) => dependencies.extend_from_slice(&template.types),
+        TypeData::StringMapping(mapping) => dependencies.push(mapping.target),
+        TypeData::Conditional(conditional) => {
+            dependencies.extend([conditional.check_type, conditional.extends_type]);
+        }
+        _ => {}
+    }
+    for dependency in dependencies {
+        validate_conditional_operand(store, dependency, visiting)?;
+    }
+    visiting.remove(&type_);
     Ok(())
 }
 
@@ -1617,7 +1775,7 @@ fn contains_type_parameter(
         let record = store
             .type_payload(type_)
             .ok_or(ConditionalTypeError::InvalidType(type_))?;
-        let result = match record.data() {
+        let mut result = match record.data() {
             TypeData::TypeParameter(_) => !excluded.contains(&type_),
             TypeData::Union(union) => union.union.types.iter().try_fold(false, |found, item| {
                 Ok::<_, ConditionalTypeError>(found || visit(store, *item, excluded, visiting)?)
@@ -1664,6 +1822,31 @@ fn contains_type_parameter(
             }
             _ => false,
         };
+        if !result && let Some(structured) = record.data().structured() {
+            for signature in structured.signatures.as_deref().unwrap_or_default() {
+                let signature_record = store
+                    .signature(*signature)
+                    .ok_or(ConditionalTypeError::InvalidSignature(*signature))?;
+                let return_type = signature_record
+                    .resolved_return_type()
+                    .ok_or(ConditionalTypeError::InvalidSignature(*signature))?;
+                if visit(store, return_type, excluded, visiting)? {
+                    result = true;
+                    break;
+                }
+                if let Some(parameters) = store.callable_signature_parameter_types(*signature) {
+                    for parameter in parameters {
+                        if visit(store, *parameter, excluded, visiting)? {
+                            result = true;
+                            break;
+                        }
+                    }
+                    if result {
+                        break;
+                    }
+                }
+            }
+        }
         visiting.remove(&type_);
         Ok(result)
     }
@@ -1671,15 +1854,27 @@ fn contains_type_parameter(
     visit(store, type_, excluded, &mut HashSet::new())
 }
 
+#[derive(Clone, Copy)]
+struct ConditionalInferenceContext<'a> {
+    infer_parameters: &'a [TypeId],
+    mapped_parameters: &'a [TypeId],
+    type_arguments: &'a [TypeId],
+    global_types: Option<&'a CanonicalGlobalTypes>,
+}
+
 fn infer_from_types(
     store: &mut CanonicalTypeMapperStore,
     source: TypeId,
     target: TypeId,
-    parameters: &[TypeId],
+    context: ConditionalInferenceContext<'_>,
     candidates: &mut [Vec<TypeId>],
-    global_types: Option<&CanonicalGlobalTypes>,
+    session: &mut InstantiationSession,
 ) -> Result<bool, ConditionalTypeError> {
-    if let Some(index) = parameters.iter().position(|parameter| *parameter == target) {
+    if let Some(index) = context
+        .infer_parameters
+        .iter()
+        .position(|parameter| *parameter == target)
+    {
         if !candidates[index].contains(&source) {
             candidates[index].push(source);
         }
@@ -1693,9 +1888,9 @@ fn infer_from_types(
             store,
             &source_tuple,
             &target_tuple,
-            parameters,
+            context,
             candidates,
-            global_types,
+            session,
         );
     }
 
@@ -1727,15 +1922,9 @@ fn infer_from_types(
             return Ok(false);
         };
         for (source, target) in matches.into_iter().zip(target_types) {
-            let candidate = template_inference_candidate(store, source, target, parameters)?;
-            if !infer_from_types(
-                store,
-                candidate,
-                target,
-                parameters,
-                candidates,
-                global_types,
-            )? {
+            let candidate =
+                template_inference_candidate(store, source, target, context.infer_parameters)?;
+            if !infer_from_types(store, candidate, target, context, candidates, session)? {
                 return Ok(false);
             }
         }
@@ -1761,27 +1950,30 @@ fn infer_from_types(
             return Ok(false);
         }
         for (source, target) in source_arguments.into_iter().zip(target_arguments) {
-            if !infer_from_types(store, source, target, parameters, candidates, global_types)? {
+            if !infer_from_types(store, source, target, context, candidates, session)? {
                 return Ok(false);
             }
         }
         return Ok(true);
     }
 
-    if source_record.data().structured().is_some() && target_record.data().structured().is_some() {
-        return infer_from_structured_types(
-            store,
-            source,
-            target,
-            parameters,
-            candidates,
-            global_types,
-        );
+    if target_record.data().structured().is_some() {
+        if source_record.data().structured().is_none() {
+            return if source_record
+                .flags()
+                .intersects(TypeFlags::ANY | TypeFlags::NEVER)
+            {
+                is_assignable(store, source, target, context.global_types)
+            } else {
+                Ok(false)
+            };
+        }
+        return infer_from_structured_types(store, source, target, context, candidates, session);
     }
     if contains_type_parameter(store, target, &HashSet::new())? {
         Err(ConditionalTypeError::UnsupportedInference { source, target })
     } else {
-        is_assignable(store, source, target, global_types)
+        is_assignable(store, source, target, context.global_types)
     }
 }
 
@@ -1789,9 +1981,9 @@ fn infer_from_tuple_types(
     store: &mut CanonicalTypeMapperStore,
     source: &InferenceTupleShape,
     target: &InferenceTupleShape,
-    parameters: &[TypeId],
+    context: ConditionalInferenceContext<'_>,
     candidates: &mut [Vec<TypeId>],
-    global_types: Option<&CanonicalGlobalTypes>,
+    session: &mut InstantiationSession,
 ) -> Result<bool, ConditionalTypeError> {
     let variable_indices = target
         .element_infos
@@ -1817,14 +2009,7 @@ fn infer_from_tuple_types(
             return Ok(false);
         }
         for (source, target) in source.element_types.iter().zip(&target.element_types) {
-            if !infer_from_types(
-                store,
-                *source,
-                *target,
-                parameters,
-                candidates,
-                global_types,
-            )? {
+            if !infer_from_types(store, *source, *target, context, candidates, session)? {
                 return Ok(false);
             }
         }
@@ -1840,9 +2025,9 @@ fn infer_from_tuple_types(
             store,
             source.element_types[index],
             target.element_types[index],
-            parameters,
+            context,
             candidates,
-            global_types,
+            session,
         )? {
             return Ok(false);
         }
@@ -1854,9 +2039,9 @@ fn infer_from_tuple_types(
             store,
             source.element_types[source_index],
             target.element_types[target_index],
-            parameters,
+            context,
             candidates,
-            global_types,
+            session,
         )? {
             return Ok(false);
         }
@@ -1870,7 +2055,7 @@ fn infer_from_tuple_types(
     {
         let middle_infos = &source.element_infos[variable..end];
         let mut request = CanonicalTupleTypeRequest::new(middle_types, middle_infos, false);
-        if let Some(global_types) = global_types {
+        if let Some(global_types) = context.global_types {
             request =
                 request.with_array_targets(CanonicalArrayTargets::from_global_types(global_types));
         }
@@ -1879,9 +2064,9 @@ fn infer_from_tuple_types(
             store,
             middle,
             target.element_types[variable],
-            parameters,
+            context,
             candidates,
-            global_types,
+            session,
         );
     }
     for element in middle_types {
@@ -1889,9 +2074,9 @@ fn infer_from_tuple_types(
             store,
             *element,
             target.element_types[variable],
-            parameters,
+            context,
             candidates,
-            global_types,
+            session,
         )? {
             return Ok(false);
         }
@@ -1910,6 +2095,7 @@ fn structured_inference_shape(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
 ) -> Result<StructuredInferenceShape, ConditionalTypeError> {
+    validate_conditional_operand(store, type_, &mut HashSet::new())?;
     let record = store
         .type_payload(type_)
         .ok_or(ConditionalTypeError::InvalidType(type_))?;
@@ -1935,9 +2121,9 @@ fn infer_from_structured_types(
     store: &mut CanonicalTypeMapperStore,
     source: TypeId,
     target: TypeId,
-    parameters: &[TypeId],
+    context: ConditionalInferenceContext<'_>,
     candidates: &mut [Vec<TypeId>],
-    global_types: Option<&CanonicalGlobalTypes>,
+    session: &mut InstantiationSession,
 ) -> Result<bool, ConditionalTypeError> {
     let source_shape = structured_inference_shape(store, source)?;
     let target_shape = structured_inference_shape(store, target)?;
@@ -1945,7 +2131,7 @@ fn infer_from_structured_types(
         && target_shape.call_signatures.is_empty()
         && target_shape.construct_signatures.is_empty()
     {
-        return is_assignable(store, source, target, global_types);
+        return is_assignable(store, source, target, context.global_types);
     }
 
     for target_property in target_shape.properties {
@@ -1969,13 +2155,29 @@ fn infer_from_structured_types(
             .value_symbol_links(target_property)
             .and_then(|links| links.resolved_type)
             .ok_or(ConditionalTypeError::UnsupportedInference { source, target })?;
+        let source_type = map_type(
+            store,
+            source_type,
+            context.mapped_parameters,
+            context.type_arguments,
+            context.global_types,
+            session,
+        )?;
+        let target_type = map_type(
+            store,
+            target_type,
+            context.mapped_parameters,
+            context.type_arguments,
+            context.global_types,
+            session,
+        )?;
         if !infer_from_types(
             store,
             source_type,
             target_type,
-            parameters,
+            context,
             candidates,
-            global_types,
+            session,
         )? {
             return Ok(false);
         }
@@ -2000,27 +2202,110 @@ fn infer_from_structured_types(
         for (index, target_signature) in targets.iter().copied().enumerate() {
             let source_index = sources.len().saturating_sub(targets.len()) + index;
             let source_signature = sources[source_index.min(sources.len() - 1)];
-            let source_return = store
-                .signature(source_signature)
-                .and_then(Signature::resolved_return_type)
-                .ok_or(ConditionalTypeError::InvalidSignature(source_signature))?;
-            let target_return = store
-                .signature(target_signature)
-                .and_then(Signature::resolved_return_type)
-                .ok_or(ConditionalTypeError::InvalidSignature(target_signature))?;
+            let (source_parameters, source_minimum, source_return) =
+                inference_signature_parts(store, source_signature)?;
+            let (target_parameters, _, target_return) =
+                inference_signature_parts(store, target_signature)?;
+            if source_minimum > target_parameters.len() {
+                return Ok(false);
+            }
+            for (source_parameter, target_parameter) in
+                source_parameters.into_iter().zip(target_parameters)
+            {
+                let source_parameter = map_type(
+                    store,
+                    source_parameter,
+                    context.mapped_parameters,
+                    context.type_arguments,
+                    context.global_types,
+                    session,
+                )?;
+                let target_parameter = map_type(
+                    store,
+                    target_parameter,
+                    context.mapped_parameters,
+                    context.type_arguments,
+                    context.global_types,
+                    session,
+                )?;
+                let compatible = if contains_mapped_type_parameter(
+                    store,
+                    target_parameter,
+                    context.infer_parameters,
+                    &mut HashSet::new(),
+                )? {
+                    infer_from_types(
+                        store,
+                        source_parameter,
+                        target_parameter,
+                        context,
+                        candidates,
+                        session,
+                    )?
+                } else {
+                    is_assignable(
+                        store,
+                        target_parameter,
+                        source_parameter,
+                        context.global_types,
+                    )?
+                };
+                if !compatible {
+                    return Ok(false);
+                }
+            }
+            let source_return = map_type(
+                store,
+                source_return,
+                context.mapped_parameters,
+                context.type_arguments,
+                context.global_types,
+                session,
+            )?;
+            let target_return = map_type(
+                store,
+                target_return,
+                context.mapped_parameters,
+                context.type_arguments,
+                context.global_types,
+                session,
+            )?;
             if !infer_from_types(
                 store,
                 source_return,
                 target_return,
-                parameters,
+                context,
                 candidates,
-                global_types,
+                session,
             )? {
                 return Ok(false);
             }
         }
     }
     Ok(true)
+}
+
+fn inference_signature_parts(
+    store: &CanonicalTypeMapperStore,
+    signature: SignatureId,
+) -> Result<(Vec<TypeId>, usize, TypeId), ConditionalTypeError> {
+    let record = store
+        .signature(signature)
+        .ok_or(ConditionalTypeError::InvalidSignature(signature))?;
+    let minimum = usize::try_from(record.min_argument_count())
+        .map_err(|_| ConditionalTypeError::InvalidSignature(signature))?;
+    let parameters = match store.callable_signature_parameter_types(signature) {
+        Some(parameters) if parameters.len() == record.parameters().len() => parameters.to_vec(),
+        None if record.parameters().is_empty() => Vec::new(),
+        _ => return Err(ConditionalTypeError::InvalidSignature(signature)),
+    };
+    if minimum > parameters.len() {
+        return Err(ConditionalTypeError::InvalidSignature(signature));
+    }
+    let return_type = record
+        .resolved_return_type()
+        .ok_or(ConditionalTypeError::InvalidSignature(signature))?;
+    Ok((parameters, minimum, return_type))
 }
 
 fn template_inference_candidate(
@@ -2192,8 +2477,8 @@ fn infer_template_literal_matches(
             } else {
                 &source_texts[segment]
             };
-            if let Some(character) = current[position..].chars().next() {
-                (segment, position + character.len_utf8())
+            if let Some((character, _)) = split_first_template_code_point(&current[position..]) {
+                (segment, position + character.len())
             } else if segment < last_source {
                 (segment + 1, 0)
             } else {
@@ -2376,6 +2661,17 @@ fn conditional_check_is_assignable_worker(
             global_types,
             visiting,
         )
+    } else if matches!(
+        store.type_payload(target).map(TypeRecord::data),
+        Some(TypeData::TemplateLiteral(_))
+    ) && store.type_payload(source).is_some_and(|record| {
+        record
+            .flags()
+            .intersects(TypeFlags::STRING_LITERAL | TypeFlags::TEMPLATE_LITERAL | TypeFlags::UNION)
+    }) {
+        store
+            .is_type_matched_by_template_literal_type(source, target)
+            .map_err(Into::into)
     } else {
         ordinary_assignability(store, source, target, global_types)
     };
@@ -2476,18 +2772,20 @@ fn is_never(store: &CanonicalTypeMapperStore, type_: TypeId) -> Result<bool, Con
 
 #[cfg(test)]
 mod tests {
-    use ts_ast::{FileId, NodeData, SyntaxKind};
+    use ts_ast::{FileId, NodeData, SyntaxKind, encode_js_string};
     use ts_binder::{
-        BoundFile, CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts,
-        CanonicalSourceLanguage, EscapedName, SymbolData, SymbolFlags,
+        BoundFile, CanonicalBinder, CanonicalModuleState, CanonicalNameResolverOptions,
+        CanonicalSourceFileFacts, CanonicalSourceLanguage, EscapedName, SymbolData, SymbolFlags,
     };
+    use ts_core::JsString;
     use ts_parser::{ParseResult, parse_source_file};
 
     use super::*;
     use crate::semantic::{
+        CanonicalCheckerDiagnostics, CanonicalCheckerOptions, DeclaredTypeHost,
         IntrinsicBootstrapOptions, SemanticStore, ValueSymbolLinks,
-        declared::execute_type_parameter, mapper::TypeMapper, signatures::SignatureFlags,
-        types::ObjectFlags,
+        declared::execute_type_parameter, mapper::TypeMapper, production::GlobalMergeCompletion,
+        type_nodes::CanonicalTypeQuery, types::ObjectFlags,
     };
 
     struct Fixture {
@@ -2578,6 +2876,49 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing type-parameter symbol {expected}"));
             execute_type_parameter(&mut self.store, symbol)
         }
+
+        fn declared_alias(&mut self, expected: &str) -> TypeId {
+            let declaration = self
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+                        return None;
+                    };
+                    let NodeData::Identifier(name) = &self.parsed.arena.get(alias.name)?.data
+                    else {
+                        return None;
+                    };
+                    (name.text == expected).then_some(NodeRef::new(
+                        self.parsed.arena.id(),
+                        self.file,
+                        node,
+                    ))
+                })
+                .unwrap_or_else(|| panic!("missing type alias {expected}"));
+            let symbol = self
+                .bound
+                .symbol(declaration)
+                .unwrap_or_else(|| panic!("missing type-alias symbol {expected}"));
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&self.parsed.arena, &self.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let result = CanonicalTypeQuery::new(
+                &mut self.store,
+                &host,
+                CanonicalCheckerOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_declared_type_of_symbol(symbol)
+            .unwrap();
+            assert!(diagnostics.is_empty());
+            result
+        }
     }
 
     fn branches(true_type: TypeId, false_type: TypeId) -> ConditionalTypeBranches {
@@ -2597,7 +2938,11 @@ mod tests {
             .unwrap();
         let signature = store
             .alloc_signature(
-                SignatureFlags::NONE,
+                if construct {
+                    SignatureFlags::CONSTRUCT
+                } else {
+                    SignatureFlags::NONE
+                },
                 None,
                 Vec::new(),
                 None,
@@ -3255,14 +3600,42 @@ mod tests {
 
     #[test]
     fn template_inference_consumes_complete_unicode_code_points() {
-        for (source, expected, selected) in [
+        let surrogate = encode_js_string(&JsString::from_units(vec![0xd800]));
+        let surrogate_source = format!("{surrogate}abc");
+        for (source, input, expected, selected) in [
             (
                 "type Head<T> = T extends `${infer H}${infer R}` ? H : never;",
+                "ABC",
+                "A",
+                "H",
+            ),
+            (
+                "type Head<T> = T extends `${infer H}${infer R}` ? H : never;",
+                "\u{3042}\u{3044}\u{3046}",
+                "\u{3042}",
+                "H",
+            ),
+            (
+                "type Head<T> = T extends `${infer H}${infer R}` ? H : never;",
+                "\u{1F600}abc",
                 "\u{1F600}",
                 "H",
             ),
             (
+                "type Head<T> = T extends `${infer H}${infer R}` ? H : never;",
+                surrogate_source.as_str(),
+                surrogate.as_str(),
+                "H",
+            ),
+            (
                 "type Rest<T> = T extends `${infer H}${infer R}` ? R : never;",
+                "\u{1F600}abc",
+                "abc",
+                "R",
+            ),
+            (
+                "type Rest<T> = T extends `${infer H}${infer R}` ? R : never;",
+                surrogate_source.as_str(),
                 "abc",
                 "R",
             ),
@@ -3298,7 +3671,134 @@ mod tests {
             .unwrap();
             let value = fixture
                 .store
-                .regular_string_literal_type("\u{1F600}abc".to_owned())
+                .regular_string_literal_type(input.to_owned())
+                .unwrap();
+            let result = get_conditional_type_instantiation(
+                &mut fixture.store,
+                ConditionalTypeInstantiation {
+                    conditional_type: conditional,
+                    type_arguments: &[value],
+                    branches: branch_types,
+                    alias: None,
+                    for_constraint: false,
+                },
+                None,
+                None,
+            )
+            .unwrap();
+            let Some(TypeData::Literal(literal)) =
+                fixture.store.type_payload(result).map(TypeRecord::data)
+            else {
+                panic!("template inference must produce a string literal")
+            };
+            assert_eq!(literal.value, LiteralValue::String(expected.to_owned()));
+        }
+    }
+
+    #[test]
+    fn conditional_template_assignability_matches_patterns_and_unions() {
+        let mut fixture = Fixture::new("type Pattern = `start-${string}`;");
+        let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        let target = fixture
+            .store
+            .get_template_literal_type(&["start-".to_owned(), String::new()], &[string])
+            .unwrap();
+        let matching = fixture
+            .store
+            .regular_string_literal_type("start-value".to_owned())
+            .unwrap();
+        let japanese = fixture
+            .store
+            .regular_string_literal_type("start-\u{3042}".to_owned())
+            .unwrap();
+        let mismatch = fixture
+            .store
+            .regular_string_literal_type("other-value".to_owned())
+            .unwrap();
+        let matching_union =
+            canonical_anonymous_union(&mut fixture.store, &[matching, japanese]).unwrap();
+        let mixed_union =
+            canonical_anonymous_union(&mut fixture.store, &[matching, mismatch]).unwrap();
+
+        for (source, expected) in [
+            (matching, true),
+            (japanese, true),
+            (mismatch, false),
+            (matching_union, true),
+            (mixed_union, false),
+        ] {
+            assert_eq!(
+                conditional_check_is_assignable(&mut fixture.store, source, target, None),
+                Ok(expected),
+                "source={source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn template_inference_preserves_unconstrained_string_placeholders() {
+        for (source, input, expected, first) in [
+            (
+                "type Head<T> = T extends `${infer H}${string}` ? H : never;",
+                "ABC",
+                "A",
+                true,
+            ),
+            (
+                "type Head<T> = T extends `${infer H}${string}` ? H : never;",
+                "\u{3042}\u{3044}\u{3046}",
+                "\u{3042}",
+                true,
+            ),
+            (
+                "type Rest<T> = T extends `${string}${infer R}` ? R : never;",
+                "ABC",
+                "BC",
+                false,
+            ),
+            (
+                "type Rest<T> = T extends `${string}${infer R}` ? R : never;",
+                "\u{3042}\u{3044}\u{3046}",
+                "\u{3044}\u{3046}",
+                false,
+            ),
+        ] {
+            let mut fixture = Fixture::new(source);
+            let node = fixture.conditional();
+            let parameter = fixture.type_parameter("T");
+            let inferred = fixture.type_parameter(if first { "H" } else { "R" });
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            let (string, never) = (bootstrap.string_type, bootstrap.never_type);
+            let placeholders = if first {
+                [inferred, string]
+            } else {
+                [string, inferred]
+            };
+            let template = fixture
+                .store
+                .get_template_literal_type(
+                    &[String::new(), String::new(), String::new()],
+                    &placeholders,
+                )
+                .unwrap();
+            let branch_types = branches(inferred, never);
+            let conditional = get_type_from_conditional_type(
+                &mut fixture.store,
+                ConditionalTypeRequest {
+                    node,
+                    check_type: parameter,
+                    extends_type: template,
+                    branches: branch_types,
+                    infer_type_parameters: &[inferred],
+                    outer_type_parameters: &[parameter],
+                    alias: None,
+                },
+                None,
+            )
+            .unwrap();
+            let value = fixture
+                .store
+                .regular_string_literal_type(input.to_owned())
                 .unwrap();
             let result = get_conditional_type_instantiation(
                 &mut fixture.store,
@@ -3573,6 +4073,316 @@ mod tests {
                 "construct={construct}"
             );
         }
+    }
+
+    #[test]
+    fn declared_constructor_inference_maps_alias_arguments_and_checks_signatures() {
+        let mut fixture = Fixture::new(concat!(
+            "type Strings = { new(value: string): number }; ",
+            "type Numbers = { new(value: number): string }; ",
+            "type Extra = { new(value: string, extra: number): boolean }; ",
+            "type Overloaded = { new(value: number): string; new(value: string): boolean }; ",
+            "type Callable = { (value: string): boolean }; ",
+            "type Extract<T, Value> = T extends { new(value: Value): infer Result } ",
+            "? Result : never;",
+        ));
+        let strings = fixture.declared_alias("Strings");
+        let numbers = fixture.declared_alias("Numbers");
+        let extra = fixture.declared_alias("Extra");
+        let overloaded = fixture.declared_alias("Overloaded");
+        let callable = fixture.declared_alias("Callable");
+        let conditional = fixture.declared_alias("Extract");
+        let inferred = fixture.type_parameter("Result");
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let (string, number, boolean, any, unknown, never) = (
+            bootstrap.string_type,
+            bootstrap.number_type,
+            bootstrap.boolean_type,
+            bootstrap.any_type,
+            bootstrap.unknown_type,
+            bootstrap.never_type,
+        );
+        let branch_types = branches(inferred, never);
+        let cases = [
+            (strings, string, number),
+            (strings, number, never),
+            (numbers, number, string),
+            (extra, string, never),
+            (overloaded, string, boolean),
+            (callable, string, never),
+            (any, string, unknown),
+        ];
+
+        for (source, argument, expected) in cases {
+            assert_eq!(
+                get_conditional_type_instantiation(
+                    &mut fixture.store,
+                    ConditionalTypeInstantiation {
+                        conditional_type: conditional,
+                        type_arguments: &[source, argument],
+                        branches: branch_types,
+                        alias: None,
+                        for_constraint: false,
+                    },
+                    None,
+                    None,
+                ),
+                Ok(expected),
+                "source={source:?}, argument={argument:?}",
+            );
+        }
+
+        let union =
+            canonical_anonymous_union(&mut fixture.store, &[strings, numbers, boolean]).unwrap();
+        assert_eq!(
+            get_conditional_type_instantiation(
+                &mut fixture.store,
+                ConditionalTypeInstantiation {
+                    conditional_type: conditional,
+                    type_arguments: &[union, string],
+                    branches: branch_types,
+                    alias: None,
+                    for_constraint: false,
+                },
+                None,
+                None,
+            ),
+            Ok(number),
+        );
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.mapper_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            get_conditional_type_instantiation(
+                &mut fixture.store,
+                ConditionalTypeInstantiation {
+                    conditional_type: conditional,
+                    type_arguments: &[union, string],
+                    branches: branch_types,
+                    alias: None,
+                    for_constraint: false,
+                },
+                None,
+                None,
+            ),
+            Ok(number),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.mapper_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn constructor_inference_rejects_poisoned_provenance_before_cached_results() {
+        for corruption in 0..3 {
+            let mut fixture = Fixture::new(concat!(
+                "type Source = { new(): string }; ",
+                "type Extract<T> = T extends { new(): infer Result } ? Result : never;",
+            ));
+            let source = fixture.declared_alias("Source");
+            let conditional = fixture.declared_alias("Extract");
+            let inferred = fixture.type_parameter("Result");
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            let (string, number, never) = (
+                bootstrap.string_type,
+                bootstrap.number_type,
+                bootstrap.never_type,
+            );
+            let branch_types = branches(inferred, never);
+            assert_eq!(
+                get_conditional_type_instantiation(
+                    &mut fixture.store,
+                    ConditionalTypeInstantiation {
+                        conditional_type: conditional,
+                        type_arguments: &[source],
+                        branches: branch_types,
+                        alias: None,
+                        for_constraint: false,
+                    },
+                    None,
+                    None,
+                ),
+                Ok(string),
+            );
+
+            let root = conditional_snapshot(&fixture.store, conditional)
+                .unwrap()
+                .root;
+            let target = fixture.store.conditional_root(root).unwrap().extends_type();
+            let poisoned = match corruption {
+                0 | 1 => {
+                    let owner = if corruption == 0 { source } else { target };
+                    let signature = fixture
+                        .store
+                        .type_payload(owner)
+                        .and_then(|record| record.data().structured())
+                        .and_then(|structured| structured.signatures.as_deref())
+                        .and_then(|signatures| signatures.first())
+                        .copied()
+                        .unwrap();
+                    assert!(
+                        fixture
+                            .store
+                            .set_signature_resolved_return_type(signature, Some(number))
+                    );
+                    owner
+                }
+                2 => {
+                    let signature = fixture
+                        .store
+                        .type_payload(source)
+                        .and_then(|record| record.data().structured())
+                        .and_then(|structured| structured.signatures.as_deref())
+                        .and_then(|signatures| signatures.first())
+                        .copied()
+                        .unwrap();
+                    let forged = fixture
+                        .store
+                        .alloc_plain_object_type(ObjectFlags::ANONYMOUS, None)
+                        .unwrap();
+                    assert!(fixture.store.set_structured_type_members(
+                        forged,
+                        None,
+                        None,
+                        None,
+                        Some(vec![signature]),
+                        None,
+                    ));
+                    forged
+                }
+                _ => unreachable!(),
+            };
+            let argument = if corruption == 2 { poisoned } else { source };
+            let before = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.mapper_len(),
+                fixture.store.checker_link_allocated_lengths(),
+                fixture
+                    .store
+                    .conditional_root(root)
+                    .unwrap()
+                    .instantiations()
+                    .clone(),
+            );
+            assert_eq!(
+                get_conditional_type_instantiation(
+                    &mut fixture.store,
+                    ConditionalTypeInstantiation {
+                        conditional_type: conditional,
+                        type_arguments: &[argument],
+                        branches: branch_types,
+                        alias: None,
+                        for_constraint: false,
+                    },
+                    None,
+                    None,
+                ),
+                Err(ConditionalTypeError::Relation(
+                    RelationUnavailable::MalformedFunctionType(poisoned),
+                )),
+                "corruption case {corruption}",
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.mapper_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                    fixture
+                        .store
+                        .conditional_root(root)
+                        .unwrap()
+                        .instantiations()
+                        .clone(),
+                ),
+                before,
+                "corruption case {corruption}",
+            );
+        }
+    }
+
+    #[test]
+    fn cached_distributive_constructor_constraints_revalidate_their_target() {
+        let mut fixture =
+            Fixture::new("type Extract<T> = T extends { new(): infer Result } ? Result : never;");
+        let conditional = fixture.declared_alias("Extract");
+        let parameter = fixture.type_parameter("T");
+        let inferred = fixture.type_parameter("Result");
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let (string, number, never) = (
+            bootstrap.string_type,
+            bootstrap.number_type,
+            bootstrap.never_type,
+        );
+        assert!(fixture.store.set_type_parameter_resolution(
+            parameter,
+            Some(string),
+            None,
+            None,
+            None,
+        ));
+        let branch_types = branches(inferred, never);
+        assert_eq!(
+            get_constraint_of_distributive_conditional_type(
+                &mut fixture.store,
+                conditional,
+                branch_types,
+                None,
+                None,
+            ),
+            Ok(None),
+        );
+        let target = conditional_snapshot(&fixture.store, conditional)
+            .map(|data| data.extends_type)
+            .unwrap();
+        let signature = fixture
+            .store
+            .type_payload(target)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.signatures.as_deref())
+            .and_then(|signatures| signatures.first())
+            .copied()
+            .unwrap();
+        assert!(
+            fixture
+                .store
+                .set_signature_resolved_return_type(signature, Some(number))
+        );
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.mapper_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            get_constraint_of_distributive_conditional_type(
+                &mut fixture.store,
+                conditional,
+                branch_types,
+                None,
+                None,
+            ),
+            Err(ConditionalTypeError::Relation(
+                RelationUnavailable::MalformedFunctionType(target),
+            )),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.mapper_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            before,
+        );
     }
 
     #[test]

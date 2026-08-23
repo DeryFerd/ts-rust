@@ -393,3 +393,48 @@ fn javascript_binder_and_owned_jsdoc_plan_share_canonical_declaration_identity()
         &JsDocType::Intrinsic(JsDocIntrinsicType::Number)
     );
 }
+
+#[test]
+fn javascript_jsdoc_assignment_checks_only_the_annotated_declaration() {
+    let source = "/** @type {number} */\nvar first, second, third;\nfirst; second; third;";
+    let parsed = parse_javascript_source_file(source);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(35);
+    let mut binder = CanonicalBinder::new();
+    binder
+        .bind_source_file_with_facts(
+            &parsed.arena,
+            parsed.source_file,
+            file,
+            CanonicalSourceFileFacts::new(
+                EscapedName::source("\"/project/input.js\""),
+                CanonicalSourceLanguage::JavaScript,
+                false,
+                CanonicalModuleState::Script,
+            ),
+        )
+        .unwrap();
+    binder
+        .bind_javascript_declaration_slice(&parsed.arena, file)
+        .unwrap();
+    let mut context = CanonicalCheckerContext::new(
+        binder.finish(),
+        vec![(file, &parsed.arena)],
+        CanonicalCheckerOptions::default(),
+    )
+    .unwrap();
+
+    context.check_source_file(file).unwrap();
+
+    let [diagnostic] = context.diagnostics().as_slice() else {
+        panic!(
+            "only the JSDoc-annotated variable should be uninitialized: {:?}",
+            context.diagnostics()
+        )
+    };
+    assert_eq!(diagnostic.diagnostic.code(), 2454);
+    assert_eq!(diagnostic.diagnostic.arguments, ["first"]);
+
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(context.diagnostics().len(), 1);
+}

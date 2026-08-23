@@ -1096,7 +1096,15 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                         .contains_key(signature)
                     || self.signature(*signature).is_none_or(|record| {
                         record.declaration().is_none_or(|declaration| {
-                            self.source_node_kind(declaration) != Some(SyntaxKind::CallSignature)
+                            match self.source_node_kind(declaration) {
+                                Some(SyntaxKind::CallSignature) => {
+                                    record.flags().contains(SignatureFlags::CONSTRUCT)
+                                }
+                                Some(SyntaxKind::ConstructSignature) => {
+                                    !record.flags().contains(SignatureFlags::CONSTRUCT)
+                                }
+                                _ => true,
+                            }
                         })
                     })
             })
@@ -1439,9 +1447,9 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             || !self.source_callable_provenance.is_empty()
             || !self.source_overload_provenance.is_empty()
             || self.signatures.iter().any(|(_, signature)| {
-                signature.declaration().is_some_and(|node| {
-                    self.source_node_kind(node) == Some(SyntaxKind::CallSignature)
-                })
+                signature
+                    .declaration()
+                    .is_some_and(|node| self.node_is_declared_callable_signature(node))
             })
     }
 
@@ -1453,6 +1461,13 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
 
     fn node_is_function_type(&self, node: NodeRef) -> bool {
         self.source_node_kind(node) == Some(SyntaxKind::FunctionType)
+    }
+
+    fn node_is_declared_callable_signature(&self, node: NodeRef) -> bool {
+        matches!(
+            self.source_node_kind(node),
+            Some(SyntaxKind::CallSignature | SyntaxKind::ConstructSignature)
+        )
     }
 
     fn node_is_source_callable_declaration(&self, node: NodeRef) -> bool {
@@ -1485,7 +1500,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             if self.node_is_function_type(node)
                 || self.node_is_source_callable_declaration(node)
                 || self.node_is_source_overload_declaration(node)
-                || self.source_node_kind(node) == Some(SyntaxKind::CallSignature)
+                || self.node_is_declared_callable_signature(node)
             {
                 return true;
             }
@@ -1507,7 +1522,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                     if self.node_is_function_type(parent)
                         || self.node_is_source_callable_declaration(parent)
                         || self.node_is_source_overload_declaration(parent)
-                        || self.source_node_kind(parent) == Some(SyntaxKind::CallSignature)
+                        || self.node_is_declared_callable_signature(parent)
             )
     }
 
@@ -1521,7 +1536,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             .and_then(Signature::declaration)
             .is_some_and(|declaration| {
                 self.node_is_function_type(declaration)
-                    || self.source_node_kind(declaration) == Some(SyntaxKind::CallSignature)
+                    || self.node_is_declared_callable_signature(declaration)
                     || self
                         .source_callable_type_for_signature(signature)
                         .and_then(|type_| self.source_callable_provenance(type_))
@@ -1550,7 +1565,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             self.type_node_links(declaration)
                 .and_then(|links| links.resolved_type)
                 .filter(|type_| self.type_has_function_type_provenance(*type_))
-        } else if self.source_node_kind(declaration) == Some(SyntaxKind::CallSignature) {
+        } else if self.node_is_declared_callable_signature(declaration) {
             self.declared_call_set_types_by_signature
                 .get(&signature)
                 .copied()
@@ -2040,7 +2055,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         let dirty = (self.node_is_function_type(node)
             || self.node_is_source_callable_declaration(node)
             || self.node_is_source_overload_declaration(node))
-            || self.source_node_kind(node) == Some(SyntaxKind::CallSignature);
+            || self.node_is_declared_callable_signature(node);
         let dirty = dirty && published && changed;
         self.links.signature.replace_key(node, links);
         if relation_dirty {
@@ -3601,7 +3616,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             return false;
         };
         let valid_callable = self.node_is_function_type(declaration)
-            || self.source_node_kind(declaration) == Some(SyntaxKind::CallSignature)
+            || self.node_is_declared_callable_signature(declaration)
             || self
                 .source_callable_type_for_signature(id)
                 .and_then(|type_| self.source_callable_provenance(type_))
@@ -4164,6 +4179,26 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 SourceNodeParent::Parent(NodeRef::new(node.arena, node.file, parent))
             })
         })
+    }
+
+    /// Returns the sole direct primitive annotation on a registered declaration.
+    #[must_use]
+    pub(super) fn source_primitive_type_annotation(&self, declaration: NodeRef) -> Option<NodeRef> {
+        if !self.contains_node_ref(declaration) {
+            return None;
+        }
+        let annotation = declaration.node.index().checked_sub(1)?;
+        let fact = self
+            .source_node_facts
+            .get(&declaration.arena)
+            .and_then(|facts| facts.get(annotation))
+            .copied()
+            .flatten()?;
+        if fact.parent != Some(declaration.node) || !fact.kind.is_keyword_type() {
+            return None;
+        }
+        let node = NodeId::new(u32::try_from(annotation).ok()?);
+        Some(NodeRef::new(declaration.arena, declaration.file, node))
     }
 
     #[must_use]
@@ -6829,6 +6864,150 @@ mod tests {
         assert!(!store.set_jsx_element_links(foreign_node, JsxElementLinks::default()));
         assert_eq!(store.jsx_element_links(foreign_node), None);
         assert_eq!(store.checker_link_allocated_lengths(), before);
+    }
+
+    #[test]
+    fn declared_construct_signatures_require_matching_flags_and_publish_owned_caches() {
+        let parsed = parse_source_file(concat!(
+            "type Factory = { new(value: number): string }; ",
+            "type Callback = { (value: number): string };",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(90_004);
+        let mut store = CanonicalTypeMapperStore::new();
+        assert!(
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .is_some()
+        );
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        let construct = node_ref_of_kind(&parsed.arena, file, SyntaxKind::ConstructSignature);
+        let call = node_ref_of_kind(&parsed.arena, file, SyntaxKind::CallSignature);
+        let NodeData::ConstructSignatureDeclaration(construct_data) =
+            &parsed.arena.get(construct.node).unwrap().data
+        else {
+            panic!("the factory has a construct signature")
+        };
+        let parameter_node =
+            NodeRef::new(parsed.arena.id(), file, construct_data.parameters.nodes[0]);
+        let return_annotation = NodeRef::new(
+            parsed.arena.id(),
+            file,
+            construct_data
+                .type_
+                .expect("the constructor has a return type"),
+        );
+        let mut parameter_data = SymbolData::new(
+            SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+            EscapedName::source("value"),
+        );
+        parameter_data.declarations = Some(vec![parameter_node]);
+        parameter_data.value_declaration = Some(parameter_node);
+        let parameter = store.alloc_symbol(parameter_data).unwrap();
+        let (number, string) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.number_type, bootstrap.string_type)
+        };
+        let owner = store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, None)
+            .unwrap();
+        let missing_construct_flag = store
+            .alloc_signature(
+                SignatureFlags::NONE,
+                Some(construct),
+                Vec::new(),
+                None,
+                vec![parameter],
+                Some(string),
+                None,
+                1,
+            )
+            .unwrap();
+        let wrong_construct_flag = store
+            .alloc_signature(
+                SignatureFlags::CONSTRUCT,
+                Some(call),
+                Vec::new(),
+                None,
+                Vec::new(),
+                Some(string),
+                None,
+                0,
+            )
+            .unwrap();
+        let signature = store
+            .alloc_signature(
+                SignatureFlags::CONSTRUCT,
+                Some(construct),
+                Vec::new(),
+                None,
+                vec![parameter],
+                Some(string),
+                None,
+                1,
+            )
+            .unwrap();
+        let before = (
+            store.declared_call_set_provenance.len(),
+            store.declared_call_set_types_by_signature.len(),
+        );
+
+        assert!(!store.set_declared_call_set_provenance(owner, &[missing_construct_flag]));
+        assert!(!store.set_declared_call_set_provenance(owner, &[wrong_construct_flag]));
+        assert_eq!(
+            (
+                store.declared_call_set_provenance.len(),
+                store.declared_call_set_types_by_signature.len(),
+            ),
+            before,
+        );
+        assert!(store.try_reserve_declared_call_set_provenance(1, 1));
+        assert!(store.set_declared_call_set_provenance(owner, &[signature]));
+        assert_eq!(
+            store.declared_call_set_type_for_signature(signature),
+            Some(owner)
+        );
+        assert!(store.set_function_signature_return_annotation(
+            signature,
+            return_annotation,
+            false,
+        ));
+        assert!(store.set_signature_links(
+            construct,
+            SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(signature),
+                ..SignatureLinks::default()
+            },
+        ));
+        assert!(
+            store.set_callable_signature_parameter_types_batch(vec![(signature, vec![number],)])
+        );
+        assert_eq!(
+            store.callable_signature_parameter_types(signature),
+            Some([number].as_slice()),
+        );
+        assert!(store.signature_is_callable(signature));
+        assert!(store.symbol_is_callable_parameter(parameter));
+        assert!(store.node_has_callable_ancestor(return_annotation));
+
+        assert!(store.set_value_symbol_links(
+            parameter,
+            ValueSymbolLinks {
+                resolved_type: Some(number),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        store.union_cache_needs_validation = false;
+        assert!(store.set_value_symbol_links(
+            parameter,
+            ValueSymbolLinks {
+                resolved_type: Some(string),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        assert!(store.union_cache_needs_validation);
     }
 
     #[test]

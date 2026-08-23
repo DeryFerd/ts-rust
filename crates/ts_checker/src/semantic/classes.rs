@@ -15,6 +15,7 @@
 //! that graph only after seeing the exact direct base plan earlier in source.
 //! Empty zero-argument methods retain their canonical callable identities.
 //! Direct classes can also retain one string-to-number index signature.
+//! Definite annotated fields admit one authenticated ambient-function decorator.
 //! Nonempty executable bodies, general heritage, and non-primitive annotations
 //! remain later class stages.
 
@@ -33,6 +34,7 @@ use super::{
     declared::{preflight_class_or_interface_reference, preflight_node, type_list_key},
     links::{TypeNodeLinks, ValueSymbolLinks},
     signatures::SignatureFlags,
+    source_callables::{StoredSourceCallableValidation, validate_stored_source_callable},
     store::{DirectClassHeritageProvenance, SourceNodeParent},
     type_records::{
         ConstrainedTypeData, ObjectTypeData, StructuredTypeData, TypeCacheState, TypeData,
@@ -489,6 +491,264 @@ fn bound_symbol(
     host.symbol_matches(store, node, symbol).then_some(symbol)
 }
 
+fn validate_decorator_function_value(
+    store: &CanonicalTypeMapperStore,
+    symbol: SemanticSymbolId,
+    declaration: NodeRef,
+) -> Result<(), ClassError> {
+    let value = match store.value_symbol_links(symbol) {
+        None => None,
+        Some(links) if links == &ValueSymbolLinks::default() => None,
+        Some(links) => {
+            let Some(value) = links.resolved_type else {
+                return Err(invariant(ClassInvariant::InvalidPropertyValueCache(symbol)));
+            };
+            if links
+                != &(ValueSymbolLinks {
+                    resolved_type: Some(value),
+                    ..ValueSymbolLinks::default()
+                })
+            {
+                return Err(invariant(ClassInvariant::InvalidPropertyValueCache(symbol)));
+            }
+            Some(value)
+        }
+    };
+    if value != store.source_callable_type_for_owner(symbol) {
+        return Err(invariant(ClassInvariant::InvalidPropertyValueCache(symbol)));
+    }
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if !matches!(
+        validate_stored_source_callable(store, value),
+        StoredSourceCallableValidation::Valid(_)
+    ) {
+        return Err(invariant(ClassInvariant::InvalidPropertyValueCache(symbol)));
+    }
+    let Some(provenance) = store.source_callable_provenance(value) else {
+        return Err(invariant(ClassInvariant::InvalidPropertyValueCache(symbol)));
+    };
+    let Some(signature) = store.signature(provenance.signature) else {
+        return Err(invariant(ClassInvariant::InvalidPropertyValueCache(symbol)));
+    };
+    let Some(any) = store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| bootstrap.any_type)
+    else {
+        return Err(invariant(ClassInvariant::BootstrapUnavailable(declaration)));
+    };
+    if provenance.owner_symbol != symbol
+        || provenance.declaration != declaration
+        || signature.flags() != SignatureFlags::HAS_REST_PARAMETER
+        || signature.parameters().len() != 1
+        || signature.min_argument_count() != 0
+        || signature.resolved_return_type() != Some(any)
+    {
+        return Err(invariant(ClassInvariant::InvalidPropertyValueCache(symbol)));
+    }
+    Ok(())
+}
+
+fn validate_decorator_function_signature(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    field: NodeRef,
+    declaration: NodeRef,
+) -> Result<(), ClassError> {
+    let reject = || unsupported(ClassUnsupported::PropertyModifiers(field));
+    let record = preflight_node(store, host, declaration)?;
+    let NodeData::FunctionDeclaration(function) = &record.data else {
+        return Err(reject());
+    };
+    let Some(modifiers) = function.modifiers.as_ref() else {
+        return Err(reject());
+    };
+    let [modifier] = modifiers.list.nodes.as_slice() else {
+        return Err(reject());
+    };
+    let modifier = NodeRef::new(declaration.arena, declaration.file, *modifier);
+    let modifier_record = preflight_node(store, host, modifier)?;
+    if record.kind != SyntaxKind::FunctionDeclaration
+        || record.flags.0 != 0
+        || function.body.is_some()
+        || function.type_parameters.is_some()
+        || function.facts != 0
+        || modifiers.flags.0 != 0
+        || modifiers.list.has_trailing_comma
+        || modifier_record.kind != SyntaxKind::DeclareKeyword
+        || modifier_record.flags.0 != 0
+        || modifier_record.parent != Some(declaration.node)
+        || !matches!(modifier_record.data, NodeData::Token(_))
+        || function.parameters.has_trailing_comma
+        || function.parameters.nodes.len() != 1
+    {
+        return Err(reject());
+    }
+    let Some(return_type) = function.type_ else {
+        return Err(reject());
+    };
+    let return_type = NodeRef::new(declaration.arena, declaration.file, return_type);
+    let return_record = preflight_node(store, host, return_type)?;
+    if return_record.kind != SyntaxKind::AnyKeyword
+        || return_record.flags.0 != 0
+        || return_record.parent != Some(declaration.node)
+        || !matches!(return_record.data, NodeData::KeywordTypeNode(_))
+    {
+        return Err(reject());
+    }
+
+    let parameter = NodeRef::new(
+        declaration.arena,
+        declaration.file,
+        function.parameters.nodes[0],
+    );
+    let parameter_record = preflight_node(store, host, parameter)?;
+    let NodeData::ParameterDeclaration(parameter_data) = &parameter_record.data else {
+        return Err(reject());
+    };
+    let Some(rest) = parameter_data.dot_dot_dot_token else {
+        return Err(reject());
+    };
+    let rest = NodeRef::new(parameter.arena, parameter.file, rest);
+    let rest_record = preflight_node(store, host, rest)?;
+    if parameter_record.kind != SyntaxKind::Parameter
+        || parameter_record.flags.0 != 0
+        || parameter_record.parent != Some(declaration.node)
+        || parameter_data.initializer.is_some()
+        || parameter_data.question_token.is_some()
+        || parameter_data.modifiers.is_some()
+        || parameter_data.facts != 0
+        || rest_record.kind != SyntaxKind::DotDotDotToken
+        || rest_record.flags.0 != 0
+        || rest_record.parent != Some(parameter.node)
+        || !matches!(rest_record.data, NodeData::Token(_))
+    {
+        return Err(reject());
+    }
+    let Some(type_node) = parameter_data.type_ else {
+        return Err(reject());
+    };
+    let type_node = NodeRef::new(parameter.arena, parameter.file, type_node);
+    let type_record = preflight_node(store, host, type_node)?;
+    let NodeData::ArrayTypeNode(array) = &type_record.data else {
+        return Err(reject());
+    };
+    let element = NodeRef::new(type_node.arena, type_node.file, array.element_type);
+    let element_record = preflight_node(store, host, element)?;
+    if type_record.kind != SyntaxKind::ArrayType
+        || type_record.flags.0 != 0
+        || type_record.parent != Some(parameter.node)
+        || element_record.kind != SyntaxKind::AnyKeyword
+        || element_record.flags.0 != 0
+        || element_record.parent != Some(type_node.node)
+        || !matches!(element_record.data, NodeData::KeywordTypeNode(_))
+    {
+        return Err(reject());
+    }
+    Ok(())
+}
+
+fn authenticate_class_property_decorator(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    field: NodeRef,
+    name: NodeRef,
+    decorator: NodeRef,
+) -> Result<(), ClassError> {
+    let reject = || unsupported(ClassUnsupported::PropertyModifiers(field));
+    let field_record = preflight_node(store, host, field)?;
+    let NodeData::PropertyDeclaration(property) = &field_record.data else {
+        return Err(reject());
+    };
+    let Some(postfix) = property.postfix_token else {
+        return Err(reject());
+    };
+    let postfix = NodeRef::new(field.arena, field.file, postfix);
+    let postfix_record = preflight_node(store, host, postfix)?;
+    if property.type_.is_none()
+        || property.initializer.is_some()
+        || postfix_record.kind != SyntaxKind::ExclamationToken
+        || postfix_record.parent != Some(field.node)
+    {
+        return Err(reject());
+    }
+
+    let record = preflight_node(store, host, decorator)?;
+    let NodeData::Decorator(data) = &record.data else {
+        return Err(reject());
+    };
+    let name_record = preflight_node(store, host, name)?;
+    let expression = NodeRef::new(decorator.arena, decorator.file, data.expression);
+    let expression_record = preflight_node(store, host, expression)?;
+    let NodeData::Identifier(identifier) = &expression_record.data else {
+        return Err(reject());
+    };
+    if record.kind != SyntaxKind::Decorator
+        || record.flags.0 != 0
+        || record.parent != Some(field.node)
+        || record.range.start < field_record.range.start
+        || record.range.end > name_record.range.start
+        || data.facts != 0
+        || expression_record.kind != SyntaxKind::Identifier
+        || expression_record.flags.0 != 0
+        || expression_record.parent != Some(decorator.node)
+        || expression_record.range.start <= record.range.start
+        || expression_record.range.end != record.range.end
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+    {
+        return Err(reject());
+    }
+
+    let (arena, bound) = host
+        .source(expression)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidProperty(field)))?;
+    let mut callback_host = host.name_resolver_host(store)?;
+    let raw = CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut callback_host)
+        .map_err(|_| invariant(ClassInvariant::InvalidProperty(field)))?
+        .resolve(
+            Some(CanonicalResolutionLocation::Bound(expression)),
+            &identifier.text,
+            SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE,
+            None,
+            false,
+            false,
+        )
+        .map_err(|_| reject())?
+        .ok_or_else(reject)?;
+    let symbol = store.get_merged_symbol(raw).ok_or_else(reject)?;
+    let symbol_record = store.symbol(symbol).ok_or_else(reject)?;
+    let Some([declaration]) = symbol_record.declarations() else {
+        return Err(reject());
+    };
+    let declaration = *declaration;
+    let function_record = preflight_node(store, host, declaration)?;
+    if raw != symbol
+        || symbol_record.flags() != SymbolFlags::FUNCTION
+        || symbol_record.check_flags() != CheckFlags::NONE
+        || symbol_record.name().as_utf8() != Some(identifier.text.as_str())
+        || symbol_record.value_declaration() != Some(declaration)
+        || symbol_record.members().is_some()
+        || symbol_record.exports().is_some()
+        || symbol_record.parent().is_some()
+        || symbol_record.export_symbol().is_some()
+        || !declaration.is_for(field.arena, field.file)
+        || function_record.range.end > record.range.start
+        || !host.symbol_matches(store, declaration, symbol)
+    {
+        return Err(reject());
+    }
+    if store
+        .symbol_node_links(expression)
+        .is_some_and(|links| links.resolved_symbol.is_some_and(|cached| cached != symbol))
+    {
+        return Err(invariant(ClassInvariant::InvalidProperty(field)));
+    }
+    validate_decorator_function_signature(store, host, field, declaration)?;
+    validate_decorator_function_value(store, symbol, declaration)
+}
+
 fn class_property_modifiers(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -514,6 +774,10 @@ fn class_property_modifiers(
         .collect::<Vec<_>>()
         .as_slice()
     {
+        [SyntaxKind::Decorator] => {
+            authenticate_class_property_decorator(store, host, declaration, name, kinds[0].0)?;
+            (ClassPropertySide::Instance, false)
+        }
         [SyntaxKind::PublicKeyword] => (ClassPropertySide::Instance, false),
         [SyntaxKind::ReadonlyKeyword] => (ClassPropertySide::Instance, true),
         [SyntaxKind::PublicKeyword, SyntaxKind::ReadonlyKeyword] => {
@@ -547,7 +811,7 @@ fn class_property_modifiers(
         || kinds.iter().any(|(node, record)| {
             let invalid = record.parent != Some(declaration.node)
                 || record.flags.0 != 0
-                || !matches!(record.data, NodeData::Token(_))
+                || !matches!(record.data, NodeData::Token(_) | NodeData::Decorator(_))
                 || record.range.start < previous_end
                 || record.range.start < modifiers.list.range.start
                 || record.range.end > modifiers.list.range.end;
@@ -3069,20 +3333,26 @@ fn shell_state(
         )));
     };
     if let Some(instance) = instance {
-        let Some(TypeData::Interface(interface)) = store
-            .type_payload(instance)
-            .map(super::type_records::TypeRecord::data)
-        else {
+        let Some(interface) = exact_instance_identity(store, plan, instance) else {
             return Err(invariant(ClassInvariant::InvalidInstanceCache(plan.symbol)));
         };
-        if !matches!(value, StaticShellState::WarmMembers(_))
-            && (interface.base_types_resolved
-                || interface.resolved_base_types.is_some()
-                || interface
-                    .resolved_base_constructor_type
-                    .is_some_and(|type_| type_ != undefined_type)
-                || matches!(value, StaticShellState::WarmShell(_))
-                    && interface.resolved_base_constructor_type != Some(undefined_type))
+        if store.direct_class_heritage_provenance(instance).is_some()
+            || !matches!(value, StaticShellState::WarmMembers(_))
+                && (store.type_payload(instance).is_none_or(|record| {
+                    record.object_flags() != (ObjectFlags::CLASS | ObjectFlags::REFERENCE)
+                }) || interface.base_types_resolved
+                    || interface.resolved_base_types.is_some()
+                    || interface
+                        .resolved_base_constructor_type
+                        .is_some_and(|type_| type_ != undefined_type)
+                    || matches!(value, StaticShellState::WarmShell(_))
+                        && interface.resolved_base_constructor_type != Some(undefined_type)
+                    || interface.declared_members_resolved
+                    || interface.declared_members.is_some()
+                    || interface.declared_call_signatures.is_some()
+                    || interface.declared_construct_signatures.is_some()
+                    || interface.declared_index_infos.is_some()
+                    || interface.reference.object.structured != StructuredTypeData::default())
         {
             return Err(invariant(ClassInvariant::InvalidInstanceCache(plan.symbol)));
         }
@@ -3290,6 +3560,19 @@ fn publish_class_methods(
         .zip(&plan.method_return_types)
         .zip(signature_lists)
     {
+        if exact_method_callable(store, method, *return_type).is_some() {
+            if let Some(type_node) = method.return_type_node {
+                assert!(store.set_type_node_links(
+                    type_node,
+                    TypeNodeLinks {
+                        resolved_type: Some(*return_type),
+                        ..TypeNodeLinks::default()
+                    },
+                ));
+            }
+            continue;
+        }
+
         let method_type = store
             .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(method.symbol))
             .expect("the class transaction reserved the method value identity");
@@ -3502,18 +3785,25 @@ pub(super) fn execute_nongeneric_class_members(
         }
         table
     });
-    let default_construct_signature = store
-        .alloc_signature(
-            SignatureFlags::CONSTRUCT,
-            plan.constructor_declaration(),
-            Vec::new(),
-            None,
-            Vec::new(),
-            Some(shells.instance_type),
-            None,
-            0,
-        )
-        .expect("the class-member transaction reserved one exact default signature");
+    let default_construct_signature = plan
+        .class
+        .constructor
+        .and_then(|constructor| store.signature_links(constructor.declaration))
+        .and_then(|links| links.resolved_signature.signature())
+        .unwrap_or_else(|| {
+            store
+                .alloc_signature(
+                    SignatureFlags::CONSTRUCT,
+                    plan.constructor_declaration(),
+                    Vec::new(),
+                    None,
+                    Vec::new(),
+                    Some(shells.instance_type),
+                    None,
+                    0,
+                )
+                .expect("the class-member transaction reserved one exact default signature")
+        });
     construct_signatures.push(default_construct_signature);
     if let Some(constructor) = plan.class.constructor {
         assert!(store.set_signature_links(
@@ -4080,6 +4370,11 @@ fn exact_stored_property(
         && store.source_node_kind(*declaration) == Some(SyntaxKind::PropertyDeclaration)
         && store.source_node_parent(*declaration)
             == Some(SourceNodeParent::Parent(owner_declaration))
+        && store
+            .source_primitive_type_annotation(*declaration)
+            .is_some_and(|annotation| {
+                store.source_type_node_result_is_exact(annotation, property_type, &[])
+            })
         && links
             == &(ValueSymbolLinks {
                 resolved_type: Some(property_type),
@@ -4087,6 +4382,62 @@ fn exact_stored_property(
             })
         && primitive)
         .then_some(*declaration)
+}
+
+fn exact_stored_method_return_type(
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    return_type: TypeId,
+) -> bool {
+    // Empty class method bodies follow the optional return annotation in the arena.
+    let Some(body_index) = declaration
+        .node
+        .index()
+        .checked_sub(1)
+        .and_then(|index| u32::try_from(index).ok())
+    else {
+        return false;
+    };
+    let body = NodeRef::new(
+        declaration.arena,
+        declaration.file,
+        ts_ast::NodeId::new(body_index),
+    );
+    if store.source_node_kind(body) != Some(SyntaxKind::Block)
+        || store.source_node_parent(body) != Some(SourceNodeParent::Parent(declaration))
+    {
+        return false;
+    }
+    let Some(previous_index) = body
+        .node
+        .index()
+        .checked_sub(1)
+        .and_then(|index| u32::try_from(index).ok())
+    else {
+        return false;
+    };
+    let previous = NodeRef::new(
+        declaration.arena,
+        declaration.file,
+        ts_ast::NodeId::new(previous_index),
+    );
+    if store.source_node_parent(previous) != Some(SourceNodeParent::Parent(declaration)) {
+        return false;
+    }
+    match store.source_node_kind(previous) {
+        Some(SyntaxKind::Identifier) => store
+            .intrinsic_bootstrap()
+            .is_some_and(|bootstrap| return_type == bootstrap.void_type),
+        Some(SyntaxKind::VoidKeyword | SyntaxKind::AnyKeyword | SyntaxKind::UndefinedKeyword) => {
+            store.type_node_links(previous)
+                == Some(&TypeNodeLinks {
+                    resolved_type: Some(return_type),
+                    ..TypeNodeLinks::default()
+                })
+                && store.source_type_node_result_is_exact(previous, return_type, &[])
+        }
+        _ => false,
+    }
 }
 
 fn exact_stored_method(
@@ -4106,7 +4457,6 @@ fn exact_stored_method(
         return None;
     };
     let return_type = store.signature(*signature)?.resolved_return_type()?;
-    let bootstrap = store.intrinsic_bootstrap()?;
     (record.flags() == SymbolFlags::METHOD
         && record.check_flags() == CheckFlags::NONE
         && record.value_declaration() == Some(*declaration)
@@ -4118,12 +4468,7 @@ fn exact_stored_method(
         && store.source_node_kind(*declaration) == Some(SyntaxKind::MethodDeclaration)
         && store.source_node_parent(*declaration)
             == Some(SourceNodeParent::Parent(owner_declaration))
-        && [
-            bootstrap.void_type,
-            bootstrap.any_type,
-            bootstrap.undefined_type,
-        ]
-        .contains(&return_type)
+        && exact_stored_method_return_type(store, *declaration, return_type)
         && exact_method_value(store, method, *declaration, return_type)
             == Some((method_type, *signature)))
     .then_some(*declaration)
@@ -4726,6 +5071,238 @@ mod tests {
             .unwrap()
     }
 
+    fn warm_class_method(
+        store: &mut TestStore,
+        method: &ClassMethodPlan,
+        return_type: TypeId,
+    ) -> (TypeId, SignatureId) {
+        let type_ = store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(method.symbol))
+            .unwrap();
+        let signature = store
+            .alloc_signature(
+                SignatureFlags::NONE,
+                Some(method.declaration),
+                Vec::new(),
+                None,
+                Vec::new(),
+                Some(return_type),
+                None,
+                0,
+            )
+            .unwrap();
+        assert!(store.set_signature_links(
+            method.declaration,
+            SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(signature),
+                ..SignatureLinks::default()
+            },
+        ));
+        assert!(store.set_value_symbol_links(
+            method.symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(type_),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        assert!(store.set_structured_type_members(
+            type_,
+            None,
+            None,
+            Some(vec![signature]),
+            None,
+            None,
+        ));
+        (type_, signature)
+    }
+
+    #[test]
+    fn authenticated_field_decorator_preserves_property_identity_and_replays_warm() {
+        let mut fixture = fixture(concat!(
+            "declare function decorate(...args: any[]): any; ",
+            "class Model { @decorate value!: bigint; }",
+        ));
+        let owner = class_symbol(&fixture, "Model");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
+        assert!(plan.uninitialized_instance_properties().is_empty());
+
+        let members =
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan).unwrap();
+
+        let [property] = members.declared_instance_properties() else {
+            panic!("the decorated field retains one canonical class property")
+        };
+        let bigint = fixture.store.intrinsic_bootstrap().unwrap().bigint_type;
+        assert_eq!(
+            fixture
+                .store
+                .value_symbol_links(*property)
+                .and_then(|links| links.resolved_type),
+            Some(bigint)
+        );
+        assert_eq!(
+            fixture.store.symbol(*property).unwrap().check_flags(),
+            CheckFlags::NONE
+        );
+        assert_eq!(
+            validate_class_heritage_members(&fixture.store, members.shells().instance_type()),
+            ClassHeritageMembersValidation::Valid
+        );
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.symbol_store().symbol_table_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        assert_eq!(
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan),
+            Ok(members)
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.symbol_store().symbol_table_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm
+        );
+    }
+
+    #[test]
+    fn authenticated_definite_bigint_field_decorator_checks_from_source() {
+        let parsed = parse_source_file(concat!(
+            "declare function dec(...args: any[]): any; ",
+            "class C { @dec prop!: bigint; }",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(303);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/decorated-field.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            [(file, &parsed.arena)].into_iter().collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+
+        context.check_source_file(file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn unsupported_field_decorators_reject_before_class_publication() {
+        for source in [
+            "class Model { @missing value!: bigint; }",
+            "declare const dec: any; class Model { @dec value!: bigint; }",
+            "declare function dec(value: any): any; class Model { @dec value!: bigint; }",
+            "declare function dec(...args: any[]): number; class Model { @dec value!: bigint; }",
+            "declare function dec(...args: any[]): any; class Model { @dec value: bigint; }",
+            "declare function dec(...args: any[]): any; class Model { @dec() value!: bigint; }",
+            "declare function dec(...args: any[]): any; class Model { @dec @dec value!: bigint; }",
+        ] {
+            let fixture = fixture(source);
+            let owner = class_symbol(&fixture, "Model");
+            let bound = &fixture.files[&fixture.file];
+            let host = host(&fixture.parsed.arena, bound);
+            let cold = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            assert!(matches!(
+                plan_nongeneric_class_member_query(&fixture.store, &host, owner),
+                Err(ClassError::Unsupported(
+                    ClassUnsupported::PropertyModifiers(_)
+                ))
+            ));
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                cold
+            );
+            assert!(fixture.store.declared_type_links(owner).is_none());
+            assert!(fixture.store.value_symbol_links(owner).is_none());
+        }
+    }
+
+    #[test]
+    fn malformed_decorator_function_value_rejects_before_class_publication() {
+        let mut fixture = fixture(concat!(
+            "declare function dec(...args: any[]): any; ",
+            "class Model { @dec value!: bigint; }",
+        ));
+        let owner = class_symbol(&fixture, "Model");
+        let declaration = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionDeclaration).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let decorator = fixture.files[&fixture.file].symbol(declaration).unwrap();
+        let wrong = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        assert!(fixture.store.set_value_symbol_links(
+            decorator,
+            ValueSymbolLinks {
+                resolved_type: Some(wrong),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let poisoned = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        assert_eq!(
+            plan_nongeneric_class_member_query(&fixture.store, &host, owner),
+            Err(invariant(ClassInvariant::InvalidPropertyValueCache(
+                decorator
+            )))
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            poisoned
+        );
+        assert!(fixture.store.declared_type_links(owner).is_none());
+        assert!(fixture.store.value_symbol_links(owner).is_none());
+    }
+
     #[test]
     fn class_string_index_publishes_one_shared_index_and_replays_warm() {
         let mut fixture = fixture("class Indexed { [key: string]: number; constructor() {} }");
@@ -5207,6 +5784,54 @@ mod tests {
     }
 
     #[test]
+    fn prewarmed_class_methods_keep_their_callable_and_signature_identities() {
+        let mut fixture = fixture("class Model { instance(): void {} static run(): any {} }");
+        let owner = class_symbol(&fixture, "Model");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let plan = plan_nongeneric_class_members(&fixture.store, &host, owner).unwrap();
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let return_types = [bootstrap.void_type, bootstrap.any_type];
+        let expected = plan
+            .class
+            .methods
+            .iter()
+            .zip(return_types)
+            .map(|(method, return_type)| warm_class_method(&mut fixture.store, method, return_type))
+            .collect::<Vec<_>>();
+        let type_count = fixture.store.type_len();
+        let signature_count = fixture.store.signature_len();
+
+        let members = execute_nongeneric_class_members(&mut fixture.store, &host, &plan).unwrap();
+
+        assert_eq!(fixture.store.type_len(), type_count + 3);
+        assert_eq!(fixture.store.signature_len(), signature_count + 1);
+        for ((method, return_type), identity) in
+            plan.class.methods.iter().zip(return_types).zip(expected)
+        {
+            assert_eq!(
+                exact_method_callable(&fixture.store, method, return_type),
+                Some(identity)
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .type_node_links(method.return_type_node.unwrap()),
+                Some(&TypeNodeLinks {
+                    resolved_type: Some(return_type),
+                    ..TypeNodeLinks::default()
+                })
+            );
+        }
+        assert_eq!(members.declared_instance_properties().len(), 1);
+        assert_eq!(members.declared_static_properties().len(), 1);
+        assert_eq!(
+            validate_class_heritage_members(&fixture.store, members.shells().instance_type()),
+            ClassHeritageMembersValidation::Valid
+        );
+    }
+
+    #[test]
     fn instance_zero_argument_methods_share_the_ordered_class_member_table() {
         let mut fixture = fixture("class Model { public run(): void {} value: string; }");
         let owner = class_symbol(&fixture, "Model");
@@ -5233,6 +5858,65 @@ mod tests {
         assert_eq!(names, ["run", "value"]);
         let declared = fixture.store.symbol(owner).unwrap().members().unwrap();
         assert_ne!(members.instance_members(), Some(declared));
+        assert_eq!(
+            validate_class_heritage_members(&fixture.store, members.shells().instance_type()),
+            ClassHeritageMembersValidation::Valid
+        );
+    }
+
+    #[test]
+    fn derived_static_properties_reuse_prewarmed_base_method_signatures() {
+        let mut fixture = fixture(concat!(
+            "class Base { static inherited(): any {} } ",
+            "class Derived extends Base { static own(): void {} }",
+        ));
+        let owner = class_symbol(&fixture, "Derived");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
+        let ClassMemberQueryPlan::Derived { class, base } = &plan else {
+            panic!("Derived retains its direct base")
+        };
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let own_return_type = bootstrap.void_type;
+        let inherited_return_type = bootstrap.any_type;
+        let own = warm_class_method(&mut fixture.store, &class.class.methods[0], own_return_type);
+        let inherited = warm_class_method(
+            &mut fixture.store,
+            &base.class.methods[0],
+            inherited_return_type,
+        );
+        let type_count = fixture.store.type_len();
+        let signature_count = fixture.store.signature_len();
+
+        let members =
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan).unwrap();
+
+        assert_eq!(fixture.store.type_len(), type_count + 6);
+        assert_eq!(fixture.store.signature_len(), signature_count + 2);
+        assert_eq!(
+            exact_method_callable(&fixture.store, &class.class.methods[0], own_return_type),
+            Some(own)
+        );
+        assert_eq!(
+            exact_method_callable(
+                &fixture.store,
+                &base.class.methods[0],
+                inherited_return_type,
+            ),
+            Some(inherited)
+        );
+        assert_eq!(
+            members.static_properties(),
+            &[class.class.methods[0].symbol, base.class.methods[0].symbol]
+        );
+        assert_eq!(
+            fixture
+                .store
+                .symbol_table(members.static_members())
+                .and_then(|table| table.get_source("inherited")),
+            Some(base.class.methods[0].symbol)
+        );
         assert_eq!(
             validate_class_heritage_members(&fixture.store, members.shells().instance_type()),
             ClassHeritageMembersValidation::Valid
@@ -5356,6 +6040,150 @@ mod tests {
         assert_eq!(
             validate_class_heritage_members(&fixture.store, derived.shells().instance_type()),
             ClassHeritageMembersValidation::Valid
+        );
+    }
+
+    #[test]
+    fn forged_inherited_static_property_type_invalidates_the_derived_graph() {
+        let mut fixture = fixture(concat!(
+            "class Base { static inherited: number; } ",
+            "class Derived extends Base {}",
+        ));
+        let owner = class_symbol(&fixture, "Derived");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
+        let ClassMemberQueryPlan::Derived { base, .. } = &plan else {
+            panic!("Derived retains its direct base")
+        };
+        let inherited = &base.class.static_properties[0];
+        let members =
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan).unwrap();
+        let instance = members.shells().instance_type();
+        let base_instance = members.base().unwrap().instance_type();
+        assert_eq!(
+            fixture.store.is_type_assignable_to(instance, base_instance),
+            Ok(true)
+        );
+
+        let wrong = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        assert!(fixture.store.set_type_node_links(
+            inherited.type_node,
+            TypeNodeLinks {
+                resolved_type: Some(wrong),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        assert!(fixture.store.set_value_symbol_links(
+            inherited.symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(wrong),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        let poisoned = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.symbol_store().symbol_table_len(),
+            fixture.store.checker_link_allocated_lengths(),
+            fixture.store.relation_state_snapshot(),
+        );
+
+        assert_eq!(
+            validate_class_heritage_members(&fixture.store, instance),
+            ClassHeritageMembersValidation::Malformed
+        );
+        assert_eq!(
+            fixture.store.is_type_assignable_to(instance, base_instance),
+            Err(super::super::relater::RelationUnavailable::InvalidStructuredMembers(instance,))
+        );
+        assert_eq!(
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan),
+            Err(invariant(ClassInvariant::InvalidPropertyTypeCache(
+                inherited.type_node,
+            )))
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.symbol_store().symbol_table_len(),
+                fixture.store.checker_link_allocated_lengths(),
+                fixture.store.relation_state_snapshot(),
+            ),
+            poisoned
+        );
+    }
+
+    #[test]
+    fn forged_inherited_method_return_type_invalidates_the_derived_graph() {
+        let mut fixture = fixture(concat!(
+            "class Base { static inherited(): void {} } ",
+            "class Derived extends Base {}",
+        ));
+        let owner = class_symbol(&fixture, "Derived");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
+        let ClassMemberQueryPlan::Derived { base, .. } = &plan else {
+            panic!("Derived retains its direct base")
+        };
+        let inherited = &base.class.methods[0];
+        let annotation = inherited.return_type_node.unwrap();
+        let members =
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan).unwrap();
+        let instance = members.shells().instance_type();
+        let base_instance = members.base().unwrap().instance_type();
+        assert_eq!(
+            fixture.store.is_type_assignable_to(instance, base_instance),
+            Ok(true)
+        );
+        let void = fixture.store.intrinsic_bootstrap().unwrap().void_type;
+        let (_, signature) = exact_method_callable(&fixture.store, inherited, void).unwrap();
+        let wrong = fixture.store.intrinsic_bootstrap().unwrap().any_type;
+        assert!(
+            fixture
+                .store
+                .set_signature_resolved_return_type(signature, Some(wrong))
+        );
+        assert!(fixture.store.set_type_node_links(
+            annotation,
+            TypeNodeLinks {
+                resolved_type: Some(wrong),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        let poisoned = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.symbol_store().symbol_table_len(),
+            fixture.store.checker_link_allocated_lengths(),
+            fixture.store.relation_state_snapshot(),
+        );
+
+        assert_eq!(
+            validate_class_heritage_members(&fixture.store, instance),
+            ClassHeritageMembersValidation::Malformed
+        );
+        assert_eq!(
+            fixture.store.is_type_assignable_to(instance, base_instance),
+            Err(super::super::relater::RelationUnavailable::InvalidStructuredMembers(instance,))
+        );
+        assert_eq!(
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan),
+            Err(invariant(ClassInvariant::InvalidPropertyTypeCache(
+                annotation,
+            )))
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.symbol_store().symbol_table_len(),
+                fixture.store.checker_link_allocated_lengths(),
+                fixture.store.relation_state_snapshot(),
+            ),
+            poisoned
         );
     }
 
@@ -5527,6 +6355,60 @@ mod tests {
     }
 
     #[test]
+    fn prewarmed_constructor_signature_is_reused_by_class_members() {
+        let mut fixture = fixture("class Model { constructor() {} }");
+        let owner = class_symbol(&fixture, "Model");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let plan = plan_nongeneric_class_members(&fixture.store, &host, owner).unwrap();
+        let constructor = plan.class.constructor.unwrap();
+        let instance = fixture
+            .store
+            .get_declared_type_of_symbol(&host, owner)
+            .unwrap();
+        let signature = fixture
+            .store
+            .alloc_signature(
+                SignatureFlags::CONSTRUCT,
+                Some(constructor.declaration),
+                Vec::new(),
+                None,
+                Vec::new(),
+                Some(instance),
+                None,
+                0,
+            )
+            .unwrap();
+        assert!(fixture.store.set_signature_links(
+            constructor.declaration,
+            SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(signature),
+                ..SignatureLinks::default()
+            },
+        ));
+        let type_count = fixture.store.type_len();
+        let signature_count = fixture.store.signature_len();
+
+        let members = execute_nongeneric_class_members(&mut fixture.store, &host, &plan).unwrap();
+
+        assert_eq!(members.shells().instance_type(), instance);
+        assert_eq!(members.default_construct_signature(), signature);
+        assert_eq!(fixture.store.type_len(), type_count + 1);
+        assert_eq!(fixture.store.signature_len(), signature_count);
+        assert_eq!(
+            fixture.store.signature_links(constructor.declaration),
+            Some(&SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(signature),
+                ..SignatureLinks::default()
+            })
+        );
+        assert_eq!(
+            validate_class_heritage_members(&fixture.store, instance),
+            ClassHeritageMembersValidation::Valid
+        );
+    }
+
+    #[test]
     fn warm_value_without_instance_and_poisoned_value_reject_atomically() {
         let mut fixture = fixture("class Poisoned {}");
         let symbol = class_symbol(&fixture, "Poisoned");
@@ -5629,6 +6511,86 @@ mod tests {
                 .store
                 .value_symbol_links(symbol)
                 .is_none_or(|links| links == &ValueSymbolLinks::default())
+        );
+    }
+
+    #[test]
+    fn published_instance_members_cannot_be_reused_as_a_cold_class_shell() {
+        let mut fixture = fixture("class Model {}");
+        let owner = class_symbol(&fixture, "Model");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let instance = fixture
+            .store
+            .get_declared_type_of_symbol(&host, owner)
+            .unwrap();
+        assert!(
+            fixture
+                .store
+                .set_interface_declared_members(instance, true, None, None, None, None,)
+        );
+        let plan = plan_nongeneric_class(&fixture.store, &host, owner).unwrap();
+        let state = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        assert_eq!(
+            execute_nongeneric_class_shells(&mut fixture.store, &host, &plan),
+            Err(invariant(ClassInvariant::InvalidInstanceCache(owner)))
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            state
+        );
+        assert!(fixture.store.value_symbol_links(owner).is_none());
+    }
+
+    #[test]
+    fn no_base_class_shell_rejects_forged_direct_heritage_provenance() {
+        let mut fixture = fixture("class Base {} class Model {}");
+        let base_owner = class_symbol(&fixture, "Base");
+        let owner = class_symbol(&fixture, "Model");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let base_plan = plan_nongeneric_class_members(&fixture.store, &host, base_owner).unwrap();
+        let base = execute_nongeneric_class_members(&mut fixture.store, &host, &base_plan).unwrap();
+        let plan = plan_nongeneric_class(&fixture.store, &host, owner).unwrap();
+        let shells = execute_nongeneric_class_shells(&mut fixture.store, &host, &plan).unwrap();
+        assert!(fixture.store.publish_direct_class_heritage_provenance(
+            shells.instance_type(),
+            DirectClassHeritageProvenance {
+                owner_symbol: owner,
+                owner_value_type: shells.value_type(),
+                base_symbol: base_owner,
+                base_instance_type: base.shells().instance_type(),
+                base_value_type: base.shells().value_type(),
+            },
+        ));
+        let state = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.symbol_store().symbol_table_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        assert_eq!(
+            execute_nongeneric_class_shells(&mut fixture.store, &host, &plan),
+            Err(invariant(ClassInvariant::InvalidInstanceCache(owner)))
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.symbol_store().symbol_table_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            state
         );
     }
 

@@ -237,3 +237,75 @@ fn production_assignment_distinguishes_lone_high_and_low_surrogates() {
         ["\"\\uDC00\"", "\"\\uD800\""]
     );
 }
+
+#[test]
+fn type_queries_preserve_identical_surrogate_pair_literal_types() {
+    let parsed = parse_source_file(concat!(
+        "const literal = \"\\u{1F600}\" as const;\n",
+        "const braceEscaped = \"\\u{D83D}\\u{DE00}\" as const;\n",
+        "const adjacentEscaped = \"\\uD83D\\uDE00\" as const;\n",
+        "const first: typeof literal = braceEscaped;\n",
+        "const second: typeof adjacentEscaped = braceEscaped;\n",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(1);
+    let mut context = context(&parsed, file);
+
+    context.check_source_file(file).unwrap();
+    assert!(
+        context.diagnostics().is_empty(),
+        "{:?}",
+        context.diagnostics()
+    );
+
+    let queries = parsed
+        .arena
+        .iter()
+        .filter_map(|(node, record)| {
+            matches!(record.data, NodeData::TypeQueryNode(_)).then_some(NodeRef::new(
+                parsed.arena.id(),
+                file,
+                node,
+            ))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(queries.len(), 2);
+    let types = queries
+        .iter()
+        .map(|query| {
+            let NodeData::TypeQueryNode(type_query) = &parsed.arena.get(query.node).unwrap().data
+            else {
+                panic!("the selected node must be a type query")
+            };
+            let name = NodeRef::new(query.arena, query.file, type_query.expr_name);
+            assert!(
+                context
+                    .store()
+                    .symbol_node_links(name)
+                    .and_then(|links| links.resolved_symbol)
+                    .is_some(),
+                "the referenced identifier must own the resolved symbol",
+            );
+            assert!(
+                context
+                    .store()
+                    .symbol_node_links(*query)
+                    .and_then(|links| links.resolved_symbol)
+                    .is_none(),
+                "the typeof wrapper must not own the identifier symbol",
+            );
+            context
+                .store()
+                .type_node_links(*query)
+                .and_then(|links| links.resolved_type)
+                .expect("type query must resolve its referenced literal")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(types[0], types[1]);
+    assert_eq!(literal_units(context.store(), types[0]), [0xd83d, 0xde00]);
+
+    let type_count = context.store().type_len();
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(context.store().type_len(), type_count);
+    assert!(context.diagnostics().is_empty());
+}

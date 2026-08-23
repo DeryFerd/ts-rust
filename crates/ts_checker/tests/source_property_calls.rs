@@ -74,6 +74,57 @@ fn function_type_parameter(parsed: &ParseResult, file: FileId, expected: &str) -
 }
 
 #[test]
+fn class_method_calls_use_published_instance_and_static_signatures() {
+    let parsed = parse_source_file(concat!(
+        "class Model { public run() {} static ready() {} }\n",
+        "const model = new Model();\n",
+        "model.run();\n",
+        "Model.ready();\n",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(40);
+    let calls = nodes_of_kind(&parsed, file, SyntaxKind::CallExpression);
+    let mut context = context(&parsed, file);
+
+    context.check_source_file(file).unwrap();
+    assert!(
+        context.diagnostics().is_empty(),
+        "{:?}",
+        context.diagnostics()
+    );
+
+    for call in calls {
+        let return_type = context
+            .store()
+            .type_node_links(call)
+            .and_then(|links| links.resolved_type)
+            .expect("class method call must publish its return type");
+        assert_eq!(context.type_to_string(return_type).unwrap(), "void");
+        assert!(
+            context
+                .store()
+                .signature_links(call)
+                .is_some_and(|links| links.resolved_signature.signature().is_some())
+        );
+    }
+
+    let warm = (
+        context.store().type_len(),
+        context.store().signature_len(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
+}
+
+#[test]
 fn required_own_property_calls_publish_public_links_and_diagnostics() {
     let parsed = parse_source_file(concat!(
         "type API = { fn: (value: number) => string }; ",

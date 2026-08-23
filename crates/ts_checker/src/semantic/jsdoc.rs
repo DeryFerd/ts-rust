@@ -329,7 +329,7 @@ impl PlannedJsDocType {
         &self.type_
     }
 
-    /// Returns the original name of a locally resolved scalar typedef.
+    /// Returns the original name of a locally resolved supported typedef.
     #[must_use]
     pub fn resolved_alias_name(&self) -> Option<&str> {
         match (&self.type_, self.resolved_type.as_deref()) {
@@ -339,7 +339,14 @@ impl PlannedJsDocType {
                     JsDocType::Intrinsic(_)
                     | JsDocType::StringLiteral(_)
                     | JsDocType::NumberLiteral(_)
-                    | JsDocType::BigIntLiteral(_),
+                    | JsDocType::BigIntLiteral(_)
+                    | JsDocType::Parenthesized(_)
+                    | JsDocType::Nullable(_)
+                    | JsDocType::NonNullable(_)
+                    | JsDocType::Optional(_)
+                    | JsDocType::Array(_)
+                    | JsDocType::ReadonlyArray(_)
+                    | JsDocType::Union(_),
                 ),
             ) => Some(name),
             _ => None,
@@ -1818,7 +1825,7 @@ fn substitute_local_typedefs(
 ) -> Option<JsDocType> {
     match type_ {
         JsDocType::Named(name) if shadowed.contains(name) => None,
-        JsDocType::Named(name) => resolve_scalar_typedef(name, aliases, &mut HashSet::new()),
+        JsDocType::Named(name) => resolve_local_typedef(name, aliases, &mut HashSet::new()),
         JsDocType::Parenthesized(inner) => substitute_local_typedefs(inner, aliases, shadowed)
             .map(Box::new)
             .map(JsDocType::Parenthesized),
@@ -1871,7 +1878,7 @@ fn substitute_local_typedefs(
     }
 }
 
-fn resolve_scalar_typedef(
+fn resolve_local_typedef(
     name: &str,
     aliases: &HashMap<String, JsDocType>,
     visiting: &mut HashSet<String>,
@@ -1879,24 +1886,49 @@ fn resolve_scalar_typedef(
     if !visiting.insert(name.to_owned()) {
         return None;
     }
-    let resolved = match aliases.get(name)? {
+    let resolved = aliases
+        .get(name)
+        .and_then(|type_| resolve_local_typedef_target(type_, aliases, visiting));
+    visiting.remove(name);
+    resolved
+}
+
+fn resolve_local_typedef_target(
+    type_: &JsDocType,
+    aliases: &HashMap<String, JsDocType>,
+    visiting: &mut HashSet<String>,
+) -> Option<JsDocType> {
+    match type_ {
         scalar @ (JsDocType::Intrinsic(_)
         | JsDocType::StringLiteral(_)
         | JsDocType::NumberLiteral(_)
         | JsDocType::BigIntLiteral(_)) => Some(scalar.clone()),
-        JsDocType::Named(next) => resolve_scalar_typedef(next, aliases, visiting),
-        JsDocType::Parenthesized(inner) => match inner.as_ref() {
-            scalar @ (JsDocType::Intrinsic(_)
-            | JsDocType::StringLiteral(_)
-            | JsDocType::NumberLiteral(_)
-            | JsDocType::BigIntLiteral(_)) => Some(scalar.clone()),
-            JsDocType::Named(next) => resolve_scalar_typedef(next, aliases, visiting),
-            _ => None,
-        },
+        JsDocType::Named(next) => resolve_local_typedef(next, aliases, visiting),
+        JsDocType::Parenthesized(inner) => resolve_local_typedef_target(inner, aliases, visiting)
+            .map(Box::new)
+            .map(JsDocType::Parenthesized),
+        JsDocType::Nullable(inner) => resolve_local_typedef_target(inner, aliases, visiting)
+            .map(Box::new)
+            .map(JsDocType::Nullable),
+        JsDocType::NonNullable(inner) => resolve_local_typedef_target(inner, aliases, visiting)
+            .map(Box::new)
+            .map(JsDocType::NonNullable),
+        JsDocType::Optional(inner) => resolve_local_typedef_target(inner, aliases, visiting)
+            .map(Box::new)
+            .map(JsDocType::Optional),
+        JsDocType::Array(inner) => resolve_local_typedef_target(inner, aliases, visiting)
+            .map(Box::new)
+            .map(JsDocType::Array),
+        JsDocType::ReadonlyArray(inner) => resolve_local_typedef_target(inner, aliases, visiting)
+            .map(Box::new)
+            .map(JsDocType::ReadonlyArray),
+        JsDocType::Union(members) => members
+            .iter()
+            .map(|member| resolve_local_typedef_target(member, aliases, visiting))
+            .collect::<Option<Vec<_>>>()
+            .map(JsDocType::Union),
         _ => None,
-    };
-    visiting.remove(name);
-    resolved
+    }
 }
 
 fn is_jsdoc_declaration_candidate(kind: SyntaxKind) -> bool {
@@ -3851,6 +3883,104 @@ mod tests {
     }
 
     #[test]
+    fn local_composite_typedef_aliases_preserve_names_and_canonical_identity() {
+        let javascript = parse_javascript_source_file(concat!(
+            "/** @typedef {number} NS.Base */\n",
+            "/** @typedef {NS.Base | string} NS.Scalar */\n",
+            "/** @typedef {NS.Scalar[]} NS.Mutable */\n",
+            "/** @typedef {ReadonlyArray<NS.Mutable>} NS.Readonly */\n",
+            "/** @typedef {?NS.Readonly} NS.Nullable */\n",
+            "/** @typedef {NS.Scalar=} NS.Optional */\n",
+            "/** @type {NS.Scalar} */ const scalar = 1;\n",
+            "/** @type {NS.Mutable} */ const mutable = [];\n",
+            "/** @type {NS.Readonly} */ const view = [];\n",
+            "/** @type {NS.Nullable} */ const nullable = null;\n",
+            "/** @type {NS.Optional} */ const optional = undefined;",
+        ));
+        assert!(
+            javascript.diagnostics.is_empty(),
+            "{:?}",
+            javascript.diagnostics
+        );
+        let root = NodeRef::new(
+            javascript.arena.id(),
+            FileId::new(93),
+            javascript.source_file,
+        );
+        let plan = plan_javascript_source_jsdoc(&javascript.arena, root).unwrap();
+        assert!(plan.diagnostics().is_empty(), "{:?}", plan.diagnostics());
+
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> { length: number; } ",
+            "interface ReadonlyArray<T> { readonly length: number; } ",
+            "const marker = 1;",
+        ));
+        let options = CanonicalCheckerOptions {
+            intrinsic: IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            },
+            ..CanonicalCheckerOptions::default()
+        };
+        let mut context = context(&parsed, options);
+        let globals = context.global_types().clone();
+        let expected = [
+            ("NS.Scalar", "/** @type {number | string} */"),
+            ("NS.Mutable", "/** @type {(number | string)[]} */"),
+            (
+                "NS.Readonly",
+                "/** @type {ReadonlyArray<(number | string)[]>} */",
+            ),
+            (
+                "NS.Nullable",
+                "/** @type {?ReadonlyArray<(number | string)[]>} */",
+            ),
+            ("NS.Optional", "/** @type {(number | string)=} */"),
+        ];
+        assert_eq!(plan.declarations().len(), expected.len());
+
+        for (declaration, (name, direct)) in plan.declarations().iter().zip(expected) {
+            let annotation = declaration.type_().unwrap();
+            assert_eq!(annotation.type_(), &JsDocType::Named(name.to_owned()));
+            assert_eq!(annotation.resolved_alias_name(), Some(name));
+
+            let cold = context.store().type_len();
+            preflight_planned_jsdoc_type(context.store(), &globals, options, annotation).unwrap();
+            assert_eq!(context.store().type_len(), cold);
+
+            let resolved = resolve_planned_jsdoc_type(
+                context.store_mut_for_test(),
+                &globals,
+                options,
+                annotation,
+            )
+            .unwrap();
+            let direct = type_tag(direct);
+            let direct_annotation = direct.type_tag().unwrap().type_expression().unwrap();
+            let canonical = resolve_jsdoc_type(
+                context.store_mut_for_test(),
+                &globals,
+                options,
+                direct_annotation,
+            )
+            .unwrap();
+            assert_eq!(resolved, canonical);
+
+            let warm = context.store().type_len();
+            assert_eq!(
+                resolve_planned_jsdoc_type(
+                    context.store_mut_for_test(),
+                    &globals,
+                    options,
+                    annotation,
+                ),
+                Ok(resolved)
+            );
+            assert_eq!(context.store().type_len(), warm);
+        }
+    }
+
+    #[test]
     fn object_typedef_properties_retain_alias_names_after_canonical_resolution() {
         let javascript = parse_javascript_source_file(concat!(
             "/**\n",
@@ -3919,7 +4049,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_cyclic_and_non_scalar_typedefs_remain_typed_boundaries() {
+    fn duplicate_cyclic_and_unsupported_typedefs_remain_typed_boundaries() {
         for source in [
             concat!(
                 "/** @typedef {number} Value */\n",
@@ -3934,7 +4064,30 @@ mod tests {
                 "const value = 1;",
             ),
             concat!(
-                "/** @typedef {string | number} Value */\n",
+                "/** @typedef {Next[]} Value */\n",
+                "/** @typedef {?Value} Next */\n",
+                "/** @type {Value} */\n",
+                "const value = 1;",
+            ),
+            concat!(
+                "/** @typedef {number} NS.Base */\n",
+                "/** @typedef {string} NS.Base */\n",
+                "/** @typedef {NS.Base | boolean} Value */\n",
+                "/** @type {Value} */\n",
+                "const value = 1;",
+            ),
+            concat!(
+                "/** @typedef {Missing | number} Value */\n",
+                "/** @type {Value} */\n",
+                "const value = 1;",
+            ),
+            concat!(
+                "/** @typedef {{ value: number }} Value */\n",
+                "/** @type {Value} */\n",
+                "const value = 1;",
+            ),
+            concat!(
+                "/** @typedef {(value: number) => number} Value */\n",
                 "/** @type {Value} */\n",
                 "const value = 1;",
             ),
@@ -3954,19 +4107,25 @@ mod tests {
             let annotation = plan.declarations()[0].type_().unwrap();
             let parsed = parse_source_file("const marker = 1;");
             let options = CanonicalCheckerOptions::default();
-            let context = context(&parsed, options);
+            let mut context = context(&parsed, options);
+            let globals = context.global_types().clone();
             let cold = context.store().type_len();
+            let expected = JsDocTypeResolutionError::UnresolvedTypeReference {
+                name: "Value".to_owned(),
+                range: annotation.range(),
+            };
             assert_eq!(
-                preflight_planned_jsdoc_type(
-                    context.store(),
-                    context.global_types(),
+                preflight_planned_jsdoc_type(context.store(), &globals, options, annotation,),
+                Err(expected.clone())
+            );
+            assert_eq!(
+                resolve_planned_jsdoc_type(
+                    context.store_mut_for_test(),
+                    &globals,
                     options,
                     annotation,
                 ),
-                Err(JsDocTypeResolutionError::UnresolvedTypeReference {
-                    name: "Value".to_owned(),
-                    range: annotation.range(),
-                })
+                Err(expected)
             );
             assert_eq!(context.store().type_len(), cold);
         }
@@ -4223,7 +4382,7 @@ mod tests {
     #[test]
     fn callback_templates_and_receiver_keep_their_own_signature() {
         let javascript = parse_javascript_source_file(concat!(
-            "/** @typedef {number} T */\n",
+            "/** @typedef {number | string} T */\n",
             "/**\n",
             " * @template T\n",
             " * @callback NS.Handler\n",

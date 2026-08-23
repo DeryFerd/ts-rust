@@ -736,3 +736,94 @@ fn production_source_checking_resolves_homomorphic_mapped_type_aliases() {
         assert!(record.constraint_type.is_some());
     }
 }
+
+#[test]
+fn production_record_alias_instantiations_preserve_distinct_named_aliases() {
+    let parsed = parse_source_file(concat!(
+        "type Record<K extends keyof any, T> = { [P in K]: T };\n",
+        "type First = Record<string, number>;\n",
+        "type Second = Record<string, number>;\n",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(1);
+    let mut binder = CanonicalBinder::new();
+    binder
+        .bind_source_file_with_facts(
+            &parsed.arena,
+            parsed.source_file,
+            file,
+            CanonicalSourceFileFacts::new(
+                EscapedName::source("\"/project/production-record-types.ts\""),
+                CanonicalSourceLanguage::TypeScript,
+                false,
+                CanonicalModuleState::Script,
+            ),
+        )
+        .unwrap();
+    binder
+        .bind_typescript_declaration_slice(&parsed.arena, file)
+        .unwrap();
+    let mut context = CanonicalCheckerContext::new(
+        binder.finish(),
+        vec![(file, &parsed.arena)],
+        CanonicalCheckerOptions::default(),
+    )
+    .unwrap();
+
+    context.check_source_file(file).unwrap();
+    assert!(context.diagnostics().is_empty());
+
+    let alias_type = |name: &str| {
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(identifier) = &parsed.arena.get(alias.name)?.data else {
+                    return None;
+                };
+                (identifier.text == name).then_some(NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .unwrap();
+        let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        context
+            .store()
+            .type_alias_links(symbol)
+            .and_then(|links| links.declared_type)
+            .unwrap()
+    };
+    let declared = alias_type("Record");
+    let first = alias_type("First");
+    let second = alias_type("Second");
+    assert_ne!(first, second);
+    assert_eq!(context.type_to_string(first).unwrap(), "First");
+    assert_eq!(context.type_to_string(second).unwrap(), "Second");
+
+    let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+    for instantiated in [first, second] {
+        let TypeData::Mapped(mapped) = context.store().type_payload(instantiated).unwrap().data()
+        else {
+            panic!("Record<string, number> must retain an instantiated mapped type")
+        };
+        assert_eq!(mapped.object.target, Some(declared));
+        assert_eq!(mapped.constraint_type, Some(bootstrap.string_type));
+        assert_eq!(mapped.template_type, Some(bootstrap.number_type));
+    }
+
+    let warm = (
+        context.store().type_len(),
+        context.store().mapper_len(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().mapper_len(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
+}

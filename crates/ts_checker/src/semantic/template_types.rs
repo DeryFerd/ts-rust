@@ -131,7 +131,9 @@ fn javascript_lowercase(value: &str) -> String {
     let mut result = String::with_capacity(value.len());
     let mut start = 0;
     for (index, character) in value.char_indices() {
-        if has_post_unicode_15_case_mapping(character) {
+        if has_post_unicode_15_case_mapping(character)
+            && !matches!(character, '\u{019B}' | '\u{0264}' | '\u{A7D3}' | '\u{A7D5}')
+        {
             result.push_str(&value[start..index].to_lowercase());
             result.push(character);
             start = index + character.len_utf8();
@@ -2046,6 +2048,30 @@ mod tests {
         assert_eq!(
             StringMappingKind::Lowercase.apply("\u{1c89}\u{03a3}"),
             "\u{1c89}\u{03c3}"
+        );
+    }
+
+    #[test]
+    fn intrinsic_lowercase_preserves_final_sigma_around_existing_cased_characters() {
+        for character in ['\u{019B}', '\u{0264}', '\u{A7D3}', '\u{A7D5}'] {
+            assert_eq!(
+                StringMappingKind::Lowercase.apply(&format!("{character}\u{03a3}")),
+                format!("{character}\u{03c2}"),
+            );
+            assert_eq!(
+                StringMappingKind::Lowercase.apply(&format!("A\u{03a3}{character}")),
+                format!("a\u{03c3}{character}"),
+            );
+            assert_eq!(
+                StringMappingKind::Uppercase.apply(&character.to_string()),
+                character.to_string(),
+            );
+        }
+
+        let lone = encode_js_string(&JsString::from_units(vec![u16::from(b'A'), 0xd800, 0x03a3]));
+        assert_eq!(
+            decode_js_string(&StringMappingKind::Lowercase.apply(&lone)).as_units(),
+            &[u16::from(b'a'), 0xd800, 0x03c3],
         );
     }
 

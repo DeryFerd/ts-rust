@@ -429,6 +429,11 @@ fn prepare_expression(
                 UnsupportedSourceSyntax::Call(expression.node),
             ));
         }
+        PlannedExpressionKind::Arrow(_) => {
+            return Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Arrow(expression.node),
+            ));
+        }
         PlannedExpressionKind::New(_) => {
             return Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::New(
                 expression.node,

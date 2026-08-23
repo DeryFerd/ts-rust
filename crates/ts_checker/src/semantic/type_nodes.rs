@@ -292,6 +292,7 @@ struct TypeQueryPlan {
     keyofs: BTreeMap<NodeRef, NodeRef>,
     aliases: BTreeMap<SemanticSymbolId, TypeAliasPlan>,
     references: BTreeMap<NodeRef, PlannedTypeReference>,
+    type_queries: BTreeMap<NodeRef, PlannedValueTypeQuery>,
     literals: BTreeMap<NodeRef, PlannedLiteralType>,
     unions: BTreeMap<NodeRef, PlannedUnionType>,
     intersections: BTreeMap<NodeRef, PlannedIntersectionType>,
@@ -325,6 +326,14 @@ struct PlannedUniqueSymbolDiagnostic {
 struct PlannedArrayType {
     element_type: NodeRef,
     fallback: Option<TypeId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PlannedValueTypeQuery {
+    name: NodeRef,
+    symbol: SemanticSymbolId,
+    initializer: Option<NodeRef>,
+    type_: TypeId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -390,6 +399,30 @@ fn type_alias_instantiation_cache_key(
         hasher.update(&[0]);
     }
     CacheHashKey::new(hasher.digest128())
+}
+
+fn valid_record_mapped_alias_identity(
+    store: &CanonicalTypeMapperStore,
+    symbol: SemanticSymbolId,
+    arguments: &[TypeId],
+    instantiated: TypeId,
+) -> bool {
+    store
+        .type_payload(instantiated)
+        .and_then(TypeRecord::alias)
+        .and_then(|alias| store.type_alias(alias))
+        .is_some_and(|alias| {
+            alias.symbol() == Some(symbol) && alias.type_arguments() == Some(arguments)
+        })
+}
+
+fn is_instantiated_mapped_type(store: &CanonicalTypeMapperStore, type_: TypeId) -> bool {
+    store.type_payload(type_).is_some_and(|record| {
+        matches!(record.data(), TypeData::Mapped(_))
+            && record
+                .object_flags()
+                .contains(ObjectFlags::INSTANTIATED_MAPPED)
+    })
 }
 
 fn write_type_list(hasher: &mut Xxh3, types: &[TypeId]) {
@@ -1216,6 +1249,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             SyntaxKind::TypeReference => {
                 self.plan_type_reference(node, alias_owner, union_constituent)
             }
+            SyntaxKind::TypeQuery => self.plan_value_type_query(node),
             SyntaxKind::UnionType => self.plan_union_type(node, alias_owner),
             SyntaxKind::IntersectionType => self.plan_intersection_type(node, alias_owner),
             SyntaxKind::ConditionalType => self.plan_conditional_type(node, alias_owner),
@@ -1491,6 +1525,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         if self.plan.mapped_types.contains_key(&node) {
             return Ok(());
         }
+        let mapped = plan_mapped_type_declaration(self.store, self.host, node)
+            .map_err(|error| mapped_type_error(error, node))?;
         if let Some(alias) = alias_owner
             && self
                 .plan
@@ -1498,15 +1534,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 .get(&alias)
                 .is_some_and(|alias| !alias.type_parameters.is_empty())
         {
-            return Err(type_node_unavailable(
-                TypeNodeUnavailable::GenericReferenceUnsupported {
-                    node,
-                    symbol: alias,
-                },
-            ));
+            self.validate_record_mapped_alias_plan(alias, mapped)?;
         }
-        let mapped = plan_mapped_type_declaration(self.store, self.host, node)
-            .map_err(|error| mapped_type_error(error, node))?;
         self.plan.mapped_types.insert(node, mapped);
         self.plan_type_node_in_context(mapped.constraint(), None, false)?;
         if let Some(source) = mapped.modifiers_source() {
@@ -1517,6 +1546,65 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         }
         if let Some(name_type) = mapped.name_type() {
             self.plan_type_node_in_context(name_type, None, false)?;
+        }
+        Ok(())
+    }
+
+    fn validate_record_mapped_alias_plan(
+        &self,
+        alias: SemanticSymbolId,
+        mapped: MappedTypeDeclarationPlan,
+    ) -> Result<(), DeclaredTypeError> {
+        let unsupported = || {
+            type_node_unavailable(TypeNodeUnavailable::GenericReferenceUnsupported {
+                node: mapped.node(),
+                symbol: alias,
+            })
+        };
+        let plan = self.plan.aliases.get(&alias).ok_or_else(&unsupported)?;
+        let [key, value] = plan.type_parameters.as_slice() else {
+            return Err(unsupported());
+        };
+        let Some(key_constraint) = key.constraint else {
+            return Err(unsupported());
+        };
+        let Some(template) = mapped.template() else {
+            return Err(unsupported());
+        };
+        if plan.name_text != "Record"
+            || key.default_type.is_some()
+            || value.constraint.is_some()
+            || value.default_type.is_some()
+            || mapped.name_type().is_some()
+            || mapped.modifiers_source().is_some()
+            || mapped.modifiers().bits() != 0
+        {
+            return Err(unsupported());
+        }
+
+        let constraint = preflight_node(self.store, self.host, key_constraint)?;
+        let NodeData::TypeOperatorNode(operator) = &constraint.data else {
+            return Err(unsupported());
+        };
+        let operand = NodeRef::new(key_constraint.arena, key_constraint.file, operator.type_);
+        if constraint.kind != SyntaxKind::TypeOperator
+            || operator.operator != SyntaxKind::KeyOfKeyword
+            || preflight_node(self.store, self.host, operand)?.kind != SyntaxKind::AnyKeyword
+        {
+            return Err(unsupported());
+        }
+
+        for (node, expected) in [(mapped.constraint(), key.symbol), (template, value.symbol)] {
+            let record = preflight_node(self.store, self.host, node)?;
+            let NodeData::TypeReferenceNode(reference) = &record.data else {
+                return Err(unsupported());
+            };
+            if record.kind != SyntaxKind::TypeReference
+                || reference.type_arguments.is_some()
+                || self.resolve_uncached_type_reference_symbol(node)? != expected
+            {
+                return Err(unsupported());
+            }
         }
         Ok(())
     }
@@ -3615,6 +3703,76 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                                 .is_some_and(|instantiation| *instantiation == declared_type)
                         };
                         if is_cached_instantiation {
+                            if matches!(
+                                self.store
+                                    .type_payload(target_cached.declared_type)
+                                    .map(TypeRecord::data),
+                                Some(TypeData::Mapped(_))
+                            ) {
+                                let type_parameters = self
+                                    .store
+                                    .type_alias_links(canonical)
+                                    .and_then(|links| links.type_parameters.as_deref())
+                                    .ok_or_else(|| {
+                                        type_node_unavailable(
+                                            TypeNodeUnavailable::InvalidCachedTypeAlias(
+                                                root_symbol,
+                                            ),
+                                        )
+                                    })?;
+                                let type_arguments = self
+                                    .type_reference_argument_nodes(reference)?
+                                    .into_iter()
+                                    .map(|argument| {
+                                        self.cached_type_node_identity(root_symbol, argument)
+                                    })
+                                    .collect::<Result<Vec<_>, _>>()?;
+                                let owner_arguments = self
+                                    .store
+                                    .type_alias_links(symbol)
+                                    .and_then(|links| links.type_parameters.as_ref())
+                                    .cloned()
+                                    .unwrap_or_default();
+                                let owner_is_local = self.is_local_type_alias(symbol)?;
+                                let target_has_host_declaration = self
+                                    .store
+                                    .symbol(canonical)
+                                    .and_then(|target| target.declarations())
+                                    .and_then(|declarations| declarations.first())
+                                    .is_some_and(|declaration| {
+                                        self.host.source(*declaration).is_some()
+                                    });
+                                let target_is_local = owner_is_local
+                                    && target_has_host_declaration
+                                    && self.is_local_type_alias(canonical)?;
+                                let (identity_symbol, identity_arguments) =
+                                    if owner_is_local && !target_is_local {
+                                        (canonical, type_arguments.as_slice())
+                                    } else {
+                                        (symbol, owner_arguments.as_slice())
+                                    };
+                                if self
+                                    .store
+                                    .validate_record_mapped_alias_instantiation(
+                                        canonical,
+                                        target_cached.declared_type,
+                                        type_parameters,
+                                        &type_arguments,
+                                        declared_type,
+                                    )
+                                    .is_err()
+                                    || !valid_record_mapped_alias_identity(
+                                        self.store,
+                                        identity_symbol,
+                                        identity_arguments,
+                                        declared_type,
+                                    )
+                                {
+                                    return Err(type_node_unavailable(
+                                        TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
+                                    ));
+                                }
+                            }
                             return Ok(());
                         }
                         return Err(type_node_unavailable(
@@ -4169,6 +4327,237 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         }
     }
 
+    fn plan_value_type_query(&mut self, node: NodeRef) -> Result<(), DeclaredTypeError> {
+        let unsupported = || {
+            type_node_unavailable(TypeNodeUnavailable::UnsupportedSyntax {
+                node,
+                kind: SyntaxKind::TypeQuery,
+            })
+        };
+        let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node));
+        let record = preflight_node(self.store, self.host, node)?;
+        let NodeData::TypeQueryNode(query) = &record.data else {
+            return Err(invalid());
+        };
+        if record.kind != SyntaxKind::TypeQuery
+            || record.flags.0 != 0
+            || query.type_arguments.is_some()
+        {
+            return Err(unsupported());
+        }
+
+        let name = NodeRef::new(node.arena, node.file, query.expr_name);
+        let name_record = preflight_node(self.store, self.host, name)?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Err(unsupported());
+        };
+        if name_record.kind != SyntaxKind::Identifier
+            || name_record.flags.0 != 0
+            || name_record.parent != Some(node.node)
+            || identifier.text.is_empty()
+        {
+            return Err(invalid());
+        }
+
+        let (arena, bound) = self.host.source(node).ok_or({
+            DeclaredTypeError::Unavailable(DeclaredTypeUnavailable::MissingOrForeignFacts(node))
+        })?;
+        let mut callback_host = self.host.name_resolver_host(self.store)?;
+        let resolved = CanonicalNameResolver::new(
+            arena,
+            bound,
+            self.store.symbol_store(),
+            &mut callback_host,
+        )?
+        .resolve(
+            Some(CanonicalResolutionLocation::Bound(name)),
+            &identifier.text,
+            SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE,
+            None,
+            false,
+            false,
+        );
+        let symbol = match resolved {
+            Ok(Some(symbol)) => self.store.get_merged_symbol(symbol).ok_or_else(invalid)?,
+            Ok(None) | Err(CanonicalNameResolutionError::AliasResolutionUnavailable(_)) => {
+                return Err(unsupported());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let symbol_record = self.store.symbol(symbol).ok_or_else(invalid)?;
+        let Some([declaration]) = symbol_record.declarations() else {
+            return Err(unsupported());
+        };
+        let declaration = *declaration;
+        if !declaration.is_for(node.arena, node.file)
+            || symbol_record.value_declaration() != Some(declaration)
+            || symbol_record.name().as_utf8() != Some(identifier.text.as_str())
+            || symbol_record.check_flags() != ts_binder::CheckFlags::NONE
+            || symbol_record.parent().is_some()
+            || symbol_record.members().is_some()
+            || symbol_record.exports().is_some()
+            || symbol_record.export_symbol().is_some()
+            || self.store.get_merged_symbol(symbol) != Some(symbol)
+            || bound
+                .symbol(declaration)
+                .and_then(|bound_symbol| self.store.get_merged_symbol(bound_symbol))
+                != Some(symbol)
+        {
+            return Err(unsupported());
+        }
+        let declaration_record = preflight_node(self.store, self.host, declaration)?;
+        if declaration_record.range.end > record.range.start {
+            return Err(unsupported());
+        }
+
+        let value_type = match self.store.value_symbol_links(symbol) {
+            None => None,
+            Some(links) if links == &super::ValueSymbolLinks::default() => None,
+            Some(links) => {
+                let type_ = links.resolved_type.ok_or_else(invalid)?;
+                if links
+                    != &(super::ValueSymbolLinks {
+                        resolved_type: Some(type_),
+                        ..super::ValueSymbolLinks::default()
+                    })
+                    || self.store.type_payload(type_).is_none()
+                {
+                    return Err(invalid());
+                }
+                Some(type_)
+            }
+        };
+
+        let (initializer, type_) = match (&declaration_record.data, symbol_record.flags()) {
+            (NodeData::VariableDeclaration(variable), SymbolFlags::BLOCK_SCOPED_VARIABLE)
+                if declaration_record.kind == SyntaxKind::VariableDeclaration =>
+            {
+                let list = declaration_record
+                    .parent
+                    .map(|parent| NodeRef::new(node.arena, node.file, parent))
+                    .ok_or_else(unsupported)?;
+                let list_record = preflight_node(self.store, self.host, list)?;
+                let NodeData::VariableDeclarationList(declarations) = &list_record.data else {
+                    return Err(unsupported());
+                };
+                let statement = list_record
+                    .parent
+                    .map(|parent| NodeRef::new(node.arena, node.file, parent))
+                    .ok_or_else(unsupported)?;
+                let statement_record = preflight_node(self.store, self.host, statement)?;
+                let NodeData::VariableStatement(statement_data) = &statement_record.data else {
+                    return Err(unsupported());
+                };
+                if list_record.kind != SyntaxKind::VariableDeclarationList
+                    || list_record.flags.0 != NODE_FLAG_CONST
+                    || !declarations.declarations.nodes.contains(&declaration.node)
+                    || statement_record.kind != SyntaxKind::VariableStatement
+                    || statement_record.parent != Some(bound.source_file().node)
+                    || statement_data.declaration_list != list.node
+                    || variable.type_.is_some() && value_type.is_none()
+                {
+                    return Err(unsupported());
+                }
+                let initializer = variable
+                    .initializer
+                    .map(|initializer| NodeRef::new(node.arena, node.file, initializer))
+                    .ok_or_else(unsupported)?;
+                if preflight_node(self.store, self.host, initializer)?.parent
+                    != Some(declaration.node)
+                {
+                    return Err(invalid());
+                }
+                let initializer_type = if let Some(links) = self.store.type_node_links(initializer)
+                {
+                    if links.outer_type_parameters.is_some() {
+                        return Err(invalid());
+                    }
+                    links.resolved_type
+                } else {
+                    None
+                };
+                if initializer_type.is_some_and(|type_| self.store.type_payload(type_).is_none())
+                    || variable.type_.is_none()
+                        && value_type
+                            .zip(initializer_type)
+                            .is_some_and(|(value, initializer)| value != initializer)
+                {
+                    return Err(invalid());
+                }
+                let type_ = value_type.or(initializer_type).ok_or_else(unsupported)?;
+                if !matches!(
+                    self.store.type_payload(type_).map(TypeRecord::data),
+                    Some(TypeData::Intrinsic(_) | TypeData::Literal(_))
+                ) {
+                    return Err(unsupported());
+                }
+                (Some(initializer), type_)
+            }
+            (NodeData::FunctionDeclaration(_), SymbolFlags::FUNCTION)
+                if declaration_record.kind == SyntaxKind::FunctionDeclaration
+                    && declaration_record.parent == Some(bound.source_file().node) =>
+            {
+                let type_ = value_type.ok_or_else(unsupported)?;
+                if self.store.source_callable_type_for_owner(symbol) != Some(type_)
+                    || self
+                        .store
+                        .source_callable_provenance(type_)
+                        .is_none_or(|provenance| {
+                            provenance.family != SourceCallableFamily::FunctionDeclaration
+                                || provenance.owner_symbol != symbol
+                                || provenance.declaration != declaration
+                        })
+                {
+                    return Err(invalid());
+                }
+                (None, type_)
+            }
+            _ => return Err(unsupported()),
+        };
+
+        let cached_type = self
+            .store
+            .type_node_links(node)
+            .and_then(|links| {
+                links
+                    .outer_type_parameters
+                    .is_none()
+                    .then_some(links.resolved_type)
+            })
+            .flatten();
+        let cached_symbol = self
+            .store
+            .symbol_node_links(name)
+            .and_then(|links| links.resolved_symbol);
+        if self
+            .store
+            .type_node_links(node)
+            .is_some_and(|links| links.outer_type_parameters.is_some())
+            || self
+                .store
+                .symbol_node_links(node)
+                .is_some_and(|links| links.resolved_symbol.is_some())
+            || cached_type.is_some_and(|cached| cached != type_)
+            || cached_symbol.is_some_and(|cached| cached != symbol)
+            || cached_type.is_some() != cached_symbol.is_some()
+        {
+            return Err(invalid());
+        }
+
+        let planned = PlannedValueTypeQuery {
+            name,
+            symbol,
+            initializer,
+            type_,
+        };
+        if let Some(previous) = self.plan.type_queries.insert(node, planned)
+            && previous != planned
+        {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+
     fn plan_type_reference(
         &mut self,
         node: NodeRef,
@@ -4301,6 +4690,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             && cached_enum_owner.is_none()
             && !cached_syntax_contains_builtin_array
             && !self.cached_class_or_interface_reference(node)
+            && !cached_type.is_some_and(|cached| is_instantiated_mapped_type(self.store, cached))
             && !qualified
             && !matches!(name_text, "Array" | "ReadonlyArray")
         {
@@ -7509,6 +7899,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .checked_add(plan.indexed_accesses.len())
             .and_then(|count| count.checked_add(plan.keyofs.len()))
             .and_then(|count| count.checked_add(plan.references.len()))
+            .and_then(|count| count.checked_add(plan.type_queries.len()))
             .and_then(|count| count.checked_add(plan.literals.len()))
             .and_then(|count| count.checked_add(plan.unions.len()))
             .and_then(|count| count.checked_add(plan.intersections.len()))
@@ -7535,6 +7926,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .chain(plan.indexed_accesses.keys())
             .chain(plan.keyofs.keys())
             .chain(plan.references.keys())
+            .chain(plan.type_queries.keys())
             .chain(plan.literals.keys())
             .chain(plan.unions.keys())
             .chain(plan.intersections.keys())
@@ -7783,8 +8175,14 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .checked_add(interface_index_infos)
             .ok_or_else(|| Self::literal_cache_error(LiteralTypeCacheError::Capacity))?;
         let type_node_links = self.missing_planned_type_node_links(plan)?;
+        let symbol_node_links = plan
+            .type_queries
+            .values()
+            .filter(|query| self.store.symbol_node_links(query.name).is_none())
+            .count();
         if !self.store.try_reserve_index_infos(index_infos)
             || !self.store.try_reserve_types(additional_types)
+            || !self.store.try_reserve_symbol_node_links(symbol_node_links)
             || !self.store.try_reserve_type_node_links(type_node_links)
         {
             return Err(Self::literal_cache_error(LiteralTypeCacheError::Capacity));
@@ -8255,6 +8653,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 )),
             },
             SyntaxKind::TypeReference => self.execute_type_reference(node, plan, prepared),
+            SyntaxKind::TypeQuery => self.execute_value_type_query(node, plan),
             SyntaxKind::UnionType => self.execute_union_type(node, plan, prepared),
             SyntaxKind::IntersectionType => self.execute_intersection_type(node, plan, prepared),
             SyntaxKind::ConditionalType => self.execute_conditional_type(node, plan, prepared),
@@ -9508,6 +9907,72 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         Ok(resolved_type)
     }
 
+    fn execute_value_type_query(
+        &mut self,
+        node: NodeRef,
+        plan: &TypeQueryPlan,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node));
+        let query = plan.type_queries.get(&node).copied().ok_or_else(invalid)?;
+        let value_type = self
+            .store
+            .value_symbol_links(query.symbol)
+            .and_then(|links| links.resolved_type);
+        if value_type.is_some_and(|type_| type_ != query.type_)
+            || value_type.is_none()
+                && query.initializer.and_then(|initializer| {
+                    self.store
+                        .type_node_links(initializer)
+                        .and_then(|links| links.resolved_type)
+                }) != Some(query.type_)
+            || self.store.type_payload(query.type_).is_none()
+        {
+            return Err(invalid());
+        }
+
+        let cached_type = self
+            .store
+            .type_node_links(node)
+            .and_then(|links| links.resolved_type);
+        let cached_symbol = self
+            .store
+            .symbol_node_links(query.name)
+            .and_then(|links| links.resolved_symbol);
+        if self
+            .store
+            .symbol_node_links(node)
+            .is_some_and(|links| links.resolved_symbol.is_some())
+            || cached_type.is_some_and(|cached| cached != query.type_)
+            || cached_symbol.is_some_and(|cached| cached != query.symbol)
+            || cached_type.is_some() != cached_symbol.is_some()
+        {
+            return Err(invalid());
+        }
+        if cached_type.is_some() {
+            return Ok(query.type_);
+        }
+
+        let mut symbol_links = self
+            .store
+            .symbol_node_links(query.name)
+            .cloned()
+            .unwrap_or_default();
+        symbol_links.resolved_symbol = Some(query.symbol);
+        if !self.store.set_symbol_node_links(query.name, symbol_links) {
+            return Err(invalid());
+        }
+        let mut type_links = self
+            .store
+            .type_node_links(node)
+            .cloned()
+            .unwrap_or_default();
+        type_links.resolved_type = Some(query.type_);
+        if !self.store.set_type_node_links(node, type_links) {
+            return Err(invalid());
+        }
+        Ok(query.type_)
+    }
+
     fn execute_type_reference(
         &mut self,
         node: NodeRef,
@@ -9525,6 +9990,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     || reference.global_array_target.is_some()
                     || reference.direct_generic
                     || plan.interfaces.contains_key(&reference.symbol)
+                    || is_instantiated_mapped_type(self.store, resolved_type)
             })
         {
             return Ok(resolved_type);
@@ -9792,6 +10258,130 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             &type_parameters,
             &type_arguments,
         )?;
+        if matches!(
+            self.store.type_payload(declared_type).map(TypeRecord::data),
+            Some(TypeData::Mapped(_))
+        ) {
+            let invalid_cache = || {
+                type_node_unavailable(TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(
+                    symbol,
+                ))
+            };
+            let (identity_symbol, identity_arguments) = alias_identity
+                .as_ref()
+                .map_or((symbol, type_arguments.as_slice()), |(owner, arguments)| {
+                    (*owner, arguments.as_slice())
+                });
+            if let Some(cached) = links
+                .instantiations
+                .as_ref()
+                .and_then(|instantiations| instantiations.get(&key))
+                .copied()
+            {
+                if self
+                    .store
+                    .validate_record_mapped_alias_instantiation(
+                        symbol,
+                        declared_type,
+                        &type_parameters,
+                        &type_arguments,
+                        cached,
+                    )
+                    .is_err()
+                    || !valid_record_mapped_alias_identity(
+                        self.store,
+                        identity_symbol,
+                        identity_arguments,
+                        cached,
+                    )
+                {
+                    return Err(invalid_cache());
+                }
+                return Ok(cached);
+            }
+
+            if self.store.get_merged_symbol(identity_symbol) != Some(identity_symbol)
+                || self
+                    .store
+                    .symbol(identity_symbol)
+                    .is_none_or(|identity| identity.flags() != SymbolFlags::TYPE_ALIAS)
+                || identity_arguments
+                    .iter()
+                    .any(|argument| self.store.type_payload(*argument).is_none())
+            {
+                return Err(invalid_cache());
+            }
+
+            let mut alias_arguments = Vec::new();
+            alias_arguments
+                .try_reserve(identity_arguments.len())
+                .map_err(|_| type_node_unavailable(TypeNodeUnavailable::LiteralTypeCapacity))?;
+            alias_arguments.extend_from_slice(identity_arguments);
+            let mut updated_links = links.clone();
+            updated_links
+                .instantiations
+                .as_mut()
+                .ok_or_else(invalid_cache)?
+                .try_reserve(1)
+                .map_err(|_| type_node_unavailable(TypeNodeUnavailable::LiteralTypeCapacity))?;
+            if !self.store.try_reserve_type_aliases(1)
+                || !self.store.try_reserve_types(2)
+                || !self.store.try_reserve_mappers(3)
+            {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::LiteralTypeCapacity,
+                ));
+            }
+
+            let instantiation = self
+                .store
+                .instantiate_record_mapped_alias(
+                    symbol,
+                    declared_type,
+                    &type_parameters,
+                    &type_arguments,
+                )
+                .map_err(|error| match error {
+                    MappedTypeError::Capacity => {
+                        type_node_unavailable(TypeNodeUnavailable::LiteralTypeCapacity)
+                    }
+                    _ => type_node_unavailable(
+                        TypeNodeUnavailable::GenericAliasInstantiationUnsupported {
+                            alias: symbol,
+                            declared_type,
+                        },
+                    ),
+                })?;
+            let identity = self
+                .store
+                .alloc_type_alias(Some(identity_symbol))
+                .ok_or_else(invalid_cache)?;
+            if !self
+                .store
+                .set_type_alias_arguments(identity, Some(alias_arguments))
+                || !self.store.set_type_alias(instantiation, Some(identity))
+                || !valid_record_mapped_alias_identity(
+                    self.store,
+                    identity_symbol,
+                    identity_arguments,
+                    instantiation,
+                )
+            {
+                return Err(invalid_cache());
+            }
+
+            if updated_links
+                .instantiations
+                .as_mut()
+                .ok_or_else(invalid_cache)?
+                .insert(key, instantiation)
+                .is_some()
+                || !self.store.set_type_alias_links(symbol, updated_links)
+            {
+                return Err(invalid_cache());
+            }
+            return Ok(instantiation);
+        }
         let instantiation = if matches!(
             self.store.type_payload(declared_type).map(TypeRecord::data),
             Some(TypeData::Conditional(_))
@@ -10691,6 +11281,28 @@ mod tests {
             declaration.file,
             variable.type_.expect("variable has a type annotation"),
         )
+    }
+
+    fn variable_initializer_node(fixture: &Fixture, name: &str) -> NodeRef {
+        let declaration = named_node(fixture, SyntaxKind::VariableDeclaration, name);
+        let NodeData::VariableDeclaration(variable) =
+            &fixture.parsed.arena.get(declaration.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        NodeRef::new(
+            declaration.arena,
+            declaration.file,
+            variable.initializer.expect("variable has an initializer"),
+        )
+    }
+
+    fn type_query_name(fixture: &Fixture, query: NodeRef) -> NodeRef {
+        let NodeData::TypeQueryNode(data) = &fixture.parsed.arena.get(query.node).unwrap().data
+        else {
+            panic!("expected a type query")
+        };
+        NodeRef::new(query.arena, query.file, data.expr_name)
     }
 
     fn merge_duplicate_alias_declarations(fixture: &mut Fixture, name: &str) -> SemanticSymbolId {
@@ -12930,6 +13542,308 @@ mod tests {
                 .get(&type_list_key(parameters)),
             Some(&declared)
         );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn record_mapped_alias_instantiations_preserve_distinct_owner_identities() {
+        let mut fixture = fixture(concat!(
+            "type Record<K extends keyof any, T> = { [P in K]: T }; ",
+            "type First = Record<string, number>; ",
+            "type Second = Record<string, number>; ",
+            "let standalone: Record<string, number>;",
+        ));
+        let record = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Record");
+        let first = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "First");
+        let second = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Second");
+        let standalone = variable_type_node(&fixture, "standalone");
+        let arguments = {
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            [bootstrap.string_type, bootstrap.number_type]
+        };
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let first_type = query_declared(
+            &mut fixture,
+            first,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let second_type = query_declared(
+            &mut fixture,
+            second,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let standalone_type = query_node(&mut fixture, standalone, &mut diagnostics).unwrap();
+        assert_ne!(first_type, second_type);
+        assert_ne!(first_type, standalone_type);
+        assert_ne!(second_type, standalone_type);
+
+        let links = fixture.store.type_alias_links(record).unwrap();
+        let declared = links.declared_type.unwrap();
+        let parameters = links.type_parameters.as_ref().unwrap();
+        for (instantiated, owner, alias_arguments) in [
+            (first_type, first, Vec::new()),
+            (second_type, second, Vec::new()),
+            (standalone_type, record, arguments.to_vec()),
+        ] {
+            assert!(valid_record_mapped_alias_identity(
+                &fixture.store,
+                owner,
+                &alias_arguments,
+                instantiated,
+            ));
+            assert_eq!(
+                fixture.store.validate_record_mapped_alias_instantiation(
+                    record,
+                    declared,
+                    parameters,
+                    &arguments,
+                    instantiated,
+                ),
+                Ok(()),
+            );
+        }
+
+        let first_global = fixture
+            .store
+            .symbol_store()
+            .assigned_global_symbol_id(first)
+            .unwrap();
+        let second_global = fixture
+            .store
+            .symbol_store()
+            .assigned_global_symbol_id(second)
+            .unwrap();
+        let instantiations = links.instantiations.as_ref().unwrap();
+        assert_eq!(instantiations.len(), 4);
+        assert_eq!(
+            instantiations.get(&alias_instantiation_key(
+                &arguments,
+                Some((first_global, &[])),
+            )),
+            Some(&first_type),
+        );
+        assert_eq!(
+            instantiations.get(&alias_instantiation_key(
+                &arguments,
+                Some((second_global, &[])),
+            )),
+            Some(&second_type),
+        );
+        assert_eq!(
+            instantiations.get(&alias_instantiation_key(&arguments, None)),
+            Some(&standalone_type),
+        );
+
+        let warm = union_state(&fixture.store);
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                first,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(first_type),
+        );
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                second,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(second_type),
+        );
+        assert_eq!(
+            query_node(&mut fixture, standalone, &mut diagnostics),
+            Ok(standalone_type),
+        );
+        assert_eq!(union_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn generic_mapped_aliases_require_the_exact_record_declaration() {
+        let cases = [
+            (
+                "type Record<K extends string, T> = { [P in K]: T };",
+                "Record",
+            ),
+            (
+                "type Record<K extends keyof any, T = number> = { [P in K]: T };",
+                "Record",
+            ),
+            (
+                "type Record<K extends keyof any, T> = { readonly [P in K]: T };",
+                "Record",
+            ),
+            (
+                "type Record<K extends keyof any, T> = { [P in K]: K };",
+                "Record",
+            ),
+            (
+                "type Other<K extends keyof any, T> = { [P in K]: T };",
+                "Other",
+            ),
+        ];
+
+        for (source, name) in cases {
+            let mut fixture = fixture(source);
+            let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, name);
+            let mapped = alias_parts(&fixture, name).2;
+            let before = union_state(&fixture.store);
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            assert_eq!(
+                query_declared(
+                    &mut fixture,
+                    alias,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                ),
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::GenericReferenceUnsupported {
+                        node: mapped,
+                        symbol: alias,
+                    },
+                )),
+                "source: {source}",
+            );
+            assert_eq!(union_state(&fixture.store), before, "source: {source}");
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn record_mapped_alias_warm_cache_rejects_invalid_mapper_and_owner_metadata() {
+        for corruption in 0..3 {
+            let mut fixture = fixture(concat!(
+                "type Record<K extends keyof any, T> = { [P in K]: T }; ",
+                "type First = Record<string, number>;",
+            ));
+            let first = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "First");
+            let string_type = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let instantiated = query_declared(
+                &mut fixture,
+                first,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap();
+            let record = fixture.store.type_payload(instantiated).unwrap();
+            let identity = record.alias().unwrap();
+            let TypeData::Mapped(mapped) = record.data() else {
+                unreachable!()
+            };
+            let parameter = mapped.type_parameter.unwrap();
+
+            match corruption {
+                0 => {
+                    let TypeData::TypeParameter(parameter_data) =
+                        fixture.store.type_payload(parameter).unwrap().data()
+                    else {
+                        unreachable!()
+                    };
+                    let constraint = parameter_data.constraint;
+                    let target = parameter_data.target;
+                    let default_type = parameter_data.resolved_default_type;
+                    assert!(fixture.store.set_type_parameter_resolution(
+                        parameter,
+                        constraint,
+                        target,
+                        None,
+                        default_type,
+                    ));
+                }
+                1 => {
+                    assert!(
+                        fixture
+                            .store
+                            .set_type_alias_arguments(identity, Some(vec![string_type]))
+                    );
+                }
+                2 => assert!(fixture.store.set_type_alias(instantiated, None)),
+                _ => unreachable!(),
+            }
+
+            let before = union_state(&fixture.store);
+            for _ in 0..2 {
+                assert_eq!(
+                    query_declared(
+                        &mut fixture,
+                        first,
+                        CanonicalTypeQueryOptions::default(),
+                        &mut diagnostics,
+                    ),
+                    Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidCachedTypeAlias(first),
+                    )),
+                    "corruption case {corruption}",
+                );
+                assert_eq!(union_state(&fixture.store), before);
+            }
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn record_mapped_alias_rejects_another_owners_cached_instance_before_publication() {
+        let mut fixture = fixture(concat!(
+            "type Record<K extends keyof any, T> = { [P in K]: T }; ",
+            "type First = Record<string, number>; ",
+            "type Second = Record<string, number>;",
+        ));
+        let record = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Record");
+        let first = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "First");
+        let second = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Second");
+        let second_reference = alias_parts(&fixture, "Second").2;
+        let arguments = {
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            [bootstrap.string_type, bootstrap.number_type]
+        };
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let first_type = query_declared(
+            &mut fixture,
+            first,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let second_global = fixture.store.global_symbol_id(second).unwrap();
+        let second_key = alias_instantiation_key(&arguments, Some((second_global, &[])));
+        let mut links = fixture.store.type_alias_links(record).unwrap().clone();
+        assert_eq!(
+            links
+                .instantiations
+                .as_mut()
+                .unwrap()
+                .insert(second_key, first_type),
+            None,
+        );
+        assert!(fixture.store.set_type_alias_links(record, links));
+        let before = union_state(&fixture.store);
+
+        for _ in 0..2 {
+            assert_eq!(
+                query_declared(
+                    &mut fixture,
+                    second,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                ),
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(record),
+                )),
+            );
+            assert_eq!(union_state(&fixture.store), before);
+            assert!(fixture.store.type_alias_links(second).is_none());
+            assert!(fixture.store.type_node_links(second_reference).is_none());
+            assert!(fixture.store.symbol_node_links(second_reference).is_none());
+        }
         assert!(diagnostics.is_empty());
     }
 
@@ -15673,6 +16587,313 @@ mod tests {
         assert_eq!(literal_state(&fixture.store), before);
         assert!(fixture.store.type_alias_links(alias).is_none());
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn value_type_query_reads_checked_const_initializer_before_value_publication() {
+        let mut fixture =
+            fixture(r#"const literal = "\u{D83D}\u{DE00}" as const; let result: typeof literal;"#);
+        let symbol = fixture
+            .store
+            .get_merged_symbol(named_symbol(
+                &fixture,
+                SyntaxKind::VariableDeclaration,
+                "literal",
+            ))
+            .unwrap();
+        let initializer = variable_initializer_node(&fixture, "literal");
+        let expected = fixture
+            .store
+            .regular_string_literal_type("\u{1F600}".to_owned())
+            .unwrap();
+        assert!(fixture.store.set_type_node_links(
+            initializer,
+            TypeNodeLinks {
+                resolved_type: Some(expected),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        assert!(fixture.store.value_symbol_links(symbol).is_none());
+
+        let query = variable_type_node(&fixture, "result");
+        let name = type_query_name(&fixture, query);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        assert_eq!(
+            query_node(&mut fixture, query, &mut diagnostics),
+            Ok(expected)
+        );
+        assert_eq!(
+            fixture.store.type_node_links(query),
+            Some(&TypeNodeLinks {
+                resolved_type: Some(expected),
+                ..TypeNodeLinks::default()
+            }),
+        );
+        assert_eq!(
+            fixture.store.symbol_node_links(name),
+            Some(&SymbolNodeLinks {
+                resolved_symbol: Some(symbol),
+            }),
+        );
+        assert!(fixture.store.symbol_node_links(query).is_none());
+        assert!(fixture.store.value_symbol_links(symbol).is_none());
+
+        let warm = store_state(&fixture.store);
+        assert_eq!(
+            query_node(&mut fixture, query, &mut diagnostics),
+            Ok(expected)
+        );
+        assert_eq!(store_state(&fixture.store), warm);
+        assert!(fixture.store.value_symbol_links(symbol).is_none());
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn value_type_query_reuses_published_source_function_identity() {
+        let mut fixture =
+            fixture("function value(): string { return ''; } let result: typeof value;");
+        let declaration = named_node(&fixture, SyntaxKind::FunctionDeclaration, "value");
+        let owner = node_symbol(&fixture, declaration);
+        let query = variable_type_node(&fixture, "result");
+        let name = type_query_name(&fixture, query);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let expected =
+            query_source_callable(&mut fixture, declaration, owner, &mut diagnostics).unwrap();
+
+        assert_eq!(
+            query_node(&mut fixture, query, &mut diagnostics),
+            Ok(expected)
+        );
+        assert_eq!(
+            fixture
+                .store
+                .symbol_node_links(name)
+                .and_then(|links| links.resolved_symbol),
+            Some(owner),
+        );
+        assert!(fixture.store.symbol_node_links(query).is_none());
+
+        let warm = store_state(&fixture.store);
+        assert_eq!(
+            query_node(&mut fixture, query, &mut diagnostics),
+            Ok(expected)
+        );
+        assert_eq!(store_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn unsupported_value_type_queries_fail_before_semantic_writes() {
+        let cases = [
+            ("let value = 'ok'; let result: typeof value;", true),
+            ("const value = 'ok'; let result: typeof value;", false),
+            (
+                "const value = 'ok'; let result: typeof value<string>;",
+                true,
+            ),
+            (
+                "const value = 'ok'; let result: typeof value.missing;",
+                true,
+            ),
+        ];
+
+        for (source, seed_initializer) in cases {
+            let mut fixture = fixture(source);
+            let query = variable_type_node(&fixture, "result");
+            let name = type_query_name(&fixture, query);
+            if seed_initializer {
+                let initializer = variable_initializer_node(&fixture, "value");
+                let expected = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+                assert!(fixture.store.set_type_node_links(
+                    initializer,
+                    TypeNodeLinks {
+                        resolved_type: Some(expected),
+                        ..TypeNodeLinks::default()
+                    },
+                ));
+            }
+
+            let before = store_state(&fixture.store);
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            assert_eq!(
+                query_node(&mut fixture, query, &mut diagnostics),
+                Err(DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::UnsupportedSyntax {
+                        node: query,
+                        kind: SyntaxKind::TypeQuery,
+                    },
+                )),
+                "source: {source}",
+            );
+            assert_eq!(store_state(&fixture.store), before, "source: {source}");
+            assert!(fixture.store.type_node_links(query).is_none());
+            assert!(fixture.store.symbol_node_links(query).is_none());
+            assert!(fixture.store.symbol_node_links(name).is_none());
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn corrupted_value_type_query_caches_fail_atomically() {
+        for corruption in 0..7 {
+            let mut fixture =
+                fixture("const value = 'ok'; const other = 'bad'; let result: typeof value;");
+            let symbol = fixture
+                .store
+                .get_merged_symbol(named_symbol(
+                    &fixture,
+                    SyntaxKind::VariableDeclaration,
+                    "value",
+                ))
+                .unwrap();
+            let other = fixture
+                .store
+                .get_merged_symbol(named_symbol(
+                    &fixture,
+                    SyntaxKind::VariableDeclaration,
+                    "other",
+                ))
+                .unwrap();
+            let query = variable_type_node(&fixture, "result");
+            let name = type_query_name(&fixture, query);
+            let initializer = variable_initializer_node(&fixture, "value");
+            let (expected, wrong) = {
+                let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+                (bootstrap.string_type, bootstrap.number_type)
+            };
+            assert!(fixture.store.set_type_node_links(
+                initializer,
+                TypeNodeLinks {
+                    resolved_type: Some(expected),
+                    ..TypeNodeLinks::default()
+                },
+            ));
+
+            match corruption {
+                0 => {
+                    assert!(fixture.store.set_type_node_links(
+                        query,
+                        TypeNodeLinks {
+                            resolved_type: Some(wrong),
+                            ..TypeNodeLinks::default()
+                        },
+                    ));
+                    assert!(fixture.store.set_symbol_node_links(
+                        name,
+                        SymbolNodeLinks {
+                            resolved_symbol: Some(symbol),
+                        },
+                    ));
+                }
+                1 => {
+                    assert!(fixture.store.set_type_node_links(
+                        query,
+                        TypeNodeLinks {
+                            resolved_type: Some(expected),
+                            ..TypeNodeLinks::default()
+                        },
+                    ));
+                    assert!(fixture.store.set_symbol_node_links(
+                        name,
+                        SymbolNodeLinks {
+                            resolved_symbol: Some(other),
+                        },
+                    ));
+                }
+                2 => {
+                    assert!(fixture.store.set_value_symbol_links(
+                        symbol,
+                        ValueSymbolLinks {
+                            resolved_type: Some(wrong),
+                            ..ValueSymbolLinks::default()
+                        },
+                    ));
+                }
+                3 => {
+                    assert!(fixture.store.set_type_node_links(
+                        query,
+                        TypeNodeLinks {
+                            resolved_type: Some(expected),
+                            ..TypeNodeLinks::default()
+                        },
+                    ));
+                }
+                4 => {
+                    assert!(fixture.store.set_symbol_node_links(
+                        name,
+                        SymbolNodeLinks {
+                            resolved_symbol: Some(symbol),
+                        },
+                    ));
+                }
+                5 => {
+                    assert!(fixture.store.set_type_node_links(
+                        query,
+                        TypeNodeLinks {
+                            resolved_type: Some(expected),
+                            outer_type_parameters: Some(vec![expected]),
+                        },
+                    ));
+                    assert!(fixture.store.set_symbol_node_links(
+                        name,
+                        SymbolNodeLinks {
+                            resolved_symbol: Some(symbol),
+                        },
+                    ));
+                }
+                6 => {
+                    assert!(fixture.store.set_type_node_links(
+                        query,
+                        TypeNodeLinks {
+                            resolved_type: Some(expected),
+                            ..TypeNodeLinks::default()
+                        },
+                    ));
+                    assert!(fixture.store.set_symbol_node_links(
+                        name,
+                        SymbolNodeLinks {
+                            resolved_symbol: Some(symbol),
+                        },
+                    ));
+                    assert!(fixture.store.set_symbol_node_links(
+                        query,
+                        SymbolNodeLinks {
+                            resolved_symbol: Some(symbol),
+                        },
+                    ));
+                }
+                _ => unreachable!(),
+            }
+
+            let before = store_state(&fixture.store);
+            let cached_type = fixture.store.type_node_links(query).cloned();
+            let cached_symbol = fixture.store.symbol_node_links(name).cloned();
+            let wrapper_symbol = fixture.store.symbol_node_links(query).cloned();
+            let value_links = fixture.store.value_symbol_links(symbol).cloned();
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            assert_eq!(
+                query_node(&mut fixture, query, &mut diagnostics),
+                Err(DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(query),
+                )),
+                "corruption case {corruption}",
+            );
+            assert_eq!(store_state(&fixture.store), before);
+            assert_eq!(fixture.store.type_node_links(query).cloned(), cached_type);
+            assert_eq!(
+                fixture.store.symbol_node_links(name).cloned(),
+                cached_symbol
+            );
+            assert_eq!(
+                fixture.store.symbol_node_links(query).cloned(),
+                wrapper_symbol
+            );
+            assert_eq!(
+                fixture.store.value_symbol_links(symbol).cloned(),
+                value_links
+            );
+            assert!(diagnostics.is_empty());
+        }
     }
 
     #[test]

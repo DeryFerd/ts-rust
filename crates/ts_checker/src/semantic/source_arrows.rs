@@ -2098,6 +2098,8 @@ mod tests {
         for source in [
             "const container = { run: (value: string): string => value };",
             "const callbacks = [(value: number): number => value];",
+            "const result = invoke((value: string): string => value);",
+            "const inferred = invoke((value: number) => value);",
         ] {
             let fixture = Fixture::new(source);
             let declaration = fixture
@@ -2138,6 +2140,65 @@ mod tests {
                     fixture.store.checker_link_allocated_lengths(),
                 ),
                 before,
+            );
+            assert!(
+                fixture
+                    .store
+                    .source_callable_type_for_owner(owner)
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn nested_arrow_arguments_preserve_lexical_this_expression_identity() {
+        for (source, expected_kind, returned) in [
+            (
+                "const result = invoke((value: string): unknown => this);",
+                SyntaxKind::ThisKeyword,
+                false,
+            ),
+            (
+                "const result = invoke((value: string): unknown => this.value);",
+                SyntaxKind::PropertyAccessExpression,
+                false,
+            ),
+            (
+                "const result = invoke((value: string): unknown => { return this.value; });",
+                SyntaxKind::PropertyAccessExpression,
+                true,
+            ),
+        ] {
+            let fixture = Fixture::new(source);
+            let declaration = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::ArrowFunction).then_some(NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let owner = fixture.bound.symbol(declaration).unwrap();
+            let host = fixture.host();
+
+            let (callable, body) =
+                plan_source_arrow_value(&fixture.store, &host, declaration, None).unwrap();
+            assert_eq!(callable.declaration, declaration);
+            assert_eq!(callable.owner_symbol, owner);
+            assert_eq!(callable.parameters.len(), 1);
+
+            let ((SourceArrowBodyPlan::ConciseExpression { expression }, false)
+            | (SourceArrowBodyPlan::ReturnExpression { expression, .. }, true)) = (body, returned)
+            else {
+                panic!("unexpected lexical this arrow body")
+            };
+            assert_eq!(
+                fixture.parsed.arena.get(expression.node).unwrap().kind,
+                expected_kind,
             );
             assert!(
                 fixture

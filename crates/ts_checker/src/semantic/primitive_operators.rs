@@ -1,11 +1,12 @@
 //! Exact scalar kernel for ordinary non-assignment binary operators.
 //!
 //! The admitted domain is deliberately atomic: the canonical `string`,
-//! `number`, `bigint`, and `boolean` types plus their validated literal pairs.
-//! Every broader type family remains a typed boundary. The kernel mirrors the
-//! pinned checker's operator-specific diagnostics and recovery types without
-//! publishing expression links; source integration owns publication after the
-//! complete result and diagnostic batch have been staged.
+//! `number`, `bigint`, and `boolean` types plus their validated literal pairs
+//! and authenticated homogeneous enum types. Every broader type family remains
+//! a typed boundary. The kernel mirrors the pinned checker's operator-specific
+//! diagnostics and recovery types without publishing expression links; source
+//! integration owns publication after the complete result and diagnostic batch
+//! have been staged.
 
 use ts_ast::{NodeRef, SyntaxKind};
 use ts_diagnostics::{Diagnostic, message_by_code};
@@ -14,6 +15,7 @@ use super::{
     CanonicalCheckerDiagnostic, CanonicalTypeMapperStore, RelationUnavailable,
     TypeDisplayUnavailable, TypeId,
     bootstrap::LiteralTypeCacheError,
+    enums,
     formatter::type_to_string,
     type_records::{LiteralValue, TypeData},
     types::TypeFlags,
@@ -408,7 +410,13 @@ fn primitive_scalar(
         .type_payload(type_)
         .ok_or(PrimitiveBinaryInvariant::InvalidType(type_))?;
     if let TypeData::Union(union) = record.data() {
-        store.validate_union_constituent(type_)?;
+        if record.flags().intersects(TypeFlags::ENUM_LITERAL) {
+            if !enums::is_canonical_enum_union(store, type_) {
+                return Err(PrimitiveBinaryInvariant::InvalidType(type_).into());
+            }
+        } else {
+            store.validate_union_constituent(type_)?;
+        }
         let mut members = union.union.types.iter().copied();
         let first = members
             .next()
@@ -429,14 +437,31 @@ fn primitive_scalar(
     let TypeData::Literal(literal) = record.data() else {
         return Err(PrimitiveBinaryUnsupported::Operand { node, type_ }.into());
     };
+    let enum_like = record.flags().intersects(TypeFlags::ENUM_LIKE);
+    if enum_like && enums::canonical_enum_type_owner(store, type_).is_none() {
+        return Err(PrimitiveBinaryInvariant::InvalidType(type_).into());
+    }
     let family = match (record.flags(), &literal.value) {
         (TypeFlags::STRING_LITERAL, LiteralValue::String(_)) => PrimitiveScalarFamily::String,
-        (TypeFlags::NUMBER_LITERAL, LiteralValue::Number(_)) => PrimitiveScalarFamily::Number,
+        (TypeFlags::NUMBER_LITERAL, LiteralValue::Number(_))
+        | (TypeFlags::ENUM, LiteralValue::ComputedEnum) => PrimitiveScalarFamily::Number,
         (TypeFlags::BIG_INT_LITERAL, LiteralValue::BigInt(_)) => PrimitiveScalarFamily::BigInt,
         (TypeFlags::BOOLEAN_LITERAL, LiteralValue::Boolean(_)) => PrimitiveScalarFamily::Boolean,
+        (flags, LiteralValue::String(_))
+            if flags == TypeFlags::STRING_LITERAL | TypeFlags::ENUM_LITERAL =>
+        {
+            PrimitiveScalarFamily::String
+        }
+        (flags, LiteralValue::Number(_))
+            if flags == TypeFlags::NUMBER_LITERAL | TypeFlags::ENUM_LITERAL =>
+        {
+            PrimitiveScalarFamily::Number
+        }
         _ => return Err(PrimitiveBinaryUnsupported::Operand { node, type_ }.into()),
     };
-    store.validate_union_constituent(type_)?;
+    if !enum_like {
+        store.validate_union_constituent(type_)?;
+    }
     let base = match family {
         PrimitiveScalarFamily::String => bootstrap.string_type,
         PrimitiveScalarFamily::Number => bootstrap.number_type,
@@ -755,12 +780,17 @@ fn comparison_diagnostic(
 #[cfg(test)]
 mod tests {
     use ts_ast::{FileId, NodeData, NodeRef};
+    use ts_binder::{
+        CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
+        EscapedName,
+    };
     use ts_jsnum::{Number, PseudoBigInt};
     use ts_parser::{ParseResult, parse_source_file};
 
     use super::*;
     use crate::semantic::{
-        IntrinsicBootstrapOptions, SemanticStore, mapper::TypeMapper, type_records::TypeRecord,
+        DeclaredTypeHost, IntrinsicBootstrapOptions, SemanticStore, mapper::TypeMapper,
+        type_records::TypeRecord, types::ObjectFlags,
     };
 
     #[derive(Clone, Copy)]
@@ -776,6 +806,68 @@ mod tests {
             .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
             .unwrap();
         store
+    }
+
+    fn published_enums(
+        text: &str,
+    ) -> (
+        ParseResult,
+        CanonicalTypeMapperStore,
+        Vec<enums::CanonicalEnumSemantics>,
+    ) {
+        let parsed = parse_source_file(text);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(1);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/enum-operators.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let (symbols, files) = binder.finish().try_into_parts().unwrap();
+        let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
+        assert!(
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .is_some()
+        );
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        let enumerations = {
+            let bound = &files[&file];
+            let host = DeclaredTypeHost::new([(&parsed.arena, bound)]).unwrap();
+            let mut declarations = parsed
+                .arena
+                .iter()
+                .filter_map(|(node, record)| {
+                    (record.kind == SyntaxKind::EnumDeclaration).then_some((
+                        record.range.start,
+                        NodeRef::new(parsed.arena.id(), file, node),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            declarations.sort_by_key(|(start, _)| *start);
+            declarations
+                .into_iter()
+                .map(|(_, declaration)| {
+                    let owner = bound.symbol(declaration).unwrap();
+                    enums::get_enum_semantics(&mut store, &host, owner).unwrap()
+                })
+                .collect()
+        };
+        (parsed, store, enumerations)
     }
 
     fn binary_nodes(parsed: &ParseResult) -> BinaryNodes {
@@ -961,6 +1053,198 @@ mod tests {
                     node: nodes.left,
                     type_: mixed,
                 },
+            )),
+        );
+    }
+
+    #[test]
+    fn authenticated_enum_members_and_homogeneous_unions_support_scalar_operators() {
+        let (parsed, mut store, enumerations) = published_enums(concat!(
+            "declare function compute(): number; ",
+            "const enum Numeric { First = 1, Second = 2 } ",
+            "enum Text { First = 'first', Second = 'second' } ",
+            "enum Mixed { Text = 'mixed', Value = 3 } ",
+            "enum Computed { First = compute(), Second = 4 } ",
+            "const value = left + right;",
+        ));
+        let nodes = binary_nodes(&parsed);
+        let [numeric, text, mixed, computed] = enumerations.as_slice() else {
+            panic!("the fixture must publish four enum declarations")
+        };
+        let (number, string, boolean) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.number_type,
+                bootstrap.string_type,
+                bootstrap.boolean_type,
+            )
+        };
+
+        for (operator, left, right, expected) in [
+            (
+                SyntaxKind::PlusToken,
+                numeric.members[0].fresh_type,
+                number,
+                number,
+            ),
+            (
+                SyntaxKind::MinusToken,
+                numeric.declared_type,
+                numeric.members[1].regular_type,
+                number,
+            ),
+            (
+                SyntaxKind::GreaterThanToken,
+                number,
+                numeric.members[1].fresh_type,
+                boolean,
+            ),
+            (
+                SyntaxKind::PlusToken,
+                text.members[0].fresh_type,
+                number,
+                string,
+            ),
+            (
+                SyntaxKind::LessThanToken,
+                string,
+                text.declared_type,
+                boolean,
+            ),
+            (
+                SyntaxKind::GreaterThanToken,
+                number,
+                computed.members[0].fresh_type,
+                boolean,
+            ),
+            (SyntaxKind::BarToken, computed.declared_type, number, number),
+            (
+                SyntaxKind::EqualsEqualsEqualsToken,
+                numeric.members[0].fresh_type,
+                numeric.members[0].regular_type,
+                boolean,
+            ),
+        ] {
+            let resolution =
+                check_primitive_binary(&mut store, request(nodes, operator, left, right)).unwrap();
+            assert_eq!(resolution.result_type, expected, "operator {operator:?}");
+            assert!(resolution.diagnostics.is_empty(), "operator {operator:?}");
+        }
+
+        assert_eq!(
+            check_primitive_binary(
+                &mut store,
+                request(nodes, SyntaxKind::PlusToken, mixed.declared_type, number),
+            ),
+            Err(PrimitiveBinaryError::Unsupported(
+                PrimitiveBinaryUnsupported::Operand {
+                    node: nodes.left,
+                    type_: mixed.declared_type,
+                },
+            )),
+        );
+    }
+
+    #[test]
+    fn enum_operands_preserve_nullish_diagnostics_and_reject_poisoned_caches() {
+        let (parsed, mut store, enumerations) = published_enums(concat!(
+            "enum Numeric { First = 1, Second = 2 } ",
+            "enum Text { Value = 'text' } ",
+            "const value = left + right;",
+        ));
+        let nodes = binary_nodes(&parsed);
+        let [numeric, text] = enumerations.as_slice() else {
+            panic!("the fixture must publish two enum declarations")
+        };
+        let (null, number, string, error) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.null_widening_type,
+                bootstrap.number_type,
+                bootstrap.string_type,
+                bootstrap.error_type,
+            )
+        };
+        let numeric_member = &numeric.members[0];
+
+        let null_plus_number = check_primitive_binary(
+            &mut store,
+            request(
+                nodes,
+                SyntaxKind::PlusToken,
+                null,
+                numeric_member.fresh_type,
+            ),
+        )
+        .unwrap();
+        assert_eq!(null_plus_number.result_type, error);
+        assert_eq!(
+            rendered(&null_plus_number),
+            [(
+                nodes.left,
+                18_050,
+                "The value 'null' cannot be used here.".to_owned(),
+            )],
+        );
+        let text_plus_null = check_primitive_binary(
+            &mut store,
+            request(
+                nodes,
+                SyntaxKind::PlusToken,
+                text.members[0].fresh_type,
+                null,
+            ),
+        )
+        .unwrap();
+        assert_eq!(text_plus_null.result_type, string);
+        assert!(text_plus_null.diagnostics.is_empty());
+
+        assert!(store.set_literal_links(
+            numeric_member.fresh_type,
+            None,
+            numeric_member.regular_type,
+        ));
+        assert_eq!(
+            check_primitive_binary(
+                &mut store,
+                request(
+                    nodes,
+                    SyntaxKind::PlusToken,
+                    numeric_member.fresh_type,
+                    number,
+                ),
+            ),
+            Err(PrimitiveBinaryError::Invariant(
+                PrimitiveBinaryInvariant::InvalidType(numeric_member.fresh_type),
+            )),
+        );
+        assert!(store.set_literal_links(
+            numeric_member.fresh_type,
+            Some(numeric_member.fresh_type),
+            numeric_member.regular_type,
+        ));
+
+        let ordinary = store.regular_number_literal_type(Number::new(9.0)).unwrap();
+        let fresh_ordinary = store.fresh_type_of_literal_type(ordinary).unwrap();
+        assert!(store.set_literal_links(fresh_ordinary, None, ordinary));
+        assert_eq!(
+            check_primitive_binary(
+                &mut store,
+                request(nodes, SyntaxKind::PlusToken, fresh_ordinary, number),
+            ),
+            Err(PrimitiveBinaryError::Literal(
+                LiteralTypeCacheError::InvalidCachedLiteral(fresh_ordinary),
+            )),
+        );
+
+        assert!(store.set_type_object_flags(numeric.declared_type, ObjectFlags::NONE));
+        assert_eq!(
+            check_primitive_binary(
+                &mut store,
+                request(nodes, SyntaxKind::PlusToken, numeric.declared_type, number),
+            ),
+            Err(PrimitiveBinaryError::Invariant(
+                PrimitiveBinaryInvariant::InvalidType(numeric.declared_type),
             )),
         );
     }

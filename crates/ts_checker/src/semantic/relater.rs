@@ -22,8 +22,10 @@ use super::{
     ResolvedSignatureState, SignatureLinks,
     array_types::{ArrayTypeError, CanonicalArrayTargets},
     bootstrap::LiteralTypeCacheError,
+    callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
     callables::{
-        StoredSingleCallableValidation, ValidatedSingleCallable, validate_stored_single_callable,
+        CallableFamily, StoredSingleCallableValidation, ValidatedSingleCallable,
+        validate_stored_single_callable,
     },
     classes::{ClassHeritageMembersValidation, validate_class_heritage_members},
     derived_types::DerivedObjectLiteralValidation,
@@ -1245,6 +1247,13 @@ impl<'store> RelaterSession<'store> {
             }
         }
 
+        if let Some(related) =
+            self.store
+                .authenticated_template_literal_relation(source, target, self.relation)?
+        {
+            return Ok(bool_to_ternary(related));
+        }
+
         if (self.relation == RelationKind::Comparable
             && !target_flags.intersects(TypeFlags::NEVER)
             && self.store.is_simple_type_related_to(
@@ -1261,6 +1270,26 @@ impl<'store> RelaterSession<'store> {
             )?
         {
             return Ok(Ternary::True);
+        }
+
+        if source_flags.intersects(TypeFlags::OBJECT)
+            && target_flags.intersects(TypeFlags::OBJECT)
+            && self
+                .store
+                .authenticated_declared_construct_pair(
+                    source,
+                    target,
+                    self.relation,
+                    self.strict_function_types,
+                )?
+                .is_some()
+        {
+            return self.recursive_type_related_to(
+                source,
+                target,
+                intersection_state,
+                recursion_flags,
+            );
         }
 
         if source_flags.intersects(TypeFlags::STRUCTURED_OR_INSTANTIABLE)
@@ -1643,6 +1672,21 @@ impl<'store> RelaterSession<'store> {
                 target,
                 relation: self.relation,
             });
+        }
+        if let Some((source_signature, target_signature)) =
+            self.store.authenticated_declared_construct_pair(
+                source,
+                target,
+                self.relation,
+                self.strict_function_types,
+            )?
+        {
+            return self.compare_signatures_related(
+                &source_signature,
+                &target_signature,
+                SignatureCheckMode::NONE,
+                intersection_state,
+            );
         }
         let source_members = self.resolved_object_members(source, true)?;
         let allow_fresh_target = self.allows_fresh_object_target();
@@ -2101,11 +2145,21 @@ impl<'store> RelaterSession<'store> {
                     .map(|symbol| symbol.name().to_owned())
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let target_table = target_members_id
-            .and_then(|members| self.store.symbol_table(members))
-            .ok_or(RelationUnavailable::InvalidStructuredMembers(target))?;
+        let target_table = match target_members_id {
+            Some(members) => Some(
+                self.store
+                    .symbol_table(members)
+                    .ok_or(RelationUnavailable::InvalidStructuredMembers(target))?,
+            ),
+            None if target_members.properties.is_empty()
+                && !target_members.index_infos.is_empty() =>
+            {
+                None
+            }
+            None => return Err(RelationUnavailable::InvalidStructuredMembers(target)),
+        };
         for name in source_names {
-            if target_table.get(name.as_ref()).is_none()
+            if target_table.is_none_or(|table| table.get(name.as_ref()).is_none())
                 && !self.index_signature_accepts_name(
                     target,
                     &target_members.index_infos,
@@ -4054,9 +4108,15 @@ impl<'store> RelaterSession<'store> {
                 declarations.to_vec(),
             )
         };
-        let members = structured
-            .members
-            .ok_or(RelationUnavailable::InvalidStructuredMembers(type_id))?;
+        let validated_class = owner_flags == SymbolFlags::CLASS
+            && validate_class_heritage_members(self.store, type_id)
+                == ClassHeritageMembersValidation::Valid;
+        let members = if validated_class {
+            owner_members
+        } else {
+            structured.members
+        }
+        .ok_or(RelationUnavailable::InvalidStructuredMembers(type_id))?;
         self.observe_symbol_table(members);
         let table = self
             .store
@@ -4079,7 +4139,8 @@ impl<'store> RelaterSession<'store> {
             || key_type == self.bootstrap.number_type
             || key_type == symbol_key
             || is_template_pattern_index_key(self.store, key_type);
-        if owner_flags != SymbolFlags::TYPE_LITERAL
+        if !validated_class
+            && owner_flags != SymbolFlags::TYPE_LITERAL
             && owner_flags & SymbolFlags::TYPE != SymbolFlags::INTERFACE
             || owner_members != Some(members)
             || self.store.source_node_kind(declaration) != Some(SyntaxKind::IndexSignature)
@@ -4374,6 +4435,77 @@ impl Drop for RelaterSession<'_> {
 }
 
 impl SemanticStore<TypeRecord, TypeMapper> {
+    fn authenticated_declared_construct_signature(
+        &self,
+        type_: TypeId,
+    ) -> Result<Option<ValidatedSingleCallable>, RelationUnavailable> {
+        if !self.type_has_declared_call_set_provenance(type_) {
+            return Ok(None);
+        }
+        let StoredCallableSetValidation::Valid {
+            family: CallableFamily::DeclaredCallSignatures,
+            projection,
+            ..
+        } = validate_stored_callable_set(self, type_)
+        else {
+            return Err(RelationUnavailable::MalformedFunctionType(type_));
+        };
+        if projection.construct_signatures.is_empty() {
+            return Ok(None);
+        }
+        let [signature] = projection.construct_signatures.as_ref() else {
+            return Err(RelationUnavailable::StructuredSignatures(type_));
+        };
+        if !projection.call_signatures.is_empty() {
+            return Err(RelationUnavailable::StructuredSignatures(type_));
+        }
+        let signature = *signature;
+        let record = self
+            .signature(signature)
+            .ok_or(RelationUnavailable::MalformedFunctionType(type_))?;
+        let parameters = self
+            .callable_signature_parameter_types(signature)
+            .ok_or(RelationUnavailable::MalformedFunctionType(type_))?
+            .to_vec();
+        let min_argument_count = usize::try_from(record.min_argument_count())
+            .map_err(|_| RelationUnavailable::MalformedFunctionType(type_))?;
+        let return_type = record
+            .resolved_return_type()
+            .ok_or(RelationUnavailable::UnresolvedSignatureReturn(signature))?;
+        Ok(Some(ValidatedSingleCallable {
+            owner: type_,
+            signature,
+            parameters,
+            rest_parameter: None,
+            min_argument_count,
+            return_type: Some(return_type),
+            strict_variance_exempt: false,
+        }))
+    }
+
+    fn authenticated_declared_construct_pair(
+        &self,
+        source: TypeId,
+        target: TypeId,
+        relation: RelationKind,
+        strict_function_types: Option<bool>,
+    ) -> Result<Option<(ValidatedSingleCallable, ValidatedSingleCallable)>, RelationUnavailable>
+    {
+        match (
+            self.authenticated_declared_construct_signature(source)?,
+            self.authenticated_declared_construct_signature(target)?,
+        ) {
+            (None, None) => Ok(None),
+            (Some(source), Some(target))
+                if relation == RelationKind::Assignable && strict_function_types.is_some() =>
+            {
+                Ok(Some((source, target)))
+            }
+            (Some(source), _) => Err(RelationUnavailable::StructuredSignatures(source.owner)),
+            (None, Some(target)) => Err(RelationUnavailable::StructuredSignatures(target.owner)),
+        }
+    }
+
     fn admit_callable_relation_type(
         &self,
         type_: TypeId,
@@ -4388,8 +4520,8 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     RelationUnavailable::StructuredSignatures(type_)
                 })
             }
-            StoredSingleCallableValidation::Valid { .. } => {
-                if strict_function_types.is_some() {
+            StoredSingleCallableValidation::Valid { callable, .. } => {
+                if strict_function_types.is_some() || callable.strict_variance_exempt {
                     Ok(true)
                 } else {
                     Err(RelationUnavailable::StructuredSignatures(type_))
@@ -5196,6 +5328,11 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             return Ok(related);
         }
         if !relation.is_identity() {
+            if let Some(related) =
+                self.authenticated_template_literal_relation(source, target, relation)?
+            {
+                return Ok(related);
+            }
             if (relation == RelationKind::Comparable
                 && !target_flags.intersects(TypeFlags::NEVER)
                 && self.is_simple_type_related_to(target, source, relation, bootstrap)?)
@@ -5215,6 +5352,16 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             if source_flags.intersects(TypeFlags::SINGLETON) {
                 return Ok(true);
             }
+        }
+
+        if source_flags.intersects(TypeFlags::OBJECT) && target_flags.intersects(TypeFlags::OBJECT)
+        {
+            self.authenticated_declared_construct_pair(
+                source,
+                target,
+                relation,
+                strict_function_types,
+            )?;
         }
 
         let supported_array_relation = source_flags.intersects(TypeFlags::OBJECT)
@@ -5287,6 +5434,73 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             });
         }
         Ok(false)
+    }
+
+    fn authenticated_template_literal_relation(
+        &self,
+        source: TypeId,
+        target: TypeId,
+        relation: RelationKind,
+    ) -> Result<Option<bool>, RelationUnavailable> {
+        if relation.is_identity() {
+            return Ok(None);
+        }
+        let source_flags = self.type_flags(source)?;
+        let target_flags = self.type_flags(target)?;
+        let (source, target) = if target_flags.intersects(TypeFlags::TEMPLATE_LITERAL)
+            && source_flags.intersects(TypeFlags::STRING_LITERAL | TypeFlags::TEMPLATE_LITERAL)
+        {
+            (source, target)
+        } else if relation == RelationKind::Comparable
+            && source_flags.intersects(TypeFlags::TEMPLATE_LITERAL)
+            && target_flags.intersects(TypeFlags::STRING_LITERAL)
+        {
+            (target, source)
+        } else {
+            return Ok(None);
+        };
+
+        self.authenticate_template_literal_type(target)?;
+        let source_record = self
+            .type_payload(source)
+            .ok_or(RelationUnavailable::Type(source))?;
+        if source_record.flags().intersects(TypeFlags::STRING_LITERAL) {
+            if source_record.flags().intersects(TypeFlags::ENUM_LITERAL) {
+                if enums::canonical_enum_type_owner(self, source).is_none() {
+                    return Err(RelationUnavailable::MalformedLiteral(source));
+                }
+            } else {
+                self.validate_union_constituent(source)
+                    .map_err(|error| union_validation_unavailable(source, error))?;
+            }
+        } else {
+            self.authenticate_template_literal_type(source)?;
+        }
+
+        self.is_type_matched_by_template_literal_type(source, target)
+            .map(Some)
+            .map_err(|_| RelationUnavailable::MalformedStructuredType(target))
+    }
+
+    fn authenticate_template_literal_type(&self, type_: TypeId) -> Result<(), RelationUnavailable> {
+        let record = self
+            .type_payload(type_)
+            .ok_or(RelationUnavailable::Type(type_))?;
+        let TypeData::TemplateLiteral(template) = record.data() else {
+            return Err(RelationUnavailable::MalformedStructuredType(type_));
+        };
+        if record.flags() != TypeFlags::TEMPLATE_LITERAL
+            || self
+                .cached_resolved_template_literal_type(&template.texts, &template.types)
+                .map_err(|_| RelationUnavailable::MalformedStructuredType(type_))?
+                != Some(type_)
+            || !self
+                .is_type_matched_by_template_literal_type(type_, type_)
+                .map_err(|_| RelationUnavailable::MalformedStructuredType(type_))?
+        {
+            return Err(RelationUnavailable::MalformedStructuredType(type_));
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_lines)] // Keep the pinned branch order visibly linear.
@@ -6127,6 +6341,31 @@ mod tests {
             .unwrap()
     }
 
+    fn query_declared_relation_alias(fixture: &mut FunctionRelationFixture, name: &str) -> TypeId {
+        let globals = fixture.store.intrinsic_bootstrap().unwrap().globals;
+        let symbol = fixture
+            .store
+            .symbol_table(globals)
+            .and_then(|globals| globals.get_source(name))
+            .unwrap_or_else(|| panic!("missing declared alias {name}"));
+        let host = relation_host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let type_ = CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_declared_type_of_symbol(symbol)
+        .unwrap();
+        assert!(diagnostics.is_empty());
+        type_
+    }
+
     fn resolve_all_function_returns(fixture: &mut FunctionRelationFixture) {
         let signatures = fixture
             .parsed
@@ -6357,6 +6596,264 @@ mod tests {
             Err(RelationUnavailable::InvalidStructuredMembers(target_type))
         );
         assert_eq!(fixture.store.relation_state_snapshot(), stale);
+    }
+
+    #[test]
+    fn validated_class_string_indexes_compare_with_maps_and_fresh_objects() {
+        let mut fixture = function_relation_fixture(concat!(
+            "class Indexed { [name: string]: number; constructor() {} } ",
+            "type Numbers = { [name: string]: number }; ",
+            "type Strings = { [name: string]: string }; ",
+            "type Actions = { [name: `do-${string}`]: number };",
+        ));
+        let indexed = query_class_members(&mut fixture, "Indexed")
+            .shells()
+            .instance_type();
+        let numbers = query_declared_relation_alias(&mut fixture, "Numbers");
+        let strings = query_declared_relation_alias(&mut fixture, "Strings");
+        let actions = query_declared_relation_alias(&mut fixture, "Actions");
+        let (number, string) = {
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            (bootstrap.number_type, bootstrap.string_type)
+        };
+        let matching = alloc_typed_property(&mut fixture.store, "value", number, false);
+        let valid = alloc_fresh_property_object(&mut fixture.store, vec![matching]);
+        let mismatching = alloc_typed_property(&mut fixture.store, "value", string, false);
+        let invalid = alloc_fresh_property_object(&mut fixture.store, vec![mismatching]);
+
+        assert_eq!(
+            fixture.store.is_type_assignable_to(indexed, numbers),
+            Ok(true)
+        );
+        assert_eq!(
+            fixture.store.is_type_assignable_to(numbers, indexed),
+            Ok(true)
+        );
+        assert_eq!(
+            fixture.store.is_type_assignable_to(indexed, actions),
+            Ok(true)
+        );
+        assert_eq!(
+            fixture.store.is_type_assignable_to(indexed, strings),
+            Ok(false)
+        );
+        assert_eq!(
+            fixture.store.is_type_assignable_to(valid, indexed),
+            Ok(true)
+        );
+        assert_eq!(
+            fixture.store.is_type_assignable_to(invalid, indexed),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn poisoned_indexed_class_graph_is_rejected_before_warmed_relation_cache() {
+        let mut fixture = function_relation_fixture(concat!(
+            "class Indexed { [name: string]: number; constructor() {} } ",
+            "type Numbers = { [name: string]: number };",
+        ));
+        let class = query_class_members(&mut fixture, "Indexed");
+        let indexed = class.shells().instance_type();
+        let numbers = query_declared_relation_alias(&mut fixture, "Numbers");
+        assert_eq!(
+            fixture.store.is_type_assignable_to(indexed, numbers),
+            Ok(true)
+        );
+        let key = fixture
+            .store
+            .relation_key_if_available(
+                indexed,
+                numbers,
+                super::IntersectionState::NONE,
+                false,
+                false,
+            )
+            .unwrap()
+            .key();
+        assert!(
+            fixture
+                .store
+                .relation_cache_get(RelationKind::Assignable, key)
+                .intersects(RelationComparisonResult::SUCCEEDED)
+        );
+
+        let index = fixture
+            .store
+            .type_payload(indexed)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.index_infos.as_deref())
+            .and_then(|indexes| indexes.first().copied())
+            .unwrap();
+        let index_symbol = fixture
+            .store
+            .symbol(class.shells().symbol())
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| fixture.store.symbol_table(members))
+            .and_then(|members| members.get(InternalSymbolName::Index.as_ref()))
+            .unwrap();
+        assert!(
+            fixture
+                .store
+                .set_index_info_symbol(index, Some(index_symbol))
+        );
+        let poisoned = fixture.store.relation_state_snapshot();
+
+        assert_eq!(
+            fixture.store.is_type_assignable_to(indexed, numbers),
+            Err(RelationUnavailable::InvalidStructuredMembers(indexed))
+        );
+        assert_eq!(fixture.store.relation_state_snapshot(), poisoned);
+    }
+
+    #[test]
+    fn authenticated_declared_construct_signatures_follow_callable_assignability() {
+        let mut fixture = function_relation_fixture(concat!(
+            "type Narrow = { new(value: \"fixed\"): string }; ",
+            "type Wide = { new(value: string): string }; ",
+            "type LiteralReturn = { new(value: string): \"fixed\" }; ",
+            "type NumericReturn = { new(value: string): number }; ",
+            "type Zero = { new(): string }; ",
+            "interface InterfaceWide { new(value: string): string; }",
+        ));
+        let narrow = query_declared_relation_alias(&mut fixture, "Narrow");
+        let wide = query_declared_relation_alias(&mut fixture, "Wide");
+        let literal_return = query_declared_relation_alias(&mut fixture, "LiteralReturn");
+        let numeric_return = query_declared_relation_alias(&mut fixture, "NumericReturn");
+        let zero = query_declared_relation_alias(&mut fixture, "Zero");
+        let interface_wide = query_declared_relation_alias(&mut fixture, "InterfaceWide");
+
+        for (source, target, expected) in [
+            (wide, narrow, true),
+            (narrow, wide, false),
+            (literal_return, wide, true),
+            (wide, literal_return, false),
+            (numeric_return, wide, false),
+            (wide, zero, false),
+            (zero, wide, true),
+            (wide, interface_wide, true),
+            (interface_wide, wide, true),
+        ] {
+            assert_eq!(
+                fixture
+                    .store
+                    .is_type_assignable_to_with_strict_function_types(source, target, true),
+                Ok(expected)
+            );
+        }
+
+        let mut bivariant = function_relation_fixture(concat!(
+            "type Narrow = { new(value: \"fixed\"): string }; ",
+            "type Wide = { new(value: string): string };",
+        ));
+        let narrow = query_declared_relation_alias(&mut bivariant, "Narrow");
+        let wide = query_declared_relation_alias(&mut bivariant, "Wide");
+        assert_eq!(
+            bivariant
+                .store
+                .is_type_assignable_to_with_strict_function_types(narrow, wide, false),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn declared_construct_relation_boundaries_do_not_publish_partial_results() {
+        let mut fixture = function_relation_fixture(concat!(
+            "type Left = { new(value: string): string }; ",
+            "type Right = { new(value: string): string }; ",
+            "type Overloaded = { new(value: string): string; new(value: number): number }; ",
+            "type Callable = { (value: string): string };",
+        ));
+        let left = query_declared_relation_alias(&mut fixture, "Left");
+        let right = query_declared_relation_alias(&mut fixture, "Right");
+        let overloaded = query_declared_relation_alias(&mut fixture, "Overloaded");
+        let callable = query_declared_relation_alias(&mut fixture, "Callable");
+        let before = fixture.store.relation_state_snapshot();
+
+        assert_eq!(
+            fixture.store.is_type_assignable_to(left, right),
+            Err(RelationUnavailable::StructuredSignatures(left))
+        );
+        assert_eq!(fixture.store.relation_state_snapshot(), before);
+        assert_eq!(
+            fixture.store.is_type_related_to_with_strict_function_types(
+                left,
+                right,
+                RelationKind::Subtype,
+                true,
+            ),
+            Err(RelationUnavailable::StructuredSignatures(left))
+        );
+        assert_eq!(fixture.store.relation_state_snapshot(), before);
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to_with_strict_function_types(overloaded, right, true),
+            Err(RelationUnavailable::StructuredSignatures(overloaded))
+        );
+        assert_eq!(fixture.store.relation_state_snapshot(), before);
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to_with_strict_function_types(left, callable, true),
+            Err(RelationUnavailable::StructuredSignatures(left))
+        );
+        assert_eq!(fixture.store.relation_state_snapshot(), before);
+    }
+
+    #[test]
+    fn poisoned_declared_construct_signature_invalidates_a_warmed_relation() {
+        let mut fixture = function_relation_fixture(concat!(
+            "type Left = { new(value: string): string }; ",
+            "type Right = { new(value: string): string };",
+        ));
+        let left = query_declared_relation_alias(&mut fixture, "Left");
+        let right = query_declared_relation_alias(&mut fixture, "Right");
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to_with_strict_function_types(left, right, true),
+            Ok(true)
+        );
+        let key = fixture
+            .store
+            .relation_key_if_available(left, right, super::IntersectionState::NONE, false, false)
+            .unwrap()
+            .key();
+        assert!(
+            fixture
+                .store
+                .relation_cache_get(RelationKind::Assignable, key)
+                .intersects(RelationComparisonResult::SUCCEEDED)
+        );
+
+        let signature = fixture
+            .store
+            .type_payload(left)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.signatures.as_deref())
+            .and_then(|signatures| signatures.first().copied())
+            .unwrap();
+        assert!(
+            fixture
+                .store
+                .set_signature_flags(signature, SignatureFlags::NONE)
+        );
+        assert_eq!(
+            fixture
+                .store
+                .relation_cache_get(RelationKind::Assignable, key),
+            RelationComparisonResult::NONE
+        );
+        let poisoned = fixture.store.relation_state_snapshot();
+
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to_with_strict_function_types(left, right, true),
+            Err(RelationUnavailable::MalformedFunctionType(left))
+        );
+        assert_eq!(fixture.store.relation_state_snapshot(), poisoned);
     }
 
     #[test]
@@ -8421,6 +8918,85 @@ mod tests {
         assert_eq!(store.is_type_assignable_to(any, number), Ok(true));
         assert_eq!(store.is_type_comparable_to(any, number), Ok(true));
         assert_eq!(store.is_type_subtype_of(any, number), Ok(false));
+        assert_eq!(store.relation_state_snapshot(), before);
+    }
+
+    #[test]
+    fn authenticated_string_and_template_literals_compare_against_template_patterns() {
+        let mut store = initialized(true);
+        let (string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let target = store
+            .get_template_literal_type(&["do-".to_owned(), String::new()], &[string])
+            .unwrap();
+        let narrow = store
+            .get_template_literal_type(&["do-prefix-".to_owned(), String::new()], &[number])
+            .unwrap();
+        let wrong_pattern = store
+            .get_template_literal_type(&["undo-".to_owned(), String::new()], &[number])
+            .unwrap();
+        let matching = store.regular_string_literal_type("do-save".into()).unwrap();
+        let wrong = store
+            .regular_string_literal_type("undo-save".into())
+            .unwrap();
+        let fresh = store.fresh_type_of_literal_type(matching).unwrap();
+        let before = store.relation_state_snapshot();
+
+        for relation in [
+            RelationKind::Assignable,
+            RelationKind::Subtype,
+            RelationKind::StrictSubtype,
+            RelationKind::Comparable,
+        ] {
+            assert_eq!(
+                store.is_type_related_to(matching, target, relation),
+                Ok(true)
+            );
+            assert_eq!(store.is_type_related_to(fresh, target, relation), Ok(true));
+            assert_eq!(store.is_type_related_to(wrong, target, relation), Ok(false));
+            assert_eq!(store.is_type_related_to(narrow, target, relation), Ok(true));
+            assert_eq!(
+                store.is_type_related_to(wrong_pattern, target, relation),
+                Ok(false)
+            );
+        }
+        assert_eq!(store.is_type_comparable_to(target, matching), Ok(true));
+        assert_eq!(store.is_type_comparable_to(target, wrong), Ok(false));
+        assert_eq!(store.is_type_identical_to(matching, target), Ok(false));
+        assert_eq!(store.relation_state_snapshot(), before);
+    }
+
+    #[test]
+    fn template_relations_reject_unowned_literal_and_duplicate_pattern_identities() {
+        let mut store = initialized(true);
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let texts = ["do-".to_owned(), String::new()];
+        let pattern = store.get_template_literal_type(&texts, &[string]).unwrap();
+        let forged_literal = alloc_literal(
+            &mut store,
+            TypeFlags::STRING_LITERAL,
+            LiteralValue::String("do-save".into()),
+        );
+        let canonical_literal = store.regular_string_literal_type("do-save".into()).unwrap();
+        let forged_pattern = store
+            .alloc_template_literal_type(texts.to_vec(), vec![string])
+            .unwrap();
+        let before = store.relation_state_snapshot();
+
+        assert_eq!(
+            store.is_type_assignable_to(forged_literal, pattern),
+            Err(RelationUnavailable::MalformedLiteral(forged_literal))
+        );
+        assert_eq!(
+            store.is_type_assignable_to(canonical_literal, forged_pattern),
+            Err(RelationUnavailable::MalformedStructuredType(forged_pattern))
+        );
+        assert_eq!(
+            store.is_type_assignable_to(forged_pattern, pattern),
+            Err(RelationUnavailable::MalformedStructuredType(forged_pattern))
+        );
         assert_eq!(store.relation_state_snapshot(), before);
     }
 

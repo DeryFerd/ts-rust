@@ -282,6 +282,52 @@ fn inferred_function_diagnostics_replay_at_the_declaration_slot() {
     assert_eq!(context.diagnostics(), &diagnostics);
 }
 
+#[test]
+fn inferred_switch_returns_merge_grouped_literal_clauses() {
+    let source = concat!(
+        "function describe(level: number) {\n",
+        "  switch (level) {\n",
+        "    case 0:\n",
+        "    case 1:\n",
+        "      return 'ready';\n",
+        "    default:\n",
+        "      return 'fallback';\n",
+        "  }\n",
+        "}\n",
+        "const result = describe(1);\n",
+    );
+    let parsed = parse_source_file(source);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(9);
+    let mut context = context(&parsed, file);
+
+    context.check_source_file(file).unwrap();
+
+    assert!(context.diagnostics().is_empty());
+    let call = call_expression(source, &parsed, file, "describe(1)");
+    assert_eq!(
+        context
+            .type_to_string(resolved_type(&context, call))
+            .unwrap(),
+        "string"
+    );
+
+    let warm = (
+        context.store().type_len(),
+        context.store().signature_len(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
+}
+
 fn assert_function_boundary_before_publication(
     source: &str,
     file: FileId,

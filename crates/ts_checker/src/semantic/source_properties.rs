@@ -1,10 +1,13 @@
 //! Exact source integration for direct and chained property reads.
 //!
 //! The recursively planned receiver must already have a canonical `any` type,
-//! a published enum value, an imported namespace, or belong to the validated
-//! own-property object domain in `relater`. Enum values reuse their published
-//! member identities. Namespace reexports retain their export alias while
-//! reading the final value symbol. Exact two-constituent
+//! a published enum value, a validated class constructor, an imported
+//! namespace, or belong to the validated own-property object domain in
+//! `relater`. Enum values reuse their published member identities. Class
+//! constructors read their validated static member tables without treating
+//! construct signatures as property-only objects. Namespace reexports retain
+//! their export alias while reading the final value symbol. Exact
+//! two-constituent
 //! unions of source-declared type literals reuse the canonical union-property
 //! adapter. A property missing from any union constituent recovers with
 //! `errorType` plus a deferred TS2339 or stable-common-candidate TS2551
@@ -16,17 +19,19 @@
 //! union read adapter.
 
 use ts_ast::{NodeArena, NodeData, NodeRef, SyntaxKind};
-use ts_binder::{SemanticSymbolId, SymbolFlags};
+use ts_binder::{CheckFlags, SemanticSymbolId, SymbolFlags};
 use ts_diagnostics::{Diagnostic, message_by_code};
 
 use super::{
     CanonicalCheckerDiagnostic, CanonicalCheckerOptions, CanonicalGlobalTypes,
     CanonicalTypeFormatFlags, CanonicalTypeMapperStore, DeclaredTypeHost, RelationUnavailable,
-    SymbolNodeLinks, TypeDisplayUnavailable, TypeId, TypeNodeLinks,
+    SymbolNodeLinks, TypeDisplayUnavailable, TypeId, TypeNodeLinks, ValueSymbolLinks,
     bootstrap::UnionReduction,
+    classes::{self, ClassHeritageMembersValidation},
     enums,
     formatter::type_to_string_with_host_global_types_and_flags,
     member_resolution::UnionPropertyError,
+    relater::ResolvedOwnProperty,
     source::{PlannedExpression, PlannedExpressionKind},
     spelling::get_spelling_suggestion,
     type_records::{TypeData, TypeRecord},
@@ -211,6 +216,12 @@ enum NamespaceProperty {
         symbol: SemanticSymbolId,
         type_: TypeId,
     },
+    Missing,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClassStaticProperty {
+    Present(ResolvedOwnProperty),
     Missing,
 }
 
@@ -507,7 +518,12 @@ pub(super) fn check_direct_source_property(
                 }),
             )
         }
-    } else if let Some(property) = store.resolved_own_property(receiver_type, &plan.name)? {
+    } else if let Some(property) = match resolve_class_static_property(store, plan, receiver_type)?
+    {
+        Some(ClassStaticProperty::Present(property)) => Some(property),
+        Some(ClassStaticProperty::Missing) => None,
+        None => store.resolved_own_property(receiver_type, &plan.name)?,
+    } {
         if property.optional {
             if !plan.is_read() {
                 return Err(SourcePropertyError::Unsupported(
@@ -571,6 +587,107 @@ pub(super) fn check_direct_source_property(
 
     publish_property_links(store, plan.node, property, type_)?;
     Ok(CheckedSourceProperty { type_, diagnostic })
+}
+
+fn resolve_class_static_property(
+    store: &CanonicalTypeMapperStore,
+    plan: &SourcePropertyPlan,
+    receiver_type: TypeId,
+) -> Result<Option<ClassStaticProperty>, SourcePropertyError> {
+    let receiver = store
+        .type_payload(receiver_type)
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    let Some(owner) = receiver.symbol() else {
+        return Ok(None);
+    };
+    let owner = store
+        .get_merged_symbol(owner)
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    let class = store
+        .symbol(owner)
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    if !class.flags().contains(SymbolFlags::CLASS) {
+        return Ok(None);
+    }
+    if store
+        .value_symbol_links(owner)
+        .and_then(|links| links.resolved_type)
+        != Some(receiver_type)
+    {
+        return Ok(None);
+    }
+
+    let instance = store
+        .declared_type_links(owner)
+        .and_then(|links| links.declared_type)
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    if classes::validate_class_heritage_members(store, instance)
+        != ClassHeritageMembersValidation::Valid
+    {
+        return Err(SourcePropertyError::InvalidCache(plan.node));
+    }
+    let TypeData::Object(value) = receiver.data() else {
+        return Err(SourcePropertyError::InvalidCache(plan.node));
+    };
+    let members = value
+        .structured
+        .members
+        .and_then(|members| store.symbol_table(members))
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    let Some(symbol) = members.get_source(&plan.name) else {
+        return Ok(Some(ClassStaticProperty::Missing));
+    };
+    let property = store
+        .symbol(symbol)
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    if value
+        .structured
+        .properties
+        .as_deref()
+        .is_none_or(|properties| !properties.contains(&symbol))
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || property.name().as_utf8() != Some(plan.name.as_str())
+    {
+        return Err(SourcePropertyError::InvalidCache(plan.node));
+    }
+
+    let flags = property.flags();
+    let type_ = if flags == (SymbolFlags::PROPERTY | SymbolFlags::PROTOTYPE) {
+        if property.parent() != Some(owner) || property.name().as_utf8() != Some("prototype") {
+            return Err(SourcePropertyError::InvalidCache(plan.node));
+        }
+        instance
+    } else {
+        if flags != SymbolFlags::PROPERTY
+            && flags != SymbolFlags::METHOD
+            && flags != (SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL)
+        {
+            return Err(SourcePropertyError::InvalidCache(plan.node));
+        }
+        let links = store
+            .value_symbol_links(symbol)
+            .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+        let type_ = links
+            .resolved_type
+            .filter(|type_| store.type_payload(*type_).is_some())
+            .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+        if links
+            != &(ValueSymbolLinks {
+                resolved_type: Some(type_),
+                ..ValueSymbolLinks::default()
+            })
+        {
+            return Err(SourcePropertyError::InvalidCache(plan.node));
+        }
+        type_
+    };
+
+    Ok(Some(ClassStaticProperty::Present(ResolvedOwnProperty {
+        symbol,
+        type_,
+        optional: flags.contains(SymbolFlags::OPTIONAL),
+        readonly: property.check_flags().contains(CheckFlags::READONLY),
+    })))
 }
 
 fn resolve_enum_property(
@@ -1228,7 +1345,7 @@ mod tests {
 
     use super::*;
     use crate::semantic::{
-        AliasSymbolLinks, AliasTargetState, IntrinsicBootstrapOptions, ValueSymbolLinks,
+        AliasSymbolLinks, AliasTargetState, CanonicalCheckerContext, IntrinsicBootstrapOptions,
         source::{PlannedExpressionKind, PlannedIdentifierRead, PlannedIdentifierReadKind},
         types::ObjectFlags,
     };
@@ -1440,6 +1557,65 @@ mod tests {
         )
     }
 
+    fn published_class<'arena>(
+        parsed: &'arena ParseResult,
+        file: FileId,
+        expected: &str,
+    ) -> (
+        CanonicalCheckerContext<'arena>,
+        SemanticSymbolId,
+        TypeId,
+        TypeId,
+    ) {
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/class-properties.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        )
+        .unwrap();
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::ClassDeclaration(class) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(name) = &parsed.arena.get(class.name?)?.data else {
+                    return None;
+                };
+                (name.text == expected).then_some(NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .expect("fixture contains the requested class declaration");
+        let owner = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        let members = context.get_nongeneric_class_members(owner).unwrap();
+        let instance = members.shells().instance_type();
+        let value = members.shells().value_type();
+        (context, owner, instance, value)
+    }
+
     #[test]
     fn required_own_property_publishes_exact_symbol_and_type_cold_and_warm() {
         let parsed = parsed("const result = object.value;");
@@ -1555,6 +1731,220 @@ mod tests {
                 .and_then(|links| links.resolved_type),
             Some(fresh_type),
         );
+    }
+
+    #[test]
+    fn class_static_properties_preserve_declared_and_inherited_symbols() {
+        for (index, (source, owner_name, member_name)) in [
+            (
+                "class Model { static count: number; } const result = Model.count;",
+                "Model",
+                "count",
+            ),
+            (
+                concat!(
+                    "class Base { static count: number; } ",
+                    "class Derived extends Base {} ",
+                    "const result = Derived.count;",
+                ),
+                "Derived",
+                "count",
+            ),
+            (
+                "class Model {} const result = Model.prototype;",
+                "Model",
+                "prototype",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let parsed = parsed(source);
+            let file = FileId::new(522 + u32::try_from(index).unwrap());
+            let access = property_access(&parsed, file);
+            let (mut context, owner, instance, value) = published_class(&parsed, file, owner_name);
+            let member = context
+                .store()
+                .type_payload(value)
+                .and_then(|record| record.data().structured())
+                .and_then(|structured| structured.members)
+                .and_then(|members| context.store().symbol_table(members))
+                .and_then(|members| members.get_source(member_name))
+                .unwrap();
+            let expected = if member_name == "prototype" {
+                instance
+            } else {
+                context.store().intrinsic_bootstrap().unwrap().number_type
+            };
+            let syntax =
+                plan_direct_source_property_syntax(&parsed.arena, context.store(), access).unwrap();
+            let receiver = PlannedExpression::new(
+                syntax.receiver(),
+                PlannedExpressionKind::Identifier(PlannedIdentifierRead {
+                    resolved_symbol: owner,
+                    value_symbol: owner,
+                    kind: PlannedIdentifierReadKind::DeclaredValue,
+                }),
+            );
+            let plan = finish_direct_source_property_plan(&syntax, receiver).unwrap();
+
+            for _ in 0..2 {
+                assert_eq!(
+                    check_direct_source_property(context.store_mut_for_test(), None, &plan, value,),
+                    Ok(CheckedSourceProperty {
+                        type_: expected,
+                        diagnostic: None,
+                    }),
+                    "source {source}",
+                );
+            }
+            assert_eq!(
+                context
+                    .store()
+                    .symbol_node_links(access)
+                    .and_then(|links| links.resolved_symbol),
+                Some(member),
+            );
+        }
+    }
+
+    #[test]
+    fn class_static_methods_are_exact_member_call_callees() {
+        let parsed = parsed(concat!(
+            "class Base { static ready(): any {} } ",
+            "class Derived extends Base {} ",
+            "const result = Derived.ready();",
+        ));
+        let file = FileId::new(525);
+        let access = property_access(&parsed, file);
+        let call = NodeRef::new(
+            parsed.arena.id(),
+            file,
+            parsed.arena.get(access.node).unwrap().parent.unwrap(),
+        );
+        let (mut context, owner, _, value) = published_class(&parsed, file, "Derived");
+        let method = context
+            .store()
+            .type_payload(value)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.members)
+            .and_then(|members| context.store().symbol_table(members))
+            .and_then(|members| members.get_source("ready"))
+            .unwrap();
+        let method_type = context
+            .store()
+            .value_symbol_links(method)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let syntax =
+            plan_direct_source_property_call_syntax(&parsed.arena, context.store(), access, call)
+                .unwrap();
+        let name = syntax.name_node();
+        let receiver = PlannedExpression::new(
+            syntax.receiver(),
+            PlannedExpressionKind::Identifier(PlannedIdentifierRead {
+                resolved_symbol: owner,
+                value_symbol: owner,
+                kind: PlannedIdentifierReadKind::DeclaredValue,
+            }),
+        );
+        let plan = finish_direct_source_property_plan(&syntax, receiver).unwrap();
+
+        assert!(plan.is_call_callee_for(call, name));
+        assert_eq!(
+            check_direct_source_property(context.store_mut_for_test(), None, &plan, value),
+            Ok(CheckedSourceProperty {
+                type_: method_type,
+                diagnostic: None,
+            }),
+        );
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(access)
+                .and_then(|links| links.resolved_symbol),
+            Some(method),
+        );
+    }
+
+    #[test]
+    fn optional_class_static_properties_include_undefined_without_losing_readonly() {
+        let parsed = parsed(concat!(
+            "class Model { static readonly count?: number; } ",
+            "const result = Model.count;",
+        ));
+        let file = FileId::new(526);
+        let access = property_access(&parsed, file);
+        let (mut context, owner, _, value) = published_class(&parsed, file, "Model");
+        let syntax =
+            plan_direct_source_property_syntax(&parsed.arena, context.store(), access).unwrap();
+        let receiver = PlannedExpression::new(
+            syntax.receiver(),
+            PlannedExpressionKind::Identifier(PlannedIdentifierRead {
+                resolved_symbol: owner,
+                value_symbol: owner,
+                kind: PlannedIdentifierReadKind::DeclaredValue,
+            }),
+        );
+        let plan = finish_direct_source_property_plan(&syntax, receiver).unwrap();
+        let Some(ClassStaticProperty::Present(property)) =
+            resolve_class_static_property(context.store(), &plan, value).unwrap()
+        else {
+            panic!("expected a validated class static property")
+        };
+        assert!(property.optional);
+        assert!(property.readonly);
+
+        let checked =
+            check_direct_source_property(context.store_mut_for_test(), None, &plan, value).unwrap();
+        let TypeData::Union(union) = context.store().type_payload(checked.type_).unwrap().data()
+        else {
+            panic!("strict optional class properties must include undefined")
+        };
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        assert!(union.union.types.contains(&bootstrap.number_type));
+        assert!(union.union.types.contains(&bootstrap.undefined_type));
+    }
+
+    #[test]
+    fn poisoned_class_static_member_cache_fails_before_access_publication() {
+        let parsed = parsed("class Model { static count: number; } const result = Model.count;");
+        let file = FileId::new(527);
+        let access = property_access(&parsed, file);
+        let (mut context, owner, _, value) = published_class(&parsed, file, "Model");
+        let property = context
+            .store()
+            .symbol(owner)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| context.store().symbol_table(exports))
+            .and_then(|exports| exports.get_source("count"))
+            .unwrap();
+        let poison = context.store().intrinsic_bootstrap().unwrap().string_type;
+        assert!(context.store_mut_for_test().set_value_symbol_links(
+            property,
+            ValueSymbolLinks {
+                resolved_type: Some(poison),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        let syntax =
+            plan_direct_source_property_syntax(&parsed.arena, context.store(), access).unwrap();
+        let receiver = PlannedExpression::new(
+            syntax.receiver(),
+            PlannedExpressionKind::Identifier(PlannedIdentifierRead {
+                resolved_symbol: owner,
+                value_symbol: owner,
+                kind: PlannedIdentifierReadKind::DeclaredValue,
+            }),
+        );
+        let plan = finish_direct_source_property_plan(&syntax, receiver).unwrap();
+
+        assert_eq!(
+            check_direct_source_property(context.store_mut_for_test(), None, &plan, value),
+            Err(SourcePropertyError::InvalidCache(access)),
+        );
+        assert!(context.store().type_node_links(access).is_none());
+        assert!(context.store().symbol_node_links(access).is_none());
     }
 
     #[test]

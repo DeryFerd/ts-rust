@@ -26,7 +26,10 @@ use super::{
     SourceLiteralCacheError, SourceSyntaxRole, SymbolNodeLinks, TypeId, TypeNodeLinks,
     UnsupportedSourceSyntax, ValueSymbolLinks,
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
-    formatter::{get_type_names_for_assignability_error, type_to_string},
+    formatter::{
+        CanonicalTypeFormatFlags, get_type_names_for_assignability_error,
+        type_to_string_with_host_and_flags,
+    },
     indexed_access_types::template_pattern_index_matches_name,
     production::CanonicalJsxRuntimeEvidence,
     signatures::SignatureFlags,
@@ -1210,20 +1213,8 @@ fn resolve_namespace_interface(
                     && property.facts == 0 =>
             {
                 let name_node = child_ref(member, property.name);
-                let name_record = host
-                    .node(name_node)
-                    .ok_or(SourceCheckError::Property(name_node))?;
-                let name = match &name_record.data {
-                    NodeData::Identifier(name) if name_record.kind == SyntaxKind::Identifier => {
-                        name.text.as_str()
-                    }
-                    NodeData::StringLiteral(name)
-                        if name_record.kind == SyntaxKind::StringLiteral =>
-                    {
-                        name.text.as_str()
-                    }
-                    _ => return Err(unsupported(name_node, name_record.kind)),
-                };
+                let (name, computed_literal) =
+                    jsx_namespace_property_name(host, member, name_node)?;
                 let property_symbol = host
                     .bound_file(member)
                     .and_then(|bound| bound.symbol(member))
@@ -1234,11 +1225,11 @@ fn resolve_namespace_interface(
                     .symbol(property_symbol)
                     .ok_or(SourceCheckError::Property(member))?;
                 if !property_record.flags().contains(SymbolFlags::PROPERTY)
-                    || property_record.name().as_utf8() != Some(name)
+                    || property_record.name().as_utf8() != Some(name.as_str())
                     || property_record.parent() != Some(symbol)
                     || members
                         .and_then(|members| store.symbol_table(members))
-                        .and_then(|members| members.get_source(name))
+                        .and_then(|members| members.get_source(&name))
                         != Some(property_symbol)
                 {
                     return Err(SourceCheckError::Property(member));
@@ -1249,6 +1240,27 @@ fn resolve_namespace_interface(
                     .ok_or_else(|| unsupported(member, record.kind))?;
                 let type_ = CanonicalTypeQuery::new(store, host, options, diagnostics)?
                     .get_type_from_type_node(annotation)?;
+                if let Some(literal) = computed_literal {
+                    let record = host
+                        .node(literal)
+                        .ok_or(SourceCheckError::Property(literal))?;
+                    let literal_type = match &record.data {
+                        NodeData::StringLiteral(_) | NodeData::NoSubstitutionTemplateLiteral(_) => {
+                            store.regular_string_literal_type(name.clone())?
+                        }
+                        NodeData::NumericLiteral(_) => {
+                            let value = ts_jsnum::from_string(&name);
+                            if value.is_nan() {
+                                return Err(SourceCheckError::Unsupported(
+                                    UnsupportedSourceSyntax::InvalidLiteralSpelling(literal),
+                                ));
+                            }
+                            store.regular_number_literal_type(value)?
+                        }
+                        _ => return Err(unsupported(literal, record.kind)),
+                    };
+                    publish_type_links(store, literal, literal_type)?;
+                }
                 properties.push(JsxNamespaceProperty {
                     symbol: property_symbol,
                     type_,
@@ -1380,6 +1392,64 @@ fn resolve_namespace_interface(
     Ok(type_)
 }
 
+fn jsx_namespace_property_name(
+    host: &DeclaredTypeHost<'_>,
+    member: NodeRef,
+    name: NodeRef,
+) -> Result<(String, Option<NodeRef>), SourceCheckError> {
+    let record = host.node(name).ok_or(SourceCheckError::Property(name))?;
+    if record.parent != Some(member.node) {
+        return Err(SourceCheckError::Property(name));
+    }
+    match &record.data {
+        NodeData::Identifier(identifier) if record.kind == SyntaxKind::Identifier => {
+            Ok((identifier.text.clone(), None))
+        }
+        NodeData::StringLiteral(literal) if record.kind == SyntaxKind::StringLiteral => {
+            Ok((literal.text.clone(), None))
+        }
+        NodeData::ComputedPropertyName(computed)
+            if record.kind == SyntaxKind::ComputedPropertyName && computed.facts == 0 =>
+        {
+            let expression = child_ref(name, computed.expression);
+            let literal_record = host
+                .node(expression)
+                .ok_or(SourceCheckError::Property(expression))?;
+            if literal_record.parent != Some(name.node)
+                || literal_record.flags.0 != 0
+                || literal_record.range.start < record.range.start
+                || literal_record.range.end > record.range.end
+            {
+                return Err(unsupported(name, record.kind));
+            }
+            let text = match &literal_record.data {
+                NodeData::StringLiteral(literal)
+                    if literal.token_flags.0 == 0
+                        && literal_record.kind == SyntaxKind::StringLiteral =>
+                {
+                    literal.text.clone()
+                }
+                NodeData::NumericLiteral(literal)
+                    if literal.token_flags.0 == 0
+                        && literal_record.kind == SyntaxKind::NumericLiteral =>
+                {
+                    literal.text.clone()
+                }
+                NodeData::NoSubstitutionTemplateLiteral(literal)
+                    if literal.token_flags.0 == 0
+                        && literal.template_flags.0 == 0
+                        && literal_record.kind == SyntaxKind::NoSubstitutionTemplateLiteral =>
+                {
+                    literal.text.clone()
+                }
+                _ => return Err(unsupported(expression, literal_record.kind)),
+            };
+            Ok((text, Some(expression)))
+        }
+        _ => Err(unsupported(name, record.kind)),
+    }
+}
+
 fn validate_namespace_interface(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
@@ -1509,7 +1579,13 @@ fn execute_jsx_element(
                     intrinsic.attributes_type,
                     namespace.element_type,
                 )?;
-                publish_type_links(store, tag.node, namespace.any_type)?;
+                publish_intrinsic_tag_links(
+                    store,
+                    arena,
+                    tag,
+                    namespace.any_type,
+                    intrinsic.symbol,
+                )?;
                 publish_symbol_links(store, plan.opening, intrinsic.symbol)?;
                 publish_jsx_links(
                     store,
@@ -1608,10 +1684,10 @@ fn execute_jsx_element(
             };
             check_attribute_assignability(
                 store,
+                (arena, bound),
                 plan.opening,
                 tag,
-                expected_attributes,
-                actual_attributes,
+                (expected_attributes, actual_attributes),
                 &checked,
                 diagnostics,
             )?;
@@ -1663,7 +1739,13 @@ fn check_jsx_closing_tag(
             options,
             diagnostics,
         )?;
-        publish_type_links(store, closing.tag.node, namespace.any_type)?;
+        publish_intrinsic_tag_links(
+            store,
+            arena,
+            &closing.tag,
+            namespace.any_type,
+            intrinsic.symbol,
+        )?;
         publish_symbol_links(store, closing.node, intrinsic.symbol)?;
         return publish_jsx_links(
             store,
@@ -1689,6 +1771,24 @@ fn check_jsx_closing_tag(
     let component_type = jsx_component_value_type(store, arena, bound, symbol, closing.tag.node)?;
     publish_symbol_links(store, closing.tag.node, symbol)?;
     publish_type_links(store, closing.tag.node, component_type)
+}
+
+fn publish_intrinsic_tag_links(
+    store: &mut CanonicalTypeMapperStore,
+    arena: &NodeArena,
+    tag: &JsxTagPlan,
+    type_: TypeId,
+    symbol: SemanticSymbolId,
+) -> Result<(), SourceCheckError> {
+    publish_type_links(store, tag.node, type_)?;
+    publish_symbol_links(store, tag.node, symbol)?;
+    if let Some(NodeData::JsxNamespacedName(name)) =
+        arena.get(tag.node.node).map(|record| &record.data)
+    {
+        publish_type_links(store, child_ref(tag.node, name.namespace), type_)?;
+        publish_type_links(store, child_ref(tag.node, name.name), type_)?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)] // Named and indexed lookup must retain pinned precedence.
@@ -1763,7 +1863,22 @@ fn resolve_intrinsic_tag(
             SourceLiteralCacheError::BootstrapUninitialized,
         ))?
         .string_type;
+    let mut patterned_index = None;
+    let mut string_index = None;
     for index in indexes {
+        let info = store
+            .index_info(index)
+            .ok_or(SourceCheckError::Property(opening))?;
+        if info.key_type() == string_type {
+            string_index.get_or_insert(index);
+        } else if template_pattern_index_matches_name(store, info.key_type(), &tag.name)
+            && patterned_index.replace(index).is_some()
+        {
+            return Err(unsupported(opening, SyntaxKind::IndexSignature));
+        }
+    }
+
+    if let Some(index) = patterned_index.or(string_index) {
         let (key_type, value_type, declaration, existing) = {
             let info = store
                 .index_info(index)
@@ -1775,8 +1890,10 @@ fn resolve_intrinsic_tag(
                 info.index_symbol(),
             )
         };
-        if key_type != string_type {
-            continue;
+        if key_type != string_type
+            && !template_pattern_index_matches_name(store, key_type, &tag.name)
+        {
+            return Err(SourceCheckError::Property(opening));
         }
         let symbol = if let Some(symbol) = existing {
             validate_index_symbol(store, symbol, owner, declaration, value_type, opening)?;
@@ -2635,10 +2752,10 @@ fn validate_attribute_object(
 
 fn check_attribute_assignability(
     store: &mut CanonicalTypeMapperStore,
+    source: (&NodeArena, &BoundFile),
     opening: NodeRef,
     tag: &JsxTagPlan,
-    expected: TypeId,
-    actual: TypeId,
+    (expected, actual): (TypeId, TypeId),
     attributes: &[CheckedJsxAttribute],
     diagnostics: &mut CanonicalCheckerDiagnostics,
 ) -> Result<(), SourceCheckError> {
@@ -2656,6 +2773,7 @@ fn check_attribute_assignability(
     let required = structured.properties.clone().unwrap_or_default();
     let index_infos = structured.index_infos.clone().unwrap_or_default();
     let mut present = HashSet::with_capacity(attributes.len());
+    let mut has_excess_attribute = false;
     for attribute in attributes {
         present.insert(attribute.plan.name.as_str());
         let expected_property = expected_members
@@ -2673,7 +2791,14 @@ fn check_attribute_assignability(
         } else if attribute.plan.name.contains('-') {
             continue;
         } else {
-            let target = type_to_string(store, expected)?;
+            has_excess_attribute = true;
+            let host = DeclaredTypeHost::new([source]).map_err(super::DeclaredTypeError::from)?;
+            let target = type_to_string_with_host_and_flags(
+                store,
+                &host,
+                expected,
+                CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+            )?;
             let detail = Diagnostic::with_arguments(
                 message_by_code(2339).ok_or(SourceCheckError::MissingDiagnostic(2339))?,
                 [attribute.plan.name.as_str(), target.as_str()],
@@ -2682,13 +2807,13 @@ fn check_attribute_assignability(
             .map_err(|_| SourceCheckError::MissingDiagnostic(2339))?;
             let diagnostic = Diagnostic::with_arguments(
                 message_by_code(2322).ok_or(SourceCheckError::MissingDiagnostic(2322))?,
-                [format_attribute_object(attributes), target],
+                [format_attribute_object(store, &host, attributes)?, target],
             )
             .with_details([format!("  {detail}")]);
             merge_retry_diagnostic(
                 diagnostics,
                 CanonicalCheckerDiagnostic {
-                    node: Some(tag.node),
+                    node: Some(attribute.plan.name_node),
                     range_override: None,
                     diagnostic,
                     related_information: Vec::new(),
@@ -2708,25 +2833,30 @@ fn check_attribute_assignability(
         }
     }
 
-    for property in required {
-        let record = store
-            .symbol(property)
-            .ok_or(SourceCheckError::Property(opening))?;
-        if record.flags().contains(SymbolFlags::OPTIONAL) {
-            continue;
-        }
-        let name = record
-            .name()
-            .as_utf8()
-            .ok_or(SourceCheckError::Property(opening))?;
-        if !present.contains(name) {
-            let source = if attributes.is_empty() {
-                "{}".to_owned()
-            } else {
-                format_attribute_object(attributes)
-            };
-            let target = type_to_string(store, expected)?;
-            add_diagnostic(diagnostics, tag.node, 2741, [name, &source, &target])?;
+    if !has_excess_attribute {
+        for property in required {
+            let record = store
+                .symbol(property)
+                .ok_or(SourceCheckError::Property(opening))?;
+            if record.flags().contains(SymbolFlags::OPTIONAL) {
+                continue;
+            }
+            let name = record
+                .name()
+                .as_utf8()
+                .ok_or(SourceCheckError::Property(opening))?;
+            if !present.contains(name) {
+                let host =
+                    DeclaredTypeHost::new([source]).map_err(super::DeclaredTypeError::from)?;
+                let source = format_attribute_object(store, &host, attributes)?;
+                let target = type_to_string_with_host_and_flags(
+                    store,
+                    &host,
+                    expected,
+                    CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+                )?;
+                add_diagnostic(diagnostics, tag.node, 2741, [name, &source, &target])?;
+            }
         }
     }
 
@@ -2762,16 +2892,35 @@ fn matching_attribute_index_value_type(
     Ok(string_index)
 }
 
-fn format_attribute_object(attributes: &[CheckedJsxAttribute]) -> String {
+fn format_attribute_object(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    attributes: &[CheckedJsxAttribute],
+) -> Result<String, SourceCheckError> {
     if attributes.is_empty() {
-        return "{}".to_owned();
+        return Ok("{}".to_owned());
     }
     let names = attributes
         .iter()
-        .map(|attribute| format!("{}: unknown;", attribute.plan.name))
-        .collect::<Vec<_>>()
+        .map(|attribute| -> Result<String, SourceCheckError> {
+            let name = if attribute.plan.name.contains(':') {
+                format!("\"{}\"", attribute.plan.name)
+            } else {
+                attribute.plan.name.clone()
+            };
+            Ok(format!(
+                "{name}: {};",
+                type_to_string_with_host_and_flags(
+                    store,
+                    host,
+                    attribute.type_,
+                    CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+                )?
+            ))
+        })
+        .collect::<Result<Vec<_>, _>>()?
         .join(" ");
-    format!("{{ {names} }}")
+    Ok(format!("{{ {names} }}"))
 }
 
 fn emit_intrinsic_type_argument_diagnostic(
@@ -2951,7 +3100,9 @@ mod runtime_tests {
     use ts_parser::{ParseResult, parse_jsx_source_file};
 
     use super::*;
-    use crate::semantic::{IntrinsicBootstrapOptions, production::CanonicalJsxRuntime};
+    use crate::semantic::{
+        IntrinsicBootstrapOptions, formatter::type_to_string, production::CanonicalJsxRuntime,
+    };
 
     struct RuntimeFixture {
         parsed: ParseResult,
@@ -3448,6 +3599,533 @@ mod runtime_tests {
         .unwrap();
 
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Validate computed keys and all intrinsic symbol locations.
+    fn computed_intrinsic_names_keep_literal_types_and_opening_closing_symbols() {
+        let mut fixture = RuntimeFixture::new(
+            concat!(
+                "declare var React: any;\n",
+                "declare namespace JSX {\n",
+                "  interface IntrinsicElements {\n",
+                "    [\"package\"]: any;\n",
+                "    [7]: any;\n",
+                "    [`widget`]: any;\n",
+                "  }\n",
+                "}\n",
+                "const first = <package />;\n",
+                "const second = <package></package>;\n",
+                "const third = <widget />;\n",
+            ),
+            FileId::new(8_125),
+        );
+        let namespace = fixture
+            .bound
+            .locals(fixture.bound.source_file())
+            .and_then(|locals| fixture.store.symbol_table(locals))
+            .and_then(|locals| locals.get_source("JSX"))
+            .unwrap();
+        let globals = fixture.store.intrinsic_bootstrap().unwrap().globals;
+        assert_eq!(
+            fixture
+                .store
+                .insert_symbol(globals, EscapedName::source("JSX"), namespace),
+            Some(None),
+        );
+        let first = fixture.expression("first");
+        let second = fixture.expression("second");
+        let third = fixture.expression("third");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        for expression in [first, second, third] {
+            fixture.check(expression, CanonicalJsxRuntime::Classic, &mut diagnostics);
+        }
+
+        assert!(diagnostics.is_empty());
+        let exports = fixture.store.symbol(namespace).unwrap().exports().unwrap();
+        let intrinsics = fixture
+            .store
+            .symbol_table(exports)
+            .and_then(|exports| exports.get_source("IntrinsicElements"))
+            .unwrap();
+        let members = fixture.store.symbol(intrinsics).unwrap().members().unwrap();
+        let package = fixture
+            .store
+            .symbol_table(members)
+            .and_then(|members| members.get_source("package"))
+            .unwrap();
+        let widget = fixture
+            .store
+            .symbol_table(members)
+            .and_then(|members| members.get_source("widget"))
+            .unwrap();
+
+        for (expression, expected) in [(first, package), (third, widget)] {
+            let NodeData::JsxSelfClosingElement(element) =
+                &fixture.parsed.arena.get(expression.node).unwrap().data
+            else {
+                unreachable!("the fixture contains a self-closing intrinsic")
+            };
+            let name = child_ref(expression, element.tag_name);
+            assert_eq!(
+                fixture
+                    .store
+                    .symbol_node_links(expression)
+                    .and_then(|links| links.resolved_symbol),
+                Some(expected),
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .symbol_node_links(name)
+                    .and_then(|links| links.resolved_symbol),
+                Some(expected),
+            );
+        }
+
+        let NodeData::JsxElement(paired) = &fixture.parsed.arena.get(second.node).unwrap().data
+        else {
+            unreachable!("the fixture contains a paired intrinsic")
+        };
+        let opening = child_ref(second, paired.opening_element);
+        let closing = child_ref(second, paired.closing_element);
+        let NodeData::JsxOpeningElement(opening_data) =
+            &fixture.parsed.arena.get(opening.node).unwrap().data
+        else {
+            unreachable!("the paired intrinsic has an opening tag")
+        };
+        let NodeData::JsxClosingElement(closing_data) =
+            &fixture.parsed.arena.get(closing.node).unwrap().data
+        else {
+            unreachable!("the paired intrinsic has a closing tag")
+        };
+        for node in [
+            opening,
+            child_ref(opening, opening_data.tag_name),
+            closing,
+            child_ref(closing, closing_data.tag_name),
+        ] {
+            assert_eq!(
+                fixture
+                    .store
+                    .symbol_node_links(node)
+                    .and_then(|links| links.resolved_symbol),
+                Some(package),
+            );
+        }
+
+        let mut literals = Vec::new();
+        for (_, record) in fixture.parsed.arena.iter() {
+            let NodeData::ComputedPropertyName(computed) = &record.data else {
+                continue;
+            };
+            let literal =
+                NodeRef::new(fixture.parsed.arena.id(), fixture.file, computed.expression);
+            let type_ = fixture
+                .store
+                .type_node_links(literal)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            literals.push(type_to_string(&fixture.store, type_).unwrap());
+        }
+        assert_eq!(literals, ["\"package\"", "7", "\"widget\""]);
+
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.symbol_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+            diagnostics.as_slice().to_vec(),
+        );
+        for expression in [first, second, third] {
+            fixture.check(expression, CanonicalJsxRuntime::Classic, &mut diagnostics);
+        }
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+                diagnostics.as_slice().to_vec(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn dynamic_computed_intrinsic_names_remain_a_typed_boundary() {
+        let mut fixture = RuntimeFixture::new(
+            concat!(
+                "declare const key: string;\n",
+                "declare namespace JSX {\n",
+                "  interface IntrinsicElements { [key]: any; }\n",
+                "}\n",
+                "const view = <div />;\n",
+            ),
+            FileId::new(8_126),
+        );
+        let namespace = fixture
+            .bound
+            .locals(fixture.bound.source_file())
+            .and_then(|locals| fixture.store.symbol_table(locals))
+            .and_then(|locals| locals.get_source("JSX"))
+            .unwrap();
+        let globals = fixture.store.intrinsic_bootstrap().unwrap().globals;
+        assert_eq!(
+            fixture
+                .store
+                .insert_symbol(globals, EscapedName::source("JSX"), namespace),
+            Some(None),
+        );
+        let expression = fixture.expression("view");
+        let host = DeclaredTypeHost::new([(&fixture.parsed.arena, &fixture.bound)]).unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let error = fixture
+            .store
+            .check_jsx_element(
+                &host,
+                expression,
+                CanonicalCheckerOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SourceCheckError::Unsupported(UnsupportedSourceSyntax::Syntax {
+                kind: SyntaxKind::Identifier,
+                ..
+            })
+        ));
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn namespaced_intrinsic_tags_publish_identifier_types_and_replay_warm() {
+        let mut fixture = RuntimeFixture::new(
+            concat!(
+                "declare namespace JSX {\n",
+                "  interface IntrinsicElements { \"NS:Widget\": any; }\n",
+                "}\n",
+                "const first = <NS:Widget />;\n",
+                "const second = <NS:Widget></NS:Widget>;\n",
+            ),
+            FileId::new(8_127),
+        );
+        let namespace = fixture
+            .bound
+            .locals(fixture.bound.source_file())
+            .and_then(|locals| fixture.store.symbol_table(locals))
+            .and_then(|locals| locals.get_source("JSX"))
+            .unwrap();
+        let globals = fixture.store.intrinsic_bootstrap().unwrap().globals;
+        assert_eq!(
+            fixture
+                .store
+                .insert_symbol(globals, EscapedName::source("JSX"), namespace),
+            Some(None),
+        );
+        let first = fixture.expression("first");
+        let second = fixture.expression("second");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        for expression in [first, second] {
+            fixture.check(expression, CanonicalJsxRuntime::Preserve, &mut diagnostics);
+        }
+
+        assert!(diagnostics.is_empty());
+        let exports = fixture.store.symbol(namespace).unwrap().exports().unwrap();
+        let intrinsics = fixture
+            .store
+            .symbol_table(exports)
+            .and_then(|exports| exports.get_source("IntrinsicElements"))
+            .unwrap();
+        let members = fixture.store.symbol(intrinsics).unwrap().members().unwrap();
+        let expected = fixture
+            .store
+            .symbol_table(members)
+            .and_then(|members| members.get_source("NS:Widget"))
+            .unwrap();
+        let any = fixture.store.intrinsic_bootstrap().unwrap().any_type;
+        let mut namespaced_count = 0;
+        for (node, record) in fixture.parsed.arena.iter() {
+            let NodeData::JsxNamespacedName(name) = &record.data else {
+                continue;
+            };
+            namespaced_count += 1;
+            let tag = NodeRef::new(fixture.parsed.arena.id(), fixture.file, node);
+            assert_eq!(
+                fixture
+                    .store
+                    .symbol_node_links(tag)
+                    .and_then(|links| links.resolved_symbol),
+                Some(expected),
+            );
+            for identifier in [name.namespace, name.name] {
+                let identifier = child_ref(tag, identifier);
+                assert_eq!(
+                    fixture
+                        .store
+                        .type_node_links(identifier)
+                        .and_then(|links| links.resolved_type),
+                    Some(any),
+                );
+                assert!(fixture.store.symbol_node_links(identifier).is_none());
+            }
+        }
+        assert_eq!(namespaced_count, 3);
+
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.symbol_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        for expression in [first, second] {
+            fixture.check(expression, CanonicalJsxRuntime::Preserve, &mut diagnostics);
+        }
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn patterned_intrinsic_indexes_take_precedence_and_replay_warm() {
+        let mut fixture = RuntimeFixture::new(
+            concat!(
+                "declare namespace JSX {\n",
+                "  interface IntrinsicElements {\n",
+                "    [tag: string]: any;\n",
+                "    [tag: `custom-${string}`]: { label: string };\n",
+                "  }\n",
+                "}\n",
+                "const patterned = <custom-panel label=\"ready\" />;\n",
+                "const fallback = <plain-panel optional={1} />;\n",
+                "const mismatch = <custom-panel label={1} />;\n",
+            ),
+            FileId::new(8_128),
+        );
+        let namespace = fixture
+            .bound
+            .locals(fixture.bound.source_file())
+            .and_then(|locals| fixture.store.symbol_table(locals))
+            .and_then(|locals| locals.get_source("JSX"))
+            .unwrap();
+        let globals = fixture.store.intrinsic_bootstrap().unwrap().globals;
+        assert_eq!(
+            fixture
+                .store
+                .insert_symbol(globals, EscapedName::source("JSX"), namespace),
+            Some(None),
+        );
+        let patterned = fixture.expression("patterned");
+        let fallback = fixture.expression("fallback");
+        let mismatch = fixture.expression("mismatch");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        for expression in [patterned, fallback, mismatch] {
+            fixture.check(expression, CanonicalJsxRuntime::Preserve, &mut diagnostics);
+        }
+
+        let pattern_symbol = fixture
+            .store
+            .symbol_node_links(patterned)
+            .and_then(|links| links.resolved_symbol)
+            .unwrap();
+        let fallback_symbol = fixture
+            .store
+            .symbol_node_links(fallback)
+            .and_then(|links| links.resolved_symbol)
+            .unwrap();
+        assert_ne!(pattern_symbol, fallback_symbol);
+        assert_eq!(
+            fixture
+                .store
+                .symbol_node_links(mismatch)
+                .and_then(|links| links.resolved_symbol),
+            Some(pattern_symbol),
+        );
+        for expression in [patterned, fallback, mismatch] {
+            assert_eq!(
+                fixture
+                    .store
+                    .jsx_element_links(expression)
+                    .unwrap()
+                    .jsx_flags,
+                JsxFlags::INTRINSIC_INDEXED_ELEMENT,
+            );
+        }
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics.as_slice()[0].diagnostic.code(), 2322);
+        assert_eq!(
+            diagnostics.as_slice()[0].diagnostic.render().unwrap(),
+            "Type 'number' is not assignable to type 'string'.",
+        );
+
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.symbol_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+            diagnostics.as_slice().to_vec(),
+        );
+        for expression in [patterned, fallback, mismatch] {
+            fixture.check(expression, CanonicalJsxRuntime::Preserve, &mut diagnostics);
+        }
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+                diagnostics.as_slice().to_vec(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn unmatched_intrinsic_patterns_keep_the_exact_opening_diagnostic() {
+        let mut fixture = RuntimeFixture::new(
+            concat!(
+                "declare namespace JSX {\n",
+                "  interface IntrinsicElements { [tag: `custom-${string}`]: any; }\n",
+                "}\n",
+                "const view = <plain-panel />;\n",
+            ),
+            FileId::new(8_129),
+        );
+        let namespace = fixture
+            .bound
+            .locals(fixture.bound.source_file())
+            .and_then(|locals| fixture.store.symbol_table(locals))
+            .and_then(|locals| locals.get_source("JSX"))
+            .unwrap();
+        let globals = fixture.store.intrinsic_bootstrap().unwrap().globals;
+        assert_eq!(
+            fixture
+                .store
+                .insert_symbol(globals, EscapedName::source("JSX"), namespace),
+            Some(None),
+        );
+        let opening = fixture.expression("view");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        fixture.check(opening, CanonicalJsxRuntime::Preserve, &mut diagnostics);
+
+        assert_eq!(diagnostics.len(), 1);
+        let diagnostic = &diagnostics.as_slice()[0];
+        assert_eq!(diagnostic.node, Some(opening));
+        assert_eq!(diagnostic.diagnostic.code(), 2339);
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "Property 'plain-panel' does not exist on type 'JSX.IntrinsicElements'.",
+        );
+    }
+
+    #[test]
+    fn excess_jsx_attributes_report_exact_names_without_missing_property_duplicates() {
+        let mut fixture = RuntimeFixture::new(
+            concat!(
+                "declare namespace JSX {\n",
+                "  interface IntrinsicElements { div: { label: string }; }\n",
+                "}\n",
+                "const first = <div extra=\"bad\" />;\n",
+                "const second = <div ns:invalid=\"bad\" />;\n",
+                "const missing = <div />;\n",
+            ),
+            FileId::new(8_130),
+        );
+        let namespace = fixture
+            .bound
+            .locals(fixture.bound.source_file())
+            .and_then(|locals| fixture.store.symbol_table(locals))
+            .and_then(|locals| locals.get_source("JSX"))
+            .unwrap();
+        let globals = fixture.store.intrinsic_bootstrap().unwrap().globals;
+        assert_eq!(
+            fixture
+                .store
+                .insert_symbol(globals, EscapedName::source("JSX"), namespace),
+            Some(None),
+        );
+        let first = fixture.expression("first");
+        let second = fixture.expression("second");
+        let missing = fixture.expression("missing");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        for expression in [first, second, missing] {
+            fixture.check(expression, CanonicalJsxRuntime::Preserve, &mut diagnostics);
+        }
+
+        assert_eq!(diagnostics.len(), 3);
+        for (diagnostic, (expected_name, expected_source)) in
+            diagnostics.as_slice().iter().take(2).zip([
+                ("extra", "{ extra: string; }"),
+                ("ns:invalid", "{ \"ns:invalid\": string; }"),
+            ])
+        {
+            assert_eq!(diagnostic.diagnostic.code(), 2322);
+            let anchor = diagnostic.node.unwrap();
+            let record = fixture.parsed.arena.get(anchor.node).unwrap();
+            let actual_name = match &record.data {
+                NodeData::Identifier(name) => name.text.clone(),
+                NodeData::JsxNamespacedName(name) => {
+                    let NodeData::Identifier(namespace) =
+                        &fixture.parsed.arena.get(name.namespace).unwrap().data
+                    else {
+                        unreachable!("the fixture uses an identifier namespace")
+                    };
+                    let NodeData::Identifier(local) =
+                        &fixture.parsed.arena.get(name.name).unwrap().data
+                    else {
+                        unreachable!("the fixture uses an identifier local name")
+                    };
+                    format!("{}:{}", namespace.text, local.text)
+                }
+                _ => unreachable!("the diagnostic is anchored to a JSX attribute name"),
+            };
+            assert_eq!(actual_name, expected_name);
+            assert_eq!(
+                diagnostic.diagnostic.render().unwrap(),
+                format!(
+                    "Type '{expected_source}' is not assignable to type '{{ label: string; }}'.\n  \
+                     Property '{expected_name}' does not exist on type '{{ label: string; }}'.",
+                ),
+            );
+        }
+
+        let required = &diagnostics.as_slice()[2];
+        assert_eq!(required.diagnostic.code(), 2741);
+        assert_eq!(
+            required.diagnostic.render().unwrap(),
+            "Property 'label' is missing in type '{}' but required in type '{ label: string; }'.",
+        );
+        let NodeData::Identifier(name) = &fixture
+            .parsed
+            .arena
+            .get(required.node.unwrap().node)
+            .unwrap()
+            .data
+        else {
+            unreachable!("the missing property diagnostic is anchored to the JSX tag")
+        };
+        assert_eq!(name.text, "div");
+
+        let warm = diagnostics.as_slice().to_vec();
+        for expression in [first, second, missing] {
+            fixture.check(expression, CanonicalJsxRuntime::Preserve, &mut diagnostics);
+        }
+        assert_eq!(diagnostics.as_slice(), warm.as_slice());
     }
 
     #[test]

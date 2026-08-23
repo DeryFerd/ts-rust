@@ -1422,6 +1422,18 @@ mod tests {
     }
 
     #[test]
+    fn switch_clause_flow_remains_explicitly_unsupported() {
+        let flow = flow();
+        let flags = FlowFlags::SWITCH_CLAUSE | FlowFlags::REFERENCED;
+        assert_eq!(
+            source_flow_kind(flow, flags),
+            Err(SourceFlowError::Unsupported(
+                SourceFlowUnsupported::FlowKind { flow, flags }
+            )),
+        );
+    }
+
+    #[test]
     fn start_validation_preserves_the_exact_preflight_payload_shape() {
         let arena = NodeArena::default();
         let file = FileId::new(7);

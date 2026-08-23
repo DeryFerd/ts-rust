@@ -5,7 +5,7 @@ use ts_binder::{
 };
 use ts_checker::semantic::{
     CanonicalCheckerContext, CanonicalCheckerOptions, CanonicalEnumMemberValue, SourceCheckError,
-    SymbolNodeLinks, TypeNodeLinks, UnsupportedSourceSyntax, ValueSymbolLinks,
+    SymbolNodeLinks, TypeNodeLinks, ValueSymbolLinks,
 };
 use ts_jsnum::Number;
 use ts_parser::{ParseResult, parse_source_file};
@@ -420,7 +420,7 @@ fn ambient_variables_can_name_enums_with_constant_member_expressions() {
 }
 
 #[test]
-fn later_missing_ambient_annotation_is_typed_atomic_and_repeatable() {
+fn later_missing_ambient_annotation_uses_any_and_replays_warm() {
     let parsed = parse_source_file(concat!(
         "const early = 1;\n",
         "declare const valid: number;\n",
@@ -430,39 +430,55 @@ fn later_missing_ambient_annotation_is_typed_atomic_and_repeatable() {
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
     let file = FileId::new(2_103);
     let mut context = checker_context(&parsed, file, false, CanonicalModuleState::Script);
-    let missing = variable_declaration(&parsed, file, "missing");
+    let missing = variable_symbol(&parsed, file, &context, "missing");
     let early = variable_symbol(&parsed, file, &context, "early");
     let valid = variable_symbol(&parsed, file, &context, "valid");
     let read_owner = variable_symbol(&parsed, file, &context, "read");
     let read = variable_initializer(&parsed, file, "read");
-    let before = (
+
+    context.check_source_file(file).unwrap();
+
+    let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+    assert_eq!(
+        context
+            .store()
+            .value_symbol_links(missing)
+            .and_then(|links| links.resolved_type),
+        Some(bootstrap.any_type),
+    );
+    assert_eq!(
+        context
+            .store()
+            .value_symbol_links(valid)
+            .and_then(|links| links.resolved_type),
+        Some(bootstrap.number_type),
+    );
+    for symbol in [early, read_owner] {
+        assert!(context.store().value_symbol_links(symbol).is_some());
+    }
+    assert!(context.store().symbol_node_links(read).is_some());
+    assert!(context.store().type_node_links(read).is_some());
+    assert!(context.diagnostics().is_empty());
+    assert!(is_type_checked(&context, file));
+
+    let warm = (
         context.store().type_len(),
         context.store().mapper_len(),
         context.store().signature_len(),
         context.store().relation_state_snapshot(),
+        context.diagnostics().clone(),
     );
-    let expected =
-        SourceCheckError::Unsupported(UnsupportedSourceSyntax::MissingVariableType(missing));
-
-    for _ in 0..2 {
-        assert_eq!(context.check_source_file(file), Err(expected));
-        assert_eq!(
-            (
-                context.store().type_len(),
-                context.store().mapper_len(),
-                context.store().signature_len(),
-                context.store().relation_state_snapshot(),
-            ),
-            before
-        );
-        for symbol in [early, valid, read_owner] {
-            assert!(context.store().value_symbol_links(symbol).is_none());
-        }
-        assert!(context.store().symbol_node_links(read).is_none());
-        assert!(context.store().type_node_links(read).is_none());
-        assert!(context.diagnostics().is_empty());
-        assert!(!is_type_checked(&context, file));
-    }
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().mapper_len(),
+            context.store().signature_len(),
+            context.store().relation_state_snapshot(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
 }
 
 #[test]

@@ -2,10 +2,10 @@
 //!
 //! This module owns the exact syntax-to-member-table boundary.  It deliberately
 //! does not recurse through property annotations: [`super::type_nodes`] plans
-//! and executes property, index, and call-signature annotations so one query
-//! retains a single dependency graph and resolution stack. Declared call sets
-//! are limited to pure nongeneric, fixed-arity call-signature members; mixed
-//! and optional/rest/construct forms remain explicit boundaries.
+//! and executes property, index, and signature annotations so one query
+//! retains a single dependency graph and resolution stack. Declared signature
+//! sets are limited to pure nongeneric, fixed-arity call or construct members;
+//! mixed and optional/rest forms remain explicit boundaries.
 
 use std::collections::{HashMap, HashSet};
 
@@ -92,7 +92,7 @@ pub(super) struct PlannedCallParameter {
     null_literal_identity: bool,
 }
 
-/// One nongeneric, fixed-arity call signature in source declaration order.
+/// One nongeneric, fixed-arity call or construct signature in source order.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct PlannedCallSignature {
     pub declaration: NodeRef,
@@ -102,6 +102,28 @@ pub(super) struct PlannedCallSignature {
     return_identity_node: NodeRef,
     return_null_literal_identity: bool,
     flags: SignatureFlags,
+}
+
+impl PlannedCallSignature {
+    const fn is_construct(&self) -> bool {
+        self.flags.contains(SignatureFlags::CONSTRUCT)
+    }
+
+    const fn syntax_kind(&self) -> SyntaxKind {
+        if self.is_construct() {
+            SyntaxKind::ConstructSignature
+        } else {
+            SyntaxKind::CallSignature
+        }
+    }
+
+    const fn internal_name(&self) -> InternalSymbolName {
+        if self.is_construct() {
+            InternalSymbolName::New
+        } else {
+            InternalSymbolName::Call
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -289,10 +311,36 @@ pub(super) fn validate_stored_declared_call_set(
                 && interface.resolved_base_constructor_type.is_none()
                 && interface.resolved_base_types.is_none()
                 && interface.declared_members_resolved
-                && interface.declared_construct_signatures.is_none()
                 && interface.declared_index_infos.is_none()
-                && interface.declared_call_signatures.as_deref()
-                    == interface.reference.object.structured.signatures.as_deref();
+                && match (
+                    interface.declared_call_signatures.as_deref(),
+                    interface.declared_construct_signatures.as_deref(),
+                ) {
+                    (Some(calls), None) => {
+                        calls
+                            == interface
+                                .reference
+                                .object
+                                .structured
+                                .signatures
+                                .as_deref()
+                                .unwrap_or_default()
+                            && interface.reference.object.structured.call_signature_count
+                                == calls.len()
+                    }
+                    (None, Some(constructs)) => {
+                        constructs
+                            == interface
+                                .reference
+                                .object
+                                .structured
+                                .signatures
+                                .as_deref()
+                                .unwrap_or_default()
+                            && interface.reference.object.structured.call_signature_count == 0
+                    }
+                    _ => false,
+                };
             (
                 *declaration,
                 &interface.reference.object.structured,
@@ -305,12 +353,13 @@ pub(super) fn validate_stored_declared_call_set(
     let Some(signatures) = structured.signatures.as_deref() else {
         return StoredDeclaredCallSetValidation::Malformed;
     };
+    let constructs = structured.call_signature_count == 0;
     if !exact_owner
         || signatures.is_empty()
         || structured.constrained != ConstrainedTypeData::default()
         || structured.members != members
         || structured.properties.is_some()
-        || structured.call_signature_count != signatures.len()
+        || !constructs && structured.call_signature_count != signatures.len()
         || structured.index_infos.is_some()
         || structured
             .object_type_without_abstract_construct_signatures
@@ -321,10 +370,12 @@ pub(super) fn validate_stored_declared_call_set(
     let Some(members) = members.and_then(|members| store.symbol_table(members)) else {
         return StoredDeclaredCallSetValidation::Malformed;
     };
-    let Some(call_symbol) = members
-        .get(InternalSymbolName::Call.as_ref())
-        .filter(|_| members.len() == 1)
-    else {
+    let name = if constructs {
+        InternalSymbolName::New
+    } else {
+        InternalSymbolName::Call
+    };
+    let Some(call_symbol) = members.get(name.as_ref()).filter(|_| members.len() == 1) else {
         return StoredDeclaredCallSetValidation::Malformed;
     };
     let Some(call_record) = store.symbol(call_symbol) else {
@@ -337,7 +388,7 @@ pub(super) fn validate_stored_declared_call_set(
     if declarations.len() != signatures.len()
         || call_record.flags() != SymbolFlags::SIGNATURE
         || call_record.check_flags() != CheckFlags::NONE
-        || call_record.name() != InternalSymbolName::Call.as_ref()
+        || call_record.name() != name.as_ref()
         || call_record.declarations() != Some(declarations.as_slice())
         || call_record.value_declaration().is_some()
         || call_record.members().is_some()
@@ -369,7 +420,12 @@ pub(super) fn validate_stored_declared_call_set(
         let minimum = usize::try_from(signature_record.min_argument_count()).ok();
         if !seen_signatures.insert(signature)
             || store.declared_call_set_type_for_signature(signature) != Some(type_)
-            || store.source_node_kind(declaration) != Some(SyntaxKind::CallSignature)
+            || store.source_node_kind(declaration)
+                != Some(if constructs {
+                    SyntaxKind::ConstructSignature
+                } else {
+                    SyntaxKind::CallSignature
+                })
             || store.source_node_parent(declaration)
                 != Some(SourceNodeParent::Parent(owner_declaration))
             || store.signature_links(declaration)
@@ -377,7 +433,10 @@ pub(super) fn validate_stored_declared_call_set(
                     resolved_signature: ResolvedSignatureState::Resolved(signature),
                     ..SignatureLinks::default()
                 })
-            || signature_record.flags().bits() & !SignatureFlags::HAS_LITERAL_TYPES.bits() != 0
+            || signature_record.flags().contains(SignatureFlags::CONSTRUCT) != constructs
+            || signature_record.flags().bits()
+                & !(SignatureFlags::HAS_LITERAL_TYPES | SignatureFlags::CONSTRUCT).bits()
+                != 0
             || signature_record.resolved_min_argument_count() != -1
             || minimum != Some(signature_record.parameters().len())
             || !signature_record.type_parameters().is_empty()
@@ -388,8 +447,12 @@ pub(super) fn validate_stored_declared_call_set(
             || signature_record.isolated_signature_type().is_some()
             || signature_record.composite().is_some()
             || store.signature_has_circular_return_type(signature)
-            || cached_annotation_identity(store, return_annotation, null_literal_identity)
-                != Some(return_type)
+            || !valid_signature_return_annotation(
+                store,
+                return_annotation,
+                null_literal_identity,
+                return_type,
+            )
             || parameter_types.len() != signature_record.parameters().len()
         {
             return StoredDeclaredCallSetValidation::Malformed;
@@ -892,13 +955,13 @@ pub(super) fn plan_interface(
         if let Some(call) = base_plan.call_signatures.first() {
             return Err(PropertyObjectError::UnsupportedMember {
                 node: call.declaration,
-                kind: SyntaxKind::CallSignature,
+                kind: call.syntax_kind(),
             });
         }
         if let Some(call) = plan.call_signatures.first() {
             return Err(PropertyObjectError::UnsupportedMember {
                 node: call.declaration,
-                kind: SyntaxKind::CallSignature,
+                kind: call.syntax_kind(),
             });
         }
         if !value_declarations.is_empty() {
@@ -1110,7 +1173,7 @@ pub(super) fn plan_generic_interface(
     if let Some(call) = plan.call_signatures.first() {
         return Err(PropertyObjectError::UnsupportedMember {
             node: call.declaration,
-            kind: SyntaxKind::CallSignature,
+            kind: call.syntax_kind(),
         });
     }
     if raw_table.len() != parameter_symbols.as_ref().map_or(0, Vec::len) + plan.properties.len() {
@@ -1475,6 +1538,7 @@ fn plan_members(
                     | SyntaxKind::PropertySignature
                     | SyntaxKind::IndexSignature
                     | SyntaxKind::CallSignature
+                    | SyntaxKind::ConstructSignature
             ),
             PropertyObjectKind::Interface => matches!(
                 member_record.kind,
@@ -1482,6 +1546,7 @@ fn plan_members(
                     | SyntaxKind::PropertySignature
                     | SyntaxKind::IndexSignature
                     | SyntaxKind::CallSignature
+                    | SyntaxKind::ConstructSignature
             ),
         };
         if !admitted_kind {
@@ -1490,14 +1555,23 @@ fn plan_members(
                 kind: member_record.kind,
             });
         }
-        if member_record.kind == SyntaxKind::CallSignature {
-            call_signatures.push(plan_call_signature(
-                store,
-                host,
-                member_owner,
-                symbol,
-                member,
-            )?);
+        if matches!(
+            member_record.kind,
+            SyntaxKind::CallSignature | SyntaxKind::ConstructSignature
+        ) {
+            let signature = plan_call_signature(store, host, member_owner, symbol, member)?;
+            if call_signatures
+                .first()
+                .is_some_and(|previous: &PlannedCallSignature| {
+                    previous.is_construct() != signature.is_construct()
+                })
+            {
+                return Err(PropertyObjectError::UnsupportedMember {
+                    node: member,
+                    kind: member_record.kind,
+                });
+            }
+            call_signatures.push(signature);
             continue;
         }
 
@@ -1832,9 +1906,22 @@ fn plan_members(
             }
             || match call_signatures.first() {
                 Some(signature) => {
-                    table.get(InternalSymbolName::Call.as_ref()) != Some(signature.symbol)
+                    table.get(signature.internal_name().as_ref()) != Some(signature.symbol)
+                        || table
+                            .get(
+                                if signature.is_construct() {
+                                    InternalSymbolName::Call
+                                } else {
+                                    InternalSymbolName::New
+                                }
+                                .as_ref(),
+                            )
+                            .is_some()
                 }
-                None => table.get(InternalSymbolName::Call.as_ref()).is_some(),
+                None => {
+                    table.get(InternalSymbolName::Call.as_ref()).is_some()
+                        || table.get(InternalSymbolName::New.as_ref()).is_some()
+                }
             }
     }) {
         return Err(invalid_plan(&provisional));
@@ -1871,7 +1958,7 @@ fn plan_members(
     if !call_signatures.is_empty() && (!properties.is_empty() || !indexes.is_empty()) {
         return Err(PropertyObjectError::UnsupportedMember {
             node: call_signatures[0].declaration,
-            kind: SyntaxKind::CallSignature,
+            kind: call_signatures[0].syntax_kind(),
         });
     }
     if let Some(call) = call_signatures.first() {
@@ -1882,10 +1969,9 @@ fn plan_members(
         let Some(record) = store.symbol(call.symbol) else {
             return Err(invalid_plan(&provisional));
         };
-        if call_signatures
-            .iter()
-            .any(|signature| signature.symbol != call.symbol)
-            || record.declarations() != Some(declarations.as_slice())
+        if call_signatures.iter().any(|signature| {
+            signature.symbol != call.symbol || signature.is_construct() != call.is_construct()
+        }) || record.declarations() != Some(declarations.as_slice())
         {
             return Err(invalid_plan(&provisional));
         }
@@ -1943,34 +2029,62 @@ fn plan_call_signature(
     owner_symbol: SemanticSymbolId,
     declaration: NodeRef,
 ) -> Result<PlannedCallSignature, PropertyObjectError> {
+    let syntax_kind = store
+        .source_node_kind(declaration)
+        .unwrap_or(SyntaxKind::CallSignature);
     let unsupported = || PropertyObjectError::UnsupportedMember {
         node: declaration,
-        kind: SyntaxKind::CallSignature,
+        kind: syntax_kind,
     };
     let record = preflight_node(store, host, declaration).map_err(|_| unsupported())?;
-    let NodeData::CallSignatureDeclaration(call) = &record.data else {
-        return Err(unsupported());
-    };
-    if record.kind != SyntaxKind::CallSignature
-        || record.parent != Some(owner.node)
+    let (full_signature, next_container, signature_symbol, type_parameters, parameter_nodes, type_) =
+        match &record.data {
+            NodeData::CallSignatureDeclaration(call)
+                if record.kind == SyntaxKind::CallSignature =>
+            {
+                (
+                    call.full_signature,
+                    call.next_container,
+                    call.symbol,
+                    call.type_parameters.as_ref(),
+                    &call.parameters,
+                    call.type_,
+                )
+            }
+            NodeData::ConstructSignatureDeclaration(construct)
+                if record.kind == SyntaxKind::ConstructSignature =>
+            {
+                (
+                    construct.full_signature,
+                    construct.next_container,
+                    construct.symbol,
+                    construct.type_parameters.as_ref(),
+                    &construct.parameters,
+                    construct.type_,
+                )
+            }
+            _ => return Err(unsupported()),
+        };
+    let is_construct = record.kind == SyntaxKind::ConstructSignature;
+    if record.parent != Some(owner.node)
         || record.flags.0 != 0
-        || call.full_signature.is_some()
-        || call.next_container.is_some()
-        || call.symbol.is_some()
-        || call.type_parameters.is_some()
-        || call.parameters.has_trailing_comma
-        || call.parameters.range.start < record.range.start
-        || call.parameters.range.end > record.range.end
+        || full_signature.is_some()
+        || next_container.is_some()
+        || signature_symbol.is_some()
+        || type_parameters.is_some()
+        || parameter_nodes.has_trailing_comma
+        || parameter_nodes.range.start < record.range.start
+        || parameter_nodes.range.end > record.range.end
     {
         return Err(unsupported());
     }
-    let Some(return_id) = call.type_ else {
+    let Some(return_id) = type_ else {
         return Err(unsupported());
     };
     let return_type = NodeRef::new(declaration.arena, declaration.file, return_id);
     let return_record = preflight_node(store, host, return_type).map_err(|_| unsupported())?;
     if return_record.parent != Some(declaration.node)
-        || return_record.range.start < call.parameters.range.end
+        || return_record.range.start < parameter_nodes.range.end
         || return_record.range.end > record.range.end
     {
         return Err(unsupported());
@@ -1985,7 +2099,13 @@ fn plan_call_signature(
     if call_symbol != raw_call_symbol
         || call_record.flags() != SymbolFlags::SIGNATURE
         || call_record.check_flags() != CheckFlags::NONE
-        || call_record.name() != InternalSymbolName::Call.as_ref()
+        || call_record.name()
+            != if is_construct {
+                InternalSymbolName::New
+            } else {
+                InternalSymbolName::Call
+            }
+            .as_ref()
         || call_record
             .declarations()
             .is_none_or(|declarations| !declarations.contains(&declaration))
@@ -2001,7 +2121,7 @@ fn plan_call_signature(
     let locals = bound
         .locals(declaration)
         .and_then(|locals| store.symbol_table(locals));
-    if call.parameters.nodes.is_empty() {
+    if parameter_nodes.nodes.is_empty() {
         if locals.is_some_and(|locals| !locals.is_empty()) {
             return Err(unsupported());
         }
@@ -2009,10 +2129,14 @@ fn plan_call_signature(
         return Err(unsupported());
     }
 
-    let mut parameters = Vec::with_capacity(call.parameters.nodes.len());
-    let mut previous_end = call.parameters.range.start;
-    let mut flags = SignatureFlags::NONE;
-    for parameter_id in &call.parameters.nodes {
+    let mut parameters = Vec::with_capacity(parameter_nodes.nodes.len());
+    let mut previous_end = parameter_nodes.range.start;
+    let mut flags = if is_construct {
+        SignatureFlags::CONSTRUCT
+    } else {
+        SignatureFlags::NONE
+    };
+    for parameter_id in &parameter_nodes.nodes {
         let parameter = NodeRef::new(declaration.arena, declaration.file, *parameter_id);
         let parameter_record = preflight_node(store, host, parameter).map_err(|_| unsupported())?;
         let NodeData::ParameterDeclaration(data) = &parameter_record.data else {
@@ -2022,8 +2146,8 @@ fn plan_call_signature(
             || parameter_record.parent != Some(declaration.node)
             || parameter_record.flags.0 != 0
             || parameter_record.range.start < previous_end
-            || parameter_record.range.start < call.parameters.range.start
-            || parameter_record.range.end > call.parameters.range.end
+            || parameter_record.range.start < parameter_nodes.range.start
+            || parameter_record.range.end > parameter_nodes.range.end
             || data.dot_dot_dot_token.is_some()
             || data.initializer.is_some()
             || data.question_token.is_some()
@@ -2644,6 +2768,11 @@ fn validate_interface_record(
     {
         return Some(PropertyObjectState::Shell(type_));
     }
+    let resolved_signatures = resolved_call_signature_ids(store, plan);
+    let construct_signatures = plan
+        .call_signatures
+        .first()
+        .is_some_and(PlannedCallSignature::is_construct);
     if record.object_flags() == ObjectFlags::INTERFACE | ObjectFlags::MEMBERS_RESOLVED
         && interface.base_types_resolved
         && interface.resolved_base_constructor_type.is_none()
@@ -2651,8 +2780,13 @@ fn validate_interface_record(
         && interface.declared_members_resolved
         && interface.declared_members == plan.members
         && interface.declared_call_signatures.as_deref()
-            == resolved_call_signature_ids(store, plan).as_deref()
-        && interface.declared_construct_signatures.is_none()
+            == (!construct_signatures)
+                .then_some(resolved_signatures.as_deref())
+                .flatten()
+        && interface.declared_construct_signatures.as_deref()
+            == construct_signatures
+                .then_some(resolved_signatures.as_deref())
+                .flatten()
         && interface.declared_index_infos.as_deref()
             == interface.reference.object.structured.index_infos.as_deref()
         && valid_declared_structured_members(store, &interface.reference.object, plan)
@@ -3425,30 +3559,40 @@ fn valid_declared_structured_members(
     plan: &PropertyObjectPlan,
 ) -> bool {
     let call_signatures = resolved_call_signature_ids(store, plan);
-    (plan.call_signatures.is_empty()
-        || store.type_has_declared_call_set_provenance(
-            match plan.kind {
-                PropertyObjectKind::TypeLiteral => store
-                    .type_node_links(plan.node)
-                    .and_then(|links| links.resolved_type),
-                PropertyObjectKind::Interface => store
-                    .declared_type_links(plan.symbol)
-                    .and_then(|links| links.declared_type),
-                PropertyObjectKind::ObjectLiteral => None,
-            }
-            .unwrap_or_else(|| {
-                store
-                    .intrinsic_bootstrap()
-                    .expect("declared object validation requires bootstrap")
-                    .error_type
-            }),
-        ))
+    let construct_signatures = plan
+        .call_signatures
+        .first()
+        .is_some_and(PlannedCallSignature::is_construct);
+    valid_planned_call_signature_set(store, plan)
+        && (plan.call_signatures.is_empty()
+            || store.type_has_declared_call_set_provenance(
+                match plan.kind {
+                    PropertyObjectKind::TypeLiteral => store
+                        .type_node_links(plan.node)
+                        .and_then(|links| links.resolved_type),
+                    PropertyObjectKind::Interface => store
+                        .declared_type_links(plan.symbol)
+                        .and_then(|links| links.declared_type),
+                    PropertyObjectKind::ObjectLiteral => None,
+                }
+                .unwrap_or_else(|| {
+                    store
+                        .intrinsic_bootstrap()
+                        .expect("declared object validation requires bootstrap")
+                        .error_type
+                }),
+            ))
         && valid_object_tail(object)
         && object.structured.constrained == ConstrainedTypeData::default()
         && object.structured.members == plan.members
         && object.structured.properties == plan.expected_properties()
         && object.structured.signatures.as_deref() == call_signatures.as_deref()
-        && object.structured.call_signature_count == call_signatures.as_ref().map_or(0, Vec::len)
+        && object.structured.call_signature_count
+            == if construct_signatures {
+                0
+            } else {
+                call_signatures.as_ref().map_or(0, Vec::len)
+            }
         && valid_declared_index_infos(store, object.structured.index_infos.as_deref(), plan)
         && object
             .structured
@@ -3521,6 +3665,34 @@ fn cached_annotation_identity(
     } else {
         cached_planned_type_identity(store, node)
     }
+}
+
+fn valid_signature_return_annotation(
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+    null_literal_identity: bool,
+    type_: TypeId,
+) -> bool {
+    if let Some(cached) = cached_annotation_identity(store, node, null_literal_identity) {
+        return cached == type_;
+    }
+    if null_literal_identity
+        || store.source_node_kind(node) != Some(SyntaxKind::InferType)
+        || store.type_node_links(node).is_some()
+    {
+        return false;
+    }
+    let Some(symbol) = cached_ordinary_type_parameter_owner(store, type_) else {
+        return false;
+    };
+    let Some([declaration]) = store
+        .symbol(symbol)
+        .and_then(ts_binder::semantic::Symbol::declarations)
+    else {
+        return false;
+    };
+    store.source_node_kind(*declaration) == Some(SyntaxKind::TypeParameter)
+        && store.source_node_parent(*declaration) == Some(SourceNodeParent::Parent(node))
 }
 
 fn peel_parenthesized_type(
@@ -3723,11 +3895,45 @@ fn resolved_property_links(store: &CanonicalTypeMapperStore, plan: &PropertyObje
     }) && resolved_call_signature_ids(store, plan).is_some() != plan.call_signatures.is_empty()
 }
 
+fn valid_planned_call_signature_set(
+    store: &CanonicalTypeMapperStore,
+    plan: &PropertyObjectPlan,
+) -> bool {
+    let Some(first) = plan.call_signatures.first() else {
+        return plan.members.is_none_or(|members| {
+            store.symbol_table(members).is_some_and(|members| {
+                members.get(InternalSymbolName::Call.as_ref()).is_none()
+                    && members.get(InternalSymbolName::New.as_ref()).is_none()
+            })
+        });
+    };
+    let Some(members) = plan.members.and_then(|members| store.symbol_table(members)) else {
+        return false;
+    };
+    let Some(record) = store.symbol(first.symbol) else {
+        return false;
+    };
+    members.len() == 1
+        && members.get(first.internal_name().as_ref()) == Some(first.symbol)
+        && record.name() == first.internal_name().as_ref()
+        && record.declarations().is_some_and(|declarations| {
+            declarations.iter().copied().eq(plan
+                .call_signatures
+                .iter()
+                .map(|signature| signature.declaration))
+        })
+        && plan.call_signatures.iter().all(|signature| {
+            signature.symbol == first.symbol
+                && signature.is_construct() == first.is_construct()
+                && store.source_node_kind(signature.declaration) == Some(signature.syntax_kind())
+        })
+}
+
 fn resolved_call_signature_ids(
     store: &CanonicalTypeMapperStore,
     plan: &PropertyObjectPlan,
 ) -> Option<Vec<SignatureId>> {
-    if plan.call_signatures.is_empty() {
+    if plan.call_signatures.is_empty() || !valid_planned_call_signature_set(store, plan) {
         return None;
     }
     plan.call_signatures
@@ -3780,11 +3986,12 @@ fn validate_resolved_call_signature(
                 planned.return_identity_node,
                 planned.return_null_literal_identity,
             ))
-        || cached_annotation_identity(
+        || !valid_signature_return_annotation(
             store,
             planned.return_identity_node,
             planned.return_null_literal_identity,
-        ) != Some(return_type)
+            return_type,
+        )
         || parameter_types.len() != planned.parameters.len()
     {
         return None;
@@ -3890,7 +4097,8 @@ pub(super) fn validate_resolved_declared_member_types(
                     info.key_type() == *key_type && info.value_type() == *value_type
                 })
             });
-    let valid_calls = call_types.len() == plan.call_signatures.len()
+    let valid_calls = valid_planned_call_signature_set(store, plan)
+        && call_types.len() == plan.call_signatures.len()
         && plan
             .call_signatures
             .iter()
@@ -3937,6 +4145,9 @@ pub(super) fn publish_declared_members(
         return Err(PropertyObjectError::InvalidObjectLiteral(plan.node));
     }
     let type_ = state.type_id();
+    if !valid_planned_call_signature_set(store, plan) {
+        return Err(invalid_cache(plan, type_));
+    }
     if state.is_resolved() {
         validate_resolved_declared_member_types(
             store,
@@ -3998,22 +4209,22 @@ pub(super) fn publish_declared_members(
     }
 
     for (planned, resolved) in plan.call_signatures.iter().zip(call_types) {
-        if cached_annotation_identity(
+        if !valid_signature_return_annotation(
             store,
             planned.return_identity_node,
             planned.return_null_literal_identity,
-        ) != Some(resolved.return_type)
-            || planned
-                .parameters
-                .iter()
-                .zip(&resolved.parameter_types)
-                .any(|(parameter, type_)| {
-                    cached_annotation_identity(
-                        store,
-                        parameter.identity_node,
-                        parameter.null_literal_identity,
-                    ) != Some(*type_)
-                })
+            resolved.return_type,
+        ) || planned
+            .parameters
+            .iter()
+            .zip(&resolved.parameter_types)
+            .any(|(parameter, type_)| {
+                cached_annotation_identity(
+                    store,
+                    parameter.identity_node,
+                    parameter.null_literal_identity,
+                ) != Some(*type_)
+            })
         {
             return Err(invalid_cache(plan, type_));
         }
@@ -4078,7 +4289,12 @@ pub(super) fn publish_declared_members(
             },
         ));
     }
-    let published_signatures = (!signatures.is_empty()).then_some(signatures.clone());
+    let constructs = plan
+        .call_signatures
+        .first()
+        .is_some_and(PlannedCallSignature::is_construct);
+    let published_calls = (!signatures.is_empty() && !constructs).then(|| signatures.clone());
+    let published_constructs = constructs.then(|| signatures.clone());
 
     // All fallible checks precede publication.  The store setters below can
     // only reject foreign identities, all of which were validated above.
@@ -4099,8 +4315,8 @@ pub(super) fn publish_declared_members(
                 type_,
                 plan.members,
                 plan.expected_properties(),
-                published_signatures.clone(),
-                None,
+                published_calls.clone(),
+                published_constructs.clone(),
                 published_index_infos,
             ));
         }
@@ -4109,8 +4325,8 @@ pub(super) fn publish_declared_members(
                 type_,
                 true,
                 plan.members,
-                published_signatures.clone(),
-                None,
+                published_calls.clone(),
+                published_constructs.clone(),
                 published_index_infos.clone(),
             ));
             assert!(store.set_interface_base_resolution(type_, true, None, None));
@@ -4118,8 +4334,8 @@ pub(super) fn publish_declared_members(
                 type_,
                 plan.members,
                 plan.expected_properties(),
-                published_signatures.clone(),
-                None,
+                published_calls,
+                published_constructs,
                 published_index_infos,
             ));
         }
@@ -4991,6 +5207,455 @@ mod generic_publication_tests {
         assert_eq!(
             (
                 fixture.store.type_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn type_literal_construct_signatures_publish_authenticated_cold_and_warm_members() {
+        let mut fixture = interface_fixture(
+            "interface Owner {} type Constructor = { new(value: number): string };",
+            3_713,
+        );
+        let literal = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::TypeLiteral).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .expect("the fixture contains a constructor type literal");
+        let alias = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::TypeAliasDeclaration).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .and_then(|declaration| fixture.bound.symbol(declaration))
+            .expect("the fixture contains a bound constructor alias");
+        let host = host(&fixture.parsed, &fixture.bound);
+        let plan = plan_type_literal(&fixture.store, &host, literal, Some(alias)).unwrap();
+        let [planned] = plan.call_signatures.as_slice() else {
+            panic!("the type literal must retain one declared construct signature")
+        };
+        assert!(planned.is_construct());
+        assert_eq!(planned.parameters.len(), 1);
+        assert_eq!(
+            fixture.store.symbol(planned.symbol).unwrap().name(),
+            InternalSymbolName::New.as_ref(),
+        );
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let type_ = CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalCheckerOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_declared_type_of_symbol(alias)
+        .unwrap();
+        let TypeData::Object(object) = fixture.store.type_payload(type_).unwrap().data() else {
+            panic!("a constructor type literal must retain its anonymous object")
+        };
+        assert_eq!(object.structured.call_signature_count, 0);
+        let [signature] = object.structured.signatures.as_deref().unwrap() else {
+            panic!("the structured object must publish one construct signature")
+        };
+        let signature = *signature;
+        let record = fixture.store.signature(signature).unwrap();
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        assert!(record.flags().contains(SignatureFlags::CONSTRUCT));
+        assert_eq!(record.declaration(), Some(planned.declaration));
+        assert_eq!(record.resolved_return_type(), Some(bootstrap.string_type));
+        assert_eq!(
+            fixture.store.callable_signature_parameter_types(signature),
+            Some([bootstrap.number_type].as_slice()),
+        );
+        assert!(matches!(
+            validate_stored_declared_call_set(&fixture.store, type_),
+            StoredDeclaredCallSetValidation::Valid(_)
+        ));
+
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalCheckerOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_declared_type_of_symbol(alias),
+            Ok(type_),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn interface_construct_overloads_publish_authenticated_cold_and_warm_members() {
+        let mut fixture = interface_fixture(
+            "interface Constructor { new(value: number): string; new(value: string): number }",
+            3_715,
+        );
+        let host = host(&fixture.parsed, &fixture.bound);
+        let plan = plan_interface(&fixture.store, &host, fixture.symbol).unwrap();
+        assert_eq!(plan.call_signatures.len(), 2);
+        assert!(
+            plan.call_signatures
+                .iter()
+                .all(PlannedCallSignature::is_construct)
+        );
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let type_ = CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalCheckerOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_declared_type_of_symbol(fixture.symbol)
+        .unwrap();
+        let TypeData::Interface(interface) = fixture.store.type_payload(type_).unwrap().data()
+        else {
+            panic!("constructor overloads must publish one interface")
+        };
+        assert!(interface.declared_call_signatures.is_none());
+        let signatures = interface
+            .declared_construct_signatures
+            .as_deref()
+            .expect("constructor overloads must publish construct signatures");
+        assert_eq!(
+            interface.reference.object.structured.signatures.as_deref(),
+            Some(signatures),
+        );
+        assert_eq!(
+            interface.reference.object.structured.call_signature_count,
+            0
+        );
+
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let number = bootstrap.number_type;
+        let string = bootstrap.string_type;
+        for ((signature, planned), (parameter_type, return_type)) in signatures
+            .iter()
+            .zip(&plan.call_signatures)
+            .zip([(number, string), (string, number)])
+        {
+            let record = fixture.store.signature(*signature).unwrap();
+            assert!(record.flags().contains(SignatureFlags::CONSTRUCT));
+            assert_eq!(record.declaration(), Some(planned.declaration));
+            assert_eq!(record.resolved_return_type(), Some(return_type));
+            assert_eq!(
+                fixture.store.callable_signature_parameter_types(*signature),
+                Some([parameter_type].as_slice()),
+            );
+        }
+        assert_eq!(
+            validate_stored_declared_call_set(&fixture.store, type_),
+            StoredDeclaredCallSetValidation::Valid(vec![number, string, string, number]),
+        );
+
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalCheckerOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_declared_type_of_symbol(fixture.symbol),
+            Ok(type_),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn mixed_call_and_construct_signatures_are_unsupported_before_publication() {
+        for (source, type_literal, expected_kind, file) in [
+            (
+                "interface Mixed { (): string; new(): number }",
+                false,
+                SyntaxKind::ConstructSignature,
+                3_716,
+            ),
+            (
+                "interface Mixed { new(): number; (): string }",
+                false,
+                SyntaxKind::CallSignature,
+                3_717,
+            ),
+            (
+                "interface Owner {} type Mixed = { (): string; new(): number };",
+                true,
+                SyntaxKind::ConstructSignature,
+                3_718,
+            ),
+            (
+                "interface Owner {} type Mixed = { new(): number; (): string };",
+                true,
+                SyntaxKind::CallSignature,
+                3_719,
+            ),
+        ] {
+            let fixture = interface_fixture(source, file);
+            let host = host(&fixture.parsed, &fixture.bound);
+            let unsupported = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == expected_kind).then_some(NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        node,
+                    ))
+                })
+                .expect("the fixture contains the unsupported signature");
+            let before = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+            let planned = if type_literal {
+                let literal = fixture
+                    .parsed
+                    .arena
+                    .iter()
+                    .find_map(|(node, record)| {
+                        (record.kind == SyntaxKind::TypeLiteral).then_some(NodeRef::new(
+                            fixture.parsed.arena.id(),
+                            fixture.file,
+                            node,
+                        ))
+                    })
+                    .expect("the fixture contains a mixed type literal");
+                plan_type_literal(&fixture.store, &host, literal, None)
+            } else {
+                plan_interface(&fixture.store, &host, fixture.symbol)
+            };
+            assert_eq!(
+                planned,
+                Err(PropertyObjectError::UnsupportedMember {
+                    node: unsupported,
+                    kind: expected_kind,
+                }),
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_construct_publication_plans_are_rejected_atomically() {
+        let mut fixture = interface_fixture(
+            "interface Constructor { new(value: number): string; new(value: string): number }",
+            3_720,
+        );
+        let host = host(&fixture.parsed, &fixture.bound);
+        let plan = plan_interface(&fixture.store, &host, fixture.symbol).unwrap();
+        let flags = fixture.store.symbol(fixture.symbol).unwrap().flags();
+        let type_ = get_declared_class_interface_or_type_parameter(
+            &mut fixture.store,
+            &host,
+            fixture.symbol,
+            flags,
+        )
+        .unwrap()
+        .unwrap();
+        let state = interface_state(&fixture.store, &plan, type_).unwrap();
+        assert_eq!(state, PropertyObjectState::Shell(type_));
+
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let resolved = [
+            ResolvedCallSignatureTypes {
+                parameter_types: vec![bootstrap.number_type],
+                return_type: bootstrap.string_type,
+            },
+            ResolvedCallSignatureTypes {
+                parameter_types: vec![bootstrap.string_type],
+                return_type: bootstrap.number_type,
+            },
+        ];
+        let mut mixed_plan = plan.clone();
+        mixed_plan.call_signatures[1].flags = SignatureFlags::NONE;
+        let mut missing_plan = plan.clone();
+        missing_plan.call_signatures.clear();
+
+        let snapshot = |store: &CanonicalTypeMapperStore| {
+            let record = store.type_payload(type_).unwrap();
+            let TypeData::Interface(interface) = record.data() else {
+                panic!("constructor publication must preserve its interface shell")
+            };
+            (
+                record.object_flags(),
+                interface.clone(),
+                store.signature_len(),
+                store.checker_link_allocated_lengths(),
+                plan.call_signatures
+                    .iter()
+                    .map(|signature| {
+                        (
+                            store.signature_links(signature.declaration).cloned(),
+                            signature
+                                .parameters
+                                .iter()
+                                .map(|parameter| {
+                                    store.value_symbol_links(parameter.symbol).cloned()
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        };
+        for (invalid_plan, call_types) in [
+            (&mixed_plan, resolved.as_slice()),
+            (&missing_plan, &[] as &[ResolvedCallSignatureTypes]),
+        ] {
+            let before = snapshot(&fixture.store);
+            assert_eq!(
+                publish_declared_members(
+                    &mut fixture.store,
+                    invalid_plan,
+                    state,
+                    &[],
+                    &[],
+                    call_types,
+                ),
+                Err(PropertyObjectError::InvalidCachedInterface {
+                    symbol: fixture.symbol,
+                    type_,
+                }),
+            );
+            assert_eq!(snapshot(&fixture.store), before);
+        }
+    }
+
+    #[test]
+    fn conditional_constructor_return_inference_retains_its_declared_signature() {
+        let mut fixture = interface_fixture(
+            concat!(
+                "interface Owner {} ",
+                "type ExtractReturn<T> = T extends { new(): infer R } ? R : never;",
+            ),
+            3_714,
+        );
+        let alias = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::TypeAliasDeclaration).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .and_then(|declaration| fixture.bound.symbol(declaration))
+            .expect("the fixture contains the conditional alias");
+        let host = host(&fixture.parsed, &fixture.bound);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let conditional_type = CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalCheckerOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_declared_type_of_symbol(alias)
+        .unwrap();
+        let TypeData::Conditional(conditional) =
+            fixture.store.type_payload(conditional_type).unwrap().data()
+        else {
+            panic!("a generic constructor inference alias must retain its conditional type")
+        };
+        let root = fixture.store.conditional_root(conditional.root).unwrap();
+        let [inferred] = root.infer_type_parameters().unwrap() else {
+            panic!("the constructor return must own one infer parameter")
+        };
+        let inferred = *inferred;
+        let extends_type = root.extends_type();
+        let TypeData::Object(object) = fixture.store.type_payload(extends_type).unwrap().data()
+        else {
+            panic!("the conditional extends operand must remain a constructor object")
+        };
+        assert_eq!(object.structured.call_signature_count, 0);
+        let [signature] = object.structured.signatures.as_deref().unwrap() else {
+            panic!("the constructor object must expose one construct signature")
+        };
+        let signature = fixture.store.signature(*signature).unwrap();
+        assert!(signature.flags().contains(SignatureFlags::CONSTRUCT));
+        assert_eq!(signature.resolved_return_type(), Some(inferred));
+        assert_eq!(
+            validate_stored_declared_call_set(&fixture.store, extends_type),
+            StoredDeclaredCallSetValidation::Valid(vec![inferred]),
+        );
+
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalCheckerOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_declared_type_of_symbol(alias),
+            Ok(conditional_type),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
                 fixture.store.checker_link_allocated_lengths(),
             ),
             warm,

@@ -2839,7 +2839,17 @@ fn plan_direct_imported_module_namespace(
             target,
         });
     }
-    members.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+    members.sort_by_key(|member| {
+        store
+            .symbol(member.symbol)
+            .and_then(|symbol| symbol.declarations())
+            .and_then(|declarations| declarations.first())
+            .and_then(|declaration| {
+                host.source(*declaration)
+                    .and_then(|(arena, _)| arena.get(declaration.node))
+            })
+            .map(|declaration| declaration.range.start)
+    });
     Ok(PlannedSourceImportValueTarget::ModuleNamespace {
         declaration,
         members,
@@ -2860,10 +2870,20 @@ fn materialize_imported_module_namespace(
 ) -> Result<(TypeId, Vec<PreparedSourceImportModuleProperty>), SourceImportError> {
     let owner =
         (store.source_node_kind(declaration) == Some(SyntaxKind::SourceFile)).then_some(module);
-    if let Some(existing) = store
+    let existing = store
         .value_symbol_links(module)
         .and_then(|links| links.resolved_type)
-    {
+        .or_else(|| {
+            owner.and_then(|owner| {
+                store.types().find_map(|(type_, record)| {
+                    (record.symbol() == Some(owner)
+                        && record.object_flags()
+                            == ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED)
+                        .then_some(type_)
+                })
+            })
+        });
+    if let Some(existing) = existing {
         let structured = store
             .type_payload(existing)
             .filter(|record| {
@@ -4702,6 +4722,121 @@ mod tests {
         assert_eq!(warm, prepared);
         assert_eq!(store_state(&fixture.store), published);
         assert_eq!(display_type(&fixture, warm.type_), "typeof import(\"701\")");
+    }
+
+    #[test]
+    fn repeated_namespace_imports_share_one_deferred_module_identity() {
+        let mut fixture = fixture(
+            &[
+                r#"
+                    import * as first from "./target";
+                    import * as second from "./target";
+                    const firstValue = first;
+                    const secondValue = second;
+                "#,
+                r#"
+                    export function zebra(): number { return 1; }
+                    export function alpha(): string { return "alpha"; }
+                "#,
+            ],
+            &[
+                Route {
+                    source: 0,
+                    specifier: 0,
+                    target: Some(1),
+                },
+                Route {
+                    source: 0,
+                    specifier: 1,
+                    target: Some(1),
+                },
+            ],
+        );
+        let first = fixture.plan_import(0, 0);
+        let second = fixture.plan_import(0, 1);
+        let first_node = identifier_initializer(&fixture, 0, "first");
+        let second_node = identifier_initializer(&fixture, 0, "second");
+        let bound = fixture.bound.get(&fixture.files[0].file).unwrap();
+        let first_read = plan_source_import_identifier_read(
+            &fixture.files[0].parsed.arena,
+            bound,
+            &fixture.store,
+            &first.bindings[0],
+            first_node,
+            "first",
+            first.bindings[0].alias_symbol,
+        )
+        .unwrap();
+        let second_read = plan_source_import_identifier_read(
+            &fixture.files[0].parsed.arena,
+            bound,
+            &fixture.store,
+            &second.bindings[0],
+            second_node,
+            "second",
+            second.bindings[0].alias_symbol,
+        )
+        .unwrap();
+        let resolved = resolve_all(
+            &mut fixture,
+            &[first.bindings[0].clone(), second.bindings[0].clone()],
+        )
+        .unwrap();
+        assert_ne!(
+            resolved[0].binding.alias_symbol,
+            resolved[1].binding.alias_symbol
+        );
+        assert_eq!(resolved[0].target_symbol, resolved[1].target_symbol);
+
+        let first_prepared = prepare_one(&mut fixture, &resolved[0], &first_read).unwrap();
+        let first_state = (store_state(&fixture.store), fixture.store.symbol_len());
+        let second_prepared = prepare_one(&mut fixture, &resolved[1], &second_read).unwrap();
+        assert_eq!(first_prepared.type_, second_prepared.type_);
+        assert_eq!(
+            (store_state(&fixture.store), fixture.store.symbol_len()),
+            first_state,
+        );
+        assert!(
+            fixture
+                .store
+                .value_symbol_links(first_prepared.target_symbol)
+                .is_none()
+        );
+        for prepared in [&first_prepared, &second_prepared] {
+            assert!(
+                fixture
+                    .store
+                    .value_symbol_links(prepared.binding.alias_symbol)
+                    .is_none()
+            );
+            let PreparedSourceImportTarget::ModuleNamespace { properties } = &prepared.target
+            else {
+                panic!("expected an imported module namespace")
+            };
+            assert_eq!(
+                properties
+                    .iter()
+                    .map(|property| property.name.clone())
+                    .collect::<Vec<_>>(),
+                vec![EscapedName::source("zebra"), EscapedName::source("alpha")],
+            );
+        }
+
+        let prepared = [first_prepared, second_prepared];
+        let publications =
+            preflight_prepared_source_import_publications(&fixture.store, &prepared).unwrap();
+        assert_eq!(publications.len(), 3);
+        publish_for_test(&mut fixture.store, &prepared);
+        let published = (store_state(&fixture.store), fixture.store.symbol_len());
+
+        let first_warm = prepare_one(&mut fixture, &resolved[0], &first_read).unwrap();
+        let second_warm = prepare_one(&mut fixture, &resolved[1], &second_read).unwrap();
+        assert_eq!(first_warm, prepared[0]);
+        assert_eq!(second_warm, prepared[1]);
+        assert_eq!(
+            (store_state(&fixture.store), fixture.store.symbol_len()),
+            published,
+        );
     }
 
     #[test]

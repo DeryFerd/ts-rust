@@ -31,11 +31,11 @@ use super::{
     enums,
     functions::{FunctionTypeDisplayError, FunctionTypeUnsupported},
     keyof_types,
-    links::ValueSymbolLinks,
+    links::{ResolvedSignatureState, SignatureLinks, ValueSymbolLinks},
     mapped_types::plan_mapped_type_declaration,
     object_members,
     reference_types::validate_direct_generic_reference,
-    signatures::{ElementFlags, IndexFlags},
+    signatures::{ElementFlags, IndexFlags, SignatureFlags},
     source_callables::{
         SourceCallableDisplayError, SourceCallableUnsupported, StoredSourceCallableValidation,
         validate_stored_source_callable,
@@ -922,6 +922,17 @@ fn display_object_type(
             visiting,
         );
     }
+    let declared_construct = match object_members::validate_stored_declared_call_set(store, type_id)
+    {
+        object_members::StoredDeclaredCallSetValidation::NotDeclaredCallSet => false,
+        object_members::StoredDeclaredCallSetValidation::Malformed => {
+            return Err(TypeDisplayUnavailable::MalformedType(type_id));
+        }
+        object_members::StoredDeclaredCallSetValidation::Valid(_) => record
+            .data()
+            .structured()
+            .is_some_and(|structured| structured.call_signature_count == 0),
+    };
     if let Some(alias) = record.alias() {
         if single_callable_family(store, type_id).is_some() {
             validate_opaque_single_callable_alias(store, type_id)?;
@@ -929,6 +940,11 @@ fn display_object_type(
             validate_property_object_alias(store, host, type_id, record, alias)?;
         }
         return display_alias_name(store, type_id, alias, state);
+    }
+    if let Some(host) = host
+        && let Some(name) = display_validated_enum_value(store, host, type_id, record, state)?
+    {
+        return Ok(name);
     }
     if let Some(host) = host
         && let Some(name) = display_validated_module_namespace(store, host, type_id, record, state)?
@@ -990,6 +1006,27 @@ fn display_object_type(
         );
     }
 
+    if let Some(host) = host
+        && let Some(return_type) = validated_class_method_return_type(store, host, type_id, record)?
+    {
+        if !visiting.insert(type_id) {
+            return Err(TypeDisplayUnavailable::CyclicType(type_id));
+        }
+        state.add(3);
+        let result = display_type_worker(
+            store,
+            Some(host),
+            global_types,
+            return_type,
+            flags,
+            state,
+            visiting,
+        )
+        .map(|return_type| format!("() => {return_type}"));
+        visiting.remove(&type_id);
+        return result;
+    }
+
     if let Some(projection) = validated_single_callable_display(store, host, global_types, type_id)?
     {
         if !visiting.insert(type_id) {
@@ -1006,6 +1043,24 @@ fn display_object_type(
         );
         visiting.remove(&type_id);
         return result;
+    }
+    if declared_construct {
+        if matches!(record.data(), TypeData::Interface(_)) {
+            return display_interface_name(store, host, type_id, record, state);
+        }
+        let host = host.ok_or(TypeDisplayUnavailable::FunctionType {
+            type_id,
+            reason: FunctionTypeDisplayUnavailable::SourceContext,
+        })?;
+        return display_declared_construct_signatures(
+            store,
+            host,
+            global_types,
+            type_id,
+            flags,
+            state,
+            visiting,
+        );
     }
     if let Some(reason) = unsupported_callable_shape(store, type_id, record)? {
         return Err(TypeDisplayUnavailable::FunctionType { type_id, reason });
@@ -1039,6 +1094,198 @@ fn display_object_type(
     );
     visiting.remove(&type_id);
     result
+}
+
+fn display_validated_enum_value(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    type_id: TypeId,
+    record: &TypeRecord,
+    state: &mut DisplayState,
+) -> Result<Option<String>, TypeDisplayUnavailable> {
+    let Some(owner) = record.symbol() else {
+        return Ok(None);
+    };
+    let owner_record = store
+        .symbol(owner)
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    if !owner_record.flags().intersects(SymbolFlags::ENUM) {
+        return Ok(None);
+    }
+    let TypeData::Object(object) = record.data() else {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    };
+    let [declaration] = owner_record.declarations().unwrap_or_default() else {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    };
+    let declaration_node = host
+        .node(*declaration)
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let NodeData::EnumDeclaration(enumeration) = &declaration_node.data else {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    };
+    let declared = store
+        .declared_type_links(owner)
+        .and_then(|links| links.declared_type)
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let name = NodeRef::new(declaration.arena, declaration.file, enumeration.name);
+    if record.object_flags() != ObjectFlags::ANONYMOUS
+        || record.alias().is_some()
+        || object.structured != super::type_records::StructuredTypeData::default()
+        || object.target.is_some()
+        || object.mapper.is_some()
+        || object.instantiations != TypeCacheState::Unallocated
+        || !matches!(
+            owner_record.flags(),
+            SymbolFlags::REGULAR_ENUM | SymbolFlags::CONST_ENUM
+        )
+        || owner_record.check_flags() != CheckFlags::NONE
+        || owner_record.value_declaration() != Some(*declaration)
+        || owner_record.members().is_some()
+        || owner_record.exports().is_some() == enumeration.members.nodes.is_empty()
+        || owner_record.export_symbol().is_some()
+        || store.get_merged_symbol(owner) != Some(owner)
+        || store.value_symbol_links(owner)
+            != Some(&ValueSymbolLinks {
+                resolved_type: Some(type_id),
+                ..ValueSymbolLinks::default()
+            })
+        || enums::canonical_enum_type_owner(store, declared) != Some(owner)
+        || !host.symbol_matches(store, *declaration, owner)
+        || !host.node(name).is_some_and(|node| {
+            matches!(&node.data, NodeData::Identifier(identifier)
+                if owner_record.name().as_utf8() == Some(identifier.text.as_str()))
+        })
+    {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
+    let name = display_symbol_name(store, type_id, owner, state)
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    state.add(7);
+    Ok(Some(format!("typeof {name}")))
+}
+
+fn validated_class_method_return_type(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    type_id: TypeId,
+    record: &TypeRecord,
+) -> Result<Option<TypeId>, TypeDisplayUnavailable> {
+    let Some(method) = record.symbol() else {
+        return Ok(None);
+    };
+    let method_record = store
+        .symbol(method)
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    if method_record.flags() != SymbolFlags::METHOD {
+        return Ok(None);
+    }
+    let TypeData::Object(object) = record.data() else {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    };
+    let [declaration] = method_record.declarations().unwrap_or_default() else {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    };
+    let method_node = host
+        .node(*declaration)
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let NodeData::MethodDeclaration(method_data) = &method_node.data else {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    };
+    let class = method_record
+        .parent()
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let class_record = store
+        .symbol(class)
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let [class_declaration] = class_record.declarations().unwrap_or_default() else {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    };
+    let instance = store
+        .declared_type_links(class)
+        .and_then(|links| links.declared_type)
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let value = store
+        .value_symbol_links(class)
+        .and_then(|links| links.resolved_type)
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let [signature] = object.structured.signatures.as_deref().unwrap_or_default() else {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    };
+    let signature_record = store
+        .signature(*signature)
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let return_type = signature_record
+        .resolved_return_type()
+        .filter(|type_| store.type_payload(*type_).is_some())
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let name = NodeRef::new(declaration.arena, declaration.file, method_data.name);
+    let in_class_members = [instance, value].into_iter().any(|class_type| {
+        store
+            .type_payload(class_type)
+            .and_then(|class_type| class_type.data().structured())
+            .and_then(|structured| structured.members)
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get(method_record.name()))
+            == Some(method)
+    });
+    if record.object_flags() != (ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED)
+        || record.alias().is_some()
+        || object.target.is_some()
+        || object.mapper.is_some()
+        || object.instantiations != TypeCacheState::Unallocated
+        || object.structured.constrained != super::type_records::ConstrainedTypeData::default()
+        || object.structured.members.is_some()
+        || object.structured.properties.is_some()
+        || object.structured.call_signature_count != 1
+        || object.structured.index_infos.is_some()
+        || object
+            .structured
+            .object_type_without_abstract_construct_signatures
+            .is_some()
+        || method_record.check_flags() != CheckFlags::NONE
+        || method_record.value_declaration() != Some(*declaration)
+        || method_record.members().is_some()
+        || method_record.exports().is_some()
+        || method_record.export_symbol().is_some()
+        || store.get_merged_symbol(method) != Some(method)
+        || store.value_symbol_links(method)
+            != Some(&ValueSymbolLinks {
+                resolved_type: Some(type_id),
+                ..ValueSymbolLinks::default()
+            })
+        || !class_record.flags().contains(SymbolFlags::CLASS)
+        || store.get_merged_symbol(class) != Some(class)
+        || validate_class_heritage_members(store, instance) != ClassHeritageMembersValidation::Valid
+        || !in_class_members
+        || method_node.parent != Some(class_declaration.node)
+        || !host.symbol_matches(store, *class_declaration, class)
+        || !host.symbol_matches(store, *declaration, method)
+        || !host.node(name).is_some_and(|node| {
+            matches!(&node.data, NodeData::Identifier(identifier)
+                if method_record.name().as_utf8() == Some(identifier.text.as_str()))
+        })
+        || signature_record.flags() != SignatureFlags::NONE
+        || signature_record.declaration() != Some(*declaration)
+        || !signature_record.type_parameters().is_empty()
+        || !signature_record.parameters().is_empty()
+        || signature_record.this_parameter().is_some()
+        || signature_record.min_argument_count() != 0
+        || signature_record.resolved_min_argument_count() != -1
+        || signature_record.resolved_type_predicate().is_some()
+        || signature_record.target().is_some()
+        || signature_record.mapper().is_some()
+        || signature_record.isolated_signature_type().is_some()
+        || signature_record.composite().is_some()
+        || store.signature_links(*declaration)
+            != Some(&SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(*signature),
+                ..SignatureLinks::default()
+            })
+    {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
+    Ok(Some(return_type))
 }
 
 fn display_validated_module_namespace(
@@ -1251,13 +1498,14 @@ fn display_mapped_type_alias(
         .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
     let plan = plan_mapped_type_declaration(store, host, declaration)
         .map_err(|_| TypeDisplayUnavailable::MalformedType(type_id))?;
+    let declared_type = mapped.object.target.unwrap_or(type_id);
     if record.flags() != TypeFlags::OBJECT
         || !record.object_flags().contains(ObjectFlags::MAPPED)
         || record.symbol() != Some(plan.symbol())
         || store
             .type_node_links(declaration)
             .and_then(|links| links.resolved_type)
-            != Some(type_id)
+            != Some(declared_type)
         || mapped
             .type_parameter
             .is_none_or(|type_| store.type_payload(type_).is_none())
@@ -1309,10 +1557,77 @@ fn display_mapped_type_alias(
         || store
             .type_alias_links(symbol)
             .and_then(|links| links.declared_type)
-            != Some(type_id)
+            != Some(declared_type)
     {
         return Err(TypeDisplayUnavailable::MalformedType(type_id));
     }
+
+    if mapped.object.target.is_some() {
+        let instantiation_mapper = mapped
+            .object
+            .mapper
+            .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+        let type_parameters = store
+            .type_alias_links(symbol)
+            .and_then(|links| links.type_parameters.as_deref())
+            .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+        let type_arguments = [
+            mapped
+                .constraint_type
+                .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?,
+            mapped
+                .template_type
+                .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?,
+        ];
+        if store.mapper_payload(instantiation_mapper).is_none()
+            || store
+                .validate_record_mapped_alias_instantiation(
+                    symbol,
+                    declared_type,
+                    type_parameters,
+                    &type_arguments,
+                    type_id,
+                )
+                .is_err()
+        {
+            return Err(TypeDisplayUnavailable::MalformedType(type_id));
+        }
+
+        let alias = record
+            .alias()
+            .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+        let identity = store
+            .type_alias(alias)
+            .ok_or(TypeDisplayUnavailable::Alias { type_id, alias })?;
+        let owner = identity
+            .symbol()
+            .ok_or(TypeDisplayUnavailable::Alias { type_id, alias })?;
+        let owner_record = store
+            .symbol(owner)
+            .ok_or(TypeDisplayUnavailable::Alias { type_id, alias })?;
+        let [owner_declaration] = owner_record.declarations().unwrap_or_default() else {
+            return Err(TypeDisplayUnavailable::Alias { type_id, alias });
+        };
+        let owner_links = store
+            .type_alias_links(owner)
+            .ok_or(TypeDisplayUnavailable::Alias { type_id, alias })?;
+        if owner_record.flags() != SymbolFlags::TYPE_ALIAS
+            || store.get_merged_symbol(owner) != Some(owner)
+            || !host.symbol_matches(store, *owner_declaration, owner)
+            || !matches!(
+                host.node(*owner_declaration).map(|node| &node.data),
+                Some(NodeData::TypeAliasDeclaration(_))
+            )
+            || owner_links.declared_type != Some(type_id)
+            || identity.type_arguments()
+                != Some(owner_links.type_parameters.as_deref().unwrap_or_default())
+        {
+            return Err(TypeDisplayUnavailable::Alias { type_id, alias });
+        }
+
+        return display_alias_name(store, type_id, alias, state);
+    }
+
     display_symbol_name(store, type_id, symbol, state)
         .ok_or(TypeDisplayUnavailable::MalformedType(type_id))
 }
@@ -1501,6 +1816,118 @@ fn display_source_overload_set(
             state.add(2);
         }
         result.push('}');
+        Ok(result)
+    })();
+    visiting.remove(&type_id);
+    result
+}
+
+#[allow(clippy::too_many_arguments)] // Keep recursive formatter state explicit.
+fn display_declared_construct_signatures(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: Option<&CanonicalGlobalTypes>,
+    type_id: TypeId,
+    flags: CanonicalTypeFormatFlags,
+    state: &mut DisplayState,
+    visiting: &mut HashSet<TypeId>,
+) -> Result<String, TypeDisplayUnavailable> {
+    let record = store
+        .type_payload(type_id)
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let structured = record
+        .data()
+        .structured()
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let signatures = structured
+        .signatures
+        .as_deref()
+        .filter(|signatures| !signatures.is_empty())
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let owner = record
+        .symbol()
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let owner_record = store
+        .symbol(owner)
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let [owner_declaration] = owner_record.declarations().unwrap_or_default() else {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    };
+    let construct_symbol = structured
+        .members
+        .and_then(|members| store.symbol_table(members))
+        .and_then(|members| members.get(InternalSymbolName::New.as_ref()))
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    if !host.symbol_matches(store, *owner_declaration, owner) {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
+    if !visiting.insert(type_id) {
+        return Err(TypeDisplayUnavailable::CyclicType(type_id));
+    }
+    let result = (|| {
+        let overloaded = signatures.len() != 1;
+        let mut result = if overloaded {
+            String::from("{ ")
+        } else {
+            String::from("new ")
+        };
+        state.add(4);
+        for signature in signatures {
+            let signature_record = store
+                .signature(*signature)
+                .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+            let declaration = signature_record
+                .declaration()
+                .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+            if !matches!(
+                host.node(declaration).map(|node| &node.data),
+                Some(NodeData::ConstructSignatureDeclaration(_))
+            ) || !host.symbol_matches(store, declaration, construct_symbol)
+            {
+                return Err(TypeDisplayUnavailable::MalformedType(type_id));
+            }
+            if overloaded {
+                result.push_str("new ");
+                state.add(4);
+            }
+            append_source_signature_parameters(
+                store,
+                host,
+                global_types,
+                type_id,
+                *signature,
+                flags,
+                state,
+                visiting,
+                &mut result,
+            )?;
+            if overloaded {
+                result.push_str(": ");
+                state.add(2);
+            } else {
+                result.push_str(" => ");
+                state.add(4);
+            }
+            let return_type = signature_record
+                .resolved_return_type()
+                .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+            result.push_str(&display_type_worker(
+                store,
+                Some(host),
+                global_types,
+                return_type,
+                flags,
+                state,
+                visiting,
+            )?);
+            if overloaded {
+                result.push_str("; ");
+                state.add(2);
+            }
+        }
+        if overloaded {
+            result.push('}');
+        }
         Ok(result)
     })();
     visiting.remove(&type_id);
@@ -2511,6 +2938,13 @@ fn validate_resolved_named_interface(
             return Err(TypeDisplayUnavailable::MalformedType(type_id));
         }
         InterfaceHeritageMembersValidation::NotHeritage => {}
+    }
+    match object_members::validate_stored_declared_call_set(store, type_id) {
+        object_members::StoredDeclaredCallSetValidation::Valid(_) => return Ok(()),
+        object_members::StoredDeclaredCallSetValidation::Malformed => {
+            return Err(TypeDisplayUnavailable::MalformedType(type_id));
+        }
+        object_members::StoredDeclaredCallSetValidation::NotDeclaredCallSet => {}
     }
     let structured = &interface.reference.object.structured;
     if !interface.base_types_resolved
@@ -3782,10 +4216,22 @@ fn display_union_constituent(
 }
 
 fn is_unaliased_single_callable_type(store: &CanonicalTypeMapperStore, type_id: TypeId) -> bool {
+    let Some(record) = store
+        .type_payload(type_id)
+        .filter(|record| record.alias().is_none())
+    else {
+        return false;
+    };
     single_callable_family(store, type_id).is_some()
-        && store
-            .type_payload(type_id)
-            .is_some_and(|record| record.alias().is_none())
+        || matches!(record.data(), TypeData::Object(_))
+            && record.data().structured().is_some_and(|structured| {
+                structured.call_signature_count == 0
+                    && matches!(structured.signatures.as_deref(), Some([_]))
+            })
+            && matches!(
+                object_members::validate_stored_declared_call_set(store, type_id),
+                object_members::StoredDeclaredCallSetValidation::Valid(_)
+            )
 }
 
 fn union_elision(count: usize, flags: CanonicalTypeFormatFlags) -> String {
@@ -4728,6 +5174,64 @@ mod tests {
     }
 
     #[test]
+    fn instantiated_mapped_aliases_keep_owner_names_and_reject_forged_mappers() {
+        let parsed = parse_source_file(concat!(
+            "type Record<K extends keyof any, T> = { [P in K]: T }; ",
+            "type First = Record<string, number>; ",
+            "type Second = Record<string, number>;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(203);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let aliases = ["First", "Second"].map(|name| {
+            let declaration = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+                        return None;
+                    };
+                    let NodeData::Identifier(identifier) = &parsed.arena.get(alias.name)?.data
+                    else {
+                        return None;
+                    };
+                    (identifier.text == name).then_some(NodeRef::new(parsed.arena.id(), file, node))
+                })
+                .unwrap();
+            let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+            context
+                .store()
+                .type_alias_links(symbol)
+                .and_then(|links| links.declared_type)
+                .unwrap()
+        });
+        for (type_, name) in aliases.into_iter().zip(["First", "Second"]) {
+            assert_eq!(context.type_to_string(type_).unwrap(), name);
+        }
+
+        let first_target = match context.store().type_payload(aliases[0]).unwrap().data() {
+            TypeData::Mapped(mapped) => mapped.object.target.unwrap(),
+            _ => panic!("expected an instantiated mapped type"),
+        };
+        let second_mapper = match context.store().type_payload(aliases[1]).unwrap().data() {
+            TypeData::Mapped(mapped) => mapped.object.mapper.unwrap(),
+            _ => panic!("expected an instantiated mapped type"),
+        };
+        assert!(context.store_mut_for_test().set_object_target_and_mapper(
+            aliases[0],
+            Some(first_target),
+            Some(second_mapper),
+        ));
+        assert_eq!(
+            context.type_to_string(aliases[0]),
+            Err(TypeDisplayUnavailable::MalformedType(aliases[0])),
+        );
+    }
+
+    #[test]
     fn source_class_instances_and_values_keep_distinct_type_names() {
         let parsed = parse_source_file(concat!(
             "class Base {} ",
@@ -4769,6 +5273,316 @@ mod tests {
                 format!("typeof {name}")
             );
         }
+    }
+
+    #[test]
+    fn source_enum_values_format_as_type_queries_and_reject_poisoned_owner_links() {
+        let parsed = parse_source_file(concat!(
+            "enum Status { Ready = 1, Complete = 2 } ",
+            "const missing = Status.Missing;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(202);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::EnumDeclaration).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let owner = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        let declared = context
+            .store()
+            .declared_type_links(owner)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let value = context
+            .store()
+            .value_symbol_links(owner)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        assert_eq!(context.type_to_string(declared).unwrap(), "Status");
+        assert_eq!(context.type_to_string(value).unwrap(), "typeof Status");
+        assert!(type_to_string(context.store(), value).is_err());
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected one missing enum member")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2339);
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "Property 'Missing' does not exist on type 'typeof Status'."
+        );
+
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(owner, ValueSymbolLinks::default())
+        );
+        assert_eq!(
+            context.type_to_string(value),
+            Err(TypeDisplayUnavailable::MalformedType(value))
+        );
+    }
+
+    #[test]
+    fn class_owned_methods_format_only_after_the_entire_class_graph_is_authenticated() {
+        let parsed = parse_source_file(concat!(
+            "class Model { ",
+            "public run() {} ",
+            "static named(): any {} ",
+            "}",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(203);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let mut run = None;
+        for (node, record) in parsed.arena.iter() {
+            let NodeData::MethodDeclaration(method) = &record.data else {
+                continue;
+            };
+            let NodeData::Identifier(name) = &parsed.arena.get(method.name).unwrap().data else {
+                panic!("test methods have identifier names")
+            };
+            let declaration = NodeRef::new(parsed.arena.id(), file, node);
+            let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+            let callable = context
+                .store()
+                .value_symbol_links(symbol)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            let expected = if name.text == "run" {
+                run = Some((declaration, callable));
+                "() => void"
+            } else {
+                "() => any"
+            };
+            assert_eq!(context.type_to_string(callable).unwrap(), expected);
+            assert!(matches!(
+                type_to_string(context.store(), callable),
+                Err(TypeDisplayUnavailable::FunctionType {
+                    type_id,
+                    reason: FunctionTypeDisplayUnavailable::UnvalidatedCallable,
+                }) if type_id == callable
+            ));
+        }
+
+        let (declaration, callable) = run.unwrap();
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_signature_links(declaration, SignatureLinks::default())
+        );
+        assert_eq!(
+            context.type_to_string(callable),
+            Err(TypeDisplayUnavailable::MalformedType(callable))
+        );
+    }
+
+    #[test]
+    fn declared_construct_signatures_format_without_changing_calls_or_objects() {
+        let parsed = parse_source_file(concat!(
+            "interface Named { new(value: number): string; } ",
+            "type Alias = { new(value: number): string }; ",
+            "let single: { new(value: number): string }; ",
+            "let overloaded: { ",
+            "new(value: number): string; new(label: string): number; ",
+            "}; ",
+            "let callable: { (value: number): string }; ",
+            "let object: { value: number };",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(204);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        let single = context
+            .get_type_from_type_node(variable_type_node(&parsed, file, "single"))
+            .unwrap();
+        let overloaded = context
+            .get_type_from_type_node(variable_type_node(&parsed, file, "overloaded"))
+            .unwrap();
+        let callable = context
+            .get_type_from_type_node(variable_type_node(&parsed, file, "callable"))
+            .unwrap();
+        let object = context
+            .get_type_from_type_node(variable_type_node(&parsed, file, "object"))
+            .unwrap();
+
+        assert!(is_unaliased_single_callable_type(context.store(), single));
+        assert!(!is_unaliased_single_callable_type(
+            context.store(),
+            overloaded
+        ));
+        assert!(!is_unaliased_single_callable_type(
+            context.store(),
+            callable
+        ));
+        assert!(!is_unaliased_single_callable_type(context.store(), object));
+        assert_eq!(
+            context.type_to_string(single).unwrap(),
+            "new (value: number) => string"
+        );
+        assert_eq!(
+            context.type_to_string(overloaded).unwrap(),
+            "{ new (value: number): string; new (label: string): number; }"
+        );
+        assert_eq!(
+            type_to_string(context.store(), single),
+            Err(TypeDisplayUnavailable::FunctionType {
+                type_id: single,
+                reason: FunctionTypeDisplayUnavailable::SourceContext,
+            })
+        );
+        assert_eq!(
+            context.type_to_string(callable),
+            Err(TypeDisplayUnavailable::FunctionType {
+                type_id: callable,
+                reason: FunctionTypeDisplayUnavailable::UnvalidatedCallable,
+            })
+        );
+        assert_eq!(
+            context.type_to_string(object).unwrap(),
+            "{ value: number; }"
+        );
+
+        let alias_declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::TypeAliasDeclaration).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let interface_declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::InterfaceDeclaration).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let (alias_symbol, interface_symbol) = {
+            let bound = &context.file(file).unwrap().1;
+            (
+                bound.symbol(alias_declaration).unwrap(),
+                bound.symbol(interface_declaration).unwrap(),
+            )
+        };
+        let alias = context.get_declared_type_of_symbol(alias_symbol).unwrap();
+        let named = context
+            .get_declared_type_of_symbol(interface_symbol)
+            .unwrap();
+
+        assert!(context.store().type_has_declared_call_set_provenance(alias));
+        assert!(context.store().type_has_declared_call_set_provenance(named));
+        assert!(!is_unaliased_single_callable_type(context.store(), alias));
+        assert!(!is_unaliased_single_callable_type(context.store(), named));
+        assert_eq!(context.type_to_string(alias).unwrap(), "Alias");
+        assert_eq!(type_to_string(context.store(), alias).unwrap(), "Alias");
+        assert_eq!(context.type_to_string(named).unwrap(), "Named");
+        assert_eq!(type_to_string(context.store(), named).unwrap(), "Named");
+    }
+
+    #[test]
+    fn declared_constructor_display_rejects_poisoned_alias_and_parameter_provenance() {
+        let parsed = parse_source_file(concat!(
+            "type Alias = { new(value: number): string }; ",
+            "let inline: { new(label: string): number };",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(205);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        let alias_declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::TypeAliasDeclaration).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let alias_symbol = context
+            .file(file)
+            .unwrap()
+            .1
+            .symbol(alias_declaration)
+            .unwrap();
+        let alias = context.get_declared_type_of_symbol(alias_symbol).unwrap();
+        let inline = context
+            .get_type_from_type_node(variable_type_node(&parsed, file, "inline"))
+            .unwrap();
+        let (_, alias_signature_declaration) =
+            type_literal_member(&parsed, file, "Alias", SyntaxKind::ConstructSignature);
+        let inline_signature = context
+            .store()
+            .type_payload(inline)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.signatures.as_deref())
+            .and_then(|signatures| signatures.first())
+            .copied()
+            .unwrap();
+        let inline_parameter = context
+            .store()
+            .signature(inline_signature)
+            .unwrap()
+            .parameters()[0];
+
+        assert_eq!(context.type_to_string(alias).unwrap(), "Alias");
+        assert_eq!(
+            context.type_to_string(inline).unwrap(),
+            "new (label: string) => number"
+        );
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_signature_links(alias_signature_declaration, SignatureLinks::default())
+        );
+        assert_eq!(
+            context.type_to_string(alias),
+            Err(TypeDisplayUnavailable::MalformedType(alias))
+        );
+        assert_eq!(
+            type_to_string(context.store(), alias),
+            Err(TypeDisplayUnavailable::MalformedType(alias))
+        );
+        assert_eq!(
+            context.type_to_string(inline).unwrap(),
+            "new (label: string) => number"
+        );
+
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert!(context.store_mut_for_test().set_value_symbol_links(
+            inline_parameter,
+            ValueSymbolLinks {
+                resolved_type: Some(number),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        assert_eq!(
+            context.type_to_string(inline),
+            Err(TypeDisplayUnavailable::MalformedType(inline))
+        );
+        assert_eq!(
+            type_to_string(context.store(), inline),
+            Err(TypeDisplayUnavailable::MalformedType(inline))
+        );
     }
 
     #[test]

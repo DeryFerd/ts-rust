@@ -7,15 +7,21 @@
 
 use std::collections::HashSet;
 
+use ts_ast::SyntaxKind;
+use ts_binder::{CheckFlags, SymbolFlags};
+
 use super::{
-    CanonicalTypeMapperStore, SignatureId, TypeId,
+    CanonicalTypeMapperStore, ResolvedSignatureState, SignatureId, SignatureLinks, TypeId,
     callables::{
         CallableFamily, StoredSingleCallableValidation, ValidatedSingleCallable,
         validate_stored_single_callable_provider,
     },
+    classes::{ClassHeritageMembersValidation, validate_class_heritage_members},
+    links::ValueSymbolLinks,
     object_members::{StoredDeclaredCallSetValidation, validate_stored_declared_call_set},
     signatures::SignatureFlags,
     source_overloads::{StoredSourceOverloadValidation, validate_stored_source_overload},
+    store::SourceNodeParent,
     type_records::TypeData,
     types::TypeFlags,
 };
@@ -124,7 +130,117 @@ pub(super) fn validate_stored_callable_set(
         }
     }
 
+    if let Some(validation) = validate_stored_class_method_callable_set(store, type_) {
+        return validation;
+    }
+
     validate_stored_intersection_callable_set(store, type_)
+}
+
+fn validate_stored_class_method_callable_set(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Option<StoredCallableSetValidation> {
+    let method_symbol = store.type_payload(type_)?.symbol()?;
+    let method = store.symbol(method_symbol)?;
+    if !method.flags().contains(SymbolFlags::METHOD) {
+        return None;
+    }
+
+    let family = CallableFamily::DeclaredCallSignatures;
+    let authenticated = (|| {
+        let [declaration] = method.declarations()? else {
+            return None;
+        };
+        let declaration = *declaration;
+        let owner = method.parent()?;
+        let class = store.symbol(owner)?;
+        let [class_declaration] = class.declarations()? else {
+            return None;
+        };
+        let instance = store.declared_type_links(owner)?.declared_type?;
+        let value = store.value_symbol_links(owner)?.resolved_type?;
+        if method.flags() != SymbolFlags::METHOD
+            || method.check_flags() != CheckFlags::NONE
+            || method.name().is_reserved_member_name()
+            || method.name().is_private_identifier()
+            || method.name().is_late_bound()
+            || method.value_declaration() != Some(declaration)
+            || method.members().is_some()
+            || method.exports().is_some()
+            || method.export_symbol().is_some()
+            || store.get_merged_symbol(method_symbol) != Some(method_symbol)
+            || !class.flags().contains(SymbolFlags::CLASS)
+            || store.get_merged_symbol(owner) != Some(owner)
+            || store.source_node_kind(declaration) != Some(SyntaxKind::MethodDeclaration)
+            || store.source_node_parent(declaration)
+                != Some(SourceNodeParent::Parent(*class_declaration))
+            || store.value_symbol_links(method_symbol)
+                != Some(&ValueSymbolLinks {
+                    resolved_type: Some(type_),
+                    ..ValueSymbolLinks::default()
+                })
+            || validate_class_heritage_members(store, instance)
+                != ClassHeritageMembersValidation::Valid
+        {
+            return None;
+        }
+
+        let member_count = [instance, value]
+            .into_iter()
+            .filter(|class_type| {
+                store
+                    .type_payload(*class_type)
+                    .and_then(|record| record.data().structured())
+                    .and_then(|structured| structured.members)
+                    .and_then(|members| store.symbol_table(members))
+                    .and_then(|members| members.get(method.name()))
+                    == Some(method_symbol)
+            })
+            .count();
+        if member_count != 1 {
+            return None;
+        }
+
+        let projection =
+            validate_stored_callable_set_projection_with(store, type_, true, |signature| {
+                store
+                    .callable_signature_parameter_types(signature)
+                    .map(<[TypeId]>::to_vec)
+                    .or_else(|| {
+                        store
+                            .signature(signature)?
+                            .parameters()
+                            .is_empty()
+                            .then(Vec::new)
+                    })
+            })?;
+        let [callable] = projection.call_signatures.as_ref() else {
+            return None;
+        };
+        let signature = callable.signature;
+        let return_type = callable.return_type?;
+        if !projection.construct_signatures.is_empty()
+            || store.signature(signature)?.declaration() != Some(declaration)
+            || store.signature_links(declaration)
+                != Some(&SignatureLinks {
+                    resolved_signature: ResolvedSignatureState::Resolved(signature),
+                    ..SignatureLinks::default()
+                })
+        {
+            return None;
+        }
+        Some((projection, return_type))
+    })();
+
+    Some(match authenticated {
+        Some((projection, return_type)) => StoredCallableSetValidation::Valid {
+            family,
+            projection,
+            edges: vec![return_type],
+        },
+        None => StoredCallableSetValidation::Malformed { family },
+    })
 }
 
 fn validate_stored_intersection_callable_set(

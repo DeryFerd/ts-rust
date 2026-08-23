@@ -316,3 +316,56 @@ fn conditional_tuple_rest_preserves_its_required_suffix() {
         warm
     );
 }
+
+#[test]
+fn conditional_template_inference_preserves_unicode_code_points() {
+    let parsed = parse_source_file(concat!(
+        "type First<T extends string> = T extends `${infer Head}${string}` ? Head : never;\n",
+        "type Rest<T extends string> = T extends `${string}${infer Tail}` ? Tail : never;\n",
+        "type AsciiFirst = First<\"ABC\">;\n",
+        "type AsciiRest = Rest<\"ABC\">;\n",
+        "type JapaneseFirst = First<\"\\u3042\\u3044\\u3046\">;\n",
+        "type JapaneseRest = Rest<\"\\u3042\\u3044\\u3046\">;\n",
+        "type EmojiFirst = First<\"\\u{1F600}abc\">;\n",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(5);
+    let mut context = context(&parsed, file);
+
+    context.check_source_file(file).unwrap();
+    assert!(
+        context.diagnostics().is_empty(),
+        "{:?}",
+        context.diagnostics()
+    );
+
+    for (name, expected) in [
+        ("AsciiFirst", "\"A\""),
+        ("AsciiRest", "\"BC\""),
+        ("JapaneseFirst", "\"\u{3042}\""),
+        ("JapaneseRest", "\"\u{3044}\u{3046}\""),
+        ("EmojiFirst", "\"\u{1f600}\""),
+    ] {
+        let alias = alias_symbol(&parsed, file, &context, name);
+        assert_eq!(
+            context.type_to_string(alias_type(&context, alias)).unwrap(),
+            expected,
+            "alias {name}",
+        );
+    }
+
+    let warm = (
+        context.store().type_len(),
+        context.store().conditional_root_len(),
+        context.store().mapper_len(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().conditional_root_len(),
+            context.store().mapper_len(),
+        ),
+        warm,
+    );
+}

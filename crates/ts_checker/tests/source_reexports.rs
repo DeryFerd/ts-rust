@@ -229,6 +229,66 @@ fn source_is_checked(context: &CanonicalCheckerContext<'_>, file: FileId) -> boo
 }
 
 #[test]
+fn repeated_namespace_imports_reuse_one_module_identity() {
+    let consumer = parse_source_file(concat!(
+        "import * as first from './module';\n",
+        "import * as second from './module';\n",
+        "const firstValue: number = first.value;\n",
+        "const secondValue: number = second.value;\n",
+    ));
+    let module = parse_source_file("export const value: number = 1;\n");
+    let files = [
+        Source {
+            parsed: &consumer,
+            file: FileId::new(90),
+            path: "\"/project/consumer.ts\"",
+        },
+        Source {
+            parsed: &module,
+            file: FileId::new(91),
+            path: "\"/project/module.ts\"",
+        },
+    ];
+    let mut context = make_context(
+        &files,
+        &[
+            Route {
+                source: 0,
+                specifier: 0,
+                target: 1,
+            },
+            Route {
+                source: 0,
+                specifier: 1,
+                target: 1,
+            },
+        ],
+    );
+
+    context.check_source_file(files[0].file).unwrap();
+    assert!(
+        context.diagnostics().is_empty(),
+        "{:?}",
+        context.diagnostics()
+    );
+
+    let warm = (
+        context.store().type_len(),
+        context.store().symbol_len(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(files[0].file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
+}
+
+#[test]
 #[allow(clippy::too_many_lines)]
 fn two_hop_renamed_value_and_function_reexports_are_exact_and_warm_stable() {
     let consumer = parse_source_file(concat!(

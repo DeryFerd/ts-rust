@@ -8,8 +8,8 @@ use std::collections::HashSet;
 
 use ts_ast::{ModifierList, Node, NodeArena, NodeData, NodeFlags, NodeRef, SyntaxKind};
 use ts_binder::{
-    BoundFile, CheckFlags, EscapedName, SemanticSymbolId, SymbolFlags, SymbolTableId,
-    canonical_has_syntactic_modifier, semantic::PreparedSymbolTable,
+    BoundFile, CanonicalNameResolutionError, CheckFlags, EscapedName, SemanticSymbolId,
+    SymbolFlags, SymbolTableId, canonical_has_syntactic_modifier, semantic::PreparedSymbolTable,
 };
 use ts_diagnostics::{Diagnostic, message_by_code};
 
@@ -37,6 +37,9 @@ const GLOBAL_AUGMENTATION_CONTEXT: u32 = 2_669;
 const GLOBAL_AUGMENTATION_DECLARE: u32 = 2_670;
 const USE_NAMESPACE_KEYWORD: u32 = 1_540;
 const CIRCULAR_DEFINITION_OF_IMPORT_ALIAS: u32 = 2_303;
+const VARIABLE_IMPLICITLY_HAS_ANY_TYPE: u32 = 7_005;
+const NODE_FLAG_LET: u32 = 1 << 0;
+const NODE_FLAG_CONST: u32 = 1 << 1;
 
 /// One checked declaration inside a namespace or ambient module.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -104,6 +107,14 @@ struct SourceNamespaceImportPlan {
     type_only: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SourceNamespaceImplicitVariablePlan {
+    declaration: NodeRef,
+    symbol: SemanticSymbolId,
+    name: String,
+    primary_declaration: bool,
+}
+
 /// A complete, read-only namespace declaration and body plan.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SourceNamespacePlan {
@@ -113,6 +124,7 @@ pub(super) struct SourceNamespacePlan {
     pub(super) ambient: bool,
     pub(super) members: Vec<SourceNamespaceMemberPlan>,
     imports: Vec<SourceNamespaceImportPlan>,
+    implicit_variables: Vec<SourceNamespaceImplicitVariablePlan>,
     diagnostics: Vec<NamespaceDiagnosticPlan>,
 }
 
@@ -958,8 +970,12 @@ fn plan_namespace_variables(
     owner: SemanticSymbolId,
     ambient: bool,
     statement: NodeRef,
-    members: &mut Vec<SourceNamespaceMemberPlan>,
+    output: (
+        &mut Vec<SourceNamespaceMemberPlan>,
+        &mut Vec<SourceNamespaceImplicitVariablePlan>,
+    ),
 ) -> Result<(), SourceCheckError> {
+    let (members, implicit_variables) = output;
     let record = owned_node(arena, bound, store, statement)?;
     let NodeData::VariableStatement(variable) = &record.data else {
         return Err(SourceCheckError::Provenance(
@@ -1010,18 +1026,6 @@ fn plan_namespace_variables(
                 SourceSyntaxRole::VariableInitializer,
             ));
         }
-        let annotation = variable.type_.ok_or(SourceCheckError::Unsupported(
-            UnsupportedSourceSyntax::MissingVariableType(declaration),
-        ))?;
-        let annotation = child(declaration, annotation);
-        let annotation_record = owned_node(arena, bound, store, annotation)?;
-        if annotation_record.parent != Some(declaration.node) {
-            return Err(invalid_parent(
-                annotation,
-                declaration,
-                annotation_record.parent,
-            ));
-        }
         let symbol = declaration_symbol(bound, store, declaration, SymbolFlags::VARIABLE)?;
         validate_symbol_parent(store, declaration, symbol, Some(owner))?;
         if store.value_symbol_links(symbol).is_some_and(|links| {
@@ -1031,10 +1035,83 @@ fn plan_namespace_variables(
                 VariableInvariant::InvalidValueLinks(symbol),
             ));
         }
-        members.push(SourceNamespaceMemberPlan::AmbientVariable {
+        if let Some(annotation) = variable.type_ {
+            let annotation = child(declaration, annotation);
+            let annotation_record = owned_node(arena, bound, store, annotation)?;
+            if annotation_record.parent != Some(declaration.node) {
+                return Err(invalid_parent(
+                    annotation,
+                    declaration,
+                    annotation_record.parent,
+                ));
+            }
+            members.push(SourceNamespaceMemberPlan::AmbientVariable {
+                declaration,
+                symbol,
+                annotation,
+            });
+            continue;
+        }
+
+        let name = child(declaration, variable.name);
+        let name_record = owned_node(arena, bound, store, name)?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Err(unsupported(
+                name,
+                name_record.kind,
+                SourceSyntaxRole::VariableName,
+            ));
+        };
+        let expected_flags = match list_record.flags.0 {
+            0 => SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+            NODE_FLAG_LET | NODE_FLAG_CONST => SymbolFlags::BLOCK_SCOPED_VARIABLE,
+            _ => {
+                return Err(unsupported(
+                    list,
+                    list_record.kind,
+                    SourceSyntaxRole::VariableDeclarationList,
+                ));
+            }
+        };
+        let symbol_record = store.symbol(symbol).ok_or(SourceCheckError::Provenance(
+            SourceCheckProvenanceError::MissingDeclarationSymbol(declaration),
+        ))?;
+        let value_declaration = symbol_record.value_declaration();
+        if record.flags.0 != 0
+            || variable.exclamation_token.is_some()
+            || variable.local_symbol.is_some()
+            || variable.symbol.is_some()
+            || variable.facts != 0
+            || declaration_record.kind != SyntaxKind::VariableDeclaration
+            || declaration_record.flags.0 != 0
+            || list_record.kind != SyntaxKind::VariableDeclarationList
+            || declarations.facts != 0
+            || declarations.declarations.has_trailing_comma
+            || name_record.kind != SyntaxKind::Identifier
+            || name_record.flags.0 != 0
+            || name_record.parent != Some(declaration.node)
+            || identifier.flow_node.is_some()
+            || identifier.text.is_empty()
+            || symbol_record.flags() != expected_flags
+            || symbol_record.check_flags() != CheckFlags::NONE
+            || symbol_record.declarations().is_none_or(|declarations| {
+                !declarations.contains(&declaration)
+                    || value_declaration.is_none_or(|value| !declarations.contains(&value))
+            })
+            || symbol_record.name().as_utf8() != Some(identifier.text.as_str())
+            || symbol_record.members().is_some()
+            || symbol_record.exports().is_some()
+            || symbol_record.export_symbol().is_some()
+        {
+            return Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::MissingVariableType(declaration),
+            ));
+        }
+        implicit_variables.push(SourceNamespaceImplicitVariablePlan {
             declaration,
             symbol,
-            annotation,
+            name: identifier.text.clone(),
+            primary_declaration: value_declaration == Some(declaration),
         });
     }
     Ok(())
@@ -1168,6 +1245,7 @@ fn plan_namespace(
 
     let mut members = Vec::new();
     let mut imports = Vec::new();
+    let mut implicit_variables = Vec::new();
     if let Some(body) = namespace.body {
         let body = child(declaration, body);
         let body_record = owned_node(arena, bound, store, body)?;
@@ -1257,7 +1335,7 @@ fn plan_namespace(
                                 symbol,
                                 ambient,
                                 statement,
-                                &mut members,
+                                (&mut members, &mut implicit_variables),
                             )?;
                         }
                         SyntaxKind::ImportEqualsDeclaration => {
@@ -1294,6 +1372,7 @@ fn plan_namespace(
         ambient,
         members,
         imports,
+        implicit_variables,
         diagnostics,
     })
 }
@@ -1364,6 +1443,18 @@ fn namespace_imports<'plan>(
     }
 }
 
+fn namespace_implicit_variables<'plan>(
+    plan: &'plan SourceNamespacePlan,
+    variables: &mut Vec<&'plan SourceNamespaceImplicitVariablePlan>,
+) {
+    variables.extend(&plan.implicit_variables);
+    for member in &plan.members {
+        if let SourceNamespaceMemberPlan::Namespace(nested) = member {
+            namespace_implicit_variables(nested, variables);
+        }
+    }
+}
+
 fn namespace_import_is_circular(
     imports: &[ResolvedNamespaceImport<'_>],
     alias: SemanticSymbolId,
@@ -1380,6 +1471,136 @@ fn namespace_import_is_circular(
         current = import.target;
     }
     true
+}
+
+fn resolve_qualified_namespace_import(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    imports: &[&SourceNamespaceImportPlan],
+    import: &SourceNamespaceImportPlan,
+    reference: NodeRef,
+    resolving: &mut HashSet<SemanticSymbolId>,
+) -> Result<SemanticSymbolId, SourceCheckError> {
+    let (arena, bound) = host
+        .source(reference)
+        .ok_or_else(|| missing_node(reference))?;
+    let record = owned_node(arena, bound, store, reference)?;
+    let NodeData::QualifiedName(qualified) = &record.data else {
+        return Err(SourceCheckError::Unsupported(
+            UnsupportedSourceSyntax::Import(import.declaration),
+        ));
+    };
+    let left = child(reference, qualified.left);
+    let left_record = owned_node(arena, bound, store, left)?;
+    let mut namespace = match &left_record.data {
+        NodeData::QualifiedName(_) => {
+            resolve_qualified_namespace_import(store, host, imports, import, left, resolving)?
+        }
+        NodeData::Identifier(_) => {
+            let mut resolver = host.name_resolver_host(store)?;
+            resolver
+                .resolve_entity_name(left, SymbolFlags::MODULE_MEMBER)
+                .map_err(DeclaredTypeError::from)?
+                .ok_or(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Import(import.declaration),
+                ))?
+        }
+        _ => {
+            return Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Import(import.declaration),
+            ));
+        }
+    };
+
+    let mut visited = HashSet::new();
+    while store
+        .symbol(namespace)
+        .is_some_and(|record| record.flags() == SymbolFlags::ALIAS)
+    {
+        if !visited.insert(namespace) {
+            return Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Import(import.declaration),
+            ));
+        }
+        namespace = if let Some(candidate) = imports
+            .iter()
+            .copied()
+            .find(|candidate| candidate.symbol == namespace)
+        {
+            if !resolving.insert(namespace) {
+                return Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Import(import.declaration),
+                ));
+            }
+            let target =
+                resolve_namespace_import_target(store, host, imports, candidate, resolving);
+            resolving.remove(&namespace);
+            target?
+        } else {
+            store
+                .alias_symbol_links(namespace)
+                .and_then(|links| links.alias_target.symbol())
+                .ok_or(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Import(import.declaration),
+                ))?
+        };
+    }
+
+    let owner = store
+        .symbol(namespace)
+        .filter(|record| record.flags().intersects(SymbolFlags::NAMESPACE))
+        .ok_or(SourceCheckError::Unsupported(
+            UnsupportedSourceSyntax::Import(import.declaration),
+        ))?;
+    let right = child(reference, qualified.right);
+    let right_record = owned_node(arena, bound, store, right)?;
+    let NodeData::Identifier(name) = &right_record.data else {
+        return Err(SourceCheckError::Unsupported(
+            UnsupportedSourceSyntax::Import(import.declaration),
+        ));
+    };
+    store
+        .module_symbol_links(namespace)
+        .and_then(|links| links.resolved_exports)
+        .or_else(|| owner.exports())
+        .and_then(|exports| store.symbol_table(exports))
+        .and_then(|exports| exports.get_source(&name.text))
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .ok_or(SourceCheckError::Unsupported(
+            UnsupportedSourceSyntax::Import(import.declaration),
+        ))
+}
+
+fn resolve_namespace_import_target(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    imports: &[&SourceNamespaceImportPlan],
+    import: &SourceNamespaceImportPlan,
+    resolving: &mut HashSet<SemanticSymbolId>,
+) -> Result<SemanticSymbolId, SourceCheckError> {
+    let resolution = {
+        let mut resolution_host = host.name_resolver_host(store)?;
+        resolution_host.resolve_entity_name(import.reference, SymbolFlags::MODULE_MEMBER)
+    };
+    match resolution {
+        Ok(Some(target)) => Ok(target),
+        Ok(None) => Err(SourceCheckError::Unsupported(
+            UnsupportedSourceSyntax::Import(import.declaration),
+        )),
+        Err(CanonicalNameResolutionError::AliasResolutionUnavailable(alias))
+            if imports.iter().any(|candidate| candidate.symbol == alias) =>
+        {
+            resolve_qualified_namespace_import(
+                store,
+                host,
+                imports,
+                import,
+                import.reference,
+                resolving,
+            )
+        }
+        Err(error) => Err(DeclaredTypeError::from(error).into()),
+    }
 }
 
 fn preflight_namespace_imports<'plan>(
@@ -1399,14 +1620,9 @@ fn preflight_namespace_imports<'plan>(
         ));
     }
     let mut resolved_imports = Vec::with_capacity(imports.len());
-    for import in imports {
-        let mut resolution_host = host.name_resolver_host(store)?;
-        let target = resolution_host
-            .resolve_entity_name(import.reference, SymbolFlags::MODULE_MEMBER)
-            .map_err(DeclaredTypeError::from)?
-            .ok_or(SourceCheckError::Unsupported(
-                UnsupportedSourceSyntax::Import(import.declaration),
-            ))?;
+    for &import in &imports {
+        let target =
+            resolve_namespace_import_target(store, host, &imports, import, &mut HashSet::new())?;
         let target_record = store
             .symbol(target)
             .ok_or(SourceCheckError::Import(import.declaration))?;
@@ -1519,6 +1735,49 @@ fn namespace_enum_error(
         }
         super::enums::EnumTypeError::Invariant(_) => SourceCheckError::Enum(declaration),
     }
+}
+
+fn stage_namespace_value(
+    store: &CanonicalTypeMapperStore,
+    values: &mut Vec<PendingNamespaceValue>,
+    declaration: NodeRef,
+    symbol: SemanticSymbolId,
+    type_: TypeId,
+) -> Result<(), SourceCheckError> {
+    if let Some(existing) = values.iter().find(|value| value.symbol == symbol) {
+        if existing.type_ != type_ {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::CachedValueTypeMismatch {
+                    symbol,
+                    cached: existing.type_,
+                    expected: type_,
+                },
+            ));
+        }
+        return Ok(());
+    }
+    if let Some(existing) = store.value_symbol_links(symbol)
+        && existing != &ValueSymbolLinks::default()
+        && existing
+            != &(ValueSymbolLinks {
+                resolved_type: Some(type_),
+                ..ValueSymbolLinks::default()
+            })
+    {
+        return Err(SourceCheckError::Variable(
+            VariableInvariant::CachedValueTypeMismatch {
+                symbol,
+                cached: existing.resolved_type.unwrap_or(type_),
+                expected: type_,
+            },
+        ));
+    }
+    values.push(PendingNamespaceValue {
+        declaration,
+        symbol,
+        type_,
+    });
+    Ok(())
 }
 
 fn resolve_generic_namespace_property_type(
@@ -1751,15 +2010,50 @@ pub(super) fn execute_source_namespace(
     let mut annotations = Vec::new();
     let mut declarations = Vec::new();
     let mut planned_diagnostics = Vec::new();
+    let mut implicit_variables = Vec::new();
     namespace_annotations(
         plan,
         &mut annotations,
         &mut declarations,
         &mut planned_diagnostics,
     );
+    namespace_implicit_variables(plan, &mut implicit_variables);
+    implicit_variables.sort_by_key(|variable| {
+        host.node(variable.declaration)
+            .map_or(u32::MAX, |node| node.range.start.get())
+    });
     for diagnostic in &planned_diagnostics {
         if message_by_code(diagnostic.code).is_none() {
             return Err(SourceCheckError::MissingDiagnostic(diagnostic.code));
+        }
+    }
+    if options.no_implicit_any
+        && implicit_variables
+            .iter()
+            .any(|variable| variable.primary_declaration)
+        && message_by_code(VARIABLE_IMPLICITLY_HAS_ANY_TYPE).is_none()
+    {
+        return Err(SourceCheckError::MissingDiagnostic(
+            VARIABLE_IMPLICITLY_HAS_ANY_TYPE,
+        ));
+    }
+
+    let mut values = Vec::<PendingNamespaceValue>::new();
+    if !implicit_variables.is_empty() {
+        let any = store
+            .intrinsic_bootstrap()
+            .map(|bootstrap| bootstrap.any_type)
+            .ok_or(SourceCheckError::LiteralCache(
+                SourceLiteralCacheError::BootstrapUninitialized,
+            ))?;
+        for variable in &implicit_variables {
+            stage_namespace_value(
+                store,
+                &mut values,
+                variable.declaration,
+                variable.symbol,
+                any,
+            )?;
         }
     }
 
@@ -1805,7 +2099,6 @@ pub(super) fn execute_source_namespace(
         debug_assert!(staged.is_empty());
     }
 
-    let mut values = Vec::<PendingNamespaceValue>::new();
     for declaration in declarations {
         session.reset_query();
         match declaration {
@@ -1872,39 +2165,7 @@ pub(super) fn execute_source_namespace(
                     diagnostics,
                 )?
                 .get_type_from_type_node(*annotation)?;
-                if let Some(existing) = values.iter().find(|value| value.symbol == *symbol) {
-                    if existing.type_ != type_ {
-                        return Err(SourceCheckError::Variable(
-                            VariableInvariant::CachedValueTypeMismatch {
-                                symbol: *symbol,
-                                cached: existing.type_,
-                                expected: type_,
-                            },
-                        ));
-                    }
-                    continue;
-                }
-                if let Some(existing) = store.value_symbol_links(*symbol)
-                    && existing != &ValueSymbolLinks::default()
-                    && existing
-                        != &(ValueSymbolLinks {
-                            resolved_type: Some(type_),
-                            ..ValueSymbolLinks::default()
-                        })
-                {
-                    return Err(SourceCheckError::Variable(
-                        VariableInvariant::CachedValueTypeMismatch {
-                            symbol: *symbol,
-                            cached: existing.resolved_type.unwrap_or(type_),
-                            expected: type_,
-                        },
-                    ));
-                }
-                values.push(PendingNamespaceValue {
-                    declaration: *declaration,
-                    symbol: *symbol,
-                    type_,
-                });
+                stage_namespace_value(store, &mut values, *declaration, *symbol, type_)?;
             }
             SourceNamespaceMemberPlan::Namespace(_) => {
                 unreachable!("nested namespaces are expanded before semantic execution")
@@ -1941,6 +2202,28 @@ pub(super) fn execute_source_namespace(
             ));
         }
         debug_assert!(bound.contains(value.declaration));
+    }
+    if options.no_implicit_any {
+        let message = message_by_code(VARIABLE_IMPLICITLY_HAS_ANY_TYPE).ok_or(
+            SourceCheckError::MissingDiagnostic(VARIABLE_IMPLICITLY_HAS_ANY_TYPE),
+        )?;
+        for variable in implicit_variables {
+            if !variable.primary_declaration {
+                continue;
+            }
+            super::source::merge_retry_diagnostic(
+                diagnostics,
+                super::CanonicalCheckerDiagnostic {
+                    node: Some(variable.declaration),
+                    range_override: None,
+                    diagnostic: Diagnostic::with_arguments(
+                        message,
+                        [variable.name.clone(), "any".to_owned()],
+                    ),
+                    related_information: Vec::new(),
+                },
+            );
+        }
     }
     for diagnostic in planned_diagnostics {
         let message = message_by_code(diagnostic.code)
@@ -1981,6 +2264,14 @@ mod tests {
     }
 
     fn fixture(source: &'static str, module_state: CanonicalModuleState) -> Fixture {
+        fixture_with_options(source, module_state, CanonicalCheckerOptions::default())
+    }
+
+    fn fixture_with_options(
+        source: &'static str,
+        module_state: CanonicalModuleState,
+        options: CanonicalCheckerOptions,
+    ) -> Fixture {
         let parsed: &'static ParseResult = Box::leak(Box::new(parse_source_file(source)));
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let file = FileId::new(7_401);
@@ -2001,11 +2292,8 @@ mod tests {
         binder
             .bind_typescript_declaration_slice(&parsed.arena, file)
             .unwrap();
-        let context = CanonicalCheckerContext::new(
-            binder.finish(),
-            vec![(file, &parsed.arena)],
-            CanonicalCheckerOptions::default(),
-        );
+        let context =
+            CanonicalCheckerContext::new(binder.finish(), vec![(file, &parsed.arena)], options);
         let context = context.unwrap();
         Fixture {
             parsed,
@@ -2283,6 +2571,119 @@ mod tests {
     }
 
     #[test]
+    fn qualified_namespace_imports_follow_earlier_namespace_aliases() {
+        let mut fixture = fixture(
+            concat!(
+                "namespace Outer { ",
+                "export namespace Inner { export namespace Leaf {} } ",
+                "export import Visible = Inner; ",
+                "export import Selected = Visible.Leaf; ",
+                "}",
+            ),
+            CanonicalModuleState::Script,
+        );
+        let plan = plan(&fixture, 0);
+        let [SourceNamespaceMemberPlan::Namespace(inner)] = plan.members.as_slice() else {
+            panic!("the namespace must retain its first target segment")
+        };
+        let [SourceNamespaceMemberPlan::Namespace(leaf)] = inner.members.as_slice() else {
+            panic!("the nested namespace must retain the final target segment")
+        };
+        let [visible, selected] = plan.imports.as_slice() else {
+            panic!("the namespace must retain both import aliases")
+        };
+        let visible_symbol = visible.symbol;
+        let selected_symbol = selected.symbol;
+        let inner_symbol = inner.symbol;
+        let leaf_symbol = leaf.symbol;
+
+        assert!(execute(&mut fixture, &plan).unwrap().is_empty());
+        assert_eq!(
+            fixture
+                .context
+                .store()
+                .alias_symbol_links(visible_symbol)
+                .map(|links| links.alias_target),
+            Some(AliasTargetState::Resolved(inner_symbol)),
+        );
+        assert_eq!(
+            fixture
+                .context
+                .store()
+                .alias_symbol_links(selected_symbol)
+                .map(|links| links.alias_target),
+            Some(AliasTargetState::Resolved(leaf_symbol)),
+        );
+
+        let before = fixture.context.store().checker_link_allocated_lengths();
+        assert!(execute(&mut fixture, &plan).unwrap().is_empty());
+        assert_eq!(
+            fixture.context.store().checker_link_allocated_lengths(),
+            before,
+        );
+    }
+
+    #[test]
+    fn qualified_namespace_imports_follow_forward_and_nested_aliases() {
+        let mut fixture = fixture(
+            concat!(
+                "namespace Outer { ",
+                "export namespace Inner { export namespace Leaf {} } ",
+                "export namespace Nested { export import Forwarded = Visible; } ",
+                "export import Selected = Nested.Forwarded.Leaf; ",
+                "export import Visible = Inner; ",
+                "}",
+            ),
+            CanonicalModuleState::Script,
+        );
+        let plan = plan(&fixture, 0);
+        let [
+            SourceNamespaceMemberPlan::Namespace(inner),
+            SourceNamespaceMemberPlan::Namespace(nested),
+        ] = plan.members.as_slice()
+        else {
+            panic!("the namespace must retain both target namespaces")
+        };
+        let [SourceNamespaceMemberPlan::Namespace(leaf)] = inner.members.as_slice() else {
+            panic!("the first target namespace must retain its leaf")
+        };
+        let [selected, visible] = plan.imports.as_slice() else {
+            panic!("the outer namespace must retain both aliases")
+        };
+        let [forwarded] = nested.imports.as_slice() else {
+            panic!("the nested namespace must retain its forwarded alias")
+        };
+        let selected_symbol = selected.symbol;
+        let visible_symbol = visible.symbol;
+        let forwarded_symbol = forwarded.symbol;
+        let inner_symbol = inner.symbol;
+        let leaf_symbol = leaf.symbol;
+
+        assert!(execute(&mut fixture, &plan).unwrap().is_empty());
+        for (alias, target) in [
+            (selected_symbol, leaf_symbol),
+            (visible_symbol, inner_symbol),
+            (forwarded_symbol, inner_symbol),
+        ] {
+            assert_eq!(
+                fixture
+                    .context
+                    .store()
+                    .alias_symbol_links(alias)
+                    .map(|links| links.alias_target),
+                Some(AliasTargetState::Resolved(target)),
+            );
+        }
+
+        let before = fixture.context.store().checker_link_allocated_lengths();
+        assert!(execute(&mut fixture, &plan).unwrap().is_empty());
+        assert_eq!(
+            fixture.context.store().checker_link_allocated_lengths(),
+            before,
+        );
+    }
+
+    #[test]
     fn circular_namespace_imports_report_each_declaration_in_source_order() {
         let mut fixture = fixture(
             "namespace Outer { import First = Second; import Second = First; }",
@@ -2505,6 +2906,309 @@ mod tests {
     }
 
     #[test]
+    fn unannotated_ambient_namespace_variables_use_canonical_any() {
+        let mut fixture = fixture(
+            "declare namespace Values { const inferred; const explicit: number; }",
+            CanonicalModuleState::Script,
+        );
+        let plan = plan(&fixture, 0);
+        let [inferred] = plan.implicit_variables.as_slice() else {
+            panic!("the namespace must retain its unannotated variable")
+        };
+        let inferred_symbol = inferred.symbol;
+        let [
+            SourceNamespaceMemberPlan::AmbientVariable {
+                symbol: explicit_symbol,
+                ..
+            },
+        ] = plan.members.as_slice()
+        else {
+            panic!("the namespace must retain its annotated variable")
+        };
+        let explicit_symbol = *explicit_symbol;
+
+        assert!(execute(&mut fixture, &plan).unwrap().is_empty());
+        let bootstrap = fixture.context.store().intrinsic_bootstrap().unwrap();
+        assert_eq!(
+            fixture
+                .context
+                .store()
+                .value_symbol_links(inferred_symbol)
+                .and_then(|links| links.resolved_type),
+            Some(bootstrap.any_type),
+        );
+        assert_eq!(
+            fixture
+                .context
+                .store()
+                .value_symbol_links(explicit_symbol)
+                .and_then(|links| links.resolved_type),
+            Some(bootstrap.number_type),
+        );
+
+        let before = fixture.context.store().checker_link_allocated_lengths();
+        assert!(execute(&mut fixture, &plan).unwrap().is_empty());
+        assert_eq!(
+            fixture.context.store().checker_link_allocated_lengths(),
+            before,
+        );
+    }
+
+    #[test]
+    fn unannotated_ambient_namespace_variables_report_strict_implicit_any() {
+        let mut fixture = fixture_with_options(
+            "declare namespace Values { const inferred; }",
+            CanonicalModuleState::Script,
+            CanonicalCheckerOptions {
+                no_implicit_any: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        let plan = plan(&fixture, 0);
+        let [inferred] = plan.implicit_variables.as_slice() else {
+            panic!("the namespace must retain its unannotated variable")
+        };
+        let declaration = inferred.declaration;
+        let symbol = inferred.symbol;
+
+        for _ in 0..2 {
+            let diagnostics = execute(&mut fixture, &plan).unwrap();
+            let [diagnostic] = diagnostics.as_slice() else {
+                panic!("strict mode must report one implicit-any diagnostic")
+            };
+            assert_eq!(diagnostic.node, Some(declaration));
+            assert_eq!(diagnostic.diagnostic.code(), 7005);
+            assert_eq!(
+                diagnostic.diagnostic.render().unwrap(),
+                "Variable 'inferred' implicitly has an 'any' type.",
+            );
+        }
+        assert_eq!(
+            fixture
+                .context
+                .store()
+                .value_symbol_links(symbol)
+                .and_then(|links| links.resolved_type),
+            Some(
+                fixture
+                    .context
+                    .store()
+                    .intrinsic_bootstrap()
+                    .unwrap()
+                    .any_type
+            ),
+        );
+    }
+
+    #[test]
+    fn merged_ambient_namespace_variables_report_once_in_source_order() {
+        let mut fixture = fixture_with_options(
+            concat!(
+                "declare namespace Values { ",
+                "namespace Inner { var first; var first; } ",
+                "let second; ",
+                "const third; ",
+                "}",
+            ),
+            CanonicalModuleState::Script,
+            CanonicalCheckerOptions {
+                no_implicit_any: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        let plan = plan(&fixture, 0);
+        let [SourceNamespaceMemberPlan::Namespace(nested)] = plan.members.as_slice() else {
+            panic!("the namespace must retain its nested declarations")
+        };
+        let [first, repeated] = nested.implicit_variables.as_slice() else {
+            panic!("the nested namespace must retain both merged declarations")
+        };
+        let [second, third] = plan.implicit_variables.as_slice() else {
+            panic!("the outer namespace must retain both block-scoped declarations")
+        };
+        assert_eq!(first.symbol, repeated.symbol);
+        assert!(first.primary_declaration);
+        assert!(!repeated.primary_declaration);
+        let symbols = [first.symbol, second.symbol, third.symbol];
+
+        for _ in 0..2 {
+            let diagnostics = execute(&mut fixture, &plan).unwrap();
+            assert_eq!(
+                diagnostics
+                    .as_slice()
+                    .iter()
+                    .map(|diagnostic| {
+                        (
+                            diagnostic.diagnostic.code(),
+                            diagnostic.diagnostic.arguments[0].as_str(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                [(7005, "first"), (7005, "second"), (7005, "third")],
+            );
+        }
+
+        let any = fixture
+            .context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .any_type;
+        for symbol in symbols {
+            assert_eq!(
+                fixture
+                    .context
+                    .store()
+                    .value_symbol_links(symbol)
+                    .and_then(|links| links.resolved_type),
+                Some(any),
+            );
+        }
+    }
+
+    #[test]
+    fn reopened_ambient_namespace_variables_report_only_the_first_declaration() {
+        let mut fixture = fixture_with_options(
+            concat!(
+                "declare namespace Values { var repeated; } ",
+                "declare namespace Values { var repeated; }",
+            ),
+            CanonicalModuleState::Script,
+            CanonicalCheckerOptions {
+                no_implicit_any: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        let first = plan(&fixture, 0);
+        let second = plan(&fixture, 1);
+        let [first_variable] = first.implicit_variables.as_slice() else {
+            panic!("the first namespace must retain its variable")
+        };
+        let [second_variable] = second.implicit_variables.as_slice() else {
+            panic!("the reopened namespace must retain its variable")
+        };
+        assert_eq!(first_variable.symbol, second_variable.symbol);
+        assert!(first_variable.primary_declaration);
+        assert!(!second_variable.primary_declaration);
+
+        let diagnostics = execute(&mut fixture, &first).unwrap();
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("the first declaration must report exactly one implicit-any diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 7005);
+        assert!(execute(&mut fixture, &second).unwrap().is_empty());
+
+        let before = fixture.context.store().checker_link_allocated_lengths();
+        assert_eq!(execute(&mut fixture, &first).unwrap().len(), 1);
+        assert!(execute(&mut fixture, &second).unwrap().is_empty());
+        assert_eq!(
+            fixture.context.store().checker_link_allocated_lengths(),
+            before,
+        );
+    }
+
+    #[test]
+    fn invalid_implicit_variable_cache_cannot_publish_namespace_aliases_or_enums() {
+        let mut fixture = fixture(
+            concat!(
+                "declare namespace Values { ",
+                "export namespace Inner {} ",
+                "export import Visible = Inner; ",
+                "enum Empty {} ",
+                "const poisoned; ",
+                "}",
+            ),
+            CanonicalModuleState::Script,
+        );
+        let plan = plan(&fixture, 0);
+        let [
+            SourceNamespaceMemberPlan::Namespace(_),
+            SourceNamespaceMemberPlan::EmptyEnum {
+                symbol: enumeration,
+                ..
+            },
+        ] = plan.members.as_slice()
+        else {
+            panic!("the namespace must retain its nested namespace and empty enum")
+        };
+        let enumeration = *enumeration;
+        let [import] = plan.imports.as_slice() else {
+            panic!("the namespace must retain its alias")
+        };
+        let alias = import.symbol;
+        let [variable] = plan.implicit_variables.as_slice() else {
+            panic!("the namespace must retain its unannotated variable")
+        };
+        let variable = variable.symbol;
+        let bootstrap = fixture.context.store().intrinsic_bootstrap().unwrap();
+        let any = bootstrap.any_type;
+        let string = bootstrap.string_type;
+        assert!(fixture.context.store_mut_for_test().set_value_symbol_links(
+            variable,
+            ValueSymbolLinks {
+                resolved_type: Some(string),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        let before = (
+            fixture.context.store().type_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+
+        for _ in 0..2 {
+            assert_eq!(
+                execute(&mut fixture, &plan),
+                Err(SourceCheckError::Variable(
+                    VariableInvariant::CachedValueTypeMismatch {
+                        symbol: variable,
+                        cached: string,
+                        expected: any,
+                    },
+                )),
+            );
+            assert!(fixture.context.store().alias_symbol_links(alias).is_none());
+            assert!(
+                fixture
+                    .context
+                    .store()
+                    .declared_type_links(enumeration)
+                    .is_none(),
+            );
+            assert_eq!(
+                (
+                    fixture.context.store().type_len(),
+                    fixture.context.store().checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+        }
+
+        assert!(
+            fixture
+                .context
+                .store_mut_for_test()
+                .set_value_symbol_links(variable, ValueSymbolLinks::default()),
+        );
+        assert!(execute(&mut fixture, &plan).unwrap().is_empty());
+        assert_eq!(
+            fixture
+                .context
+                .store()
+                .value_symbol_links(variable)
+                .and_then(|links| links.resolved_type),
+            Some(any),
+        );
+        assert!(fixture.context.store().alias_symbol_links(alias).is_some());
+        assert!(
+            fixture
+                .context
+                .store()
+                .declared_type_links(enumeration)
+                .is_some(),
+        );
+    }
+
+    #[test]
     fn relative_ambient_module_name_reports_pinned_ts2436() {
         let mut fixture = fixture(
             "declare module \"./relative\" { var value: string; }",
@@ -2612,6 +3316,19 @@ mod tests {
                 .declared_type_links(symbol)
                 .and_then(|links| links.declared_type)
                 .is_some()
+        );
+
+        let before = (
+            fixture.context.store().type_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+        assert!(execute(&mut fixture, &plan).unwrap().is_empty());
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            before,
         );
     }
 

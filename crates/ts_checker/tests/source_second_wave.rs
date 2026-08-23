@@ -257,6 +257,50 @@ fn javascript_inferred_variables_report_incompatible_assignments() {
 }
 
 #[test]
+fn javascript_commonjs_exports_preserve_the_local_assignment_type() {
+    let parsed = parse_javascript_source_file("const value = 1; module.exports = value;");
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(8_206);
+    let mut context = context(&parsed, file, CanonicalSourceLanguage::JavaScript);
+
+    context.check_source_file(file).unwrap();
+
+    assert!(context.diagnostics().is_empty());
+    let assignment = parsed
+        .arena
+        .iter()
+        .find_map(|(node, record)| {
+            (record.kind == SyntaxKind::BinaryExpression).then_some(NodeRef::new(
+                parsed.arena.id(),
+                file,
+                node,
+            ))
+        })
+        .unwrap();
+    let assignment_type = context
+        .store()
+        .type_node_links(assignment)
+        .and_then(|links| links.resolved_type)
+        .unwrap();
+    assert_eq!(context.type_to_string(assignment_type).unwrap(), "1");
+
+    let warm = (
+        context.store().type_len(),
+        context.store().symbol_len(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
+}
+
+#[test]
 fn javascript_jsdoc_annotations_control_variable_assignment_types() {
     let parsed =
         parse_javascript_source_file("/** @type {number} */\nvar value = 1;\nvalue = 'wrong';");

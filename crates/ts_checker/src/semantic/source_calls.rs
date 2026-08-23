@@ -2,8 +2,8 @@
 //!
 //! This deliberately admits only `identifier(arguments)` or a proven required
 //! own-property `identifier.name(arguments)`. Arguments may contain scalar
-//! values, identifier and property reads, object and array literals, type
-//! assertions, nested direct calls, or recursively proven primitive
+//! values, identifier and property reads, object and array literals, arrow
+//! functions, type assertions, nested direct calls, or recursively proven primitive
 //! expressions, optionally parenthesized.
 //! The semantic kernel remains in `calls`; this module owns the AST proof,
 //! lazy-return/relation retries, call caches, and source diagnostics.
@@ -94,6 +94,7 @@ pub(super) struct DirectSourceCallSyntax {
     callee_diagnostic_node: NodeRef,
     type_arguments: Option<SourceTypeArgumentList>,
     arguments: Vec<NodeRef>,
+    argument_arrow_nodes: Vec<Option<NodeRef>>,
 }
 
 impl DirectSourceCallSyntax {
@@ -119,7 +120,7 @@ pub(super) struct CheckedSourceCall {
     pub(super) return_type: TypeId,
 }
 
-/// Returns the shared parameter context for an object or array argument.
+/// Returns the shared parameter context for an object, array, or arrow argument.
 ///
 /// Generic signatures and overloads with different parameter types require
 /// inference or overload selection before they can provide an exact context.
@@ -133,9 +134,12 @@ pub(super) fn source_call_argument_contextual_type(
     let Some(argument) = plan.arguments.get(argument_index) else {
         return Err(SourceCheckError::Call(plan.node));
     };
+    let argument = argument.unparenthesized();
     if !matches!(
-        argument.unparenthesized().kind,
-        PlannedExpressionKind::Object { .. } | PlannedExpressionKind::Array(_)
+        argument.kind,
+        PlannedExpressionKind::Object { .. }
+            | PlannedExpressionKind::Array(_)
+            | PlannedExpressionKind::Arrow(_)
     ) {
         return Ok(None);
     }
@@ -329,6 +333,7 @@ pub(super) fn plan_direct_source_call_syntax(
         .transpose()?;
 
     let mut arguments = Vec::with_capacity(call.arguments.nodes.len());
+    let mut argument_arrow_nodes = Vec::with_capacity(call.arguments.nodes.len());
     for argument_id in &call.arguments.nodes {
         let argument = NodeRef::new(node.arena, node.file, *argument_id);
         let Some(argument_record) = arena.get(*argument_id) else {
@@ -341,6 +346,7 @@ pub(super) fn plan_direct_source_call_syntax(
                 UnsupportedSourceSyntax::Call(node),
             ));
         }
+        argument_arrow_nodes.push(unparenthesized_arrow_argument_node(arena, argument));
         arguments.push(argument);
     }
     preflight_call_links(store, node)?;
@@ -351,6 +357,7 @@ pub(super) fn plan_direct_source_call_syntax(
         callee_diagnostic_node,
         type_arguments,
         arguments,
+        argument_arrow_nodes,
     })
 }
 
@@ -410,11 +417,21 @@ pub(super) fn finish_direct_source_call_plan(
     if callee.node != syntax.callee
         || !exact_callee
         || arguments.len() != syntax.arguments.len()
+        || syntax.argument_arrow_nodes.len() != syntax.arguments.len()
         || !arguments
             .iter()
             .zip(&syntax.arguments)
-            .all(|(argument, syntax_node)| {
-                argument.node == *syntax_node && is_supported_call_argument_plan(argument)
+            .zip(&syntax.argument_arrow_nodes)
+            .all(|((argument, syntax_node), syntax_arrow)| {
+                let unparenthesized = argument.unparenthesized();
+                let exact_arrow = match (&unparenthesized.kind, syntax_arrow) {
+                    (PlannedExpressionKind::Arrow(_), Some(node)) => unparenthesized.node == *node,
+                    (PlannedExpressionKind::Arrow(_), None) | (_, Some(_)) => false,
+                    (_, None) => true,
+                };
+                argument.node == *syntax_node
+                    && exact_arrow
+                    && is_supported_call_argument_plan(argument)
             })
     {
         return Err(SourceCheckError::Unsupported(
@@ -428,6 +445,22 @@ pub(super) fn finish_direct_source_call_plan(
         type_arguments: syntax.type_arguments.clone(),
         arguments,
     })
+}
+
+fn unparenthesized_arrow_argument_node(arena: &NodeArena, mut node: NodeRef) -> Option<NodeRef> {
+    loop {
+        let record = arena.get(node.node)?;
+        match (&record.data, record.kind) {
+            (
+                NodeData::ParenthesizedExpression(parenthesized),
+                SyntaxKind::ParenthesizedExpression,
+            ) => {
+                node = NodeRef::new(node.arena, node.file, parenthesized.expression);
+            }
+            (NodeData::ArrowFunction(_), SyntaxKind::ArrowFunction) => return Some(node),
+            _ => return None,
+        }
+    }
 }
 
 fn is_supported_call_argument_syntax(arena: &NodeArena, node: NodeRef) -> bool {
@@ -502,6 +535,7 @@ fn is_supported_call_argument_syntax(arena: &NodeArena, node: NodeRef) -> bool {
         }
         SyntaxKind::ElementAccessExpression => is_context_insensitive_element_syntax(arena, node),
         SyntaxKind::CallExpression => matches!(&record.data, NodeData::CallExpression(_)),
+        SyntaxKind::ArrowFunction => is_supported_arrow_argument_syntax(arena, node),
         SyntaxKind::ObjectLiteralExpression => {
             matches!(&record.data, NodeData::ObjectLiteralExpression(_))
         }
@@ -517,6 +551,110 @@ fn is_supported_call_argument_syntax(arena: &NodeArena, node: NodeRef) -> bool {
         }
         _ => false,
     }
+}
+
+fn is_supported_arrow_argument_syntax(arena: &NodeArena, node: NodeRef) -> bool {
+    let Some(record) = arena.get(node.node) else {
+        return false;
+    };
+    let NodeData::ArrowFunction(arrow) = &record.data else {
+        return false;
+    };
+    if record.kind != SyntaxKind::ArrowFunction
+        || record.flags.0 != 0
+        || arrow.asterisk_token.is_some()
+        || arrow.end_flow_node.is_some()
+        || arrow.flow_node.is_some()
+        || arrow.full_signature.is_some()
+        || arrow.next_container.is_some()
+        || arrow.symbol.is_some()
+        || arrow.type_parameters.is_some()
+        || arrow.facts != 0
+        || arrow.modifiers.is_some()
+        || arrow.parameters.range.start < record.range.start
+        || arrow.parameters.range.end > record.range.end
+    {
+        return false;
+    }
+
+    let Some(token) = arena.get(arrow.equals_greater_than_token) else {
+        return false;
+    };
+    let Some(body) = arena.get(arrow.body) else {
+        return false;
+    };
+    if token.kind != SyntaxKind::EqualsGreaterThanToken
+        || !matches!(token.data, NodeData::Token(_))
+        || token.parent != Some(node.node)
+        || token.flags.0 != 0
+        || token.range.start < arrow.parameters.range.end
+        || body.parent != Some(node.node)
+        || body.range.start < token.range.end
+        || body.range.end > record.range.end
+    {
+        return false;
+    }
+    if let Some(type_id) = arrow.type_ {
+        let Some(annotation) = arena.get(type_id) else {
+            return false;
+        };
+        if annotation.parent != Some(node.node)
+            || annotation.range.start < arrow.parameters.range.end
+            || annotation.range.end > token.range.start
+        {
+            return false;
+        }
+    }
+
+    let mut previous_end = arrow.parameters.range.start;
+    for parameter_id in &arrow.parameters.nodes {
+        let Some(parameter) = arena.get(*parameter_id) else {
+            return false;
+        };
+        let NodeData::ParameterDeclaration(data) = &parameter.data else {
+            return false;
+        };
+        if parameter.kind != SyntaxKind::Parameter
+            || parameter.parent != Some(node.node)
+            || parameter.flags.0 != 0
+            || parameter.range.start < previous_end
+            || parameter.range.end > arrow.parameters.range.end
+            || data.facts != 0
+            || data.symbol.is_some()
+            || data.modifiers.is_some()
+        {
+            return false;
+        }
+        let Some(name) = arena.get(data.name) else {
+            return false;
+        };
+        if name.kind != SyntaxKind::Identifier
+            || name.parent != Some(*parameter_id)
+            || name.flags.0 != 0
+            || name.range.start < parameter.range.start
+            || name.range.end > parameter.range.end
+            || !matches!(
+                &name.data,
+                NodeData::Identifier(identifier)
+                    if identifier.flow_node.is_none() && !identifier.text.is_empty()
+            )
+        {
+            return false;
+        }
+        if let Some(type_id) = data.type_ {
+            let Some(annotation) = arena.get(type_id) else {
+                return false;
+            };
+            if annotation.parent != Some(*parameter_id)
+                || annotation.range.start < name.range.end
+                || annotation.range.end > parameter.range.end
+            {
+                return false;
+            }
+        }
+        previous_end = parameter.range.end;
+    }
+    true
 }
 
 fn is_supported_type_assertion_argument_syntax(arena: &NodeArena, node: NodeRef) -> bool {
@@ -752,7 +890,8 @@ fn is_supported_call_argument_plan(expression: &PlannedExpression) -> bool {
         | PlannedExpressionKind::GlobalUndefined
         | PlannedExpressionKind::Identifier(_)
         | PlannedExpressionKind::Property(_)
-        | PlannedExpressionKind::Element(_) => true,
+        | PlannedExpressionKind::Element(_)
+        | PlannedExpressionKind::Arrow(_) => true,
         PlannedExpressionKind::Call(call) => {
             call.node == expression.node
                 && call.arguments.iter().all(is_supported_call_argument_plan)
@@ -820,6 +959,7 @@ fn is_context_insensitive_primitive_binary_operand_plan(expression: &PlannedExpr
         | PlannedExpressionKind::Object { .. }
         | PlannedExpressionKind::Property(_)
         | PlannedExpressionKind::Call(_)
+        | PlannedExpressionKind::Arrow(_)
         | PlannedExpressionKind::New(_)
         | PlannedExpressionKind::Conditional(_) => false,
     }
@@ -2543,6 +2683,201 @@ mod tests {
                 TextPos::new(u32::try_from(trailing_end).unwrap()),
             ))
         );
+    }
+
+    #[test]
+    fn call_plan_accepts_authenticated_arrow_arguments_without_publication() {
+        let parsed = parsed(concat!(
+            "function take(value: any): void {} ",
+            "take(() => 127); ",
+            "take((() => 1)); ",
+            "take((value: number): number => value);",
+        ));
+        let file = FileId::new(457);
+        let mut call_nodes = calls(&parsed, file);
+        call_nodes.sort_by_key(|call| parsed.arena.get(call.node).unwrap().range.start);
+        let context = context(&parsed, file);
+
+        for call in call_nodes {
+            let syntax = plan_direct_source_call_syntax(&parsed.arena, context.store(), call)
+                .expect("well-formed arrow arguments must pass call syntax validation");
+            assert_eq!(syntax.arguments().len(), 1);
+            assert!(context.store().type_node_links(call).is_none());
+            assert!(context.store().signature_links(call).is_none());
+        }
+    }
+
+    #[test]
+    fn arrow_argument_validation_rejects_forged_facts_tokens_and_body_ownership() {
+        for poison in 0..3 {
+            let mut parsed = parsed("function take(value: any): void {} take(() => 127);");
+            let file = FileId::new(458 + poison);
+            let arrow = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::ArrowFunction).then_some(NodeRef::new(
+                        parsed.arena.id(),
+                        file,
+                        node,
+                    ))
+                })
+                .expect("fixture must contain one arrow argument");
+            let (body, token) = {
+                let NodeData::ArrowFunction(arrow) = &parsed.arena.get(arrow.node).unwrap().data
+                else {
+                    unreachable!("the selected node is an arrow")
+                };
+                (arrow.body, arrow.equals_greater_than_token)
+            };
+            match poison {
+                0 => {
+                    let NodeData::ArrowFunction(arrow) =
+                        &mut parsed.arena.get_mut(arrow.node).unwrap().data
+                    else {
+                        unreachable!("the selected node is an arrow")
+                    };
+                    arrow.facts = 1;
+                }
+                1 => {
+                    let NodeData::ArrowFunction(arrow) =
+                        &mut parsed.arena.get_mut(arrow.node).unwrap().data
+                    else {
+                        unreachable!("the selected node is an arrow")
+                    };
+                    arrow.equals_greater_than_token = body;
+                }
+                2 => parsed.arena.get_mut(body).unwrap().parent = Some(token),
+                _ => unreachable!("only the three authenticated arrow fields are mutated"),
+            }
+
+            assert!(!is_supported_arrow_argument_syntax(&parsed.arena, arrow));
+            let call_nodes = calls(&parsed, file);
+            let [call] = call_nodes.as_slice() else {
+                panic!("fixture must contain one direct call")
+            };
+            let store = CanonicalTypeMapperStore::new();
+            assert!(matches!(
+                plan_direct_source_call_syntax(&parsed.arena, &store, *call),
+                Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::Call(node)))
+                    if node == *call
+            ));
+            assert!(store.type_node_links(*call).is_none());
+            assert!(store.signature_links(*call).is_none());
+        }
+    }
+
+    #[test]
+    fn arrow_argument_validation_rejects_forged_parameter_and_return_annotations() {
+        for poison in 0..3 {
+            let mut parsed = parsed(concat!(
+                "function take(value: any): void {} ",
+                "take((value: number): number => value);",
+            ));
+            let file = FileId::new(461 + poison);
+            let arrow = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::ArrowFunction).then_some(NodeRef::new(
+                        parsed.arena.id(),
+                        file,
+                        node,
+                    ))
+                })
+                .expect("fixture must contain one arrow argument");
+            let (parameter, name, parameter_type, return_type) = {
+                let NodeData::ArrowFunction(arrow_data) =
+                    &parsed.arena.get(arrow.node).unwrap().data
+                else {
+                    unreachable!("the selected node is an arrow")
+                };
+                let [parameter] = arrow_data.parameters.nodes.as_slice() else {
+                    panic!("fixture must contain one arrow parameter")
+                };
+                let NodeData::ParameterDeclaration(parameter_data) =
+                    &parsed.arena.get(*parameter).unwrap().data
+                else {
+                    unreachable!("the arrow child is a parameter")
+                };
+                (
+                    *parameter,
+                    parameter_data.name,
+                    parameter_data.type_.expect("parameter has an annotation"),
+                    arrow_data.type_.expect("arrow has a return annotation"),
+                )
+            };
+            match poison {
+                0 => parsed.arena.get_mut(name).unwrap().parent = Some(arrow.node),
+                1 => parsed.arena.get_mut(parameter_type).unwrap().parent = Some(arrow.node),
+                2 => parsed.arena.get_mut(return_type).unwrap().parent = Some(parameter),
+                _ => unreachable!("only the three owned arrow children are mutated"),
+            }
+
+            assert!(!is_supported_arrow_argument_syntax(&parsed.arena, arrow));
+            let call_nodes = calls(&parsed, file);
+            let [call] = call_nodes.as_slice() else {
+                panic!("fixture must contain one direct call")
+            };
+            let store = CanonicalTypeMapperStore::new();
+            assert!(matches!(
+                plan_direct_source_call_syntax(&parsed.arena, &store, *call),
+                Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::Call(node)))
+                    if node == *call
+            ));
+            assert!(store.type_node_links(*call).is_none());
+            assert!(store.signature_links(*call).is_none());
+        }
+    }
+
+    #[test]
+    fn finished_call_plan_rejects_scalar_plans_for_authenticated_arrow_arguments() {
+        let parsed = parsed(concat!(
+            "function take(value: any): void {} ",
+            "const direct = take(() => 1); ",
+            "const wrapped = take((() => 2));",
+        ));
+        let file = FileId::new(464);
+        let context = context(&parsed, file);
+        let symbol = first_function_symbol(&parsed, &context, file);
+
+        for call in calls(&parsed, file) {
+            let syntax = plan_direct_source_call_syntax(&parsed.arena, context.store(), call)
+                .expect("the fixture contains authenticated arrow arguments");
+            let [argument] = syntax.arguments() else {
+                panic!("the fixture calls have one argument")
+            };
+            let forged_argument = match &parsed.arena.get(argument.node).unwrap().data {
+                NodeData::ArrowFunction(_) => PlannedExpression::new(
+                    *argument,
+                    PlannedExpressionKind::String("forged".into()),
+                ),
+                NodeData::ParenthesizedExpression(parenthesized) => {
+                    let inner =
+                        NodeRef::new(argument.arena, argument.file, parenthesized.expression);
+                    PlannedExpression::new(
+                        *argument,
+                        PlannedExpressionKind::Parenthesized(Box::new(PlannedExpression::new(
+                            inner,
+                            PlannedExpressionKind::String("forged".into()),
+                        ))),
+                    )
+                }
+                _ => unreachable!("the fixture contains only direct and wrapped arrows"),
+            };
+
+            assert!(matches!(
+                finish_direct_source_call_plan(
+                    &syntax,
+                    identifier_plan(syntax.callee(), symbol),
+                    vec![forged_argument],
+                ),
+                Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::Call(node)))
+                    if node == call
+            ));
+            assert!(context.store().type_node_links(call).is_none());
+            assert!(context.store().signature_links(call).is_none());
+        }
     }
 
     #[test]
