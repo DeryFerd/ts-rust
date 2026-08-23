@@ -827,3 +827,149 @@ fn production_record_alias_instantiations_preserve_distinct_named_aliases() {
         warm,
     );
 }
+
+#[test]
+#[allow(clippy::too_many_lines)] // One source proves the complete recursive graph and warm caches.
+fn recursive_mapped_alias_constraints_preserve_the_complete_generic_graph() {
+    let parsed = parse_source_file(concat!(
+        "type Loop<T, U extends Loop<T, U>> = {\n",
+        "    [P in keyof T]: U[P] extends boolean ? number : string;\n",
+        "};\n",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(2);
+    let mut binder = CanonicalBinder::new();
+    binder
+        .bind_source_file_with_facts(
+            &parsed.arena,
+            parsed.source_file,
+            file,
+            CanonicalSourceFileFacts::new(
+                EscapedName::source("\"/project/recursive-mapped-types.ts\""),
+                CanonicalSourceLanguage::TypeScript,
+                false,
+                CanonicalModuleState::Script,
+            ),
+        )
+        .unwrap();
+    binder
+        .bind_typescript_declaration_slice(&parsed.arena, file)
+        .unwrap();
+    let mut context = CanonicalCheckerContext::new(
+        binder.finish(),
+        vec![(file, &parsed.arena)],
+        CanonicalCheckerOptions::default(),
+    )
+    .unwrap();
+
+    context.check_source_file(file).unwrap();
+    assert!(
+        context.diagnostics().is_empty(),
+        "{:?}",
+        context.diagnostics()
+    );
+
+    let (declaration, mapped_node) = parsed
+        .arena
+        .iter()
+        .find_map(|(node, record)| {
+            let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+                return None;
+            };
+            Some((
+                NodeRef::new(parsed.arena.id(), file, node),
+                NodeRef::new(parsed.arena.id(), file, alias.type_),
+            ))
+        })
+        .unwrap();
+    let alias = context.file(file).unwrap().1.symbol(declaration).unwrap();
+    let links = context.store().type_alias_links(alias).unwrap();
+    let resolved = links.declared_type.unwrap();
+    let [target, constrained] = links.type_parameters.as_deref().unwrap() else {
+        panic!("Loop must retain its two source type parameters")
+    };
+    let TypeData::TypeParameter(constrained_record) =
+        context.store().type_payload(*constrained).unwrap().data()
+    else {
+        panic!("U must retain its canonical type parameter")
+    };
+    assert_eq!(constrained_record.constraint, Some(resolved));
+
+    let TypeData::Mapped(mapped) = context.store().type_payload(resolved).unwrap().data() else {
+        panic!("Loop must resolve to a canonical mapped type")
+    };
+    assert_eq!(mapped.declaration, Some(mapped_node));
+    assert_eq!(mapped.modifiers_type, Some(*target));
+    let parameter = mapped.type_parameter.unwrap();
+    let TypeData::Index(index) = context
+        .store()
+        .type_payload(mapped.constraint_type.unwrap())
+        .unwrap()
+        .data()
+    else {
+        panic!("P must be constrained by the canonical keyof T index")
+    };
+    assert_eq!(index.target, *target);
+
+    let TypeData::Conditional(conditional) = context
+        .store()
+        .type_payload(mapped.template_type.unwrap())
+        .unwrap()
+        .data()
+    else {
+        panic!("the mapped template must retain its deferred conditional")
+    };
+    let TypeData::IndexedAccess(access) = context
+        .store()
+        .type_payload(conditional.check_type)
+        .unwrap()
+        .data()
+    else {
+        panic!("the conditional must check the deferred U[P] access")
+    };
+    assert_eq!(access.object_type, *constrained);
+    assert_eq!(access.index_type, parameter);
+    assert_eq!(
+        conditional.extends_type,
+        context.store().intrinsic_bootstrap().unwrap().boolean_type,
+    );
+    assert_eq!(
+        context
+            .store()
+            .conditional_root(conditional.root)
+            .unwrap()
+            .outer_type_parameters(),
+        Some([*constrained, parameter].as_slice()),
+    );
+
+    let alias_instantiations = links.instantiations.as_ref().unwrap();
+    assert!(alias_instantiations.len() >= 2);
+    assert!(
+        alias_instantiations
+            .values()
+            .all(|instantiation| *instantiation == resolved)
+    );
+    let ts_checker::semantic::type_records::TypeCacheState::Allocated(instantiations) =
+        &mapped.object.instantiations
+    else {
+        panic!("the mapped object must cache its alias-aware identity instantiation")
+    };
+    assert!(instantiations.values().any(|cached| *cached == resolved));
+
+    let warm = (
+        context.store().type_len(),
+        context.store().mapper_len(),
+        context.store().conditional_root_len(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().mapper_len(),
+            context.store().conditional_root_len(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
+}

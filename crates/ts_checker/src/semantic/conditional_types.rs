@@ -1357,6 +1357,10 @@ fn validate_conditional_operand(
         }
         TypeData::Object(object) => dependencies.extend(object.target),
         TypeData::TypeParameter(parameter) => dependencies.extend(parameter.constraint),
+        TypeData::Index(index) => dependencies.push(index.target),
+        TypeData::IndexedAccess(indexed) => {
+            dependencies.extend([indexed.object_type, indexed.index_type]);
+        }
         TypeData::TemplateLiteral(template) => dependencies.extend_from_slice(&template.types),
         TypeData::StringMapping(mapping) => dependencies.push(mapping.target),
         TypeData::Conditional(conditional) => {
@@ -1740,6 +1744,13 @@ fn contains_mapped_type_parameter(
                     found || contains_mapped_type_parameter(store, *item, parameters, visiting)?,
                 )
             })?,
+        TypeData::Index(index) => {
+            contains_mapped_type_parameter(store, index.target, parameters, visiting)?
+        }
+        TypeData::IndexedAccess(indexed) => {
+            contains_mapped_type_parameter(store, indexed.object_type, parameters, visiting)?
+                || contains_mapped_type_parameter(store, indexed.index_type, parameters, visiting)?
+        }
         TypeData::Conditional(conditional) => {
             contains_mapped_type_parameter(store, conditional.check_type, parameters, visiting)?
                 || contains_mapped_type_parameter(
@@ -1827,6 +1838,11 @@ fn contains_type_parameter(
                 .try_fold(false, |found, item| {
                     Ok::<_, ConditionalTypeError>(found || visit(store, *item, excluded, visiting)?)
                 })?,
+            TypeData::Index(index) => visit(store, index.target, excluded, visiting)?,
+            TypeData::IndexedAccess(indexed) => {
+                visit(store, indexed.object_type, excluded, visiting)?
+                    || visit(store, indexed.index_type, excluded, visiting)?
+            }
             TypeData::Conditional(_) => true,
             TypeData::TemplateLiteral(template) => {
                 template.types.iter().try_fold(false, |found, item| {
@@ -3037,8 +3053,12 @@ mod tests {
     use crate::semantic::{
         CanonicalCheckerDiagnostics, CanonicalCheckerOptions, DeclaredTypeHost,
         IntrinsicBootstrapOptions, SemanticStore, ValueSymbolLinks,
-        declared::execute_type_parameter, mapper::TypeMapper, production::GlobalMergeCompletion,
-        type_nodes::CanonicalTypeQuery, types::ObjectFlags,
+        declared::execute_type_parameter,
+        mapper::TypeMapper,
+        production::GlobalMergeCompletion,
+        signatures::IndexFlags,
+        type_nodes::CanonicalTypeQuery,
+        types::{AccessFlags, ObjectFlags},
     };
 
     struct Fixture {
@@ -3699,6 +3719,151 @@ mod tests {
             Err(ConditionalTypeError::DuplicateTypeParameter(parameter))
         );
         assert_eq!(fixture.store.conditional_root_len(), before);
+    }
+
+    #[test]
+    fn indexed_conditional_operands_preserve_nested_type_parameter_dependencies() {
+        let mut fixture =
+            Fixture::new("type Result<Object, Key> = Object extends Key ? Object : never;");
+        let object = fixture.type_parameter("Object");
+        let key = fixture.type_parameter("Key");
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let (string, never) = (bootstrap.string_type, bootstrap.never_type);
+        let keyof_object = fixture
+            .store
+            .alloc_index_type(object, IndexFlags::NONE)
+            .unwrap();
+        let object_access = fixture
+            .store
+            .alloc_indexed_access_type(object, string, AccessFlags::NONE)
+            .unwrap();
+        let key_access = fixture
+            .store
+            .alloc_indexed_access_type(string, key, AccessFlags::NONE)
+            .unwrap();
+        let nested_access = fixture
+            .store
+            .alloc_indexed_access_type(keyof_object, key, AccessFlags::NONE)
+            .unwrap();
+
+        for (type_, contains_object, contains_key) in [
+            (keyof_object, true, false),
+            (object_access, true, false),
+            (key_access, false, true),
+            (nested_access, true, true),
+        ] {
+            assert_eq!(
+                contains_mapped_type_parameter(
+                    &fixture.store,
+                    type_,
+                    &[object],
+                    &mut HashSet::new(),
+                ),
+                Ok(contains_object),
+            );
+            assert_eq!(
+                contains_mapped_type_parameter(&fixture.store, type_, &[key], &mut HashSet::new()),
+                Ok(contains_key),
+            );
+            assert_eq!(
+                contains_type_parameter(&fixture.store, type_, &HashSet::from([object])),
+                Ok(contains_key),
+            );
+            assert_eq!(
+                contains_type_parameter(&fixture.store, type_, &HashSet::from([key])),
+                Ok(contains_object),
+            );
+            assert_eq!(
+                contains_type_parameter(&fixture.store, type_, &HashSet::from([object, key])),
+                Ok(false),
+            );
+            assert_eq!(
+                validate_conditional_operand(&fixture.store, type_, &mut HashSet::new()),
+                Ok(()),
+            );
+        }
+
+        let node = fixture.conditional();
+        let conditional = get_type_from_conditional_type(
+            &mut fixture.store,
+            ConditionalTypeRequest {
+                node,
+                check_type: nested_access,
+                extends_type: string,
+                branches: branches(string, never),
+                infer_type_parameters: &[],
+                outer_type_parameters: &[object, key],
+                alias: None,
+            },
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            fixture.store.type_payload(conditional).map(TypeRecord::data),
+            Some(TypeData::Conditional(data)) if data.check_type == nested_access
+        ));
+    }
+
+    #[test]
+    fn indexed_conditional_operands_reject_malformed_nested_signatures() {
+        let mut fixture = Fixture::new("type Result<T> = T extends string ? T : never;");
+        let parameter = fixture.type_parameter("T");
+        let malformed = fixture
+            .store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, None)
+            .unwrap();
+        let signature = fixture
+            .store
+            .alloc_signature(
+                SignatureFlags::NONE,
+                None,
+                Vec::new(),
+                None,
+                Vec::new(),
+                None,
+                None,
+                0,
+            )
+            .unwrap();
+        assert!(fixture.store.set_structured_type_members(
+            malformed,
+            None,
+            None,
+            Some(vec![signature]),
+            None,
+            None,
+        ));
+
+        let keyof_malformed = fixture
+            .store
+            .alloc_index_type(malformed, IndexFlags::NONE)
+            .unwrap();
+        let malformed_object = fixture
+            .store
+            .alloc_indexed_access_type(malformed, parameter, AccessFlags::NONE)
+            .unwrap();
+        let malformed_index = fixture
+            .store
+            .alloc_indexed_access_type(parameter, malformed, AccessFlags::NONE)
+            .unwrap();
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.conditional_root_len(),
+        );
+
+        for type_ in [keyof_malformed, malformed_object, malformed_index] {
+            assert_eq!(
+                validate_conditional_operand(&fixture.store, type_, &mut HashSet::new()),
+                Err(ConditionalTypeError::InvalidSignature(signature)),
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.conditional_root_len()
+                ),
+                before,
+            );
+        }
     }
 
     #[test]

@@ -6,9 +6,10 @@
 //! parenthesized type literal admitted by [`super::object_members`]. Required
 //! own properties and string/number index signatures are supported, including
 //! mixed surfaces: an exact literal property wins, then an applicable number
-//! index wins over a string index. Generic or named operands, optional
-//! properties, union keys, tuples, apparent types, and diagnostic recovery
-//! remain explicit boundaries.
+//! index wins over a string index. Generic type-parameter pairs have a
+//! separate deferred constructor. Other named operands, optional properties,
+//! union keys, tuples, apparent types, and diagnostic recovery remain explicit
+//! concrete-planner boundaries.
 //!
 //! Planning chooses the exact property symbol or index-info slot before any
 //! semantic child executes. Finishing only validates the already-resolved
@@ -22,12 +23,12 @@ use ts_jsnum::Number;
 use super::{
     CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, TypeId,
     bootstrap::LiteralTypeCacheError,
-    declared::preflight_node,
+    declared::{cached_ordinary_type_parameter_owner, preflight_node},
     links::ValueSymbolLinks,
     object_members::{self, PropertyObjectError, PropertyObjectPlan, PropertyObjectState},
     type_nodes::normalize_numeric_separators,
     type_records::{LiteralValue, TypeData, TypeRecord},
-    types::TypeFlags,
+    types::{AccessFlags, TypeFlags},
 };
 
 const NODE_FLAG_JSDOC: u32 = 1 << 22;
@@ -166,6 +167,43 @@ impl std::fmt::Display for ConcreteIndexedAccessError {
 }
 
 impl std::error::Error for ConcreteIndexedAccessError {}
+
+/// Returns the canonical deferred indexed access for two owned type parameters.
+///
+/// Transient access flags do not affect the stored type identity. A malformed
+/// existing record or duplicate identity fails without allocating another type.
+pub(super) fn get_deferred_indexed_access_type(
+    store: &mut CanonicalTypeMapperStore,
+    object_type: TypeId,
+    index_type: TypeId,
+    access_flags: AccessFlags,
+) -> Option<TypeId> {
+    cached_ordinary_type_parameter_owner(store, object_type)?;
+    cached_ordinary_type_parameter_owner(store, index_type)?;
+    let persistent_flags = access_flags & AccessFlags::PERSISTENT;
+    let mut cached = None;
+
+    for (type_, record) in store.types() {
+        let TypeData::IndexedAccess(indexed) = record.data() else {
+            continue;
+        };
+        if indexed.object_type != object_type
+            || indexed.index_type != index_type
+            || indexed.access_flags != persistent_flags
+        {
+            continue;
+        }
+        if record.flags() != TypeFlags::INDEXED_ACCESS
+            || record.symbol().is_some()
+            || record.alias().is_some()
+            || cached.replace(type_).is_some()
+        {
+            return None;
+        }
+    }
+
+    cached.or_else(|| store.alloc_indexed_access_type(object_type, index_type, persistent_flags))
+}
 
 /// Preflights one complete concrete indexed-access dependency closure.
 ///
@@ -1012,8 +1050,105 @@ fn resolved_selection_type(
 mod tests {
     use ts_binder::{CheckFlags, EscapedName, SymbolFlags};
 
-    use super::{is_template_pattern_index_key, template_pattern_index_matches_name};
-    use crate::semantic::{CanonicalTypeMapperStore, IntrinsicBootstrapOptions};
+    use super::{
+        AccessFlags, get_deferred_indexed_access_type, is_template_pattern_index_key,
+        template_pattern_index_matches_name,
+    };
+    use crate::semantic::{
+        CanonicalTypeMapperStore, DeclaredTypeLinks, IntrinsicBootstrapOptions, TypeData, TypeId,
+    };
+
+    fn owned_type_parameter(store: &mut CanonicalTypeMapperStore, name: &str) -> TypeId {
+        let symbol = store.alloc_transient_symbol(
+            SymbolFlags::TYPE_PARAMETER,
+            EscapedName::source(name),
+            CheckFlags::NONE,
+        );
+        let type_ = store.alloc_type_parameter(Some(symbol)).unwrap();
+        assert!(store.set_declared_type_links(
+            symbol,
+            DeclaredTypeLinks {
+                declared_type: Some(type_),
+                ..DeclaredTypeLinks::default()
+            },
+        ));
+        type_
+    }
+
+    #[test]
+    fn deferred_indexed_access_normalizes_flags_and_reuses_owned_identity() {
+        let mut store = CanonicalTypeMapperStore::new();
+        let object = owned_type_parameter(&mut store, "U");
+        let index = owned_type_parameter(&mut store, "P");
+        let before = store.type_len();
+
+        let plain = get_deferred_indexed_access_type(
+            &mut store,
+            object,
+            index,
+            AccessFlags::WRITING | AccessFlags::CACHE_SYMBOL,
+        )
+        .unwrap();
+        let TypeData::IndexedAccess(data) = store.type_payload(plain).unwrap().data() else {
+            panic!("the generic access must retain its deferred type")
+        };
+        assert_eq!(data.object_type, object);
+        assert_eq!(data.index_type, index);
+        assert_eq!(data.access_flags, AccessFlags::NONE);
+        assert_eq!(
+            get_deferred_indexed_access_type(&mut store, object, index, AccessFlags::NONE),
+            Some(plain),
+        );
+
+        let optional = get_deferred_indexed_access_type(
+            &mut store,
+            object,
+            index,
+            AccessFlags::INCLUDE_UNDEFINED | AccessFlags::CONTEXTUAL,
+        )
+        .unwrap();
+        assert_ne!(optional, plain);
+        assert_eq!(
+            get_deferred_indexed_access_type(
+                &mut store,
+                object,
+                index,
+                AccessFlags::INCLUDE_UNDEFINED | AccessFlags::WRITING,
+            ),
+            Some(optional),
+        );
+        assert_eq!(store.type_len(), before + 2);
+    }
+
+    #[test]
+    fn deferred_indexed_access_rejects_unowned_and_poisoned_type_identities() {
+        let mut store = CanonicalTypeMapperStore::new();
+        let object = owned_type_parameter(&mut store, "U");
+        let index = owned_type_parameter(&mut store, "P");
+        let mut foreign_store = CanonicalTypeMapperStore::new();
+        let foreign = owned_type_parameter(&mut foreign_store, "Foreign");
+        let orphan = store.alloc_type_parameter(None).unwrap();
+        let before = store.type_len();
+
+        for (object, index) in [(foreign, index), (object, foreign), (orphan, index)] {
+            assert_eq!(
+                get_deferred_indexed_access_type(&mut store, object, index, AccessFlags::NONE),
+                None,
+            );
+            assert_eq!(store.type_len(), before);
+        }
+
+        let cached =
+            get_deferred_indexed_access_type(&mut store, object, index, AccessFlags::NONE).unwrap();
+        let owner = store.type_payload(object).unwrap().symbol().unwrap();
+        assert!(store.set_type_symbol(cached, Some(owner)));
+        let poisoned = store.type_len();
+        assert_eq!(
+            get_deferred_indexed_access_type(&mut store, object, index, AccessFlags::NONE),
+            None,
+        );
+        assert_eq!(store.type_len(), poisoned);
+    }
 
     #[test]
     fn template_pattern_index_matches_only_compatible_property_names() {

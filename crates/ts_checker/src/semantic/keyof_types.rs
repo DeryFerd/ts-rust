@@ -1,11 +1,13 @@
 //! Exact nongeneric property-key extraction.
 //!
 //! This leaf implements the dependency-independent prefix of pinned
-//! `getIndexType` and `getLiteralTypeFromProperties`. It accepts only fully
-//! resolved, source-owned interfaces and type literals. Named properties
-//! become canonical regular string-literal types, a number index contributes
-//! `number`, and a string index contributes `string | number`. The latter
-//! absorbs every explicit property and number index in the result.
+//! `getIndexType` and `getLiteralTypeFromProperties`. It accepts authenticated
+//! ordinary type parameters and fully resolved, source-owned interfaces and
+//! type literals. Ordinary type parameters reuse one normalized `IndexType`
+//! identity. Named properties become canonical regular string-literal types,
+//! a number index contributes `number`, and a string index contributes
+//! `string | number`. The latter absorbs every explicit property and number
+//! index in the result.
 //!
 //! Anonymous type literals use the existing canonical literal/union caches.
 //! Class/interface/reference and aliased objects additionally preserve pinned
@@ -28,6 +30,7 @@ use ts_binder::{CheckFlags, InternalSymbolName, SemanticSymbolId, SymbolFlags};
 use super::{
     CanonicalTypeMapperStore, TypeId,
     bootstrap::LiteralTypeCacheError,
+    declared::cached_ordinary_type_parameter_owner,
     links::ValueSymbolLinks,
     mapped_types::{MappedTypeError, MappedTypeKey, MappedTypeKeys, plan_mapped_type_keys},
     object_members::{
@@ -65,6 +68,7 @@ enum KeyofComposition {
     Union(Vec<NongenericKeyofPlan>),
     Intersection(Vec<NongenericKeyofPlan>),
     Intrinsic(TypeId),
+    GenericParameter,
     Mapped(Vec<MappedTypeKey>),
     MappedOverflow { size: usize, limit: usize },
 }
@@ -208,6 +212,20 @@ pub(super) fn plan_nongeneric_keyof_type(
     }
 
     match record.data() {
+        TypeData::TypeParameter(_) => {
+            if cached_ordinary_type_parameter_owner(store, target).is_none() {
+                return Err(NongenericKeyofError::MalformedObject(target));
+            }
+            return Ok(NongenericKeyofPlan {
+                target,
+                proof: DeclaredPropertyObjectProof::TypeLiteral,
+                property_names: Vec::new(),
+                has_string_index: false,
+                has_number_index: false,
+                preserves_origin: false,
+                composition: Some(KeyofComposition::GenericParameter),
+            });
+        }
         TypeData::Union(union) => {
             return plan_composite_keyof_type(store, target, &union.union.types, true);
         }
@@ -362,7 +380,11 @@ fn plan_composite_keyof_type(
             })?;
         if matches!(
             constituent.composition,
-            Some(KeyofComposition::Intrinsic(_) | KeyofComposition::MappedOverflow { .. })
+            Some(
+                KeyofComposition::Intrinsic(_)
+                    | KeyofComposition::GenericParameter
+                    | KeyofComposition::MappedOverflow { .. }
+            )
         ) {
             return Err(NongenericKeyofError::UnsupportedObject(target));
         }
@@ -479,6 +501,14 @@ fn resolve_composite_keyof_type(
 ) -> Result<TypeId, NongenericKeyofError> {
     let constituents = match composition {
         KeyofComposition::Intrinsic(result) => return Ok(*result),
+        KeyofComposition::GenericParameter => {
+            if !store.try_reserve_types(1) {
+                return Err(LiteralTypeCacheError::Capacity.into());
+            }
+            return store
+                .alloc_index_type(plan.target, IndexFlags::NONE)
+                .ok_or_else(|| LiteralTypeCacheError::Capacity.into());
+        }
         KeyofComposition::Mapped(keys) => return resolve_mapped_keyof_type(store, plan, keys),
         KeyofComposition::MappedOverflow { size, limit } => {
             debug_assert_eq!(plan.mapped_cross_product_too_large(), Some((*size, *limit)),);
@@ -541,6 +571,9 @@ fn resolve_composite_keyof_type(
             }
         }
         KeyofComposition::Intrinsic(_) => unreachable!("intrinsic keys return before planning"),
+        KeyofComposition::GenericParameter => {
+            unreachable!("generic parameter keys return before planning")
+        }
         KeyofComposition::Mapped(_) => unreachable!("mapped keys return before planning"),
         KeyofComposition::MappedOverflow { .. } => {
             unreachable!("mapped overflow returns before planning")
@@ -555,6 +588,9 @@ fn cached_composite_keyof_type(
 ) -> Result<Option<TypeId>, NongenericKeyofError> {
     let constituents = match composition {
         KeyofComposition::Intrinsic(result) => return Ok(Some(*result)),
+        KeyofComposition::GenericParameter => {
+            return cached_generic_keyof_index_type(store, plan.target);
+        }
         KeyofComposition::Mapped(keys) => return cached_mapped_keyof_type(store, plan, keys),
         KeyofComposition::MappedOverflow { .. } => {
             return store
@@ -595,6 +631,34 @@ fn cached_composite_keyof_type(
             matches!(composition, KeyofComposition::Intersection(_)),
         ),
     }
+}
+
+fn cached_generic_keyof_index_type(
+    store: &CanonicalTypeMapperStore,
+    target: TypeId,
+) -> Result<Option<TypeId>, NongenericKeyofError> {
+    if cached_ordinary_type_parameter_owner(store, target).is_none() {
+        return Err(NongenericKeyofError::MalformedObject(target));
+    }
+
+    let mut cached = None;
+    for (type_, record) in store.types() {
+        let TypeData::Index(index) = record.data() else {
+            continue;
+        };
+        if index.target != target || index.index_flags != IndexFlags::NONE {
+            continue;
+        }
+        if record.flags() != TypeFlags::INDEX
+            || record.object_flags() != ObjectFlags::NONE
+            || record.symbol().is_some()
+            || record.alias().is_some()
+            || cached.replace(type_).is_some()
+        {
+            return Err(NongenericKeyofError::InvalidCachedResult(type_));
+        }
+    }
+    Ok(cached)
 }
 
 fn resolve_mapped_keyof_type(
@@ -1442,12 +1506,14 @@ mod tests {
     use ts_parser::{ParseResult, parse_source_file};
 
     use super::{
-        IndexFlags, NongenericKeyofError, plan_nongeneric_keyof_type,
+        IndexFlags, NongenericKeyofError, cached_nongeneric_keyof_type, plan_nongeneric_keyof_type,
         resolve_nongeneric_keyof_leaf, resolve_nongeneric_keyof_type,
     };
     use crate::semantic::{
         CanonicalTypeMapperStore, DeclaredTypeHost, IntrinsicBootstrapOptions, TypeAliasLinks,
-        TypeId, object_members, type_records::TypeData,
+        TypeId, object_members,
+        type_records::TypeData,
+        types::{ObjectFlags, TypeFlags},
     };
 
     struct Fixture {
@@ -1622,6 +1688,20 @@ mod tests {
         .unwrap()
     }
 
+    fn resolve_type_parameter(fixture: &mut Fixture) -> TypeId {
+        let declaration = node_of_kind(fixture, SyntaxKind::TypeParameter);
+        let symbol = bound_symbol(fixture, declaration);
+        let host = DeclaredTypeHost::new([(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        )])
+        .unwrap();
+        fixture
+            .store
+            .get_declared_type_of_symbol(&host, symbol)
+            .unwrap()
+    }
+
     fn union_constituents(store: &CanonicalTypeMapperStore, type_: TypeId) -> Vec<TypeId> {
         match store.type_payload(type_).unwrap().data() {
             TypeData::Union(union) => union.union.types.clone(),
@@ -1637,6 +1717,95 @@ mod tests {
             bootstrap.union_cache_len(),
             store.properties_type_cache_len(),
         )
+    }
+
+    #[test]
+    fn ordinary_type_parameter_keyof_reuses_one_normalized_index_identity() {
+        let mut fixture = fixture("type Keys<T> = keyof T;");
+        let parameter = resolve_type_parameter(&mut fixture);
+        let plan = plan_nongeneric_keyof_type(&fixture.store, parameter).unwrap();
+        assert_eq!(
+            cached_nongeneric_keyof_type(&fixture.store, &plan),
+            Ok(None)
+        );
+
+        let before = cache_state(&fixture.store);
+        let cold = resolve_nongeneric_keyof_type(&mut fixture.store, &plan).unwrap();
+        let record = fixture.store.type_payload(cold).unwrap();
+        let TypeData::Index(index) = record.data() else {
+            panic!("generic keyof must create an Index type");
+        };
+        assert_eq!(record.flags(), TypeFlags::INDEX);
+        assert_eq!(record.object_flags(), ObjectFlags::NONE);
+        assert_eq!(record.symbol(), None);
+        assert_eq!(record.alias(), None);
+        assert_eq!(index.target, parameter);
+        assert_eq!(index.index_flags, IndexFlags::NONE);
+
+        let after_cold = cache_state(&fixture.store);
+        assert_eq!(after_cold, (before.0 + 1, before.1, before.2, before.3));
+        assert_eq!(
+            cached_nongeneric_keyof_type(&fixture.store, &plan),
+            Ok(Some(cold))
+        );
+        assert_eq!(
+            resolve_nongeneric_keyof_type(&mut fixture.store, &plan),
+            Ok(cold)
+        );
+        assert_eq!(cache_state(&fixture.store), after_cold);
+    }
+
+    #[test]
+    fn generic_keyof_rejects_foreign_parameters_and_malformed_owners() {
+        let mut local = fixture("type Keys<T> = keyof T;");
+        let parameter = resolve_type_parameter(&mut local);
+        let foreign = fixture("type Other<T> = T;");
+        assert_eq!(
+            plan_nongeneric_keyof_type(&foreign.store, parameter),
+            Err(NongenericKeyofError::InvalidType(parameter))
+        );
+
+        let orphan = local.store.alloc_type_parameter(None).unwrap();
+        assert_eq!(
+            plan_nongeneric_keyof_type(&local.store, orphan),
+            Err(NongenericKeyofError::MalformedObject(orphan))
+        );
+
+        let plan = plan_nongeneric_keyof_type(&local.store, parameter).unwrap();
+        assert!(local.store.set_type_symbol(parameter, None));
+        assert_eq!(
+            cached_nongeneric_keyof_type(&local.store, &plan),
+            Err(NongenericKeyofError::MalformedObject(parameter))
+        );
+    }
+
+    #[test]
+    fn generic_keyof_rejects_poisoned_or_duplicate_index_identities() {
+        let mut poisoned = fixture("type Keys<T> = keyof T;");
+        let parameter = resolve_type_parameter(&mut poisoned);
+        let plan = plan_nongeneric_keyof_type(&poisoned.store, parameter).unwrap();
+        let cached = resolve_nongeneric_keyof_type(&mut poisoned.store, &plan).unwrap();
+        let owner = poisoned.store.type_payload(parameter).unwrap().symbol();
+        assert!(poisoned.store.set_type_symbol(cached, owner));
+        let before = cache_state(&poisoned.store);
+        assert_eq!(
+            resolve_nongeneric_keyof_type(&mut poisoned.store, &plan),
+            Err(NongenericKeyofError::InvalidCachedResult(cached))
+        );
+        assert_eq!(cache_state(&poisoned.store), before);
+
+        let mut duplicate = fixture("type Keys<T> = keyof T;");
+        let parameter = resolve_type_parameter(&mut duplicate);
+        let plan = plan_nongeneric_keyof_type(&duplicate.store, parameter).unwrap();
+        resolve_nongeneric_keyof_type(&mut duplicate.store, &plan).unwrap();
+        let duplicate_index = duplicate
+            .store
+            .alloc_index_type(parameter, IndexFlags::NONE)
+            .unwrap();
+        assert_eq!(
+            cached_nongeneric_keyof_type(&duplicate.store, &plan),
+            Err(NongenericKeyofError::InvalidCachedResult(duplicate_index))
+        );
     }
 
     #[test]

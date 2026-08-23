@@ -45,7 +45,7 @@ use super::{
     },
     indexed_access_types::{
         ConcreteIndexedAccessError, ConcreteIndexedAccessPlan, finish_concrete_indexed_access,
-        plan_concrete_indexed_access,
+        get_deferred_indexed_access_type, plan_concrete_indexed_access,
     },
     instantiate::{InstantiationLimits, InstantiationSession},
     intersection_types::IntersectionTypeError,
@@ -54,7 +54,8 @@ use super::{
         resolve_nongeneric_keyof_type,
     },
     mapped_types::{
-        MappedTypeDeclarationPlan, MappedTypeError, MappedTypeRequest, plan_mapped_type_declaration,
+        MappedTypeDeclarationPlan, MappedTypeError, MappedTypeModifiers, MappedTypeRequest,
+        plan_mapped_type_declaration,
     },
     object_members::{self, PropertyObjectError, PropertyObjectPlan, PropertyObjectState},
     reference_types::{create_direct_generic_reference, validate_direct_generic_reference},
@@ -292,6 +293,7 @@ struct TypeQueryPlan {
     recovered_indexed_accesses: BTreeMap<NodeRef, PlannedRecoveredIndexedAccess>,
     keyofs: BTreeMap<NodeRef, NodeRef>,
     aliases: BTreeMap<SemanticSymbolId, TypeAliasPlan>,
+    recursive_mapped_aliases: BTreeMap<SemanticSymbolId, NodeRef>,
     references: BTreeMap<NodeRef, PlannedTypeReference>,
     type_queries: BTreeMap<NodeRef, PlannedValueTypeQuery>,
     literals: BTreeMap<NodeRef, PlannedLiteralType>,
@@ -1692,12 +1694,15 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         }
         let mapped = plan_mapped_type_declaration(self.store, self.host, node)
             .map_err(|error| mapped_type_error(error, node))?;
+        let recursive_alias =
+            alias_owner.filter(|alias| self.plan.recursive_mapped_aliases.contains_key(alias));
         if let Some(alias) = alias_owner
             && self
                 .plan
                 .aliases
                 .get(&alias)
                 .is_some_and(|alias| !alias.type_parameters.is_empty())
+            && recursive_alias.is_none()
         {
             self.validate_record_mapped_alias_plan(alias, mapped)?;
         }
@@ -1707,11 +1712,56 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             self.plan_type_node_in_context(source, None, false)?;
         }
         if let Some(template) = mapped.template() {
-            self.plan_mapped_template_type(template, mapped.type_parameter_symbol())?;
+            if let Some(alias) = recursive_alias {
+                self.plan_recursive_mapped_template(
+                    alias,
+                    template,
+                    mapped.type_parameter_symbol(),
+                )?;
+            } else {
+                self.plan_mapped_template_type(template, mapped.type_parameter_symbol())?;
+            }
         }
         if let Some(name_type) = mapped.name_type() {
             self.plan_type_node_in_context(name_type, None, false)?;
         }
+        Ok(())
+    }
+
+    fn plan_recursive_mapped_template(
+        &mut self,
+        alias: SemanticSymbolId,
+        node: NodeRef,
+        mapped_parameter: SemanticSymbolId,
+    ) -> Result<(), DeclaredTypeError> {
+        let record = preflight_node(self.store, self.host, node)?;
+        let NodeData::ConditionalTypeNode(conditional) = &record.data else {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::GenericReferenceUnsupported {
+                    node,
+                    symbol: alias,
+                },
+            ));
+        };
+        let check_type = NodeRef::new(node.arena, node.file, conditional.check_type);
+        self.plan_mapped_template_type(check_type, mapped_parameter)?;
+        self.plan_conditional_type(node, None)?;
+        let constrained_parameter = self
+            .plan
+            .aliases
+            .get(&alias)
+            .and_then(|alias| alias.type_parameters.get(1))
+            .map(|parameter| parameter.symbol)
+            .ok_or_else(|| {
+                type_node_unavailable(TypeNodeUnavailable::MissingGenericAliasMetadata(alias))
+            })?;
+        let conditional = self.plan.conditionals.get_mut(&node).ok_or_else(|| {
+            type_node_unavailable(TypeNodeUnavailable::UnsupportedSyntax {
+                node,
+                kind: SyntaxKind::ConditionalType,
+            })
+        })?;
+        conditional.outer_parameters = vec![constrained_parameter, mapped_parameter];
         Ok(())
     }
 
@@ -2376,6 +2426,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         node: NodeRef,
         alias_owner: Option<SemanticSymbolId>,
     ) -> Result<(), DeclaredTypeError> {
+        if self.plan.mapped_indexed_accesses.contains_key(&node) {
+            return Ok(());
+        }
         if let Some(alias) = alias_owner
             && self
                 .plan
@@ -6494,6 +6547,19 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 type_parameters,
             },
         );
+        if let Some(constraint) =
+            self.recursive_mapped_alias_constraint(symbol, type_node, &planned_parameters)?
+        {
+            self.plan
+                .recursive_mapped_aliases
+                .insert(symbol, constraint);
+            self.plan_type_node_in_context(type_node, Some(symbol), union_constituent)?;
+            self.plan_type_node_in_context(constraint, None, false)?;
+            if cached.is_some() {
+                self.validate_cached_generic_alias_constraints(symbol, &planned_parameters)?;
+            }
+            return Ok(type_parameter_count);
+        }
         for (index, parameter) in planned_parameters.iter().copied().enumerate() {
             let Some(constraint) = parameter.constraint else {
                 continue;
@@ -6529,6 +6595,95 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             self.validate_cached_type_alias_identity(symbol, cached, union_constituent)?;
         }
         Ok(type_parameter_count)
+    }
+
+    fn recursive_mapped_alias_constraint(
+        &self,
+        alias: SemanticSymbolId,
+        type_node: NodeRef,
+        parameters: &[PlannedTypeParameter],
+    ) -> Result<Option<NodeRef>, DeclaredTypeError> {
+        let [first, second] = parameters else {
+            return Ok(None);
+        };
+        let Some(constraint) = second.constraint else {
+            return Ok(None);
+        };
+        if first.constraint.is_some()
+            || first.default_type.is_some()
+            || second.default_type.is_some()
+            || preflight_node(self.store, self.host, type_node)?.kind != SyntaxKind::MappedType
+        {
+            return Ok(None);
+        }
+
+        let constraint_record = preflight_node(self.store, self.host, constraint)?;
+        let NodeData::TypeReferenceNode(reference) = &constraint_record.data else {
+            return Ok(None);
+        };
+        if constraint_record.kind != SyntaxKind::TypeReference
+            || reference.type_arguments.is_none()
+            || self.resolve_uncached_type_reference_symbol(constraint)? != alias
+        {
+            return Ok(None);
+        }
+        let arguments = self.type_reference_argument_nodes(constraint)?;
+        if arguments.len() != parameters.len() {
+            return Ok(None);
+        }
+        for (argument, parameter) in arguments.iter().zip(parameters) {
+            let record = preflight_node(self.store, self.host, *argument)?;
+            let NodeData::TypeReferenceNode(reference) = &record.data else {
+                return Ok(None);
+            };
+            if record.kind != SyntaxKind::TypeReference
+                || reference.type_arguments.is_some()
+                || self.resolve_uncached_type_reference_symbol(*argument)? != parameter.symbol
+            {
+                return Ok(None);
+            }
+        }
+
+        let mapped = plan_mapped_type_declaration(self.store, self.host, type_node)
+            .map_err(|error| mapped_type_error(error, type_node))?;
+        let Some(source) = mapped.modifiers_source() else {
+            return Ok(None);
+        };
+        let Some(template) = mapped.template() else {
+            return Ok(None);
+        };
+        if mapped.name_type().is_some()
+            || mapped.modifiers() != MappedTypeModifiers::NONE
+            || self.resolve_uncached_type_reference_symbol(source)? != first.symbol
+        {
+            return Ok(None);
+        }
+
+        let template_record = preflight_node(self.store, self.host, template)?;
+        let NodeData::ConditionalTypeNode(conditional) = &template_record.data else {
+            return Ok(None);
+        };
+        let check = NodeRef::new(template.arena, template.file, conditional.check_type);
+        let check_record = preflight_node(self.store, self.host, check)?;
+        let NodeData::IndexedAccessTypeNode(indexed) = &check_record.data else {
+            return Ok(None);
+        };
+        let object = NodeRef::new(check.arena, check.file, indexed.object_type);
+        let index = NodeRef::new(check.arena, check.file, indexed.index_type);
+        let extends = NodeRef::new(template.arena, template.file, conditional.extends_type);
+        let when_true = NodeRef::new(template.arena, template.file, conditional.true_type);
+        let when_false = NodeRef::new(template.arena, template.file, conditional.false_type);
+        if template_record.kind != SyntaxKind::ConditionalType
+            || check_record.kind != SyntaxKind::IndexedAccessType
+            || self.resolve_uncached_type_reference_symbol(object)? != second.symbol
+            || self.resolve_uncached_type_reference_symbol(index)? != mapped.type_parameter_symbol()
+            || preflight_node(self.store, self.host, extends)?.kind != SyntaxKind::BooleanKeyword
+            || preflight_node(self.store, self.host, when_true)?.kind != SyntaxKind::NumberKeyword
+            || preflight_node(self.store, self.host, when_false)?.kind != SyntaxKind::StringKeyword
+        {
+            return Ok(None);
+        }
+        Ok(Some(constraint))
     }
 
     fn type_node_contains_builtin_array_reference(
@@ -8710,6 +8865,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         let alias = plan.aliases.get(&symbol).cloned().ok_or_else(|| {
             type_node_unavailable(TypeNodeUnavailable::MissingPlannedTypeAlias(symbol))
         })?;
+        if plan.recursive_mapped_aliases.contains_key(&symbol) {
+            return self.execute_recursive_mapped_type_alias(symbol, &alias, plan, prepared);
+        }
         self.resolve_type_alias_parameter_constraints(symbol, &alias, plan, prepared)?;
         let error_type = self
             .store
@@ -8798,6 +8956,83 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             ));
         }
         Ok(published)
+    }
+
+    fn execute_recursive_mapped_type_alias(
+        &mut self,
+        symbol: SemanticSymbolId,
+        alias: &TypeAliasPlan,
+        plan: &TypeQueryPlan,
+        prepared: &mut PreparedTypeQueryTypes,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let mapped_plan = plan
+            .mapped_types
+            .get(&alias.type_node)
+            .copied()
+            .ok_or_else(|| {
+                type_node_unavailable(TypeNodeUnavailable::MissingGenericAliasMetadata(symbol))
+            })?;
+        let type_parameters = alias
+            .type_parameters
+            .iter()
+            .map(|parameter| execute_type_parameter(self.store, parameter.symbol))
+            .collect::<Vec<_>>();
+        let mapped = self
+            .store
+            .begin_recursive_mapped_alias(mapped_plan, symbol, &type_parameters)
+            .map_err(|error| mapped_type_error(error, alias.type_node))?;
+
+        let mut links = self
+            .store
+            .type_alias_links(symbol)
+            .cloned()
+            .unwrap_or_default();
+        let mut instantiations = HashMap::new();
+        instantiations
+            .try_reserve(1)
+            .map_err(|_| type_node_unavailable(TypeNodeUnavailable::LiteralTypeCapacity))?;
+        instantiations.insert(type_list_key(&type_parameters), mapped);
+        links.declared_type = Some(mapped);
+        links.type_parameters = Some(type_parameters.clone());
+        links.instantiations = Some(instantiations);
+        if !self.store.set_type_alias_links(symbol, links) {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTypeAliasSymbol(symbol),
+            ));
+        }
+
+        let constraint = self.execute_type_node(mapped_plan.constraint(), plan, prepared)?;
+        let mapped_parameter =
+            execute_type_parameter(self.store, mapped_plan.type_parameter_symbol());
+        self.store
+            .publish_recursive_mapped_constraint(mapped, mapped_parameter, constraint)
+            .map_err(|error| mapped_type_error(error, alias.type_node))?;
+        self.resolve_type_alias_parameter_constraints(symbol, alias, plan, prepared)?;
+
+        let template_node = mapped_plan.template().ok_or_else(|| {
+            type_node_unavailable(TypeNodeUnavailable::MissingGenericAliasMetadata(symbol))
+        })?;
+        let modifiers_node = mapped_plan.modifiers_source().ok_or_else(|| {
+            type_node_unavailable(TypeNodeUnavailable::MissingGenericAliasMetadata(symbol))
+        })?;
+        let template = self.execute_type_node(template_node, plan, prepared)?;
+        let modifiers = self.execute_type_node(modifiers_node, plan, prepared)?;
+        let request = MappedTypeRequest::new(
+            mapped_plan.node(),
+            mapped_plan.symbol(),
+            mapped_parameter,
+            constraint,
+            template,
+            modifiers,
+        );
+        self.store
+            .finish_recursive_mapped_alias(mapped, request)
+            .map_err(|error| mapped_type_error(error, alias.type_node))?;
+        let key = self.type_alias_instantiation_key(&type_parameters, None)?;
+        self.store
+            .validate_recursive_mapped_alias_identity(symbol, mapped, &type_parameters, key)
+            .map_err(|error| mapped_type_error(error, alias.type_node))?;
+        Ok(mapped)
     }
 
     fn resolve_type_alias_parameter_constraints(
@@ -9494,12 +9729,17 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 )),
             };
         }
-        let resolved = self
-            .store
-            .alloc_indexed_access_type(object_type, index_type, AccessFlags::NONE)
-            .ok_or_else(|| {
-                type_node_unavailable(TypeNodeUnavailable::InvalidIndexedAccessType(node))
-            })?;
+        let resolved = if cached_ordinary_type_parameter_owner(self.store, object_type).is_some()
+            && cached_ordinary_type_parameter_owner(self.store, index_type).is_some()
+        {
+            get_deferred_indexed_access_type(self.store, object_type, index_type, AccessFlags::NONE)
+        } else {
+            self.store
+                .alloc_indexed_access_type(object_type, index_type, AccessFlags::NONE)
+        }
+        .ok_or_else(|| {
+            type_node_unavailable(TypeNodeUnavailable::InvalidIndexedAccessType(node))
+        })?;
         let mut links = self
             .store
             .type_node_links(node)
@@ -10718,6 +10958,25 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 &type_arguments,
             )?;
             type_arguments.push(default_type);
+        }
+        if plan.recursive_mapped_aliases.contains_key(&symbol)
+            && alias_identity.is_none()
+            && type_arguments == type_parameters
+            && matches!(
+                self.store.type_payload(declared_type).map(TypeRecord::data),
+                Some(TypeData::Mapped(_))
+            )
+        {
+            return self
+                .store
+                .instantiate_recursive_mapped_alias_identity(
+                    symbol,
+                    declared_type,
+                    &type_parameters,
+                    &type_arguments,
+                    key,
+                )
+                .map_err(|error| mapped_type_error(error, metadata.type_node));
         }
         self.check_generic_alias_type_argument_constraints(
             reference,
