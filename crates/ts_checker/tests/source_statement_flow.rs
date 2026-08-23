@@ -1002,3 +1002,78 @@ fn numeric_runtime_namespace_variables_keep_inferred_and_literal_types() {
         warm,
     );
 }
+
+#[test]
+fn annotated_namespace_objects_keep_interface_and_literal_property_types() {
+    let parsed = parse_source_file(concat!(
+        "namespace Values { ",
+        "interface Shape { salt: number; pepper: number; } ",
+        "var value: Shape = { salt: 2, pepper: 0 }; ",
+        "}",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(2_162);
+    let mut context = context(&parsed, file);
+    let declarations = variable_declarations(&parsed, file, "value");
+    let [declaration] = declarations.as_slice() else {
+        panic!("expected one annotated namespace variable")
+    };
+    let declaration = *declaration;
+    let initializer = variable_initializer(&parsed, file, declaration);
+    let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+
+    context.check_source_file(file).unwrap();
+
+    assert!(context.diagnostics().is_empty());
+    assert_eq!(
+        context
+            .type_to_string(
+                context
+                    .store()
+                    .value_symbol_links(symbol)
+                    .and_then(|links| links.resolved_type)
+                    .unwrap(),
+            )
+            .unwrap(),
+        "Shape",
+    );
+    assert_eq!(
+        context
+            .type_to_string(resolved_type(&context, initializer))
+            .unwrap(),
+        "{ salt: number; pepper: number; }",
+    );
+    let NodeData::ObjectLiteralExpression(object) =
+        &parsed.arena.get(initializer.node).unwrap().data
+    else {
+        panic!("expected an object initializer")
+    };
+    for (property, expected) in object.properties.nodes.iter().zip(["2", "0"]) {
+        let NodeData::PropertyAssignment(property) = &parsed.arena.get(*property).unwrap().data
+        else {
+            panic!("expected a numeric object property")
+        };
+        let value = NodeRef::new(parsed.arena.id(), file, property.initializer);
+        assert_eq!(
+            context
+                .type_to_string(resolved_type(&context, value))
+                .unwrap(),
+            expected,
+        );
+    }
+
+    let warm = (
+        context.store().type_len(),
+        context.store().symbol_len(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
+}

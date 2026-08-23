@@ -17,8 +17,8 @@ use super::{
     AliasTargetState, CanonicalCheckerDiagnostics, CanonicalCheckerOptions, CanonicalGlobalTypes,
     CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, DeclaredTypeUnavailable,
     SourceAssertionError, SourceCheckError, SourceCheckProvenanceError, SourceLiteralCacheError,
-    SourceSyntaxRole, TypeData, TypeId, TypeMapper, TypeNodeLinks, UnsupportedSourceSyntax,
-    ValueSymbolLinks, VariableInvariant,
+    SourceObjectLiteralError, SourceSyntaxRole, TypeData, TypeId, TypeMapper, TypeNodeLinks,
+    UnsupportedSourceSyntax, ValueSymbolLinks, VariableInvariant,
     alias::{
         CanonicalAliasResolutionEvent, CanonicalAliasResolver, CanonicalAliasTargetHost,
         CanonicalAliasTargetUnavailable, CanonicalImmediateAliasTarget,
@@ -26,6 +26,7 @@ use super::{
     bootstrap::UnionReduction,
     declared::cached_ordinary_type_parameter_owner,
     instantiate::InstantiationSession,
+    object_members::{self, PropertyObjectError, PropertyObjectPlan},
     reference_types::validate_direct_generic_reference,
     type_nodes::{CanonicalTypeQuery, TypeNodeUnavailable, normalize_numeric_separators},
     types::{ObjectFlags, TypeFlags},
@@ -117,6 +118,15 @@ struct SourceNamespaceImplicitVariablePlan {
     initializer: Option<NodeRef>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SourceNamespaceObjectInitializerPlan {
+    declaration: NodeRef,
+    symbol: SemanticSymbolId,
+    interface: SemanticSymbolId,
+    annotation: NodeRef,
+    object: PropertyObjectPlan,
+}
+
 /// A complete, read-only namespace declaration and body plan.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SourceNamespacePlan {
@@ -127,6 +137,7 @@ pub(super) struct SourceNamespacePlan {
     pub(super) members: Vec<SourceNamespaceMemberPlan>,
     imports: Vec<SourceNamespaceImportPlan>,
     implicit_variables: Vec<SourceNamespaceImplicitVariablePlan>,
+    object_initializers: Vec<SourceNamespaceObjectInitializerPlan>,
     diagnostics: Vec<NamespaceDiagnosticPlan>,
 }
 
@@ -965,6 +976,258 @@ fn plan_namespace_import(
     })
 }
 
+fn namespace_object_error(node: NodeRef, error: PropertyObjectError) -> SourceCheckError {
+    match error {
+        PropertyObjectError::Capacity(node) => {
+            SourceCheckError::ObjectLiteral(SourceObjectLiteralError::Capacity(node))
+        }
+        PropertyObjectError::InvalidCachedTypeLiteral { node, type_ } => {
+            SourceCheckError::ObjectLiteral(SourceObjectLiteralError::InvalidCache {
+                node,
+                type_: Some(type_),
+            })
+        }
+        _ => SourceCheckError::ObjectLiteral(SourceObjectLiteralError::InvalidCache {
+            node,
+            type_: None,
+        }),
+    }
+}
+
+fn plan_namespace_object_initializer(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    namespace: (NodeRef, SemanticSymbolId),
+    variable: (NodeRef, SemanticSymbolId, NodeRef, NodeRef),
+    members: &[SourceNamespaceMemberPlan],
+) -> Result<SourceNamespaceObjectInitializerPlan, SourceCheckError> {
+    let (namespace, owner) = namespace;
+    let (declaration, symbol, annotation, initializer) = variable;
+    let declaration_record = owned_node(arena, bound, store, declaration)?;
+    let NodeData::VariableDeclaration(variable) = &declaration_record.data else {
+        return Err(unsupported(
+            declaration,
+            declaration_record.kind,
+            SourceSyntaxRole::VariableDeclaration,
+        ));
+    };
+    let name = child(declaration, variable.name);
+    let name_record = owned_node(arena, bound, store, name)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(unsupported(
+            name,
+            name_record.kind,
+            SourceSyntaxRole::VariableName,
+        ));
+    };
+    let symbol_record = store.symbol(symbol).ok_or(SourceCheckError::Provenance(
+        SourceCheckProvenanceError::MissingDeclarationSymbol(declaration),
+    ))?;
+    if declaration_record.kind != SyntaxKind::VariableDeclaration
+        || declaration_record.flags.0 != 0
+        || variable.exclamation_token.is_some()
+        || variable.local_symbol.is_some()
+        || variable.symbol.is_some()
+        || variable.facts != 0
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(declaration.node)
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+        || symbol_record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+        || symbol_record.check_flags() != CheckFlags::NONE
+        || symbol_record.declarations() != Some(&[declaration])
+        || symbol_record.value_declaration() != Some(declaration)
+        || symbol_record.name().as_utf8() != Some(identifier.text.as_str())
+        || symbol_record.members().is_some()
+        || symbol_record.exports().is_some()
+        || symbol_record.parent().is_some()
+        || symbol_record.export_symbol().is_some()
+        || declaration_symbol(bound, store, namespace, SymbolFlags::MODULE)? != owner
+        || bound
+            .locals(namespace)
+            .and_then(|locals| store.symbol_table(locals))
+            .and_then(|locals| locals.get_source(&identifier.text))
+            .and_then(|candidate| store.get_merged_symbol(candidate))
+            != Some(symbol)
+    {
+        return Err(unsupported(
+            declaration,
+            declaration_record.kind,
+            SourceSyntaxRole::VariableDeclaration,
+        ));
+    }
+
+    let annotation_record = owned_node(arena, bound, store, annotation)?;
+    let NodeData::TypeReferenceNode(reference) = &annotation_record.data else {
+        return Err(unsupported(
+            annotation,
+            annotation_record.kind,
+            SourceSyntaxRole::VariableDeclaration,
+        ));
+    };
+    if annotation_record.kind != SyntaxKind::TypeReference
+        || annotation_record.flags.0 != 0
+        || reference.type_arguments.is_some()
+    {
+        return Err(unsupported(
+            annotation,
+            annotation_record.kind,
+            SourceSyntaxRole::VariableDeclaration,
+        ));
+    }
+    let interface_name = child(annotation, reference.type_name);
+    let interface_name_record = owned_node(arena, bound, store, interface_name)?;
+    let NodeData::Identifier(interface_identifier) = &interface_name_record.data else {
+        return Err(unsupported(
+            interface_name,
+            interface_name_record.kind,
+            SourceSyntaxRole::VariableDeclaration,
+        ));
+    };
+    if interface_name_record.kind != SyntaxKind::Identifier
+        || interface_name_record.flags.0 != 0
+        || interface_name_record.parent != Some(annotation.node)
+        || interface_identifier.flow_node.is_some()
+        || interface_identifier.text.is_empty()
+    {
+        return Err(unsupported(
+            interface_name,
+            interface_name_record.kind,
+            SourceSyntaxRole::VariableDeclaration,
+        ));
+    }
+    let mut candidates = members.iter().filter_map(|member| match member {
+        SourceNamespaceMemberPlan::Interface {
+            declaration,
+            symbol,
+            generic: None,
+            ..
+        } if store
+            .symbol(*symbol)
+            .and_then(|record| record.name().as_utf8())
+            == Some(interface_identifier.text.as_str()) =>
+        {
+            Some((*declaration, *symbol))
+        }
+        _ => None,
+    });
+    let Some((interface_declaration, interface)) = candidates.next() else {
+        return Err(unsupported(
+            annotation,
+            annotation_record.kind,
+            SourceSyntaxRole::VariableDeclaration,
+        ));
+    };
+    let interface_record = store.symbol(interface).ok_or(SourceCheckError::Provenance(
+        SourceCheckProvenanceError::MissingDeclarationSymbol(interface_declaration),
+    ))?;
+    if candidates.next().is_some()
+        || interface_record.flags() != SymbolFlags::INTERFACE
+        || interface_record.check_flags() != CheckFlags::NONE
+        || interface_record.parent().is_some()
+        || interface_record.declarations() != Some(&[interface_declaration])
+        || interface_record.value_declaration().is_some()
+        || bound
+            .locals(namespace)
+            .and_then(|locals| store.symbol_table(locals))
+            .and_then(|locals| locals.get_source(&interface_identifier.text))
+            .and_then(|candidate| store.get_merged_symbol(candidate))
+            != Some(interface)
+    {
+        return Err(unsupported(
+            annotation,
+            annotation_record.kind,
+            SourceSyntaxRole::VariableDeclaration,
+        ));
+    }
+
+    let initializer_record = owned_node(arena, bound, store, initializer)?;
+    if initializer_record.parent != Some(declaration.node)
+        || initializer_record.kind != SyntaxKind::ObjectLiteralExpression
+    {
+        return Err(unsupported(
+            initializer,
+            initializer_record.kind,
+            SourceSyntaxRole::VariableInitializer,
+        ));
+    }
+    let host = DeclaredTypeHost::new([(arena, bound)]).map_err(DeclaredTypeError::from)?;
+    let object = object_members::plan_object_literal(store, &host, initializer).map_err(
+        |error| match error {
+            PropertyObjectError::UnsupportedMember { node, kind } => {
+                unsupported(node, kind, SourceSyntaxRole::ObjectProperty)
+            }
+            error => namespace_object_error(initializer, error),
+        },
+    )?;
+    let interface_plan = object_members::plan_interface(store, &host, interface).map_err(|_| {
+        unsupported(
+            annotation,
+            annotation_record.kind,
+            SourceSyntaxRole::VariableDeclaration,
+        )
+    })?;
+    if object.properties.is_empty()
+        || object.properties.len() != interface_plan.properties.len()
+        || !object.indexes.is_empty()
+        || !object.call_signatures.is_empty()
+        || !interface_plan.indexes.is_empty()
+        || !interface_plan.call_signatures.is_empty()
+        || interface_plan.heritage.is_some()
+    {
+        return Err(unsupported(
+            initializer,
+            initializer_record.kind,
+            SourceSyntaxRole::VariableInitializer,
+        ));
+    }
+    for property in &object.properties {
+        let property_name = owned_node(arena, bound, store, property.name_node)?;
+        let Some(expected) = interface_plan
+            .properties
+            .iter()
+            .find(|candidate| candidate.name == property.name)
+        else {
+            return Err(unsupported(
+                property.declaration,
+                SyntaxKind::PropertyAssignment,
+                SourceSyntaxRole::ObjectProperty,
+            ));
+        };
+        if property_name.kind != SyntaxKind::Identifier
+            || property.optional
+            || property.readonly
+            || expected.optional
+            || expected.readonly
+            || owned_node(arena, bound, store, expected.type_node)?.kind
+                != SyntaxKind::NumberKeyword
+        {
+            return Err(unsupported(
+                property.declaration,
+                SyntaxKind::PropertyAssignment,
+                SourceSyntaxRole::ObjectProperty,
+            ));
+        }
+        plan_namespace_numeric_initializer(
+            arena,
+            bound,
+            store,
+            property.declaration,
+            property.type_node,
+        )?;
+    }
+
+    Ok(SourceNamespaceObjectInitializerPlan {
+        declaration,
+        symbol,
+        interface,
+        annotation,
+        object,
+    })
+}
+
 fn plan_namespace_variables(
     arena: &NodeArena,
     bound: &BoundFile,
@@ -975,10 +1238,11 @@ fn plan_namespace_variables(
     output: (
         &mut Vec<SourceNamespaceMemberPlan>,
         &mut Vec<SourceNamespaceImplicitVariablePlan>,
+        &mut Vec<SourceNamespaceObjectInitializerPlan>,
     ),
 ) -> Result<(), SourceCheckError> {
     let (namespace, owner) = namespace;
-    let (members, implicit_variables) = output;
+    let (members, implicit_variables, object_initializers) = output;
     let record = owned_node(arena, bound, store, statement)?;
     let NodeData::VariableStatement(variable) = &record.data else {
         return Err(SourceCheckError::Provenance(
@@ -1030,7 +1294,7 @@ fn plan_namespace_variables(
         if declaration_record.parent != Some(list.node) {
             return Err(invalid_parent(declaration, list, declaration_record.parent));
         }
-        if runtime && (variable.type_.is_some() || variable.initializer.is_none()) {
+        if runtime && variable.initializer.is_none() {
             return Err(unsupported(
                 statement,
                 record.kind,
@@ -1062,6 +1326,22 @@ fn plan_namespace_variables(
                     declaration,
                     annotation_record.parent,
                 ));
+            }
+            if runtime {
+                let initializer = child(
+                    declaration,
+                    variable
+                        .initializer
+                        .expect("a runtime namespace variable requires an initializer"),
+                );
+                object_initializers.push(plan_namespace_object_initializer(
+                    arena,
+                    bound,
+                    store,
+                    (namespace, owner),
+                    (declaration, symbol, annotation, initializer),
+                    members,
+                )?);
             }
             members.push(SourceNamespaceMemberPlan::AmbientVariable {
                 declaration,
@@ -1202,6 +1482,30 @@ fn plan_namespace_numeric_initializer(
     Ok(value)
 }
 
+fn cached_namespace_numeric_literal(
+    store: &CanonicalTypeMapperStore,
+    value: ts_jsnum::Number,
+) -> Result<Option<TypeId>, SourceCheckError> {
+    let Some(regular) = store
+        .intrinsic_bootstrap()
+        .and_then(|bootstrap| bootstrap.cached_number_literal_type(value))
+    else {
+        return Ok(None);
+    };
+    if matches!(
+        store
+            .type_payload(regular)
+            .map(super::type_records::TypeRecord::data),
+        Some(TypeData::Literal(literal)) if literal.fresh_type.is_none()
+    ) {
+        return Ok(None);
+    }
+    store
+        .fresh_type_of_literal_type(regular)
+        .map(Some)
+        .map_err(Into::into)
+}
+
 fn plan_namespace(
     arena: &NodeArena,
     bound: &BoundFile,
@@ -1331,6 +1635,7 @@ fn plan_namespace(
     let mut members = Vec::new();
     let mut imports = Vec::new();
     let mut implicit_variables = Vec::new();
+    let mut object_initializers = Vec::new();
     if let Some(body) = namespace.body {
         let body = child(declaration, body);
         let body_record = owned_node(arena, bound, store, body)?;
@@ -1420,7 +1725,11 @@ fn plan_namespace(
                                 (declaration, symbol),
                                 ambient,
                                 statement,
-                                (&mut members, &mut implicit_variables),
+                                (
+                                    &mut members,
+                                    &mut implicit_variables,
+                                    &mut object_initializers,
+                                ),
                             )?;
                         }
                         SyntaxKind::ImportEqualsDeclaration => {
@@ -1458,6 +1767,7 @@ fn plan_namespace(
         members,
         imports,
         implicit_variables,
+        object_initializers,
         diagnostics,
     })
 }
@@ -1536,6 +1846,18 @@ fn namespace_implicit_variables<'plan>(
     for member in &plan.members {
         if let SourceNamespaceMemberPlan::Namespace(nested) = member {
             namespace_implicit_variables(nested, variables);
+        }
+    }
+}
+
+fn namespace_object_initializers<'plan>(
+    plan: &'plan SourceNamespacePlan,
+    initializers: &mut Vec<&'plan SourceNamespaceObjectInitializerPlan>,
+) {
+    initializers.extend(&plan.object_initializers);
+    for member in &plan.members {
+        if let SourceNamespaceMemberPlan::Namespace(nested) = member {
+            namespace_object_initializers(nested, initializers);
         }
     }
 }
@@ -2096,6 +2418,7 @@ pub(super) fn execute_source_namespace(
     let mut declarations = Vec::new();
     let mut planned_diagnostics = Vec::new();
     let mut implicit_variables = Vec::new();
+    let mut object_initializers = Vec::new();
     namespace_annotations(
         plan,
         &mut annotations,
@@ -2103,6 +2426,7 @@ pub(super) fn execute_source_namespace(
         &mut planned_diagnostics,
     );
     namespace_implicit_variables(plan, &mut implicit_variables);
+    namespace_object_initializers(plan, &mut object_initializers);
     implicit_variables.sort_by_key(|variable| {
         host.node(variable.declaration)
             .map_or(u32::MAX, |node| node.range.start.get())
@@ -2125,7 +2449,7 @@ pub(super) fn execute_source_namespace(
 
     let mut values = Vec::<PendingNamespaceValue>::new();
     let mut numeric_initializers = Vec::new();
-    if !implicit_variables.is_empty() {
+    if !implicit_variables.is_empty() || !object_initializers.is_empty() {
         let bootstrap = store
             .intrinsic_bootstrap()
             .ok_or(SourceCheckError::LiteralCache(
@@ -2142,11 +2466,7 @@ pub(super) fn execute_source_namespace(
                     variable.declaration,
                     initializer,
                 )?;
-                let expected = store
-                    .intrinsic_bootstrap()
-                    .and_then(|bootstrap| bootstrap.cached_number_literal_type(value))
-                    .map(|regular| store.fresh_type_of_literal_type(regular))
-                    .transpose()?;
+                let expected = cached_namespace_numeric_literal(store, value)?;
                 if let Some(links) = store.type_node_links(initializer)
                     && (links.outer_type_parameters.is_some()
                         || links
@@ -2173,6 +2493,56 @@ pub(super) fn execute_source_namespace(
                 variable.symbol,
                 type_,
             )?;
+        }
+        for initializer in &object_initializers {
+            let state = object_members::object_literal_state(store, &initializer.object)
+                .map_err(|error| namespace_object_error(initializer.object.node, error))?;
+            if state.is_some() {
+                object_members::validate_resolved_property_types(
+                    store,
+                    &initializer.object,
+                    &vec![number; initializer.object.properties.len()],
+                )
+                .map_err(|error| namespace_object_error(initializer.object.node, error))?;
+            }
+            if let Some(links) = store.value_symbol_links(initializer.symbol)
+                && links != &ValueSymbolLinks::default()
+                && store
+                    .declared_type_links(initializer.interface)
+                    .and_then(|declared| declared.declared_type)
+                    != links.resolved_type
+            {
+                return Err(SourceCheckError::Variable(
+                    VariableInvariant::InvalidValueLinks(initializer.symbol),
+                ));
+            }
+            for property in &initializer.object.properties {
+                let value = plan_namespace_numeric_initializer(
+                    arena,
+                    bound,
+                    store,
+                    property.declaration,
+                    property.type_node,
+                )?;
+                let expected = cached_namespace_numeric_literal(store, value)?;
+                let links = store.type_node_links(property.type_node);
+                if links.is_some_and(|links| {
+                    links.outer_type_parameters.is_some()
+                        || links
+                            .resolved_type
+                            .is_some_and(|cached| Some(cached) != expected)
+                }) || state.is_some() && links.and_then(|links| links.resolved_type) != expected
+                {
+                    return Err(SourceCheckError::Assertion(
+                        SourceAssertionError::InvalidExpressionCache {
+                            node: property.type_node,
+                            cached: links.and_then(|links| links.resolved_type),
+                            expected: expected.unwrap_or(number),
+                        },
+                    ));
+                }
+                numeric_initializers.push((property.type_node, value));
+            }
         }
         let numbers = numeric_initializers
             .iter()
@@ -2340,6 +2710,54 @@ pub(super) fn execute_source_namespace(
                         .and_then(|links| links.resolved_type),
                     expected: fresh,
                 },
+            ));
+        }
+    }
+    for initializer in object_initializers {
+        let target = values
+            .iter()
+            .find(|value| {
+                value.symbol == initializer.symbol && value.declaration == initializer.declaration
+            })
+            .map(|value| value.type_)
+            .ok_or(SourceCheckError::Variable(
+                VariableInvariant::InvalidValueLinks(initializer.symbol),
+            ))?;
+        if store
+            .declared_type_links(initializer.interface)
+            .and_then(|links| links.declared_type)
+            != Some(target)
+            || store
+                .type_node_links(initializer.annotation)
+                .and_then(|links| links.resolved_type)
+                != Some(target)
+        {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidValueLinks(initializer.symbol),
+            ));
+        }
+        let number = store
+            .intrinsic_bootstrap()
+            .ok_or(SourceCheckError::LiteralCache(
+                SourceLiteralCacheError::BootstrapUninitialized,
+            ))?
+            .number_type;
+        let object = object_members::publish_object_literal(
+            store,
+            &initializer.object,
+            &vec![number; initializer.object.properties.len()],
+        )
+        .map_err(|error| namespace_object_error(initializer.object.node, error))?;
+        if !store.is_type_assignable_to_with_global_types_and_strict_function_types(
+            object,
+            target,
+            global_types,
+            options.strict_function_types,
+        )? {
+            return Err(unsupported(
+                initializer.object.node,
+                SyntaxKind::ObjectLiteralExpression,
+                SourceSyntaxRole::VariableInitializer,
             ));
         }
     }
