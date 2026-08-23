@@ -1,7 +1,8 @@
-//! Exact source integration for one ordinary identifier or own-property call.
+//! Exact source integration for identifier, nested, or own-property calls.
 //!
-//! This deliberately admits only `identifier(arguments)` or a proven required
-//! own-property `identifier.name(arguments)`. Arguments may contain scalar
+//! This admits `identifier(arguments)`, a proven required own-property call,
+//! or an already proven call expression used as another call's callee.
+//! Arguments may contain scalar
 //! values, identifier and property reads, object and array literals, arrow
 //! functions, type assertions, nested direct calls, or recursively proven primitive
 //! expressions, optionally parenthesized.
@@ -48,6 +49,11 @@ use super::{
         primitive_binary_operator_text,
     },
     source_callables::{StoredSourceCallableValidation, validate_stored_source_callable},
+    source_properties::{
+        DirectSourcePropertySyntax, SourcePropertyError, SourcePropertyPlan,
+        check_direct_source_property, finish_direct_source_property_plan,
+        plan_direct_source_property_call_syntax,
+    },
     type_nodes::CanonicalTypeQuery,
     type_records::TypeData,
     types::TypeFlags,
@@ -59,6 +65,7 @@ pub(super) struct SourceCallPlan {
     pub(super) node: NodeRef,
     pub(super) callee: PlannedExpression,
     callee_diagnostic_node: NodeRef,
+    deferred_error_property: Option<SourcePropertyPlan>,
     type_arguments: Option<SourceTypeArgumentList>,
     pub(super) arguments: Vec<PlannedExpression>,
 }
@@ -66,6 +73,7 @@ pub(super) struct SourceCallPlan {
 /// The exact callee family proven by call syntax.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SourceCallCalleeForm {
+    /// An identifier or nested call planned through the ordinary expression path.
     Identifier,
     RequiredOwnProperty,
 }
@@ -92,6 +100,7 @@ pub(super) struct DirectSourceCallSyntax {
     callee: NodeRef,
     callee_form: SourceCallCalleeForm,
     callee_diagnostic_node: NodeRef,
+    deferred_error_property: Option<DirectSourcePropertySyntax>,
     type_arguments: Option<SourceTypeArgumentList>,
     arguments: Vec<NodeRef>,
     argument_arrow_nodes: Vec<Option<NodeRef>>,
@@ -209,7 +218,7 @@ pub(super) fn plan_direct_source_call_syntax(
         ));
     }
 
-    let callee = NodeRef::new(node.arena, node.file, call.expression);
+    let actual_callee = NodeRef::new(node.arena, node.file, call.expression);
     let Some(callee_record) = arena.get(call.expression) else {
         return Err(SourceCheckError::Call(node));
     };
@@ -218,31 +227,74 @@ pub(super) fn plan_direct_source_call_syntax(
             UnsupportedSourceSyntax::Call(node),
         ));
     }
-    let (callee_form, callee_diagnostic_node) = match (callee_record.kind, &callee_record.data) {
-        (SyntaxKind::Identifier, NodeData::Identifier(_)) => {
-            (SourceCallCalleeForm::Identifier, callee)
-        }
-        (SyntaxKind::PropertyAccessExpression, NodeData::PropertyAccessExpression(property)) => {
-            let name = NodeRef::new(node.arena, node.file, property.name);
-            let Some(name_record) = arena.get(property.name) else {
-                return Err(SourceCheckError::Call(node));
-            };
-            if name_record.parent != Some(callee.node)
-                || name_record.kind != SyntaxKind::Identifier
-                || !matches!(&name_record.data, NodeData::Identifier(_))
-            {
+    let (callee, callee_form, callee_diagnostic_node, deferred_error_property) =
+        match (callee_record.kind, &callee_record.data) {
+            (SyntaxKind::Identifier, NodeData::Identifier(_)) => (
+                actual_callee,
+                SourceCallCalleeForm::Identifier,
+                actual_callee,
+                None,
+            ),
+            (SyntaxKind::CallExpression, NodeData::CallExpression(_)) => {
+                plan_direct_source_call_syntax(arena, store, actual_callee)?;
+                (
+                    actual_callee,
+                    SourceCallCalleeForm::Identifier,
+                    actual_callee,
+                    None,
+                )
+            }
+            (
+                SyntaxKind::PropertyAccessExpression,
+                NodeData::PropertyAccessExpression(property),
+            ) => {
+                let name = NodeRef::new(node.arena, node.file, property.name);
+                let Some(name_record) = arena.get(property.name) else {
+                    return Err(SourceCheckError::Call(node));
+                };
+                if name_record.parent != Some(actual_callee.node)
+                    || name_record.kind != SyntaxKind::Identifier
+                    || !matches!(&name_record.data, NodeData::Identifier(_))
+                {
+                    return Err(SourceCheckError::Unsupported(
+                        UnsupportedSourceSyntax::Call(node),
+                    ));
+                }
+                let receiver = NodeRef::new(node.arena, node.file, property.expression);
+                if call.arguments.nodes.is_empty()
+                    && call.type_arguments.is_none()
+                    && arena
+                        .get(receiver.node)
+                        .is_some_and(|record| record.kind == SyntaxKind::CallExpression)
+                {
+                    let property =
+                        plan_direct_source_property_call_syntax(arena, store, actual_callee, node)
+                            .map_err(|error| deferred_property_error(node, error))?;
+                    if property.receiver() != receiver || property.name_node() != name {
+                        return Err(SourceCheckError::Call(node));
+                    }
+                    plan_direct_source_call_syntax(arena, store, receiver)?;
+                    (
+                        receiver,
+                        SourceCallCalleeForm::Identifier,
+                        name,
+                        Some(property),
+                    )
+                } else {
+                    (
+                        actual_callee,
+                        SourceCallCalleeForm::RequiredOwnProperty,
+                        name,
+                        None,
+                    )
+                }
+            }
+            _ => {
                 return Err(SourceCheckError::Unsupported(
                     UnsupportedSourceSyntax::Call(node),
                 ));
             }
-            (SourceCallCalleeForm::RequiredOwnProperty, name)
-        }
-        _ => {
-            return Err(SourceCheckError::Unsupported(
-                UnsupportedSourceSyntax::Call(node),
-            ));
-        }
-    };
+        };
 
     let type_arguments = call
         .type_arguments
@@ -355,6 +407,7 @@ pub(super) fn plan_direct_source_call_syntax(
         callee,
         callee_form,
         callee_diagnostic_node,
+        deferred_error_property,
         type_arguments,
         arguments,
         argument_arrow_nodes,
@@ -408,9 +461,22 @@ pub(super) fn finish_direct_source_call_plan(
     arguments: Vec<PlannedExpression>,
 ) -> Result<SourceCallPlan, SourceCheckError> {
     let exact_callee = match (&callee.kind, syntax.callee_form) {
-        (PlannedExpressionKind::Identifier(_), SourceCallCalleeForm::Identifier) => true,
+        (PlannedExpressionKind::Identifier(_), SourceCallCalleeForm::Identifier) => {
+            syntax.deferred_error_property.is_none()
+        }
+        (PlannedExpressionKind::Call(call), SourceCallCalleeForm::Identifier) => {
+            call.node == callee.node
+                && syntax.deferred_error_property.as_ref().map_or_else(
+                    || syntax.callee_diagnostic_node == syntax.callee,
+                    |property| {
+                        property.receiver() == syntax.callee
+                            && property.name_node() == syntax.callee_diagnostic_node
+                    },
+                )
+        }
         (PlannedExpressionKind::Property(property), SourceCallCalleeForm::RequiredOwnProperty) => {
-            property.is_call_callee_for(syntax.node, syntax.callee_diagnostic_node)
+            syntax.deferred_error_property.is_none()
+                && property.is_call_callee_for(syntax.node, syntax.callee_diagnostic_node)
         }
         _ => false,
     };
@@ -438,13 +504,36 @@ pub(super) fn finish_direct_source_call_plan(
             UnsupportedSourceSyntax::Call(syntax.node),
         ));
     }
+    let deferred_error_property = syntax
+        .deferred_error_property
+        .as_ref()
+        .map(|property| {
+            finish_direct_source_property_plan(property, callee.clone())
+                .map_err(|error| deferred_property_error(syntax.node, error))
+        })
+        .transpose()?;
     Ok(SourceCallPlan {
         node: syntax.node,
         callee,
         callee_diagnostic_node: syntax.callee_diagnostic_node,
+        deferred_error_property,
         type_arguments: syntax.type_arguments.clone(),
         arguments,
     })
+}
+
+fn deferred_property_error(call: NodeRef, error: SourcePropertyError) -> SourceCheckError {
+    match error {
+        SourcePropertyError::Unsupported(_) => {
+            SourceCheckError::Unsupported(UnsupportedSourceSyntax::Call(call))
+        }
+        SourcePropertyError::InvalidCache(node)
+        | SourcePropertyError::Capacity(node)
+        | SourcePropertyError::Union { node, .. } => SourceCheckError::Property(node),
+        SourcePropertyError::Relation(error) => SourceCheckError::from(error),
+        SourcePropertyError::Display(error) => SourceCheckError::TypeDisplayUnavailable(error),
+        SourcePropertyError::MissingDiagnostic(code) => SourceCheckError::MissingDiagnostic(code),
+    }
 }
 
 fn unparenthesized_arrow_argument_node(arena: &NodeArena, mut node: NodeRef) -> Option<NodeRef> {
@@ -1934,6 +2023,79 @@ fn preflight_call_publication(
         .and_then(|links| links.resolved_signature.signature()))
 }
 
+fn missing_semicolon_related_information(
+    host: &DeclaredTypeHost<'_>,
+    plan: &SourceCallPlan,
+) -> Result<Option<CanonicalCheckerRelatedInformation>, SourceCheckError> {
+    if plan.arguments.len() != 1 {
+        return Ok(None);
+    }
+
+    let (arena, _) = host
+        .source(plan.node)
+        .ok_or(SourceCheckError::Call(plan.node))?;
+    let Some(source) = arena.source_text() else {
+        return Ok(None);
+    };
+    let callee = host
+        .node(plan.callee.node)
+        .ok_or(SourceCheckError::Call(plan.node))?;
+    let call = host
+        .node(plan.node)
+        .ok_or(SourceCheckError::Call(plan.node))?;
+    let NodeData::CallExpression(call) = &call.data else {
+        return Err(SourceCheckError::Call(plan.node));
+    };
+    let start =
+        usize::try_from(callee.range.end.get()).map_err(|_| SourceCheckError::Call(plan.node))?;
+    let end = usize::try_from(call.arguments.range.start.get())
+        .map_err(|_| SourceCheckError::Call(plan.node))?;
+    let trivia = source
+        .get(start..end)
+        .ok_or(SourceCheckError::Call(plan.node))?;
+    if !call_trivia_has_line_break(trivia).ok_or(SourceCheckError::Call(plan.node))? {
+        return Ok(None);
+    }
+
+    Ok(Some(CanonicalCheckerRelatedInformation {
+        node: Some(plan.callee.node),
+        diagnostic: Diagnostic::new(
+            message_by_code(2734).ok_or(SourceCheckError::MissingDiagnostic(2734))?,
+        ),
+    }))
+}
+
+fn call_trivia_has_line_break(text: &str) -> Option<bool> {
+    let mut offset = 0usize;
+    while let Some(remaining) = text.get(offset..) {
+        if remaining.is_empty() {
+            return Some(false);
+        }
+        if matches!(remaining.as_bytes().first(), Some(b'\r' | b'\n')) {
+            return Some(true);
+        }
+        if remaining.starts_with("//") {
+            let Some(line_break) = remaining.find(['\r', '\n']) else {
+                return Some(false);
+            };
+            offset = offset.checked_add(line_break)?;
+            continue;
+        }
+        if remaining.starts_with("/*") {
+            let comment_end = remaining.find("*/")?.checked_add(2)?;
+            offset = offset.checked_add(comment_end)?;
+            continue;
+        }
+        let character = remaining.chars().next()?;
+        if character.is_whitespace() || matches!(character, '\u{200b}' | '\u{feff}') {
+            offset = offset.checked_add(character.len_utf8())?;
+            continue;
+        }
+        return Some(false);
+    }
+    None
+}
+
 fn recover_non_callable_source_call(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -1997,7 +2159,9 @@ fn recover_non_callable_source_call(
                 message_by_code(2349).ok_or(SourceCheckError::MissingDiagnostic(2349))?,
             )
             .with_details([format!("  {detail}")]),
-            related_information: Vec::new(),
+            related_information: missing_semicolon_related_information(host, plan)?
+                .into_iter()
+                .collect(),
         })
     } else if return_type != error_type
         && plan
@@ -2036,6 +2200,32 @@ pub(super) fn check_direct_source_call(
     argument_types: &[TypeId],
 ) -> Result<CheckedSourceCall, SourceCheckError> {
     preflight_call_links(store, plan.node)?;
+    let callee_type = if let Some(property) = &plan.deferred_error_property {
+        let bootstrap = store
+            .intrinsic_bootstrap()
+            .ok_or(SourceCheckError::Call(plan.node))?;
+        let error_type = bootstrap.error_type;
+        let unknown_signature = bootstrap.unknown_signature;
+        if callee_type != error_type {
+            return Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Call(plan.node),
+            ));
+        }
+        if preflight_call_publication(store, plan.node, error_type)?
+            .is_some_and(|signature| signature != unknown_signature)
+        {
+            return Err(SourceCheckError::Call(plan.node));
+        }
+        let checked =
+            check_direct_source_property(store, Some(global_types), property, callee_type)
+                .map_err(|error| deferred_property_error(plan.node, error))?;
+        if checked.type_ != error_type || checked.diagnostic.is_some() {
+            return Err(SourceCheckError::Property(property.node));
+        }
+        checked.type_
+    } else {
+        callee_type
+    };
     let existing_call_signature = store
         .signature_links(plan.node)
         .and_then(|links| links.resolved_signature.signature());
@@ -3032,6 +3222,50 @@ mod tests {
         ));
 
         assert_eq!(call_publication_state(&context, *first_call), before);
+    }
+
+    #[test]
+    fn nested_call_callee_rejects_poisoned_cache_without_publication() {
+        let parsed = parsed("declare function make(): string; const result = make()(1);");
+        let file = FileId::new(489);
+        let mut context = context(&parsed, file);
+        let outer = calls(&parsed, file)
+            .into_iter()
+            .find(|call| {
+                matches!(
+                    parsed.arena.get(call.node).map(|record| &record.data),
+                    Some(NodeData::CallExpression(call))
+                        if parsed
+                            .arena
+                            .get(call.expression)
+                            .is_some_and(|callee| callee.kind == SyntaxKind::CallExpression)
+                )
+            })
+            .expect("fixture must contain a call-expression callee");
+        let NodeData::CallExpression(call) = &parsed.arena.get(outer.node).unwrap().data else {
+            unreachable!("the selected node is a call")
+        };
+        let inner = NodeRef::new(parsed.arena.id(), file, call.expression);
+        let signature = context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .unknown_signature;
+        assert!(context.store_mut_for_test().set_signature_links(
+            inner,
+            SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(signature),
+                ..SignatureLinks::default()
+            },
+        ));
+        let before = call_publication_state(&context, outer);
+
+        assert!(matches!(
+            plan_direct_source_call_syntax(&parsed.arena, context.store(), outer),
+            Err(SourceCheckError::Call(node)) if node == inner
+        ));
+        assert_eq!(call_publication_state(&context, outer), before);
+        assert!(context.store().type_node_links(inner).is_none());
     }
 
     #[test]
@@ -4583,6 +4817,126 @@ mod tests {
             ),
             counts
         );
+    }
+
+    #[test]
+    fn nested_noncallable_calls_report_exact_missing_semicolon_information() {
+        let text = concat!(
+            "declare function foo(): string;\n",
+            "foo()(1 as number).toString();\n",
+            "foo()   (1 as number).toString();\n",
+            "foo()\n",
+            "(1 as number).toString();\n",
+            "foo()\n",
+            "    (1 + 2).toString();\n",
+            "foo()\n",
+            "    (<number>1).toString();\n",
+        );
+        let parsed = parsed(text);
+        let file = FileId::new(490);
+        let mut context = context(&parsed, file);
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 5, "{diagnostics:?}");
+        for (diagnostic, missing_semicolon) in
+            diagnostics.iter().zip([false, false, true, true, true])
+        {
+            assert_eq!(diagnostic.diagnostic.code(), 2349);
+            assert_eq!(
+                diagnostic.diagnostic.render().unwrap(),
+                "This expression is not callable.\n  Type 'String' has no call signatures."
+            );
+            let node = diagnostic.node.expect("TS2349 must retain its callee");
+            let range = parsed.arena.get(node.node).unwrap().range;
+            assert_eq!(
+                &text[usize::try_from(range.start.get()).unwrap()
+                    ..usize::try_from(range.end.get()).unwrap()],
+                "foo()"
+            );
+            if missing_semicolon {
+                let [related] = diagnostic.related_information.as_slice() else {
+                    panic!("a newline-separated call requires one missing-semicolon diagnostic")
+                };
+                assert_eq!(related.node, Some(node));
+                assert_eq!(related.diagnostic.code(), 2734);
+                assert_eq!(
+                    related.diagnostic.render().unwrap(),
+                    "Are you missing a semicolon?"
+                );
+            } else {
+                assert!(diagnostic.related_information.is_empty());
+            }
+        }
+
+        let invalid_calls = calls(&parsed, file)
+            .into_iter()
+            .filter(|node| {
+                matches!(
+                    parsed.arena.get(node.node).map(|record| &record.data),
+                    Some(NodeData::CallExpression(call))
+                        if parsed
+                            .arena
+                            .get(call.expression)
+                            .is_some_and(|callee| callee.kind == SyntaxKind::CallExpression)
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(invalid_calls.len(), 5);
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        for call in &invalid_calls {
+            assert_eq!(
+                context
+                    .store()
+                    .signature_links(*call)
+                    .and_then(|links| links.resolved_signature.signature()),
+                Some(bootstrap.unknown_signature)
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .type_node_links(*call)
+                    .and_then(|links| links.resolved_type),
+                Some(bootstrap.error_type)
+            );
+        }
+
+        let cold = invalid_calls
+            .iter()
+            .map(|call| call_publication_state(&context, *call))
+            .collect::<Vec<_>>();
+        mark_source_unchecked(&mut context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(
+            invalid_calls
+                .iter()
+                .map(|call| call_publication_state(&context, *call))
+                .collect::<Vec<_>>(),
+            cold
+        );
+    }
+
+    #[test]
+    fn missing_semicolon_trivia_ignores_line_breaks_inside_block_comments() {
+        for (trivia, expected) in [
+            ("", false),
+            (" \t", false),
+            ("\n", true),
+            ("\r\n", true),
+            (" // comment\n", true),
+            (" /* comment */\n", true),
+            (" /* inside\ncomment */ ", false),
+            ("\u{feff}\n", true),
+            ("<string>\n", false),
+        ] {
+            assert_eq!(
+                call_trivia_has_line_break(trivia),
+                Some(expected),
+                "{trivia:?}"
+            );
+        }
+        assert_eq!(call_trivia_has_line_break("/* unterminated"), None);
     }
 
     #[test]
