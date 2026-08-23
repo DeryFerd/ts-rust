@@ -229,11 +229,12 @@ impl CanonicalTypeMapperStore {
     /// Checks one parsed JSX element through the canonical semantic graph.
     ///
     /// The host must own the element's complete AST and binder data. Global
-    /// `JSX.Element` and `JSX.IntrinsicElements` are resolved through existing
-    /// declaration queries. Intrinsic tags retain their upstream symbol,
-    /// signature, attribute, and JSX links. Function components reuse their
-    /// existing fixed call signature. Unsupported syntax returns a typed
-    /// source boundary instead of inventing an `any` result.
+    /// `JSX.Element` uses existing declaration queries. `JSX.IntrinsicElements`
+    /// is resolved only when the planned tree contains an intrinsic tag.
+    /// Intrinsic tags retain their upstream symbol, signature, attribute, and
+    /// JSX links. Function components reuse their existing fixed call signature.
+    /// Unsupported syntax returns a typed source boundary instead of inventing
+    /// an `any` result.
     ///
     /// # Errors
     ///
@@ -257,7 +258,7 @@ impl CanonicalTypeMapperStore {
         }
 
         let plan = plan_jsx_element(arena, bound, self, expression)?;
-        let namespace = resolve_jsx_namespace(self, host, options, diagnostics, expression)?;
+        let namespace = resolve_jsx_namespace(self, host, options, diagnostics, &plan)?;
         execute_jsx_element(self, arena, bound, &namespace, &plan, options, diagnostics)
     }
 }
@@ -1100,8 +1101,10 @@ fn resolve_jsx_namespace(
     host: &DeclaredTypeHost<'_>,
     options: CanonicalCheckerOptions,
     diagnostics: &mut CanonicalCheckerDiagnostics,
-    location: NodeRef,
+    plan: &JsxElementPlan,
 ) -> Result<JsxNamespace, SourceCheckError> {
+    let location = plan.expression;
+    let needs_intrinsics = jsx_plan_needs_intrinsic_elements(plan);
     let (globals, unknown_symbol, error_type, any_type) = {
         let bootstrap = store
             .intrinsic_bootstrap()
@@ -1145,14 +1148,14 @@ fn resolve_jsx_namespace(
             {
                 return Err(SourceCheckError::Property(location));
             }
-            element_type = resolve_namespace_export_type(
-                store,
-                host,
-                namespace,
-                symbol,
-                options,
-                diagnostics,
-            )?;
+            element_type = if !needs_intrinsics
+                && matches!(&plan.kind, JsxElementPlanKind::Fragment)
+                && jsx_namespace_interface_has_heritage(store, host, namespace, symbol)?
+            {
+                store.get_declared_type_of_symbol(host, symbol)?
+            } else {
+                resolve_namespace_export_type(store, host, namespace, symbol, options, diagnostics)?
+            };
         }
         if let Some(symbol) = intrinsic {
             if store
@@ -1161,14 +1164,16 @@ fn resolve_jsx_namespace(
             {
                 return Err(SourceCheckError::Property(location));
             }
-            intrinsic_elements = Some(resolve_namespace_export_type(
-                store,
-                host,
-                namespace,
-                symbol,
-                options,
-                diagnostics,
-            )?);
+            if needs_intrinsics {
+                intrinsic_elements = Some(resolve_namespace_export_type(
+                    store,
+                    host,
+                    namespace,
+                    symbol,
+                    options,
+                    diagnostics,
+                )?);
+            }
         }
     }
 
@@ -1179,6 +1184,95 @@ fn resolve_jsx_namespace(
         error_type,
         any_type,
     })
+}
+
+fn jsx_plan_needs_intrinsic_elements(plan: &JsxElementPlan) -> bool {
+    let attributes_need_intrinsics = match &plan.kind {
+        JsxElementPlanKind::Element {
+            tag, attributes, ..
+        } => {
+            if tag.intrinsic {
+                return true;
+            }
+            let properties = match attributes {
+                JsxAttributesPlan::Properties(properties) => properties.as_slice(),
+                JsxAttributesPlan::ObjectSpread(spread) => spread.properties.as_slice(),
+            };
+            properties.iter().any(|property| {
+                matches!(
+                    &property.value,
+                    JsxAttributeValue::Expression { value, .. }
+                        if jsx_scalar_needs_intrinsic_elements(value)
+                )
+            })
+        }
+        JsxElementPlanKind::Fragment => false,
+    };
+    attributes_need_intrinsics
+        || plan.children.iter().any(|child| match child {
+            JsxChildPlan::Text { .. } => false,
+            JsxChildPlan::Expression { value, .. } => jsx_scalar_needs_intrinsic_elements(value),
+            JsxChildPlan::Element(element) => jsx_plan_needs_intrinsic_elements(element),
+        })
+}
+
+fn jsx_scalar_needs_intrinsic_elements(scalar: &JsxScalarPlan) -> bool {
+    match scalar {
+        JsxScalarPlan::Element(element) => jsx_plan_needs_intrinsic_elements(element),
+        JsxScalarPlan::Property { receiver, .. } => jsx_scalar_needs_intrinsic_elements(receiver),
+        JsxScalarPlan::AnyAssertion { value, .. } | JsxScalarPlan::Parenthesized { value, .. } => {
+            jsx_scalar_needs_intrinsic_elements(value)
+        }
+        JsxScalarPlan::Conditional {
+            condition,
+            when_true,
+            when_false,
+            ..
+        } => {
+            jsx_scalar_needs_intrinsic_elements(condition)
+                || jsx_scalar_needs_intrinsic_elements(when_true)
+                || jsx_scalar_needs_intrinsic_elements(when_false)
+        }
+        JsxScalarPlan::String { .. }
+        | JsxScalarPlan::Number { .. }
+        | JsxScalarPlan::Boolean { .. }
+        | JsxScalarPlan::Null(_)
+        | JsxScalarPlan::Identifier { .. } => false,
+    }
+}
+
+fn jsx_namespace_interface_has_heritage(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    namespace: SemanticSymbolId,
+    symbol: SemanticSymbolId,
+) -> Result<bool, SourceCheckError> {
+    let record = store
+        .symbol(symbol)
+        .ok_or_else(|| invalid_namespace_symbol(symbol))?;
+    if record.flags() != SymbolFlags::INTERFACE || record.parent() != Some(namespace) {
+        return Ok(false);
+    }
+    let declarations = record
+        .declarations()
+        .ok_or_else(|| invalid_namespace_symbol(symbol))?;
+    for declaration in declarations {
+        let node = host
+            .node(*declaration)
+            .ok_or(SourceCheckError::Property(*declaration))?;
+        let NodeData::InterfaceDeclaration(interface) = &node.data else {
+            return Err(SourceCheckError::Property(*declaration));
+        };
+        if node.kind != SyntaxKind::InterfaceDeclaration
+            || !host.symbol_matches(store, *declaration, symbol)
+        {
+            return Err(SourceCheckError::Property(*declaration));
+        }
+        if interface.heritage_clauses.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn resolve_namespace_export_type(
@@ -3476,14 +3570,16 @@ fn unsupported(node: NodeRef, kind: SyntaxKind) -> SourceCheckError {
 mod runtime_tests {
     use ts_ast::FileId;
     use ts_binder::{
-        CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
-        EscapedName,
+        CanonicalBinder, CanonicalModuleState, CanonicalNameResolverOptions,
+        CanonicalSourceFileFacts, CanonicalSourceLanguage, EscapedName,
     };
     use ts_parser::{ParseResult, parse_jsx_source_file};
 
     use super::*;
     use crate::semantic::{
-        IntrinsicBootstrapOptions, formatter::type_to_string, production::CanonicalJsxRuntime,
+        IntrinsicBootstrapOptions,
+        formatter::type_to_string,
+        production::{CanonicalJsxRuntime, GlobalMergeCompletion},
     };
 
     struct RuntimeFixture {
@@ -3980,6 +4076,188 @@ mod runtime_tests {
         )
         .unwrap();
 
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn empty_fragment_leaves_intrinsic_interface_cold_until_a_nested_tag_needs_it() {
+        let mut fixture = RuntimeFixture::new(
+            concat!(
+                "declare namespace JSX {\n",
+                "  interface Element {}\n",
+                "  interface IntrinsicElements { unsupported(): void; }\n",
+                "}\n",
+                "const empty = <></>;\n",
+                "const nested = <><div /></>;\n",
+            ),
+            FileId::new(8_134),
+        );
+        let namespace = fixture
+            .bound
+            .locals(fixture.bound.source_file())
+            .and_then(|locals| fixture.store.symbol_table(locals))
+            .and_then(|locals| locals.get_source("JSX"))
+            .unwrap();
+        let exports = fixture.store.symbol(namespace).unwrap().exports().unwrap();
+        let intrinsics = fixture
+            .store
+            .symbol_table(exports)
+            .and_then(|exports| exports.get_source("IntrinsicElements"))
+            .unwrap();
+        let globals = fixture.store.intrinsic_bootstrap().unwrap().globals;
+        assert_eq!(
+            fixture
+                .store
+                .insert_symbol(globals, EscapedName::source("JSX"), namespace),
+            Some(None),
+        );
+        let empty = fixture.expression("empty");
+        let nested = fixture.expression("nested");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        fixture.check(empty, CanonicalJsxRuntime::Preserve, &mut diagnostics);
+
+        assert!(diagnostics.is_empty());
+        assert!(fixture.store.declared_type_links(intrinsics).is_none());
+        let cold = (
+            fixture.store.type_len(),
+            fixture.store.symbol_len(),
+            fixture.store.signature_len(),
+            fixture.store.symbol_store().symbol_table_len(),
+        );
+        fixture.check(empty, CanonicalJsxRuntime::Preserve, &mut diagnostics);
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.signature_len(),
+                fixture.store.symbol_store().symbol_table_len(),
+            ),
+            cold,
+        );
+
+        let host = DeclaredTypeHost::new([(&fixture.parsed.arena, &fixture.bound)]).unwrap();
+        let error = fixture
+            .store
+            .check_jsx_element(
+                &host,
+                nested,
+                CanonicalCheckerOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            SourceCheckError::Unsupported(UnsupportedSourceSyntax::Syntax {
+                kind: SyntaxKind::MethodSignature,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn fragment_resolves_inherited_element_identity_without_expanding_intrinsics() {
+        let mut fixture = RuntimeFixture::new(
+            concat!(
+                "declare namespace React { interface ReactElement<Props, Kind> {} }\n",
+                "declare namespace JSX {\n",
+                "  interface Element extends React.ReactElement<any, any> {}\n",
+                "  interface IntrinsicElements { unsupported(): void; }\n",
+                "}\n",
+                "const view = <>\n  </>;\n",
+            ),
+            FileId::new(8_135),
+        );
+        let globals = fixture.store.intrinsic_bootstrap().unwrap().globals;
+        let locals = fixture.bound.locals(fixture.bound.source_file()).unwrap();
+        for name in ["React", "JSX"] {
+            let symbol = fixture
+                .store
+                .symbol_table(locals)
+                .and_then(|locals| locals.get_source(name))
+                .unwrap();
+            assert_eq!(
+                fixture
+                    .store
+                    .insert_symbol(globals, EscapedName::source(name), symbol),
+                Some(None),
+            );
+        }
+        let jsx = fixture
+            .store
+            .symbol_table(globals)
+            .and_then(|globals| globals.get_source("JSX"))
+            .unwrap();
+        let exports = fixture.store.symbol(jsx).unwrap().exports().unwrap();
+        let element = fixture
+            .store
+            .symbol_table(exports)
+            .and_then(|exports| exports.get_source("Element"))
+            .unwrap();
+        let intrinsics = fixture
+            .store
+            .symbol_table(exports)
+            .and_then(|exports| exports.get_source("IntrinsicElements"))
+            .unwrap();
+        let expression = fixture.expression("view");
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&fixture.parsed.arena, &fixture.bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let element_type = fixture
+            .store
+            .check_jsx_element(
+                &host,
+                expression,
+                CanonicalCheckerOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap();
+
+        assert!(diagnostics.is_empty());
+        assert_eq!(
+            fixture
+                .store
+                .declared_type_links(element)
+                .and_then(|links| links.declared_type),
+            Some(element_type),
+        );
+        assert_eq!(
+            fixture.store.type_payload(element_type).unwrap().symbol(),
+            Some(element),
+        );
+        assert!(fixture.store.declared_type_links(intrinsics).is_none());
+
+        let cold = (
+            fixture.store.type_len(),
+            fixture.store.symbol_len(),
+            fixture.store.signature_len(),
+            fixture.store.symbol_store().symbol_table_len(),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .check_jsx_element(
+                    &host,
+                    expression,
+                    CanonicalCheckerOptions::default(),
+                    &mut diagnostics,
+                )
+                .unwrap(),
+            element_type,
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.signature_len(),
+                fixture.store.symbol_store().symbol_table_len(),
+            ),
+            cold,
+        );
         assert!(diagnostics.is_empty());
     }
 
