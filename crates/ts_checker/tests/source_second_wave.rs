@@ -421,3 +421,73 @@ fn malformed_javascript_jsdoc_types_keep_exact_source_diagnostics() {
         source.find("@import").unwrap()
     );
 }
+
+#[test]
+fn object_const_assertions_preserve_readonly_literal_property_types() {
+    let parsed = parse_source_file(concat!(
+        "const value = { ",
+        "foo: 'foo', ",
+        "new: 'new', ",
+        "count: 1, ",
+        "enabled: true ",
+        "} as const;",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(8_230);
+    let mut context = context(&parsed, file, CanonicalSourceLanguage::TypeScript);
+
+    context.check_source_file(file).unwrap();
+    assert!(
+        context.diagnostics().is_empty(),
+        "{:?}",
+        context.diagnostics()
+    );
+
+    let object = parsed
+        .arena
+        .iter()
+        .find_map(|(node, record)| {
+            (record.kind == SyntaxKind::ObjectLiteralExpression).then_some(NodeRef::new(
+                parsed.arena.id(),
+                file,
+                node,
+            ))
+        })
+        .unwrap();
+    let object_type = context
+        .store()
+        .type_node_links(object)
+        .and_then(|links| links.resolved_type)
+        .unwrap();
+    let TypeData::Object(object) = context.store().type_payload(object_type).unwrap().data() else {
+        panic!("const assertion must retain its object type")
+    };
+    for (property, expected) in object
+        .structured
+        .properties
+        .as_deref()
+        .unwrap()
+        .iter()
+        .zip(["\"foo\"", "\"new\"", "1", "true"])
+    {
+        let symbol = context.store().symbol(*property).unwrap();
+        assert!(
+            symbol
+                .check_flags()
+                .contains(ts_binder::CheckFlags::READONLY)
+        );
+        let type_ = context
+            .store()
+            .value_symbol_links(*property)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        assert_eq!(context.type_to_string(type_).unwrap(), expected);
+    }
+
+    let warm = (context.store().type_len(), context.store().symbol_len());
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (context.store().type_len(), context.store().symbol_len()),
+        warm
+    );
+}

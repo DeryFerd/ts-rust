@@ -638,7 +638,7 @@ pub(super) fn plan_object_literal(
             });
         }
     }
-    plan_members(
+    let mut plan = plan_members(
         store,
         host,
         PropertyObjectKind::ObjectLiteral,
@@ -649,7 +649,71 @@ pub(super) fn plan_object_literal(
         &[],
         None,
         TypeLiteralMemberPolicy::General,
-    )
+    )?;
+    if object_literal_has_const_assertion(store, host, node)? {
+        for property in &mut plan.properties {
+            property.readonly = true;
+        }
+    }
+    Ok(plan)
+}
+
+fn object_literal_has_const_assertion(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+) -> Result<bool, PropertyObjectError> {
+    let invalid = || PropertyObjectError::InvalidObjectLiteral(node);
+    let mut operand = node;
+    loop {
+        let Some(parent) = preflight_node(store, host, operand)
+            .map_err(|_| invalid())?
+            .parent
+        else {
+            return Ok(false);
+        };
+        let parent = NodeRef::new(operand.arena, operand.file, parent);
+        let record = preflight_node(store, host, parent).map_err(|_| invalid())?;
+        let type_node = match (&record.data, record.kind) {
+            (
+                NodeData::ParenthesizedExpression(parenthesized),
+                SyntaxKind::ParenthesizedExpression,
+            ) if parenthesized.expression == operand.node => {
+                operand = parent;
+                continue;
+            }
+            (NodeData::AsExpression(assertion), SyntaxKind::AsExpression)
+                if assertion.expression == operand.node =>
+            {
+                assertion.type_
+            }
+            (NodeData::TypeAssertion(assertion), SyntaxKind::TypeAssertionExpression)
+                if assertion.expression == operand.node =>
+            {
+                assertion.type_
+            }
+            _ => return Ok(false),
+        };
+        let type_node = NodeRef::new(parent.arena, parent.file, type_node);
+        let type_record = preflight_node(store, host, type_node).map_err(|_| invalid())?;
+        if type_record.parent != Some(parent.node) {
+            return Err(invalid());
+        }
+        let NodeData::TypeReferenceNode(reference) = &type_record.data else {
+            return Ok(false);
+        };
+        if type_record.kind != SyntaxKind::TypeReference || reference.type_arguments.is_some() {
+            return Ok(false);
+        }
+        let name = NodeRef::new(type_node.arena, type_node.file, reference.type_name);
+        let name_record = preflight_node(store, host, name).map_err(|_| invalid())?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Ok(false);
+        };
+        return Ok(name_record.kind == SyntaxKind::Identifier
+            && name_record.parent == Some(type_node.node)
+            && identifier.text == "const");
+    }
 }
 
 pub(super) fn plan_type_literal(
@@ -3866,8 +3930,17 @@ fn valid_object_literal_property(
     }
     let bound = store.symbol(property.symbol)?;
     let cloned = store.symbol(cloned_symbol)?;
-    if cloned.flags() != (bound.flags() | SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT)
-        || cloned.check_flags() != CheckFlags::NONE
+    if bound.flags() != SymbolFlags::PROPERTY
+        || bound.check_flags() != CheckFlags::NONE
+        || bound.name().as_utf8() != Some(property.name.as_str())
+        || bound.declarations() != Some(&[property.declaration])
+        || bound.value_declaration() != Some(property.declaration)
+        || bound.members().is_some()
+        || bound.exports().is_some()
+        || bound.export_symbol().is_some()
+        || store.get_merged_symbol(property.symbol) != Some(property.symbol)
+        || cloned.flags() != (bound.flags() | SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT)
+        || cloned.check_flags() != source_property_check_flags(property.readonly)
         || cloned.name() != bound.name()
         || cloned.declarations() != bound.declarations()
         || cloned.value_declaration() != bound.value_declaration()
@@ -3886,7 +3959,19 @@ fn valid_object_literal_property(
         target: Some(property.symbol),
         ..ValueSymbolLinks::default()
     };
-    (links == &expected && store.type_payload(resolved_type).is_some()).then_some(resolved_type)
+    (links == &expected && valid_object_literal_property_type(store, property, resolved_type))
+        .then_some(resolved_type)
+}
+
+fn valid_object_literal_property_type(
+    store: &CanonicalTypeMapperStore,
+    property: &PlannedProperty,
+    type_: TypeId,
+) -> bool {
+    store.type_payload(type_).is_some_and(|record| {
+        !property.readonly
+            || matches!(record.data(), TypeData::Literal(literal) if literal.regular_type == type_)
+    })
 }
 
 fn unresolved_property_links(store: &CanonicalTypeMapperStore, plan: &PropertyObjectPlan) -> bool {
@@ -4803,10 +4888,33 @@ pub(super) fn publish_object_literal(
         return Ok(state.type_id());
     }
     if property_types.len() != plan.properties.len()
-        || property_types
+        || plan
+            .properties
             .iter()
-            .any(|type_| store.type_payload(*type_).is_none())
+            .zip(property_types)
+            .any(|(property, type_)| !valid_object_literal_property_type(store, property, *type_))
+        || plan.properties.first().is_some_and(|first| {
+            plan.properties
+                .iter()
+                .any(|property| property.readonly != first.readonly)
+        })
         || !unresolved_property_links(store, plan)
+    {
+        return Err(PropertyObjectError::InvalidObjectLiteral(plan.node));
+    }
+    let owner = store
+        .symbol(plan.symbol)
+        .ok_or(PropertyObjectError::InvalidObjectLiteral(plan.node))?;
+    if store.get_merged_symbol(plan.symbol) != Some(plan.symbol)
+        || owner.flags() != SymbolFlags::OBJECT_LITERAL
+        || owner.check_flags() != CheckFlags::NONE
+        || owner.name() != InternalSymbolName::Object.as_ref()
+        || owner.declarations() != Some(&[plan.node])
+        || owner.value_declaration() != Some(plan.node)
+        || owner.members() != plan.members
+        || owner.parent().is_some()
+        || owner.exports().is_some()
+        || owner.export_symbol().is_some()
     {
         return Err(PropertyObjectError::InvalidObjectLiteral(plan.node));
     }
@@ -4817,10 +4925,35 @@ pub(super) fn publish_object_literal(
         .iter()
         .map(|property| {
             let bound = store.symbol(property.symbol)?;
+            if store.get_merged_symbol(property.symbol) != Some(property.symbol)
+                || bound.flags() != SymbolFlags::PROPERTY
+                || bound.check_flags() != CheckFlags::NONE
+                || bound.name().as_utf8() != Some(property.name.as_str())
+                || bound.declarations() != Some(&[property.declaration])
+                || bound.value_declaration() != Some(property.declaration)
+                || bound.members().is_some()
+                || bound.exports().is_some()
+                || bound.parent() != Some(plan.symbol)
+                || bound.export_symbol().is_some()
+                || store.source_node_parent(property.declaration)
+                    != Some(SourceNodeParent::Parent(plan.node))
+                || store.source_node_parent(property.name_node)
+                    != Some(SourceNodeParent::Parent(property.declaration))
+                || store.source_node_parent(property.type_node)
+                    != Some(SourceNodeParent::Parent(property.declaration))
+                || plan
+                    .members
+                    .and_then(|members| store.symbol_table(members))
+                    .and_then(|members| members.get_source(&property.name))
+                    != Some(property.symbol)
+            {
+                return None;
+            }
             let mut data = SymbolData::new(
                 bound.flags() | SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT,
                 bound.name().to_owned(),
             );
+            data.check_flags = source_property_check_flags(property.readonly);
             data.declarations = bound.declarations().map(<[NodeRef]>::to_vec);
             data.value_declaration = bound.value_declaration();
             data.parent = bound.parent();
@@ -4828,14 +4961,22 @@ pub(super) fn publish_object_literal(
         })
         .collect::<Option<Vec<_>>>()
         .ok_or(PropertyObjectError::InvalidObjectLiteral(plan.node))?;
+    let prepared_members = PreparedSymbolTable::new(plan.properties.len())
+        .ok_or(PropertyObjectError::Capacity(plan.node))?;
+    let mut cloned_properties = Vec::new();
+    cloned_properties
+        .try_reserve_exact(plan.properties.len())
+        .map_err(|_| PropertyObjectError::Capacity(plan.node))?;
     if !store.try_reserve_types(1)
         || !store.try_reserve_checker_symbol_allocations(plan.properties.len(), 1)
+        || !store.try_reserve_value_symbol_links(plan.properties.len())
+        || !store
+            .try_reserve_type_node_links(usize::from(store.type_node_links(plan.node).is_none()))
     {
         return Err(PropertyObjectError::Capacity(plan.node));
     }
 
-    let members = store.alloc_symbol_table();
-    let mut cloned_properties = Vec::with_capacity(plan.properties.len());
+    let members = store.alloc_prepared_symbol_table(prepared_members);
     for ((property, property_type), data) in plan
         .properties
         .iter()
@@ -5138,6 +5279,174 @@ mod generic_publication_tests {
             publish_object_literal(&mut fixture.store, &plan, &property_types),
             Ok(type_)
         );
+    }
+
+    #[test]
+    fn const_object_literals_publish_readonly_keyword_properties_and_regular_literals() {
+        let (mut fixture, object) = object_fixture(concat!(
+            "const value = ({ ",
+            "new: 'new', delete: 'delete', break: 'break', continue: 'continue', ",
+            "count: 1, enabled: true, total: 2n ",
+            "}) as const;",
+        ));
+        let host = host(&fixture.parsed, &fixture.bound);
+        let plan = plan_object_literal(&fixture.store, &host, object).unwrap();
+        assert_eq!(
+            plan.properties
+                .iter()
+                .map(|property| property.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "new", "delete", "break", "continue", "count", "enabled", "total"
+            ],
+        );
+        assert!(plan.properties.iter().all(|property| property.readonly));
+        assert!(plan.properties.iter().all(|property| {
+            fixture.store.symbol(property.symbol).unwrap().check_flags() == CheckFlags::NONE
+        }));
+
+        let mut property_types = ["new", "delete", "break", "continue"]
+            .into_iter()
+            .map(|value| {
+                fixture
+                    .store
+                    .regular_string_literal_type(value.into())
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        property_types.push(
+            fixture
+                .store
+                .regular_number_literal_type(ts_jsnum::Number::new(1.0))
+                .unwrap(),
+        );
+        property_types.push(
+            fixture
+                .store
+                .intrinsic_bootstrap()
+                .unwrap()
+                .regular_true_type,
+        );
+        property_types.push(
+            fixture
+                .store
+                .regular_bigint_literal_type(ts_jsnum::PseudoBigInt::parse_valid("2n"))
+                .unwrap(),
+        );
+
+        let type_ = publish_object_literal(&mut fixture.store, &plan, &property_types).unwrap();
+        let TypeData::Object(record) = fixture.store.type_payload(type_).unwrap().data() else {
+            panic!("a const assertion must preserve its object-literal type")
+        };
+        let properties = record.structured.properties.as_deref().unwrap();
+        assert_eq!(properties.len(), plan.properties.len());
+        for ((symbol, planned), expected) in
+            properties.iter().zip(&plan.properties).zip(&property_types)
+        {
+            let property = fixture.store.symbol(*symbol).unwrap();
+            assert_eq!(
+                property.flags(),
+                SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT,
+            );
+            assert_eq!(property.check_flags(), CheckFlags::READONLY);
+            assert_eq!(property.name().as_utf8(), Some(planned.name.as_str()));
+            assert_eq!(property.declarations(), Some(&[planned.declaration][..]));
+            assert_eq!(
+                fixture.store.value_symbol_links(*symbol),
+                Some(&ValueSymbolLinks {
+                    resolved_type: Some(*expected),
+                    target: Some(planned.symbol),
+                    ..ValueSymbolLinks::default()
+                }),
+            );
+        }
+
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.symbol_len(),
+            fixture.store.symbol_store().symbol_table_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            publish_object_literal(&mut fixture.store, &plan, &property_types),
+            Ok(type_),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.symbol_store().symbol_table_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn const_object_publication_rejects_invalid_literals_and_poisoned_symbols_atomically() {
+        let (mut fixture, object) = object_fixture("const value = { new: 'new' } as const;");
+        let host = host(&fixture.parsed, &fixture.bound);
+        let plan = plan_object_literal(&fixture.store, &host, object).unwrap();
+        let regular = fixture
+            .store
+            .regular_string_literal_type("new".into())
+            .unwrap();
+        let fresh = fixture.store.fresh_type_of_literal_type(regular).unwrap();
+        let state = |store: &CanonicalTypeMapperStore| {
+            (
+                store.type_len(),
+                store.symbol_len(),
+                store.symbol_store().symbol_table_len(),
+                store.checker_link_allocated_lengths(),
+            )
+        };
+        let before = state(&fixture.store);
+        assert_eq!(
+            publish_object_literal(&mut fixture.store, &plan, &[fresh]),
+            Err(PropertyObjectError::InvalidObjectLiteral(object)),
+        );
+        assert_eq!(state(&fixture.store), before);
+
+        assert!(fixture.store.set_symbol_flags(
+            plan.properties[0].symbol,
+            SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL,
+            CheckFlags::NONE,
+        ));
+        let poisoned = state(&fixture.store);
+        assert_eq!(
+            publish_object_literal(&mut fixture.store, &plan, &[regular]),
+            Err(PropertyObjectError::InvalidObjectLiteral(object)),
+        );
+        assert_eq!(state(&fixture.store), poisoned);
+        assert!(fixture.store.set_symbol_flags(
+            plan.properties[0].symbol,
+            SymbolFlags::PROPERTY,
+            CheckFlags::NONE,
+        ));
+
+        let type_ = publish_object_literal(&mut fixture.store, &plan, &[regular]).unwrap();
+        let property = fixture
+            .store
+            .type_payload(type_)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.properties.as_ref())
+            .and_then(|properties| properties.first())
+            .copied()
+            .unwrap();
+        assert!(fixture.store.set_symbol_flags(
+            property,
+            SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT,
+            CheckFlags::NONE,
+        ));
+        let poisoned = state(&fixture.store);
+        assert_eq!(
+            publish_object_literal(&mut fixture.store, &plan, &[regular]),
+            Err(PropertyObjectError::InvalidCachedTypeLiteral {
+                node: object,
+                type_,
+            }),
+        );
+        assert_eq!(state(&fixture.store), poisoned);
     }
 
     #[test]

@@ -1,10 +1,11 @@
 //! Contextual typing for the property-only object-literal source slice.
 //!
 //! The pinned checker obtains an object's contextual type once, looks up each
-//! source property by name, and checks property initializers as mutable
-//! locations. This module precomputes that dependency tree without publishing
-//! checker state, so a malformed target cannot leave a partially constructed
-//! source object behind.
+//! source property by name, and checks ordinary property initializers as
+//! mutable locations. Const-asserted properties retain regular literal types.
+//! This module precomputes that dependency tree without publishing checker
+//! state, so a malformed target cannot leave a partially constructed source
+//! object behind.
 
 use std::collections::{HashMap, HashSet};
 
@@ -26,6 +27,7 @@ use super::{
 enum ExpressionLocation {
     Cached,
     Mutable,
+    Readonly,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -406,7 +408,11 @@ fn prepare_expression(
                     current_flow_types,
                     expression,
                     property_context,
-                    ExpressionLocation::Mutable,
+                    if property.readonly {
+                        ExpressionLocation::Readonly
+                    } else {
+                        ExpressionLocation::Mutable
+                    },
                 )?);
             }
             PreparedExpression::Object(prepared)
@@ -639,6 +645,9 @@ fn literal_treatment(
 ) -> Result<LiteralTreatment, SourceCheckError> {
     if location == ExpressionLocation::Cached {
         return Ok(LiteralTreatment::Fresh);
+    }
+    if location == ExpressionLocation::Readonly {
+        return Ok(LiteralTreatment::Regular);
     }
     if is_literal_of_contextual_type(
         store,

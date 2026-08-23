@@ -221,6 +221,92 @@ fn direct_conditional_initializers_join_in_branch_order_and_replay_warm() {
 }
 
 #[test]
+fn annotated_literal_conditionals_keep_widened_types_and_assignment_diagnostics() {
+    for (index, (source, expected_diagnostic)) in [
+        ("var accepted: string | number = (true ? 1 : '');", None),
+        (
+            "var rejected: boolean = (true ? 1 : '');",
+            Some(concat!(
+                "Type 'string | number' is not assignable to type 'boolean'.\n",
+                "  Type 'string' is not assignable to type 'boolean'.",
+            )),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let parsed = parse_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(30 + u32::try_from(index).unwrap());
+        let mut context = context(&parsed, file);
+
+        context.check_source_file(file).unwrap();
+
+        let conditional = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ConditionalExpression).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        assert_eq!(
+            context
+                .type_to_string(resolved_type(&context, conditional))
+                .unwrap(),
+            "\"\" | 1",
+        );
+        let parenthesized = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ParenthesizedExpression).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        assert_eq!(
+            context
+                .type_to_string(resolved_type(&context, parenthesized))
+                .unwrap(),
+            "\"\" | 1",
+        );
+        assert_eq!(
+            context
+                .diagnostics()
+                .as_slice()
+                .first()
+                .map(|diagnostic| diagnostic.diagnostic.render().unwrap()),
+            expected_diagnostic.map(str::to_owned),
+        );
+        assert_eq!(
+            context.diagnostics().len(),
+            usize::from(expected_diagnostic.is_some()),
+        );
+
+        let warm = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.diagnostics().clone(),
+        );
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.diagnostics().clone(),
+            ),
+            warm,
+        );
+    }
+}
+
+#[test]
 #[allow(clippy::too_many_lines)] // The complete unsupported-form matrix shares one atomic setup.
 fn unsupported_contextual_narrowed_inferred_and_assigned_forms_fail_before_publication() {
     for (index, source) in [

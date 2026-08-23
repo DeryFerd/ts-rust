@@ -1849,6 +1849,21 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         statements.push(PlannedStatement::ExpressionValue(expression));
                         continue;
                     }
+                    if let NodeData::BinaryExpression(binary) = &self.node(expression)?.data
+                        && primitive_binary_operator_text(
+                            self.node(self.reference(binary.operator_token))?.kind,
+                        )
+                        .is_some()
+                        && self.node(self.reference(binary.left))?.kind
+                            != SyntaxKind::BinaryExpression
+                        && self.node(self.reference(binary.right))?.kind
+                            != SyntaxKind::BinaryExpression
+                    {
+                        self.primitive_binary_position_roots.insert(expression);
+                        let expression = self.plan_expression(expression)?;
+                        statements.push(PlannedStatement::ExpressionValue(expression));
+                        continue;
+                    }
                     let Some((store, host)) = self.semantic else {
                         return Err(self.unsupported(
                             statement,
@@ -5733,13 +5748,20 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         let mut root = expression;
         while let Some(parent) = self.node(root)?.parent.map(|node| self.reference(node)) {
             let parent_node = self.node(parent)?;
-            let NodeData::ConditionalExpression(conditional) = &parent_node.data else {
-                break;
-            };
-            if conditional.when_true != root.node && conditional.when_false != root.node {
-                break;
+            match &parent_node.data {
+                NodeData::ConditionalExpression(conditional)
+                    if conditional.when_true == root.node
+                        || conditional.when_false == root.node =>
+                {
+                    root = parent;
+                }
+                NodeData::ParenthesizedExpression(parenthesized)
+                    if parenthesized.expression == root.node =>
+                {
+                    root = parent;
+                }
+                _ => break,
             }
-            root = parent;
         }
         if !self.is_direct_top_level_variable_initializer(root)? {
             return Err(self.unsupported(
@@ -5766,13 +5788,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 SourceSyntaxRole::VariableInitializer,
             ));
         };
-        if variable.type_.is_some() {
-            return Err(self.unsupported(
-                expression,
-                SyntaxKind::ConditionalExpression,
-                SourceSyntaxRole::VariableInitializer,
-            ));
-        }
+        let contextual = variable.type_.is_some();
         let (condition_id, question_id, when_true_id, colon_id, when_false_id) = {
             let record = self.node(expression)?;
             let NodeData::ConditionalExpression(conditional) = &record.data else {
@@ -5836,25 +5852,26 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
         let condition = self.plan_expression(condition)?;
         let condition_target = condition.unparenthesized();
-        let PlannedExpressionKind::Identifier(condition_read) = &condition_target.kind else {
-            return Err(self.unsupported(
-                condition_target.node,
-                self.node(condition_target.node)?.kind,
-                SourceSyntaxRole::VariableInitializer,
-            ));
+        let condition_symbol = match &condition_target.kind {
+            PlannedExpressionKind::Identifier(condition_read)
+                if !contextual
+                    && matches!(
+                        condition_read.kind,
+                        PlannedIdentifierReadKind::Variable | PlannedIdentifierReadKind::Unresolved
+                    ) =>
+            {
+                (condition_read.kind == PlannedIdentifierReadKind::Variable)
+                    .then_some(condition_read.value_symbol)
+            }
+            PlannedExpressionKind::Boolean(_) if contextual => None,
+            _ => {
+                return Err(self.unsupported(
+                    condition_target.node,
+                    self.node(condition_target.node)?.kind,
+                    SourceSyntaxRole::VariableInitializer,
+                ));
+            }
         };
-        if !matches!(
-            condition_read.kind,
-            PlannedIdentifierReadKind::Variable | PlannedIdentifierReadKind::Unresolved
-        ) {
-            return Err(self.unsupported(
-                condition_target.node,
-                SyntaxKind::Identifier,
-                SourceSyntaxRole::VariableInitializer,
-            ));
-        }
-        let condition_symbol = (condition_read.kind == PlannedIdentifierReadKind::Variable)
-            .then_some(condition_read.value_symbol);
         let Some(condition_expectation) = self.conditional_scalar_expectation(&condition)? else {
             return Err(self.unsupported(
                 condition_target.node,
@@ -5924,8 +5941,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 SourceSyntaxRole::VariableInitializer,
             ));
         }
-        let Some(expected_result) =
-            self.conditional_expected_result(when_true_expectation, when_false_expectation)?
+        let Some(expected_result) = self.conditional_expected_result(
+            when_true_expectation,
+            when_false_expectation,
+            contextual,
+        )?
         else {
             return Err(self.unsupported(
                 expression,
@@ -5934,7 +5954,18 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             ));
         };
         if let Some((store, _)) = self.semantic {
-            preflight_source_expression_cache(store, expression, expected_result)?;
+            let expected_cache = if contextual
+                && store
+                    .type_node_links(expression)
+                    .and_then(|links| links.resolved_type)
+                    .is_some()
+            {
+                self.cached_conditional_literal_result(&when_true, &when_false)?
+                    .unwrap_or(expected_result)
+            } else {
+                expected_result
+            };
+            preflight_source_expression_cache(store, expression, expected_cache)?;
             preflight_uncached_conditional_operand_links(store, &condition)?;
             preflight_uncached_conditional_operand_links(store, &when_true)?;
             preflight_uncached_conditional_operand_links(store, &when_false)?;
@@ -6079,10 +6110,67 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
     }
 
+    fn cached_conditional_literal_result(
+        &self,
+        when_true: &PlannedExpression,
+        when_false: &PlannedExpression,
+    ) -> Result<Option<TypeId>, SourceCheckError> {
+        let Some((store, _)) = self.semantic else {
+            return Ok(None);
+        };
+        let bootstrap = store
+            .intrinsic_bootstrap()
+            .ok_or(SourceCheckError::LiteralCache(
+                SourceLiteralCacheError::BootstrapUninitialized,
+            ))?;
+        let cached_literal = |expression: &PlannedExpression| {
+            let regular = match &expression.unparenthesized().kind {
+                PlannedExpressionKind::String(value) => bootstrap.cached_string_literal_type(value),
+                PlannedExpressionKind::Number { value, .. } => {
+                    bootstrap.cached_number_literal_type(*value)
+                }
+                PlannedExpressionKind::BigInt { value, .. } => {
+                    bootstrap.cached_bigint_literal_type(value)
+                }
+                PlannedExpressionKind::Boolean(value) => Some(if *value {
+                    bootstrap.regular_true_type
+                } else {
+                    bootstrap.regular_false_type
+                }),
+                _ => None,
+            };
+            let Some(regular) = regular else {
+                return Ok(None);
+            };
+            if store.type_payload(regular).is_some_and(|record| {
+                matches!(record.data(), TypeData::Literal(literal) if literal.fresh_type.is_none())
+            }) {
+                return Ok(None);
+            }
+            store.fresh_type_of_literal_type(regular).map(Some)
+        };
+        let (Some(first), Some(second)) = (cached_literal(when_true)?, cached_literal(when_false)?)
+        else {
+            return Ok(None);
+        };
+        let cached = if first == second {
+            Some(first)
+        } else {
+            bootstrap
+                .cached_union_type(&[first, second])
+                .or_else(|| bootstrap.cached_union_type(&[second, first]))
+        };
+        if let Some(cached) = cached {
+            store.validate_cached_union_result(cached, None)?;
+        }
+        Ok(cached)
+    }
+
     fn conditional_expected_result(
         &self,
         when_true: ConditionalScalarExpectation,
         when_false: ConditionalScalarExpectation,
+        contextual: bool,
     ) -> Result<Option<TypeId>, SourceCheckError> {
         let Some((store, _)) = self.semantic else {
             return Ok(None);
@@ -6135,6 +6223,14 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 },
             ) => Some(bootstrap.string_or_number_type),
             (
+                ConditionalScalarExpectation::Literal(ConditionalScalarFamily::String),
+                ConditionalScalarExpectation::Literal(ConditionalScalarFamily::Number),
+            )
+            | (
+                ConditionalScalarExpectation::Literal(ConditionalScalarFamily::Number),
+                ConditionalScalarExpectation::Literal(ConditionalScalarFamily::String),
+            ) if contextual => Some(bootstrap.string_or_number_type),
+            (
                 ConditionalScalarExpectation::Exact {
                     family: ConditionalScalarFamily::Number,
                     ..
@@ -6154,6 +6250,14 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     ..
                 },
             ) => Some(bootstrap.number_or_bigint_type),
+            (
+                ConditionalScalarExpectation::Literal(ConditionalScalarFamily::Number),
+                ConditionalScalarExpectation::Literal(ConditionalScalarFamily::BigInt),
+            )
+            | (
+                ConditionalScalarExpectation::Literal(ConditionalScalarFamily::BigInt),
+                ConditionalScalarExpectation::Literal(ConditionalScalarFamily::Number),
+            ) if contextual => Some(bootstrap.number_or_bigint_type),
             _ => None,
         };
         if let Some(result) = result {
@@ -6383,15 +6487,23 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
         let const_assertion = self.is_const_assertion_type(type_node)?;
         let operand = self.plan_expression(operand)?;
-        if const_assertion
-            && !matches!(
-                &operand.unparenthesized().kind,
-                PlannedExpressionKind::String(_)
-                    | PlannedExpressionKind::Number { .. }
-                    | PlannedExpressionKind::BigInt { .. }
-                    | PlannedExpressionKind::Boolean(_)
-            )
-        {
+        let supported_const_operand = match &operand.unparenthesized().kind {
+            PlannedExpressionKind::String(_)
+            | PlannedExpressionKind::Number { .. }
+            | PlannedExpressionKind::BigInt { .. }
+            | PlannedExpressionKind::Boolean(_) => true,
+            PlannedExpressionKind::Object { properties, .. } => properties.iter().all(|property| {
+                matches!(
+                    &property.unparenthesized().kind,
+                    PlannedExpressionKind::String(_)
+                        | PlannedExpressionKind::Number { .. }
+                        | PlannedExpressionKind::BigInt { .. }
+                        | PlannedExpressionKind::Boolean(_)
+                )
+            }),
+            _ => false,
+        };
+        if const_assertion && !supported_const_operand {
             return Err(SourceCheckError::Unsupported(
                 UnsupportedSourceSyntax::ConstAssertion(expression),
             ));
@@ -7292,6 +7404,30 @@ fn prepare_source_property_diagnostic_sink(
     Ok(diagnostics)
 }
 
+fn prepare_const_object_property(
+    expression: &PlannedExpression,
+    prepared: &PreparedExpression,
+) -> Result<PreparedExpression, SourceCheckError> {
+    match (&expression.kind, prepared) {
+        (
+            PlannedExpressionKind::String(_)
+            | PlannedExpressionKind::Number { .. }
+            | PlannedExpressionKind::BigInt { .. }
+            | PlannedExpressionKind::Boolean(_),
+            PreparedExpression::Literal(_),
+        ) => Ok(PreparedExpression::Literal(LiteralTreatment::Regular)),
+        (
+            PlannedExpressionKind::Parenthesized(inner),
+            PreparedExpression::Parenthesized(prepared),
+        ) => Ok(PreparedExpression::Parenthesized(Box::new(
+            prepare_const_object_property(inner, prepared)?,
+        ))),
+        _ => Err(SourceCheckError::Unsupported(
+            UnsupportedSourceSyntax::ConstAssertion(expression.node),
+        )),
+    }
+}
+
 fn execute_expression_types<F>(
     store: &mut CanonicalTypeMapperStore,
     global_types: Option<&CanonicalGlobalTypes>,
@@ -7503,13 +7639,21 @@ where
                 .map_err(source_object_execution_error)?;
             let mut checked_properties = Vec::with_capacity(properties.len());
             let mut property_types = Vec::with_capacity(properties.len());
-            for (property, prepared) in properties.iter().zip(prepared_properties) {
+            for ((property, prepared), property_plan) in properties
+                .iter()
+                .zip(prepared_properties)
+                .zip(&plan.properties)
+            {
+                let const_preparation = property_plan
+                    .readonly
+                    .then(|| prepare_const_object_property(property, prepared))
+                    .transpose()?;
                 let checked = execute_expression_types(
                     store,
                     global_types,
                     current_flow_types,
                     property,
-                    prepared,
+                    const_preparation.as_ref().unwrap_or(prepared),
                     property_diagnostics,
                     check_nested_expression,
                 )?;
@@ -8290,7 +8434,12 @@ fn check_expression_type(
             read,
         ),
         PlannedExpressionKind::Conditional(conditional) => {
-            if contextual_type.is_some() {
+            if contextual_type.is_some()
+                && !matches!(
+                    conditional.condition.unparenthesized().kind,
+                    PlannedExpressionKind::Boolean(_)
+                )
+            {
                 return Err(SourceCheckError::Conditional(conditional.node));
             }
             let condition =
@@ -8396,16 +8545,29 @@ fn check_expression_type(
                 when_false.result,
                 conditional.when_false_expectation,
             )?;
-            let result_type = store.expression_union_type_with_global_types(
+            let raw_type = store.expression_union_type_with_global_types(
                 global_types,
                 &[when_true.result, when_false.result],
                 UnionReduction::Subtype,
             )?;
+            let result_type = if contextual_type.is_some() {
+                let widened_types = [
+                    widened_fresh_literal_type(store, when_true.result)?,
+                    widened_fresh_literal_type(store, when_false.result)?,
+                ];
+                store.expression_union_type_with_global_types(
+                    global_types,
+                    &widened_types,
+                    UnionReduction::Subtype,
+                )?
+            } else {
+                raw_type
+            };
             if result_type != conditional.expected_result {
                 return Err(SourceCheckError::Conditional(conditional.node));
             }
-            publish_expression_type(store, conditional.node, result_type)?;
-            Ok(CheckedExpressionTypes::leaf(result_type, result_type))
+            publish_expression_type(store, conditional.node, raw_type)?;
+            Ok(CheckedExpressionTypes::leaf(raw_type, result_type))
         }
         PlannedExpressionKind::Element(element) => {
             let receiver = check_expression_type(
@@ -8721,13 +8883,26 @@ fn check_expression_type(
                         operand_types.result,
                     )),
                 )?;
-                let TypeData::Literal(literal) = record.data() else {
-                    return Err(SourceCheckError::LiteralCache(
-                        SourceLiteralCacheError::InvalidCachedLiteral(operand_types.result),
-                    ));
+                let target = match record.data() {
+                    TypeData::Literal(literal) => {
+                        let target = literal.regular_type;
+                        store.validate_union_constituent(target)?;
+                        target
+                    }
+                    TypeData::Object(_)
+                        if matches!(
+                            &operand.unparenthesized().kind,
+                            PlannedExpressionKind::Object { .. }
+                        ) =>
+                    {
+                        operand_types.result
+                    }
+                    _ => {
+                        return Err(SourceCheckError::LiteralCache(
+                            SourceLiteralCacheError::InvalidCachedLiteral(operand_types.result),
+                        ));
+                    }
                 };
-                let target = literal.regular_type;
-                store.validate_union_constituent(target)?;
                 publish_expression_type(store, expression.node, target)?;
                 return Ok(CheckedExpressionTypes::leaf(target, target));
             }
@@ -9700,7 +9875,22 @@ fn check_assignment_to_type(
             options,
             session,
         )?;
+        let conditional_detail = conditional_assignment_detail(
+            store,
+            host,
+            global_types,
+            expression,
+            source_type,
+            target,
+            options,
+        )?;
         for mut diagnostic in staged {
+            if diagnostic.diagnostic.code() == 2322
+                && diagnostic.diagnostic.details.is_empty()
+                && let Some(detail) = conditional_detail.as_ref()
+            {
+                diagnostic.diagnostic.details.push(format!("  {detail}"));
+            }
             if let Some(target_display_name) = target_display_name
                 && diagnostic.diagnostic.code() == 2322
                 && diagnostic.node == Some(fallback_node)
@@ -9715,6 +9905,53 @@ fn check_assignment_to_type(
         declared_type: target,
         assigned_type: source_type,
     })
+}
+
+fn conditional_assignment_detail(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    expression: &PlannedExpression,
+    source_type: TypeId,
+    target: TypeId,
+    options: CanonicalCheckerOptions,
+) -> Result<Option<String>, SourceCheckError> {
+    if !matches!(
+        expression.unparenthesized().kind,
+        PlannedExpressionKind::Conditional(_)
+    ) {
+        return Ok(None);
+    }
+    let constituents = match store.type_payload(source_type).map(TypeRecord::data) {
+        Some(TypeData::Union(union)) => union.union.types.clone(),
+        Some(_) => return Ok(None),
+        None => return Err(RelationUnavailable::Type(source_type).into()),
+    };
+    for constituent in constituents {
+        if store.is_type_assignable_to_with_global_types(constituent, target, global_types)? {
+            continue;
+        }
+        let mut flags = CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT;
+        if options.no_error_truncation {
+            flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
+        }
+        let display = get_type_names_for_assignability_error_with_host_global_types_and_flags(
+            store,
+            host,
+            global_types,
+            constituent,
+            target,
+            flags,
+        )?;
+        let detail = Diagnostic::with_arguments(
+            message_by_code(2322).ok_or(SourceCheckError::MissingDiagnostic(2322))?,
+            [display.source, display.target],
+        )
+        .render()
+        .map_err(|_| SourceCheckError::Conditional(expression.node))?;
+        return Ok(Some(detail));
+    }
+    Ok(None)
 }
 
 #[allow(clippy::too_many_arguments)] // Reuses the caller's checker state and instantiation session.
@@ -13404,6 +13641,13 @@ pub(super) fn check_source_file(
                             )
                         }
                         (PlannedVariableInitializer::Expression(initializer), None) => {
+                            let preserve_const_assertion = matches!(
+                                initializer.unparenthesized().kind,
+                                PlannedExpressionKind::Assertion {
+                                    const_assertion: true,
+                                    ..
+                                }
+                            );
                             let initializer = check_expression_type(
                                 store,
                                 host,
@@ -13418,12 +13662,16 @@ pub(super) fn check_source_file(
                                 None,
                                 &mut deferred,
                             )?;
-                            let declared_type = inferred_variable_type(
-                                store,
-                                global_types,
-                                variable.binding,
-                                initializer.result,
-                            )?;
+                            let declared_type = if preserve_const_assertion {
+                                initializer.result
+                            } else {
+                                inferred_variable_type(
+                                    store,
+                                    global_types,
+                                    variable.binding,
+                                    initializer.result,
+                                )?
+                            };
                             let current_flow_type = current_flow_type_after_assignment(
                                 store,
                                 host,
@@ -20070,8 +20318,93 @@ mod tests {
     }
 
     #[test]
+    fn exported_flat_const_objects_preserve_readonly_literal_properties() {
+        let source = parsed(concat!(
+            "export const ordinary = { new: 'new', delete: 'delete' }; ",
+            "export const frozen = ({ ",
+            "new: 'new', delete: 'delete', break: 'break', ",
+            "count: 1, enabled: true, total: 2n ",
+            "}) as const;",
+        ));
+        let file = FileId::new(8_430);
+        let mut context = context_with_module_state(
+            &[(file, &source)],
+            CanonicalModuleState::External,
+            CanonicalCheckerOptions::default(),
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let ordinary = variable_initializer(&source, file, "ordinary");
+        let assertion = variable_initializer(&source, file, "frozen");
+        let NodeData::AsExpression(assertion_data) =
+            &source.arena.get(assertion.node).unwrap().data
+        else {
+            panic!("expected a const assertion")
+        };
+        let parenthesized = NodeRef::new(source.arena.id(), file, assertion_data.expression);
+        let NodeData::ParenthesizedExpression(parenthesized_data) =
+            &source.arena.get(parenthesized.node).unwrap().data
+        else {
+            panic!("expected a parenthesized const object")
+        };
+        let object = NodeRef::new(source.arena.id(), file, parenthesized_data.expression);
+        let frozen = variable_value_type(&context, &source, file, "frozen");
+        assert_eq!(resolved_node_type(&context, assertion), frozen);
+        assert_eq!(resolved_node_type(&context, parenthesized), frozen);
+        assert_eq!(resolved_node_type(&context, object), frozen);
+        assert_eq!(
+            context
+                .type_to_string(object_property_type(&context, ordinary, "new"))
+                .unwrap(),
+            "string"
+        );
+        for (name, expected) in [
+            ("new", "\"new\""),
+            ("delete", "\"delete\""),
+            ("break", "\"break\""),
+            ("count", "1"),
+            ("enabled", "true"),
+            ("total", "2n"),
+        ] {
+            assert_eq!(
+                context
+                    .type_to_string(object_property_type(&context, object, name))
+                    .unwrap(),
+                expected
+            );
+        }
+        let TypeData::Object(record) = context.store().type_payload(frozen).unwrap().data() else {
+            panic!("expected a frozen object type")
+        };
+        for symbol in record.structured.properties.as_deref().unwrap_or_default() {
+            assert!(
+                context
+                    .store()
+                    .symbol(*symbol)
+                    .unwrap()
+                    .check_flags()
+                    .contains(CheckFlags::READONLY)
+            );
+        }
+        assert_eq!(
+            context.type_to_string(frozen).unwrap(),
+            concat!(
+                "{ readonly new: \"new\"; readonly delete: \"delete\"; ",
+                "readonly break: \"break\"; readonly count: 1; ",
+                "readonly enabled: true; readonly total: 2n; }",
+            )
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
     fn nonscalar_const_assertions_remain_an_atomic_typed_boundary() {
-        let source = parsed(r"var value = { item: 1 } as const;");
+        let source = parsed(r"var value = { item: { nested: 1 } } as const;");
         let file = FileId::new(116);
         let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
         let before = observable_state(&context, file);

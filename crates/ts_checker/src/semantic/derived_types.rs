@@ -21,7 +21,7 @@ use super::{
     ids::TypeId,
     links::ValueSymbolLinks,
     mapper::TypeMapper,
-    store::SemanticStore,
+    store::{SemanticStore, SourceNodeParent},
     type_records::{
         ConstrainedTypeData, ObjectTypeData, StructuredTypeData, TypeCacheState, TypeData,
         TypeRecord,
@@ -1005,6 +1005,18 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         if raw_table.is_some_and(|raw| raw.len() != properties.len()) {
             return None;
         }
+        let expected_property_checks = match properties.first() {
+            Some(property) if self.symbol(*property)?.check_flags() == CheckFlags::READONLY => {
+                if !self.readonly_object_literal_source(*owner_declaration) {
+                    return None;
+                }
+                CheckFlags::READONLY
+            }
+            Some(property) if self.symbol(*property)?.check_flags() != CheckFlags::NONE => {
+                return None;
+            }
+            _ => CheckFlags::NONE,
+        };
 
         let mut expected_flags = ObjectFlags::ANONYMOUS
             | ObjectFlags::OBJECT_LITERAL
@@ -1034,7 +1046,12 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             };
             if property_links != &expected_links
                 || property_record.flags() != (SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT)
-                || property_record.check_flags() != CheckFlags::NONE
+                || property_record.check_flags() != expected_property_checks
+                || expected_property_checks == CheckFlags::READONLY
+                    && !matches!(
+                        property_type_record.data(),
+                        TypeData::Literal(literal) if literal.regular_type == property_type
+                    )
                 || property_record.parent() != Some(owner)
                 || property_record.members().is_some()
                 || property_record.exports().is_some()
@@ -1088,6 +1105,20 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             members,
             properties: result,
         })
+    }
+
+    fn readonly_object_literal_source(&self, declaration: NodeRef) -> bool {
+        let mut current = declaration;
+        while let Some(SourceNodeParent::Parent(parent)) = self.source_node_parent(current) {
+            match self.source_node_kind(parent) {
+                Some(SyntaxKind::ParenthesizedExpression) => current = parent,
+                Some(SyntaxKind::AsExpression | SyntaxKind::TypeAssertionExpression) => {
+                    return true;
+                }
+                _ => return false,
+            }
+        }
+        false
     }
 
     fn resolved_object_shape(&self, type_: TypeId) -> Option<ObjectShape> {
@@ -1786,6 +1817,98 @@ mod tests {
             widened
         );
         assert_eq!(observable_state(context.store()), warm_widened_state);
+    }
+
+    #[test]
+    fn readonly_const_objects_retain_literal_properties_and_reject_mixed_flags() {
+        let source = parsed(concat!(
+            "const ordinary = { value: 1 }; ",
+            "const frozen = ({ value: 1, label: 'ready' }) as const;",
+        ));
+        let file = FileId::new(43);
+        let mut context = checker_context(&[(file, &source)]);
+
+        context.check_source_file(file).unwrap();
+
+        let ordinary =
+            resolved_expression_type(&context, variable_initializer(&source, file, "ordinary"));
+        let frozen =
+            resolved_expression_type(&context, variable_initializer(&source, file, "frozen"));
+        let ordinary_shape = context.store().fresh_object_shape(ordinary).unwrap();
+        let frozen_shape = context.store().fresh_object_shape(frozen).unwrap();
+        assert_eq!(
+            context
+                .store()
+                .symbol(property(&ordinary_shape, "value").symbol)
+                .unwrap()
+                .check_flags(),
+            CheckFlags::NONE,
+        );
+        for property in &frozen_shape.properties {
+            assert_eq!(
+                context
+                    .store()
+                    .symbol(property.symbol)
+                    .unwrap()
+                    .check_flags(),
+                CheckFlags::READONLY,
+            );
+            assert!(matches!(
+                context.store().type_payload(property.type_).unwrap().data(),
+                TypeData::Literal(literal) if literal.regular_type == property.type_
+            ));
+        }
+
+        let regular = context
+            .store_mut_for_test()
+            .get_regular_type_of_object_literal(frozen)
+            .unwrap();
+        let regular_shape = context.store().resolved_object_shape(regular).unwrap();
+        for (fresh, regular) in frozen_shape
+            .properties
+            .iter()
+            .zip(&regular_shape.properties)
+        {
+            assert_eq!(regular.symbol, fresh.symbol);
+            assert_eq!(regular.type_, fresh.type_);
+        }
+
+        let warm = observable_state(context.store());
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .get_regular_type_of_object_literal(frozen),
+            Ok(regular),
+        );
+        assert_eq!(observable_state(context.store()), warm);
+
+        let property = frozen_shape.properties[0].symbol;
+        let flags = context.store().symbol(property).unwrap().flags();
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_symbol_flags(property, flags, CheckFlags::NONE,)
+        );
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .get_regular_type_of_object_literal(frozen),
+            Err(DerivedTypeError::InvalidRegularObjectLiteralCache {
+                source: frozen,
+                cached: regular,
+            }),
+        );
+        assert!(context.store_mut_for_test().set_symbol_flags(
+            property,
+            flags,
+            CheckFlags::READONLY,
+        ));
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .get_regular_type_of_object_literal(frozen),
+            Ok(regular),
+        );
     }
 
     #[test]

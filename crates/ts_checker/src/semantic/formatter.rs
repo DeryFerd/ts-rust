@@ -867,6 +867,7 @@ impl DisplayState {
 enum StructuralObjectProof {
     Synthetic,
     ObjectLiteral,
+    ConstObjectLiteral,
     DeclaredTypeLiteral(SemanticSymbolId),
 }
 
@@ -3220,8 +3221,12 @@ fn validate_structural_object_shell(
         let owner = record
             .symbol()
             .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
-        validate_object_literal_contract(store, host, type_id, record, owner)?;
-        return Ok(StructuralObjectProof::ObjectLiteral);
+        let readonly = validate_object_literal_contract(store, host, type_id, record, owner)?;
+        return Ok(if readonly {
+            StructuralObjectProof::ConstObjectLiteral
+        } else {
+            StructuralObjectProof::ObjectLiteral
+        });
     }
     let Some(owner) = record.symbol() else {
         if record
@@ -3256,7 +3261,7 @@ fn validate_object_literal_contract(
     type_id: TypeId,
     record: &TypeRecord,
     owner: SemanticSymbolId,
-) -> Result<(), TypeDisplayUnavailable> {
+) -> Result<bool, TypeDisplayUnavailable> {
     let TypeData::Object(object) = record.data() else {
         return Err(TypeDisplayUnavailable::MalformedType(type_id));
     };
@@ -3309,6 +3314,12 @@ fn validate_object_literal_contract(
         ),
         None => None,
     };
+    let readonly = const_asserted_object_literal(store, host, type_id, *owner_declaration)?;
+    let expected_check_flags = if readonly {
+        CheckFlags::READONLY
+    } else {
+        CheckFlags::NONE
+    };
 
     let mut expected_object_flags = ObjectFlags::ANONYMOUS
         | ObjectFlags::OBJECT_LITERAL
@@ -3344,7 +3355,7 @@ fn validate_object_literal_contract(
         };
         if clone_links != &expected_links
             || clone_record.flags() != (SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT)
-            || clone_record.check_flags() != CheckFlags::NONE
+            || clone_record.check_flags() != expected_check_flags
             || clone_record.parent() != Some(owner)
             || clone_record.members().is_some()
             || clone_record.exports().is_some()
@@ -3374,6 +3385,15 @@ fn validate_object_literal_contract(
             || store.source_node_kind(*declaration) != Some(SyntaxKind::PropertyAssignment)
             || result_table.get(clone_record.name()) != Some(*clone)
             || raw_table.and_then(|table| table.get(raw_record.name())) != Some(raw)
+            || readonly
+                && !valid_const_object_property_literal(
+                    store,
+                    host,
+                    *owner_declaration,
+                    *declaration,
+                    raw,
+                    property_type.0,
+                )
         {
             return Err(TypeDisplayUnavailable::MalformedType(type_id));
         }
@@ -3384,7 +3404,74 @@ fn validate_object_literal_contract(
     {
         return Err(TypeDisplayUnavailable::MalformedType(type_id));
     }
-    Ok(())
+    Ok(readonly)
+}
+
+fn const_asserted_object_literal(
+    store: &CanonicalTypeMapperStore,
+    host: Option<&DeclaredTypeHost<'_>>,
+    type_id: TypeId,
+    declaration: NodeRef,
+) -> Result<bool, TypeDisplayUnavailable> {
+    let Some(host) = host else {
+        return Ok(false);
+    };
+    let plan = object_members::plan_object_literal(store, host, declaration)
+        .map_err(|_| TypeDisplayUnavailable::MalformedType(type_id))?;
+    let readonly = plan
+        .properties
+        .first()
+        .is_some_and(|property| property.readonly);
+    if plan.node != declaration
+        || store.type_payload(type_id).and_then(TypeRecord::symbol) != Some(plan.symbol)
+        || plan
+            .properties
+            .iter()
+            .any(|property| property.readonly != readonly)
+        || readonly
+            && store
+                .type_node_links(declaration)
+                .and_then(|links| links.resolved_type)
+                != Some(type_id)
+    {
+        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    }
+    Ok(readonly)
+}
+
+fn valid_const_object_property_literal(
+    store: &CanonicalTypeMapperStore,
+    host: Option<&DeclaredTypeHost<'_>>,
+    owner: NodeRef,
+    declaration: NodeRef,
+    donor: SemanticSymbolId,
+    property_type: TypeId,
+) -> bool {
+    let Some(host) = host else {
+        return false;
+    };
+    let Some(node) = host.node(declaration) else {
+        return false;
+    };
+    let NodeData::PropertyAssignment(property) = &node.data else {
+        return false;
+    };
+    if node.parent != Some(owner.node) || !host.symbol_matches(store, declaration, donor) {
+        return false;
+    }
+    let initializer = NodeRef::new(declaration.arena, declaration.file, property.initializer);
+    let Some(initializer_type) = store
+        .type_node_links(initializer)
+        .and_then(|links| links.resolved_type)
+    else {
+        return false;
+    };
+    let Some(TypeData::Literal(literal)) =
+        store.type_payload(initializer_type).map(TypeRecord::data)
+    else {
+        return false;
+    };
+    literal.regular_type == property_type
 }
 
 fn validate_structural_owner(
@@ -3647,6 +3734,10 @@ fn validated_property(
             record.flags() == (SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT)
                 && record.check_flags() == CheckFlags::NONE
         }
+        StructuralObjectProof::ConstObjectLiteral => {
+            record.flags() == (SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT)
+                && record.check_flags() == CheckFlags::READONLY
+        }
         StructuralObjectProof::DeclaredTypeLiteral(_) => {
             let allowed = SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL;
             record.flags().contains(SymbolFlags::PROPERTY)
@@ -3679,11 +3770,13 @@ fn validated_property(
         .filter(|property_type| store.type_payload(*property_type).is_some())
         .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
     let expected_links = match proof {
-        StructuralObjectProof::ObjectLiteral => ValueSymbolLinks {
-            resolved_type: Some(property_type),
-            target: links.target,
-            ..ValueSymbolLinks::default()
-        },
+        StructuralObjectProof::ObjectLiteral | StructuralObjectProof::ConstObjectLiteral => {
+            ValueSymbolLinks {
+                resolved_type: Some(property_type),
+                target: links.target,
+                ..ValueSymbolLinks::default()
+            }
+        }
         StructuralObjectProof::Synthetic | StructuralObjectProof::DeclaredTypeLiteral(_) => {
             ValueSymbolLinks {
                 resolved_type: Some(property_type),
@@ -3692,7 +3785,10 @@ fn validated_property(
         }
     };
     if links != &expected_links
-        || matches!(proof, StructuralObjectProof::ObjectLiteral) && links.target.is_none()
+        || matches!(
+            proof,
+            StructuralObjectProof::ObjectLiteral | StructuralObjectProof::ConstObjectLiteral
+        ) && links.target.is_none()
     {
         return Err(TypeDisplayUnavailable::MalformedType(type_id));
     }
@@ -3710,6 +3806,7 @@ fn validated_property(
             record.check_flags().contains(CheckFlags::READONLY)
         }
         StructuralObjectProof::ObjectLiteral => false,
+        StructuralObjectProof::ConstObjectLiteral => true,
         StructuralObjectProof::DeclaredTypeLiteral(owner) => {
             let host = host.ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
             validate_declared_property(
@@ -6381,6 +6478,106 @@ mod tests {
                 context.diagnostics().clone(),
             ),
             warm,
+        );
+    }
+
+    #[test]
+    fn const_object_literals_preserve_readonly_values_and_donor_property_names() {
+        let parsed = parse_source_file(concat!(
+            "const ordinary = { new: 'ordinary', count: 1 }; ",
+            "const frozen = ({ ",
+            "new: 'new', delete: 'delete', ",
+            "\"bad-key\": 'ready', \"0\": true, 7: 2, total: 3n ",
+            "}) as const;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(194_002);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let mut objects = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::ObjectLiteralExpression).then_some((
+                    record.range.start,
+                    NodeRef::new(parsed.arena.id(), file, node),
+                ))
+            })
+            .collect::<Vec<_>>();
+        objects.sort_by_key(|(start, _)| *start);
+        let [(_, ordinary_node), (_, frozen_node)] = objects.as_slice() else {
+            panic!("expected one ordinary and one const-asserted object")
+        };
+        let object_type = |node| {
+            context
+                .store()
+                .type_node_links(node)
+                .and_then(|links| links.resolved_type)
+                .unwrap()
+        };
+        let ordinary = object_type(*ordinary_node);
+        let frozen = object_type(*frozen_node);
+
+        assert_eq!(
+            context.type_to_string(ordinary).unwrap(),
+            "{ new: string; count: number; }",
+        );
+        assert_eq!(
+            context.type_to_string(frozen).unwrap(),
+            concat!(
+                "{ readonly new: \"new\"; readonly delete: \"delete\"; ",
+                "readonly \"bad-key\": \"ready\"; readonly \"0\": true; ",
+                "readonly 7: 2; readonly total: 3n; }",
+            ),
+        );
+        assert_eq!(
+            type_to_string(context.store(), frozen),
+            Err(TypeDisplayUnavailable::MalformedType(frozen)),
+        );
+
+        let ordinary_property = context
+            .store()
+            .type_payload(ordinary)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.properties.as_deref())
+            .and_then(|properties| properties.first())
+            .copied()
+            .unwrap();
+        let ordinary_flags = context.store().symbol(ordinary_property).unwrap().flags();
+        assert!(context.store_mut_for_test().set_symbol_flags(
+            ordinary_property,
+            ordinary_flags,
+            CheckFlags::READONLY,
+        ));
+        assert_eq!(
+            context.type_to_string(ordinary),
+            Err(TypeDisplayUnavailable::MalformedType(ordinary)),
+        );
+
+        let frozen_property = context
+            .store()
+            .type_payload(frozen)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.properties.as_deref())
+            .and_then(|properties| properties.first())
+            .copied()
+            .unwrap();
+        let mut links = context
+            .store()
+            .value_symbol_links(frozen_property)
+            .unwrap()
+            .clone();
+        links.resolved_type = Some(context.store().intrinsic_bootstrap().unwrap().string_type);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(frozen_property, links)
+        );
+        assert_eq!(
+            context.type_to_string(frozen),
+            Err(TypeDisplayUnavailable::MalformedType(frozen)),
         );
     }
 
