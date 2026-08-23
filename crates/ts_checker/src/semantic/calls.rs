@@ -553,6 +553,15 @@ fn effective_minimum_argument_count(
     store: &CanonicalTypeMapperStore,
     callable: &ValidatedSingleCallable,
 ) -> Result<usize, DirectCallError> {
+    if store
+        .signature(callable.signature)
+        .ok_or(DirectCallInvariant::InvalidSignature(callable.signature))?
+        .flags()
+        .contains(SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE)
+    {
+        return Ok(0);
+    }
+
     let mut minimum = callable.min_argument_count;
     while minimum != 0
         && type_contains_void(
@@ -1261,6 +1270,72 @@ mod tests {
         assert_eq!(
             resolution.applicability,
             DirectCallApplicability::Applicable
+        );
+    }
+
+    #[test]
+    fn untyped_javascript_signatures_use_zero_effective_minimum_without_changing_metadata() {
+        let mut store = initialized_store();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let any = bootstrap.any_type;
+        let number = bootstrap.number_type;
+        let void = bootstrap.void_type;
+        let javascript = callable(
+            &mut store,
+            SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE,
+            &[any],
+            1,
+            Some(void),
+        );
+
+        let missing = project_validated_direct_call(
+            &store,
+            None,
+            request(javascript.owner, &[]),
+            &javascript,
+        )
+        .unwrap();
+        assert_eq!(missing.projection.minimum_argument_count, 0);
+        assert_eq!(missing.projection.maximum_argument_count, 1);
+        assert_eq!(missing.applicability, DirectCallApplicability::Applicable);
+
+        let extra = project_validated_direct_call(
+            &store,
+            None,
+            request(javascript.owner, &[number, number, number]),
+            &javascript,
+        )
+        .unwrap();
+        assert_eq!(extra.projection.minimum_argument_count, 0);
+        assert_eq!(extra.projection.maximum_argument_count, 1);
+        assert_eq!(
+            extra.applicability,
+            DirectCallApplicability::TooManyArguments {
+                expected_at_most: 1,
+                actual: 3,
+            },
+        );
+
+        let stored = store.signature(javascript.signature).unwrap();
+        assert_eq!(stored.min_argument_count(), 1);
+        assert_eq!(stored.resolved_min_argument_count(), -1);
+
+        let typescript = callable(&mut store, SignatureFlags::NONE, &[any], 1, Some(void));
+        let missing = project_validated_direct_call(
+            &store,
+            None,
+            request(typescript.owner, &[]),
+            &typescript,
+        )
+        .unwrap();
+        assert_eq!(missing.projection.minimum_argument_count, 1);
+        assert_eq!(missing.projection.maximum_argument_count, 1);
+        assert_eq!(
+            missing.applicability,
+            DirectCallApplicability::TooFewArguments {
+                expected_at_least: 1,
+                actual: 0,
+            },
         );
     }
 

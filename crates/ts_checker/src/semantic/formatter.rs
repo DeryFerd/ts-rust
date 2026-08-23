@@ -6,8 +6,9 @@
 //! `internal/checker/nodebuilderimpl.go::typeToTypeNode`, and
 //! `internal/checker/relater.go::reportRelationError` at
 //! `dc37b5249ab60e2bbce936f71b883e6c8136167e`. It deliberately stops before
-//! qualified symbol naming and advanced structural type serialization. Those
-//! families return [`TypeDisplayUnavailable`] rather than placeholder text.
+//! advanced structural type serialization. Namespace-qualified aliases retain
+//! their authenticated binder export chains; unsupported display families
+//! return [`TypeDisplayUnavailable`] rather than placeholder text.
 
 use std::{collections::HashSet, fmt::Write as _, ops};
 
@@ -940,7 +941,7 @@ fn display_object_type(
         } else {
             validate_property_object_alias(store, host, type_id, record, alias)?;
         }
-        return display_alias_name(store, type_id, alias, state);
+        return display_alias_name(store, host, type_id, alias, state);
     }
     if let Some(host) = host
         && let Some(name) = display_validated_enum_value(store, host, type_id, record, state)?
@@ -1626,7 +1627,7 @@ fn display_mapped_type_alias(
             return Err(TypeDisplayUnavailable::Alias { type_id, alias });
         }
 
-        return display_alias_name(store, type_id, alias, state);
+        return display_alias_name(store, Some(host), type_id, alias, state);
     }
 
     display_symbol_name(store, type_id, symbol, state)
@@ -3108,7 +3109,7 @@ fn valid_display_type_alias_owner(
         alias_record.parent(),
     ) {
         (Some(false), None) => true,
-        (Some(true), Some(parent)) => host.is_some_and(|host| {
+        (Some(true), Some(_)) => host.is_some_and(|host| {
             let Some(declaration_record) = host.node(declaration) else {
                 return false;
             };
@@ -3131,7 +3132,7 @@ fn valid_display_type_alias_owner(
                 alias_symbol,
                 name,
                 type_alias.modifiers.as_ref(),
-            ) == Ok(Some(parent))
+            ) == Ok(store.get_parent_of_symbol(alias_symbol))
         }),
         _ => false,
     }
@@ -4162,7 +4163,7 @@ fn display_intersection_type(
             .type_payload(type_id)
             .ok_or(TypeDisplayUnavailable::Type(type_id))?;
         if let Some(alias) = record.alias() {
-            return display_alias_name(store, type_id, alias, state);
+            return display_alias_name(store, host, type_id, alias, state);
         }
         let mut result = String::new();
         for (index, constituent) in projection.types.iter().enumerate() {
@@ -4205,7 +4206,7 @@ fn display_union_type(
             .type_payload(type_id)
             .ok_or(TypeDisplayUnavailable::Type(type_id))?;
         if let Some(alias) = record.alias() {
-            return display_alias_name(store, type_id, alias, state);
+            return display_alias_name(store, host, type_id, alias, state);
         }
         let TypeData::Union(data) = record.data() else {
             return Err(TypeDisplayUnavailable::InvalidUnion(type_id));
@@ -4246,6 +4247,7 @@ fn display_union_type(
 
 fn display_alias_name(
     store: &CanonicalTypeMapperStore,
+    host: Option<&DeclaredTypeHost<'_>>,
     type_id: TypeId,
     alias: TypeAliasId,
     state: &mut DisplayState,
@@ -4256,8 +4258,105 @@ fn display_alias_name(
     let symbol = alias_record
         .symbol()
         .ok_or(TypeDisplayUnavailable::Alias { type_id, alias })?;
+    let qualified = host
+        .filter(|_| {
+            store
+                .symbol(symbol)
+                .is_some_and(|record| record.parent().is_some())
+        })
+        .map(|host| namespace_qualified_alias_name(store, host, symbol))
+        .transpose()
+        .map_err(|()| TypeDisplayUnavailable::Alias { type_id, alias })?;
+    if let Some(name) = qualified {
+        state.add(name.len().saturating_add(1).saturating_mul(2));
+        return Ok(name);
+    }
     display_symbol_name(store, type_id, symbol, state)
         .ok_or(TypeDisplayUnavailable::Alias { type_id, alias })
+}
+
+fn namespace_qualified_alias_name(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+) -> Result<String, ()> {
+    let mut current = symbol;
+    let mut seen = HashSet::new();
+    let mut names = Vec::new();
+
+    loop {
+        let record = store.symbol(current).ok_or(())?;
+        let name = record
+            .name()
+            .as_utf8()
+            .filter(|name| is_plain_identifier(name))
+            .ok_or(())?;
+        names.push(name);
+        let Some(parent) = store.get_parent_of_symbol(current) else {
+            break;
+        };
+        if !seen.insert(parent) || store.get_merged_symbol(parent) != Some(parent) {
+            return Err(());
+        }
+
+        let owner = store.symbol(parent).ok_or(())?;
+        if !owner.flags().intersects(SymbolFlags::MODULE)
+            || owner.check_flags() != CheckFlags::NONE
+            || owner
+                .exports()
+                .and_then(|exports| store.symbol_table(exports))
+                .and_then(|exports| exports.get(record.name()))
+                .and_then(|export| store.get_merged_symbol(export))
+                != Some(current)
+        {
+            return Err(());
+        }
+
+        let declarations = owner.declarations().ok_or(())?;
+        if declarations.len() == 1
+            && host
+                .node(declarations[0])
+                .is_some_and(|declaration| declaration.kind == SyntaxKind::SourceFile)
+        {
+            if owner.flags() != SymbolFlags::VALUE_MODULE
+                || owner.parent().is_some()
+                || !host.symbol_matches(store, declarations[0], parent)
+            {
+                return Err(());
+            }
+            break;
+        }
+
+        let owner_name = owner
+            .name()
+            .as_utf8()
+            .filter(|name| is_plain_identifier(name))
+            .ok_or(())?;
+        let authenticated = declarations.iter().any(|declaration| {
+            let Some(record) = host.node(*declaration) else {
+                return false;
+            };
+            let NodeData::ModuleDeclaration(namespace) = &record.data else {
+                return false;
+            };
+            let name = NodeRef::new(declaration.arena, declaration.file, namespace.name);
+            record.kind == SyntaxKind::ModuleDeclaration
+                && host.symbol_matches(store, *declaration, parent)
+                && host.node(name).is_some_and(|name| {
+                    matches!(&name.data, NodeData::Identifier(identifier)
+                        if name.kind == SyntaxKind::Identifier
+                            && name.parent == Some(declaration.node)
+                            && identifier.text == owner_name)
+                })
+        });
+        if !authenticated {
+            return Err(());
+        }
+        current = parent;
+    }
+
+    names.reverse();
+    Ok(names.join("."))
 }
 
 fn format_union_types(
@@ -5036,6 +5135,34 @@ mod tests {
             CanonicalCheckerOptions::default(),
         )
         .unwrap()
+    }
+
+    fn namespace_export(
+        context: &CanonicalCheckerContext<'_>,
+        file: FileId,
+        segments: &[&str],
+    ) -> SemanticSymbolId {
+        let [namespace, members @ ..] = segments else {
+            panic!("a namespace export requires at least its namespace name")
+        };
+        let bound = context.file(file).unwrap().1;
+        let mut symbol = bound
+            .locals(bound.source_file())
+            .and_then(|locals| context.store().symbol_table(locals))
+            .and_then(|locals| locals.get_source(namespace))
+            .and_then(|symbol| context.store().get_merged_symbol(symbol))
+            .unwrap();
+        for member in members {
+            symbol = context
+                .store()
+                .symbol(symbol)
+                .and_then(ts_binder::semantic::Symbol::exports)
+                .and_then(|exports| context.store().symbol_table(exports))
+                .and_then(|exports| exports.get_source(member))
+                .and_then(|export| context.store().get_merged_symbol(export))
+                .unwrap();
+        }
+        symbol
     }
 
     fn type_alias_body(parsed: &ParseResult, file: FileId, expected: &str) -> NodeRef {
@@ -6094,6 +6221,189 @@ mod tests {
             context.type_to_string(user_type),
             Err(TypeDisplayUnavailable::Alias {
                 type_id: user_type,
+                alias,
+            })
+        );
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().type_alias_len(),
+                context.store().mapper_len(),
+                context.store().relation_state_snapshot(),
+            ),
+            before
+        );
+    }
+
+    #[test]
+    fn namespace_aliases_keep_qualified_names_in_arrays_tuples_and_error_pairs() {
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "namespace A { ",
+            "export type Outer = { value: string }; ",
+            "export type Inner = { value: string }; ",
+            "} ",
+            "namespace B { ",
+            "export type Outer = { value: number }; ",
+            "export type Inner = { value: number }; ",
+            "}",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(209);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        let symbols = [
+            namespace_export(&context, file, &["A", "Outer"]),
+            namespace_export(&context, file, &["B", "Outer"]),
+            namespace_export(&context, file, &["A", "Inner"]),
+            namespace_export(&context, file, &["B", "Inner"]),
+        ];
+        let [a_outer, b_outer, a_inner, b_inner] =
+            symbols.map(|symbol| context.get_declared_type_of_symbol(symbol).unwrap());
+
+        for (type_, expected) in [
+            (a_outer, "A.Outer"),
+            (b_outer, "B.Outer"),
+            (a_inner, "A.Inner"),
+            (b_inner, "B.Inner"),
+        ] {
+            assert_eq!(context.type_to_string(type_).unwrap(), expected);
+        }
+        assert_eq!(
+            context
+                .get_type_names_for_assignability_error(b_outer, a_outer)
+                .unwrap(),
+            AssignabilityErrorDisplay {
+                source: "B.Outer".into(),
+                target: "A.Outer".into(),
+            }
+        );
+
+        let global_types = context.global_types().clone();
+        let (a_array, b_array, a_tuple, b_tuple) = {
+            let store = context.store_mut_for_test();
+            let a_array = store
+                .create_canonical_array_type(&global_types, a_inner, false)
+                .unwrap();
+            let b_array = store
+                .create_canonical_array_type(&global_types, b_inner, false)
+                .unwrap();
+            let info = store
+                .create_tuple_element_info(ElementFlags::REQUIRED, None)
+                .unwrap();
+            let a_tuple = store
+                .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(
+                    &[a_inner],
+                    &[info],
+                    false,
+                ))
+                .unwrap();
+            let b_tuple = store
+                .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(
+                    &[b_inner],
+                    &[info],
+                    false,
+                ))
+                .unwrap();
+            (a_array, b_array, a_tuple, b_tuple)
+        };
+        for (type_, expected) in [
+            (a_array, "A.Inner[]"),
+            (b_array, "B.Inner[]"),
+            (a_tuple, "[A.Inner]"),
+            (b_tuple, "[B.Inner]"),
+        ] {
+            assert_eq!(context.type_to_string(type_).unwrap(), expected);
+        }
+        assert_eq!(
+            context
+                .get_type_names_for_assignability_error(b_array, a_array)
+                .unwrap(),
+            AssignabilityErrorDisplay {
+                source: "B.Inner[]".into(),
+                target: "A.Inner[]".into(),
+            }
+        );
+        assert_eq!(
+            context
+                .get_type_names_for_assignability_error(b_tuple, a_tuple)
+                .unwrap(),
+            AssignabilityErrorDisplay {
+                source: "[B.Inner]".into(),
+                target: "[A.Inner]".into(),
+            }
+        );
+
+        let warm = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().type_alias_len(),
+            context.store().mapper_len(),
+            context.store().relation_state_snapshot(),
+        );
+        assert_eq!(context.type_to_string(b_array).unwrap(), "B.Inner[]");
+        assert_eq!(context.type_to_string(a_tuple).unwrap(), "[A.Inner]");
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().type_alias_len(),
+                context.store().mapper_len(),
+                context.store().relation_state_snapshot(),
+            ),
+            warm
+        );
+    }
+
+    #[test]
+    fn reopened_nested_namespace_aliases_validate_each_export_edge() {
+        let parsed = parse_source_file(concat!(
+            "namespace Shared { export type Previous = { value: string }; } ",
+            "namespace Shared { ",
+            "export namespace Nested { export type Item = { value: number }; } ",
+            "}",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(210);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        let alias_symbol = namespace_export(&context, file, &["Shared", "Nested", "Item"]);
+        let other_symbol = namespace_export(&context, file, &["Shared", "Previous"]);
+        let nested_symbol = namespace_export(&context, file, &["Shared", "Nested"]);
+        let type_ = context.get_declared_type_of_symbol(alias_symbol).unwrap();
+        let alias = context
+            .store()
+            .type_payload(type_)
+            .unwrap()
+            .alias()
+            .unwrap();
+
+        assert_eq!(context.type_to_string(type_).unwrap(), "Shared.Nested.Item");
+        let exports = context
+            .store()
+            .symbol(nested_symbol)
+            .unwrap()
+            .exports()
+            .unwrap();
+        assert_eq!(
+            context.store_mut_for_test().insert_symbol(
+                exports,
+                EscapedName::source("Item"),
+                other_symbol,
+            ),
+            Some(Some(alias_symbol))
+        );
+        let before = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().type_alias_len(),
+            context.store().mapper_len(),
+            context.store().relation_state_snapshot(),
+        );
+
+        assert_eq!(
+            context.type_to_string(type_),
+            Err(TypeDisplayUnavailable::Alias {
+                type_id: type_,
                 alias,
             })
         );

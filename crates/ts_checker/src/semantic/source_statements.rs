@@ -184,6 +184,17 @@ pub(super) struct SourceControlIfSyntax {
     pub(super) nested_export_diagnostics: Vec<CanonicalCheckerDiagnostic>,
 }
 
+/// One inferred-void function whose sole branch declares a local const enum.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceConditionalEnumFunctionStatementsSyntax {
+    pub(super) body: NodeRef,
+    pub(super) control: SourceControlIfSyntax,
+    pub(super) condition_identifier: NodeRef,
+    pub(super) enum_declaration: NodeRef,
+    pub(super) enum_symbol: SemanticSymbolId,
+    pub(super) join_flow: FlowRef,
+}
+
 /// Loop families whose binder graph preserves source evaluation order.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SourceControlLoopKind {
@@ -1242,6 +1253,22 @@ pub(super) fn plan_source_linear_function_statements_syntax(
     .plan_linear()
 }
 
+/// Proves an inferred-void `if (parameter) const enum` function body.
+pub(super) fn plan_source_conditional_enum_function_statements_syntax(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    callable: &SourceCallablePlan,
+) -> Result<SourceConditionalEnumFunctionStatementsSyntax, SourceFunctionStatementsError> {
+    SyntaxPlanner {
+        arena,
+        bound,
+        store,
+        callable,
+    }
+    .plan_conditional_enum()
+}
+
 /// Proves an exhaustive literal-case switch and its grouped binder-flow paths.
 pub(super) fn plan_source_switch_function_statements_syntax(
     arena: &NodeArena,
@@ -1287,6 +1314,413 @@ struct SyntaxPlanner<'a> {
 }
 
 impl SyntaxPlanner<'_> {
+    fn plan_conditional_enum(
+        &self,
+    ) -> Result<SourceConditionalEnumFunctionStatementsSyntax, SourceFunctionStatementsError> {
+        let declaration = self.callable.declaration;
+        if !declaration.is_for(self.arena.id(), self.bound.file_id())
+            || self.bound.node_arena_id() != self.arena.id()
+            || self.bound.node_arena_revision() != self.arena.revision()
+        {
+            return Err(SourceFunctionStatementsInvariant::BoundSourceMismatch(declaration).into());
+        }
+        if self.callable.family != SourceCallableFamily::FunctionDeclaration
+            || !self.callable.return_type.is_inferred()
+            || !self.callable.type_parameters.is_empty()
+        {
+            return Err(self.unsupported(
+                declaration,
+                self.node(declaration)?.kind,
+                SourceFunctionStatementsRole::Callable,
+            ));
+        }
+
+        let record = self.node(declaration)?;
+        let NodeData::FunctionDeclaration(function) = &record.data else {
+            return Err(self.unsupported(
+                declaration,
+                record.kind,
+                SourceFunctionStatementsRole::Callable,
+            ));
+        };
+        if record.kind != SyntaxKind::FunctionDeclaration
+            || function.body != Some(self.callable.body.node)
+            || function.type_.is_some()
+        {
+            return Err(SourceFunctionStatementsInvariant::InvalidCallableEdge(declaration).into());
+        }
+        let [parameter] = self.callable.parameters.as_slice() else {
+            return Err(self.unsupported(
+                declaration,
+                record.kind,
+                SourceFunctionStatementsRole::Callable,
+            ));
+        };
+        let parameter_record = self.node(parameter.declaration)?;
+        let NodeData::ParameterDeclaration(parameter_data) = &parameter_record.data else {
+            return Err(self.unsupported(
+                parameter.declaration,
+                parameter_record.kind,
+                SourceFunctionStatementsRole::Callable,
+            ));
+        };
+        let parameter_name = self.reference(parameter_data.name);
+        let parameter_name_record = self.node(parameter_name)?;
+        let NodeData::Identifier(parameter_identifier) = &parameter_name_record.data else {
+            return Err(self.unsupported(
+                parameter_name,
+                parameter_name_record.kind,
+                SourceFunctionStatementsRole::Callable,
+            ));
+        };
+        if parameter_name_record.kind != SyntaxKind::Identifier
+            || parameter_name_record.parent != Some(parameter.declaration.node)
+            || self.bound.symbol(parameter.declaration) != Some(parameter.symbol)
+        {
+            return Err(SourceFunctionStatementsInvariant::InvalidCallableEdge(declaration).into());
+        }
+
+        let body = self.callable.body;
+        self.validate_range(body, declaration)?;
+        let statements = self.plan_body(body, declaration)?;
+        let [statement] = statements.as_slice() else {
+            return Err(SourceFunctionStatementsError::Unsupported(
+                SourceFunctionStatementsUnsupported::MissingFinalIf(body),
+            ));
+        };
+        let statement = self.reference(*statement);
+        let control = plan_source_control_if_syntax(self.arena, self.bound, statement, body)?;
+        if control.else_statement.is_some() || !control.nested_export_diagnostics.is_empty() {
+            return Err(self.unsupported(
+                statement,
+                SyntaxKind::IfStatement,
+                SourceFunctionStatementsRole::IfStatement,
+            ));
+        }
+        self.validate_container(statement, declaration)?;
+        self.validate_block_scope_container(statement, declaration)?;
+        let condition = self.plan_condition(control.condition, declaration)?;
+        if condition.identifier != control.condition || condition.typeof_condition.is_some() {
+            return Err(self.unsupported(
+                control.condition,
+                self.node(control.condition)?.kind,
+                SourceFunctionStatementsRole::Condition,
+            ));
+        }
+        let NodeData::Identifier(identifier) = &self.node(condition.identifier)?.data else {
+            return Err(self.unsupported(
+                condition.identifier,
+                self.node(condition.identifier)?.kind,
+                SourceFunctionStatementsRole::Condition,
+            ));
+        };
+        if identifier.text != parameter_identifier.text {
+            return Err(self.unsupported(
+                condition.identifier,
+                SyntaxKind::Identifier,
+                SourceFunctionStatementsRole::Condition,
+            ));
+        }
+
+        let (enum_symbol, enum_name) =
+            self.plan_embedded_const_enum(control.then_statement, control.statement, declaration)?;
+        let join_flow = self.validate_conditional_enum_flow(&control, enum_name)?;
+
+        Ok(SourceConditionalEnumFunctionStatementsSyntax {
+            body,
+            enum_declaration: control.then_statement,
+            control,
+            condition_identifier: condition.identifier,
+            enum_symbol,
+            join_flow,
+        })
+    }
+
+    fn plan_embedded_const_enum(
+        &self,
+        declaration: NodeRef,
+        parent: NodeRef,
+        callable: NodeRef,
+    ) -> Result<(SemanticSymbolId, NodeRef), SourceFunctionStatementsError> {
+        let record = self.node(declaration)?;
+        let NodeData::EnumDeclaration(enumeration) = &record.data else {
+            return Err(self.unsupported(
+                declaration,
+                record.kind,
+                SourceFunctionStatementsRole::BranchStatement,
+            ));
+        };
+        if record.kind != SyntaxKind::EnumDeclaration
+            || record.flags.0 != 0
+            || record.parent != Some(parent.node)
+            || enumeration.flow_node.is_some()
+            || enumeration.local_symbol.is_some()
+            || enumeration.symbol.is_some()
+            || enumeration.facts != 0
+            || enumeration.members.has_trailing_comma
+        {
+            return Err(self.unsupported(
+                declaration,
+                record.kind,
+                SourceFunctionStatementsRole::BranchStatement,
+            ));
+        }
+        self.validate_range(declaration, parent)?;
+        self.validate_container(declaration, callable)?;
+        self.validate_block_scope_container(declaration, callable)?;
+
+        let Some(modifiers) = enumeration.modifiers.as_ref() else {
+            return Err(self.unsupported(
+                declaration,
+                record.kind,
+                SourceFunctionStatementsRole::BranchStatement,
+            ));
+        };
+        let [modifier] = modifiers.list.nodes.as_slice() else {
+            return Err(self.unsupported(
+                declaration,
+                record.kind,
+                SourceFunctionStatementsRole::BranchStatement,
+            ));
+        };
+        let modifier = self.reference(*modifier);
+        let modifier_record = self.node(modifier)?;
+        if modifiers.flags.0 != 0
+            || modifiers.list.has_trailing_comma
+            || modifier_record.kind != SyntaxKind::ConstKeyword
+            || modifier_record.flags.0 != 0
+            || modifier_record.parent != Some(declaration.node)
+            || !matches!(modifier_record.data, NodeData::Token(_))
+        {
+            return Err(self.unsupported(
+                modifier,
+                modifier_record.kind,
+                SourceFunctionStatementsRole::BranchStatement,
+            ));
+        }
+        self.validate_range(modifier, declaration)?;
+
+        let name = self.reference(enumeration.name);
+        let name_record = self.node(name)?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Err(self.unsupported(
+                name,
+                name_record.kind,
+                SourceFunctionStatementsRole::BranchStatement,
+            ));
+        };
+        if name_record.kind != SyntaxKind::Identifier
+            || name_record.flags.0 != 0
+            || name_record.parent != Some(declaration.node)
+            || identifier.flow_node.is_some()
+            || identifier.text.is_empty()
+        {
+            return Err(self.unsupported(
+                name,
+                name_record.kind,
+                SourceFunctionStatementsRole::BranchStatement,
+            ));
+        }
+        self.validate_range(name, declaration)?;
+        self.validate_order(modifier, name)?;
+        self.validate_container(name, declaration)?;
+        self.validate_block_scope_container(name, declaration)?;
+
+        let [member] = enumeration.members.nodes.as_slice() else {
+            return Err(self.unsupported(
+                declaration,
+                record.kind,
+                SourceFunctionStatementsRole::BranchStatement,
+            ));
+        };
+        let member = self.reference(*member);
+        let member_record = self.node(member)?;
+        let NodeData::EnumMember(member_data) = &member_record.data else {
+            return Err(self.unsupported(
+                member,
+                member_record.kind,
+                SourceFunctionStatementsRole::BranchStatement,
+            ));
+        };
+        if member_record.kind != SyntaxKind::EnumMember
+            || member_record.flags.0 != 0
+            || member_record.parent != Some(declaration.node)
+            || member_data.postfix_token.is_some()
+            || member_data.symbol.is_some()
+            || member_data.facts != 0
+            || member_data.modifiers.is_some()
+        {
+            return Err(self.unsupported(
+                member,
+                member_record.kind,
+                SourceFunctionStatementsRole::BranchStatement,
+            ));
+        }
+        self.validate_range(member, declaration)?;
+        self.validate_container(member, declaration)?;
+        self.validate_block_scope_container(member, declaration)?;
+        let member_name = self.reference(member_data.name);
+        let member_name_record = self.node(member_name)?;
+        let NodeData::Identifier(member_identifier) = &member_name_record.data else {
+            return Err(self.unsupported(
+                member_name,
+                member_name_record.kind,
+                SourceFunctionStatementsRole::BranchStatement,
+            ));
+        };
+        if member_name_record.kind != SyntaxKind::Identifier
+            || member_name_record.flags.0 != 0
+            || member_name_record.parent != Some(member.node)
+            || member_identifier.flow_node.is_some()
+            || member_identifier.text.is_empty()
+        {
+            return Err(self.unsupported(
+                member_name,
+                member_name_record.kind,
+                SourceFunctionStatementsRole::BranchStatement,
+            ));
+        }
+        let initializer = member_data.initializer.map(|node| self.reference(node));
+        let Some(initializer) = initializer else {
+            return Err(self.unsupported(
+                member,
+                member_record.kind,
+                SourceFunctionStatementsRole::BranchStatement,
+            ));
+        };
+        let initializer_record = self.node(initializer)?;
+        let NodeData::NumericLiteral(literal) = &initializer_record.data else {
+            return Err(self.unsupported(
+                initializer,
+                initializer_record.kind,
+                SourceFunctionStatementsRole::BranchStatement,
+            ));
+        };
+        if initializer_record.kind != SyntaxKind::NumericLiteral
+            || initializer_record.flags.0 != 0
+            || initializer_record.parent != Some(member.node)
+            || literal.token_flags.0 != 0
+        {
+            return Err(self.unsupported(
+                initializer,
+                initializer_record.kind,
+                SourceFunctionStatementsRole::BranchStatement,
+            ));
+        }
+        self.validate_range(member_name, member)?;
+        self.validate_range(initializer, member)?;
+        self.validate_order(member_name, initializer)?;
+
+        let symbol = self.bound.symbol(declaration).ok_or(
+            SourceFunctionStatementsInvariant::InvalidCallableEdge(declaration),
+        )?;
+        let owner = self
+            .store
+            .symbol(symbol)
+            .filter(|owner| {
+                owner.flags() == SymbolFlags::CONST_ENUM
+                    && owner.name().as_utf8() == Some(identifier.text.as_str())
+                    && owner.value_declaration() == Some(declaration)
+                    && self.store.get_merged_symbol(symbol) == Some(symbol)
+            })
+            .ok_or(SourceFunctionStatementsInvariant::InvalidCallableEdge(
+                declaration,
+            ))?;
+        if owner.declarations() != Some(&[declaration]) {
+            return Err(SourceFunctionStatementsInvariant::InvalidCallableEdge(declaration).into());
+        }
+        let locals = self
+            .bound
+            .locals(callable)
+            .ok_or(SourceFunctionStatementsInvariant::MissingLocals(callable))?;
+        let actual = self
+            .store
+            .symbol_table(locals)
+            .and_then(|locals| locals.get_source(&identifier.text));
+        if actual != Some(symbol) {
+            return Err(SourceFunctionStatementsInvariant::LocalTableMismatch {
+                declaration,
+                scope: callable,
+                expected: symbol,
+                actual,
+            }
+            .into());
+        }
+        Ok((symbol, name))
+    }
+
+    fn validate_conditional_enum_flow(
+        &self,
+        control: &SourceControlIfSyntax,
+        enum_name: NodeRef,
+    ) -> Result<FlowRef, SourceFunctionStatementsError> {
+        let declaration = self.callable.declaration;
+        let graph = self.bound.flow_graph();
+        if graph.container_is_complete(declaration) != Some(true) {
+            return Err(Self::incomplete_switch_flow(declaration));
+        }
+        let start = graph.container_start(declaration).ok_or(
+            SourceFunctionStatementsInvariant::MissingFlowStart(declaration),
+        )?;
+        let start_node = graph
+            .nodes()
+            .get(start)
+            .ok_or_else(|| Self::incomplete_switch_flow(declaration))?;
+        if joined_semantic_flow_flags(start_node.flags) != FlowFlags::START.bits()
+            || start_node.payload.is_some()
+            || start_node.antecedent.is_some()
+            || !start_node.antecedents.is_empty()
+            || self.bound.flow_at(control.statement) != Some(start)
+            || self.bound.flow_at(control.condition) != Some(start)
+        {
+            return Err(Self::incomplete_switch_flow(control.statement));
+        }
+        if graph.container_return(declaration).is_some() {
+            return Err(
+                SourceFunctionStatementsInvariant::UnexpectedReturnFlow(declaration).into(),
+            );
+        }
+        let join_flow = graph
+            .container_end(declaration)
+            .ok_or_else(|| Self::incomplete_switch_flow(control.statement))?;
+        let join = graph
+            .nodes()
+            .get(join_flow)
+            .ok_or_else(|| Self::incomplete_switch_flow(control.statement))?;
+        if joined_semantic_flow_flags(join.flags) != FlowFlags::BRANCH_LABEL.bits()
+            || join.payload.is_some()
+            || join.antecedent.is_some()
+            || join.antecedents.len() != 2
+            || join.antecedents[0] == join.antecedents[1]
+        {
+            return Err(Self::incomplete_switch_flow(control.statement));
+        }
+        for (edge, flags) in join
+            .antecedents
+            .iter()
+            .copied()
+            .zip([FlowFlags::TRUE_CONDITION, FlowFlags::FALSE_CONDITION])
+        {
+            let node = graph
+                .nodes()
+                .get(edge)
+                .ok_or_else(|| Self::incomplete_switch_flow(control.statement))?;
+            if joined_semantic_flow_flags(node.flags) != flags.bits()
+                || node.payload != Some(FlowNodePayload::Ast(control.condition))
+                || node.antecedent != Some(start)
+                || !node.antecedents.is_empty()
+            {
+                return Err(Self::incomplete_switch_flow(control.statement));
+            }
+        }
+        if self.bound.flow_container(enum_name) != Some(declaration)
+            || self.bound.flow_at(enum_name) != Some(join.antecedents[0])
+        {
+            return Err(Self::incomplete_switch_flow(enum_name));
+        }
+        Ok(join_flow)
+    }
+
     fn plan_switch(
         &self,
     ) -> Result<SourceSwitchFunctionStatementsSyntax, SourceFunctionStatementsError> {
@@ -4235,6 +4669,112 @@ mod joined_tests {
                 &callable,
             )
         }
+
+        fn conditional_enum_plan(
+            &self,
+        ) -> Result<SourceConditionalEnumFunctionStatementsSyntax, SourceFunctionStatementsError>
+        {
+            let callable = self.callable();
+            plan_source_conditional_enum_function_statements_syntax(
+                &self.parsed.arena,
+                &self.bound,
+                &self.store,
+                &callable,
+            )
+        }
+    }
+
+    #[test]
+    fn inferred_void_if_authenticates_embedded_const_enum_and_branch_join() {
+        let fixture = JoinedFixture::new(
+            concat!(
+                "function choose(value: number) {\n",
+                "  if (value)\n",
+                "    const enum Choice { Ready = 1 }\n",
+                "}\n",
+            ),
+            FileId::new(1_350),
+        );
+        let syntax = fixture.conditional_enum_plan().unwrap();
+        let callable = fixture.declaration();
+        assert_eq!(syntax.body, fixture.callable().body);
+        assert_eq!(syntax.control.condition, syntax.condition_identifier);
+        assert_eq!(syntax.control.then_statement, syntax.enum_declaration);
+        assert!(syntax.control.else_statement.is_none());
+        assert_eq!(
+            fixture.bound.symbol(syntax.enum_declaration),
+            Some(syntax.enum_symbol),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .symbol_table(fixture.bound.locals(callable).unwrap())
+                .and_then(|locals| locals.get_source("Choice")),
+            Some(syntax.enum_symbol),
+        );
+        assert_eq!(
+            fixture.bound.flow_graph().container_end(callable),
+            Some(syntax.join_flow),
+        );
+        let join = fixture
+            .bound
+            .flow_graph()
+            .nodes()
+            .get(syntax.join_flow)
+            .unwrap();
+        assert_eq!(
+            joined_semantic_flow_flags(join.flags),
+            FlowFlags::BRANCH_LABEL.bits(),
+        );
+        assert_eq!(join.antecedents.len(), 2);
+    }
+
+    #[test]
+    fn inferred_void_if_rejects_unsupported_enum_branches_and_callable_shapes() {
+        for (index, source) in [
+            "function choose(value: number): void { if (value) const enum E { A = 1 } }",
+            "function choose(value: number) { if (value) enum E { A = 1 } }",
+            "function choose(value: number) { if (value) { const enum E { A = 1 } } }",
+            "function choose(value: number) { if (value) const enum E { A = 1 } else ; }",
+            "function choose(value: number) { if (value) const enum E { A = 1, B = 2 } }",
+            "function choose(value: number) { if (value) const enum E { A = 'ready' } }",
+            "function choose(value: number) { if ((value)) const enum E { A = 1 } }",
+            "function choose(value: number, other: number) { if (value) const enum E { A = 1 } }",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture =
+                JoinedFixture::new(source, FileId::new(1_351 + u32::try_from(index).unwrap()));
+            assert!(matches!(
+                fixture.conditional_enum_plan(),
+                Err(SourceFunctionStatementsError::Unsupported(_)),
+            ));
+        }
+    }
+
+    #[test]
+    fn embedded_const_enum_planning_replays_without_semantic_publication() {
+        let fixture = JoinedFixture::new(
+            "function choose(value: number) { if (value) const enum E { A = 1 } }",
+            FileId::new(1_359),
+        );
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.mapper_len(),
+        );
+        let first = fixture.conditional_enum_plan().unwrap();
+        let second = fixture.conditional_enum_plan().unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.mapper_len(),
+            ),
+            before,
+        );
     }
 
     #[test]

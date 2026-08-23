@@ -15,6 +15,7 @@ use ts_binder::{EscapedName, SemanticSymbolId};
 use super::{
     CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeHost, RelationUnavailable, TypeId,
     VariableInvariant,
+    callables::{StoredSingleCallableValidation, validate_stored_single_callable},
     mapped_types::{FiniteRecordMappedProjection, MappedTypeError},
     object_members::PlannedProperty,
     relater::ResolvedDeclaredPropertyObject,
@@ -247,6 +248,16 @@ fn preflight_contextual_type_graph(
             return Ok(());
         }
         if flags.intersects(TypeFlags::OBJECT) {
+            match validate_stored_single_callable(store, contextual_type) {
+                StoredSingleCallableValidation::Valid { .. } => return Ok(()),
+                StoredSingleCallableValidation::Pending { .. } => {
+                    return Err(RelationUnavailable::UnresolvedFunctionType(contextual_type).into());
+                }
+                StoredSingleCallableValidation::Malformed { .. } => {
+                    return Err(RelationUnavailable::MalformedFunctionType(contextual_type).into());
+                }
+                StoredSingleCallableValidation::NotCallable => {}
+            }
             if let Some(global_types) = global_types
                 && let Some(element_type) =
                     store.canonical_array_element_type(global_types, contextual_type)?
@@ -862,7 +873,7 @@ fn validate_contextual_union(
 
 #[cfg(test)]
 mod tests {
-    use ts_ast::{FileId, NodeArena, NodeData, NodeId, NodeRef};
+    use ts_ast::{FileId, NodeArena, NodeData, NodeId, NodeRef, SyntaxKind};
     use ts_binder::{
         CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
         CheckFlags, EscapedName, SymbolFlags,
@@ -956,6 +967,175 @@ mod tests {
             })
             .collect();
         PlannedExpression::new(object, PlannedExpressionKind::Object { plan, properties })
+    }
+
+    fn contextual_function_types(
+        parsed: &ParseResult,
+        file: FileId,
+        store: &CanonicalTypeMapperStore,
+    ) -> Vec<(NodeRef, TypeId)> {
+        parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                if record.kind != SyntaxKind::FunctionType {
+                    return None;
+                }
+                let node = NodeRef::new(parsed.arena.id(), file, node);
+                store
+                    .type_node_links(node)
+                    .and_then(|links| links.resolved_type)
+                    .map(|type_| (node, type_))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn contextual_object_graph_accepts_authenticated_nested_callable_leaves() {
+        let parsed = parse_source_file(concat!(
+            "interface Target { ",
+            "callback: (value: string) => string; ",
+            "nested: { handler: (value: number) => number }; ",
+            "} ",
+            "const value: Target = { ",
+            "callback: (value: string) => value, ",
+            "nested: { handler: (value: number) => value }, ",
+            "};",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(1_065);
+        let mut context = mapped_record_context(&parsed, file);
+        let (annotation, object) = mapped_record_nodes(&parsed, file);
+        let target = context.get_type_from_type_node(annotation).unwrap();
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new([(&parsed.arena, &bound)]).unwrap();
+        let callables = contextual_function_types(&parsed, file, context.store());
+        assert_eq!(callables.len(), 2);
+        assert!(callables.iter().all(|(_, callable)| {
+            matches!(
+                validate_stored_single_callable(context.store(), *callable),
+                StoredSingleCallableValidation::Valid { .. }
+            )
+        }));
+        let store = context.store_mut_for_test();
+        let before = (
+            store.type_len(),
+            store.mapper_len(),
+            store.signature_len(),
+            store.symbol_len(),
+            store.checker_link_allocated_lengths(),
+            store.relation_state_snapshot(),
+        );
+
+        for _ in 0..2 {
+            preflight_contextual_type_graph(
+                store,
+                &host,
+                None,
+                target,
+                &mut HashSet::new(),
+                &mut HashSet::new(),
+            )
+            .unwrap();
+            let root = resolve_contextual_property_object(store, &host, target)
+                .unwrap()
+                .unwrap();
+            assert_eq!(root.get_source("callback"), Some(callables[0].1));
+            let nested = root.get_source("nested").unwrap();
+            let nested = resolve_contextual_property_object(store, &host, nested)
+                .unwrap()
+                .unwrap();
+            assert_eq!(nested.get_source("handler"), Some(callables[1].1));
+            assert_eq!(
+                (
+                    store.type_len(),
+                    store.mapper_len(),
+                    store.signature_len(),
+                    store.symbol_len(),
+                    store.checker_link_allocated_lengths(),
+                    store.relation_state_snapshot(),
+                ),
+                before,
+            );
+            assert!(store.type_node_links(object).is_none());
+        }
+    }
+
+    #[test]
+    fn malformed_contextual_callable_leaf_fails_before_object_publication() {
+        let parsed = parse_source_file(concat!(
+            "interface Target { callback: (value: string) => string; } ",
+            "const value: Target = { callback: (value: string) => value };",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(1_066);
+        let mut context = mapped_record_context(&parsed, file);
+        let (annotation, object) = mapped_record_nodes(&parsed, file);
+        let target = context.get_type_from_type_node(annotation).unwrap();
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new([(&parsed.arena, &bound)]).unwrap();
+        let [(declaration, callable)] = contextual_function_types(&parsed, file, context.store())
+            .try_into()
+            .expect("the target declares one authenticated function type");
+        let store = context.store_mut_for_test();
+        let signature = store
+            .signature_links(declaration)
+            .and_then(|links| links.resolved_signature.signature())
+            .unwrap();
+        let [parameter] = store.signature(signature).unwrap().parameters() else {
+            panic!("the contextual signature has one parameter")
+        };
+        let parameter = *parameter;
+        let original = store.value_symbol_links(parameter).unwrap().clone();
+        let mut poisoned = original.clone();
+        poisoned.resolved_type = Some(store.intrinsic_bootstrap().unwrap().number_type);
+        assert!(store.set_value_symbol_links(parameter, poisoned));
+        let before = (
+            store.type_len(),
+            store.mapper_len(),
+            store.signature_len(),
+            store.symbol_len(),
+            store.checker_link_allocated_lengths(),
+            store.relation_state_snapshot(),
+        );
+
+        assert_eq!(
+            preflight_contextual_type_graph(
+                store,
+                &host,
+                None,
+                callable,
+                &mut HashSet::new(),
+                &mut HashSet::new(),
+            ),
+            Err(SourceCheckError::RelationUnavailable(
+                RelationUnavailable::MalformedFunctionType(callable),
+            )),
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.mapper_len(),
+                store.signature_len(),
+                store.symbol_len(),
+                store.checker_link_allocated_lengths(),
+                store.relation_state_snapshot(),
+            ),
+            before,
+        );
+        assert!(store.type_node_links(object).is_none());
+
+        assert!(store.set_value_symbol_links(parameter, original));
+        preflight_contextual_type_graph(
+            store,
+            &host,
+            None,
+            target,
+            &mut HashSet::new(),
+            &mut HashSet::new(),
+        )
+        .unwrap();
+        assert!(store.type_node_links(object).is_none());
     }
 
     #[test]

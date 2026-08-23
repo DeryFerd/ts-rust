@@ -456,3 +456,60 @@ fn computed_object_bindings_report_missing_index_signatures_without_implicit_any
         warm,
     );
 }
+
+#[test]
+fn invalid_function_type_parameters_preserve_all_ordered_grammar_diagnostics() {
+    let library = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
+    let text = "function Invalid(): (public value) => Missing {}";
+    let parsed = parse_source_file(text);
+    assert!(library.diagnostics.is_empty());
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(3_508);
+    let mut context = context_with_options(
+        &library,
+        &parsed,
+        file,
+        CanonicalCheckerOptions {
+            no_implicit_any: true,
+            ..CanonicalCheckerOptions::default()
+        },
+    );
+
+    context.check_source_file(file).unwrap();
+
+    let actual = context
+        .diagnostics()
+        .as_slice()
+        .iter()
+        .map(|diagnostic| {
+            (
+                diagnostic.diagnostic.code(),
+                node_text(text, &parsed, diagnostic.node.unwrap()),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        [
+            (2355, "(public value) => Missing"),
+            (2369, "public value"),
+            (7006, "public value"),
+            (2304, "Missing"),
+        ],
+    );
+
+    let warm = (
+        context.store().type_len(),
+        context.store().signature_len(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
+}

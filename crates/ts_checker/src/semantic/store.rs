@@ -198,6 +198,8 @@ pub(super) struct SourceCallableProvenance {
     /// return-annotation edge. Contextual arrows retain both this target and
     /// `contextual_variable` so warm validation can distinguish the target
     /// identity from the arrow expression's independently inferred callable.
+    /// Object-property arrows use their exact binder-owned property as the
+    /// contextual anchor instead of a variable symbol.
     pub(super) contextual_target: Option<TypeId>,
     pub(super) contextual_variable: Option<SemanticSymbolId>,
 }
@@ -1205,8 +1207,11 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                     && provenance.return_provenance == SourceCallableReturnProvenance::Inferred
                     && target != type_
                     && self.types.get(target).is_some()
-                    && self.symbols.contains_symbol(variable)
-                    && variable != provenance.owner_symbol
+                    && self.source_contextual_callable_anchor_is_exact(
+                        provenance.declaration,
+                        provenance.owner_symbol,
+                        variable,
+                    )
             }
             _ => false,
         };
@@ -1282,6 +1287,90 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             self.mark_relation_inputs_dirty();
         }
         true
+    }
+
+    /// Proves the exact variable or object-property owner of a contextual arrow.
+    pub(super) fn source_contextual_callable_anchor_is_exact(
+        &self,
+        declaration: NodeRef,
+        owner_symbol: SemanticSymbolId,
+        anchor: SemanticSymbolId,
+    ) -> bool {
+        let Some(owner) = self.symbol(owner_symbol) else {
+            return false;
+        };
+        if anchor == owner_symbol
+            || self.get_merged_symbol(owner_symbol) != Some(owner_symbol)
+            || self.get_merged_symbol(anchor) != Some(anchor)
+            || self.source_node_kind(declaration) != Some(SyntaxKind::ArrowFunction)
+            || owner.flags() != SymbolFlags::FUNCTION
+            || owner.check_flags() != CheckFlags::NONE
+            || owner.declarations() != Some(&[declaration])
+            || owner.value_declaration() != Some(declaration)
+            || owner.members().is_some()
+            || owner.exports().is_some()
+            || owner.parent().is_some()
+            || owner.export_symbol().is_some()
+        {
+            return false;
+        }
+        let Some(symbol) = self.symbol(anchor) else {
+            return false;
+        };
+        let Some([anchor_declaration]) = symbol.declarations() else {
+            return false;
+        };
+        let anchor_declaration = *anchor_declaration;
+        if symbol.check_flags() != CheckFlags::NONE
+            || symbol.value_declaration() != Some(anchor_declaration)
+            || symbol.members().is_some()
+            || symbol.exports().is_some()
+            || symbol.export_symbol().is_some()
+        {
+            return false;
+        }
+
+        if symbol.flags() == SymbolFlags::BLOCK_SCOPED_VARIABLE {
+            return symbol.parent().is_none()
+                && self.source_node_kind(anchor_declaration)
+                    == Some(SyntaxKind::VariableDeclaration);
+        }
+        if symbol.flags() != SymbolFlags::PROPERTY
+            || self.source_node_kind(anchor_declaration) != Some(SyntaxKind::PropertyAssignment)
+            || self.source_node_parent(declaration)
+                != Some(SourceNodeParent::Parent(anchor_declaration))
+        {
+            return false;
+        }
+
+        let Some(SourceNodeParent::Parent(object_declaration)) =
+            self.source_node_parent(anchor_declaration)
+        else {
+            return false;
+        };
+        let Some(object_owner) = symbol
+            .parent()
+            .and_then(|parent| self.get_merged_symbol(parent))
+        else {
+            return false;
+        };
+        let Some(object) = self.symbol(object_owner) else {
+            return false;
+        };
+        self.source_node_kind(object_declaration) == Some(SyntaxKind::ObjectLiteralExpression)
+            && object.flags() == SymbolFlags::OBJECT_LITERAL
+            && object.check_flags() == CheckFlags::NONE
+            && object.declarations() == Some(&[object_declaration])
+            && object.value_declaration() == Some(object_declaration)
+            && object.parent().is_none()
+            && object.exports().is_none()
+            && object.export_symbol().is_none()
+            && self.get_merged_symbol(object_owner) == Some(object_owner)
+            && object
+                .members()
+                .and_then(|members| self.symbol_table(members))
+                .and_then(|members| members.get(symbol.name()))
+                == Some(anchor)
     }
 
     pub(super) fn source_callable_provenance(
@@ -5300,8 +5389,6 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             }
             None => {
                 prepared.syntax.inferred_empty_body_is_exact()
-                    && prepared.parameters.is_empty()
-                    && prepared.min_argument_count == 0
                     && !prepared.return_null_literal_identity
                     && prepared.generic_return_type_parameter.is_none()
                     && self
@@ -5717,7 +5804,47 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             )
             || annotation.is_some_and(|node| {
                 self.source_named_interface_keyof_result_is_exact(node, constraint)
+                    || self.source_recovered_unresolved_type_reference_is_exact(node, constraint)
             })
+    }
+
+    /// Authenticates the cached error result for an unresolved generic bound.
+    pub(super) fn source_recovered_unresolved_type_reference_is_exact(
+        &self,
+        node: NodeRef,
+        result: TypeId,
+    ) -> bool {
+        let Some(bootstrap) = self.intrinsic_bootstrap.as_ref() else {
+            return false;
+        };
+        let Some(SourceNodeParent::Parent(parameter)) = self.source_node_parent(node) else {
+            return false;
+        };
+        let Some(identifier_index) = node
+            .node
+            .index()
+            .checked_sub(1)
+            .and_then(|index| u32::try_from(index).ok())
+        else {
+            return false;
+        };
+        let identifier = NodeRef::new(node.arena, node.file, NodeId::new(identifier_index));
+        result == bootstrap.error_type
+            && self.source_node_kind(node) == Some(SyntaxKind::TypeReference)
+            && self.source_node_kind(parameter) == Some(SyntaxKind::TypeParameter)
+            && self.source_node_kind(identifier) == Some(SyntaxKind::Identifier)
+            && self.source_node_parent(identifier) == Some(SourceNodeParent::Parent(node))
+            && self.type_node_links(node)
+                == Some(&TypeNodeLinks {
+                    resolved_type: Some(result),
+                    outer_type_parameters: None,
+                })
+            && self
+                .symbol_node_links(node)
+                .is_none_or(|links| links == &SymbolNodeLinks::default())
+            && self
+                .symbol_node_links(identifier)
+                .is_none_or(|links| links == &SymbolNodeLinks::default())
     }
 
     fn source_named_interface_keyof_result_is_exact(&self, node: NodeRef, result: TypeId) -> bool {
@@ -6060,6 +6187,9 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         if kind != Some(SyntaxKind::TypeReference) {
             return false;
         }
+        if self.source_recovered_unresolved_type_reference_is_exact(node, result) {
+            return true;
+        }
         let Some(earlier) = earlier
             .iter()
             .find(|row| row.provenance.type_parameter == result)
@@ -6377,6 +6507,191 @@ mod tests {
             },
         ));
         assert!(!store.source_type_node_result_is_exact(null_node, null, &[]));
+    }
+
+    #[test]
+    fn recovered_generic_constraints_require_exact_unresolved_reference_caches() {
+        let parsed = parse_source_file("function broken<T extends hm>(value: T) {}");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(90_015);
+        let mut store = CanonicalTypeMapperStore::new();
+        assert!(
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .is_some()
+        );
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        let constraint = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::TypeReference
+                    && record.parent.is_some_and(|parent| {
+                        parsed
+                            .arena
+                            .get(parent)
+                            .is_some_and(|parent| parent.kind == SyntaxKind::TypeParameter)
+                    }))
+                .then_some(NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .expect("the generic parameter has one unresolved constraint");
+        let (error, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.error_type, bootstrap.number_type)
+        };
+        assert!(!store.source_recovered_unresolved_type_reference_is_exact(constraint, error));
+        assert!(!store.source_type_node_result_is_exact(constraint, error, &[]));
+        assert!(store.set_type_node_links(
+            constraint,
+            TypeNodeLinks {
+                resolved_type: Some(error),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        assert!(store.source_recovered_unresolved_type_reference_is_exact(constraint, error));
+        assert!(store.source_type_node_result_is_exact(constraint, error, &[]));
+        assert!(store.source_direct_constraint_has_leaf_base(error, Some(constraint)));
+        assert!(!store.source_direct_constraint_has_leaf_base(error, None));
+
+        let forged = store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::TYPE_PARAMETER,
+                EscapedName::source("forged"),
+            ))
+            .unwrap();
+        assert!(store.set_symbol_node_links(
+            constraint,
+            SymbolNodeLinks {
+                resolved_symbol: Some(forged),
+            },
+        ));
+        assert!(!store.source_recovered_unresolved_type_reference_is_exact(constraint, error));
+        assert!(store.set_symbol_node_links(constraint, SymbolNodeLinks::default()));
+        assert!(store.source_recovered_unresolved_type_reference_is_exact(constraint, error));
+        assert!(store.set_type_node_links(
+            constraint,
+            TypeNodeLinks {
+                resolved_type: Some(number),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        assert!(!store.source_recovered_unresolved_type_reference_is_exact(constraint, error));
+        assert!(!store.source_type_node_result_is_exact(constraint, number, &[]));
+    }
+
+    #[test]
+    fn contextual_callable_anchors_authenticate_variables_and_object_properties() {
+        let parsed = parse_source_file(concat!(
+            "const direct: (value: string) => void = value => {}; ",
+            "const object = { run: value => {} };",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(90_016);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/contextual-anchors.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let direct_arrow = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ArrowFunction
+                    && record.parent.is_some_and(|parent| {
+                        parsed
+                            .arena
+                            .get(parent)
+                            .is_some_and(|parent| parent.kind == SyntaxKind::VariableDeclaration)
+                    }))
+                .then_some(NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .expect("direct contextual variable has one arrow");
+        let property = node_ref_of_kind(&parsed.arena, file, SyntaxKind::PropertyAssignment);
+        let property_arrow = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ArrowFunction && record.parent == Some(property.node))
+                    .then_some(NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .expect("object property has one direct arrow");
+        let variable = NodeRef::new(
+            direct_arrow.arena,
+            direct_arrow.file,
+            parsed.arena.get(direct_arrow.node).unwrap().parent.unwrap(),
+        );
+        let (direct_owner, property_owner, variable_symbol, property_symbol) = {
+            let bound = binder.file(file).unwrap();
+            (
+                bound.symbol(direct_arrow).unwrap(),
+                bound.symbol(property_arrow).unwrap(),
+                bound.symbol(variable).unwrap(),
+                bound.symbol(property).unwrap(),
+            )
+        };
+        let (symbols, _) = binder.finish().try_into_parts().unwrap();
+        let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
+        assert!(
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .is_some()
+        );
+
+        assert!(store.source_contextual_callable_anchor_is_exact(
+            direct_arrow,
+            direct_owner,
+            variable_symbol,
+        ));
+        assert!(store.source_contextual_callable_anchor_is_exact(
+            property_arrow,
+            property_owner,
+            property_symbol,
+        ));
+        assert!(!store.source_contextual_callable_anchor_is_exact(
+            direct_arrow,
+            direct_owner,
+            property_symbol,
+        ));
+        assert!(!store.source_contextual_callable_anchor_is_exact(
+            property_arrow,
+            property_owner,
+            property_owner,
+        ));
+        assert!(!store.source_contextual_callable_anchor_is_exact(
+            property_arrow,
+            direct_owner,
+            property_symbol,
+        ));
+
+        let property_parent = store.symbol(property_symbol).unwrap().parent();
+        assert!(store.set_symbol_relationships(property_symbol, None, None, None, None));
+        assert!(!store.source_contextual_callable_anchor_is_exact(
+            property_arrow,
+            property_owner,
+            property_symbol,
+        ));
+        assert!(
+            store.set_symbol_relationships(property_symbol, None, None, property_parent, None,)
+        );
+        assert!(store.source_contextual_callable_anchor_is_exact(
+            property_arrow,
+            property_owner,
+            property_symbol,
+        ));
     }
 
     #[test]
@@ -8252,6 +8567,107 @@ mod tests {
             store.signature(signature).unwrap().resolved_return_type(),
             Some(void)
         );
+    }
+
+    #[test]
+    fn inferred_generic_void_publication_preserves_value_parameter_provenance() {
+        let parsed = parse_source_file("function empty<T extends hm>(value: T) {}");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(90_017);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/inferred-generic-parameter.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let (symbols, mut files) = binder.finish().try_into_parts().unwrap();
+        let bound = files.remove(&file).unwrap();
+        let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
+        assert!(
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .is_some()
+        );
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        let declaration = node_ref_of_kind(&parsed.arena, file, SyntaxKind::FunctionDeclaration);
+        let owner = bound.symbol(declaration).unwrap();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let plan = plan_source_callable(&store, &host, declaration, owner, None).unwrap();
+        let generic = plan.type_parameters[0];
+        let value = plan.parameters[0].symbol;
+        let type_parameter = execute_type_parameter(&mut store, generic.symbol);
+        let (no_constraint, error_type) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.no_constraint_type, bootstrap.error_type)
+        };
+        let constraint = generic
+            .constraint
+            .expect("the supported parameter-bearing generic has an unresolved constraint");
+        assert!(store.set_type_node_links(
+            constraint,
+            TypeNodeLinks {
+                resolved_type: Some(error_type),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        let resolved = super::ResolvedSourceCallableTypeParameter {
+            provenance: super::SourceCallableTypeParameterProvenance {
+                declaration: generic.declaration,
+                symbol: generic.symbol,
+                type_parameter,
+                constraint: Some(constraint),
+                default_type: None,
+            },
+            constraint: error_type,
+            default_type: no_constraint,
+        };
+        let (callable, signature) = store
+            .publish_source_generic_callable(super::PreparedSourceGenericCallablePublication {
+                syntax: &plan.type_parameter_syntax,
+                family: plan.family,
+                declaration,
+                owner_symbol: owner,
+                owner_parent: plan.owner_parent,
+                export_local: plan.export_local,
+                type_parameters: vec![resolved],
+                parameters: vec![value],
+                flags: plan.flags,
+                min_argument_count: 1,
+                return_annotation: None,
+                return_null_literal_identity: false,
+                generic_return_type_parameter: None,
+                array_targets: plan.array_targets,
+            })
+            .expect("proven empty generic bodies may retain value parameters");
+        assert_eq!(
+            store
+                .source_callable_provenance(callable)
+                .unwrap()
+                .return_provenance,
+            super::SourceCallableReturnProvenance::Inferred,
+        );
+        let signature = store.signature(signature).unwrap();
+        assert_eq!(signature.type_parameters(), [type_parameter]);
+        assert_eq!(signature.parameters(), [value]);
+        assert_eq!(signature.min_argument_count(), 1);
+        assert_eq!(signature.resolved_return_type(), None);
     }
 
     #[test]

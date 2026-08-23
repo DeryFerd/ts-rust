@@ -22,7 +22,7 @@ use super::{
     object_members::{StoredDeclaredCallSetValidation, validate_stored_declared_call_set},
     signatures::SignatureFlags,
     source_overloads::{StoredSourceOverloadValidation, validate_stored_source_overload},
-    store::SourceNodeParent,
+    store::{SourceCallableReturnProvenance, SourceNodeParent},
     type_records::{ConstrainedTypeData, TypeCacheState, TypeData},
     types::{ObjectFlags, TypeFlags},
 };
@@ -83,6 +83,15 @@ pub(super) fn validate_stored_callable_set(
             callable,
             edges,
         } => {
+            if !valid_untyped_javascript_source_signature(
+                store,
+                callable.owner,
+                callable.signature,
+                &callable.parameters,
+                callable.min_argument_count,
+            ) {
+                return StoredCallableSetValidation::Malformed { family };
+            }
             return StoredCallableSetValidation::Valid {
                 family,
                 projection: CallableSetProjection {
@@ -140,6 +149,82 @@ pub(super) fn validate_stored_callable_set(
     }
 
     validate_stored_intersection_callable_set(store, type_)
+}
+
+fn valid_untyped_javascript_source_signature(
+    store: &CanonicalTypeMapperStore,
+    owner: TypeId,
+    signature: SignatureId,
+    parameter_types: &[TypeId],
+    minimum: usize,
+) -> bool {
+    let Some(record) = store.signature(signature) else {
+        return false;
+    };
+    if !record
+        .flags()
+        .contains(SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE)
+    {
+        return true;
+    }
+    let Some(provenance) = store.source_callable_provenance(owner) else {
+        return false;
+    };
+    let Some(bootstrap) = store.intrinsic_bootstrap() else {
+        return false;
+    };
+    if record.flags() != SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE
+        || record.declaration() != Some(provenance.declaration)
+        || record.parameters().len() != parameter_types.len()
+        || minimum != parameter_types.len()
+        || minimum == 0
+        || !record.type_parameters().is_empty()
+        || record.this_parameter().is_some()
+        || provenance.signature != signature
+        || provenance.contextual_target.is_some()
+        || provenance.contextual_variable.is_some()
+        || provenance.generic_return_type_parameter.is_some()
+        || provenance.return_provenance != SourceCallableReturnProvenance::Inferred
+        || store.source_node_kind(provenance.declaration) != Some(provenance.family.syntax_kind())
+        || store
+            .type_payload(owner)
+            .and_then(super::TypeRecord::symbol)
+            != Some(provenance.owner_symbol)
+        || store.source_callable_type_for_owner(provenance.owner_symbol) != Some(owner)
+        || store.source_callable_type_for_declaration(provenance.declaration) != Some(owner)
+        || store.source_callable_type_for_signature(signature) != Some(owner)
+        || store
+            .function_signature_return_annotation(signature)
+            .is_some()
+    {
+        return false;
+    }
+
+    record
+        .parameters()
+        .iter()
+        .copied()
+        .zip(parameter_types)
+        .all(|(symbol, type_)| {
+            let Some([declaration]) = store
+                .symbol(symbol)
+                .and_then(ts_binder::semantic::Symbol::declarations)
+            else {
+                return false;
+            };
+            *type_ == bootstrap.any_type
+                && store.source_node_kind(*declaration) == Some(SyntaxKind::Parameter)
+                && store.source_node_parent(*declaration)
+                    == Some(SourceNodeParent::Parent(provenance.declaration))
+                && store
+                    .source_primitive_type_annotation(*declaration)
+                    .is_none()
+                && store.value_symbol_links(symbol)
+                    == Some(&ValueSymbolLinks {
+                        resolved_type: Some(bootstrap.any_type),
+                        ..ValueSymbolLinks::default()
+                    })
+        })
 }
 
 #[allow(clippy::too_many_lines)] // Keep the complete wrapper and method proof together.
@@ -631,6 +716,10 @@ fn validate_stored_callable_set_projection_with(
             return None;
         }
         let minimum = usize::try_from(record.min_argument_count()).ok()?;
+        if !valid_untyped_javascript_source_signature(store, owner, signature, &parameters, minimum)
+        {
+            return None;
+        }
         let rest_parameter = if record.has_rest_parameter() {
             Some(parameters.pop()?)
         } else {
@@ -671,13 +760,17 @@ mod tests {
         CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
         EscapedName, SemanticSymbolId, SymbolData, SymbolFlags,
     };
-    use ts_parser::{ParseResult, parse_source_file};
+    use ts_parser::{ParseResult, parse_javascript_source_file, parse_source_file};
 
     use super::*;
     use crate::semantic::{
         CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions, SemanticStore,
-        TypeRecord, bootstrap::UnionReduction, callables::validate_stored_single_callable,
-        mapper::TypeMapper, types::ObjectFlags,
+        TypeRecord,
+        bootstrap::UnionReduction,
+        callables::validate_stored_single_callable,
+        calls::{DirectCallApplicability, DirectCallForm, DirectCallRequest, resolve_direct_call},
+        mapper::TypeMapper,
+        types::ObjectFlags,
     };
 
     const DEFAULT_LIBRARY_METHODS: &str = concat!(
@@ -734,6 +827,45 @@ mod tests {
                 },
                 ..CanonicalCheckerOptions::default()
             },
+        )
+        .unwrap()
+    }
+
+    fn source_callable_context(
+        parsed: &ParseResult,
+        file: FileId,
+        language: CanonicalSourceLanguage,
+    ) -> CanonicalCheckerContext<'_> {
+        let extension = match language {
+            CanonicalSourceLanguage::TypeScript => "ts",
+            CanonicalSourceLanguage::JavaScript => "js",
+        };
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source(format!("\"/project/{}.{extension}\"", file.index())),
+                    language,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        match language {
+            CanonicalSourceLanguage::TypeScript => binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap(),
+            CanonicalSourceLanguage::JavaScript => binder
+                .bind_javascript_declaration_slice(&parsed.arena, file)
+                .unwrap(),
+        };
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions::default(),
         )
         .unwrap()
     }
@@ -1117,6 +1249,170 @@ mod tests {
         assert!(callable.parameters.is_empty());
         assert_eq!(callable.rest_parameter, Some(number));
         assert_eq!(callable.min_argument_count, 0);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Compare raw and effective arity for both JavaScript owners.
+    fn untyped_javascript_source_callables_keep_raw_arity_and_allow_zero_arguments() {
+        for (index, (source, kind, expected_family)) in [
+            (
+                "function named(value) {}",
+                SyntaxKind::FunctionDeclaration,
+                CallableFamily::FunctionDeclaration,
+            ),
+            (
+                "const object = { run: (value) => {} };",
+                SyntaxKind::ArrowFunction,
+                CallableFamily::ArrowFunction,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let parsed = parse_javascript_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(4_422 + u32::try_from(index).unwrap());
+            let mut context =
+                source_callable_context(&parsed, file, CanonicalSourceLanguage::JavaScript);
+            context.check_source_file(file).unwrap();
+
+            let declaration = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == kind).then_some(NodeRef::new(parsed.arena.id(), file, node))
+                })
+                .unwrap();
+            let owner = context.file(file).unwrap().1.symbol(declaration).unwrap();
+            let type_ = context
+                .store()
+                .source_callable_type_for_owner(owner)
+                .unwrap();
+            let StoredCallableSetValidation::Valid {
+                family, projection, ..
+            } = validate_stored_callable_set(context.store(), type_)
+            else {
+                panic!("expected an authenticated untyped JavaScript callable")
+            };
+            assert_eq!(family, expected_family);
+            let [callable] = projection.call_signatures.as_ref() else {
+                panic!("expected one JavaScript source signature")
+            };
+            let signature = context.store().signature(callable.signature).unwrap();
+            assert_eq!(
+                signature.flags(),
+                SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE,
+            );
+            assert_eq!(signature.min_argument_count(), 1);
+            assert_eq!(callable.min_argument_count, 1);
+            assert_eq!(callable.parameters.len(), 1);
+
+            let global_types = context.global_types().clone();
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            let no_arguments = resolve_direct_call(
+                context.store_mut_for_test(),
+                &global_types,
+                false,
+                DirectCallRequest {
+                    form: DirectCallForm::Call,
+                    optional_chain: false,
+                    type_argument_count: 0,
+                    has_spread_argument: false,
+                    callee: type_,
+                    arguments: &[],
+                },
+            )
+            .unwrap();
+            assert_eq!(no_arguments.projection.minimum_argument_count, 0);
+            assert_eq!(no_arguments.projection.maximum_argument_count, 1);
+            assert_eq!(
+                no_arguments.applicability,
+                DirectCallApplicability::Applicable
+            );
+
+            let extra_arguments = resolve_direct_call(
+                context.store_mut_for_test(),
+                &global_types,
+                false,
+                DirectCallRequest {
+                    form: DirectCallForm::Call,
+                    optional_chain: false,
+                    type_argument_count: 0,
+                    has_spread_argument: false,
+                    callee: type_,
+                    arguments: &[number, number, number],
+                },
+            )
+            .unwrap();
+            assert_eq!(extra_arguments.projection.minimum_argument_count, 0);
+            assert_eq!(extra_arguments.projection.maximum_argument_count, 1);
+            assert_eq!(
+                extra_arguments.applicability,
+                DirectCallApplicability::TooManyArguments {
+                    expected_at_most: 1,
+                    actual: 3,
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn forged_javascript_arity_flags_require_an_untyped_source_callable() {
+        let mut store = initialized_store();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let any = bootstrap.any_type;
+        let void = bootstrap.void_type;
+        let signature = signature(
+            &mut store,
+            SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE,
+            &[any],
+            1,
+            void,
+        );
+        let owner = owner(&mut store, vec![signature], Vec::new());
+        assert_eq!(
+            project(&store, owner, &HashMap::from([(signature, vec![any])])),
+            None,
+        );
+
+        let parsed = parse_source_file("function typed(value: number): void {}");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(4_424);
+        let mut context =
+            source_callable_context(&parsed, file, CanonicalSourceLanguage::TypeScript);
+        context.check_source_file(file).unwrap();
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionDeclaration).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let owner = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        let type_ = context
+            .store()
+            .source_callable_type_for_owner(owner)
+            .unwrap();
+        let signature = context
+            .store()
+            .source_callable_provenance(type_)
+            .unwrap()
+            .signature;
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_signature_flags(signature, SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE,)
+        );
+        assert!(matches!(
+            validate_stored_callable_set(context.store(), type_),
+            StoredCallableSetValidation::Malformed {
+                family: CallableFamily::FunctionDeclaration,
+            }
+        ));
     }
 
     #[test]

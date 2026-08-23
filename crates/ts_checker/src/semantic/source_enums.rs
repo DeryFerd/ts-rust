@@ -1,9 +1,11 @@
-//! Source-statement planning for the canonical top-level enum slice.
+//! Source-statement planning for canonical top-level and local const enums.
 //!
 //! This leaf deliberately does not install source dispatch. The integration
 //! hook is small: register this module from `semantic/mod.rs`, retain a
 //! [`SourceEnumPlan`] for every `EnumDeclaration` during the source prepass,
-//! then call [`execute_top_level_enum`] at that statement. The returned
+//! then call [`execute_top_level_enum`] at that statement. Local const enums
+//! instead use [`plan_local_const_enum`] and [`execute_local_const_enum`],
+//! retaining their exact function-owned binder scope. The returned
 //! [`CanonicalEnumSemantics::value_type`] is the value read for the enum name;
 //! member reads use each member's `fresh_type`.
 //!
@@ -16,7 +18,7 @@
 use std::collections::HashSet;
 
 use ts_ast::{Node, NodeData, NodeRef, SyntaxKind};
-use ts_binder::SemanticSymbolId;
+use ts_binder::{CheckFlags, SemanticSymbolId, SymbolFlags};
 
 use super::{
     CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost,
@@ -52,11 +54,13 @@ pub(super) struct SourceEnumMemberPlan {
     pub(super) symbol: SemanticSymbolId,
 }
 
-/// Allocation-free plan for one bounded top-level enum statement.
+/// Allocation-free plan for one bounded top-level or local enum statement.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SourceEnumPlan {
     pub(super) declaration: NodeRef,
     pub(super) name: NodeRef,
+    /// The actual binder locals owner for an admitted function-local enum.
+    pub(super) lexical_owner: Option<NodeRef>,
     /// Symbol recorded directly by the bound declaration.
     pub(super) declaration_symbol: SemanticSymbolId,
     /// Canonical enum owner used by declared/value type caches.
@@ -80,6 +84,7 @@ pub(super) enum SourceEnumUnsupported {
     IdentifierFlags(NodeRef),
     ModifierFlags(NodeRef),
     MemberFlags(NodeRef),
+    LocalDeclaration(NodeRef),
     ExportOutsideExternalModule(NodeRef),
     Canonical {
         declaration: NodeRef,
@@ -93,6 +98,9 @@ pub(super) enum SourceEnumInvariant {
     InvalidSourceFile(NodeRef),
     MissingSourceFacts(NodeRef),
     InvalidTopLevelStatement(NodeRef),
+    InvalidLocalStatement(NodeRef),
+    InvalidLexicalOwner(NodeRef),
+    InvalidLocalSymbol(NodeRef),
     InvalidDeclaration(NodeRef),
     InvalidIdentifier(NodeRef),
     MissingDeclarationSymbol(NodeRef),
@@ -128,6 +136,7 @@ impl SourceEnumError {
                 | SourceEnumUnsupported::IdentifierFlags(node)
                 | SourceEnumUnsupported::ModifierFlags(node)
                 | SourceEnumUnsupported::MemberFlags(node)
+                | SourceEnumUnsupported::LocalDeclaration(node)
                 | SourceEnumUnsupported::ExportOutsideExternalModule(node) => Some(node),
                 SourceEnumUnsupported::Canonical { declaration, .. } => Some(declaration),
             },
@@ -135,6 +144,9 @@ impl SourceEnumError {
                 SourceEnumInvariant::InvalidSourceFile(node)
                 | SourceEnumInvariant::MissingSourceFacts(node)
                 | SourceEnumInvariant::InvalidTopLevelStatement(node)
+                | SourceEnumInvariant::InvalidLocalStatement(node)
+                | SourceEnumInvariant::InvalidLexicalOwner(node)
+                | SourceEnumInvariant::InvalidLocalSymbol(node)
                 | SourceEnumInvariant::InvalidDeclaration(node)
                 | SourceEnumInvariant::InvalidIdentifier(node)
                 | SourceEnumInvariant::MissingDeclarationSymbol(node)
@@ -185,12 +197,42 @@ fn range_contains(parent: &Node, child: &Node) -> bool {
         && child.range.end.get() <= parent.range.end.get()
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceEnumPlacement {
+    TopLevel,
+    Local { lexical_owner: NodeRef },
+}
+
 /// Proves one top-level TypeScript enum statement without allocating or
 /// publishing semantic state.
 pub(super) fn plan_top_level_enum(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     declaration: NodeRef,
+) -> Result<SourceEnumPlan, SourceEnumError> {
+    plan_source_enum(store, host, declaration, SourceEnumPlacement::TopLevel)
+}
+
+/// Proves one unbraced function-local const enum and its exact binder scope.
+pub(super) fn plan_local_const_enum(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    lexical_owner: NodeRef,
+) -> Result<SourceEnumPlan, SourceEnumError> {
+    plan_source_enum(
+        store,
+        host,
+        declaration,
+        SourceEnumPlacement::Local { lexical_owner },
+    )
+}
+
+fn plan_source_enum(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    placement: SourceEnumPlacement,
 ) -> Result<SourceEnumPlan, SourceEnumError> {
     let record = preflight_node(store, host, declaration)?;
     if record.kind != SyntaxKind::EnumDeclaration {
@@ -227,21 +269,29 @@ pub(super) fn plan_top_level_enum(
     let NodeData::SourceFile(source_data) = &source_record.data else {
         return Err(invariant(SourceEnumInvariant::InvalidSourceFile(source)));
     };
-    if source_record.kind != SyntaxKind::SourceFile
-        || source_record.parent.is_some()
-        || record.parent != Some(source.node)
-        || !range_contains(source_record, record)
-        || source_data
-            .statements
-            .nodes
-            .iter()
-            .filter(|node| **node == declaration.node)
-            .count()
-            != 1
-    {
-        return Err(invariant(SourceEnumInvariant::InvalidTopLevelStatement(
-            declaration,
-        )));
+    if source_record.kind != SyntaxKind::SourceFile || source_record.parent.is_some() {
+        return Err(invariant(SourceEnumInvariant::InvalidSourceFile(source)));
+    }
+    match placement {
+        SourceEnumPlacement::TopLevel => {
+            if record.parent != Some(source.node)
+                || !range_contains(source_record, record)
+                || source_data
+                    .statements
+                    .nodes
+                    .iter()
+                    .filter(|node| **node == declaration.node)
+                    .count()
+                    != 1
+            {
+                return Err(invariant(SourceEnumInvariant::InvalidTopLevelStatement(
+                    declaration,
+                )));
+            }
+        }
+        SourceEnumPlacement::Local { lexical_owner } => {
+            validate_local_enum_statement(store, host, declaration, lexical_owner)?;
+        }
     }
     let facts = bound
         .source_facts()
@@ -271,6 +321,17 @@ pub(super) fn plan_top_level_enum(
     let owner_symbol = store
         .get_merged_symbol(declaration_symbol)
         .ok_or_else(|| invariant(SourceEnumInvariant::InvalidMergedSymbol(declaration_symbol)))?;
+    if let SourceEnumPlacement::Local { lexical_owner } = placement {
+        validate_local_enum_symbol(
+            store,
+            host,
+            declaration,
+            lexical_owner,
+            name_data.text.as_str(),
+            declaration_symbol,
+            owner_symbol,
+        )?;
+    }
     let diagnostics = enums::preflight_enum_diagnostics(store, host, owner_symbol)
         .map_err(|error| canonical_error(declaration, error))?;
 
@@ -315,6 +376,13 @@ pub(super) fn plan_top_level_enum(
         ));
     }
     let is_ambient = has_declare || facts.is_declaration_file();
+    if matches!(placement, SourceEnumPlacement::Local { .. })
+        && (!is_const || is_ambient || explicitly_exported)
+    {
+        return Err(unsupported(SourceEnumUnsupported::LocalDeclaration(
+            declaration,
+        )));
+    }
     let export_route = match bound.local_symbol(declaration) {
         None => SourceEnumExportRoute::Local,
         Some(local_symbol) => {
@@ -417,6 +485,10 @@ pub(super) fn plan_top_level_enum(
     Ok(SourceEnumPlan {
         declaration,
         name,
+        lexical_owner: match placement {
+            SourceEnumPlacement::TopLevel => None,
+            SourceEnumPlacement::Local { lexical_owner } => Some(lexical_owner),
+        },
         declaration_symbol,
         owner_symbol,
         members,
@@ -425,6 +497,162 @@ pub(super) fn plan_top_level_enum(
         is_const,
         is_ambient,
     })
+}
+
+fn validate_local_enum_statement(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    lexical_owner: NodeRef,
+) -> Result<(), SourceEnumError> {
+    let record = preflight_node(store, host, declaration)?;
+    let NodeData::EnumDeclaration(enumeration) = &record.data else {
+        return Err(invariant(SourceEnumInvariant::InvalidDeclaration(
+            declaration,
+        )));
+    };
+    let Some(modifiers) = enumeration.modifiers.as_ref() else {
+        return Err(unsupported(SourceEnumUnsupported::LocalDeclaration(
+            declaration,
+        )));
+    };
+    let [modifier] = modifiers.list.nodes.as_slice() else {
+        return Err(unsupported(SourceEnumUnsupported::LocalDeclaration(
+            declaration,
+        )));
+    };
+    let modifier = NodeRef::new(declaration.arena, declaration.file, *modifier);
+    let modifier_record = preflight_node(store, host, modifier)?;
+    if modifiers.flags.0 != 0
+        || modifiers.list.has_trailing_comma
+        || modifier_record.kind != SyntaxKind::ConstKeyword
+        || modifier_record.flags.0 != 0
+        || modifier_record.parent != Some(declaration.node)
+        || !matches!(modifier_record.data, NodeData::Token(_))
+        || !range_contains(record, modifier_record)
+    {
+        return Err(unsupported(SourceEnumUnsupported::LocalDeclaration(
+            declaration,
+        )));
+    }
+
+    let owner = preflight_node(store, host, lexical_owner)?;
+    let NodeData::FunctionDeclaration(function) = &owner.data else {
+        return Err(invariant(SourceEnumInvariant::InvalidLexicalOwner(
+            lexical_owner,
+        )));
+    };
+    if owner.kind != SyntaxKind::FunctionDeclaration || owner.flags.0 != 0 {
+        return Err(invariant(SourceEnumInvariant::InvalidLexicalOwner(
+            lexical_owner,
+        )));
+    }
+    let bound = host
+        .bound_file(declaration)
+        .ok_or_else(|| invariant(SourceEnumInvariant::InvalidDeclaration(declaration)))?;
+    if bound.container(declaration) != Some(lexical_owner)
+        || bound.block_scope_container(declaration) != Some(lexical_owner)
+    {
+        return Err(invariant(SourceEnumInvariant::InvalidLexicalOwner(
+            lexical_owner,
+        )));
+    }
+    let body = function
+        .body
+        .map(|node| NodeRef::new(lexical_owner.arena, lexical_owner.file, node))
+        .ok_or_else(|| invariant(SourceEnumInvariant::InvalidLexicalOwner(lexical_owner)))?;
+    let body_record = preflight_node(store, host, body)?;
+    let NodeData::Block(block) = &body_record.data else {
+        return Err(invariant(SourceEnumInvariant::InvalidLexicalOwner(
+            lexical_owner,
+        )));
+    };
+    if body_record.kind != SyntaxKind::Block
+        || body_record.parent != Some(lexical_owner.node)
+        || !range_contains(owner, body_record)
+    {
+        return Err(invariant(SourceEnumInvariant::InvalidLexicalOwner(
+            lexical_owner,
+        )));
+    }
+
+    let parent = record
+        .parent
+        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+        .ok_or_else(|| invariant(SourceEnumInvariant::InvalidLocalStatement(declaration)))?;
+    let parent_record = preflight_node(store, host, parent)?;
+    let NodeData::IfStatement(statement) = &parent_record.data else {
+        return Err(invariant(SourceEnumInvariant::InvalidLocalStatement(
+            declaration,
+        )));
+    };
+    if parent_record.kind != SyntaxKind::IfStatement
+        || parent_record.flags.0 != 0
+        || parent_record.parent != Some(body.node)
+        || statement.flow_node.is_some()
+        || statement.facts != 0
+        || statement.then_statement != declaration.node
+            && statement.else_statement != Some(declaration.node)
+        || !range_contains(body_record, parent_record)
+        || !range_contains(parent_record, record)
+        || block
+            .statements
+            .nodes
+            .iter()
+            .filter(|node| **node == parent.node)
+            .count()
+            != 1
+    {
+        return Err(invariant(SourceEnumInvariant::InvalidLocalStatement(
+            declaration,
+        )));
+    }
+
+    if bound.container(parent) != Some(lexical_owner)
+        || bound.block_scope_container(parent) != Some(lexical_owner)
+    {
+        return Err(invariant(SourceEnumInvariant::InvalidLexicalOwner(
+            lexical_owner,
+        )));
+    }
+    Ok(())
+}
+
+fn validate_local_enum_symbol(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    lexical_owner: NodeRef,
+    name: &str,
+    declaration_symbol: SemanticSymbolId,
+    owner_symbol: SemanticSymbolId,
+) -> Result<(), SourceEnumError> {
+    let bound = host
+        .bound_file(declaration)
+        .ok_or_else(|| invariant(SourceEnumInvariant::InvalidDeclaration(declaration)))?;
+    let owner = store
+        .symbol(owner_symbol)
+        .ok_or_else(|| invariant(SourceEnumInvariant::InvalidMergedSymbol(owner_symbol)))?;
+    let lexical_symbol = bound
+        .locals(lexical_owner)
+        .and_then(|locals| store.symbol_table(locals))
+        .and_then(|locals| locals.get_source(name));
+    if owner_symbol != declaration_symbol
+        || lexical_symbol != Some(declaration_symbol)
+        || bound.local_symbol(declaration).is_some()
+        || owner.flags() != SymbolFlags::CONST_ENUM
+        || owner.check_flags() != CheckFlags::NONE
+        || owner.name().as_utf8() != Some(name)
+        || owner.declarations() != Some(&[declaration])
+        || owner.value_declaration() != Some(declaration)
+        || owner.parent().is_some()
+        || owner.export_symbol().is_some()
+    {
+        return Err(invariant(SourceEnumInvariant::InvalidLocalSymbol(
+            declaration,
+        )));
+    }
+    Ok(())
 }
 
 fn validate_materialization(
@@ -487,7 +715,29 @@ pub(super) fn execute_top_level_enum(
     plan: &SourceEnumPlan,
 ) -> Result<CanonicalEnumSemantics, SourceEnumError> {
     let current = plan_top_level_enum(store, host, plan.declaration)?;
-    if current != *plan {
+    execute_planned_enum(store, host, plan, &current)
+}
+
+/// Publishes or validates an admitted function-local const enum.
+pub(super) fn execute_local_const_enum(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &SourceEnumPlan,
+) -> Result<CanonicalEnumSemantics, SourceEnumError> {
+    let lexical_owner = plan
+        .lexical_owner
+        .ok_or_else(|| invariant(SourceEnumInvariant::PlanMismatch(plan.declaration)))?;
+    let current = plan_local_const_enum(store, host, plan.declaration, lexical_owner)?;
+    execute_planned_enum(store, host, plan, &current)
+}
+
+fn execute_planned_enum(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &SourceEnumPlan,
+    current: &SourceEnumPlan,
+) -> Result<CanonicalEnumSemantics, SourceEnumError> {
+    if current != plan {
         return Err(invariant(SourceEnumInvariant::PlanMismatch(
             plan.declaration,
         )));
@@ -585,6 +835,206 @@ mod tests {
             fixture.file,
             source.statements.nodes[index],
         )
+    }
+
+    fn local_enum(fixture: &Fixture, lexical_owner: NodeRef, expected: &str) -> NodeRef {
+        let bound = &fixture.files[&fixture.file];
+        fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::EnumDeclaration(enumeration) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(name) = &fixture.parsed.arena.get(enumeration.name)?.data
+                else {
+                    return None;
+                };
+                let declaration = NodeRef::new(fixture.parsed.arena.id(), fixture.file, node);
+                (name.text == expected && bound.container(declaration) == Some(lexical_owner))
+                    .then_some(declaration)
+            })
+            .unwrap_or_else(|| panic!("missing local enum {expected}"))
+    }
+
+    #[test]
+    fn embedded_const_enum_preserves_lexical_shadowing_and_reuses_warm_caches() {
+        let mut fixture = fixture(
+            concat!(
+                "const enum E { A = 2 } ",
+                "function choose(value: number) { ",
+                "if (value) const enum E { A = 1 } ",
+                "}",
+            ),
+            CanonicalModuleState::Script,
+            false,
+        );
+        let global_declaration = statement(&fixture, 0);
+        let lexical_owner = statement(&fixture, 1);
+        let declaration = local_enum(&fixture, lexical_owner, "E");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.type_alias_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        let global = plan_top_level_enum(&fixture.store, &host, global_declaration).unwrap();
+        let local =
+            plan_local_const_enum(&fixture.store, &host, declaration, lexical_owner).unwrap();
+        assert_eq!(local.lexical_owner, Some(lexical_owner));
+        assert!(local.is_const);
+        assert!(!local.is_ambient);
+        assert_eq!(local.export_route, SourceEnumExportRoute::Local);
+        assert_ne!(local.owner_symbol, global.owner_symbol);
+        assert_eq!(
+            bound
+                .locals(lexical_owner)
+                .and_then(|locals| fixture.store.symbol_table(locals))
+                .and_then(|locals| locals.get_source("E")),
+            Some(local.owner_symbol),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.type_alias_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+
+        let global_result = execute_top_level_enum(&mut fixture.store, &host, &global).unwrap();
+        let local_result = execute_local_const_enum(&mut fixture.store, &host, &local).unwrap();
+        assert_ne!(global_result.declared_type, local_result.declared_type);
+        assert_ne!(global_result.value_type, local_result.value_type);
+        assert_eq!(
+            local_result.members[0].value,
+            enums::CanonicalEnumMemberValue::Number(ts_jsnum::Number::new(1.0)),
+        );
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.type_alias_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            plan_local_const_enum(&fixture.store, &host, declaration, lexical_owner),
+            Ok(local.clone()),
+        );
+        assert_eq!(
+            execute_local_const_enum(&mut fixture.store, &host, &local),
+            Ok(local_result),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.type_alias_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn local_const_enum_rejects_foreign_owners_and_poisoned_member_caches() {
+        let mut fixture = fixture(
+            concat!(
+                "function choose(value: number) { ",
+                "if (value) const enum E { A = 1 } ",
+                "} ",
+                "function other() {}",
+            ),
+            CanonicalModuleState::Script,
+            false,
+        );
+        let lexical_owner = statement(&fixture, 0);
+        let foreign_owner = statement(&fixture, 1);
+        let declaration = local_enum(&fixture, lexical_owner, "E");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.type_alias_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            plan_local_const_enum(&fixture.store, &host, declaration, foreign_owner),
+            Err(SourceEnumError::Invariant(
+                SourceEnumInvariant::InvalidLexicalOwner(foreign_owner),
+            )),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.type_alias_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+
+        let plan =
+            plan_local_const_enum(&fixture.store, &host, declaration, lexical_owner).unwrap();
+        let materialized = execute_local_const_enum(&mut fixture.store, &host, &plan).unwrap();
+        let member = &materialized.members[0];
+        assert!(fixture.store.set_value_symbol_links(
+            member.symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(materialized.value_type),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        let poisoned = (
+            fixture.store.type_len(),
+            fixture.store.type_alias_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            plan_local_const_enum(&fixture.store, &host, declaration, lexical_owner),
+            Err(SourceEnumError::Invariant(SourceEnumInvariant::Canonical {
+                declaration,
+                reason: EnumTypeInvariant::InvalidCache(plan.owner_symbol),
+            })),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.type_alias_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            poisoned,
+        );
+        assert!(fixture.store.set_value_symbol_links(
+            member.symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(member.fresh_type),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        assert_eq!(
+            execute_local_const_enum(&mut fixture.store, &host, &plan),
+            Ok(materialized),
+        );
+    }
+
+    #[test]
+    fn local_enum_planning_keeps_non_const_declarations_unsupported() {
+        let fixture = fixture(
+            "function choose(value: number) { if (value) enum E { A = 1 } }",
+            CanonicalModuleState::Script,
+            false,
+        );
+        let lexical_owner = statement(&fixture, 0);
+        let declaration = local_enum(&fixture, lexical_owner, "E");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+
+        assert_eq!(
+            plan_local_const_enum(&fixture.store, &host, declaration, lexical_owner),
+            Err(SourceEnumError::Unsupported(
+                SourceEnumUnsupported::LocalDeclaration(declaration),
+            )),
+        );
     }
 
     #[test]

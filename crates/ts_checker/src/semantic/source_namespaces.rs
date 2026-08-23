@@ -8,8 +8,9 @@ use std::collections::HashSet;
 
 use ts_ast::{ModifierList, Node, NodeArena, NodeData, NodeFlags, NodeRef, SyntaxKind};
 use ts_binder::{
-    BoundFile, CanonicalNameResolutionError, CheckFlags, EscapedName, SemanticSymbolId,
-    SymbolFlags, SymbolTableId, canonical_has_syntactic_modifier, semantic::PreparedSymbolTable,
+    BoundFile, CanonicalNameResolutionError, CheckFlags, EscapedName, InternalSymbolName,
+    SemanticSymbolId, SymbolFlags, SymbolTableId, canonical_has_syntactic_modifier,
+    semantic::PreparedSymbolTable,
 };
 use ts_diagnostics::{Diagnostic, message_by_code};
 
@@ -40,6 +41,7 @@ const AMBIENT_MODULES_CANNOT_BE_NESTED: u32 = 2_435;
 const AMBIENT_MODULE_NAME_CANNOT_BE_RELATIVE: u32 = 2_436;
 const GLOBAL_AUGMENTATION_CONTEXT: u32 = 2_669;
 const GLOBAL_AUGMENTATION_DECLARE: u32 = 2_670;
+const AMBIENT_EXPORT_ASSIGNMENT_MUST_BE_ENTITY_NAME: u32 = 2_714;
 const USE_NAMESPACE_KEYWORD: u32 = 1_540;
 const CIRCULAR_DEFINITION_OF_IMPORT_ALIAS: u32 = 2_303;
 const VARIABLE_IMPLICITLY_HAS_ANY_TYPE: u32 = 7_005;
@@ -2198,6 +2200,159 @@ fn cached_namespace_string_literal(
         .map_err(Into::into)
 }
 
+fn plan_invalid_ambient_export_assignment(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+    declaration: NodeRef,
+) -> Result<NamespaceDiagnosticPlan, SourceCheckError> {
+    let record = owned_node(arena, bound, store, declaration)?;
+    let NodeData::ExportAssignment(export) = &record.data else {
+        return Err(unsupported(
+            declaration,
+            record.kind,
+            SourceSyntaxRole::Statement,
+        ));
+    };
+    if record.kind != SyntaxKind::ExportAssignment
+        || record.flags.0 != 0
+        || export.flow_node.is_some()
+        || export.symbol.is_some()
+        || export.type_.is_some()
+        || export.facts != 0
+        || export.modifiers.is_some()
+    {
+        return Err(unsupported(
+            declaration,
+            record.kind,
+            SourceSyntaxRole::Statement,
+        ));
+    }
+
+    let symbol = declaration_symbol(bound, store, declaration, SymbolFlags::PROPERTY)?;
+    let symbol_record = store.symbol(symbol).ok_or(SourceCheckError::Provenance(
+        SourceCheckProvenanceError::MissingDeclarationSymbol(declaration),
+    ))?;
+    let expected_name = if export.is_export_equals {
+        InternalSymbolName::ExportEquals.as_ref()
+    } else {
+        InternalSymbolName::Default.as_ref()
+    };
+    if symbol_record.flags() != SymbolFlags::PROPERTY
+        || symbol_record.check_flags() != CheckFlags::NONE
+        || symbol_record.name() != expected_name
+        || symbol_record.declarations() != Some(&[declaration])
+        || symbol_record.value_declaration() != Some(declaration)
+        || symbol_record.members().is_some()
+        || symbol_record.exports().is_some()
+        || symbol_record.export_symbol().is_some()
+        || store.get_parent_of_symbol(symbol) != Some(owner)
+        || store
+            .symbol(owner)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| store.symbol_table(exports))
+            .and_then(|exports| exports.get(expected_name))
+            != Some(symbol)
+    {
+        return Err(SourceCheckError::Provenance(
+            SourceCheckProvenanceError::MissingDeclarationSymbol(declaration),
+        ));
+    }
+
+    let expression = child(declaration, export.expression);
+    let expression_record = owned_node(arena, bound, store, expression)?;
+    let NodeData::TypeOfExpression(type_of) = &expression_record.data else {
+        return Err(unsupported(
+            expression,
+            expression_record.kind,
+            SourceSyntaxRole::Statement,
+        ));
+    };
+    if expression_record.kind != SyntaxKind::TypeOfExpression
+        || expression_record.flags.0 != 0
+        || expression_record.parent != Some(declaration.node)
+        || expression_record.range.start < record.range.start
+        || expression_record.range.end > record.range.end
+    {
+        return Err(unsupported(
+            expression,
+            expression_record.kind,
+            SourceSyntaxRole::Statement,
+        ));
+    }
+
+    let operand = child(expression, type_of.expression);
+    let operand_record = owned_node(arena, bound, store, operand)?;
+    if operand_record.flags.0 != 0 || operand_record.parent != Some(expression.node) {
+        return Err(unsupported(
+            operand,
+            operand_record.kind,
+            SourceSyntaxRole::Statement,
+        ));
+    }
+    match &operand_record.data {
+        NodeData::Identifier(identifier)
+            if operand_record.kind == SyntaxKind::Identifier
+                && identifier.flow_node.is_none()
+                && !identifier.text.is_empty() => {}
+        NodeData::PropertyAccessExpression(access)
+            if operand_record.kind == SyntaxKind::PropertyAccessExpression
+                && access.flow_node.is_none()
+                && access.question_dot_token.is_none()
+                && access.facts == 0 =>
+        {
+            let base = child(operand, access.expression);
+            let base_record = owned_node(arena, bound, store, base)?;
+            let NodeData::Identifier(identifier) = &base_record.data else {
+                return Err(unsupported(
+                    base,
+                    base_record.kind,
+                    SourceSyntaxRole::Statement,
+                ));
+            };
+            let name = child(operand, access.name);
+            let name_record = owned_node(arena, bound, store, name)?;
+            let NodeData::Identifier(property) = &name_record.data else {
+                return Err(unsupported(
+                    name,
+                    name_record.kind,
+                    SourceSyntaxRole::Statement,
+                ));
+            };
+            if base_record.kind != SyntaxKind::Identifier
+                || base_record.flags.0 != 0
+                || base_record.parent != Some(operand.node)
+                || identifier.flow_node.is_some()
+                || identifier.text.is_empty()
+                || name_record.kind != SyntaxKind::Identifier
+                || name_record.flags.0 != 0
+                || name_record.parent != Some(operand.node)
+                || property.flow_node.is_some()
+                || property.text != "default"
+            {
+                return Err(unsupported(
+                    operand,
+                    operand_record.kind,
+                    SourceSyntaxRole::Statement,
+                ));
+            }
+        }
+        _ => {
+            return Err(unsupported(
+                operand,
+                operand_record.kind,
+                SourceSyntaxRole::Statement,
+            ));
+        }
+    }
+
+    Ok(NamespaceDiagnosticPlan {
+        node: expression,
+        code: AMBIENT_EXPORT_ASSIGNMENT_MUST_BE_ENTITY_NAME,
+    })
+}
+
 fn plan_namespace(
     arena: &NodeArena,
     bound: &BoundFile,
@@ -2445,6 +2600,11 @@ fn plan_namespace(
                                 declaration,
                                 symbol,
                                 statement,
+                            )?);
+                        }
+                        SyntaxKind::ExportAssignment if ambient && is_string_module => {
+                            diagnostics.push(plan_invalid_ambient_export_assignment(
+                                arena, bound, store, symbol, statement,
                             )?);
                         }
                         SyntaxKind::EmptyStatement => {}
@@ -4955,6 +5115,76 @@ mod tests {
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics.as_slice()[0].diagnostic.code(), 2436);
         assert_eq!(diagnostics.as_slice()[0].node, Some(plan.name));
+    }
+
+    #[test]
+    fn ambient_module_typeof_export_assignments_report_ts2714_without_publication() {
+        for (source, expected) in [
+            (
+                "declare module \"indirect\" { export default typeof Foo.default; }",
+                "typeof Foo.default",
+            ),
+            (
+                "declare module \"indirect\" { export = typeof Foo2; }",
+                "typeof Foo2",
+            ),
+        ] {
+            let mut fixture = fixture(source, CanonicalModuleState::Script);
+            let namespace = plan(&fixture, 0);
+            assert!(namespace.members.is_empty());
+            assert!(namespace.imports.is_empty());
+            let [planned] = namespace.diagnostics.as_slice() else {
+                panic!("expected one invalid ambient export diagnostic")
+            };
+            assert_eq!(planned.code, AMBIENT_EXPORT_ASSIGNMENT_MUST_BE_ENTITY_NAME);
+            let range = fixture.parsed.arena.get(planned.node.node).unwrap().range;
+            assert_eq!(
+                &source[usize::try_from(range.start.get()).unwrap()
+                    ..usize::try_from(range.end.get()).unwrap()],
+                expected,
+            );
+            let symbol = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::ExportAssignment).then_some(NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        node,
+                    ))
+                })
+                .and_then(|node| fixture.context.file(fixture.file).unwrap().1.symbol(node))
+                .unwrap();
+            let before = (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            );
+
+            for _ in 0..2 {
+                let diagnostics = execute(&mut fixture, &namespace).unwrap();
+                let [diagnostic] = diagnostics.as_slice() else {
+                    panic!("expected one ambient export grammar diagnostic")
+                };
+                assert_eq!(diagnostic.diagnostic.code(), 2714);
+                assert_eq!(diagnostic.node, Some(planned.node));
+                assert_eq!(
+                    diagnostic.diagnostic.render().unwrap(),
+                    "The expression of an export assignment must be an identifier or qualified name in an ambient context.",
+                );
+                assert!(fixture.context.store().alias_symbol_links(symbol).is_none());
+                assert!(fixture.context.store().value_symbol_links(symbol).is_none());
+                assert_eq!(
+                    (
+                        fixture.context.store().type_len(),
+                        fixture.context.store().symbol_len(),
+                        fixture.context.store().checker_link_allocated_lengths(),
+                    ),
+                    before,
+                );
+            }
+        }
     }
 
     #[test]

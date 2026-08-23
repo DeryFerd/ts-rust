@@ -2,8 +2,8 @@
 //!
 //! This slice accepts leading, top-level side-effect imports, default imports,
 //! namespace imports, and named imports, including explicit named `default`
-//! bindings. Imports and reexports must use identifier names and cannot have
-//! attributes. Alias discovery belongs to the production alias host. A
+//! bindings. Imports and reexports must use identifier names. Alias discovery
+//! belongs to the production alias host. A
 //! successful alias may traverse named and explicit default reexports before
 //! reaching one unique exported declaration in another retained TypeScript
 //! source. Value preparation supports initialized annotated `const`
@@ -34,7 +34,7 @@ use std::collections::{HashMap, HashSet};
 use ts_ast::{Node, NodeArena, NodeData, NodeRef, SyntaxKind};
 use ts_binder::{
     BoundFile, CanonicalNameResolutionError, CanonicalNameResolver, CanonicalResolutionLocation,
-    CheckFlags, EscapedName, SemanticSymbolId, SymbolData, SymbolFlags,
+    CheckFlags, EscapedName, InternalSymbolName, SemanticSymbolId, SymbolData, SymbolFlags,
 };
 
 use super::{
@@ -46,6 +46,7 @@ use super::{
         CanonicalAliasTargetHost, CanonicalImmediateAliasTarget,
     },
     array_types::CanonicalArrayTargets,
+    enums,
     instantiate::InstantiationSession,
     jsdoc::{
         PlannedJsDocType, plan_javascript_source_jsdoc, preflight_planned_jsdoc_type,
@@ -180,6 +181,12 @@ enum PreparedSourceImportTarget {
     AnnotatedFunction {
         signature: SignatureId,
     },
+    ConstEnum {
+        declared_type: TypeId,
+    },
+    ExportedObject {
+        expression: NodeRef,
+    },
     JavaScriptAnnotatedConst {
         annotation: Option<PlannedJsDocType>,
     },
@@ -216,6 +223,14 @@ enum PlannedSourceImportValueTarget {
         literal: String,
     },
     AnnotatedFunction(Box<SourceCallablePlan>),
+    ConstEnum {
+        declaration: NodeRef,
+    },
+    ExportedObject {
+        declaration: NodeRef,
+        expression: NodeRef,
+        type_: TypeId,
+    },
     JavaScriptAnnotatedConst {
         declaration: NodeRef,
         annotation: Option<PlannedJsDocType>,
@@ -252,7 +267,6 @@ pub(super) enum SourceImportUnsupported {
     JavaScriptSource(NodeRef),
     CommonJsSource(NodeRef),
     ScriptSource(NodeRef),
-    DeclarationFile(NodeRef),
     ImportShape(NodeRef),
     ExportShape(NodeRef),
     ImportClause(NodeRef),
@@ -361,7 +375,6 @@ impl SourceImportError {
                 | SourceImportUnsupported::JavaScriptSource(node)
                 | SourceImportUnsupported::CommonJsSource(node)
                 | SourceImportUnsupported::ScriptSource(node)
-                | SourceImportUnsupported::DeclarationFile(node)
                 | SourceImportUnsupported::ImportShape(node)
                 | SourceImportUnsupported::ExportShape(node)
                 | SourceImportUnsupported::ImportClause(node)
@@ -705,12 +718,6 @@ fn plan_top_level_named_import(
     if !facts.is_external_module() {
         return Err(unsupported(SourceImportUnsupported::ScriptSource(source)));
     }
-    if facts.is_declaration_file() {
-        return Err(unsupported(SourceImportUnsupported::DeclarationFile(
-            source,
-        )));
-    }
-
     let source_record = checked_node(arena, bound, store, source)?;
     let NodeData::SourceFile(source_data) = &source_record.data else {
         return Err(invariant(SourceImportInvariant::InvalidSource(source)));
@@ -752,10 +759,19 @@ fn plan_top_level_named_import(
             declaration,
         )));
     }
-    if import.attributes.is_some() {
-        return Err(unsupported(SourceImportUnsupported::ImportAttributes(
+    if let Some(attributes) = import.attributes {
+        if phase != SourceImportPhase::Value {
+            return Err(unsupported(SourceImportUnsupported::ImportAttributes(
+                declaration,
+            )));
+        }
+        validate_value_import_attributes(
+            arena,
+            bound,
+            store,
             declaration,
-        )));
+            NodeRef::new(declaration.arena, declaration.file, attributes),
+        )?;
     }
 
     let module_specifier =
@@ -1031,6 +1047,104 @@ fn plan_top_level_named_import(
     })
 }
 
+fn validate_value_import_attributes(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    attributes: NodeRef,
+) -> Result<(), SourceImportError> {
+    let declaration_record = checked_node(arena, bound, store, declaration)?;
+    let record = checked_node(arena, bound, store, attributes)?;
+    let NodeData::ImportAttributes(data) = &record.data else {
+        return Err(unsupported(SourceImportUnsupported::ImportAttributes(
+            attributes,
+        )));
+    };
+    if record.kind != SyntaxKind::ImportAttributes
+        || record.flags.0 != 0
+        || record.parent != Some(declaration.node)
+        || !range_contains(declaration_record, record)
+        || data.token != SyntaxKind::WithKeyword
+        || data.facts != 0
+        || data.attributes.nodes.is_empty()
+        || data.attributes.range.start < record.range.start
+        || data.attributes.range.end > record.range.end
+    {
+        return Err(unsupported(SourceImportUnsupported::ImportAttributes(
+            attributes,
+        )));
+    }
+
+    let mut names = HashSet::with_capacity(data.attributes.nodes.len());
+    let mut previous_end = data.attributes.range.start;
+    for attribute in &data.attributes.nodes {
+        let attribute = NodeRef::new(attributes.arena, attributes.file, *attribute);
+        let attribute_record = checked_node(arena, bound, store, attribute)?;
+        let NodeData::ImportAttribute(entry) = &attribute_record.data else {
+            return Err(unsupported(SourceImportUnsupported::ImportAttributes(
+                attribute,
+            )));
+        };
+        if attribute_record.kind != SyntaxKind::ImportAttribute
+            || attribute_record.flags.0 != 0
+            || attribute_record.parent != Some(attributes.node)
+            || attribute_record.range.start < previous_end
+            || attribute_record.range.end > data.attributes.range.end
+            || entry.facts != 0
+        {
+            return Err(unsupported(SourceImportUnsupported::ImportAttributes(
+                attribute,
+            )));
+        }
+        let name = NodeRef::new(attribute.arena, attribute.file, entry.name);
+        let name_record = checked_node(arena, bound, store, name)?;
+        let text = match &name_record.data {
+            NodeData::Identifier(identifier)
+                if name_record.kind == SyntaxKind::Identifier && identifier.flow_node.is_none() =>
+            {
+                identifier.text.as_str()
+            }
+            NodeData::StringLiteral(literal)
+                if name_record.kind == SyntaxKind::StringLiteral && literal.token_flags.0 == 0 =>
+            {
+                literal.text.as_str()
+            }
+            _ => {
+                return Err(unsupported(SourceImportUnsupported::ImportAttributes(name)));
+            }
+        };
+        if name_record.flags.0 != 0
+            || name_record.parent != Some(attribute.node)
+            || !range_contains(attribute_record, name_record)
+            || text.is_empty()
+            || !names.insert(text)
+        {
+            return Err(unsupported(SourceImportUnsupported::ImportAttributes(name)));
+        }
+
+        let value = NodeRef::new(attribute.arena, attribute.file, entry.value);
+        let value_record = checked_node(arena, bound, store, value)?;
+        if value_record.parent != Some(attribute.node)
+            || value_record.flags.0 != 0
+            || value_record.range.start < name_record.range.end
+            || value_record.range.end != attribute_record.range.end
+            || !matches!(
+                &value_record.data,
+                NodeData::StringLiteral(literal)
+                    if value_record.kind == SyntaxKind::StringLiteral
+                        && literal.token_flags.0 == 0
+            )
+        {
+            return Err(unsupported(SourceImportUnsupported::ImportAttributes(
+                value,
+            )));
+        }
+        previous_end = attribute_record.range.end;
+    }
+    Ok(())
+}
+
 /// Proves one complete top-level named reexport without checker writes.
 ///
 /// Only identifier-named `export { source as public } from "./target"` forms
@@ -1055,12 +1169,6 @@ pub(super) fn plan_top_level_named_reexport(
     if !facts.is_external_module() {
         return Err(unsupported(SourceImportUnsupported::ScriptSource(source)));
     }
-    if facts.is_declaration_file() {
-        return Err(unsupported(SourceImportUnsupported::DeclarationFile(
-            source,
-        )));
-    }
-
     let source_record = checked_node(arena, bound, store, source)?;
     let NodeData::SourceFile(source_data) = &source_record.data else {
         return Err(invariant(SourceImportInvariant::InvalidSource(source)));
@@ -2040,6 +2148,8 @@ pub(super) fn prepare_source_import_value(
     let target_declaration = match &planned_target {
         PlannedSourceImportValueTarget::AnnotatedConst { declaration, .. }
         | PlannedSourceImportValueTarget::DeclarationNumericConst { declaration, .. }
+        | PlannedSourceImportValueTarget::ConstEnum { declaration }
+        | PlannedSourceImportValueTarget::ExportedObject { declaration, .. }
         | PlannedSourceImportValueTarget::JavaScriptAnnotatedConst { declaration, .. }
         | PlannedSourceImportValueTarget::ModuleNamespace { declaration, .. } => *declaration,
         PlannedSourceImportValueTarget::AnnotatedFunction(callable) => callable.declaration,
@@ -2130,6 +2240,22 @@ pub(super) fn prepare_source_import_value(
                 },
             )
         }
+        PlannedSourceImportValueTarget::ConstEnum { .. } => {
+            let enumeration = enums::get_enum_semantics(store, declared_host, target)
+                .map_err(DeclaredTypeError::from)?;
+            (
+                enumeration.value_type,
+                PreparedSourceImportTarget::ConstEnum {
+                    declared_type: enumeration.declared_type,
+                },
+            )
+        }
+        PlannedSourceImportValueTarget::ExportedObject {
+            expression, type_, ..
+        } => (
+            type_,
+            PreparedSourceImportTarget::ExportedObject { expression },
+        ),
         PlannedSourceImportValueTarget::JavaScriptAnnotatedConst {
             declaration,
             annotation,
@@ -2843,6 +2969,14 @@ fn plan_direct_import_value_target(
         .map(Box::new)
         .map(PlannedSourceImportValueTarget::AnnotatedFunction);
     }
+    if flags == SymbolFlags::CONST_ENUM {
+        return plan_direct_const_enum_target(store, host, alias, target);
+    }
+    if flags == SymbolFlags::PROPERTY
+        || flags == SymbolFlags::PROPERTY | SymbolFlags::NAMESPACE_MODULE
+    {
+        return plan_direct_exported_object_target(store, host, alias, target);
+    }
     if flags.intersects(SymbolFlags::MODULE) && flags.intersects(SymbolFlags::VALUE) {
         return plan_direct_imported_module_namespace(
             store,
@@ -2858,6 +2992,208 @@ fn plan_direct_import_value_target(
         target,
         flags,
     }))
+}
+
+fn plan_direct_const_enum_target(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    alias: SemanticSymbolId,
+    target: SemanticSymbolId,
+) -> Result<PlannedSourceImportValueTarget, SourceImportError> {
+    let record = store
+        .symbol(target)
+        .ok_or_else(|| invariant(SourceImportInvariant::InvalidTargetSymbol(target)))?;
+    let Some([declaration]) = record.declarations() else {
+        return Err(unsupported(SourceImportUnsupported::TargetSymbol {
+            alias,
+            target,
+            flags: record.flags(),
+        }));
+    };
+    let declaration = *declaration;
+    let (arena, bound) = host
+        .source(declaration)
+        .ok_or_else(|| unsupported(SourceImportUnsupported::TargetDeclaration(declaration)))?;
+    let facts = bound.source_facts().ok_or_else(|| {
+        invariant(SourceImportInvariant::MissingSourceFacts(
+            bound.source_file(),
+        ))
+    })?;
+    let declaration_record = checked_node(arena, bound, store, declaration)?;
+    let NodeData::EnumDeclaration(enumeration) = &declaration_record.data else {
+        return Err(unsupported(SourceImportUnsupported::TargetDeclaration(
+            declaration,
+        )));
+    };
+    let Some(module) = bound.symbol(bound.source_file()) else {
+        return Err(unsupported(SourceImportUnsupported::TargetDeclaration(
+            declaration,
+        )));
+    };
+    let name = NodeRef::new(declaration.arena, declaration.file, enumeration.name);
+    let name_text = exact_identifier(
+        arena,
+        bound,
+        store,
+        name,
+        declaration,
+        SourceImportUnsupported::TargetDeclaration(name),
+    )?;
+    if record.flags() != SymbolFlags::CONST_ENUM
+        || record.check_flags() != CheckFlags::NONE
+        || record.value_declaration() != Some(declaration)
+        || record.parent() != Some(module)
+        || record.name().as_bytes() != name_text.as_bytes()
+        || declaration_record.kind != SyntaxKind::EnumDeclaration
+        || declaration_record.parent != Some(bound.source_file().node)
+        || declaration_record.flags.0 != 0
+        || !facts.is_external_module()
+        || facts.is_javascript_file()
+        || bound.symbol(declaration) != Some(target)
+        || store.get_merged_symbol(target) != Some(target)
+        || store
+            .symbol(module)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| store.symbol_table(exports))
+            .and_then(|exports| exports.get(record.name()))
+            != Some(target)
+    {
+        return Err(unsupported(SourceImportUnsupported::TargetDeclaration(
+            declaration,
+        )));
+    }
+    enums::preflight_enum(store, host, target).map_err(DeclaredTypeError::from)?;
+    Ok(PlannedSourceImportValueTarget::ConstEnum { declaration })
+}
+
+fn plan_direct_exported_object_target(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    alias: SemanticSymbolId,
+    target: SemanticSymbolId,
+) -> Result<PlannedSourceImportValueTarget, SourceImportError> {
+    let record = store
+        .symbol(target)
+        .ok_or_else(|| invariant(SourceImportInvariant::InvalidTargetSymbol(target)))?;
+    let Some([declaration]) = record.declarations() else {
+        return Err(unsupported(SourceImportUnsupported::TargetSymbol {
+            alias,
+            target,
+            flags: record.flags(),
+        }));
+    };
+    let declaration = *declaration;
+    let (arena, bound) = host
+        .source(declaration)
+        .ok_or_else(|| unsupported(SourceImportUnsupported::TargetDeclaration(declaration)))?;
+    let declaration_record = checked_node(arena, bound, store, declaration)?;
+    let NodeData::ExportAssignment(assignment) = &declaration_record.data else {
+        return Err(unsupported(SourceImportUnsupported::TargetDeclaration(
+            declaration,
+        )));
+    };
+    let Some(module) = bound.symbol(bound.source_file()) else {
+        return Err(unsupported(SourceImportUnsupported::TargetDeclaration(
+            declaration,
+        )));
+    };
+    let expected_name = if assignment.is_export_equals {
+        InternalSymbolName::ExportEquals.as_ref()
+    } else {
+        InternalSymbolName::Default.as_ref()
+    };
+    let promoted = record.flags() == SymbolFlags::PROPERTY | SymbolFlags::NAMESPACE_MODULE;
+    let valid_promoted_exports = if promoted {
+        assignment.is_export_equals
+            && record
+                .exports()
+                .and_then(|exports| store.symbol_table(exports))
+                .is_some_and(|exports| {
+                    !exports.is_empty()
+                        && exports.iter().all(|(name, symbol)| {
+                            store.symbol(symbol).is_some_and(|export| {
+                                export
+                                    .flags()
+                                    .intersects(SymbolFlags::TYPE | SymbolFlags::NAMESPACE)
+                                    && store
+                                        .symbol(module)
+                                        .and_then(ts_binder::semantic::Symbol::exports)
+                                        .and_then(|exports| store.symbol_table(exports))
+                                        .and_then(|exports| exports.get(name))
+                                        == Some(symbol)
+                            })
+                        })
+                })
+    } else {
+        record.exports().is_none()
+    };
+    if record.check_flags() != CheckFlags::NONE
+        || record.parent() != Some(module)
+        || record.name() != expected_name
+        || record.value_declaration() != Some(declaration)
+        || record.members().is_some()
+        || record.export_symbol().is_some()
+        || !valid_promoted_exports
+        || declaration_record.kind != SyntaxKind::ExportAssignment
+        || declaration_record.flags.0 != 0
+        || declaration_record.parent != Some(bound.source_file().node)
+        || assignment.flow_node.is_some()
+        || assignment.modifiers.is_some()
+        || assignment.symbol.is_some()
+        || assignment.type_.is_some()
+        || assignment.facts != 0
+        || bound.symbol(declaration) != Some(target)
+        || store.get_merged_symbol(target) != Some(target)
+        || bound
+            .source_facts()
+            .is_none_or(|facts| !facts.is_external_module() || facts.is_javascript_file())
+        || store
+            .symbol(module)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| store.symbol_table(exports))
+            .and_then(|exports| exports.get(expected_name))
+            != Some(target)
+    {
+        return Err(unsupported(SourceImportUnsupported::TargetDeclaration(
+            declaration,
+        )));
+    }
+
+    let expression = NodeRef::new(declaration.arena, declaration.file, assignment.expression);
+    let expression_record = checked_node(arena, bound, store, expression)?;
+    if expression_record.kind != SyntaxKind::ObjectLiteralExpression
+        || !matches!(expression_record.data, NodeData::ObjectLiteralExpression(_))
+        || expression_record.parent != Some(declaration.node)
+        || expression_record.flags.0 != 0
+    {
+        return Err(unsupported(SourceImportUnsupported::TargetDeclaration(
+            expression,
+        )));
+    }
+    let Some(type_) = store
+        .value_symbol_links(target)
+        .and_then(|links| links.resolved_type)
+    else {
+        return Err(unsupported(SourceImportUnsupported::TargetDeclaration(
+            declaration,
+        )));
+    };
+    if store
+        .type_node_links(expression)
+        .and_then(|links| links.resolved_type)
+        != Some(type_)
+        || store
+            .type_payload(type_)
+            .is_none_or(|record| record.data().structured().is_none())
+    {
+        return Err(invariant(SourceImportInvariant::InvalidTargetLinks(target)));
+    }
+
+    Ok(PlannedSourceImportValueTarget::ExportedObject {
+        declaration,
+        expression,
+        type_,
+    })
 }
 
 fn plan_direct_imported_module_namespace(
@@ -3243,6 +3579,13 @@ fn materialize_imported_module_namespace(
                 .get_return_type_of_signature(signature)?;
                 (type_, None)
             }
+            PlannedSourceImportValueTarget::ConstEnum { .. } => (
+                enums::get_enum_semantics(store, host, member.value_symbol)
+                    .map_err(DeclaredTypeError::from)?
+                    .value_type,
+                None,
+            ),
+            PlannedSourceImportValueTarget::ExportedObject { type_, .. } => (type_, None),
             PlannedSourceImportValueTarget::DeclarationNumericConst { literal, .. } => (
                 declaration_numeric_literal_type(store, member.value_symbol, &literal)?,
                 None,
@@ -3394,7 +3737,12 @@ fn preflight_imported_module_namespace_members(
                 .preflight_type_of_source_callable(callable.declaration, callable.owner_symbol)?;
             }
             PlannedSourceImportValueTarget::DeclarationNumericConst { .. }
-            | PlannedSourceImportValueTarget::JavaScriptAnnotatedConst { .. } => {}
+            | PlannedSourceImportValueTarget::JavaScriptAnnotatedConst { .. }
+            | PlannedSourceImportValueTarget::ExportedObject { .. } => {}
+            PlannedSourceImportValueTarget::ConstEnum { .. } => {
+                enums::preflight_enum(store, host, member.value_symbol)
+                    .map_err(DeclaredTypeError::from)?;
+            }
             PlannedSourceImportValueTarget::ModuleNamespace { members, .. } => {
                 preflight_imported_module_namespace_members(
                     store,
@@ -4131,6 +4479,8 @@ fn prepare_value_links(
         || (!alias
             && record.flags() != SymbolFlags::BLOCK_SCOPED_VARIABLE
             && record.flags() != SymbolFlags::FUNCTION
+            && record.flags() != SymbolFlags::CONST_ENUM
+            && record.flags() != SymbolFlags::PROPERTY
             && !record.flags().intersects(SymbolFlags::MODULE))
         || store.type_payload(type_).is_none()
     {
@@ -4237,6 +4587,44 @@ fn validate_prepared_import_value(
                     validate_stored_source_callable(store, prepared.type_),
                     StoredSourceCallableValidation::Valid(_)
                 )
+        }
+        PreparedSourceImportTarget::ConstEnum { declared_type } => {
+            store.symbol(prepared.target_symbol).is_some_and(|target| {
+                target.flags() == SymbolFlags::CONST_ENUM
+                    && target.value_declaration() == Some(prepared.target_declaration)
+            }) && store
+                .declared_type_links(prepared.target_symbol)
+                .and_then(|links| links.declared_type)
+                == Some(*declared_type)
+                && enums::canonical_enum_type_owner(store, *declared_type)
+                    == Some(prepared.target_symbol)
+                && store
+                    .value_symbol_links(prepared.target_symbol)
+                    .and_then(|links| links.resolved_type)
+                    == Some(prepared.type_)
+                && store
+                    .type_payload(prepared.type_)
+                    .is_some_and(|record| record.symbol() == Some(prepared.target_symbol))
+        }
+        PreparedSourceImportTarget::ExportedObject { expression } => {
+            store.symbol(prepared.target_symbol).is_some_and(|target| {
+                (target.flags() == SymbolFlags::PROPERTY
+                    || target.flags() == SymbolFlags::PROPERTY | SymbolFlags::NAMESPACE_MODULE)
+                    && target.declarations() == Some(&[prepared.target_declaration])
+                    && target.value_declaration() == Some(prepared.target_declaration)
+            }) && store.source_node_kind(prepared.target_declaration)
+                == Some(SyntaxKind::ExportAssignment)
+                && store.source_node_kind(*expression) == Some(SyntaxKind::ObjectLiteralExpression)
+                && store.source_node_parent(*expression)
+                    == Some(SourceNodeParent::Parent(prepared.target_declaration))
+                && store
+                    .value_symbol_links(prepared.target_symbol)
+                    .and_then(|links| links.resolved_type)
+                    == Some(prepared.type_)
+                && store
+                    .type_node_links(*expression)
+                    .and_then(|links| links.resolved_type)
+                    == Some(prepared.type_)
         }
         PreparedSourceImportTarget::JavaScriptAnnotatedConst { annotation } => {
             let valid_target = store.symbol(prepared.target_symbol).is_some_and(|target| {
@@ -6278,6 +6666,374 @@ mod tests {
         let warm = prepare_one(&mut fixture, &resolved[0], &planned_read).unwrap();
         assert_eq!(warm, prepared);
         assert_eq!(store_state(&fixture.store), published);
+    }
+
+    #[test]
+    fn declaration_file_imports_and_default_reexports_preserve_const_enum_identity() {
+        let mut fixture = fixture_with_declaration_files(
+            &[
+                r#"
+                    import Selected from "./bridge";
+                    const result = Selected.First;
+                "#,
+                r#"
+                    import { Values } from "./enum";
+                    export { Values as default } from "./enum";
+                "#,
+                "export const enum Values { First, Second }",
+            ],
+            &[
+                Route {
+                    source: 0,
+                    specifier: 0,
+                    target: Some(1),
+                },
+                Route {
+                    source: 1,
+                    specifier: 0,
+                    target: Some(2),
+                },
+                Route {
+                    source: 1,
+                    specifier: 1,
+                    target: Some(2),
+                },
+            ],
+            &[1, 2],
+        );
+        let import = fixture.plan_import(0, 0);
+        let declaration_import = fixture.plan_import(1, 0);
+        let reexport = fixture.plan_reexport(1, 0);
+        assert_eq!(reexport.bindings[0].exported_text, "default");
+        let target = direct_export(&fixture, 2, "Values");
+
+        let bridge_import = resolve_all(&mut fixture, &declaration_import.bindings).unwrap();
+        assert_eq!(bridge_import[0].target_symbol, target);
+        let bridge_export = resolve_all_reexports(&mut fixture, &reexport.bindings).unwrap();
+        assert_eq!(bridge_export[0].target_symbol, target);
+        let resolved = resolve_all(&mut fixture, &import.bindings).unwrap();
+        assert_eq!(resolved[0].target_symbol, target);
+        assert_eq!(
+            resolved[0].immediate_target_symbol,
+            reexport.bindings[0].alias_symbol,
+        );
+        assert!(fixture.store.value_symbol_links(target).is_none());
+
+        let source = &fixture.files[0];
+        let read_node = source
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::Identifier(identifier) = &record.data else {
+                    return None;
+                };
+                if identifier.text != "Selected" {
+                    return None;
+                }
+                let parent = record
+                    .parent
+                    .and_then(|parent| source.parsed.arena.get(parent))?;
+                matches!(
+                    &parent.data,
+                    NodeData::PropertyAccessExpression(access) if access.expression == node
+                )
+                .then_some(NodeRef::new(
+                    source.parsed.arena.id(),
+                    source.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let bound = fixture.bound.get(&source.file).unwrap();
+        let read = plan_source_import_identifier_read(
+            &source.parsed.arena,
+            bound,
+            &fixture.store,
+            &import.bindings[0],
+            read_node,
+            "Selected",
+            import.bindings[0].alias_symbol,
+        )
+        .unwrap();
+        let prepared = prepare_one(&mut fixture, &resolved[0], &read).unwrap();
+        let PreparedSourceImportTarget::ConstEnum { declared_type } = &prepared.target else {
+            panic!("expected a prepared const enum")
+        };
+        assert_eq!(
+            fixture
+                .store
+                .declared_type_links(target)
+                .and_then(|links| links.declared_type),
+            Some(*declared_type),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .value_symbol_links(target)
+                .and_then(|links| links.resolved_type),
+            Some(prepared.type_),
+        );
+        assert!(
+            fixture
+                .store
+                .value_symbol_links(import.bindings[0].alias_symbol)
+                .is_none()
+        );
+
+        publish_for_test(&mut fixture.store, std::slice::from_ref(&prepared));
+        let warm = (store_state(&fixture.store), fixture.store.symbol_len());
+        assert_eq!(
+            prepare_one(&mut fixture, &resolved[0], &read).unwrap(),
+            prepared,
+        );
+        assert_eq!(
+            (store_state(&fixture.store), fixture.store.symbol_len()),
+            warm,
+        );
+    }
+
+    #[test]
+    fn declaration_file_type_imports_retain_type_only_alias_without_value_links() {
+        let mut fixture = fixture_with_declaration_files(
+            &[
+                r#"import type { Model } from "./target";"#,
+                "export interface Model { value: number; }",
+            ],
+            &[Route {
+                source: 0,
+                specifier: 0,
+                target: Some(1),
+            }],
+            &[0, 1],
+        );
+        let plan = fixture.plan_type_import(0, 0);
+        let resolved = resolve_all_types(&mut fixture, &plan.bindings).unwrap();
+        let alias = plan.bindings[0].alias_symbol;
+        assert_eq!(
+            resolved[0].target_symbol,
+            direct_export(&fixture, 1, "Model"),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .alias_symbol_links(alias)
+                .and_then(|links| links.type_only_declaration),
+            Some(plan.bindings[0].declaration),
+        );
+        assert!(fixture.store.value_symbol_links(alias).is_none());
+
+        let warm = store_state(&fixture.store);
+        assert_eq!(
+            resolve_all_types(&mut fixture, &plan.bindings).unwrap(),
+            resolved
+        );
+        assert_eq!(store_state(&fixture.store), warm);
+    }
+
+    #[test]
+    fn value_import_attributes_accept_identifier_and_quoted_string_entries() {
+        let mut fixture = fixture(
+            &[
+                r#"
+                    import { value } from "./target"
+                        with { a: /* first */ "a", "b": /* second */ "b" };
+                    const result = value;
+                "#,
+                "export const value: number = 1;",
+            ],
+            &[Route {
+                source: 0,
+                specifier: 0,
+                target: Some(1),
+            }],
+        );
+        let plan = fixture.plan_import(0, 0);
+        assert_eq!(plan.bindings[0].local_text, "value");
+        let node = identifier_initializer(&fixture, 0, "value");
+        let bound = fixture.bound.get(&fixture.files[0].file).unwrap();
+        let read = plan_source_import_identifier_read(
+            &fixture.files[0].parsed.arena,
+            bound,
+            &fixture.store,
+            &plan.bindings[0],
+            node,
+            "value",
+            plan.bindings[0].alias_symbol,
+        )
+        .unwrap();
+        let resolved = resolve_all(&mut fixture, &plan.bindings).unwrap();
+        let prepared = prepare_one(&mut fixture, &resolved[0], &read).unwrap();
+        assert_eq!(
+            prepared.type_,
+            fixture.store.intrinsic_bootstrap().unwrap().number_type,
+        );
+        publish_for_test(&mut fixture.store, std::slice::from_ref(&prepared));
+        let warm = store_state(&fixture.store);
+        assert_eq!(
+            prepare_one(&mut fixture, &resolved[0], &read).unwrap(),
+            prepared,
+        );
+        assert_eq!(store_state(&fixture.store), warm);
+    }
+
+    #[test]
+    fn value_import_attributes_reject_duplicate_and_non_string_values() {
+        for source in [
+            r#"import { value } from "./target" with { a: "first", "a": "second" };"#,
+            r#"import { value } from "./target" with { a: runtime };"#,
+        ] {
+            let fixture = fixture(
+                &[source, "export const value: number = 1;"],
+                &[Route {
+                    source: 0,
+                    specifier: 0,
+                    target: Some(1),
+                }],
+            );
+            let file = &fixture.files[0];
+            let bound = fixture.bound.get(&file.file).unwrap();
+            let declaration = file
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::ImportDeclaration).then_some(NodeRef::new(
+                        file.parsed.arena.id(),
+                        file.file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let before = store_state(&fixture.store);
+            assert!(matches!(
+                plan_top_level_named_value_import(
+                    &file.parsed.arena,
+                    bound,
+                    &fixture.store,
+                    declaration,
+                ),
+                Err(SourceImportError::Unsupported(
+                    SourceImportUnsupported::ImportAttributes(_)
+                ))
+            ));
+            assert_eq!(store_state(&fixture.store), before);
+        }
+    }
+
+    #[test]
+    fn default_object_import_reuses_the_authenticated_published_export_value() {
+        let mut fixture = fixture(
+            &[
+                r#"
+                    import selected from "./target"
+                        with { a: /* first */ "a", "b": /* second */ "b" };
+                    const result = selected;
+                "#,
+                r#"export default { a: "a", b: "b", 1: "1" };"#,
+            ],
+            &[Route {
+                source: 0,
+                specifier: 0,
+                target: Some(1),
+            }],
+        );
+        let plan = fixture.plan_import(0, 0);
+        let node = identifier_initializer(&fixture, 0, "selected");
+        let bound = fixture.bound.get(&fixture.files[0].file).unwrap();
+        let read = plan_source_import_identifier_read(
+            &fixture.files[0].parsed.arena,
+            bound,
+            &fixture.store,
+            &plan.bindings[0],
+            node,
+            "selected",
+            plan.bindings[0].alias_symbol,
+        )
+        .unwrap();
+        let resolved = resolve_all(&mut fixture, &plan.bindings).unwrap();
+        let default = resolved[0].target_symbol;
+        assert_eq!(
+            fixture.store.symbol(default).unwrap().flags(),
+            SymbolFlags::PROPERTY,
+        );
+        let before = store_state(&fixture.store);
+        assert!(matches!(
+            prepare_one(&mut fixture, &resolved[0], &read),
+            Err(SourceImportError::Unsupported(
+                SourceImportUnsupported::TargetDeclaration(_)
+            ))
+        ));
+        assert_eq!(store_state(&fixture.store), before);
+
+        let (object, type_) = {
+            let Fixture {
+                files,
+                bound,
+                store,
+                ..
+            } = &mut fixture;
+            let sources = || {
+                files.iter().map(|file| {
+                    (
+                        &file.parsed.arena,
+                        bound.get(&file.file).expect("fixture bound every file"),
+                    )
+                })
+            };
+            let host = DeclaredTypeHost::new_after_global_merge(
+                sources(),
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            let file = &files[1];
+            let object =
+                file.parsed
+                    .arena
+                    .iter()
+                    .find_map(|(node, record)| {
+                        (record.kind == SyntaxKind::ObjectLiteralExpression)
+                            .then_some(NodeRef::new(file.parsed.arena.id(), file.file, node))
+                    })
+                    .unwrap();
+            let plan =
+                super::super::object_members::plan_object_literal(store, &host, object).unwrap();
+            let string = store.intrinsic_bootstrap().unwrap().string_type;
+            let type_ = super::super::object_members::publish_object_literal(
+                store,
+                &plan,
+                &[string, string, string],
+            )
+            .unwrap();
+            assert!(store.set_value_symbol_links(
+                default,
+                ValueSymbolLinks {
+                    resolved_type: Some(type_),
+                    ..ValueSymbolLinks::default()
+                },
+            ));
+            (object, type_)
+        };
+
+        let prepared = prepare_one(&mut fixture, &resolved[0], &read).unwrap();
+        assert_eq!(prepared.type_, type_);
+        assert!(matches!(
+            &prepared.target,
+            PreparedSourceImportTarget::ExportedObject { expression } if *expression == object
+        ));
+        assert!(
+            fixture
+                .store
+                .value_symbol_links(plan.bindings[0].alias_symbol)
+                .is_none()
+        );
+        publish_for_test(&mut fixture.store, std::slice::from_ref(&prepared));
+        let warm = store_state(&fixture.store);
+        assert_eq!(
+            prepare_one(&mut fixture, &resolved[0], &read).unwrap(),
+            prepared,
+        );
+        assert_eq!(store_state(&fixture.store), warm);
     }
 
     #[test]

@@ -581,6 +581,128 @@ fn recovered_conflict_marker_classes_check_the_live_method_body() {
 }
 
 #[test]
+fn class_method_generic_arity_and_static_name_diagnostics_keep_all_arguments() {
+    let cases = [
+        (
+            "class Model { public run(value: Array) {} }",
+            2314,
+            "Array",
+            ["Array<T>", "1"],
+        ),
+        (
+            "class C { static foo: string; bar() { let k = foo; } }",
+            2662,
+            "foo",
+            ["foo", "C"],
+        ),
+    ];
+
+    for (index, (source, code, expected_node, arguments)) in cases.into_iter().enumerate() {
+        let library = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
+        let parsed = parse_source_file(source);
+        assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let library_file = FileId::new(2_150 + u32::try_from(index).unwrap());
+        let file = FileId::new(2_144 + u32::try_from(index).unwrap());
+        let mut binder = CanonicalBinder::new();
+        for (input, current, name, declaration, default_library) in [
+            (&library, library_file, "\"/project/lib.d.ts\"", true, true),
+            (
+                &parsed,
+                file,
+                "\"/project/class-second-wave.ts\"",
+                false,
+                false,
+            ),
+        ] {
+            binder
+                .bind_source_file_with_facts(
+                    &input.arena,
+                    input.source_file,
+                    current,
+                    CanonicalSourceFileFacts::new_with_default_library(
+                        EscapedName::source(name),
+                        CanonicalSourceLanguage::TypeScript,
+                        declaration,
+                        default_library,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&input.arena, current)
+                .unwrap();
+        }
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            [(library_file, &library.arena), (file, &parsed.arena)]
+                .into_iter()
+                .collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("the class must produce exactly one supported grammar diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), code);
+        assert_eq!(diagnostic.diagnostic.arguments, arguments);
+        let range = parsed
+            .arena
+            .get(diagnostic.node.unwrap().node)
+            .unwrap()
+            .range;
+        assert_eq!(
+            &source[range.start.get() as usize..range.end.get() as usize],
+            expected_node,
+        );
+
+        let warm = context.diagnostics().clone();
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(context.diagnostics(), &warm);
+    }
+}
+
+#[test]
+fn ambient_getter_reports_its_circular_type_annotation_once() {
+    let source = "declare class Model { get value(): typeof this.value; }";
+    let parsed = parse_source_file(source);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(2_146);
+    let mut context = checker_context(
+        &parsed,
+        file,
+        CanonicalCheckerOptions {
+            no_implicit_any: true,
+            ..CanonicalCheckerOptions::default()
+        },
+    );
+
+    context.check_source_file(file).unwrap();
+
+    let [diagnostic] = context.diagnostics().as_slice() else {
+        panic!("the circular getter requires one declaration diagnostic")
+    };
+    assert_eq!(diagnostic.diagnostic.code(), 2502);
+    assert_eq!(diagnostic.diagnostic.arguments, ["value"]);
+    let range = parsed
+        .arena
+        .get(diagnostic.node.unwrap().node)
+        .unwrap()
+        .range;
+    assert_eq!(
+        &source[range.start.get() as usize..range.end.get() as usize],
+        "value",
+    );
+
+    let warm = context.diagnostics().clone();
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(context.diagnostics(), &warm);
+}
+
+#[test]
 fn decorated_constructor_parameter_publishes_its_annotated_signature() {
     let parsed = parse_source_file(concat!(
         "declare function decorate(target: any, key: string | symbol | undefined, index: number): void;\n",

@@ -39,6 +39,7 @@ use super::{
         validate_resolved_declared_property_type_graph,
     },
     relater::{ResolvedDeclaredProperty, ResolvedDeclaredPropertyObject},
+    signatures::ElementFlags,
     source::{
         CheckedExpressionShape, CheckedExpressionTypes, PlannedExpression, PlannedExpressionKind,
         SourceCheckError, SourceCheckProvenanceError,
@@ -1298,10 +1299,67 @@ pub(super) fn declared_property_mismatch_details(
     flags: CanonicalTypeFormatFlags,
     options: CanonicalCheckerOptions,
 ) -> Result<Vec<String>, SourceCheckError> {
+    recursive_declared_property_mismatch_details(
+        store,
+        host,
+        global_types,
+        source_type,
+        target_type,
+        flags,
+        options,
+        1,
+        &mut HashSet::new(),
+    )
+    .map(Option::unwrap_or_default)
+}
+
+#[allow(clippy::too_many_arguments)] // Keep recursive relation identity and formatting explicit.
+fn recursive_declared_property_mismatch_details(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source_type: TypeId,
+    target_type: TypeId,
+    flags: CanonicalTypeFormatFlags,
+    options: CanonicalCheckerOptions,
+    indentation: usize,
+    active: &mut HashSet<(TypeId, TypeId)>,
+) -> Result<Option<Vec<String>>, SourceCheckError> {
+    if active.len() >= 64 || !active.insert((source_type, target_type)) {
+        return Ok(None);
+    }
+
+    let result = recursive_declared_property_mismatch_details_inner(
+        store,
+        host,
+        global_types,
+        source_type,
+        target_type,
+        flags,
+        options,
+        indentation,
+        active,
+    );
+    assert!(active.remove(&(source_type, target_type)));
+    result
+}
+
+#[allow(clippy::too_many_arguments)] // Keep recursive relation identity and formatting explicit.
+fn recursive_declared_property_mismatch_details_inner(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source_type: TypeId,
+    target_type: TypeId,
+    flags: CanonicalTypeFormatFlags,
+    options: CanonicalCheckerOptions,
+    indentation: usize,
+    active: &mut HashSet<(TypeId, TypeId)>,
+) -> Result<Option<Vec<String>>, SourceCheckError> {
     for type_ in [source_type, target_type] {
         match validate_resolved_declared_property_type_graph(store, type_) {
             DeclaredPropertyTypeGraphValidation::Traversable(_) => {}
-            DeclaredPropertyTypeGraphValidation::Opaque => return Ok(Vec::new()),
+            DeclaredPropertyTypeGraphValidation::Opaque => return Ok(None),
             DeclaredPropertyTypeGraphValidation::Malformed => {
                 return Err(invalid_structure(type_));
             }
@@ -1326,28 +1384,195 @@ pub(super) fn declared_property_mismatch_details(
         )? {
             continue;
         }
-        // The complete upstream relation chain is recursive. Until those
-        // nested object, array, callable, and type-variable messages are
-        // ported, only elaborate a child pair whose terminal scalar shape is
-        // independently proven. Falling back to the root TS2322 is preferable
-        // to publishing a plausible but truncated diagnostic chain.
-        if !is_terminal_scalar_relation_leaf(store, source_property.type_)
-            || !is_terminal_scalar_relation_leaf(store, target_property.type_)
-        {
-            return Ok(Vec::new());
-        }
-        return scalar_property_mismatch_details(
+        return recursive_property_mismatch_details(
             store,
             host,
             global_types,
             name,
             source_property.type_,
             target_property.type_,
-            None,
             flags,
+            options,
+            indentation,
+            active,
         );
     }
-    Ok(Vec::new())
+    Ok(None)
+}
+
+#[allow(clippy::too_many_arguments)] // Each recursive edge retains its exact source and target.
+fn recursive_property_mismatch_details(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    name: &str,
+    source_type: TypeId,
+    target_type: TypeId,
+    flags: CanonicalTypeFormatFlags,
+    options: CanonicalCheckerOptions,
+    indentation: usize,
+    active: &mut HashSet<(TypeId, TypeId)>,
+) -> Result<Option<Vec<String>>, SourceCheckError> {
+    let nested = if is_terminal_scalar_relation_leaf(store, source_type)
+        && is_terminal_scalar_relation_leaf(store, target_type)
+    {
+        Vec::new()
+    } else if let Some((source_element, target_element)) =
+        nested_collection_element_types(store, global_types, source_type, target_type)?
+    {
+        if store.is_type_assignable_to_with_global_types_and_strict_function_types(
+            source_element,
+            target_element,
+            global_types,
+            options.strict_function_types,
+        )? {
+            return Ok(None);
+        }
+
+        let tail = if is_terminal_scalar_relation_leaf(store, source_element)
+            && is_terminal_scalar_relation_leaf(store, target_element)
+        {
+            Vec::new()
+        } else {
+            let Some(nested) = recursive_declared_property_mismatch_details(
+                store,
+                host,
+                global_types,
+                source_element,
+                target_element,
+                flags,
+                options,
+                indentation + 3,
+                active,
+            )?
+            else {
+                return Ok(None);
+            };
+            nested
+        };
+
+        let mut nested = vec![nested_assignability_message(
+            store,
+            host,
+            global_types,
+            source_element,
+            target_element,
+            flags,
+            indentation + 2,
+        )?];
+        nested.extend(tail);
+        nested
+    } else {
+        let Some(nested) = recursive_declared_property_mismatch_details(
+            store,
+            host,
+            global_types,
+            source_type,
+            target_type,
+            flags,
+            options,
+            indentation + 2,
+            active,
+        )?
+        else {
+            return Ok(None);
+        };
+        nested
+    };
+
+    let property_message = Diagnostic::with_arguments(
+        message_by_code(2326).ok_or(SourceCheckError::MissingDiagnostic(2326))?,
+        [name],
+    )
+    .render()
+    .expect("TS2326 has one formatting argument");
+    let mut details = vec![format!("{}{property_message}", "  ".repeat(indentation))];
+    details.push(nested_assignability_message(
+        store,
+        host,
+        global_types,
+        source_type,
+        target_type,
+        flags,
+        indentation + 1,
+    )?);
+    details.extend(nested);
+    Ok(Some(details))
+}
+
+fn nested_collection_element_types(
+    store: &CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    source_type: TypeId,
+    target_type: TypeId,
+) -> Result<Option<(TypeId, TypeId)>, SourceCheckError> {
+    let source_array = store.canonical_array_reference(global_types, source_type)?;
+    let target_array = store.canonical_array_reference(global_types, target_type)?;
+    match (source_array, target_array) {
+        (Some(source), Some(target)) => {
+            return Ok((source.readonly == target.readonly)
+                .then_some((source.element_type, target.element_type)));
+        }
+        (Some(_), None) | (None, Some(_)) => return Ok(None),
+        (None, None) => {}
+    }
+
+    let source_tuple = store
+        .canonical_tuple_shape(source_type)
+        .map_err(|_| invalid_structure(source_type))?;
+    let target_tuple = store
+        .canonical_tuple_shape(target_type)
+        .map_err(|_| invalid_structure(target_type))?;
+    let (Some(source), Some(target)) = (source_tuple, target_tuple) else {
+        return Ok(None);
+    };
+    let ([source_element], [target_element], [source_info], [target_info]) = (
+        source.element_types(),
+        target.element_types(),
+        source.element_infos(),
+        target.element_infos(),
+    ) else {
+        return Ok(None);
+    };
+    if source.min_length() != 1
+        || target.min_length() != 1
+        || source.fixed_length() != 1
+        || target.fixed_length() != 1
+        || source.is_readonly() != target.is_readonly()
+        || source_info.flags() != ElementFlags::REQUIRED
+        || target_info.flags() != ElementFlags::REQUIRED
+    {
+        return Ok(None);
+    }
+    Ok(Some((*source_element, *target_element)))
+}
+
+#[allow(clippy::too_many_arguments)] // Preserve the exact source, target, and diagnostic depth.
+fn nested_assignability_message(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source_type: TypeId,
+    target_type: TypeId,
+    flags: CanonicalTypeFormatFlags,
+    indentation: usize,
+) -> Result<String, SourceCheckError> {
+    let AssignabilityErrorDisplay { source, target } =
+        get_type_names_for_assignability_error_with_host_global_types_and_flags(
+            store,
+            host,
+            global_types,
+            source_type,
+            target_type,
+            flags,
+        )?;
+    let message = Diagnostic::with_arguments(
+        message_by_code(2322).ok_or(SourceCheckError::MissingDiagnostic(2322))?,
+        [source, target],
+    )
+    .render()
+    .expect("TS2322 has two formatting arguments");
+    Ok(format!("{}{message}", "  ".repeat(indentation)))
 }
 
 /// Returns the exact property relation chain for an optional value that
@@ -1801,6 +2026,185 @@ mod tests {
         };
         assert_eq!(identifier.text, "required");
         assert!(context.diagnostics().is_empty());
+    }
+
+    fn assert_nested_declared_property_details(tuple: bool) {
+        let element = |name: &str| {
+            if tuple {
+                format!("[{name}]")
+            } else {
+                format!("{name}[]")
+            }
+        };
+        let text = format!(
+            concat!(
+                "interface Array<T> {{}} ",
+                "interface ReadonlyArray<T> {{}} ",
+                "namespace A {{ ",
+                "export type Leaf = {{ id: string }}; ",
+                "export type Mid = {{ leaves: {} }}; ",
+                "export type Inner = {{ mids: {} }}; ",
+                "export type Outer = {{ inners: {} }}; ",
+                "}} ",
+                "namespace B {{ ",
+                "export type Leaf = {{ id: number }}; ",
+                "export type Mid = {{ leaves: {} }}; ",
+                "export type Inner = {{ mids: {} }}; ",
+                "export type Outer = {{ inners: {} }}; ",
+                "}} ",
+                "declare let source: B.Outer; ",
+                "declare let target: A.Outer;",
+            ),
+            element("Leaf"),
+            element("Mid"),
+            element("Inner"),
+            element("Leaf"),
+            element("Mid"),
+            element("Inner"),
+        );
+        let parsed = parse_source_file(&text);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(if tuple { 215 } else { 214 });
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/nested-property-diagnostic.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            [(file, &parsed.arena)].into_iter().collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+
+        let annotation = |expected: &str| {
+            parsed
+                .arena
+                .iter()
+                .find_map(|(_, record)| {
+                    let NodeData::VariableDeclaration(variable) = &record.data else {
+                        return None;
+                    };
+                    let NodeData::Identifier(name) = &parsed.arena.get(variable.name)?.data else {
+                        return None;
+                    };
+                    (name.text == expected).then_some(NodeRef::new(
+                        parsed.arena.id(),
+                        file,
+                        variable.type_?,
+                    ))
+                })
+                .unwrap()
+        };
+        let source_type = context
+            .get_type_from_type_node(annotation("source"))
+            .unwrap();
+        let target_type = context
+            .get_type_from_type_node(annotation("target"))
+            .unwrap();
+        assert!(
+            !context
+                .is_type_assignable_to(source_type, target_type)
+                .unwrap()
+        );
+
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new([(&parsed.arena, &bound)]).unwrap();
+        let global_types = context.global_types().clone();
+        let details = declared_property_mismatch_details(
+            context.store_mut_for_test(),
+            &host,
+            &global_types,
+            source_type,
+            target_type,
+            CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+
+        let collection = |source: &str, target: &str| {
+            format!(
+                "Type '{}' is not assignable to type '{}'.",
+                element(source),
+                element(target),
+            )
+        };
+        assert_eq!(
+            details,
+            [
+                "  Types of property 'inners' are incompatible.".to_owned(),
+                format!("    {}", collection("B.Inner", "A.Inner")),
+                "      Type 'B.Inner' is not assignable to type 'A.Inner'.".to_owned(),
+                "        Types of property 'mids' are incompatible.".to_owned(),
+                format!("          {}", collection("B.Mid", "A.Mid")),
+                "            Type 'B.Mid' is not assignable to type 'A.Mid'.".to_owned(),
+                "              Types of property 'leaves' are incompatible.".to_owned(),
+                format!("                {}", collection("B.Leaf", "A.Leaf")),
+                "                  Type 'B.Leaf' is not assignable to type 'A.Leaf'.".to_owned(),
+                "                    Types of property 'id' are incompatible.".to_owned(),
+                "                      Type 'number' is not assignable to type 'string'."
+                    .to_owned(),
+            ],
+        );
+
+        let warmed_relations = context.store().relation_state_snapshot();
+        let mut active = HashSet::from([(source_type, target_type)]);
+        assert_eq!(
+            recursive_declared_property_mismatch_details(
+                context.store_mut_for_test(),
+                &host,
+                &global_types,
+                source_type,
+                target_type,
+                CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+                CanonicalCheckerOptions::default(),
+                1,
+                &mut active,
+            )
+            .unwrap(),
+            None,
+        );
+        assert_eq!(active, HashSet::from([(source_type, target_type)]));
+        assert_eq!(context.store().relation_state_snapshot(), warmed_relations);
+        assert_eq!(
+            declared_property_mismatch_details(
+                context.store_mut_for_test(),
+                &host,
+                &global_types,
+                source_type,
+                target_type,
+                CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+                CanonicalCheckerOptions::default(),
+            )
+            .unwrap(),
+            details,
+        );
+        assert_eq!(context.store().relation_state_snapshot(), warmed_relations);
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn nested_declared_array_properties_keep_the_complete_assignability_chain() {
+        assert_nested_declared_property_details(false);
+    }
+
+    #[test]
+    fn nested_declared_tuple_properties_keep_the_complete_assignability_chain() {
+        assert_nested_declared_property_details(true);
     }
 
     #[test]

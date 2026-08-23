@@ -3,10 +3,10 @@
 //! This is the dependency-closed prefix of pinned typescript-go's
 //! `getDeclaredTypeOfEnum`, `getDeclaredTypeOfEnumMember`,
 //! `getTypeOfFuncClassEnumModule`, and `computeEnumMemberValues`. It supports
-//! one non-merged top-level or namespace enum declaration whose members have
-//! identifier or string-literal names and constant numeric or string
-//! expressions. Earlier members can be referenced by name, property access,
-//! or string element access. Numeric auto-increment, explicit ambient
+//! one non-merged top-level, namespace, or function-local enum declaration
+//! whose members have identifier or string-literal names and constant numeric
+//! or string expressions. Earlier members can be referenced by name, property
+//! access, or string element access. Numeric auto-increment, explicit ambient
 //! behavior, const-enum provenance,
 //! regular/fresh member identities, the enum declared union, and the separate
 //! enum value object are published together.
@@ -25,7 +25,7 @@
 use ts_ast::{
     BinaryExpressionData, NodeData, NodeList, NodeRef, SyntaxKind, TemplateExpressionData,
 };
-use ts_binder::{CheckFlags, InternalSymbolName, SemanticSymbolId, SymbolFlags};
+use ts_binder::{BoundFile, CheckFlags, InternalSymbolName, SemanticSymbolId, SymbolFlags};
 use ts_evaluator::{
     Evaluation, EvaluationMetadata, EvaluationOutcome, UnknownReason, Value, evaluate_with,
 };
@@ -200,6 +200,12 @@ fn enum_container(
     }
 
     let parent_record = preflight_node(store, host, parent)?;
+    if matches!(
+        parent_record.kind,
+        SyntaxKind::Block | SyntaxKind::IfStatement
+    ) {
+        return function_enum_container(store, host, bound, declaration, parent);
+    }
     let NodeData::ModuleBlock(block) = &parent_record.data else {
         return Err(unsupported(EnumTypeUnsupported::NestedDeclaration(
             declaration,
@@ -256,6 +262,161 @@ fn enum_container(
             .map(|parent| NodeRef::new(node.arena, node.file, parent));
     }
     Ok((Some(namespace_symbol), ambient))
+}
+
+fn function_enum_container(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    bound: &BoundFile,
+    declaration: NodeRef,
+    parent: NodeRef,
+) -> Result<(Option<SemanticSymbolId>, bool), EnumTypeError> {
+    let function = bound
+        .container(declaration)
+        .ok_or_else(|| invariant(EnumTypeInvariant::InvalidDeclaration(declaration)))?;
+    let function_record = preflight_node(store, host, function)?;
+    let NodeData::FunctionDeclaration(function_data) = &function_record.data else {
+        return Err(unsupported(EnumTypeUnsupported::NestedDeclaration(
+            declaration,
+        )));
+    };
+    if function_record.kind != SyntaxKind::FunctionDeclaration {
+        return Err(invariant(EnumTypeInvariant::InvalidDeclaration(
+            declaration,
+        )));
+    }
+    let body = function_data
+        .body
+        .map(|body| NodeRef::new(function.arena, function.file, body))
+        .ok_or_else(|| invariant(EnumTypeInvariant::InvalidDeclaration(declaration)))?;
+    let body_record = preflight_node(store, host, body)?;
+    if body_record.kind != SyntaxKind::Block
+        || !matches!(body_record.data, NodeData::Block(_))
+        || body_record.parent != Some(function.node)
+        || store.source_node_parent(body) != Some(super::store::SourceNodeParent::Parent(function))
+        || body_record.range.start < function_record.range.start
+        || body_record.range.end > function_record.range.end
+    {
+        return Err(invariant(EnumTypeInvariant::InvalidDeclaration(
+            declaration,
+        )));
+    }
+
+    let function_symbol = bound
+        .symbol(function)
+        .ok_or_else(|| invariant(EnumTypeInvariant::InvalidDeclaration(declaration)))?;
+    let function_owner = store
+        .get_merged_symbol(function_symbol)
+        .and_then(|symbol| store.symbol(symbol))
+        .ok_or_else(|| invariant(EnumTypeInvariant::InvalidDeclaration(declaration)))?;
+    if !function_owner.flags().contains(SymbolFlags::FUNCTION)
+        || function_owner.value_declaration() != Some(function)
+    {
+        return Err(invariant(EnumTypeInvariant::InvalidDeclaration(
+            declaration,
+        )));
+    }
+
+    let scope = bound
+        .block_scope_container(declaration)
+        .ok_or_else(|| invariant(EnumTypeInvariant::InvalidDeclaration(declaration)))?;
+    let mut scope_is_ancestor = scope == function;
+    let mut current = parent;
+    let mut child = declaration;
+    loop {
+        let record = preflight_node(store, host, current)?;
+        let child_record = preflight_node(store, host, child)?;
+        if child_record.parent != Some(current.node)
+            || store.source_node_parent(child)
+                != Some(super::store::SourceNodeParent::Parent(current))
+            || child_record.range.start < record.range.start
+            || child_record.range.end > record.range.end
+            || bound.container(current) != Some(function)
+        {
+            return Err(invariant(EnumTypeInvariant::InvalidDeclaration(
+                declaration,
+            )));
+        }
+
+        match &record.data {
+            NodeData::Block(block) if record.kind == SyntaxKind::Block => {
+                if block
+                    .statements
+                    .nodes
+                    .iter()
+                    .filter(|statement| **statement == child.node)
+                    .count()
+                    != 1
+                {
+                    return Err(invariant(EnumTypeInvariant::InvalidDeclaration(
+                        declaration,
+                    )));
+                }
+            }
+            NodeData::IfStatement(statement) if record.kind == SyntaxKind::IfStatement => {
+                let branches = usize::from(statement.then_statement == child.node)
+                    + usize::from(statement.else_statement == Some(child.node));
+                if branches != 1 {
+                    return Err(invariant(EnumTypeInvariant::InvalidDeclaration(
+                        declaration,
+                    )));
+                }
+            }
+            _ => {
+                return Err(unsupported(EnumTypeUnsupported::NestedDeclaration(
+                    declaration,
+                )));
+            }
+        }
+
+        scope_is_ancestor |= current == scope;
+        if current == body {
+            break;
+        }
+        child = current;
+        current = record
+            .parent
+            .map(|parent| NodeRef::new(current.arena, current.file, parent))
+            .ok_or_else(|| invariant(EnumTypeInvariant::InvalidDeclaration(declaration)))?;
+    }
+    if !scope_is_ancestor || scope == body && scope != function {
+        return Err(invariant(EnumTypeInvariant::InvalidDeclaration(
+            declaration,
+        )));
+    }
+
+    let declaration_record = preflight_node(store, host, declaration)?;
+    let NodeData::EnumDeclaration(enumeration) = &declaration_record.data else {
+        return Err(invariant(EnumTypeInvariant::InvalidDeclaration(
+            declaration,
+        )));
+    };
+    let name = NodeRef::new(declaration.arena, declaration.file, enumeration.name);
+    let name_record = preflight_node(store, host, name)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(invariant(EnumTypeInvariant::InvalidDeclaration(
+            declaration,
+        )));
+    };
+    let symbol = bound
+        .symbol(declaration)
+        .ok_or_else(|| invariant(EnumTypeInvariant::InvalidExportRoute(declaration)))?;
+    if name_record.kind != SyntaxKind::Identifier
+        || name_record.parent != Some(declaration.node)
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || bound.local_symbol(declaration).is_some()
+        || bound
+            .locals(scope)
+            .and_then(|locals| store.symbol_table(locals))
+            .and_then(|locals| locals.get_source(&identifier.text))
+            != Some(symbol)
+    {
+        return Err(invariant(EnumTypeInvariant::InvalidExportRoute(
+            declaration,
+        )));
+    }
+
+    Ok((None, false))
 }
 
 fn plan_enum(
@@ -2430,6 +2591,176 @@ mod tests {
         assert_eq!(
             member(&local, &fixture, "Value").value,
             CanonicalEnumMemberValue::Number(Number::new(3.0))
+        );
+    }
+
+    #[test]
+    fn function_local_and_embedded_enums_preserve_lexical_owners_and_warm_caches() {
+        let mut fixture = fixture(concat!(
+            "function direct() { ",
+            "enum Regular { First = 1, Second } ",
+            "const enum Fixed { Ready = 3 } ",
+            "} ",
+            "function embedded(value: number) { ",
+            "if (value) const enum Embedded { Active = 4 } ",
+            "} ",
+            "function scoped(value: number) { ",
+            "if (value) { enum Scoped { ScopedFirst = 5, ScopedNext } } ",
+            "}",
+        ));
+
+        for (name, is_const, member_name, member_value, block_scoped) in [
+            ("Regular", false, "Second", 2.0, false),
+            ("Fixed", true, "Ready", 3.0, false),
+            ("Embedded", true, "Active", 4.0, false),
+            ("Scoped", false, "ScopedNext", 6.0, true),
+        ] {
+            let declaration = named_node(&fixture, SyntaxKind::EnumDeclaration, name);
+            let owner = symbol(&fixture, SyntaxKind::EnumDeclaration, name);
+            let bound = &fixture.files[&fixture.file];
+            let scope = bound.block_scope_container(declaration).unwrap();
+            assert_eq!(
+                fixture.parsed.arena.get(scope.node).unwrap().kind,
+                if block_scoped {
+                    SyntaxKind::Block
+                } else {
+                    SyntaxKind::FunctionDeclaration
+                }
+            );
+            assert_eq!(
+                bound
+                    .locals(scope)
+                    .and_then(|locals| fixture.store.symbol_table(locals))
+                    .and_then(|locals| locals.get_source(name)),
+                Some(owner)
+            );
+            assert!(fixture.store.symbol(owner).unwrap().parent().is_none());
+            let host = host(&fixture.parsed.arena, bound);
+            assert!(
+                preflight_enum_diagnostics(&fixture.store, &host, owner)
+                    .unwrap()
+                    .is_empty()
+            );
+
+            let result = get_enum_semantics(&mut fixture.store, &host, owner).unwrap();
+            assert_eq!(result.is_const, is_const);
+            assert!(!result.is_ambient);
+            assert_eq!(
+                member(&result, &fixture, member_name).value,
+                CanonicalEnumMemberValue::Number(Number::new(member_value))
+            );
+            let warm = (
+                fixture.store.type_len(),
+                fixture.store.type_alias_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+            assert_eq!(
+                get_enum_semantics(&mut fixture.store, &host, owner),
+                Ok(result)
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.type_alias_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                warm
+            );
+        }
+    }
+
+    #[test]
+    fn shadowed_function_local_enums_keep_independent_value_identities() {
+        let mut fixture = fixture(concat!(
+            "function first() { enum Shared { Value = 1 } } ",
+            "function second() { enum Shared { Value = 2 } }",
+        ));
+        let bound = &fixture.files[&fixture.file];
+        let declarations = fixture
+            .parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::EnumDeclaration).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let [first, second] = declarations.as_slice() else {
+            panic!("fixture contains two local enum declarations")
+        };
+        let first_owner = bound.symbol(*first).unwrap();
+        let second_owner = bound.symbol(*second).unwrap();
+        assert_ne!(first_owner, second_owner);
+        assert_ne!(
+            bound.block_scope_container(*first),
+            bound.block_scope_container(*second)
+        );
+
+        let host = host(&fixture.parsed.arena, bound);
+        let first_result = get_enum_semantics(&mut fixture.store, &host, first_owner).unwrap();
+        let second_result = get_enum_semantics(&mut fixture.store, &host, second_owner).unwrap();
+        assert_ne!(first_result.declared_type, second_result.declared_type);
+        assert_ne!(first_result.value_type, second_result.value_type);
+        assert_eq!(
+            first_result.members[0].value,
+            CanonicalEnumMemberValue::Number(Number::new(1.0))
+        );
+        assert_eq!(
+            second_result.members[0].value,
+            CanonicalEnumMemberValue::Number(Number::new(2.0))
+        );
+    }
+
+    #[test]
+    fn forged_function_enum_scope_is_rejected_before_cache_publication() {
+        let mut fixture = fixture("function outer() { enum Good { A } enum Other { B } }");
+        let declaration = named_node(&fixture, SyntaxKind::EnumDeclaration, "Good");
+        let owner = symbol(&fixture, SyntaxKind::EnumDeclaration, "Good");
+        let other = symbol(&fixture, SyntaxKind::EnumDeclaration, "Other");
+        let bound = &fixture.files[&fixture.file];
+        let scope = bound.block_scope_container(declaration).unwrap();
+        let locals = bound.locals(scope).unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .insert_symbol(locals, EscapedName::source("Good"), other),
+            Some(Some(owner))
+        );
+        let host = host(&fixture.parsed.arena, bound);
+        let state = (
+            fixture.store.type_len(),
+            fixture.store.type_alias_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            get_enum_semantics(&mut fixture.store, &host, owner),
+            Err(EnumTypeError::Invariant(
+                EnumTypeInvariant::InvalidExportRoute(declaration)
+            ))
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.type_alias_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            state
+        );
+
+        assert_eq!(
+            fixture
+                .store
+                .insert_symbol(locals, EscapedName::source("Good"), owner),
+            Some(Some(other))
+        );
+        assert_eq!(
+            get_enum_semantics(&mut fixture.store, &host, owner)
+                .unwrap()
+                .symbol,
+            owner
         );
     }
 

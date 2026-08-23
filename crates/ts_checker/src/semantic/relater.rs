@@ -45,12 +45,13 @@ use super::{
         ExpandingFlags, IntersectionState, RecursionFlags, RecursionIdentityUnavailable,
         RelationComparisonResult, RelationKeyUnavailable, RelationKind, SignatureCheckMode,
     },
-    signatures::{SignatureFlags, Ternary},
+    signatures::{ElementFlags, SignatureFlags, Ternary},
     store::{RelationObservationToken, SemanticStore, SourceNodeParent},
     structured_members::{
         InterfaceHeritageMembersValidation, validate_interface_heritage_members,
         validate_planned_interface_heritage_members,
     },
+    tuple_types::TupleShape,
     type_records::{
         CacheHashKey, ConstrainedTypeData, StructuredTypeData, TypeCacheState, TypeData, TypeRecord,
     },
@@ -1173,6 +1174,18 @@ impl<'store> RelaterSession<'store> {
         let source_flags = self.store.type_flags(source)?;
         let mut target_flags = self.store.type_flags(target)?;
 
+        if source_flags.intersects(TypeFlags::OBJECT)
+            && target_flags.intersects(TypeFlags::OBJECT)
+            && canonical_fixed_tuple_pair(self.store, source, target)?.is_some()
+        {
+            return self.recursive_type_related_to(
+                source,
+                target,
+                intersection_state,
+                recursion_flags,
+            );
+        }
+
         if self.relation.is_identity() {
             if source_flags != target_flags {
                 return Ok(Ternary::False);
@@ -1682,6 +1695,9 @@ impl<'store> RelaterSession<'store> {
                 relation: self.relation,
             });
         }
+        if canonical_fixed_tuple_pair(self.store, source, target)?.is_some() {
+            return self.fixed_tuple_types_related_to(source, target, intersection_state);
+        }
         if let Some((source_signature, target_signature)) =
             self.store.authenticated_declared_construct_pair(
                 source,
@@ -1734,6 +1750,85 @@ impl<'store> RelaterSession<'store> {
                 &target_members,
                 intersection_state,
             )?;
+        }
+        Ok(result)
+    }
+
+    fn fixed_tuple_types_related_to(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        intersection_state: IntersectionState,
+    ) -> Result<Ternary, RelationUnavailable> {
+        let comparisons = {
+            let (source_shape, target_shape) = canonical_fixed_tuple_pair(
+                self.store, source, target,
+            )?
+            .ok_or(RelationUnavailable::StructuralRelation {
+                source,
+                target,
+                relation: self.relation,
+            })?;
+            let source_arity = source_shape.fixed_length();
+            let target_arity = target_shape.fixed_length();
+
+            if source_shape.is_readonly() && !target_shape.is_readonly()
+                || self.relation.is_identity()
+                    && (source_shape.is_readonly() != target_shape.is_readonly()
+                        || source_arity != target_arity)
+                || source_arity < target_shape.min_length()
+                || target_arity < source_shape.min_length()
+                || target_arity < source_arity
+            {
+                return Ok(Ternary::False);
+            }
+
+            let mut comparisons = Vec::with_capacity(source_arity);
+            for position in 0..source_arity {
+                let source_flags = source_shape.element_infos()[position].flags();
+                let target_flags = target_shape.element_infos()[position].flags();
+                if self.relation.is_identity() && source_flags != target_flags
+                    || target_flags.contains(ElementFlags::REQUIRED)
+                        && !source_flags.contains(ElementFlags::REQUIRED)
+                {
+                    return Ok(Ternary::False);
+                }
+                comparisons.push((
+                    source_shape.element_types()[position],
+                    target_shape.element_types()[position],
+                    source_flags,
+                    target_flags,
+                ));
+            }
+            comparisons
+        };
+
+        let mut result = Ternary::True;
+        for (source_type, target_type, source_flags, target_flags) in comparisons {
+            let related =
+                if !self.relation.is_identity() && self.bootstrap.exact_optional_property_types {
+                    let source_types = self.effective_property_types(
+                        source_type,
+                        source_flags.contains(ElementFlags::OPTIONAL)
+                            && target_flags.contains(ElementFlags::OPTIONAL),
+                    )?;
+                    let target_types = self.effective_property_types(
+                        target_type,
+                        target_flags.contains(ElementFlags::OPTIONAL),
+                    )?;
+                    self.property_types_related(&source_types, &target_types)?
+                } else {
+                    self.is_related_to_ex(
+                        source_type,
+                        target_type,
+                        RecursionFlags::BOTH,
+                        intersection_state,
+                    )?
+                };
+            if related == Ternary::False {
+                return Ok(Ternary::False);
+            }
+            result &= related;
         }
         Ok(result)
     }
@@ -3835,6 +3930,9 @@ impl<'store> RelaterSession<'store> {
             && source_flags.intersects(TypeFlags::OBJECT)
             && target_flags.intersects(TypeFlags::OBJECT)
         {
+            if canonical_fixed_tuple_pair(self.store, source, target)?.is_some() {
+                return Ok(());
+            }
             self.ensure_supported_object_kind(source, true)?;
             self.ensure_supported_object_kind(target, self.allows_fresh_object_target())?;
             return Ok(());
@@ -5570,7 +5668,8 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             }
         }
 
-        if source_flags.intersects(TypeFlags::OBJECT) && target_flags.intersects(TypeFlags::OBJECT)
+        let supported_fixed_tuple_relation = if source_flags.intersects(TypeFlags::OBJECT)
+            && target_flags.intersects(TypeFlags::OBJECT)
         {
             self.authenticated_declared_construct_pair(
                 source,
@@ -5578,7 +5677,10 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 relation,
                 strict_function_types,
             )?;
-        }
+            canonical_fixed_tuple_pair(self, source, target)?.is_some()
+        } else {
+            false
+        };
 
         let supported_array_relation = source_flags.intersects(TypeFlags::OBJECT)
             && target_flags.intersects(TypeFlags::OBJECT)
@@ -5591,6 +5693,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         if source_flags.intersects(TypeFlags::OBJECT)
             && target_flags.intersects(TypeFlags::OBJECT)
             && !supported_array_relation
+            && !supported_fixed_tuple_relation
             && (strict_function_types.is_some() || self.claimed_strict_function_types().is_none())
         {
             let key = self
@@ -6143,6 +6246,34 @@ impl SemanticStore<TypeRecord, TypeMapper> {
     }
 }
 
+fn canonical_fixed_tuple_pair(
+    store: &SemanticStore<TypeRecord, TypeMapper>,
+    source: TypeId,
+    target: TypeId,
+) -> Result<Option<(TupleShape<'_>, TupleShape<'_>)>, RelationUnavailable> {
+    let Some(source_shape) = store
+        .canonical_tuple_shape(source)
+        .map_err(|_| RelationUnavailable::InvalidStructuredMembers(source))?
+    else {
+        return Ok(None);
+    };
+    let Some(target_shape) = store
+        .canonical_tuple_shape(target)
+        .map_err(|_| RelationUnavailable::InvalidStructuredMembers(target))?
+    else {
+        return Ok(None);
+    };
+
+    for shape in [source_shape, target_shape] {
+        if shape.combined_flags().intersects(ElementFlags::VARIABLE) {
+            return Err(RelationUnavailable::UnsupportedStructuredType(
+                shape.type_(),
+            ));
+        }
+    }
+    Ok(Some((source_shape, target_shape)))
+}
+
 fn configured_array_reference_targets(
     store: &SemanticStore<TypeRecord, TypeMapper>,
     global_types: Option<RelationGlobalTypes>,
@@ -6349,7 +6480,8 @@ mod tests {
         declared::type_list_key,
         global_types::create_type_from_generic_global_type,
         production::GlobalMergeCompletion,
-        signatures::{SignatureFlags, Ternary},
+        signatures::{ElementFlags, SignatureFlags, Ternary},
+        tuple_types::CanonicalTupleTypeRequest,
         type_nodes::{CanonicalTypeQuery, CanonicalTypeQueryOptions},
         type_records::{LiteralValue, RegularLiteralLink, TypeData, TypeRecord},
         types::{ObjectFlags, TypeFlags},
@@ -6595,6 +6727,26 @@ mod tests {
         };
         assert!(diagnostics.is_empty());
         type_
+    }
+
+    fn canonical_relation_tuple(
+        store: &mut TestStore,
+        element_types: &[TypeId],
+        element_flags: &[ElementFlags],
+        readonly: bool,
+    ) -> TypeId {
+        let element_infos = element_flags
+            .iter()
+            .copied()
+            .map(|flags| store.create_tuple_element_info(flags, None).unwrap())
+            .collect::<Vec<_>>();
+        store
+            .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(
+                element_types,
+                &element_infos,
+                readonly,
+            ))
+            .unwrap()
     }
 
     fn query_class_members(fixture: &mut FunctionRelationFixture, name: &str) -> ClassMembers {
@@ -8218,6 +8370,272 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn canonical_fixed_tuples_compare_positionally_and_covariantly() {
+        let mut store = initialized(true);
+        let (string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let literal = store.regular_string_literal_type("fixed".into()).unwrap();
+        let narrow =
+            canonical_relation_tuple(&mut store, &[literal], &[ElementFlags::REQUIRED], false);
+        let wide =
+            canonical_relation_tuple(&mut store, &[string], &[ElementFlags::REQUIRED], false);
+        let numeric =
+            canonical_relation_tuple(&mut store, &[number], &[ElementFlags::REQUIRED], false);
+        let pair = canonical_relation_tuple(
+            &mut store,
+            &[string, string],
+            &[ElementFlags::REQUIRED, ElementFlags::REQUIRED],
+            false,
+        );
+        let optional =
+            canonical_relation_tuple(&mut store, &[string], &[ElementFlags::OPTIONAL], false);
+        let empty = canonical_relation_tuple(&mut store, &[], &[], false);
+
+        for relation in [
+            RelationKind::Assignable,
+            RelationKind::Subtype,
+            RelationKind::StrictSubtype,
+        ] {
+            assert_eq!(store.is_type_related_to(narrow, wide, relation), Ok(true));
+            assert_eq!(store.is_type_related_to(wide, narrow, relation), Ok(false));
+            assert_eq!(store.is_type_related_to(wide, numeric, relation), Ok(false));
+            assert_eq!(store.is_type_related_to(wide, pair, relation), Ok(false));
+            assert_eq!(store.is_type_related_to(pair, wide, relation), Ok(false));
+            assert_eq!(store.is_type_related_to(wide, optional, relation), Ok(true));
+            assert_eq!(
+                store.is_type_related_to(optional, wide, relation),
+                Ok(false)
+            );
+            assert_eq!(
+                store.is_type_related_to(empty, optional, relation),
+                Ok(true)
+            );
+            assert_eq!(
+                store.is_type_related_to(optional, empty, relation),
+                Ok(false)
+            );
+        }
+
+        assert_eq!(store.is_type_comparable_to(wide, narrow), Ok(true));
+        assert_eq!(store.is_type_identical_to(wide, narrow), Ok(false));
+        assert_eq!(store.is_type_identical_to(wide, optional), Ok(false));
+    }
+
+    #[test]
+    fn canonical_fixed_tuple_readonly_relations_are_directional() {
+        let mut store = initialized(true);
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let literal = store.regular_string_literal_type("fixed".into()).unwrap();
+        let mutable_wide =
+            canonical_relation_tuple(&mut store, &[string], &[ElementFlags::REQUIRED], false);
+        let mutable_narrow =
+            canonical_relation_tuple(&mut store, &[literal], &[ElementFlags::REQUIRED], false);
+        let readonly_wide =
+            canonical_relation_tuple(&mut store, &[string], &[ElementFlags::REQUIRED], true);
+        let readonly_narrow =
+            canonical_relation_tuple(&mut store, &[literal], &[ElementFlags::REQUIRED], true);
+
+        for relation in [
+            RelationKind::Assignable,
+            RelationKind::Subtype,
+            RelationKind::StrictSubtype,
+            RelationKind::Comparable,
+        ] {
+            assert_eq!(
+                store.is_type_related_to(mutable_narrow, readonly_wide, relation),
+                Ok(true)
+            );
+            assert_eq!(
+                store.is_type_related_to(readonly_narrow, mutable_wide, relation),
+                Ok(false)
+            );
+            assert_eq!(
+                store.is_type_related_to(readonly_narrow, readonly_wide, relation),
+                Ok(true)
+            );
+        }
+
+        assert_eq!(
+            store.is_type_identical_to(mutable_wide, readonly_wide),
+            Ok(false)
+        );
+        assert_eq!(
+            store.is_type_identical_to(readonly_wide, mutable_wide),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn canonical_fixed_tuples_compare_nested_object_and_tuple_members() {
+        fn nested_tuple_object(store: &mut TestStore, leaf_type: TypeId) -> TypeId {
+            let leaf_property = alloc_typed_property(store, "id", leaf_type, false);
+            let leaf = alloc_property_object(store, vec![leaf_property]);
+            let leaves = canonical_relation_tuple(store, &[leaf], &[ElementFlags::REQUIRED], false);
+            let middle_property = alloc_typed_property(store, "leaves", leaves, false);
+            let middle = alloc_property_object(store, vec![middle_property]);
+            let middles =
+                canonical_relation_tuple(store, &[middle], &[ElementFlags::REQUIRED], false);
+            let outer_property = alloc_typed_property(store, "inners", middles, false);
+            alloc_property_object(store, vec![outer_property])
+        }
+
+        let mut store = initialized(true);
+        let (string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let source = nested_tuple_object(&mut store, string);
+        let matching = nested_tuple_object(&mut store, string);
+        let different = nested_tuple_object(&mut store, number);
+
+        assert_eq!(store.is_type_assignable_to(source, matching), Ok(true));
+        assert_eq!(store.is_type_identical_to(source, matching), Ok(true));
+        assert_eq!(store.is_type_assignable_to(source, different), Ok(false));
+        assert_eq!(store.is_type_identical_to(source, different), Ok(false));
+    }
+
+    #[test]
+    fn canonical_fixed_tuples_remove_exact_optional_missing_elements() {
+        let mut store = initialized_with_options(true, true);
+        let (string, undefined, missing) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.string_type,
+                bootstrap.undefined_type,
+                bootstrap.missing_type,
+            )
+        };
+        let literal = store.regular_string_literal_type("fixed".into()).unwrap();
+        let optional_string = canonical_union(&mut store, &[missing, string]);
+        let optional_literal = canonical_union(&mut store, &[missing, literal]);
+        let required_string =
+            canonical_relation_tuple(&mut store, &[string], &[ElementFlags::REQUIRED], false);
+        let required_undefined =
+            canonical_relation_tuple(&mut store, &[undefined], &[ElementFlags::REQUIRED], false);
+        let wide = canonical_relation_tuple(
+            &mut store,
+            &[optional_string],
+            &[ElementFlags::OPTIONAL],
+            false,
+        );
+        let narrow = canonical_relation_tuple(
+            &mut store,
+            &[optional_literal],
+            &[ElementFlags::OPTIONAL],
+            false,
+        );
+
+        assert_eq!(store.is_type_assignable_to(required_string, wide), Ok(true));
+        assert_eq!(
+            store.is_type_assignable_to(required_undefined, wide),
+            Ok(false)
+        );
+        assert_eq!(store.is_type_assignable_to(narrow, wide), Ok(true));
+        assert_eq!(
+            store.is_type_assignable_to(narrow, required_string),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn canonical_variable_tuple_relations_remain_explicitly_unsupported() {
+        let mut store = initialized(true);
+        let (string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let parameter = store.alloc_type_parameter(None).unwrap();
+        let fixed =
+            canonical_relation_tuple(&mut store, &[string], &[ElementFlags::REQUIRED], false);
+        let rest = canonical_relation_tuple(
+            &mut store,
+            &[string, number],
+            &[ElementFlags::REQUIRED, ElementFlags::REST],
+            false,
+        );
+        let variadic = canonical_relation_tuple(
+            &mut store,
+            &[string, parameter],
+            &[ElementFlags::REQUIRED, ElementFlags::VARIADIC],
+            false,
+        );
+
+        for variable in [rest, variadic] {
+            for (source, target) in [(fixed, variable), (variable, fixed)] {
+                let before = store.relation_state_snapshot();
+                assert_eq!(
+                    store.is_type_assignable_to(source, target),
+                    Err(RelationUnavailable::UnsupportedStructuredType(variable))
+                );
+                assert_eq!(store.relation_state_snapshot(), before);
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_fixed_tuple_relations_reject_poisoned_warm_caches() {
+        let mut store = initialized(true);
+        let (string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let literal = store.regular_string_literal_type("fixed".into()).unwrap();
+        let source =
+            canonical_relation_tuple(&mut store, &[literal], &[ElementFlags::REQUIRED], false);
+        let target =
+            canonical_relation_tuple(&mut store, &[string], &[ElementFlags::REQUIRED], false);
+        let tuple_target = store
+            .canonical_tuple_shape(source)
+            .unwrap()
+            .unwrap()
+            .target();
+        let this_type = match store.type_payload(tuple_target).unwrap().data() {
+            TypeData::Tuple(tuple) => tuple.interface.this_type.unwrap(),
+            _ => unreachable!("canonical tuple references have a tuple target"),
+        };
+        let key = store
+            .relation_key_if_available(source, target, super::IntersectionState::NONE, false, false)
+            .unwrap()
+            .key();
+
+        assert_eq!(store.is_type_assignable_to(source, target), Ok(true));
+        assert!(
+            store
+                .relation_cache_get(RelationKind::Assignable, key)
+                .intersects(RelationComparisonResult::SUCCEEDED)
+        );
+        let warm = store.relation_state_snapshot();
+        assert_eq!(store.is_type_assignable_to(source, target), Ok(true));
+        assert_eq!(store.relation_state_snapshot(), warm);
+
+        assert!(store.set_resolved_base_constraint(this_type, Some(number)));
+        assert_eq!(
+            store.relation_cache_get(RelationKind::Assignable, key),
+            RelationComparisonResult::NONE
+        );
+        let poisoned_target = store.relation_state_snapshot();
+        assert_eq!(
+            store.is_type_assignable_to(source, target),
+            Err(RelationUnavailable::InvalidStructuredMembers(source))
+        );
+        assert_eq!(store.relation_state_snapshot(), poisoned_target);
+        assert!(store.set_resolved_base_constraint(this_type, None));
+        assert_eq!(store.is_type_assignable_to(source, target), Ok(true));
+
+        assert!(store.set_type_reference_resolution(source, None, Some(vec![number])));
+        let poisoned_reference = store.relation_state_snapshot();
+        assert_eq!(
+            store.is_type_assignable_to(source, target),
+            Err(RelationUnavailable::InvalidStructuredMembers(source))
+        );
+        assert_eq!(store.relation_state_snapshot(), poisoned_reference);
+        assert!(store.set_type_reference_resolution(source, None, Some(vec![literal])));
+        assert_eq!(store.is_type_assignable_to(source, target), Ok(true));
     }
 
     #[test]

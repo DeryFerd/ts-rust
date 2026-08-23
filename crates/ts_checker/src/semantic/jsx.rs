@@ -98,6 +98,10 @@ struct JsxObjectSpreadPlan {
 #[derive(Clone, Debug)]
 enum JsxAttributeValue {
     ImplicitTrue,
+    EmptyExpression {
+        wrapper: NodeRef,
+        report: bool,
+    },
     Expression {
         wrapper: Option<NodeRef>,
         value: JsxScalarPlan,
@@ -123,6 +127,7 @@ enum JsxScalarPlan {
         node: NodeRef,
         name: String,
     },
+    GlobalThis(NodeRef),
     Property {
         node: NodeRef,
         receiver: Box<Self>,
@@ -635,6 +640,13 @@ fn recovered_conflict_marker_closing(
                 .unwrap_or(source)
                 .starts_with("<<<<<<<")
         });
+    let recovered_unary = recovered_javascript_unary_plus_closing(
+        arena,
+        bound,
+        store,
+        expression,
+        record.range.start,
+    )?;
     if record.kind != SyntaxKind::Identifier
         || record.flags.0 != 1 << 15
         || identifier.flow_node.is_some()
@@ -643,11 +655,69 @@ fn recovered_conflict_marker_closing(
         || closing_record.flags.0 != 0
         || closing_record.range != record.range
         || expression_record.range.end != closing_record.range.end
-        || !marker
+        || !marker && !recovered_unary
     {
         return Err(unsupported(name, record.kind));
     }
     Ok(true)
+}
+
+fn recovered_javascript_unary_plus_closing(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    expression: NodeRef,
+    position: ts_core::TextPos,
+) -> Result<bool, SourceCheckError> {
+    if bound
+        .source_facts()
+        .is_none_or(|facts| !facts.is_javascript_file())
+        || arena
+            .source_text()
+            .and_then(|source| source.get(position.get() as usize..))
+            .is_none_or(|suffix| !suffix.trim().is_empty())
+    {
+        return Ok(false);
+    }
+    let record = jsx_node(arena, bound, store, expression)?;
+    let NodeData::JsxElement(element) = &record.data else {
+        return Ok(false);
+    };
+    let opening = child_ref(expression, element.opening_element);
+    let opening_record = jsx_node(arena, bound, store, opening)?;
+    let NodeData::JsxOpeningElement(opening_data) = &opening_record.data else {
+        return Ok(false);
+    };
+    let tag = child_ref(opening, opening_data.tag_name);
+    let tag_record = jsx_node(arena, bound, store, tag)?;
+    if !matches!(&tag_record.data, NodeData::Identifier(name) if name.text == "number") {
+        return Ok(false);
+    }
+    let Some(parent) = record.parent.map(|parent| child_ref(expression, parent)) else {
+        return Ok(false);
+    };
+    let parent_record = jsx_node(arena, bound, store, parent)?;
+    let NodeData::PrefixUnaryExpression(prefix) = &parent_record.data else {
+        return Ok(false);
+    };
+    if parent_record.kind != SyntaxKind::PrefixUnaryExpression
+        || parent_record.flags.0 != 0
+        || prefix.operator != SyntaxKind::PlusToken
+        || prefix.operand != expression.node
+    {
+        return Ok(false);
+    }
+    let Some(variable) = parent_record.parent.map(|node| child_ref(parent, node)) else {
+        return Ok(false);
+    };
+    let variable_record = jsx_node(arena, bound, store, variable)?;
+    Ok(matches!(
+        &variable_record.data,
+        NodeData::VariableDeclaration(declaration)
+            if variable_record.kind == SyntaxKind::VariableDeclaration
+                && declaration.type_.is_none()
+                && declaration.initializer == Some(parent.node)
+    ))
 }
 
 fn plan_jsx_tag(
@@ -760,6 +830,7 @@ fn plan_jsx_attributes(
         }
     }
 
+    let mut reported_empty_expression = false;
     attributes
         .properties
         .nodes
@@ -839,18 +910,24 @@ fn plan_jsx_attributes(
                         {
                             return Err(unsupported(initializer, initializer_record.kind));
                         }
-                        let inner = expression
-                            .expression
-                            .ok_or_else(|| unsupported(initializer, SyntaxKind::JsxExpression))?;
-                        JsxAttributeValue::Expression {
-                            wrapper: Some(initializer),
-                            value: plan_scalar(
-                                arena,
-                                bound,
-                                store,
-                                initializer,
-                                child_ref(initializer, inner),
-                            )?,
+                        if let Some(inner) = expression.expression {
+                            JsxAttributeValue::Expression {
+                                wrapper: Some(initializer),
+                                value: plan_scalar(
+                                    arena,
+                                    bound,
+                                    store,
+                                    initializer,
+                                    child_ref(initializer, inner),
+                                )?,
+                            }
+                        } else {
+                            let report = !reported_empty_expression;
+                            reported_empty_expression = true;
+                            JsxAttributeValue::EmptyExpression {
+                                wrapper: initializer,
+                                report,
+                            }
                         }
                     } else {
                         JsxAttributeValue::Expression {
@@ -1041,6 +1118,14 @@ fn plan_scalar(
         NodeData::KeywordExpression(_) if record.kind == SyntaxKind::NullKeyword => {
             Ok(JsxScalarPlan::Null(node))
         }
+        NodeData::KeywordExpression(keyword)
+            if record.kind == SyntaxKind::ThisKeyword && keyword.flow_node.is_none() =>
+        {
+            if !jsx_is_script_level_this(arena, bound, node) {
+                return Err(unsupported(node, record.kind));
+            }
+            Ok(JsxScalarPlan::GlobalThis(node))
+        }
         NodeData::Identifier(identifier)
             if record.kind == SyntaxKind::Identifier && identifier.flow_node.is_none() =>
         {
@@ -1060,12 +1145,12 @@ fn plan_scalar(
         {
             let receiver_node = child_ref(node, access.expression);
             let receiver_record = jsx_node(arena, bound, store, receiver_node)?;
-            if receiver_record.kind != SyntaxKind::Identifier
-                || !matches!(&receiver_record.data, NodeData::Identifier(_))
+            let receiver = plan_scalar(arena, bound, store, node, receiver_node)?;
+            if !matches!(&receiver, JsxScalarPlan::Identifier { .. })
+                && !jsx_scalar_is_script_global_this(&receiver)
             {
                 return Err(unsupported(receiver_node, receiver_record.kind));
             }
-            let receiver = plan_scalar(arena, bound, store, node, receiver_node)?;
             let name_node = child_ref(node, access.name);
             let name_record = jsx_node(arena, bound, store, name_node)?;
             let NodeData::Identifier(name) = &name_record.data else {
@@ -1161,6 +1246,43 @@ fn plan_scalar(
             )?)))
         }
         _ => Err(unsupported(node, record.kind)),
+    }
+}
+
+fn jsx_is_script_level_this(arena: &NodeArena, bound: &BoundFile, node: NodeRef) -> bool {
+    if bound
+        .source_facts()
+        .is_none_or(ts_binder::CanonicalSourceFileFacts::is_external_or_common_js_module)
+    {
+        return false;
+    }
+    let mut parent = arena.get(node.node).and_then(|record| record.parent);
+    while let Some(current) = parent {
+        let Some(record) = arena.get(current) else {
+            return false;
+        };
+        if matches!(
+            record.kind,
+            SyntaxKind::FunctionDeclaration
+                | SyntaxKind::FunctionExpression
+                | SyntaxKind::ArrowFunction
+                | SyntaxKind::MethodDeclaration
+                | SyntaxKind::Constructor
+                | SyntaxKind::ClassDeclaration
+                | SyntaxKind::ModuleDeclaration
+        ) {
+            return false;
+        }
+        parent = record.parent;
+    }
+    true
+}
+
+fn jsx_scalar_is_script_global_this(scalar: &JsxScalarPlan) -> bool {
+    match scalar {
+        JsxScalarPlan::GlobalThis(_) => true,
+        JsxScalarPlan::Property { receiver, .. } => jsx_scalar_is_script_global_this(receiver),
+        _ => false,
     }
 }
 
@@ -1373,6 +1495,7 @@ fn jsx_scalar_needs_intrinsic_elements(scalar: &JsxScalarPlan) -> bool {
         | JsxScalarPlan::Number { .. }
         | JsxScalarPlan::Boolean { .. }
         | JsxScalarPlan::Null(_)
+        | JsxScalarPlan::GlobalThis(_)
         | JsxScalarPlan::Identifier { .. } => false,
     }
 }
@@ -3195,6 +3318,13 @@ fn check_jsx_attributes(
                     ))?
                     .true_type
             }
+            JsxAttributeValue::EmptyExpression { wrapper, report } => {
+                if *report {
+                    add_diagnostic(diagnostics, *wrapper, 17_000, std::iter::empty::<&str>())?;
+                }
+                publish_type_links(store, *wrapper, namespace.error_type)?;
+                namespace.error_type
+            }
             JsxAttributeValue::Expression { wrapper, value } => {
                 let type_ =
                     execute_scalar(store, arena, bound, namespace, value, options, diagnostics)?;
@@ -3380,6 +3510,25 @@ fn execute_scalar(
                 .null_type;
             (*node, null_type)
         }
+        JsxScalarPlan::GlobalThis(node) => {
+            let symbol = store
+                .intrinsic_bootstrap()
+                .ok_or(SourceCheckError::LiteralCache(
+                    SourceLiteralCacheError::BootstrapUninitialized,
+                ))?
+                .global_this_symbol;
+            let type_ = store
+                .value_symbol_links(symbol)
+                .and_then(|links| links.resolved_type)
+                .filter(|type_| {
+                    store
+                        .type_payload(*type_)
+                        .is_some_and(|record| record.symbol() == Some(symbol))
+                })
+                .ok_or(SourceCheckError::Property(*node))?;
+            publish_symbol_links(store, *node, symbol)?;
+            (*node, type_)
+        }
         JsxScalarPlan::Identifier { node, name } => {
             let Some(symbol) = resolve_scoped_jsx_value_symbol(store, arena, bound, *node, name)
             else {
@@ -3427,7 +3576,25 @@ fn execute_scalar(
                 options,
                 diagnostics,
             )?;
-            if receiver_type == namespace.any_type || receiver_type == namespace.error_type {
+            if matches!(receiver.as_ref(), JsxScalarPlan::GlobalThis(_)) {
+                let bootstrap =
+                    store
+                        .intrinsic_bootstrap()
+                        .ok_or(SourceCheckError::LiteralCache(
+                            SourceLiteralCacheError::BootstrapUninitialized,
+                        ))?;
+                if name != "state"
+                    || store
+                        .symbol_table(bootstrap.globals)
+                        .is_none_or(|globals| globals.get_source(name).is_some())
+                {
+                    return Err(unsupported(*node, SyntaxKind::PropertyAccessExpression));
+                }
+                if options.no_implicit_any {
+                    add_diagnostic(diagnostics, *name_node, 7017, ["typeof globalThis"])?;
+                }
+                (*node, namespace.any_type)
+            } else if receiver_type == namespace.any_type || receiver_type == namespace.error_type {
                 (*node, receiver_type)
             } else if let Some(property) = store.resolved_own_property(receiver_type, name)? {
                 if property.optional {
@@ -4147,7 +4314,7 @@ mod runtime_tests {
         CanonicalBinder, CanonicalModuleState, CanonicalNameResolverOptions,
         CanonicalSourceFileFacts, CanonicalSourceLanguage, EscapedName,
     };
-    use ts_parser::{ParseResult, parse_jsx_source_file};
+    use ts_parser::{ParseResult, parse_javascript_source_file, parse_jsx_source_file};
 
     use super::*;
     use crate::semantic::{
@@ -4165,15 +4332,28 @@ mod runtime_tests {
 
     impl RuntimeFixture {
         fn new(source: &str, file: FileId) -> Self {
-            Self::build(source, file, false)
+            Self::build(source, file, false, false)
         }
 
         fn recovering(source: &str, file: FileId) -> Self {
-            Self::build(source, file, true)
+            Self::build(source, file, true, false)
         }
 
-        fn build(source: &str, file: FileId, allow_parser_diagnostics: bool) -> Self {
-            let parsed = parse_jsx_source_file(source);
+        fn recovering_javascript(source: &str, file: FileId) -> Self {
+            Self::build(source, file, true, true)
+        }
+
+        fn build(
+            source: &str,
+            file: FileId,
+            allow_parser_diagnostics: bool,
+            javascript: bool,
+        ) -> Self {
+            let parsed = if javascript {
+                parse_javascript_source_file(source)
+            } else {
+                parse_jsx_source_file(source)
+            };
             if !allow_parser_diagnostics {
                 assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
             }
@@ -4184,16 +4364,30 @@ mod runtime_tests {
                     parsed.source_file,
                     file,
                     CanonicalSourceFileFacts::new(
-                        EscapedName::source("\"/project/runtime.tsx\""),
-                        CanonicalSourceLanguage::TypeScript,
+                        EscapedName::source(if javascript {
+                            "\"/project/runtime.js\""
+                        } else {
+                            "\"/project/runtime.tsx\""
+                        }),
+                        if javascript {
+                            CanonicalSourceLanguage::JavaScript
+                        } else {
+                            CanonicalSourceLanguage::TypeScript
+                        },
                         false,
                         CanonicalModuleState::Script,
                     ),
                 )
                 .unwrap();
-            binder
-                .bind_typescript_declaration_slice(&parsed.arena, file)
-                .unwrap();
+            if javascript {
+                binder
+                    .bind_javascript_declaration_slice(&parsed.arena, file)
+                    .unwrap();
+            } else {
+                binder
+                    .bind_typescript_declaration_slice(&parsed.arena, file)
+                    .unwrap();
+            }
             let (symbols, mut files) = binder.finish().try_into_parts().unwrap();
             let bound = files.remove(&file).unwrap();
             let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
@@ -6307,6 +6501,277 @@ mod runtime_tests {
             })
         ));
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn javascript_unary_plus_accepts_only_its_recovered_number_element() {
+        let source = "const saved = 'oops';\nconst value = + <number> saved;\n";
+        let mut fixture = RuntimeFixture::recovering_javascript(source, FileId::new(8_142));
+        assert_eq!(
+            fixture
+                .parsed
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [Some(17008), Some(1005)],
+        );
+        let unary = fixture.expression("value");
+        let NodeData::PrefixUnaryExpression(prefix) =
+            &fixture.parsed.arena.get(unary.node).unwrap().data
+        else {
+            unreachable!("the fixture contains a unary-plus variable initializer")
+        };
+        let expression = child_ref(unary, prefix.operand);
+        let host = DeclaredTypeHost::new([(&fixture.parsed.arena, &fixture.bound)]).unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let error_type = fixture.store.intrinsic_bootstrap().unwrap().error_type;
+
+        assert_eq!(
+            fixture
+                .store
+                .check_jsx_element(
+                    &host,
+                    expression,
+                    CanonicalCheckerOptions {
+                        no_implicit_any: false,
+                        ..CanonicalCheckerOptions::default()
+                    },
+                    &mut diagnostics,
+                )
+                .unwrap(),
+            error_type,
+        );
+        assert!(diagnostics.is_empty());
+        let cold = (
+            fixture.store.type_len(),
+            fixture.store.symbol_len(),
+            fixture.store.signature_len(),
+        );
+        fixture
+            .store
+            .check_jsx_element(
+                &host,
+                expression,
+                CanonicalCheckerOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap();
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.signature_len(),
+            ),
+            cold,
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn javascript_unary_plus_rejects_other_unclosed_intrinsic_tags() {
+        let mut fixture = RuntimeFixture::recovering_javascript(
+            "const saved = 'oops';\nconst value = + <other> saved;\n",
+            FileId::new(8_143),
+        );
+        let unary = fixture.expression("value");
+        let NodeData::PrefixUnaryExpression(prefix) =
+            &fixture.parsed.arena.get(unary.node).unwrap().data
+        else {
+            unreachable!("the fixture contains a unary-plus variable initializer")
+        };
+        let expression = child_ref(unary, prefix.operand);
+        let host = DeclaredTypeHost::new([(&fixture.parsed.arena, &fixture.bound)]).unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        assert!(matches!(
+            fixture.store.check_jsx_element(
+                &host,
+                expression,
+                CanonicalCheckerOptions::default(),
+                &mut diagnostics,
+            ),
+            Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Syntax {
+                    kind: SyntaxKind::Identifier,
+                    ..
+                }
+            ))
+        ));
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn only_the_first_empty_attribute_expression_on_each_opening_is_reported() {
+        let mut fixture = RuntimeFixture::new(
+            concat!(
+                "declare var React: any;\n",
+                "const view = <Missing first={} second={} />;\n",
+            ),
+            FileId::new(8_144),
+        );
+        let expression = fixture.expression("view");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        fixture.check(expression, CanonicalJsxRuntime::Classic, &mut diagnostics);
+
+        assert_eq!(
+            diagnostics
+                .as_slice()
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2304, 17_000],
+        );
+        let empty = &diagnostics.as_slice()[1];
+        assert_eq!(
+            empty.diagnostic.render().unwrap(),
+            "JSX attributes must only be assigned a non-empty 'expression'.",
+        );
+        let range = fixture
+            .parsed
+            .arena
+            .get(empty.node.unwrap().node)
+            .unwrap()
+            .range;
+        assert_eq!(
+            fixture
+                .parsed
+                .arena
+                .source_text()
+                .unwrap()
+                .get(range.start.get() as usize..range.end.get() as usize),
+            Some("{}"),
+        );
+        let cold = (
+            fixture.store.type_len(),
+            fixture.store.symbol_len(),
+            fixture.store.signature_len(),
+            diagnostics.as_slice().to_vec(),
+        );
+        fixture.check(expression, CanonicalJsxRuntime::Classic, &mut diagnostics);
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.signature_len(),
+                diagnostics.as_slice().to_vec(),
+            ),
+            cold,
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // The complete fixture proves nested grammar and global-this order.
+    fn empty_component_attributes_and_script_this_keep_exact_diagnostics() {
+        let source = concat!(
+            "declare var React: any;\n",
+            "const output = <View>\n",
+            "  <ListView refreshControl={\n",
+            "    <RefreshControl onRefresh={} refreshing={} />\n",
+            "  } dataSource={this.state.ds} renderRow={}>\n",
+            "  </ListView>\n",
+            "</View>;\n",
+        );
+        let mut fixture = RuntimeFixture::new(source, FileId::new(8_145));
+        let global_this = fixture
+            .store
+            .intrinsic_bootstrap()
+            .unwrap()
+            .global_this_symbol;
+        let global_this_type = fixture
+            .store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(global_this))
+            .unwrap();
+        assert!(fixture.store.set_value_symbol_links(
+            global_this,
+            ValueSymbolLinks {
+                resolved_type: Some(global_this_type),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        let expression = fixture.expression("output");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        fixture.check(expression, CanonicalJsxRuntime::Classic, &mut diagnostics);
+
+        let mut ordered = diagnostics.as_slice().iter().collect::<Vec<_>>();
+        ordered.sort_by_key(|diagnostic| {
+            let range = fixture
+                .parsed
+                .arena
+                .get(diagnostic.node.unwrap().node)
+                .unwrap()
+                .range;
+            (range.start, range.end, diagnostic.diagnostic.code())
+        });
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2304, 2304, 2304, 17_000, 7017, 17_000, 2304, 2304],
+        );
+        let implicit = ordered
+            .iter()
+            .find(|diagnostic| diagnostic.diagnostic.code() == 7017)
+            .unwrap();
+        assert_eq!(
+            implicit.diagnostic.render().unwrap(),
+            "Element implicitly has an 'any' type because type 'typeof globalThis' \
+             has no index signature.",
+        );
+        let state = fixture
+            .parsed
+            .arena
+            .get(implicit.node.unwrap().node)
+            .unwrap();
+        assert_eq!(
+            source.get(state.range.start.get() as usize..state.range.end.get() as usize),
+            Some("state"),
+        );
+        let this = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ThisKeyword).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .symbol_node_links(this)
+                .and_then(|links| links.resolved_symbol),
+            Some(global_this),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .type_node_links(this)
+                .and_then(|links| links.resolved_type),
+            Some(global_this_type),
+        );
+        let cold = (
+            fixture.store.type_len(),
+            fixture.store.symbol_len(),
+            fixture.store.signature_len(),
+            diagnostics.as_slice().to_vec(),
+        );
+        fixture.check(expression, CanonicalJsxRuntime::Classic, &mut diagnostics);
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.signature_len(),
+                diagnostics.as_slice().to_vec(),
+            ),
+            cold,
+        );
     }
 
     #[test]

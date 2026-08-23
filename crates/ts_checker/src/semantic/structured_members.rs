@@ -90,7 +90,9 @@ fn matching_inherited_property_contract(
     first_record.name() == second_record.name()
         && first_record.flags() == second_record.flags()
         && first_record.check_flags() == second_record.check_flags()
-        && first_type == second_type
+        && (first_type == second_type
+            || first_record.flags().contains(SymbolFlags::METHOD)
+                && matching_interface_method_contract(store, first, second))
 }
 
 /// Resolves and publishes one or two direct interface bases.
@@ -287,9 +289,20 @@ pub(super) fn resolve_direct_interface_members(
         let base_optional = store
             .symbol(base_property)
             .is_some_and(|record| record.flags().contains(SymbolFlags::OPTIONAL));
-        if property.optional && !base_optional
-            || store.is_type_assignable_to(own_type, base_type) != Ok(true)
-        {
+        let own_method = store
+            .symbol(property.symbol)
+            .is_some_and(|record| record.flags().contains(SymbolFlags::METHOD));
+        let base_method = store
+            .symbol(base_property)
+            .is_some_and(|record| record.flags().contains(SymbolFlags::METHOD));
+        let compatible = if own_method && base_method {
+            matching_interface_method_contract(store, property.symbol, base_property)
+        } else if own_method || base_method {
+            false
+        } else {
+            store.is_type_assignable_to(own_type, base_type) == Ok(true)
+        };
+        if property.optional && !base_optional || !compatible {
             return Err(PropertyObjectError::UnsupportedMember {
                 node: property.declaration,
                 kind: store
@@ -1325,7 +1338,158 @@ fn valid_property_symbol(store: &CanonicalTypeMapperStore, property: SemanticSym
                     ..ValueSymbolLinks::default()
                 }
                 && store.type_payload(type_).is_some()
+                && (!method || valid_interface_method_value(store, property, type_).is_some())
         })
+}
+
+pub(super) fn valid_interface_method_value(
+    store: &CanonicalTypeMapperStore,
+    method: SemanticSymbolId,
+    type_: TypeId,
+) -> Option<SignatureId> {
+    let method_record = store.symbol(method)?;
+    let [declaration] = method_record.declarations()? else {
+        return None;
+    };
+    let declaration = *declaration;
+    let owner = method_record.parent()?;
+    let owner_record = store.symbol(owner)?;
+    let owner_declarations = owner_record.declarations()?;
+    let Some(SourceNodeParent::Parent(owner_declaration)) = store.source_node_parent(declaration)
+    else {
+        return None;
+    };
+    let record = store.type_payload(type_)?;
+    let TypeData::Object(object) = record.data() else {
+        return None;
+    };
+    let [signature] = object.structured.signatures.as_deref()? else {
+        return None;
+    };
+    let signature = *signature;
+    let callable = store.signature(signature)?;
+    let return_type = callable.resolved_return_type()?;
+    let annotation = store.source_primitive_type_annotation(declaration)?;
+    let parameter_types = match store.callable_signature_parameter_types(signature) {
+        Some(parameters) => parameters,
+        None if callable.parameters().is_empty() => &[],
+        None => return None,
+    };
+    let required_parameters = callable
+        .parameters()
+        .len()
+        .checked_sub(usize::from(callable.has_rest_parameter()))?;
+    if owner_record.flags() != SymbolFlags::INTERFACE
+        || !owner_declarations.contains(&owner_declaration)
+        || store.source_node_kind(owner_declaration) != Some(SyntaxKind::InterfaceDeclaration)
+        || store.source_node_kind(declaration) != Some(SyntaxKind::MethodSignature)
+        || record.flags() != TypeFlags::OBJECT
+        || record.object_flags() != ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
+        || record.symbol() != Some(method)
+        || record.alias().is_some()
+        || object.target.is_some()
+        || object.mapper.is_some()
+        || object.instantiations != TypeCacheState::Unallocated
+        || object.structured.constrained != ConstrainedTypeData::default()
+        || object.structured.members.is_some()
+        || object.structured.properties.is_some()
+        || object.structured.call_signature_count != 1
+        || object.structured.index_infos.is_some()
+        || object
+            .structured
+            .object_type_without_abstract_construct_signatures
+            .is_some()
+        || callable.flags().bits()
+            & !(SignatureFlags::HAS_REST_PARAMETER | SignatureFlags::HAS_LITERAL_TYPES).bits()
+            != 0
+        || callable.declaration() != Some(declaration)
+        || !callable.type_parameters().is_empty()
+        || callable.this_parameter().is_some()
+        || usize::try_from(callable.min_argument_count()).ok() != Some(required_parameters)
+        || callable.resolved_min_argument_count() != -1
+        || callable.resolved_type_predicate().is_some()
+        || callable.target().is_some()
+        || callable.mapper().is_some()
+        || callable.isolated_signature_type().is_some()
+        || callable.composite().is_some()
+        || store.signature_has_circular_return_type(signature)
+        || parameter_types.len() != callable.parameters().len()
+        || !valid_call_return_annotation(store, annotation, false, return_type)
+        || store.signature_links(declaration)
+            != Some(&SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(signature),
+                ..SignatureLinks::default()
+            })
+    {
+        return None;
+    }
+
+    let mut seen_parameters = HashSet::with_capacity(parameter_types.len());
+    for (parameter, parameter_type) in callable.parameters().iter().copied().zip(parameter_types) {
+        let record = store.symbol(parameter)?;
+        let [parameter_declaration] = record.declarations()? else {
+            return None;
+        };
+        if !seen_parameters.insert(parameter)
+            || record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+            || record.check_flags() != CheckFlags::NONE
+            || record.value_declaration() != Some(*parameter_declaration)
+            || record.members().is_some()
+            || record.exports().is_some()
+            || record.parent().is_some()
+            || record.export_symbol().is_some()
+            || store.get_merged_symbol(parameter) != Some(parameter)
+            || store.source_node_kind(*parameter_declaration) != Some(SyntaxKind::Parameter)
+            || store.source_node_parent(*parameter_declaration)
+                != Some(SourceNodeParent::Parent(declaration))
+            || store.type_payload(*parameter_type).is_none()
+            || store.value_symbol_links(parameter)
+                != Some(&ValueSymbolLinks {
+                    resolved_type: Some(*parameter_type),
+                    ..ValueSymbolLinks::default()
+                })
+        {
+            return None;
+        }
+    }
+    Some(signature)
+}
+
+fn matching_interface_method_contract(
+    store: &CanonicalTypeMapperStore,
+    first: SemanticSymbolId,
+    second: SemanticSymbolId,
+) -> bool {
+    let Some(first_type) = store
+        .value_symbol_links(first)
+        .and_then(|links| links.resolved_type)
+    else {
+        return false;
+    };
+    let Some(second_type) = store
+        .value_symbol_links(second)
+        .and_then(|links| links.resolved_type)
+    else {
+        return false;
+    };
+    let Some(first_signature) = valid_interface_method_value(store, first, first_type) else {
+        return false;
+    };
+    let Some(second_signature) = valid_interface_method_value(store, second, second_type) else {
+        return false;
+    };
+    let Some(first_record) = store.signature(first_signature) else {
+        return false;
+    };
+    let Some(second_record) = store.signature(second_signature) else {
+        return false;
+    };
+    first_record.flags() == second_record.flags()
+        && first_record.min_argument_count() == second_record.min_argument_count()
+        && first_record.resolved_return_type() == second_record.resolved_return_type()
+        && first_record.parameters().len() == second_record.parameters().len()
+        && store.callable_signature_parameter_types(first_signature)
+            == store.callable_signature_parameter_types(second_signature)
 }
 
 fn exact_property_table(
@@ -1431,6 +1595,11 @@ mod tests {
     const CALLABLE_SOURCE: &str = concat!(
         "interface Base { (): string }\n",
         "interface Derived extends Base { (key: string): string }\n",
+    );
+
+    const METHOD_SOURCE: &str = concat!(
+        "interface Base { method(): void }\n",
+        "interface Derived { method(): void }\n",
     );
 
     struct Fixture {
@@ -1609,6 +1778,71 @@ mod tests {
         }
     }
 
+    fn publish_interface_method_for_test(
+        fixture: &mut Fixture,
+        owner: &str,
+    ) -> (SemanticSymbolId, TypeId, SignatureId) {
+        let owner = interface_symbol(fixture, owner);
+        let method = fixture
+            .store
+            .symbol(owner)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| fixture.store.symbol_table(members))
+            .and_then(|members| members.get_source("method"))
+            .unwrap();
+        let [declaration] = fixture
+            .store
+            .symbol(method)
+            .unwrap()
+            .declarations()
+            .unwrap()
+        else {
+            panic!("the method fixture contains one declaration per interface")
+        };
+        let declaration = *declaration;
+        let void = fixture.store.intrinsic_bootstrap().unwrap().void_type;
+        let type_ = fixture
+            .store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(method))
+            .unwrap();
+        let signature = fixture
+            .store
+            .alloc_signature(
+                SignatureFlags::NONE,
+                Some(declaration),
+                Vec::new(),
+                None,
+                Vec::new(),
+                Some(void),
+                None,
+                0,
+            )
+            .unwrap();
+        assert!(fixture.store.set_signature_links(
+            declaration,
+            SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(signature),
+                ..SignatureLinks::default()
+            },
+        ));
+        assert!(fixture.store.set_value_symbol_links(
+            method,
+            ValueSymbolLinks {
+                resolved_type: Some(type_),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        assert!(fixture.store.set_structured_type_members(
+            type_,
+            None,
+            None,
+            Some(vec![signature]),
+            None,
+            None,
+        ));
+        (method, type_, signature)
+    }
+
     fn indexed_derived_plan(
         fixture: &Fixture,
         host: &DeclaredTypeHost<'_>,
@@ -1770,6 +2004,93 @@ mod tests {
             derived_type,
             number_type,
         }
+    }
+
+    #[test]
+    fn interface_methods_preserve_owner_and_match_distinct_callable_identities() {
+        let mut fixture = fixture_with_source(METHOD_SOURCE, 804);
+        let (base, base_type, base_signature) =
+            publish_interface_method_for_test(&mut fixture, "Base");
+        let (derived, derived_type, derived_signature) =
+            publish_interface_method_for_test(&mut fixture, "Derived");
+
+        assert_ne!(base_type, derived_type);
+        assert_ne!(base_signature, derived_signature);
+        assert!(valid_property_symbol(&fixture.store, base));
+        assert!(valid_property_symbol(&fixture.store, derived));
+        assert_eq!(
+            valid_interface_method_value(&fixture.store, base, base_type),
+            Some(base_signature)
+        );
+        assert_eq!(
+            valid_interface_method_value(&fixture.store, derived, derived_type),
+            Some(derived_signature)
+        );
+        assert!(matching_interface_method_contract(
+            &fixture.store,
+            base,
+            derived
+        ));
+        assert!(matching_inherited_property_contract(
+            &fixture.store,
+            base,
+            derived
+        ));
+    }
+
+    #[test]
+    fn malformed_interface_method_values_and_return_types_fail_closed() {
+        let mut fixture = fixture_with_source(METHOD_SOURCE, 805);
+        let (base, _, _) = publish_interface_method_for_test(&mut fixture, "Base");
+        let (derived, derived_type, signature) =
+            publish_interface_method_for_test(&mut fixture, "Derived");
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        let void = fixture.store.intrinsic_bootstrap().unwrap().void_type;
+
+        assert!(
+            fixture
+                .store
+                .set_signature_resolved_return_type(signature, Some(number))
+        );
+        assert!(!valid_property_symbol(&fixture.store, derived));
+        assert!(!matching_interface_method_contract(
+            &fixture.store,
+            base,
+            derived
+        ));
+
+        assert!(
+            fixture
+                .store
+                .set_signature_resolved_return_type(signature, Some(void))
+        );
+        assert!(valid_property_symbol(&fixture.store, derived));
+
+        let forged = fixture
+            .store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(base))
+            .unwrap();
+        assert!(fixture.store.set_structured_type_members(
+            forged,
+            None,
+            None,
+            Some(vec![signature]),
+            None,
+            None,
+        ));
+        assert!(fixture.store.set_value_symbol_links(
+            derived,
+            ValueSymbolLinks {
+                resolved_type: Some(forged),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        assert!(!valid_property_symbol(&fixture.store, derived));
+        assert_eq!(
+            valid_interface_method_value(&fixture.store, derived, forged),
+            None
+        );
+        assert_ne!(derived_type, forged);
     }
 
     #[test]

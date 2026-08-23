@@ -17,7 +17,7 @@ use ts_binder::{
 
 use super::{
     CanonicalTypeMapperStore, DeclaredTypeHost, SignatureId, TypeId,
-    declared::{cached_ordinary_type_parameter_owner, preflight_node},
+    declared::{cached_ordinary_type_parameter_owner, preflight_node, type_list_key},
     interface_heritage::{
         DirectInterfaceHeritageError, DirectInterfaceHeritagePlan, plan_direct_interface_heritage,
     },
@@ -138,6 +138,17 @@ impl PlannedCallSignature {
 pub(super) struct ResolvedCallSignatureTypes {
     pub parameter_types: Vec<TypeId>,
     pub return_type: TypeId,
+}
+
+/// One source-only call-signature contribution to the initialized global Array.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct GlobalArrayCallAugmentationPlan {
+    pub declaration: NodeRef,
+    pub symbol: SemanticSymbolId,
+    pub target: TypeId,
+    pub signature: NodeRef,
+    pub return_type: NodeRef,
+    pub any_array_type: TypeId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1243,6 +1254,317 @@ pub(super) fn plan_interface(
         });
     }
     Ok(plan)
+}
+
+/// Authenticates one source-only `interface Array<T> { (): any[] }` contribution.
+///
+/// Global initialization has already merged and created the generic Array
+/// target. This proof inspects only the current declaration and existing
+/// identities; it does not resolve unrelated library members or publish a
+/// callable signature.
+pub(super) fn plan_global_array_call_augmentation(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    symbol: SemanticSymbolId,
+) -> Result<Option<GlobalArrayCallAugmentationPlan>, PropertyObjectError> {
+    let canonical = store
+        .get_merged_symbol(symbol)
+        .ok_or(PropertyObjectError::InvalidInterfaceSymbol(symbol))?;
+    let invalid = || PropertyObjectError::InvalidInterface {
+        declaration,
+        symbol: canonical,
+    };
+    let record = preflight_node(store, host, declaration).map_err(|_| invalid())?;
+    let NodeData::InterfaceDeclaration(interface) = &record.data else {
+        return Err(invalid());
+    };
+    let name = NodeRef::new(declaration.arena, declaration.file, interface.name);
+    let name_record = preflight_node(store, host, name).map_err(|_| invalid())?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(invalid());
+    };
+    if identifier.text != "Array" {
+        return Ok(None);
+    }
+    let bootstrap = store.intrinsic_bootstrap().ok_or_else(invalid)?;
+    let global = store
+        .symbol_table(bootstrap.globals)
+        .and_then(|globals| globals.get_source("Array"))
+        .and_then(|global| store.get_merged_symbol(global));
+    if global != Some(canonical) {
+        return Ok(None);
+    }
+    let bound = host.bound_file(declaration).ok_or_else(invalid)?;
+    let facts = bound.source_facts().ok_or_else(invalid)?;
+    if facts.is_default_library()
+        || facts.is_declaration_file()
+        || facts.is_javascript_file()
+        || facts.is_external_or_common_js_module()
+    {
+        return Ok(None);
+    }
+
+    let owner = store.symbol(canonical).ok_or_else(invalid)?;
+    let allowed_flags =
+        SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::TRANSIENT;
+    let Some(owner_declarations) = owner.declarations() else {
+        return Err(invalid());
+    };
+    let has_library_owner = owner_declarations.iter().any(|candidate| {
+        candidate.file != declaration.file
+            && host
+                .bound_file(*candidate)
+                .and_then(ts_binder::BoundFile::source_facts)
+                .is_some_and(ts_binder::CanonicalSourceFileFacts::is_default_library)
+    });
+    if !has_library_owner {
+        return Ok(None);
+    }
+    let Some(members) = owner
+        .members()
+        .and_then(|members| store.symbol_table(members))
+    else {
+        return Err(invalid());
+    };
+    let Some(parameters) = interface.type_parameters.as_ref() else {
+        return Err(invalid());
+    };
+    let source = record
+        .parent
+        .map(|parent| NodeRef::new(declaration.arena, declaration.file, parent))
+        .ok_or_else(invalid)?;
+    let source_record = preflight_node(store, host, source).map_err(|_| invalid())?;
+    let NodeData::SourceFile(source_data) = &source_record.data else {
+        return Err(invalid());
+    };
+    if record.kind != SyntaxKind::InterfaceDeclaration
+        || record.flags.0 != 0
+        || !host.symbol_matches(store, declaration, canonical)
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(declaration.node)
+        || identifier.flow_node.is_some()
+        || interface.flow_node.is_some()
+        || interface.local_symbol.is_some()
+        || interface.symbol.is_some()
+        || interface.modifiers.is_some()
+        || interface.heritage_clauses.is_some()
+        || interface.members.has_trailing_comma
+        || interface.members.nodes.len() != 1
+        || parameters.has_trailing_comma
+        || parameters.nodes.len() != 1
+        || source_record.kind != SyntaxKind::SourceFile
+        || source_record.parent.is_some()
+        || bound.source_file() != source
+        || source_data
+            .statements
+            .nodes
+            .iter()
+            .filter(|candidate| **candidate == declaration.node)
+            .count()
+            != 1
+        || owner.flags() & SymbolFlags::TYPE != SymbolFlags::INTERFACE
+        || owner.flags().without(allowed_flags) != SymbolFlags::NONE
+        || owner.check_flags() != CheckFlags::NONE
+        || owner.name().as_utf8() != Some("Array")
+        || owner.parent().is_some()
+        || owner.exports().is_some()
+        || owner.export_symbol().is_some()
+        || !owner_declarations.contains(&declaration)
+    {
+        return Err(invalid());
+    }
+
+    let target = store
+        .declared_type_links(canonical)
+        .and_then(|links| links.declared_type)
+        .ok_or_else(invalid)?;
+    let target_record = store.type_payload(target).ok_or_else(invalid)?;
+    let TypeData::Interface(target_interface) = target_record.data() else {
+        return Err(invalid());
+    };
+    let reference = validate_direct_generic_reference(store, target).map_err(|_| invalid())?;
+    let [parameter_type] = reference.type_arguments.as_slice() else {
+        return Err(invalid());
+    };
+    let shared_parameter =
+        cached_ordinary_type_parameter_owner(store, *parameter_type).ok_or_else(invalid)?;
+    if reference.target != target
+        || target_record.flags() != TypeFlags::OBJECT
+        || !target_record
+            .object_flags()
+            .contains(ObjectFlags::INTERFACE | ObjectFlags::REFERENCE)
+        || target_record.symbol() != Some(canonical)
+        || target_record.alias().is_some()
+        || target_interface.outer_type_parameter_count != 0
+        || target_interface.declared_members_resolved
+        || target_interface.reference.object.structured != StructuredTypeData::default()
+    {
+        return Err(invalid());
+    }
+
+    let parameter = NodeRef::new(declaration.arena, declaration.file, parameters.nodes[0]);
+    let parameter_record = preflight_node(store, host, parameter).map_err(|_| invalid())?;
+    let NodeData::TypeParameterDeclaration(parameter_data) = &parameter_record.data else {
+        return Err(invalid());
+    };
+    let parameter_name = NodeRef::new(parameter.arena, parameter.file, parameter_data.name);
+    let parameter_name_record =
+        preflight_node(store, host, parameter_name).map_err(|_| invalid())?;
+    let NodeData::Identifier(parameter_identifier) = &parameter_name_record.data else {
+        return Err(invalid());
+    };
+    let parameter_symbol = bound
+        .symbol(parameter)
+        .and_then(|parameter| store.get_merged_symbol(parameter))
+        .ok_or_else(invalid)?;
+    let parameter_symbol_record = store.symbol(parameter_symbol).ok_or_else(invalid)?;
+    if parameter_record.kind != SyntaxKind::TypeParameter
+        || parameter_record.flags.0 != 0
+        || parameter_record.parent != Some(declaration.node)
+        || parameter_data.constraint.is_some()
+        || parameter_data.default_type.is_some()
+        || parameter_data.expression.is_some()
+        || parameter_data.symbol.is_some()
+        || parameter_data.modifiers.is_some()
+        || parameter_name_record.kind != SyntaxKind::Identifier
+        || parameter_name_record.flags.0 != 0
+        || parameter_name_record.parent != Some(parameter.node)
+        || parameter_identifier.flow_node.is_some()
+        || parameter_identifier.text != "T"
+        || parameter_symbol != shared_parameter
+        || !host.symbol_matches(store, parameter, parameter_symbol)
+        || !parameter_symbol_record
+            .flags()
+            .contains(SymbolFlags::TYPE_PARAMETER)
+        || parameter_symbol_record
+            .flags()
+            .without(SymbolFlags::TYPE_PARAMETER | SymbolFlags::TRANSIENT)
+            != SymbolFlags::NONE
+        || parameter_symbol_record.check_flags() != CheckFlags::NONE
+        || parameter_symbol_record.name().as_utf8() != Some("T")
+        || parameter_symbol_record
+            .declarations()
+            .is_none_or(|declarations| !declarations.contains(&parameter))
+        || parameter_symbol_record.value_declaration().is_some()
+        || parameter_symbol_record.members().is_some()
+        || parameter_symbol_record.exports().is_some()
+        || parameter_symbol_record.export_symbol().is_some()
+        || store.get_parent_of_symbol(parameter_symbol) != Some(canonical)
+        || members
+            .get_source("T")
+            .and_then(|parameter| store.get_merged_symbol(parameter))
+            != Some(parameter_symbol)
+    {
+        return Err(invalid());
+    }
+
+    let signature = NodeRef::new(
+        declaration.arena,
+        declaration.file,
+        interface.members.nodes[0],
+    );
+    let signature_record = preflight_node(store, host, signature).map_err(|_| invalid())?;
+    let NodeData::CallSignatureDeclaration(call) = &signature_record.data else {
+        return Err(invalid());
+    };
+    let call_symbol = bound
+        .symbol(signature)
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .ok_or_else(invalid)?;
+    let call_record = store.symbol(call_symbol).ok_or_else(invalid)?;
+    if signature_record.kind != SyntaxKind::CallSignature
+        || signature_record.flags.0 != 0
+        || signature_record.parent != Some(declaration.node)
+        || call.full_signature.is_some()
+        || call.next_container.is_some()
+        || call.symbol.is_some()
+        || call.type_parameters.is_some()
+        || call.parameters.has_trailing_comma
+        || !call.parameters.nodes.is_empty()
+        || call_record.flags() != SymbolFlags::SIGNATURE
+        || call_record.check_flags() != CheckFlags::NONE
+        || call_record.name() != InternalSymbolName::Call.as_ref()
+        || call_record.declarations() != Some(&[signature])
+        || call_record.value_declaration().is_some()
+        || call_record.members().is_some()
+        || call_record.exports().is_some()
+        || call_record.export_symbol().is_some()
+        || call_record
+            .parent()
+            .and_then(|parent| store.get_merged_symbol(parent))
+            != Some(canonical)
+        || members.get(InternalSymbolName::Call.as_ref()) != Some(call_symbol)
+        || store
+            .signature_links(signature)
+            .is_some_and(|links| links != &SignatureLinks::default())
+        || bound
+            .locals(signature)
+            .and_then(|locals| store.symbol_table(locals))
+            .is_some_and(|locals| !locals.is_empty())
+    {
+        return Err(invalid());
+    }
+
+    let return_type = call
+        .type_
+        .map(|type_| NodeRef::new(signature.arena, signature.file, type_))
+        .ok_or_else(invalid)?;
+    let return_record = preflight_node(store, host, return_type).map_err(|_| invalid())?;
+    let NodeData::ArrayTypeNode(array) = &return_record.data else {
+        return Err(invalid());
+    };
+    let element = NodeRef::new(return_type.arena, return_type.file, array.element_type);
+    let element_record = preflight_node(store, host, element).map_err(|_| invalid())?;
+    let TypeCacheState::Allocated(instantiations) =
+        &target_interface.reference.object.instantiations
+    else {
+        return Err(invalid());
+    };
+    let any_array_type = instantiations
+        .get(&type_list_key(&[bootstrap.any_type]))
+        .copied()
+        .ok_or_else(invalid)?;
+    let any_reference =
+        validate_direct_generic_reference(store, any_array_type).map_err(|_| invalid())?;
+    if return_record.kind != SyntaxKind::ArrayType
+        || return_record.flags.0 != 0
+        || return_record.parent != Some(signature.node)
+        || return_record.range.start < call.parameters.range.end
+        || return_record.range.end > signature_record.range.end
+        || element_record.kind != SyntaxKind::AnyKeyword
+        || !matches!(element_record.data, NodeData::KeywordTypeNode(_))
+        || element_record.flags.0 != 0
+        || element_record.parent != Some(return_type.node)
+        || element_record.range.start != return_record.range.start
+        || element_record.range.end > return_record.range.end
+        || any_reference.target != target
+        || any_reference.type_arguments.as_slice() != [bootstrap.any_type]
+        || store.type_node_links(element).is_some_and(|links| {
+            links.outer_type_parameters.is_some()
+                || links
+                    .resolved_type
+                    .is_some_and(|type_| type_ != bootstrap.any_type)
+        })
+        || store.type_node_links(return_type).is_some_and(|links| {
+            links.outer_type_parameters.is_some()
+                || links
+                    .resolved_type
+                    .is_some_and(|type_| type_ != any_array_type)
+        })
+    {
+        return Err(invalid());
+    }
+
+    Ok(Some(GlobalArrayCallAugmentationPlan {
+        declaration,
+        symbol: canonical,
+        target,
+        signature,
+        return_type,
+        any_array_type,
+    }))
 }
 
 /// Plans the property declarations of one source-owned generic interface.
@@ -5266,8 +5588,9 @@ mod generic_publication_tests {
 
     use super::*;
     use crate::semantic::{
-        CanonicalCheckerDiagnostics, CanonicalCheckerOptions, IntrinsicBootstrapOptions,
-        declared::get_declared_class_interface_or_type_parameter,
+        CanonicalCheckerDiagnostics, CanonicalCheckerOptions, CanonicalGlobalTypes,
+        IntrinsicBootstrapOptions, declared::get_declared_class_interface_or_type_parameter,
+        global_types::initialize_global_library_types, links::TypeNodeLinks,
         production::GlobalMergeCompletion, type_nodes::CanonicalTypeQuery,
     };
 
@@ -5277,6 +5600,118 @@ mod generic_publication_tests {
         bound: BoundFile,
         store: CanonicalTypeMapperStore,
         symbol: SemanticSymbolId,
+    }
+
+    struct GlobalArrayAugmentationFixture {
+        library: ParseResult,
+        source: ParseResult,
+        library_bound: BoundFile,
+        source_bound: BoundFile,
+        store: CanonicalTypeMapperStore,
+        global_types: CanonicalGlobalTypes,
+        declaration: NodeRef,
+        symbol: SemanticSymbolId,
+    }
+
+    fn global_array_augmentation_fixture(
+        source_text: &str,
+        file: u32,
+    ) -> GlobalArrayAugmentationFixture {
+        let library = parse_source_file(concat!(
+            "interface IArguments {} ",
+            "interface Array<T> {} declare var Array: any; ",
+            "interface Object {} interface Function {} ",
+            "interface String {} interface Number {} interface Boolean {} ",
+            "interface RegExp {} interface ReadonlyArray<T> {} interface ThisType<T> {}",
+        ));
+        let source = parse_source_file(source_text);
+        assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let library_file = FileId::new(file);
+        let source_file = FileId::new(file + 1);
+        let mut binder = CanonicalBinder::new();
+        for (parsed, file, is_default_library) in [
+            (&library, library_file, true),
+            (&source, source_file, false),
+        ] {
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new_with_default_library(
+                        EscapedName::source(format!("\"/array-augmentation-{}.ts\"", file.index())),
+                        CanonicalSourceLanguage::TypeScript,
+                        is_default_library,
+                        is_default_library,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+
+        let (symbols, mut files) = binder.finish().try_into_parts().unwrap();
+        let library_bound = files.remove(&library_file).unwrap();
+        let source_bound = files.remove(&source_file).unwrap();
+        let declaration = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::InterfaceDeclaration).then_some(NodeRef::new(
+                    source.arena.id(),
+                    source_file,
+                    node,
+                ))
+            })
+            .expect("the source contains one array augmentation");
+        let symbol = source_bound.symbol(declaration).unwrap();
+        let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
+        for (parsed, file) in [(&library, library_file), (&source, source_file)] {
+            assert!(
+                store
+                    .register_source_file(&parsed.arena, parsed.source_file, file)
+                    .is_some()
+            );
+        }
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        let globals = store.intrinsic_bootstrap().unwrap().globals;
+        let library_symbols = store
+            .symbol_table(library_bound.locals(library_bound.source_file()).unwrap())
+            .unwrap()
+            .iter()
+            .map(|(_, symbol)| symbol)
+            .collect::<Vec<_>>();
+        for symbol in library_symbols {
+            store.merge_global_symbol(globals, symbol).unwrap();
+        }
+        store.merge_global_symbol(globals, symbol).unwrap();
+        let global_types = {
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [
+                    (&library.arena, &library_bound),
+                    (&source.arena, &source_bound),
+                ],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            initialize_global_library_types(&mut store, &host, globals, false).unwrap()
+        };
+
+        GlobalArrayAugmentationFixture {
+            library,
+            source,
+            library_bound,
+            source_bound,
+            store,
+            global_types,
+            declaration,
+            symbol,
+        }
     }
 
     fn fixture() -> Fixture {
@@ -5467,6 +5902,251 @@ mod generic_publication_tests {
             store.symbol_store().symbol_table_len(),
             store.checker_link_allocated_lengths(),
         )
+    }
+
+    #[test]
+    fn global_array_call_augmentation_reuses_initialized_target_without_expanding_members() {
+        let mut fixture =
+            global_array_augmentation_fixture("interface Array<T> { (): any[]; }", 3_731);
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&fixture.library.arena, &fixture.library_bound),
+                (&fixture.source.arena, &fixture.source_bound),
+            ],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.symbol_len(),
+            fixture.store.symbol_store().symbol_table_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        let plan = plan_global_array_call_augmentation(
+            &fixture.store,
+            &host,
+            fixture.declaration,
+            fixture.symbol,
+        )
+        .unwrap()
+        .expect("a default-library Array augmentation must be authenticated");
+        assert_eq!(plan.declaration, fixture.declaration);
+        assert_eq!(
+            plan.symbol,
+            fixture.store.get_merged_symbol(fixture.symbol).unwrap()
+        );
+        assert_eq!(plan.target, fixture.global_types.array_type);
+        assert_eq!(plan.any_array_type, fixture.global_types.any_array_type);
+        assert_eq!(
+            fixture.store.source_node_kind(plan.signature),
+            Some(SyntaxKind::CallSignature),
+        );
+        assert_eq!(
+            fixture.store.source_node_kind(plan.return_type),
+            Some(SyntaxKind::ArrayType),
+        );
+        assert!(fixture.store.signature_links(plan.signature).is_none());
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.symbol_len(),
+                fixture.store.symbol_store().symbol_table_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+        let TypeData::Interface(target) = fixture.store.type_payload(plan.target).unwrap().data()
+        else {
+            panic!("Array must retain its initialized generic interface target")
+        };
+        assert!(!target.declared_members_resolved);
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        assert_eq!(
+            CanonicalTypeQuery::new_with_global_types(
+                &mut fixture.store,
+                &host,
+                &fixture.global_types,
+                CanonicalCheckerOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_from_type_node(plan.return_type),
+            Ok(plan.any_array_type),
+        );
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.symbol_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            plan_global_array_call_augmentation(
+                &fixture.store,
+                &host,
+                fixture.declaration,
+                fixture.symbol,
+            ),
+            Ok(Some(plan)),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.symbol_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn ordinary_source_array_interfaces_are_not_global_call_augmentations() {
+        for (offset, source) in [
+            "interface Array<T> {}",
+            "interface Array<T> { value: T }",
+            "interface Array<T> { (): any[] }",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture = interface_fixture(source, 3_755 + u32::try_from(offset).unwrap());
+            let host = host(&fixture.parsed, &fixture.bound);
+            let declaration = fixture
+                .store
+                .symbol(fixture.symbol)
+                .and_then(ts_binder::semantic::Symbol::declarations)
+                .and_then(|declarations| declarations.first())
+                .copied()
+                .unwrap();
+            let before = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+            assert_eq!(
+                plan_global_array_call_augmentation(
+                    &fixture.store,
+                    &host,
+                    declaration,
+                    fixture.symbol,
+                ),
+                Ok(None),
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+        }
+    }
+
+    #[test]
+    fn global_array_call_augmentation_rejects_invalid_shapes_and_poisoned_caches() {
+        for (offset, source) in [
+            "interface Array<T> { (value: any): any[]; }",
+            "interface Array<T> { (): number[]; }",
+            "interface Array<T> { (): any[]; marker: any; }",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture = global_array_augmentation_fixture(
+                source,
+                3_740 + u32::try_from(offset).unwrap() * 2,
+            );
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [
+                    (&fixture.library.arena, &fixture.library_bound),
+                    (&fixture.source.arena, &fixture.source_bound),
+                ],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            let before = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+            assert!(matches!(
+                plan_global_array_call_augmentation(
+                    &fixture.store,
+                    &host,
+                    fixture.declaration,
+                    fixture.symbol,
+                ),
+                Err(PropertyObjectError::InvalidInterface { .. })
+            ));
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+        }
+
+        let mut fixture =
+            global_array_augmentation_fixture("interface Array<T> { (): any[]; }", 3_750);
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&fixture.library.arena, &fixture.library_bound),
+                (&fixture.source.arena, &fixture.source_bound),
+            ],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let plan = plan_global_array_call_augmentation(
+            &fixture.store,
+            &host,
+            fixture.declaration,
+            fixture.symbol,
+        )
+        .unwrap()
+        .unwrap();
+        let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        assert!(fixture.store.set_type_node_links(
+            plan.return_type,
+            TypeNodeLinks {
+                resolved_type: Some(string),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        let poisoned = fixture.store.checker_link_allocated_lengths();
+        assert_eq!(
+            plan_global_array_call_augmentation(
+                &fixture.store,
+                &host,
+                fixture.declaration,
+                fixture.symbol,
+            ),
+            Err(PropertyObjectError::InvalidInterface {
+                declaration: fixture.declaration,
+                symbol: plan.symbol,
+            }),
+        );
+        assert_eq!(fixture.store.checker_link_allocated_lengths(), poisoned);
+        assert!(
+            fixture
+                .store
+                .set_type_node_links(plan.return_type, TypeNodeLinks::default(),)
+        );
+        assert_eq!(
+            plan_global_array_call_augmentation(
+                &fixture.store,
+                &host,
+                fixture.declaration,
+                fixture.symbol,
+            ),
+            Ok(Some(plan)),
+        );
     }
 
     #[test]

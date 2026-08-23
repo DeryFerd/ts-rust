@@ -11,7 +11,8 @@ use std::collections::HashSet;
 
 use ts_ast::{ModifierList, NodeData, NodeList, NodeRef, SyntaxKind};
 use ts_binder::{
-    CanonicalSourceFileFacts, CheckFlags, InternalSymbolName, SemanticSymbolId, SymbolFlags,
+    CanonicalNameResolver, CanonicalResolutionLocation, CanonicalSourceFileFacts, CheckFlags,
+    InternalSymbolName, SemanticSymbolId, SymbolFlags,
 };
 
 use super::{
@@ -231,6 +232,8 @@ pub(super) struct SourceCallablePlan {
     pub(super) parameters: Vec<SourceCallableParameterPlan>,
     pub(super) return_type: SourceCallableReturnPlan,
     pub(super) body_mode: SourceCallableBodyMode,
+    /// True only for an authenticated zero-parameter async JSX function.
+    pub(super) is_async: bool,
     /// The actual body for `Present`, or the declaration diagnostic anchor for
     /// `AmbientDeclaration`.
     pub(super) body: NodeRef,
@@ -423,6 +426,21 @@ struct SourceSyntaxView<'a> {
     name: Option<ts_ast::NodeId>,
     equals_greater_than_token: Option<ts_ast::NodeId>,
     invalid_parser_cache: bool,
+}
+
+impl SourceSyntaxView<'_> {
+    fn is_async(&self, store: &CanonicalTypeMapperStore, declaration: NodeRef) -> bool {
+        self.modifiers.is_some_and(|modifiers| {
+            matches!(
+                modifiers.list.nodes.as_slice(),
+                [modifier] if store.source_node_kind(NodeRef::new(
+                    declaration.arena,
+                    declaration.file,
+                    *modifier,
+                )) == Some(SyntaxKind::AsyncKeyword)
+            )
+        })
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1311,6 +1329,7 @@ fn plan_source_callable_with_owner_shape(
         ));
     }
     let body_mode = validate_modifiers(store, host, declaration, record.range, &view)?;
+    let is_async = view.is_async(store, declaration);
 
     let bound = host
         .bound_file(declaration)
@@ -1396,12 +1415,44 @@ fn plan_source_callable_with_owner_shape(
     let array_implicit_any_arrow = eligible_implicit_any_arrow
         && !direct_implicit_any_arrow
         && is_ambiguous_union_array_source_arrow(store, host, declaration)?;
+    let object_property_arrow = eligible_implicit_any_arrow
+        && !direct_implicit_any_arrow
+        && !array_implicit_any_arrow
+        && source_object_property_arrow_symbol(store, host, declaration)?.is_some();
+    let javascript_object_implicit_any_arrow = eligible_implicit_any_arrow
+        && object_property_arrow
+        && bound
+            .source_facts()
+            .is_some_and(CanonicalSourceFileFacts::is_javascript_file);
+    let untyped_javascript_signature = bound
+        .source_facts()
+        .is_some_and(CanonicalSourceFileFacts::is_javascript_file)
+        && view.parameters.nodes.len() == 1
+        && type_parameters.is_empty()
+        && body_mode == SourceCallableBodyMode::Present
+        && (view.family == SourceCallableFamily::FunctionDeclaration
+            || javascript_object_implicit_any_arrow)
+        && view.parameters.nodes.iter().all(|parameter| {
+            host.node(NodeRef::new(
+                declaration.arena,
+                declaration.file,
+                *parameter,
+            ))
+            .is_some_and(|record| {
+                matches!(&record.data, NodeData::ParameterDeclaration(parameter)
+                        if parameter.type_.is_none())
+            })
+        });
 
     let mut parameters = Vec::with_capacity(view.parameters.nodes.len());
     let mut previous_end = view.parameters.range.start;
     let mut optional_seen = false;
     let mut min_argument_count = 0usize;
-    let mut flags = SignatureFlags::NONE;
+    let mut flags = if untyped_javascript_signature {
+        SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE
+    } else {
+        SignatureFlags::NONE
+    };
     for parameter_id in &view.parameters.nodes {
         let parameter = NodeRef::new(declaration.arena, declaration.file, *parameter_id);
         if parameters
@@ -1541,7 +1592,9 @@ fn plan_source_callable_with_owner_shape(
                     || direct_implicit_any_arrow && view.parameters.range == parameter_record.range
                     || array_implicit_any_arrow
                         && view.parameters.range.start < parameter_record.range.start
-                        && view.parameters.range.end > parameter_record.range.end)
+                        && view.parameters.range.end > parameter_record.range.end
+                    || object_property_arrow
+                        && view.parameters.nodes.as_slice() == [parameter.node])
                     || body_mode.is_ambient()
                     || !type_parameters.is_empty()
                     || rest
@@ -1755,11 +1808,31 @@ fn plan_source_callable_with_owner_shape(
                 SourceCallableUnsupported::GenericInferredReturn(declaration),
             ));
         };
+        let supported_parameter_shape = parameters.is_empty() && min_argument_count == 0
+            || match (type_parameters.as_slice(), parameters.as_slice()) {
+                ([type_parameter], [parameter])
+                    if min_argument_count == 1
+                        && !parameter.optional
+                        && !parameter.rest
+                        && parameter.initializer.is_none()
+                        && parameter.explicit_type_node().is_some() =>
+                {
+                    type_parameter.constraint.is_some_and(|constraint| {
+                        exact_unresolved_source_type_parameter_constraint(store, host, constraint)
+                            .is_ok_and(|valid| valid)
+                    }) && is_naked_source_type_parameter_annotation(
+                        store,
+                        host,
+                        parameter.identity_node,
+                        type_parameter,
+                    )?
+                }
+                _ => false,
+            };
         if view.family != SourceCallableFamily::FunctionDeclaration
             || body_mode != SourceCallableBodyMode::Present
-            || !parameters.is_empty()
+            || !supported_parameter_shape
             || flags != SignatureFlags::NONE
-            || min_argument_count != 0
             || body_record.kind != SyntaxKind::Block
             || body_record.parent != Some(declaration.node)
             || body_record.flags.0 != 0
@@ -1801,6 +1874,7 @@ fn plan_source_callable_with_owner_shape(
         parameters,
         return_type,
         body_mode,
+        is_async,
         body,
         flags,
         min_argument_count,
@@ -1821,7 +1895,39 @@ fn plan_source_callable_with_owner_shape(
     plan.type_parameter_syntax.inferred_empty_body_is_exact = inferred_empty_body_is_exact;
     match owner_shape {
         SourceCallableOwnerShape::Unique => {
-            source_callable_state(store, &plan, true)?;
+            let contextual_object_property = object_property_arrow
+                && store
+                    .source_callable_type_for_owner(owner_symbol)
+                    .and_then(|type_| store.source_callable_provenance(type_))
+                    .is_some_and(|provenance| {
+                        provenance.declaration == declaration
+                            && provenance.owner_symbol == owner_symbol
+                            && provenance.contextual_target.is_some()
+                            && provenance.contextual_variable.is_some_and(|anchor| {
+                                store.source_contextual_callable_anchor_is_exact(
+                                    declaration,
+                                    owner_symbol,
+                                    anchor,
+                                ) && store
+                                    .symbol(anchor)
+                                    .is_some_and(|symbol| symbol.flags() == SymbolFlags::PROPERTY)
+                            })
+                    });
+            if contextual_object_property {
+                let type_ = store
+                    .source_callable_type_for_owner(owner_symbol)
+                    .expect("the contextual object property already retained its owner");
+                if !matches!(
+                    validate_stored_source_callable(store, type_),
+                    StoredSourceCallableValidation::Valid(_)
+                ) {
+                    return Err(invariant(SourceCallableInvariant::InvalidTypeCache(
+                        declaration,
+                    )));
+                }
+            } else {
+                source_callable_state(store, &plan, true)?;
+            }
         }
         SourceCallableOwnerShape::AmbientOverload(_) => {
             if plan.family != SourceCallableFamily::FunctionDeclaration
@@ -1917,6 +2023,65 @@ fn namespace_source_callable_array_targets(
         return array_targets;
     }
     provenance.array_targets
+}
+
+/// Returns the authenticated object-property symbol that directly owns an arrow.
+pub(super) fn source_object_property_arrow_symbol(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+) -> Result<Option<SemanticSymbolId>, SourceCallableError> {
+    if store.source_node_kind(declaration) != Some(SyntaxKind::ArrowFunction) {
+        return Ok(None);
+    }
+    let Some(SourceNodeParent::Parent(property)) = store.source_node_parent(declaration) else {
+        return Ok(None);
+    };
+    let record = preflight_node(store, host, property)?;
+    let NodeData::PropertyAssignment(assignment) = &record.data else {
+        return Ok(None);
+    };
+    if record.kind != SyntaxKind::PropertyAssignment
+        || record.flags.0 != 0
+        || assignment.initializer != declaration.node
+        || assignment.postfix_token.is_some()
+        || assignment.modifiers.is_some()
+        || assignment.type_.is_some()
+        || assignment.symbol.is_some()
+        || assignment.facts != 0
+    {
+        return Ok(None);
+    }
+    let Some(SourceNodeParent::Parent(object)) = store.source_node_parent(property) else {
+        return Ok(None);
+    };
+    if store.source_node_kind(object) != Some(SyntaxKind::ObjectLiteralExpression) {
+        return Ok(None);
+    }
+    let Ok(plan) = super::object_members::plan_object_literal(store, host, object) else {
+        return Ok(None);
+    };
+    let Some(planned) = plan
+        .properties
+        .iter()
+        .find(|planned| planned.declaration == property && planned.type_node == declaration)
+    else {
+        return Ok(None);
+    };
+    let Some(record) = store.symbol(planned.symbol) else {
+        return Ok(None);
+    };
+    Ok((record.flags() == SymbolFlags::PROPERTY
+        && record.check_flags() == CheckFlags::NONE
+        && record.declarations() == Some(&[property])
+        && record.value_declaration() == Some(property)
+        && record.members().is_none()
+        && record.exports().is_none()
+        && record.export_symbol().is_none()
+        && store.get_parent_of_symbol(planned.symbol) == Some(plan.symbol)
+        && store.get_merged_symbol(planned.symbol) == Some(planned.symbol)
+        && host.symbol_matches(store, property, planned.symbol))
+    .then_some(planned.symbol))
 }
 
 fn is_direct_noncontextual_source_arrow(
@@ -2582,12 +2747,201 @@ fn is_exact_source_type_parameter_bound(
     if exact_named_interface_keyof_bound(store, host, bound)? {
         return Ok(true);
     }
+    if exact_unresolved_source_type_parameter_constraint(store, host, bound)? {
+        return Ok(true);
+    }
     for type_parameter in earlier {
         if is_naked_source_type_parameter_annotation(store, host, bound, type_parameter)? {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+/// Proves one missing, unqualified generic constraint without caching a name.
+pub(super) fn exact_unresolved_source_type_parameter_constraint(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    constraint: NodeRef,
+) -> Result<bool, SourceCallableError> {
+    let record = preflight_node(store, host, constraint)?;
+    let NodeData::TypeReferenceNode(reference) = &record.data else {
+        return Ok(false);
+    };
+    if record.kind != SyntaxKind::TypeReference || reference.type_arguments.is_some() {
+        return Ok(false);
+    }
+    let Some(SourceNodeParent::Parent(parameter)) = store.source_node_parent(constraint) else {
+        return Ok(false);
+    };
+    let parameter_record = preflight_node(store, host, parameter)?;
+    let NodeData::TypeParameterDeclaration(parameter_data) = &parameter_record.data else {
+        return Ok(false);
+    };
+    if parameter_record.kind != SyntaxKind::TypeParameter
+        || parameter_data.constraint != Some(constraint.node)
+        || parameter_data.default_type.is_some()
+    {
+        return Ok(false);
+    }
+    let Some(SourceNodeParent::Parent(function)) = store.source_node_parent(parameter) else {
+        return Ok(false);
+    };
+    let function_record = preflight_node(store, host, function)?;
+    let NodeData::FunctionDeclaration(function_data) = &function_record.data else {
+        return Ok(false);
+    };
+    let Some(type_parameters) = function_data.type_parameters.as_ref() else {
+        return Ok(false);
+    };
+    let ([declared_type_parameter], [value_parameter]) = (
+        type_parameters.nodes.as_slice(),
+        function_data.parameters.nodes.as_slice(),
+    ) else {
+        return Ok(false);
+    };
+    let Some(body) = function_data
+        .body
+        .map(|body| NodeRef::new(function.arena, function.file, body))
+    else {
+        return Ok(false);
+    };
+    let body_record = preflight_node(store, host, body)?;
+    let NodeData::Block(block) = &body_record.data else {
+        return Ok(false);
+    };
+    if function_record.kind != SyntaxKind::FunctionDeclaration
+        || function_record.flags.0 != 0
+        || function_data.modifiers.is_some()
+        || function_data.asterisk_token.is_some()
+        || function_data.type_.is_some()
+        || *declared_type_parameter != parameter.node
+        || type_parameters.has_trailing_comma
+        || function_data.parameters.has_trailing_comma
+        || body_record.kind != SyntaxKind::Block
+        || body_record.flags.0 != 0
+        || body_record.parent != Some(function.node)
+        || block.flow_node.is_some()
+        || block.next_container.is_some()
+        || !block.statements.nodes.is_empty()
+        || block.statements.has_trailing_comma
+        || block.facts != 0
+    {
+        return Ok(false);
+    }
+    let Some(bound) = host.bound_file(function) else {
+        return Ok(false);
+    };
+    let Some(owner) = bound.symbol(function) else {
+        return Ok(false);
+    };
+    let Some(type_parameter_symbol) = bound.symbol(parameter) else {
+        return Ok(false);
+    };
+    if bound
+        .source_facts()
+        .is_none_or(|facts| facts.is_declaration_file() || facts.is_javascript_file())
+        || !host.symbol_matches(store, function, owner)
+        || !host.symbol_matches(store, parameter, type_parameter_symbol)
+        || store.symbol(owner).is_none_or(|symbol| {
+            symbol.flags() != SymbolFlags::FUNCTION
+                || symbol.declarations() != Some(&[function])
+                || symbol.value_declaration() != Some(function)
+        })
+        || store.symbol(type_parameter_symbol).is_none_or(|symbol| {
+            symbol.flags() != SymbolFlags::TYPE_PARAMETER
+                || symbol.declarations() != Some(&[parameter])
+        })
+    {
+        return Ok(false);
+    }
+    let value_parameter = NodeRef::new(function.arena, function.file, *value_parameter);
+    let value_parameter_record = preflight_node(store, host, value_parameter)?;
+    let NodeData::ParameterDeclaration(value_parameter_data) = &value_parameter_record.data else {
+        return Ok(false);
+    };
+    let Some(annotation) = value_parameter_data
+        .type_
+        .map(|annotation| NodeRef::new(value_parameter.arena, value_parameter.file, annotation))
+    else {
+        return Ok(false);
+    };
+    if value_parameter_record.kind != SyntaxKind::Parameter
+        || value_parameter_record.parent != Some(function.node)
+        || value_parameter_data.modifiers.is_some()
+        || value_parameter_data.dot_dot_dot_token.is_some()
+        || value_parameter_data.question_token.is_some()
+        || value_parameter_data.initializer.is_some()
+        || !is_naked_source_type_parameter_annotation(
+            store,
+            host,
+            annotation,
+            &SourceCallableTypeParameterPlan {
+                declaration: parameter,
+                symbol: type_parameter_symbol,
+                constraint: Some(constraint),
+                default_type: None,
+            },
+        )?
+    {
+        return Ok(false);
+    }
+    let name = NodeRef::new(constraint.arena, constraint.file, reference.type_name);
+    let name_record = preflight_node(store, host, name)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Ok(false);
+    };
+    if name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(constraint.node)
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+        || store
+            .symbol_node_links(constraint)
+            .is_some_and(|links| links != &SymbolNodeLinks::default())
+        || store
+            .symbol_node_links(name)
+            .is_some_and(|links| links != &SymbolNodeLinks::default())
+        || bound
+            .locals(bound.source_file())
+            .and_then(|locals| store.symbol_table(locals))
+            .and_then(|locals| locals.get_source(&identifier.text))
+            .and_then(|symbol| store.symbol(symbol))
+            .is_some_and(|symbol| symbol.flags().intersects(SymbolFlags::TYPE))
+    {
+        return Ok(false);
+    }
+    let error_type = store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| bootstrap.error_type)
+        .ok_or_else(|| invariant(SourceCallableInvariant::InvalidTypeCache(constraint)))?;
+    if store.type_node_links(constraint).is_some_and(|links| {
+        links != &TypeNodeLinks::default()
+            && links
+                != &TypeNodeLinks {
+                    resolved_type: Some(error_type),
+                    ..TypeNodeLinks::default()
+                }
+    }) {
+        return Ok(false);
+    }
+    let Some((arena, bound)) = host.source(constraint) else {
+        return Ok(false);
+    };
+    let mut callback_host = host.name_resolver_host(store)?;
+    let resolved =
+        CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut callback_host)
+            .map_err(DeclaredTypeError::from)?
+            .resolve(
+                Some(CanonicalResolutionLocation::Bound(name)),
+                &identifier.text,
+                SymbolFlags::TYPE,
+                None,
+                true,
+                false,
+            )
+            .map_err(DeclaredTypeError::from)?;
+    Ok(resolved.is_none())
 }
 
 fn exact_named_interface_keyof_bound(
@@ -3336,14 +3690,9 @@ fn validate_modifiers(
     for modifier_id in &modifiers.list.nodes {
         let modifier = NodeRef::new(declaration.arena, declaration.file, *modifier_id);
         let record = preflight_node(store, host, modifier)?;
-        if record.kind == SyntaxKind::AsyncKeyword {
-            return Err(SourceCallableError::Unsupported(
-                SourceCallableUnsupported::Async(modifier),
-            ));
-        }
         if !matches!(
             record.kind,
-            SyntaxKind::ExportKeyword | SyntaxKind::DeclareKeyword
+            SyntaxKind::ExportKeyword | SyntaxKind::DeclareKeyword | SyntaxKind::AsyncKeyword
         ) || !matches!(record.data, NodeData::Token(_))
             || record.flags.0 != 0
             || record.parent != Some(declaration.node)
@@ -3360,6 +3709,19 @@ fn validate_modifiers(
     }
 
     match modifier_kinds.as_slice() {
+        [SyntaxKind::AsyncKeyword]
+            if !is_declaration_file
+                && valid_async_jsx_source_function(store, host, declaration, view)? =>
+        {
+            Ok(SourceCallableBodyMode::Present)
+        }
+        [SyntaxKind::AsyncKeyword] => Err(SourceCallableError::Unsupported(
+            SourceCallableUnsupported::Async(NodeRef::new(
+                declaration.arena,
+                declaration.file,
+                modifiers.list.nodes[0],
+            )),
+        )),
         [SyntaxKind::DeclareKeyword] | [SyntaxKind::ExportKeyword, SyntaxKind::DeclareKeyword] => {
             Ok(SourceCallableBodyMode::AmbientDeclaration)
         }
@@ -3371,6 +3733,71 @@ fn validate_modifiers(
             SourceCallableUnsupported::Modifiers(declaration),
         )),
     }
+}
+
+fn valid_async_jsx_source_function(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    view: &SourceSyntaxView<'_>,
+) -> Result<bool, SourceCallableError> {
+    if view.family != SourceCallableFamily::FunctionDeclaration
+        || !view.parameters.nodes.is_empty()
+        || view.parameters.has_trailing_comma
+        || view.type_parameters.is_some()
+        || view.return_type.is_some()
+    {
+        return Ok(false);
+    }
+    let Some(bound) = host.bound_file(declaration) else {
+        return Ok(false);
+    };
+    if bound
+        .source_facts()
+        .is_none_or(|facts| facts.is_declaration_file() || facts.is_javascript_file())
+    {
+        return Ok(false);
+    }
+    let Some(body) = view
+        .body
+        .map(|body| NodeRef::new(declaration.arena, declaration.file, body))
+    else {
+        return Ok(false);
+    };
+    let body_record = preflight_node(store, host, body)?;
+    let NodeData::Block(block) = &body_record.data else {
+        return Ok(false);
+    };
+    let [statement] = block.statements.nodes.as_slice() else {
+        return Ok(false);
+    };
+    let statement = NodeRef::new(body.arena, body.file, *statement);
+    let statement_record = preflight_node(store, host, statement)?;
+    let NodeData::ReturnStatement(return_statement) = &statement_record.data else {
+        return Ok(false);
+    };
+    let Some(expression) = return_statement
+        .expression
+        .map(|expression| NodeRef::new(statement.arena, statement.file, expression))
+    else {
+        return Ok(false);
+    };
+    let expression_record = preflight_node(store, host, expression)?;
+    Ok(body_record.kind == SyntaxKind::Block
+        && body_record.flags.0 == 0
+        && body_record.parent == Some(declaration.node)
+        && !block.statements.has_trailing_comma
+        && block.facts == 0
+        && statement_record.kind == SyntaxKind::ReturnStatement
+        && statement_record.flags.0 == 0
+        && statement_record.parent == Some(body.node)
+        && return_statement.flow_node.is_none()
+        && return_statement.facts == 0
+        && expression_record.parent == Some(statement.node)
+        && matches!(
+            expression_record.kind,
+            SyntaxKind::JsxElement | SyntaxKind::JsxSelfClosingElement | SyntaxKind::JsxFragment
+        ))
 }
 
 fn validate_owner_name_and_export_route(
@@ -3420,7 +3847,9 @@ fn validate_owner_name_and_export_route(
             }
             match local_symbol {
                 None if owner.parent().is_none()
-                    && (view.modifiers.is_none() || body_mode.is_ambient()) => {}
+                    && (view.modifiers.is_none()
+                        || body_mode.is_ambient()
+                        || view.is_async(store, declaration)) => {}
                 Some(local) if view.modifiers.is_some() => {
                     let parent = owner.parent().ok_or_else(|| {
                         invariant(SourceCallableInvariant::InvalidExportRoute(declaration))
@@ -3603,13 +4032,46 @@ fn valid_inferred_generic_source_callable(
     store: &CanonicalTypeMapperStore,
     plan: &SourceCallablePlan,
 ) -> bool {
+    let exact_parameters = plan.parameters.is_empty() && plan.min_argument_count == 0
+        || match (plan.type_parameters.as_slice(), plan.parameters.as_slice()) {
+            ([type_parameter], [parameter])
+                if plan.min_argument_count == 1
+                    && !parameter.optional
+                    && !parameter.rest
+                    && parameter.initializer.is_none()
+                    && parameter.explicit_type_node().is_some() =>
+            {
+                let Some(constraint) = type_parameter.constraint else {
+                    return false;
+                };
+                let Some(error_type) = store
+                    .intrinsic_bootstrap()
+                    .map(|bootstrap| bootstrap.error_type)
+                else {
+                    return false;
+                };
+                let Some(type_) = store
+                    .declared_type_links(type_parameter.symbol)
+                    .and_then(|links| links.declared_type)
+                else {
+                    return false;
+                };
+                store.source_recovered_unresolved_type_reference_is_exact(constraint, error_type)
+                    && source_type_parameter_annotation_links_are_cold_or_fully_warm(
+                        store,
+                        parameter.identity_node,
+                        type_parameter.symbol,
+                        type_,
+                    )
+            }
+            _ => false,
+        };
     !plan.type_parameters.is_empty()
         && plan.family == SourceCallableFamily::FunctionDeclaration
         && plan.return_type.is_inferred()
         && plan.body_mode == SourceCallableBodyMode::Present
-        && plan.parameters.is_empty()
+        && exact_parameters
         && plan.flags == SignatureFlags::NONE
-        && plan.min_argument_count == 0
         && plan.generic_return_type_parameter_index.is_none()
         && plan.type_parameter_syntax.declaration() == plan.declaration
         && plan.type_parameter_syntax.rows().len() == plan.type_parameters.len()
@@ -3872,9 +4334,9 @@ pub(super) fn reserve_source_callable_capacities(
 ///
 /// Unlike annotated source callables, this path has no synthetic type-node
 /// annotations to resolve lazily. The contextual target, final parameter
-/// value types, and inferred `void` return are all known before the first
-/// write, and the arrow expression receives an identity distinct from the
-/// variable's retained target type.
+/// value types, and inferred return are all known before the first write,
+/// and the arrow expression receives an identity distinct from the retained
+/// contextual target type.
 pub(super) fn publish_contextual_source_callable(
     store: &mut CanonicalTypeMapperStore,
     prepared: &PreparedContextualSourceCallable,
@@ -3937,19 +4399,15 @@ pub(super) fn publish_contextual_source_callable(
             && store.get_merged_symbol(prepared.owner_symbol) == Some(prepared.owner_symbol)
             && default_parameter_links(store, prepared.owner_symbol)
     });
-    let variable_valid = prepared.variable_symbol != prepared.owner_symbol
+    let variable_valid = store.source_contextual_callable_anchor_is_exact(
+        prepared.declaration,
+        prepared.owner_symbol,
+        prepared.variable_symbol,
+    );
+    let property_anchor = variable_valid
         && store
             .symbol(prepared.variable_symbol)
-            .is_some_and(|variable| {
-                variable.flags() == SymbolFlags::BLOCK_SCOPED_VARIABLE
-                    && variable.check_flags() == CheckFlags::NONE
-                    && variable.members().is_none()
-                    && variable.exports().is_none()
-                    && variable.parent().is_none()
-                    && variable.export_symbol().is_none()
-                    && store.get_merged_symbol(prepared.variable_symbol)
-                        == Some(prepared.variable_symbol)
-            });
+            .is_some_and(|symbol| symbol.flags() == SymbolFlags::PROPERTY);
     let target_valid = matches!(
         validate_stored_function_type(store, prepared.contextual_target),
         StoredFunctionTypeValidation::Valid(_)
@@ -3978,7 +4436,13 @@ pub(super) fn publish_contextual_source_callable(
                 && store.source_node_kind(parameter.declaration) == Some(SyntaxKind::Parameter)
                 && store.source_node_parent(parameter.declaration)
                     == Some(SourceNodeParent::Parent(prepared.declaration))
-                && default_parameter_links(store, parameter.symbol)
+                && (default_parameter_links(store, parameter.symbol)
+                    || property_anchor
+                        && store.value_symbol_links(parameter.symbol)
+                            == Some(&ValueSymbolLinks {
+                                resolved_type: Some(parameter.type_),
+                                ..ValueSymbolLinks::default()
+                            }))
         });
     let rest_valid = !prepared.flags.contains(SignatureFlags::HAS_REST_PARAMETER)
         || prepared.parameters.last().is_some_and(|parameter| {
@@ -4012,7 +4476,11 @@ pub(super) fn publish_contextual_source_callable(
             prepared.declaration,
         )));
     };
-    if prepared.return_type != bootstrap.void_type
+    if (!property_anchor && prepared.return_type != bootstrap.void_type)
+        || property_anchor
+            && store
+                .validate_cached_array_capability(prepared.return_type)
+                .is_err()
         || !store.try_reserve_types(1)
         || !store.try_reserve_signatures(1)
         || !store.try_reserve_source_callable_provenance(1)
@@ -4999,6 +5467,29 @@ pub(super) fn validate_stored_source_callable(
     let Some(signature_record) = store.signature(signature) else {
         return StoredSourceCallableValidation::Malformed;
     };
+    let untyped_javascript = signature_record
+        .flags()
+        .contains(SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE);
+    if untyped_javascript
+        && (signature_record.flags() != SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE
+            || signature_record.parameters().len() != 1
+            || !signature_record.type_parameters().is_empty()
+            || signature_record.min_argument_count()
+                != i32::try_from(signature_record.parameters().len()).unwrap_or(-1)
+            || signature_record.parameters().iter().any(|parameter| {
+                store
+                    .symbol(*parameter)
+                    .and_then(|parameter| parameter.declarations())
+                    .and_then(|declarations| declarations.first())
+                    .is_none_or(|declaration| {
+                        store
+                            .source_primitive_type_annotation(*declaration)
+                            .is_some()
+                    })
+            }))
+    {
+        return StoredSourceCallableValidation::Malformed;
+    }
     let contextual = match (provenance.contextual_target, provenance.contextual_variable) {
         (None, None) => None,
         (Some(target), Some(variable))
@@ -5040,9 +5531,11 @@ pub(super) fn validate_stored_source_callable(
             return_annotation.is_none()
                 && (type_parameter_edges.is_empty()
                     || family == SourceCallableFamily::FunctionDeclaration
-                        && signature_record.parameters().is_empty()
-                        && signature_record.flags() == SignatureFlags::NONE
-                        && signature_record.min_argument_count() == 0)
+                        && valid_inferred_generic_signature_parameters(
+                            store,
+                            signature,
+                            &type_parameter_edges,
+                        ))
                 && provenance.generic_return_type_parameter.is_none()
                 && !store.signature_has_circular_return_type(signature)
         }
@@ -5159,7 +5652,9 @@ pub(super) fn validate_stored_source_callable(
             & !(if contextual.is_some() {
                 SignatureFlags::HAS_REST_PARAMETER
             } else {
-                SignatureFlags::HAS_LITERAL_TYPES | SignatureFlags::HAS_REST_PARAMETER
+                SignatureFlags::HAS_LITERAL_TYPES
+                    | SignatureFlags::HAS_REST_PARAMETER
+                    | SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE
             })
             .bits()
             != 0
@@ -5234,21 +5729,20 @@ pub(super) fn validate_stored_source_callable(
         return StoredSourceCallableValidation::Malformed;
     }
     if let Some((target, variable)) = contextual {
-        let variable_valid = store.symbol(variable).is_some_and(|symbol| {
-            symbol.flags() == SymbolFlags::BLOCK_SCOPED_VARIABLE
-                && symbol.check_flags() == CheckFlags::NONE
-                && symbol.members().is_none()
-                && symbol.exports().is_none()
-                && symbol.parent().is_none()
-                && symbol.export_symbol().is_none()
-                && store.get_merged_symbol(variable) == Some(variable)
-        });
+        let variable_valid =
+            store.source_contextual_callable_anchor_is_exact(declaration, owner_symbol, variable);
+        let property_anchor = variable_valid
+            && store
+                .symbol(variable)
+                .is_some_and(|symbol| symbol.flags() == SymbolFlags::PROPERTY);
         let return_type = signature_record.resolved_return_type();
         let return_valid = store.intrinsic_bootstrap().is_some_and(|bootstrap| {
-            return_type == Some(bootstrap.void_type)
-                && store
-                    .function_signature_return_annotation(signature)
-                    .is_none()
+            return_type.is_some_and(|return_type| {
+                property_anchor && store.validate_cached_array_capability(return_type).is_ok()
+                    || !property_anchor && return_type == bootstrap.void_type
+            }) && store
+                .function_signature_return_annotation(signature)
+                .is_none()
                 && !store.signature_has_circular_return_type(signature)
         });
         let target_valid = target != type_
@@ -5472,11 +5966,7 @@ fn valid_stored_source_generic_return_provenance(
             && store
                 .function_signature_return_annotation(signature)
                 .is_none()
-            && store.signature(signature).is_some_and(|record| {
-                record.parameters().is_empty()
-                    && record.flags() == SignatureFlags::NONE
-                    && record.min_argument_count() == 0
-            });
+            && valid_inferred_generic_signature_parameters(store, signature, type_parameters);
     }
     let Some((annotation, _)) = store.function_signature_return_annotation(signature) else {
         return false;
@@ -5497,6 +5987,66 @@ fn valid_stored_source_generic_return_provenance(
         }
         None => store.source_node_kind(annotation) != Some(SyntaxKind::TypeReference),
     }
+}
+
+fn valid_inferred_generic_signature_parameters(
+    store: &CanonicalTypeMapperStore,
+    signature: SignatureId,
+    type_parameters: &[TypeId],
+) -> bool {
+    let Some(record) = store.signature(signature) else {
+        return false;
+    };
+    if record.flags() != SignatureFlags::NONE {
+        return false;
+    }
+    if record.parameters().is_empty() {
+        return record.min_argument_count() == 0;
+    }
+    let ([type_parameter], [parameter]) = (type_parameters, record.parameters()) else {
+        return false;
+    };
+    if record.min_argument_count() != 1 {
+        return false;
+    }
+    let Some([provenance]) = store.source_callable_type_parameters(signature) else {
+        return false;
+    };
+    let Some(constraint) = provenance.constraint else {
+        return false;
+    };
+    let Some(error_type) = store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| bootstrap.error_type)
+    else {
+        return false;
+    };
+    if provenance.type_parameter != *type_parameter
+        || !store.source_recovered_unresolved_type_reference_is_exact(constraint, error_type)
+        || store
+            .callable_signature_parameter_types(signature)
+            .is_some_and(|types| types != [*type_parameter])
+    {
+        return false;
+    }
+    let Some([declaration]) = store
+        .symbol(*parameter)
+        .and_then(|symbol| symbol.declarations())
+    else {
+        return false;
+    };
+    store.source_node_kind(*declaration) == Some(SyntaxKind::Parameter)
+        && record.declaration().is_some_and(|owner| {
+            store.source_node_parent(*declaration) == Some(SourceNodeParent::Parent(owner))
+        })
+        && store.value_symbol_links(*parameter).is_none_or(|links| {
+            links == &ValueSymbolLinks::default()
+                || links
+                    == &ValueSymbolLinks {
+                        resolved_type: Some(*type_parameter),
+                        ..ValueSymbolLinks::default()
+                    }
+        })
 }
 
 fn valid_source_generic_mapper_type(
@@ -6168,7 +6718,7 @@ mod tests {
         BoundFile, CanonicalBinder, CanonicalModuleState, CanonicalNameResolverOptions,
         CanonicalSourceFileFacts, CanonicalSourceLanguage, EscapedName,
     };
-    use ts_parser::{ParseResult, parse_source_file};
+    use ts_parser::{ParseResult, parse_jsx_source_file, parse_source_file};
 
     use super::*;
     use crate::semantic::{
@@ -6218,6 +6768,16 @@ mod tests {
             )
         }
 
+        fn jsx(source: &str, file: FileId) -> Self {
+            Self::with_parsed_source(
+                parse_jsx_source_file(source),
+                file,
+                false,
+                CanonicalModuleState::Script,
+                CanonicalSourceLanguage::TypeScript,
+            )
+        }
+
         fn with_source_language(
             source: &str,
             file: FileId,
@@ -6225,7 +6785,22 @@ mod tests {
             module_state: CanonicalModuleState,
             language: CanonicalSourceLanguage,
         ) -> Self {
-            let parsed = parse_source_file(source);
+            Self::with_parsed_source(
+                parse_source_file(source),
+                file,
+                declaration_file,
+                module_state,
+                language,
+            )
+        }
+
+        fn with_parsed_source(
+            parsed: ParseResult,
+            file: FileId,
+            declaration_file: bool,
+            module_state: CanonicalModuleState,
+            language: CanonicalSourceLanguage,
+        ) -> Self {
             assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
             let mut binder = CanonicalBinder::new();
             binder
@@ -6352,6 +6927,7 @@ mod tests {
                 error,
                 DeclaredTypeError::TypeNodeUnavailable(
                     TypeNodeUnavailable::MissingTypeReference(reference)
+                        | TypeNodeUnavailable::InvalidTypeReference(reference)
                 ) if reference == node
             ) {
                 return Err(error);
@@ -8155,6 +8731,138 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_generic_constraint_keeps_its_typed_parameter_and_recovers_once() {
+        let mut fixture = QueryFixture::new(
+            "function broken<Item extends Missing>(item: Item) {}",
+            FileId::new(1_264),
+        );
+        let (declaration, type_parameter) =
+            function_and_type_parameter(&fixture.parsed, fixture.file);
+        let owner = fixture.bound.symbol(declaration).unwrap();
+        let NodeData::TypeParameterDeclaration(parameter) =
+            &fixture.parsed.arena.get(type_parameter.node).unwrap().data
+        else {
+            panic!("the function must have one constrained type parameter")
+        };
+        let constraint = NodeRef::new(
+            type_parameter.arena,
+            type_parameter.file,
+            parameter.constraint.unwrap(),
+        );
+        let NodeData::TypeReferenceNode(reference) =
+            &fixture.parsed.arena.get(constraint.node).unwrap().data
+        else {
+            panic!("the constraint must name the missing type")
+        };
+        let missing_name = NodeRef::new(constraint.arena, constraint.file, reference.type_name);
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&fixture.parsed.arena, &fixture.bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let before = generic_transaction_state(&fixture.store);
+
+        assert!(
+            exact_unresolved_source_type_parameter_constraint(&fixture.store, &host, constraint)
+                .unwrap()
+        );
+        let plan = plan_source_callable(&fixture.store, &host, declaration, owner, None).unwrap();
+        assert_eq!(plan.type_parameters.len(), 1);
+        assert_eq!(plan.type_parameters[0].constraint, Some(constraint));
+        assert_eq!(plan.parameters.len(), 1);
+        assert_eq!(plan.min_argument_count, 1);
+        assert!(!plan.parameters[0].is_implicit_any());
+        assert!(plan.type_parameter_syntax.inferred_empty_body_is_exact());
+        assert_eq!(generic_transaction_state(&fixture.store), before);
+        drop(host);
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let callable = fixture
+            .query_callable(declaration, owner, &mut diagnostics)
+            .unwrap();
+        let signature = fixture
+            .store
+            .source_callable_provenance(callable)
+            .unwrap()
+            .signature;
+        let error_type = fixture.store.intrinsic_bootstrap().unwrap().error_type;
+        let type_parameter = fixture
+            .store
+            .signature(signature)
+            .unwrap()
+            .type_parameters()[0];
+        assert!(
+            fixture
+                .store
+                .source_recovered_unresolved_type_reference_is_exact(constraint, error_type)
+        );
+        assert_eq!(
+            fixture.store.callable_signature_parameter_types(signature),
+            Some([type_parameter].as_slice())
+        );
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("the missing constraint must report exactly one diagnostic")
+        };
+        assert_eq!(diagnostic.node, Some(missing_name));
+        assert_eq!(diagnostic.diagnostic.code(), 2304);
+        assert_eq!(diagnostic.diagnostic.arguments, ["Missing"]);
+
+        let void = fixture.store.intrinsic_bootstrap().unwrap().void_type;
+        assert_eq!(
+            publish_inferred_source_callable_return(&mut fixture.store, &plan, signature, void,),
+            Ok(void)
+        );
+        assert!(matches!(
+            validate_stored_source_callable(&fixture.store, callable),
+            StoredSourceCallableValidation::Valid(_)
+        ));
+        let warm = generic_transaction_state(&fixture.store);
+        assert_eq!(
+            fixture.query_callable(declaration, owner, &mut diagnostics),
+            Ok(callable)
+        );
+        assert_eq!(fixture.query_return(signature, &mut diagnostics), Ok(void));
+        assert_eq!(generic_transaction_state(&fixture.store), warm);
+        assert_eq!(diagnostics.len(), 1);
+    }
+
+    #[test]
+    fn unresolved_generic_constraint_rejects_defaults_arguments_and_other_parameter_types() {
+        for (index, source) in [
+            "function broken<Item extends Missing = any>(item: Item) {}",
+            "function broken<Item extends Missing<string>>(item: Item) {}",
+            "function broken<Item extends Missing>(item: string) {}",
+            "type Alias = string; function broken<Item extends Alias>(item: Item) {}",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture =
+                QueryFixture::new(source, FileId::new(1_265 + u32::try_from(index).unwrap()));
+            let (declaration, _) = function_and_type_parameter(&fixture.parsed, fixture.file);
+            let owner = fixture.bound.symbol(declaration).unwrap();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            let before = generic_transaction_state(&fixture.store);
+
+            assert!(
+                matches!(
+                    plan_source_callable(&fixture.store, &host, declaration, owner, None),
+                    Err(SourceCallableError::Unsupported(
+                        SourceCallableUnsupported::GenericSignature(_)
+                            | SourceCallableUnsupported::GenericInferredReturn(_)
+                    ))
+                ),
+                "{source}"
+            );
+            assert_eq!(generic_transaction_state(&fixture.store), before);
+        }
+    }
+
+    #[test]
     fn inferred_generic_parameters_and_nonempty_bodies_publish_nothing() {
         for (index, source) in [
             "function f<T>(value: T) {}",
@@ -8411,6 +9119,143 @@ mod tests {
                 .callable_signature_parameter_types(pending.signature),
             Some([base_type].as_slice())
         );
+    }
+
+    #[test]
+    fn contextual_object_property_arrow_preserves_nonvoid_return_and_replays_warm() {
+        let mut fixture = QueryFixture::new(
+            concat!(
+                "const target: (value: string) => string = ",
+                "(value: string): string => value; ",
+                "const object = { run: value => value };",
+            ),
+            FileId::new(1_216),
+        );
+        let (property, declaration) = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::PropertyAssignment(property) = &record.data else {
+                    return None;
+                };
+                Some((
+                    NodeRef::new(fixture.parsed.arena.id(), fixture.file, node),
+                    NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        property.initializer,
+                    ),
+                ))
+            })
+            .unwrap();
+        let NodeData::ArrowFunction(arrow) =
+            &fixture.parsed.arena.get(declaration.node).unwrap().data
+        else {
+            panic!("the object property must contain an arrow")
+        };
+        let parameter = NodeRef::new(
+            declaration.arena,
+            declaration.file,
+            arrow.parameters.nodes[0],
+        );
+        let target_node = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::VariableDeclaration(variable) = &record.data else {
+                    return None;
+                };
+                variable
+                    .type_
+                    .map(|type_| NodeRef::new(fixture.parsed.arena.id(), fixture.file, type_))
+            })
+            .unwrap();
+        let owner = fixture.bound.symbol(declaration).unwrap();
+        let property_symbol = fixture.bound.symbol(property).unwrap();
+        let parameter_symbol = fixture.bound.symbol(parameter).unwrap();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&fixture.parsed.arena, &fixture.bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            source_object_property_arrow_symbol(&fixture.store, &host, declaration),
+            Ok(Some(property_symbol))
+        );
+        let plan = plan_source_callable(&fixture.store, &host, declaration, owner, None).unwrap();
+        assert!(plan.parameters[0].is_implicit_any());
+        drop(host);
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let target = fixture
+            .query_type_node(target_node, &mut diagnostics)
+            .unwrap();
+        let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        let prepared = PreparedContextualSourceCallable {
+            declaration,
+            owner_symbol: owner,
+            variable_symbol: property_symbol,
+            contextual_target: target,
+            parameters: vec![ContextualSourceCallableParameter {
+                declaration: parameter,
+                symbol: parameter_symbol,
+                type_: string,
+            }],
+            flags: SignatureFlags::NONE,
+            min_argument_count: 1,
+            return_type: string,
+        };
+        let invalid = PreparedContextualSourceCallable {
+            variable_symbol: owner,
+            ..prepared.clone()
+        };
+        let before = publication_state(&fixture.store);
+        assert_eq!(
+            publish_contextual_source_callable(&mut fixture.store, &invalid),
+            Err(SourceCallableError::Invariant(
+                SourceCallableInvariant::Publication(declaration)
+            ))
+        );
+        assert_eq!(publication_state(&fixture.store), before);
+
+        let callable = publish_contextual_source_callable(&mut fixture.store, &prepared).unwrap();
+        let provenance = fixture.store.source_callable_provenance(callable).unwrap();
+        assert_eq!(provenance.contextual_variable, Some(property_symbol));
+        assert_eq!(provenance.contextual_target, Some(target));
+        assert_eq!(
+            fixture
+                .store
+                .signature(provenance.signature)
+                .unwrap()
+                .resolved_return_type(),
+            Some(string)
+        );
+        assert_eq!(
+            fixture
+                .store
+                .callable_signature_parameter_types(provenance.signature),
+            Some([string].as_slice())
+        );
+        assert!(matches!(
+            validate_stored_source_callable(&fixture.store, callable),
+            StoredSourceCallableValidation::Valid(_)
+        ));
+        let warm = publication_state(&fixture.store);
+        assert_eq!(
+            publish_contextual_source_callable(&mut fixture.store, &prepared),
+            Ok(callable)
+        );
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&fixture.parsed.arena, &fixture.bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        assert!(plan_source_callable(&fixture.store, &host, declaration, owner, None).is_ok());
+        assert_eq!(publication_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
     }
 
     #[test]
@@ -8939,6 +9784,206 @@ mod tests {
                 "{source}"
             );
             assert_eq!(publication_state(&fixture.store), before);
+        }
+    }
+
+    #[test]
+    fn async_jsx_functions_require_one_unannotated_zero_parameter_return() {
+        let fixture = QueryFixture::jsx(
+            "async function render() { return <view />; }",
+            FileId::new(1_271),
+        );
+        let declaration = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionDeclaration).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let owner = fixture.bound.symbol(declaration).unwrap();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&fixture.parsed.arena, &fixture.bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let before = publication_state(&fixture.store);
+
+        let plan = plan_source_callable(&fixture.store, &host, declaration, owner, None).unwrap();
+        assert!(plan.is_async);
+        assert_eq!(plan.family, SourceCallableFamily::FunctionDeclaration);
+        assert!(plan.parameters.is_empty());
+        assert_eq!(plan.return_type, SourceCallableReturnPlan::Inferred);
+        assert_eq!(plan.flags, SignatureFlags::NONE);
+        assert_eq!(publication_state(&fixture.store), before);
+
+        for (index, source) in [
+            "async function render(value: string) { return <view />; }",
+            "async function render(): any { return <view />; }",
+            "async function render() { return 1; }",
+            "async function render() { return <first />; return <second />; }",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture =
+                QueryFixture::jsx(source, FileId::new(1_272 + u32::try_from(index).unwrap()));
+            let declaration = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::FunctionDeclaration).then_some(NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let owner = fixture.bound.symbol(declaration).unwrap();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+
+            assert!(
+                matches!(
+                    plan_source_callable(&fixture.store, &host, declaration, owner, None),
+                    Err(SourceCallableError::Unsupported(
+                        SourceCallableUnsupported::Async(_)
+                    ))
+                ),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn javascript_untyped_flags_require_one_function_or_object_arrow_parameter() {
+        for (index, (source, family, flagged)) in [
+            (
+                "function accept(value) {}",
+                SourceCallableFamily::FunctionDeclaration,
+                true,
+            ),
+            (
+                "function accept(first, second) {}",
+                SourceCallableFamily::FunctionDeclaration,
+                false,
+            ),
+            (
+                "function accept() {}",
+                SourceCallableFamily::FunctionDeclaration,
+                false,
+            ),
+            (
+                "const object = { arguments: value => value };",
+                SourceCallableFamily::ArrowFunction,
+                true,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut fixture = QueryFixture::javascript(
+                source,
+                FileId::new(1_276 + u32::try_from(index).unwrap()),
+            );
+            let declaration = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == family.syntax_kind()).then_some(NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let owner = fixture.bound.symbol(declaration).unwrap();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            let plan =
+                plan_source_callable(&fixture.store, &host, declaration, owner, None).unwrap();
+            let expected_flags = if flagged {
+                SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE
+            } else {
+                SignatureFlags::NONE
+            };
+            assert_eq!(plan.flags, expected_flags, "{source}");
+            assert_eq!(
+                plan.min_argument_count,
+                i32::try_from(plan.parameters.len()).unwrap(),
+                "{source}"
+            );
+            if family == SourceCallableFamily::ArrowFunction {
+                assert!(
+                    source_object_property_arrow_symbol(&fixture.store, &host, declaration)
+                        .unwrap()
+                        .is_some()
+                );
+            }
+            drop(host);
+
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let callable = fixture
+                .query_callable(declaration, owner, &mut diagnostics)
+                .unwrap();
+            let signature = fixture
+                .store
+                .source_callable_provenance(callable)
+                .unwrap()
+                .signature;
+            assert_eq!(
+                fixture.store.signature(signature).unwrap().flags(),
+                expected_flags,
+                "{source}"
+            );
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            let return_type = if family == SourceCallableFamily::ArrowFunction {
+                bootstrap.any_type
+            } else {
+                bootstrap.void_type
+            };
+            publish_inferred_source_callable_return(
+                &mut fixture.store,
+                &plan,
+                signature,
+                return_type,
+            )
+            .unwrap();
+            assert!(matches!(
+                validate_stored_source_callable(&fixture.store, callable),
+                StoredSourceCallableValidation::Valid(_)
+            ));
+            if !flagged {
+                assert!(fixture.store.set_signature_flags(
+                    signature,
+                    SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE,
+                ));
+                assert_eq!(
+                    validate_stored_source_callable(&fixture.store, callable),
+                    StoredSourceCallableValidation::Malformed
+                );
+                assert!(fixture.store.set_signature_flags(signature, expected_flags));
+            }
+            let warm = publication_state(&fixture.store);
+            assert_eq!(
+                fixture.query_callable(declaration, owner, &mut diagnostics),
+                Ok(callable),
+                "{source}"
+            );
+            assert_eq!(publication_state(&fixture.store), warm);
+            assert!(diagnostics.is_empty());
         }
     }
 
