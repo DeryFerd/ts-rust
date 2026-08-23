@@ -3684,6 +3684,7 @@ fn pinned_directive_unsupported_details(case: &Case) -> Vec<String> {
                 "filename"
                     | "currentdirectory"
                     | "fullemitpaths"
+                    | "ignoredeprecations"
                     | "noimplicitreferences"
                     | "notypesandsymbols"
                     | "traceresolution"
@@ -4742,6 +4743,13 @@ fn fixture_compiler_options_result(
             directive_json_value(name, pinned_setting_value(value)),
         );
     }
+    if let Some(value) = case.directive_values("ignoreDeprecations").last() {
+        values.retain(|name, _| !name.eq_ignore_ascii_case("ignoreDeprecations"));
+        values.insert(
+            "ignoreDeprecations".to_owned(),
+            ts_config::JsonValue::String(pinned_setting_value(value).trim().to_owned()),
+        );
+    }
     for (name, value) in &variant.values {
         if name.eq_ignore_ascii_case("pretty") {
             continue;
@@ -4803,10 +4811,11 @@ fn bom_prefixed_compiler_directive(case: &Case) -> Option<(&str, &str)> {
 }
 
 fn is_compiler_option_directive(name: &str) -> bool {
-    COMPILER_OPTION_NAMES
-        .iter()
-        .chain(LIST_OPTION_NAMES)
-        .any(|option| option.eq_ignore_ascii_case(name))
+    name.eq_ignore_ascii_case("ignoreDeprecations")
+        || COMPILER_OPTION_NAMES
+            .iter()
+            .chain(LIST_OPTION_NAMES)
+            .any(|option| option.eq_ignore_ascii_case(name))
 }
 
 fn project_configuration_unsupported_details(case: &Case) -> Vec<String> {
@@ -7775,6 +7784,105 @@ mod tests {
         assert_eq!(
             variants[0].values.get("outFile").map(String::as_str),
             Some("second.js")
+        );
+    }
+
+    #[test]
+    fn ignore_deprecations_is_scalar_without_changing_variant_identity() {
+        let ordinary = Case::parse(
+            "deprecations.ts",
+            concat!("// @target: es2015, esnext\n", "const value = 1;\n"),
+        )
+        .unwrap();
+        let configured_case = Case::parse(
+            "deprecations.ts",
+            concat!(
+                "// @ignoreDeprecations: 5.0\n",
+                "// @IGNOREDEPRECATIONS: 6.0;\n",
+                "// @target: es2015, esnext\n",
+                "const value = 1;\n",
+            ),
+        )
+        .unwrap();
+        let ordinary_variants = expand_option_matrix(&ordinary);
+        let configured_variants = expand_option_matrix(&configured_case);
+
+        assert_eq!(matrix_axes(&ordinary), matrix_axes(&configured_case));
+        assert_eq!(ordinary_variants.len(), configured_variants.len());
+        for (ordinary_variant, configured_variant) in
+            ordinary_variants.iter().zip(&configured_variants)
+        {
+            assert_eq!(ordinary_variant.values, configured_variant.values);
+            assert!(configured_variant.unsupported_details.is_empty());
+            assert_eq!(
+                diagnostic_variant_key("deprecations.ts", ordinary_variant, None, "expected"),
+                diagnostic_variant_key("deprecations.ts", configured_variant, None, "expected"),
+            );
+            assert_eq!(
+                fixture_compiler_options(&configured_case, configured_variant)
+                    .ignore_deprecations
+                    .as_deref(),
+                Some("6.0")
+            );
+        }
+    }
+
+    #[test]
+    fn ignore_deprecations_overrides_projects_without_hiding_unknown_directives() {
+        let case = Case::parse(
+            "projectDeprecations.ts",
+            concat!(
+                "// @ignoreDeprecations: 6.0\n",
+                "// @unknownAxis: enabled\n",
+                "// @filename: /project/tsconfig.json\n",
+                "{\"compilerOptions\":{\"ignoreDeprecations\":\"5.0\"}}\n",
+                "// @filename: /project/main.ts\n",
+                "const value = 1;\n",
+            ),
+        )
+        .unwrap();
+        let variants = expand_option_matrix(&case);
+
+        assert_eq!(variants.len(), 1);
+        assert!(!variants[0].values.contains_key("ignoreDeprecations"));
+        assert!(
+            variants[0]
+                .unsupported_details
+                .iter()
+                .any(|detail| detail.contains("@unknownAxis"))
+        );
+        assert!(
+            variants[0]
+                .unsupported_details
+                .iter()
+                .all(|detail| !detail.contains("ignoreDeprecations"))
+        );
+        assert_eq!(
+            fixture_compiler_options(&case, &variants[0])
+                .ignore_deprecations
+                .as_deref(),
+            Some("6.0")
+        );
+    }
+
+    #[test]
+    fn applies_bom_prefixed_ignore_deprecations_without_a_variant_axis() {
+        let case = Case::parse(
+            "bomDeprecations.ts",
+            "\u{feff}// @ignoreDeprecations: 6.0\nconst value = 1;\n",
+        )
+        .unwrap();
+        let variants = expand_option_matrix(&case);
+
+        assert!(case.directives.is_empty());
+        assert_eq!(variants.len(), 1);
+        assert!(variants[0].values.is_empty());
+        assert!(variants[0].unsupported_details.is_empty());
+        assert_eq!(
+            fixture_compiler_options(&case, &variants[0])
+                .ignore_deprecations
+                .as_deref(),
+            Some("6.0")
         );
     }
 
