@@ -917,7 +917,103 @@ fn validate_control_statement_child(
     Ok(())
 }
 
-/// Returns whether a branch contains only blocks and semicolon statements.
+fn validate_labeled_statement(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    statement: NodeRef,
+    expected_parent: NodeRef,
+) -> Result<NodeRef, SourceFunctionStatementsError> {
+    let record = control_statement_node(arena, bound, statement)?;
+    let NodeData::LabeledStatement(labeled) = &record.data else {
+        return Err(unsupported_control_statement(statement, record.kind));
+    };
+    if record.kind != SyntaxKind::LabeledStatement
+        || record.flags.0 != 0
+        || labeled.flow_node.is_some()
+    {
+        return Err(unsupported_control_statement(statement, record.kind));
+    }
+
+    let container = validate_control_statement_parent(arena, bound, statement, expected_parent)?;
+    let label = NodeRef::new(statement.arena, statement.file, labeled.label);
+    validate_control_statement_child(arena, bound, statement, label, container)?;
+    let label_record = control_statement_node(arena, bound, label)?;
+    let NodeData::Identifier(identifier) = &label_record.data else {
+        return Err(unsupported_control_statement(label, label_record.kind));
+    };
+    if label_record.kind != SyntaxKind::Identifier
+        || label_record.flags.0 != 0
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+    {
+        return Err(unsupported_control_statement(label, label_record.kind));
+    }
+
+    let child = NodeRef::new(statement.arena, statement.file, labeled.statement);
+    validate_control_statement_child(arena, bound, statement, child, container)?;
+    if label_record.range.end > control_statement_node(arena, bound, child)?.range.start {
+        return Err(SourceFunctionStatementsInvariant::InvalidOrder {
+            previous: label,
+            next: child,
+        }
+        .into());
+    }
+
+    let expected_scope = bound.block_scope_container(statement).ok_or(
+        SourceFunctionStatementsInvariant::InvalidBlockScopeContainer {
+            node: statement,
+            expected: container,
+            actual: None,
+        },
+    )?;
+    for nested in [label, child] {
+        let actual = bound.block_scope_container(nested);
+        if actual != Some(expected_scope) {
+            return Err(
+                SourceFunctionStatementsInvariant::InvalidBlockScopeContainer {
+                    node: nested,
+                    expected: expected_scope,
+                    actual,
+                }
+                .into(),
+            );
+        }
+    }
+
+    let mut ancestor = Some(expected_parent);
+    while let Some(current) = ancestor {
+        let current_record = control_statement_node(arena, bound, current)?;
+        if matches!(
+            current_record.kind,
+            SyntaxKind::SourceFile
+                | SyntaxKind::FunctionDeclaration
+                | SyntaxKind::FunctionExpression
+                | SyntaxKind::ArrowFunction
+        ) {
+            break;
+        }
+        if let NodeData::LabeledStatement(outer) = &current_record.data {
+            let outer_label = NodeRef::new(current.arena, current.file, outer.label);
+            let outer_record = control_statement_node(arena, bound, outer_label)?;
+            let NodeData::Identifier(outer_identifier) = &outer_record.data else {
+                return Err(unsupported_control_statement(
+                    outer_label,
+                    outer_record.kind,
+                ));
+            };
+            if outer_identifier.text == identifier.text {
+                return Err(unsupported_control_statement(statement, record.kind));
+            }
+        }
+        ancestor = current_record
+            .parent
+            .map(|node| NodeRef::new(current.arena, current.file, node));
+    }
+
+    Ok(child)
+}
+
+/// Returns whether a branch contains only blocks, labels, and semicolon statements.
 pub(super) fn source_control_branch_is_empty(
     arena: &NodeArena,
     bound: &BoundFile,
@@ -958,6 +1054,18 @@ pub(super) fn source_control_branch_is_empty(
                 }
             }
             Ok(true)
+        }
+        NodeData::LabeledStatement(_) => {
+            let parent = record
+                .parent
+                .map(|node| NodeRef::new(statement.arena, statement.file, node))
+                .ok_or(SourceFunctionStatementsInvariant::InvalidParent {
+                    node: statement,
+                    expected: None,
+                    actual: None,
+                })?;
+            let child = validate_labeled_statement(arena, bound, statement, parent)?;
+            source_control_branch_is_empty(arena, bound, child)
         }
         NodeData::EmptyStatement(_) | NodeData::Block(_) => {
             Err(unsupported_control_statement(statement, record.kind))
@@ -1018,6 +1126,10 @@ fn collect_nested_export_diagnostics(
         NodeData::IfStatement(_) => {
             let nested = plan_source_control_if_syntax(arena, bound, statement, parent)?;
             diagnostics.extend(nested.nested_export_diagnostics);
+        }
+        NodeData::LabeledStatement(_) => {
+            let child = validate_labeled_statement(arena, bound, statement, parent)?;
+            collect_nested_export_diagnostics(arena, bound, statement, child, diagnostics)?;
         }
         NodeData::WhileStatement(_)
         | NodeData::DoStatement(_)
@@ -1493,6 +1605,12 @@ impl SyntaxPlanner<'_> {
             NodeData::StringLiteral(literal) => {
                 record.kind == SyntaxKind::StringLiteral && literal.token_flags.0 == 0
             }
+            NodeData::KeywordExpression(keyword) => {
+                matches!(
+                    record.kind,
+                    SyntaxKind::TrueKeyword | SyntaxKind::FalseKeyword
+                ) && keyword.flow_node.is_none()
+            }
             _ => false,
         };
         if record.flags.0 != 0 || !supported {
@@ -1548,7 +1666,10 @@ impl SyntaxPlanner<'_> {
         for (index, statement_id) in statements.iter().copied().enumerate() {
             let statement = self.reference(statement_id);
             match self.node(statement)?.kind {
-                SyntaxKind::VariableStatement | SyntaxKind::Block | SyntaxKind::EmptyStatement => {
+                SyntaxKind::VariableStatement
+                | SyntaxKind::Block
+                | SyntaxKind::EmptyStatement
+                | SyntaxKind::LabeledStatement => {
                     locals.extend(self.plan_local_or_block_statement(
                         statement,
                         body,
@@ -1669,11 +1790,7 @@ impl SyntaxPlanner<'_> {
         }
         self.validate_range(block, parent)?;
         self.validate_container(block, callable)?;
-        let outer_scope = if parent == self.callable.body {
-            callable
-        } else {
-            parent
-        };
+        let outer_scope = self.statement_lexical_scope(parent, callable)?;
         self.validate_block_scope_container(block, outer_scope)?;
         self.validate_node_list(block, data.statements.range, &data.statements.nodes)?;
 
@@ -1681,7 +1798,10 @@ impl SyntaxPlanner<'_> {
         for &statement_id in &data.statements.nodes {
             let statement = self.reference(statement_id);
             match self.node(statement)?.kind {
-                SyntaxKind::VariableStatement | SyntaxKind::Block | SyntaxKind::EmptyStatement => {
+                SyntaxKind::VariableStatement
+                | SyntaxKind::Block
+                | SyntaxKind::EmptyStatement
+                | SyntaxKind::LabeledStatement => {
                     locals.extend(self.plan_local_or_block_statement(statement, block, callable)?);
                 }
                 kind => {
@@ -1704,12 +1824,79 @@ impl SyntaxPlanner<'_> {
     ) -> Result<Vec<SourceLocalDeclarationSyntax>, SourceFunctionStatementsError> {
         match self.node(statement)?.kind {
             SyntaxKind::Block => self.plan_nested_local_block(statement, parent, callable),
+            SyntaxKind::LabeledStatement => {
+                self.plan_labeled_local_statement(statement, parent, callable)
+            }
             SyntaxKind::EmptyStatement => {
                 self.validate_empty_statement(statement, parent, callable)?;
                 Ok(Vec::new())
             }
             _ => self.plan_local_statement(statement, parent, callable),
         }
+    }
+
+    fn plan_labeled_local_statement(
+        &self,
+        statement: NodeRef,
+        parent: NodeRef,
+        callable: NodeRef,
+    ) -> Result<Vec<SourceLocalDeclarationSyntax>, SourceFunctionStatementsError> {
+        let child = validate_labeled_statement(self.arena, self.bound, statement, parent)?;
+        self.validate_container(statement, callable)?;
+        self.validate_block_scope_container(
+            statement,
+            self.statement_lexical_scope(parent, callable)?,
+        )?;
+        match self.node(child)?.kind {
+            SyntaxKind::Block | SyntaxKind::EmptyStatement | SyntaxKind::LabeledStatement => {
+                self.plan_local_or_block_statement(child, statement, callable)
+            }
+            kind => {
+                Err(self.unsupported(child, kind, SourceFunctionStatementsRole::BranchStatement))
+            }
+        }
+    }
+
+    fn statement_lexical_scope(
+        &self,
+        parent: NodeRef,
+        callable: NodeRef,
+    ) -> Result<NodeRef, SourceFunctionStatementsError> {
+        if parent == self.callable.body {
+            return Ok(callable);
+        }
+        if self.node(parent)?.kind != SyntaxKind::LabeledStatement {
+            return Ok(parent);
+        }
+        self.bound.block_scope_container(parent).ok_or_else(|| {
+            SourceFunctionStatementsInvariant::InvalidBlockScopeContainer {
+                node: parent,
+                expected: callable,
+                actual: None,
+            }
+            .into()
+        })
+    }
+
+    fn is_straight_line_variable_parent(
+        &self,
+        parent: NodeRef,
+    ) -> Result<bool, SourceFunctionStatementsError> {
+        let mut current = parent;
+        while current != self.callable.body {
+            let record = self.node(current)?;
+            if !matches!(
+                record.kind,
+                SyntaxKind::Block | SyntaxKind::LabeledStatement
+            ) {
+                return Ok(false);
+            }
+            let Some(next) = record.parent else {
+                return Ok(false);
+            };
+            current = self.reference(next);
+        }
+        Ok(true)
     }
 
     fn validate_empty_statement(
@@ -1739,11 +1926,7 @@ impl SyntaxPlanner<'_> {
         }
         self.validate_range(statement, parent)?;
         self.validate_container(statement, callable)?;
-        let scope = if parent == self.callable.body {
-            callable
-        } else {
-            parent
-        };
+        let scope = self.statement_lexical_scope(parent, callable)?;
         self.validate_block_scope_container(statement, scope)
     }
 
@@ -1922,11 +2105,7 @@ impl SyntaxPlanner<'_> {
         parent: NodeRef,
         callable: NodeRef,
     ) -> Result<Vec<SourceLocalDeclarationSyntax>, SourceFunctionStatementsError> {
-        let expected_scope = if parent == self.callable.body {
-            callable
-        } else {
-            parent
-        };
+        let expected_scope = self.statement_lexical_scope(parent, callable)?;
         let record = self.node(statement)?;
         let NodeData::VariableStatement(variable) = &record.data else {
             return Err(self.unsupported(
@@ -1987,7 +2166,7 @@ impl SyntaxPlanner<'_> {
             &list_data.declarations.nodes,
         )?;
         let binding = match list_record.flags.0 {
-            0 if parent == self.callable.body => VariableBindingKind::Var,
+            0 if self.is_straight_line_variable_parent(parent)? => VariableBindingKind::Var,
             NODE_FLAG_LET => VariableBindingKind::Let,
             NODE_FLAG_CONST => VariableBindingKind::Const,
             _ => {
@@ -2109,8 +2288,13 @@ impl SyntaxPlanner<'_> {
             binding,
             false,
         )?;
-        let locals = self.bound.locals(expected_scope).ok_or(
-            SourceFunctionStatementsInvariant::MissingLocals(expected_scope),
+        let symbol_scope = if binding == VariableBindingKind::Var {
+            callable
+        } else {
+            expected_scope
+        };
+        let locals = self.bound.locals(symbol_scope).ok_or(
+            SourceFunctionStatementsInvariant::MissingLocals(symbol_scope),
         )?;
         let actual = self
             .store
@@ -2119,7 +2303,7 @@ impl SyntaxPlanner<'_> {
         if actual != Some(symbol) {
             return Err(SourceFunctionStatementsInvariant::LocalTableMismatch {
                 declaration,
-                scope: expected_scope,
+                scope: symbol_scope,
                 expected: symbol,
                 actual,
             }
@@ -3609,6 +3793,74 @@ mod joined_tests {
     }
 
     #[test]
+    fn linear_body_preserves_labeled_blocks_and_function_scoped_nested_variables() {
+        let fixture = JoinedFixture::new(
+            concat!(
+                "function labeled(value: number): number {\n",
+                "  outer: {\n",
+                "    var lifted: number = value;\n",
+                "    inner: {\n",
+                "      let nested: number = lifted;\n",
+                "      empty: ;\n",
+                "    }\n",
+                "  }\n",
+                "  trailing: ;\n",
+                "  const result: number = lifted;\n",
+                "  return result;\n",
+                "}\n",
+            ),
+            FileId::new(1_270),
+        );
+        let syntax = fixture.linear_plan().unwrap();
+        assert_eq!(syntax.locals.len(), 3);
+        assert_eq!(syntax.locals[0].binding, VariableBindingKind::Var);
+        assert_eq!(syntax.locals[1].binding, VariableBindingKind::Let);
+        assert_eq!(syntax.locals[2].binding, VariableBindingKind::Const);
+
+        let callable = fixture.declaration();
+        let locals = fixture.bound.locals(callable).unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .symbol_table(locals)
+                .and_then(|table| table.get_source("lifted")),
+            Some(syntax.locals[0].symbol),
+        );
+        let points = syntax
+            .locals
+            .iter()
+            .map(|local| local.name)
+            .chain(syntax.return_statement);
+        let assignments = syntax.locals.iter().map(|local| SourceFlowAssignment {
+            declaration: local.declaration,
+            symbol: local.symbol,
+        });
+        assert!(
+            SourceFlowPlan::preflight(&fixture.bound, callable, None, points, [], assignments)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn linear_body_rejects_duplicate_labels_and_labeled_jumps() {
+        for (index, source) in [
+            "function invalid(): void { outer: { outer: ; } }",
+            "function invalid(): void { outer: { break outer; } }",
+            "function invalid(): void { outer: value; }",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture =
+                JoinedFixture::new(source, FileId::new(1_271 + u32::try_from(index).unwrap()));
+            assert!(matches!(
+                fixture.linear_plan(),
+                Err(SourceFunctionStatementsError::Unsupported(_)),
+            ));
+        }
+    }
+
+    #[test]
     fn linear_body_rejects_statements_after_return() {
         let fixture = JoinedFixture::new(
             "function invalid(): void { return; const later = 1; }",
@@ -3712,6 +3964,8 @@ mod joined_tests {
         for (index, source, expected_empty) in [
             (0u32, "if (flag) { { ; } ; }", true),
             (1, "if (flag) { value; }", false),
+            (2, "if (flag) outer: { inner: ; ; }", true),
+            (3, "if (flag) outer: { value; }", false),
         ] {
             let fixture = JoinedFixture::new(source, FileId::new(1_250 + index));
             let statement = fixture
@@ -3743,6 +3997,32 @@ mod joined_tests {
                 expected_empty,
             );
         }
+    }
+
+    #[test]
+    fn control_branch_rejects_duplicate_active_labels() {
+        let fixture = JoinedFixture::new("if (true) outer: { outer: ; }", FileId::new(1_275));
+        let statement = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::IfStatement).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        assert!(matches!(
+            plan_source_control_if_syntax(
+                &fixture.parsed.arena,
+                &fixture.bound,
+                statement,
+                fixture.bound.source_file(),
+            ),
+            Err(SourceFunctionStatementsError::Unsupported(_)),
+        ));
     }
 
     #[test]
@@ -4010,6 +4290,56 @@ mod joined_tests {
     }
 
     #[test]
+    fn function_switch_accepts_boolean_cases_and_returns() {
+        let fixture = JoinedFixture::new(
+            concat!(
+                "function invert(value: boolean): boolean {\n",
+                "  switch (value) {\n",
+                "    case true:\n",
+                "      return false;\n",
+                "    default:\n",
+                "      return true;\n",
+                "  }\n",
+                "}\n",
+            ),
+            FileId::new(1_276),
+        );
+        let callable = fixture.callable();
+        let syntax = plan_source_switch_function_statements_syntax(
+            &fixture.parsed.arena,
+            &fixture.bound,
+            &fixture.store,
+            &callable,
+        )
+        .unwrap();
+
+        assert_eq!(syntax.switch.clauses.len(), 2);
+        assert_eq!(syntax.returns.len(), 2);
+        assert_eq!(
+            fixture
+                .parsed
+                .arena
+                .get(syntax.switch.clauses[0].expression.unwrap().node)
+                .unwrap()
+                .kind,
+            SyntaxKind::TrueKeyword,
+        );
+        assert_eq!(
+            syntax
+                .returns
+                .iter()
+                .map(|value| fixture
+                    .parsed
+                    .arena
+                    .get(value.expression.node)
+                    .unwrap()
+                    .kind)
+                .collect::<Vec<_>>(),
+            [SyntaxKind::FalseKeyword, SyntaxKind::TrueKeyword],
+        );
+    }
+
+    #[test]
     fn function_switch_rejects_nonexhaustive_or_nonliteral_shapes() {
         for (index, source) in [
             "function f(level) { switch (level) { case 0: return \"value\"; } }",
@@ -4251,6 +4581,46 @@ mod joined_tests {
         let syntax = fixture.plan().unwrap();
         assert_eq!(syntax.joined_if.then_branch.locals.len(), 1);
         assert_eq!(syntax.joined_if.else_branch.locals.len(), 1);
+    }
+
+    #[test]
+    fn joined_branches_preserve_unique_labels_but_reject_conditional_var() {
+        let accepted = JoinedFixture::new(
+            concat!(
+                "function labeled(value: string | undefined): string | undefined {\n",
+                "  before: ;\n",
+                "  if (value) {\n",
+                "    truthy: { const selected: string = value; }\n",
+                "  } else {\n",
+                "    falsy: { const rejected: string | undefined = value; }\n",
+                "  }\n",
+                "  after: ;\n",
+                "  return value;\n",
+                "}\n",
+            ),
+            FileId::new(1_277),
+        );
+        let syntax = accepted.plan().unwrap();
+        assert_eq!(syntax.joined_if.then_branch.locals.len(), 1);
+        assert_eq!(syntax.joined_if.else_branch.locals.len(), 1);
+
+        let rejected = JoinedFixture::new(
+            concat!(
+                "function conditional(value: string | undefined): string | undefined {\n",
+                "  if (value) { var selected = value; }\n",
+                "  return value;\n",
+                "}\n",
+            ),
+            FileId::new(1_278),
+        );
+        assert!(matches!(
+            rejected.plan(),
+            Err(SourceJoinedFunctionStatementsError::Statements(
+                SourceFunctionStatementsError::Unsupported(
+                    SourceFunctionStatementsUnsupported::BindingKind(_),
+                ),
+            )),
+        ));
     }
 
     #[test]
