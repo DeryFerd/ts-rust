@@ -4977,16 +4977,7 @@ impl<'a> Parser<'a> {
         };
         let module_specifier = if self.current.kind == SyntaxKind::FromKeyword {
             self.bump();
-            if self.current.kind == SyntaxKind::StringLiteral {
-                Some(self.parse_string_literal())
-            } else if self.current.kind == SyntaxKind::Identifier || self.current.kind.is_keyword()
-            {
-                self.error_current("Expected a module specifier.");
-                Some(self.parse_identifier_name("Expected a module specifier."))
-            } else {
-                self.error_current("Expected a module specifier.");
-                None
-            }
+            Some(self.parse_import_module_specifier())
         } else {
             None
         };
@@ -15104,6 +15095,84 @@ export as namespace GlobalName;
             identifier_text(&result, declaration.module_specifier),
             "moduleName"
         );
+    }
+
+    #[test]
+    fn export_module_specifiers_defer_non_string_errors_to_grammar_checking() {
+        for (source, expected_kind) in [
+            ("export * from moduleName;", SyntaxKind::Identifier),
+            ("export { value } from 123;", SyntaxKind::NumericLiteral),
+            (
+                "export * from (moduleName);",
+                SyntaxKind::ParenthesizedExpression,
+            ),
+            ("export * from 0n as Module;", SyntaxKind::AsExpression),
+        ] {
+            let result = parse_source_file(source);
+            assert!(
+                result.diagnostics.is_empty(),
+                "{source}: {:?}",
+                result.diagnostics
+            );
+            let [statement] = source_statements(&result) else {
+                panic!("expected one export declaration");
+            };
+            let NodeData::ExportDeclaration(export) = &result.arena.get(*statement).unwrap().data
+            else {
+                panic!("expected export declaration");
+            };
+            let specifier = export.module_specifier.expect("export module specifier");
+            let node = result.arena.get(specifier).unwrap();
+            assert_eq!(node.kind, expected_kind, "{source}");
+            assert_eq!(node.parent, Some(*statement));
+            let expression_start = source.find("from ").unwrap() + "from ".len();
+            let expression_end = source.rfind(';').unwrap();
+            assert_eq!(node.range, text_range(expression_start, expression_end));
+        }
+    }
+
+    #[test]
+    fn missing_export_module_specifiers_keep_error_marked_expression_nodes() {
+        for source in ["export * from ;", "export { value } from ;"] {
+            let result = parse_source_file(source);
+            let semicolon = source.find(';').unwrap();
+            assert_eq!(
+                result
+                    .diagnostics
+                    .iter()
+                    .map(|diagnostic| (
+                        diagnostic.code,
+                        diagnostic.range.start.get(),
+                        diagnostic.range.end.get()
+                    ))
+                    .collect::<Vec<_>>(),
+                [(
+                    Some(1109),
+                    u32::try_from(semicolon).unwrap(),
+                    u32::try_from(semicolon + 1).unwrap()
+                )],
+                "{source}"
+            );
+            let [statement] = source_statements(&result) else {
+                panic!("expected one export declaration");
+            };
+            let NodeData::ExportDeclaration(export) = &result.arena.get(*statement).unwrap().data
+            else {
+                panic!("expected export declaration");
+            };
+            let specifier = result
+                .arena
+                .get(
+                    export
+                        .module_specifier
+                        .expect("missing export module specifier"),
+                )
+                .unwrap();
+            assert_eq!(specifier.kind, SyntaxKind::Identifier);
+            assert_eq!(specifier.flags, NODE_FLAG_HAS_ERROR);
+            assert_eq!(specifier.range, text_range(semicolon, semicolon));
+            assert_eq!(specifier.parent, Some(*statement));
+        }
     }
 
     #[test]
