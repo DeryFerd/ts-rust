@@ -434,3 +434,69 @@ fn chained_import_equals_resolves_nested_exported_namespace_functions() {
         warm,
     );
 }
+
+#[test]
+fn default_exported_interfaces_remain_valid_imported_return_types() {
+    let consumer = parse_source_file(concat!(
+        "import { styled } from './factory';\n",
+        "export const value = styled();\n",
+    ));
+    let factory = parse_source_file(concat!(
+        "import Color from './color';\n",
+        "export declare function styled(): Color;\n",
+    ));
+    let color = parse_source_file(concat!(
+        "interface Color { c: string; }\n",
+        "export default Color;\n",
+    ));
+    let files = [
+        Source {
+            parsed: &consumer,
+            file: FileId::new(60),
+            path: "\"/project/default-interface-consumer.ts\"",
+        },
+        Source {
+            parsed: &factory,
+            file: FileId::new(61),
+            path: "\"/project/default-interface-factory.ts\"",
+        },
+        Source {
+            parsed: &color,
+            file: FileId::new(62),
+            path: "\"/project/default-interface-color.ts\"",
+        },
+    ];
+    let mut checker = context(&files, &[common_js(0, 1), common_js(1, 2)]);
+
+    checker.check_source_file(files[0].file).unwrap();
+    checker.check_source_file(files[1].file).unwrap();
+    checker.check_source_file(files[2].file).unwrap();
+    assert!(
+        checker.diagnostics().is_empty(),
+        "{:?}",
+        checker.diagnostics()
+    );
+
+    let imported = alias_symbol(&checker, files[1], "Color");
+    assert!(matches!(
+        checker.resolve_alias(imported).unwrap().target,
+        AliasTargetState::Resolved(_)
+    ));
+
+    let warm = (
+        checker.store().type_len(),
+        checker.store().signature_len(),
+        checker.diagnostics().clone(),
+    );
+    checker.recheck_source_file(files[0].file).unwrap();
+    checker.recheck_source_file(files[1].file).unwrap();
+    checker.recheck_source_file(files[2].file).unwrap();
+    assert_eq!(
+        (
+            checker.store().type_len(),
+            checker.store().signature_len(),
+            checker.diagnostics().clone(),
+        ),
+        warm,
+    );
+}

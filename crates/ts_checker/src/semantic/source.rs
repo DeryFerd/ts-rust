@@ -51,6 +51,7 @@ use super::{
     ProductionAliasTargetHost, RelationUnavailable, SignatureId, SourceFileLinks, SourceFileRef,
     SymbolNodeLinks, TypeDisplayUnavailable, TypeId, TypeNodeLinks, ValueSymbolLinks,
     VariableInvariant, VariableUnsupported,
+    alias::CanonicalAliasResolver,
     array_types::CanonicalArrayTargets,
     bootstrap::{LiteralTypeCacheError, UnionReduction},
     callables::{
@@ -1104,6 +1105,7 @@ enum PlannedStatement {
     ExternalModuleMarker,
     LocalNamedExport,
     NamedReexport,
+    DefaultAlias(Box<PlannedDefaultAliasExport>),
     InvalidModuleSpecifier(NodeRef),
     AmbientVariables(Vec<(NodeRef, u32)>),
     AmbientOverload,
@@ -1132,6 +1134,13 @@ struct PlannedLocalNamedExport {
     clause: NodeRef,
     local_symbol: SemanticSymbolId,
     binding: SourceNamedReexportBindingPlan,
+}
+
+#[derive(Clone, Debug)]
+struct PlannedDefaultAliasExport {
+    declaration: NodeRef,
+    alias_symbol: SemanticSymbolId,
+    target_symbol: SemanticSymbolId,
 }
 
 #[derive(Debug)]
@@ -1890,6 +1899,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             expression_node.kind,
                             SourceSyntaxRole::Statement,
                         ));
+                    }
+                    if expression_node.kind == SyntaxKind::Identifier {
+                        let export = self.plan_default_alias_export(statement, expression)?;
+                        statements.push(PlannedStatement::DefaultAlias(Box::new(export)));
+                        continue;
                     }
                     let Some(element) = self.jsx_initializer_element(expression)? else {
                         return Err(self.unsupported(
@@ -5666,6 +5680,138 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 syntactic_type_only: export.is_type_only,
             },
         }))
+    }
+
+    fn plan_default_alias_export(
+        &self,
+        declaration: NodeRef,
+        expression: NodeRef,
+    ) -> Result<PlannedDefaultAliasExport, SourceCheckError> {
+        let Some((store, _)) = self.semantic else {
+            return Err(self.unsupported(
+                declaration,
+                SyntaxKind::ExportAssignment,
+                SourceSyntaxRole::Statement,
+            ));
+        };
+        let expression_record = self.node(expression)?;
+        let NodeData::Identifier(identifier) = &expression_record.data else {
+            return Err(self.unsupported(
+                expression,
+                expression_record.kind,
+                SourceSyntaxRole::Statement,
+            ));
+        };
+        if expression_record.kind != SyntaxKind::Identifier
+            || expression_record.flags.0 != 0
+            || expression_record.parent != Some(declaration.node)
+            || identifier.flow_node.is_some()
+            || identifier.text.is_empty()
+        {
+            return Err(self.unsupported(
+                expression,
+                expression_record.kind,
+                SourceSyntaxRole::Statement,
+            ));
+        }
+        let target_symbol = self
+            .bound
+            .locals(self.source.node_ref())
+            .and_then(|locals| store.symbol_table(locals))
+            .and_then(|locals| locals.get_source(&identifier.text))
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            .ok_or_else(|| {
+                self.unsupported(
+                    expression,
+                    SyntaxKind::Identifier,
+                    SourceSyntaxRole::Statement,
+                )
+            })?;
+        let target = store
+            .symbol(target_symbol)
+            .ok_or(SourceCheckError::Import(declaration))?;
+        let Some([target_declaration]) = target.declarations() else {
+            return Err(self.unsupported(
+                expression,
+                SyntaxKind::Identifier,
+                SourceSyntaxRole::Statement,
+            ));
+        };
+        let target_record = self.node(*target_declaration)?;
+        let supported_target = target.flags() == SymbolFlags::INTERFACE
+            && target_record.kind == SyntaxKind::InterfaceDeclaration
+            || self.prior_enums.contains(&target_symbol)
+                && matches!(
+                    target.flags(),
+                    SymbolFlags::CONST_ENUM | SymbolFlags::REGULAR_ENUM
+                )
+                && target_record.kind == SyntaxKind::EnumDeclaration;
+        if !supported_target
+            || target_record.parent != Some(self.source.node_ref().node)
+            || target_record.range.end > self.node(declaration)?.range.start
+            || target.flags() == SymbolFlags::INTERFACE
+                && (target.value_declaration().is_some()
+                    || store
+                        .value_symbol_links(target_symbol)
+                        .is_some_and(|links| links.resolved_type.is_some()))
+        {
+            return Err(self.unsupported(
+                expression,
+                SyntaxKind::Identifier,
+                SourceSyntaxRole::Statement,
+            ));
+        }
+
+        let alias_symbol = self
+            .bound
+            .symbol(declaration)
+            .ok_or(SourceCheckError::Import(declaration))?;
+        let module = self
+            .bound
+            .symbol(self.source.node_ref())
+            .ok_or(SourceCheckError::Import(declaration))?;
+        let alias = store
+            .symbol(alias_symbol)
+            .ok_or(SourceCheckError::Import(declaration))?;
+        if store
+            .symbol(module)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| store.symbol_table(exports))
+            .and_then(|exports| exports.get_source("default"))
+            != Some(alias_symbol)
+            || alias.flags() != SymbolFlags::ALIAS
+            || alias.check_flags() != CheckFlags::NONE
+            || alias.declarations() != Some(&[declaration])
+            || alias.value_declaration().is_some()
+            || alias.members().is_some()
+            || alias.exports().is_some()
+            || alias.parent() != Some(module)
+            || alias.export_symbol().is_some()
+            || alias.name().as_bytes() != b"default"
+            || store.get_merged_symbol(alias_symbol) != Some(alias_symbol)
+            || store.alias_symbol_links(alias_symbol).is_some_and(|links| {
+                links
+                    .immediate_target
+                    .is_some_and(|target| target != target_symbol)
+                    || links.type_only_declaration.is_some()
+                    || links
+                        .alias_target
+                        .symbol()
+                        .is_some_and(|target| target != target_symbol)
+            })
+            || target.flags() == SymbolFlags::INTERFACE
+                && store
+                    .value_symbol_links(alias_symbol)
+                    .is_some_and(|links| links.resolved_type.is_some())
+        {
+            return Err(SourceCheckError::Import(declaration));
+        }
+
+        Ok(PlannedDefaultAliasExport {
+            declaration,
+            alias_symbol,
+            target_symbol,
+        })
     }
 
     fn preplan_ambient_variable_statement(
@@ -15245,6 +15391,157 @@ fn source_callable_type_import_capabilities(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)] // Imported callable preparation shares source query state.
+fn materialize_imported_default_interface_return(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    alias_host: &mut ProductionAliasTargetHost<'_, '_, '_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    resolved: &ResolvedSourceImportBinding,
+) -> Result<(), SourceCheckError> {
+    let Some(target) = store.symbol(resolved.target_symbol) else {
+        return Err(SourceCheckError::Import(resolved.binding.declaration));
+    };
+    if target.flags() != SymbolFlags::FUNCTION {
+        return Ok(());
+    }
+    let Some([declaration]) = target.declarations() else {
+        return Ok(());
+    };
+    let declaration = *declaration;
+    let Some(record) = host.node(declaration) else {
+        return Err(SourceCheckError::Import(resolved.binding.declaration));
+    };
+    let NodeData::FunctionDeclaration(function) = &record.data else {
+        return Ok(());
+    };
+    let Some(return_type) = function
+        .type_
+        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+    else {
+        return Ok(());
+    };
+    let Some(return_record) = host.node(return_type) else {
+        return Err(SourceCheckError::Import(resolved.binding.declaration));
+    };
+    let NodeData::TypeReferenceNode(reference) = &return_record.data else {
+        return Ok(());
+    };
+    if return_record.kind != SyntaxKind::TypeReference
+        || return_record.parent != Some(declaration.node)
+        || reference.type_arguments.is_some()
+    {
+        return Ok(());
+    }
+    let name = NodeRef::new(return_type.arena, return_type.file, reference.type_name);
+    let Some(name_record) = host.node(name) else {
+        return Err(SourceCheckError::Import(resolved.binding.declaration));
+    };
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Ok(());
+    };
+    let name_text = identifier.text.clone();
+    let Some((arena, bound)) = host.source(declaration) else {
+        return Err(SourceCheckError::Import(resolved.binding.declaration));
+    };
+    let Some(alias) = bound
+        .locals(bound.source_file())
+        .and_then(|locals| store.symbol_table(locals))
+        .and_then(|locals| locals.get_source(&name_text))
+        .and_then(|alias| store.get_merged_symbol(alias))
+    else {
+        return Ok(());
+    };
+    let Some(alias_record) = store.symbol(alias) else {
+        return Err(SourceCheckError::Import(resolved.binding.declaration));
+    };
+    if alias_record.flags() != SymbolFlags::ALIAS {
+        return Ok(());
+    }
+    let Some([binding]) = alias_record.declarations() else {
+        return Ok(());
+    };
+    let binding = *binding;
+    let Some(binding_record) = host.node(binding) else {
+        return Err(SourceCheckError::Import(resolved.binding.declaration));
+    };
+    let NodeData::ImportClause(clause) = &binding_record.data else {
+        return Ok(());
+    };
+    if binding_record.kind != SyntaxKind::ImportClause
+        || clause.name.is_none()
+        || clause.named_bindings.is_some()
+        || clause.phase_modifier.is_some()
+    {
+        return Ok(());
+    }
+    let Some(import) = binding_record
+        .parent
+        .map(|node| NodeRef::new(binding.arena, binding.file, node))
+    else {
+        return Err(SourceCheckError::Import(binding));
+    };
+    let plan = plan_top_level_named_value_import(arena, bound, store, import)
+        .map_err(|error| SourcePlanner::import_plan_error(binding, &error))?;
+    let Some(imported) = plan.bindings.iter().find(|binding| {
+        binding.alias_symbol == alias
+            && binding.local_text == name_text
+            && binding.imported_text == "default"
+    }) else {
+        return Err(SourceCheckError::Import(binding));
+    };
+    let imported = resolve_source_import_binding(store, alias_host, imported)
+        .map_err(|error| SourcePlanner::import_plan_error(binding, &error))?;
+    if !store
+        .symbol(imported.target_symbol)
+        .is_some_and(|target| target.flags() == SymbolFlags::INTERFACE)
+    {
+        return Ok(());
+    }
+    let capability = CanonicalTypeReferenceAliasTarget::new(
+        return_type,
+        return_type,
+        imported.binding.declaration,
+        imported.binding.alias_symbol,
+        imported.immediate_target_symbol,
+        imported.target_symbol,
+    );
+    session.reset_query();
+    let callable = CanonicalTypeQuery::new_with_global_types_and_session(
+        store,
+        host,
+        global_types,
+        options,
+        session,
+        diagnostics,
+    )?
+    .with_type_reference_alias_targets([capability])?
+    .get_type_of_source_callable(declaration, resolved.target_symbol)?;
+    let signature = store
+        .source_callable_provenance(callable)
+        .filter(|provenance| {
+            provenance.declaration == declaration
+                && provenance.owner_symbol == resolved.target_symbol
+        })
+        .map(|provenance| provenance.signature)
+        .ok_or(SourceCheckError::Import(resolved.binding.declaration))?;
+    session.reset_query();
+    CanonicalTypeQuery::new_with_global_types_and_session(
+        store,
+        host,
+        global_types,
+        options,
+        session,
+        diagnostics,
+    )?
+    .with_type_reference_alias_targets([capability])?
+    .get_return_type_of_signature(signature)?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)] // Keeps body inference capabilities explicit.
 fn publish_checked_source_callable_return(
     store: &mut CanonicalTypeMapperStore,
@@ -15808,6 +16105,44 @@ pub(super) fn check_source_file(
             return Err(SourceCheckError::Import(export.binding.declaration));
         }
     }
+    for statement in &statements {
+        let PlannedStatement::DefaultAlias(export) = statement else {
+            continue;
+        };
+        if !reexport_aliases.insert(export.alias_symbol) {
+            return Err(SourceCheckError::Import(export.declaration));
+        }
+        let immediate = CanonicalAliasResolver::new(store, alias_host)
+            .get_immediate_aliased_symbol(export.alias_symbol)
+            .map_err(|error| {
+                SourcePlanner::import_plan_error(
+                    export.declaration,
+                    &SourceImportError::Alias(error),
+                )
+            })?;
+        let resolved = CanonicalAliasResolver::new(store, alias_host)
+            .resolve_alias(export.alias_symbol)
+            .map_err(|error| {
+                SourcePlanner::import_plan_error(
+                    export.declaration,
+                    &SourceImportError::Alias(error),
+                )
+            })?;
+        if immediate != Some(export.target_symbol)
+            || resolved.target != super::AliasTargetState::Resolved(export.target_symbol)
+            || !resolved.events.is_empty()
+            || store
+                .alias_symbol_links(export.alias_symbol)
+                .is_none_or(|links| {
+                    links.immediate_target != Some(export.target_symbol)
+                        || links.alias_target
+                            != super::AliasTargetState::Resolved(export.target_symbol)
+                        || links.type_only_declaration.is_some()
+                })
+        {
+            return Err(SourceCheckError::Import(export.declaration));
+        }
+    }
     for reexport in &named_reexports {
         for binding in &reexport.bindings {
             resolve_source_named_reexport_binding(store, alias_host, binding)
@@ -15952,6 +16287,50 @@ pub(super) fn check_source_file(
             .entry(reference.root)
             .or_default()
             .push(capability);
+    }
+    for function in &functions {
+        let Some(return_type) = function.callable.return_type.type_node() else {
+            continue;
+        };
+        let Some(record) = host.node(return_type) else {
+            return Err(SourceCheckError::Provenance(
+                SourceCheckProvenanceError::MissingNode(return_type),
+            ));
+        };
+        let NodeData::TypeReferenceNode(reference) = &record.data else {
+            continue;
+        };
+        if record.kind != SyntaxKind::TypeReference || reference.type_arguments.is_some() {
+            continue;
+        }
+        let name = NodeRef::new(return_type.arena, return_type.file, reference.type_name);
+        let Some(NodeData::Identifier(identifier)) = host.node(name).map(|node| &node.data) else {
+            continue;
+        };
+        let Some(resolved) = resolved_imports.values().find(|resolved| {
+            resolved.binding.imported_text == "default"
+                && resolved.binding.local_text == identifier.text
+                && host
+                    .node(resolved.binding.declaration)
+                    .is_some_and(|node| node.kind == SyntaxKind::ImportClause)
+                && store
+                    .symbol(resolved.target_symbol)
+                    .is_some_and(|target| target.flags() == SymbolFlags::INTERFACE)
+        }) else {
+            continue;
+        };
+        let capability = CanonicalTypeReferenceAliasTarget::new(
+            return_type,
+            return_type,
+            resolved.binding.declaration,
+            resolved.binding.alias_symbol,
+            resolved.immediate_target_symbol,
+            resolved.target_symbol,
+        );
+        let capabilities = type_import_capabilities.entry(return_type).or_default();
+        if !capabilities.contains(&capability) {
+            capabilities.push(capability);
+        }
     }
 
     let mut type_import_preflight_diagnostics = CanonicalCheckerDiagnostics::default();
@@ -16420,6 +16799,16 @@ pub(super) fn check_source_file(
         }
         resolve_source_import_namespace_exports(store, alias_host, resolved)
             .map_err(|error| SourcePlanner::import_plan_error(read.node, &error))?;
+        materialize_imported_default_interface_return(
+            store,
+            host,
+            alias_host,
+            global_types,
+            options,
+            session,
+            diagnostics,
+            resolved,
+        )?;
         session.reset_query();
         let prepared = prepare_source_import_value(
             store,
@@ -17103,6 +17492,7 @@ pub(super) fn check_source_file(
             PlannedStatement::ExternalModuleMarker
             | PlannedStatement::LocalNamedExport
             | PlannedStatement::NamedReexport
+            | PlannedStatement::DefaultAlias(_)
             | PlannedStatement::AmbientOverload => {}
             PlannedStatement::AmbientVariables(initializers) => {
                 for (initializer, code) in initializers {
@@ -24750,6 +25140,134 @@ mod tests {
         assert!(is_type_checked(&context, file));
         context.check_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), after_first);
+    }
+
+    #[test]
+    fn default_interface_exports_resolve_without_publishing_runtime_values() {
+        let source = parsed("interface Color { c: string; } export default Color;");
+        let file = FileId::new(8_339);
+        let mut context = context_with_module_state(
+            &[(file, &source)],
+            CanonicalModuleState::External,
+            CanonicalCheckerOptions::default(),
+        );
+        let interface = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::InterfaceDeclaration).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let export = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ExportAssignment).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let (_, bound) = context.file(file).unwrap();
+        let interface_symbol = bound.symbol(interface).unwrap();
+        let export_symbol = bound.symbol(export).unwrap();
+
+        context.check_source_file(file).unwrap();
+
+        assert_eq!(
+            context
+                .store()
+                .alias_symbol_links(export_symbol)
+                .map(|links| (links.immediate_target, links.alias_target)),
+            Some((
+                Some(interface_symbol),
+                AliasTargetState::Resolved(interface_symbol),
+            )),
+        );
+        assert!(
+            context
+                .store()
+                .value_symbol_links(interface_symbol)
+                .is_none()
+        );
+        assert!(context.store().value_symbol_links(export_symbol).is_none());
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn imported_callable_default_interface_returns_materialize_before_their_source() {
+        let consumer = parsed(concat!(
+            "import { styled } from './factory'; ",
+            "export const value = styled();",
+        ));
+        let factory = parsed(concat!(
+            "import Color from './color'; ",
+            "export declare function styled(): Color;",
+        ));
+        let color = parsed("interface Color { c: string; } export default Color;");
+        let consumer_file = FileId::new(8_340);
+        let factory_file = FileId::new(8_341);
+        let color_file = FileId::new(8_342);
+        let files = [
+            (consumer_file, &consumer),
+            (factory_file, &factory),
+            (color_file, &color),
+        ];
+        let mut context = external_context_with_import_routes(
+            &files,
+            &[
+                SourceImportRoute {
+                    source: 0,
+                    specifier: 0,
+                    target: 1,
+                },
+                SourceImportRoute {
+                    source: 1,
+                    specifier: 0,
+                    target: 2,
+                },
+            ],
+        );
+
+        context.check_source_file(consumer_file).unwrap();
+        assert!(!is_type_checked(&context, factory_file));
+        assert!(!is_type_checked(&context, color_file));
+        context.check_source_file(factory_file).unwrap();
+        context.check_source_file(color_file).unwrap();
+        assert!(context.diagnostics().is_empty());
+
+        let interface = color
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::InterfaceDeclaration).then_some(NodeRef::new(
+                    color.arena.id(),
+                    color_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let (_, color_bound) = context.file(color_file).unwrap();
+        let interface_symbol = color_bound.symbol(interface).unwrap();
+        assert!(
+            context
+                .store()
+                .value_symbol_links(interface_symbol)
+                .is_none()
+        );
+
+        let warm = observable_state(&context, consumer_file);
+        context.recheck_source_file(consumer_file).unwrap();
+        assert_eq!(observable_state(&context, consumer_file), warm);
     }
 
     #[test]
