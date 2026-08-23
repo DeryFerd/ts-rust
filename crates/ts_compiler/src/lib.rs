@@ -4787,9 +4787,14 @@ impl Program {
                         .resolved
                     {
                         self.load_file(file_system, &resolved.resolved_file_name, false);
-                    } else {
-                        self.diagnostics
-                            .push(type_definition_not_found(&directive.value));
+                    } else if !source_ignores_processing_diagnostic(
+                        &self.source_files[file_index],
+                        directive.range,
+                    ) {
+                        let mut diagnostic = type_definition_not_found(&directive.value);
+                        diagnostic.file_name = Some(containing_file.clone());
+                        diagnostic.range = Some(directive.range);
+                        self.diagnostics.push(diagnostic);
                     }
                 }
                 ReferenceKind::Lib => {
@@ -4987,12 +4992,18 @@ enum ReferenceKind {
 struct ReferenceDirective {
     kind: ReferenceKind,
     value: String,
+    range: TextRange,
 }
 
 fn reference_directives(source: &str) -> Vec<ReferenceDirective> {
     source
-        .lines()
-        .filter_map(|line| {
+        .split_inclusive('\n')
+        .scan(0_usize, |offset, line| {
+            let line_offset = *offset;
+            *offset += line.len();
+            Some((line_offset, line))
+        })
+        .filter_map(|(line_offset, line)| {
             let reference = line
                 .trim_start()
                 .strip_prefix("///")?
@@ -5005,10 +5016,45 @@ fn reference_directives(source: &str) -> Vec<ReferenceDirective> {
             ]
             .into_iter()
             .find_map(|(kind, name)| {
-                reference_attribute(reference, name).map(|value| ReferenceDirective { kind, value })
+                let (value, value_offset) = reference_attribute_value(reference, name)?;
+                let start = line_offset + line.len() - reference.len() + value_offset;
+                let end = start + value.len();
+                Some(ReferenceDirective {
+                    kind,
+                    value: value.to_owned(),
+                    range: TextRange::new(
+                        TextPos::new(u32::try_from(start).ok()?),
+                        TextPos::new(u32::try_from(end).ok()?),
+                    ),
+                })
             })
         })
         .collect()
+}
+
+fn source_ignores_processing_diagnostic(source: &SourceFile, range: TextRange) -> bool {
+    let Ok(position) = usize::try_from(range.start.get()) else {
+        return false;
+    };
+    let line_starts = source_line_starts(&source.source_text);
+    let directives = source_comment_directives(&source.parse, &line_starts);
+    let line = source_line_of_position(&line_starts, position);
+
+    for previous in (0..line).rev() {
+        if let Some(directive) = directives.get(&previous) {
+            return !directive.expect_error;
+        }
+        let start = line_starts[previous];
+        let end = line_starts
+            .get(previous + 1)
+            .copied()
+            .unwrap_or(source.source_text.len());
+        if !source_line_is_comment_or_blank(&source.source_text[start..end]) {
+            break;
+        }
+    }
+
+    false
 }
 
 fn has_preserved_reference_directive(source: &str) -> bool {
@@ -5031,6 +5077,13 @@ fn has_no_default_lib_directive(source: &str) -> bool {
 }
 
 fn reference_attribute(reference: &str, name: &str) -> Option<String> {
+    reference_attribute_value(reference, name).map(|(value, _)| value.to_owned())
+}
+
+fn reference_attribute_value<'source>(
+    reference: &'source str,
+    name: &str,
+) -> Option<(&'source str, usize)> {
     let mut rest = reference;
     while let Some(index) = rest.find(name) {
         let candidate = &rest[index + name.len()..];
@@ -5040,7 +5093,8 @@ fn reference_attribute(reference: &str, name: &str) -> Option<String> {
             let quote = candidate.chars().next()?;
             if matches!(quote, '\'' | '"') {
                 let value = &candidate[quote.len_utf8()..];
-                return value.find(quote).map(|end| value[..end].to_owned());
+                let value_offset = reference.len() - value.len();
+                return value.find(quote).map(|end| (&value[..end], value_offset));
             }
         }
         rest = &candidate[candidate
@@ -10343,14 +10397,15 @@ mod tests {
                 .source_file("/project/node_modules/@types/auto/index.d.ts")
                 .is_some()
         );
-        assert_eq!(
-            program
-                .diagnostics()
-                .iter()
-                .filter_map(|diagnostic| diagnostic.code)
-                .collect::<Vec<_>>(),
-            [2688]
-        );
+        let [diagnostic] = program.diagnostics() else {
+            panic!(
+                "expected one missing explicit type: {:?}",
+                program.diagnostics()
+            );
+        };
+        assert_eq!(diagnostic.code, Some(2688));
+        assert_eq!(diagnostic.file_name, None);
+        assert_eq!(diagnostic.range, None);
 
         fs.write_file(
             "/project/automatic.json",
@@ -10362,6 +10417,110 @@ mod tests {
             automatic
                 .source_file("/project/node_modules/@types/auto/index.d.ts")
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn missing_triple_slash_type_reference_reports_exact_value_range() {
+        let fs = MemoryFileSystem::new(true);
+        let source = concat!(
+            "/// <reference types=\"cookie-session\"/>\n",
+            "declare const foo: number;\n",
+        );
+        fs.write_file("/project/types.d.ts", source).unwrap();
+
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["types.d.ts".to_owned()],
+            CompilerOptions {
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+
+        let [diagnostic] = program.diagnostics() else {
+            panic!(
+                "expected one missing triple-slash type: {:?}",
+                program.diagnostics()
+            );
+        };
+        assert_eq!(diagnostic.code, Some(2688));
+        assert_eq!(diagnostic.file_name.as_deref(), Some("/project/types.d.ts"));
+        assert_eq!(
+            diagnostic.range,
+            Some(TextRange::new(TextPos::new(22), TextPos::new(36)))
+        );
+        assert_eq!(
+            diagnostic.message,
+            "Cannot find type definition file for 'cookie-session'."
+        );
+    }
+
+    #[test]
+    fn missing_triple_slash_type_reference_keeps_multiline_attribute_offsets() {
+        let fs = MemoryFileSystem::new(true);
+        let source = concat!(
+            "// leading comment\r\n",
+            "  /// <reference preserve='true' types = 'cookie-session' />\r\n",
+            "declare const foo: number;\n",
+        );
+        fs.write_file("/project/types.d.ts", source).unwrap();
+
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["types.d.ts".to_owned()],
+            CompilerOptions {
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+
+        let [diagnostic] = program.diagnostics() else {
+            panic!(
+                "expected one missing triple-slash type: {:?}",
+                program.diagnostics()
+            );
+        };
+        let range = diagnostic.range.expect("missing reference value range");
+        assert_eq!(
+            &source[range.start.get() as usize..range.end.get() as usize],
+            "cookie-session"
+        );
+        assert_eq!(
+            range.start.get() as usize,
+            source.find("cookie-session").unwrap()
+        );
+    }
+
+    #[test]
+    fn preceding_ts_ignore_suppresses_missing_triple_slash_type_reference() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/types.d.ts",
+            concat!(
+                "// @ts-ignore\n",
+                "/// <reference types=\"cookie-session\"/>\n",
+                "declare const foo: number;\n",
+            ),
+        )
+        .unwrap();
+
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["types.d.ts".to_owned()],
+            CompilerOptions {
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+
+        assert!(
+            program.diagnostics().is_empty(),
+            "{:?}",
+            program.diagnostics()
         );
     }
 
