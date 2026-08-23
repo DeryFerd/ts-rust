@@ -8029,8 +8029,8 @@ impl<'a> Parser<'a> {
                     | SyntaxKind::NamespaceKeyword
             )
         {
-            let position = self.current.range.start;
-            self.error_current("Expected a property name.");
+            let position = self.current.full_start;
+            self.error_code_at(TextRange::new(position, position), 1003, []);
             self.missing_identifier(position)
         } else {
             self.parse_property_name("Expected a property name.")
@@ -16147,6 +16147,72 @@ export as namespace GlobalName;
         assert!(result.arena.iter().all(|(_, node)| {
             !matches!(&node.data, NodeData::Identifier(identifier) if identifier.text.is_empty())
         }));
+    }
+
+    #[test]
+    fn reports_trailing_property_access_before_next_line_declarations() {
+        for (source, next_kind) in [
+            (
+                "const first = value.\nvar next = 1;",
+                SyntaxKind::VariableStatement,
+            ),
+            (
+                "const first = value.\r\nlet next = 1;",
+                SyntaxKind::VariableStatement,
+            ),
+            (
+                "const first = value.\nconst next = 1;",
+                SyntaxKind::VariableStatement,
+            ),
+            (
+                "const first = value.\nnamespace Named {}",
+                SyntaxKind::ModuleDeclaration,
+            ),
+        ] {
+            let result = parse_source_file(source);
+            let position = source.find('.').unwrap() + 1;
+            let diagnostic_position = u32::try_from(position).unwrap();
+            assert_eq!(
+                result
+                    .diagnostics
+                    .iter()
+                    .map(|diagnostic| (
+                        diagnostic.code,
+                        diagnostic.range.start.get(),
+                        diagnostic.range.end.get()
+                    ))
+                    .collect::<Vec<_>>(),
+                [(Some(1003), diagnostic_position, diagnostic_position)],
+                "{source:?}"
+            );
+
+            let statements = source_statements(&result);
+            assert_eq!(statements.len(), 2, "{source:?}");
+            assert_eq!(result.arena.get(statements[1]).unwrap().kind, next_kind);
+
+            let (list, _) = variable_list(&result, statements[0]);
+            let declaration = declaration_nodes(&result, list)[0];
+            let NodeData::VariableDeclaration(declaration) =
+                &result.arena.get(declaration).unwrap().data
+            else {
+                panic!("expected the first variable declaration");
+            };
+            let NodeData::PropertyAccessExpression(access) = &result
+                .arena
+                .get(declaration.initializer.unwrap())
+                .unwrap()
+                .data
+            else {
+                panic!("expected the recovered property access");
+            };
+            let missing_name = result.arena.get(access.name).unwrap();
+            assert_eq!(missing_name.flags, NODE_FLAG_HAS_ERROR);
+            assert_eq!(missing_name.range, text_range(position, position));
+        }
+
+        let valid = parse_source_file("const first = value.\nproperty;");
+        assert!(valid.diagnostics.is_empty(), "{:?}", valid.diagnostics);
+        assert_eq!(source_statements(&valid).len(), 1);
     }
 
     #[test]
