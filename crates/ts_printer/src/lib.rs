@@ -5899,9 +5899,11 @@ impl DeclarationPrinter<'_> {
                 if !self.variable_list_has_bound_names(data.declaration_list) {
                     return Ok(());
                 }
-                if self.javascript_source
-                    && !self.module_file
-                    && self.emit_javascript_global_function_variables(data.declaration_list)?
+                if (!in_namespace
+                    && self.emit_exported_function_expando(id, &node, data.declaration_list)?)
+                    || (self.javascript_source
+                        && !self.module_file
+                        && self.emit_javascript_global_function_variables(data.declaration_list)?)
                 {
                 } else if self.javascript_source
                     && self.variable_list_is_commonjs_object_export(data.declaration_list)
@@ -5944,7 +5946,9 @@ impl DeclarationPrinter<'_> {
                 } else {
                     self.function_static_assignments(data)
                 };
-                let synthesized_default_namespace = !static_assignments.is_empty()
+                let namespace_assignments =
+                    self.function_expando_namespace_assignments(&static_assignments);
+                let synthesized_default_namespace = !namespace_assignments.is_empty()
                     && declaration_has_modifier(self.arena, &node, SyntaxKind::DefaultKeyword);
                 if synthesized_default_namespace && !in_namespace {
                     self.writer.write("declare ");
@@ -6019,29 +6023,7 @@ impl DeclarationPrinter<'_> {
                     self.emit_return_type(data.type_)?;
                 }
                 self.writer.write(";");
-                if !static_assignments.is_empty() {
-                    let namespace_assignments = static_assignments
-                        .iter()
-                        .filter_map(|(property, value)| {
-                            let computed_access = self
-                                .arena
-                                .get(*property)
-                                .and_then(|property| property.parent)
-                                .and_then(|parent| self.arena.get(parent))
-                                .is_some_and(|parent| {
-                                    matches!(parent.data, NodeData::ElementAccessExpression(_))
-                                });
-                            let (name, numeric) =
-                                match self.arena.get(*property).map(|node| &node.data) {
-                                    Some(NodeData::Identifier(identifier)) if !computed_access => {
-                                        (identifier.text.clone(), false)
-                                    }
-                                    _ => self.late_bound_property_name(*property)?,
-                                };
-                            (!numeric && is_identifier_text(&name))
-                                .then_some((name, *property, *value))
-                        })
-                        .collect::<Vec<_>>();
+                if !namespace_assignments.is_empty() {
                     self.writer.newline();
                     if !synthesized_default_namespace
                         && ((!in_namespace && exported) || namespace_export)
@@ -6056,66 +6038,10 @@ impl DeclarationPrinter<'_> {
                     if let Some(name) = data.name {
                         self.emit_name(name)?;
                     }
-                    if namespace_assignments.is_empty() {
-                        self.writer.write(" { }");
-                        self.writer.newline();
-                        return Ok(());
-                    }
                     self.writer.write(" {");
                     self.writer.newline();
                     self.writer.indent += 1;
-                    let has_reserved_property = namespace_assignments
-                        .iter()
-                        .any(|(name, _, _)| is_es5_reserved_binding_name(name));
-                    let mut reserved_aliases = Vec::new();
-                    for (property_text, property, value) in &namespace_assignments {
-                        if matches!(
-                            self.arena.get(*value).map(|node| &node.data),
-                            Some(NodeData::Identifier(_))
-                        ) && let Some(value_name) = declaration_name_text(self.arena, *value)
-                        {
-                            self.writer.write("export { ");
-                            self.writer.write(value_name);
-                            if value_name != property_text {
-                                self.writer.write(" as ");
-                                self.emit_semantic_property_name(property_text);
-                            }
-                            self.writer.write(" };");
-                            self.writer.newline();
-                            continue;
-                        }
-                        let reserved = is_es5_reserved_binding_name(property_text);
-                        if has_reserved_property && !reserved {
-                            self.writer.write("export ");
-                        }
-                        self.writer.write("var ");
-                        if reserved {
-                            let alias = self.generate_declaration_temp_name();
-                            self.writer.write(&alias);
-                            reserved_aliases.push((alias, *property));
-                        } else {
-                            self.writer.write(property_text);
-                        }
-                        self.writer.write(": ");
-                        self.emit_function_static_assignment_type(*value)?;
-                        self.writer.write(";");
-                        self.writer.newline();
-                    }
-                    if !reserved_aliases.is_empty() {
-                        self.writer.write("export { ");
-                    }
-                    for (index, (alias, property)) in reserved_aliases.iter().enumerate() {
-                        if index != 0 {
-                            self.writer.write(", ");
-                        }
-                        self.writer.write(alias);
-                        self.writer.write(" as ");
-                        self.emit_name(*property)?;
-                    }
-                    if !reserved_aliases.is_empty() {
-                        self.writer.write(" };");
-                        self.writer.newline();
-                    }
+                    self.emit_function_expando_namespace_members(&namespace_assignments)?;
                     self.writer.indent -= 1;
                     self.writer.write("}");
                     if synthesized_default_namespace {
@@ -6853,7 +6779,7 @@ impl DeclarationPrinter<'_> {
             self.writer.write(";");
 
             let instance_properties = self.javascript_function_instance_properties(function.body);
-            let static_assignments = self.variable_static_assignments(&name);
+            let static_assignments = self.variable_static_assignments(variable.name);
             if !static_assignments.is_empty() {
                 self.writer.newline();
                 self.writer.write("declare namespace ");
@@ -7003,7 +6929,7 @@ impl DeclarationPrinter<'_> {
                         self.arena.get(initializer).map(|node| &node.data),
                         Some(NodeData::FunctionExpression(function))
                             if !self.javascript_function_instance_properties(function.body).is_empty()
-                                && declaration_name_text(self.arena, variable.name).is_some_and(|name| !self.variable_static_assignments(name).is_empty())
+                                && !self.variable_static_assignments(variable.name).is_empty()
                     )))
                     && *candidate != declaration
             })
@@ -11453,9 +11379,7 @@ impl DeclarationPrinter<'_> {
             }
             emitted_declaration = true;
             self.emit_name(declaration.name)?;
-            let expando_assignments = declaration_name_text(self.arena, declaration.name)
-                .map(|name| self.variable_static_assignments(name))
-                .unwrap_or_default();
+            let expando_assignments = self.variable_static_assignments(declaration.name);
             if self.javascript_source
                 && let Some(hint) = node
                     .parent
@@ -12123,10 +12047,232 @@ impl DeclarationPrinter<'_> {
             })
     }
 
-    fn variable_static_assignments(&self, variable_name: &str) -> Vec<(NodeId, NodeId)> {
-        self.arena
+    fn emit_exported_function_expando(
+        &mut self,
+        statement_id: NodeId,
+        statement: &Node,
+        list: NodeId,
+    ) -> Result<bool, EmitError> {
+        if !declaration_has_modifier(self.arena, statement, SyntaxKind::ExportKeyword)
+            || declaration_has_modifier(self.arena, statement, SyntaxKind::DefaultKeyword)
+        {
+            return Ok(false);
+        }
+        let list_node = self.node(list)?.clone();
+        let NodeData::VariableDeclarationList(list) = &list_node.data else {
+            return Ok(false);
+        };
+        let [declaration_id] = list.declarations.nodes.as_slice() else {
+            return Ok(false);
+        };
+        let declaration_node = self.node(*declaration_id)?.clone();
+        let NodeData::VariableDeclaration(declaration) = &declaration_node.data else {
+            return Ok(false);
+        };
+        if list_node.flags.0 & (1 << 1) == 0 || declaration.type_.is_some() {
+            return Ok(false);
+        }
+        if self.javascript_source
+            && list_node
+                .parent
+                .is_some_and(|statement| self.jsdoc_type_hint(statement).is_some())
+        {
+            return Ok(false);
+        }
+        if declaration_name_text(self.arena, declaration.name).is_none() {
+            return Ok(false);
+        }
+        let Some(initializer) = declaration.initializer else {
+            return Ok(false);
+        };
+        let initializer_node = self.node(initializer)?.clone();
+        let (type_parameters, parameters, return_type, body) = match &initializer_node.data {
+            NodeData::ArrowFunction(function) => (
+                function.type_parameters.clone(),
+                function.parameters.clone(),
+                function.type_,
+                function.body,
+            ),
+            NodeData::FunctionExpression(function) => (
+                function.type_parameters.clone(),
+                function.parameters.clone(),
+                function.type_,
+                function.body,
+            ),
+            _ => return Ok(false),
+        };
+        let assignments = self.function_expando_namespace_assignments(
+            &self.variable_static_assignments(declaration.name),
+        );
+        if assignments.is_empty() {
+            return Ok(false);
+        }
+        self.emit_declaration_prefix(statement, true);
+        self.writer.write("function ");
+        self.emit_name(declaration.name)?;
+        self.emit_type_parameters(type_parameters.as_ref())?;
+        if self.javascript_source && type_parameters.is_none() {
+            self.emit_jsdoc_template_parameters(statement_id);
+        }
+        let signature = self.semantic_function_signature(initializer);
+        if let Some(signature) = &signature {
+            let declaration = if self.javascript_source {
+                statement_id
+            } else {
+                initializer
+            };
+            self.emit_declaration_parameters(&parameters, signature, declaration)?;
+        } else {
+            self.emit_parameters(&parameters)?;
+        }
+        self.writer.write(": ");
+        let jsdoc_return_type = self.javascript_declaration_return_type(statement_id);
+        if let Some(return_type) = return_type {
+            self.emit_type(return_type)?;
+        } else if let Some(return_type) = jsdoc_return_type {
+            self.emit_jsdoc_type_hint(&return_type);
+        } else if matches!(
+            self.arena.get(body).map(|node| &node.data),
+            Some(NodeData::Block(_))
+        ) && !self.block_has_value_return(body)
+        {
+            self.writer.write("void");
+        } else if let Some(signature) = signature {
+            self.emit_semantic_type(signature.return_type)?;
+        } else {
+            self.writer.write("any");
+        }
+        self.writer.write(";");
+        self.writer.newline();
+        self.emit_promoted_function_expando_namespace(statement, declaration.name, &assignments)?;
+        Ok(true)
+    }
+
+    fn javascript_declaration_return_type(&self, declaration: NodeId) -> Option<String> {
+        self.javascript_source
+            .then(|| self.leading_jsdoc_comment(declaration))
+            .flatten()
+            .and_then(|comment| {
+                comment.lines().find_map(|line| {
+                    let tag = Self::jsdoc_tag_line(line);
+                    tag.find("@returns")
+                        .or_else(|| tag.find("@return"))
+                        .and_then(|start| Self::jsdoc_return_type(&tag[start..]))
+                })
+            })
+    }
+
+    fn emit_promoted_function_expando_namespace(
+        &mut self,
+        statement: &Node,
+        name: NodeId,
+        assignments: &[(String, NodeId, NodeId)],
+    ) -> Result<(), EmitError> {
+        self.emit_declaration_prefix(statement, true);
+        self.writer.write("namespace ");
+        self.emit_name(name)?;
+        self.writer.write(" {");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.emit_function_expando_namespace_members(assignments)?;
+        self.writer.indent -= 1;
+        self.writer.write("}");
+        Ok(())
+    }
+
+    fn function_expando_namespace_assignments(
+        &self,
+        assignments: &[(NodeId, NodeId)],
+    ) -> Vec<(String, NodeId, NodeId)> {
+        let mut seen = HashSet::new();
+        assignments
             .iter()
-            .filter_map(|(_, node)| {
+            .filter_map(|(property, value)| {
+                let computed = self
+                    .arena
+                    .get(*property)
+                    .and_then(|property| property.parent)
+                    .and_then(|parent| self.arena.get(parent))
+                    .is_some_and(|parent| {
+                        matches!(parent.data, NodeData::ElementAccessExpression(_))
+                    });
+                let (name, numeric) = match self.arena.get(*property).map(|node| &node.data) {
+                    Some(NodeData::Identifier(identifier)) if !computed => {
+                        (identifier.text.clone(), false)
+                    }
+                    _ => self.late_bound_property_name(*property)?,
+                };
+                (!numeric && is_identifier_text(&name) && seen.insert(name.clone()))
+                    .then_some((name, *property, *value))
+            })
+            .collect()
+    }
+
+    fn emit_function_expando_namespace_members(
+        &mut self,
+        assignments: &[(String, NodeId, NodeId)],
+    ) -> Result<(), EmitError> {
+        let has_reserved_property = assignments
+            .iter()
+            .any(|(name, _, _)| is_es5_reserved_binding_name(name));
+        for (property_name, _, value) in assignments {
+            if matches!(
+                self.arena.get(*value).map(|node| &node.data),
+                Some(NodeData::Identifier(_))
+            ) && let Some(value_name) = declaration_name_text(self.arena, *value)
+            {
+                self.writer.write("export { ");
+                self.writer.write(value_name);
+                if value_name != property_name {
+                    self.writer.write(" as ");
+                    self.emit_semantic_property_name(property_name);
+                }
+                self.writer.write(" };");
+                self.writer.newline();
+                continue;
+            }
+
+            let reserved = is_es5_reserved_binding_name(property_name);
+            if has_reserved_property && !reserved {
+                self.writer.write("export ");
+            }
+            self.writer.write("var ");
+            let alias = reserved.then(|| self.generate_declaration_temp_name());
+            self.writer.write(alias.as_deref().unwrap_or(property_name));
+            self.writer.write(": ");
+            self.emit_function_static_assignment_type(*value)?;
+            self.writer.write(";");
+            self.writer.newline();
+
+            if let Some(alias) = alias {
+                self.writer.write("export { ");
+                self.writer.write(&alias);
+                self.writer.write(" as ");
+                self.emit_semantic_property_name(property_name);
+                self.writer.write(" };");
+                self.writer.newline();
+            }
+        }
+        Ok(())
+    }
+
+    fn variable_static_assignments(&self, variable_name_id: NodeId) -> Vec<(NodeId, NodeId)> {
+        let Some(variable_name) = declaration_name_text(self.arena, variable_name_id) else {
+            return Vec::new();
+        };
+        let variable_symbol = self
+            .bindings
+            .node_symbols
+            .get(&variable_name_id)
+            .copied()
+            .or_else(|| {
+                self.bindings
+                    .resolve_name_at(variable_name_id, variable_name)
+            });
+        let mut assignments = self
+            .arena
+            .iter()
+            .filter_map(|(statement_id, node)| {
                 let NodeData::ExpressionStatement(statement) = &node.data else {
                     return None;
                 };
@@ -12145,10 +12291,44 @@ impl DeclarationPrinter<'_> {
                     }
                     _ => return None,
                 };
-                (declaration_name_text(self.arena, receiver) == Some(variable_name)
-                    && self.late_bound_property_name(property).is_some())
-                .then_some((property, assignment.right))
+                if declaration_name_text(self.arena, receiver) != Some(variable_name)
+                    || self.late_bound_property_name(property).is_none()
+                    || variable_symbol
+                        .zip(self.bindings.resolve_name_at(receiver, variable_name))
+                        .is_some_and(|(declaration, receiver)| declaration != receiver)
+                {
+                    return None;
+                }
+
+                let mut current = statement_id;
+                while let Some(parent_id) = self.arena.get(current).and_then(|node| node.parent) {
+                    let parent = self.arena.get(parent_id)?;
+                    if matches!(
+                        parent.data,
+                        NodeData::FunctionDeclaration(_)
+                            | NodeData::FunctionExpression(_)
+                            | NodeData::ArrowFunction(_)
+                            | NodeData::MethodDeclaration(_)
+                            | NodeData::GetAccessorDeclaration(_)
+                            | NodeData::SetAccessorDeclaration(_)
+                            | NodeData::ClassDeclaration(_)
+                            | NodeData::ClassExpression(_)
+                    ) {
+                        return None;
+                    }
+                    if matches!(parent.data, NodeData::SourceFile(_)) {
+                        break;
+                    }
+                    current = parent_id;
+                }
+
+                Some((node.range.start, property, assignment.right))
             })
+            .collect::<Vec<_>>();
+        assignments.sort_by_key(|(start, _, _)| *start);
+        assignments
+            .into_iter()
+            .map(|(_, property, value)| (property, value))
             .collect()
     }
 
@@ -16266,6 +16446,14 @@ impl DeclarationPrinter<'_> {
             self.emit_jsdoc_overload_signature_tail(overload);
             self.writer.write(";");
         }
+        if variable_function && !in_namespace {
+            let assignments = self
+                .function_expando_namespace_assignments(&self.variable_static_assignments(name));
+            if !assignments.is_empty() {
+                self.writer.newline();
+                self.emit_promoted_function_expando_namespace(node, name, &assignments)?;
+            }
+        }
         Ok(true)
     }
 
@@ -18772,7 +18960,7 @@ impl DeclarationPrinter<'_> {
             });
             jsdoc_optional = optional;
         } else if let Some(type_id) = type_id {
-            self.emit_semantic_type(type_id)?;
+            self.emit_widened_semantic_type(type_id)?;
         } else {
             self.writer.write("any");
         }
@@ -77349,10 +77537,10 @@ mod tests {
         let declaration = emit_declarations_with_semantics(source);
         assert!(
             declaration.contains(concat!(
-                "export declare const Point: {\n",
-                "    (x: number, y: number): Point;\n",
-                "    zero(): Point;\n",
-                "};",
+                "export declare function Point(x: number, y: number): Point;\n",
+                "export declare namespace Point {\n",
+                "    var zero: () => Point;\n",
+                "}",
             )),
             "{declaration}"
         );
@@ -86633,6 +86821,49 @@ class Board {
     }
 
     #[test]
+    fn declaration_maps_remain_stable_after_promoted_function_namespaces() {
+        let source = concat!(
+            "export const factory = (value: string) => value;\n",
+            "factory.member = 1;\n",
+            "export const after = 2;\n",
+        );
+        let parsed = parse_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let checked = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        let result = emit_declaration_file_with_semantics(
+            &parsed.arena,
+            parsed.source_file,
+            "input.ts",
+            source,
+            true,
+            Some(&checked.declaration_reachability),
+            None,
+            Some(&checked.types),
+            Some(&checked.node_types),
+            Some(&checked.import_type_references),
+            Some(&checked.named_type_references),
+            false,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.code,
+            concat!(
+                "export declare function factory(value: string): string;\n",
+                "export declare namespace factory {\n",
+                "    var member: number;\n",
+                "}\n",
+                "export declare const after = 2;\n",
+            )
+        );
+        let map = result.source_map.expect("declaration map is enabled");
+        assert_eq!(map.sources, ["input.ts"]);
+        assert_eq!(map.mappings, "AAAA;;;;AAEA");
+    }
+
+    #[test]
     fn source_map_columns_use_utf16_code_units() {
         assert_eq!(original_position("😀 value", &[0], 5), (0, 3));
 
@@ -87041,6 +87272,10 @@ class Board {
             "export const arrow = () => {};\n",
             "arrow[key] = 1;\n",
             "arrow[42] = \"value\";\n",
+            "export const numeric = () => {};\n",
+            "numeric[42] = \"value\";\n",
+            "export const invalid = () => {};\n",
+            "invalid[\"not valid\"] = true;\n",
         ));
         assert!(
             output.contains(concat!(
@@ -87053,14 +87288,132 @@ class Board {
         );
         assert!(
             output.contains(concat!(
-                "export declare const arrow: {\n",
+                "export declare function arrow(): void;\n",
+                "export declare namespace arrow {\n",
+                "    var named: number;\n",
+                "}",
+            )),
+            "{output}"
+        );
+        assert!(
+            output.contains(concat!(
+                "export declare const numeric: {\n",
                 "    (): void;\n",
-                "    named: number;\n",
                 "    42: string;\n",
                 "};",
             )),
             "{output}"
         );
+        assert!(
+            output.contains(concat!(
+                "export declare const invalid: {\n",
+                "    (): void;\n",
+                "    \"not valid\": boolean;\n",
+                "};",
+            )),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn function_expandos_do_not_emit_empty_namespaces_for_invalid_keys() {
+        let source = concat!(
+            "const key = \"not valid\";\n",
+            "export function numeric() {}\n",
+            "numeric[42] = 1;\n",
+            "export function invalid() {}\n",
+            "invalid[\"not valid\"] = 2;\n",
+            "export function computed() {}\n",
+            "computed[key] = 3;\n",
+        );
+        let expected = concat!(
+            "export declare function numeric(): void;\n",
+            "export declare function invalid(): void;\n",
+            "export declare function computed(): void;\n",
+        );
+
+        for emit in [
+            emit_declarations_with_semantics as fn(&str) -> String,
+            emit_javascript_declarations_with_semantics,
+        ] {
+            assert_eq!(emit(source), expected);
+        }
+    }
+
+    #[test]
+    fn function_expandos_preserve_reserved_members_in_source_order() {
+        let source = concat!(
+            "export function declared() {}\n",
+            "declared.class = true;\n",
+            "declared.normal = false;\n",
+            "export const arrow = () => {};\n",
+            "arrow.default = 1;\n",
+            "arrow.value = 2;\n",
+        );
+        let expected = concat!(
+            "export declare function declared(): void;\n",
+            "export declare namespace declared {\n",
+            "    var _a: boolean;\n",
+            "    export { _a as class };\n",
+            "    export var normal: boolean;\n",
+            "}\n",
+            "export declare function arrow(): void;\n",
+            "export declare namespace arrow {\n",
+            "    var _b: number;\n",
+            "    export { _b as default };\n",
+            "    export var value: number;\n",
+            "}\n",
+        );
+
+        for emit in [
+            emit_declarations_with_semantics as fn(&str) -> String,
+            emit_javascript_declarations_with_semantics,
+        ] {
+            assert_eq!(emit(source), expected);
+        }
+    }
+
+    #[test]
+    fn promoted_function_expandos_reexport_identifier_values() {
+        let source = concat!(
+            "export function original() {}\n",
+            "export const arrow = () => {};\n",
+            "arrow.original = original;\n",
+            "arrow.renamed = original;\n",
+        );
+        let expected = concat!(
+            "export declare function original(): void;\n",
+            "export declare function arrow(): void;\n",
+            "export declare namespace arrow {\n",
+            "    export { original };\n",
+            "    export { original as renamed };\n",
+            "}\n",
+        );
+
+        for emit in [
+            emit_declarations_with_semantics as fn(&str) -> String,
+            emit_javascript_declarations_with_semantics,
+        ] {
+            assert_eq!(emit(source), expected);
+        }
+    }
+
+    #[test]
+    fn variable_expandos_ignore_shadowed_nested_assignments() {
+        let source = concat!(
+            "export const arrow = () => {};\n",
+            "function nested() {\n",
+            "    const arrow = () => {};\n",
+            "    arrow.hidden = true;\n",
+            "}\n",
+        );
+
+        for emit in [
+            emit_declarations_with_semantics as fn(&str) -> String,
+            emit_javascript_declarations_with_semantics,
+        ] {
+            assert_eq!(emit(source), "export declare const arrow: () => void;\n");
+        }
     }
 
     #[test]
@@ -87757,6 +88110,30 @@ class Board {
     }
 
     #[test]
+    fn javascript_instance_properties_preserve_each_source_quote_style() {
+        let source = concat!(
+            "class Quoted {\n",
+            "    method() {\n",
+            "        this['single'] = 1;\n",
+            "        this[\"double\"] = true;\n",
+            "        this[\"not valid\"] = \"value\";\n",
+            "    }\n",
+            "}\n",
+        );
+        assert_eq!(
+            emit_javascript_declarations_with_semantics(source),
+            concat!(
+                "declare class Quoted {\n",
+                "    'single': number;\n",
+                "    \"double\": boolean;\n",
+                "    \"not valid\": string;\n",
+                "    method(): void;\n",
+                "}\n",
+            )
+        );
+    }
+
+    #[test]
     fn javascript_function_expandos_include_valid_computed_static_names() {
         let source = concat!(
             "const key = \"computed\";\n",
@@ -87775,6 +88152,70 @@ class Board {
                 "    var named: number;\n",
                 "    var computed: number;\n",
                 "    var direct: number;\n",
+                "}\n",
+            )
+        );
+    }
+
+    #[test]
+    fn javascript_arrow_expandos_promote_only_identifier_safe_members() {
+        let source = concat!(
+            "const key = \"named\";\n",
+            "export const arrow = () => {};\n",
+            "arrow[key] = 1;\n",
+            "arrow[42] = \"ignored\";\n",
+            "export const expression = function () {};\n",
+            "expression.named = 2;\n",
+            "export const numeric = () => {};\n",
+            "numeric[42] = \"value\";\n",
+            "export const invalid = () => {};\n",
+            "invalid[\"not valid\"] = true;\n",
+        );
+        assert_eq!(
+            emit_javascript_declarations_with_semantics(source),
+            concat!(
+                "export declare function arrow(): void;\n",
+                "export declare namespace arrow {\n",
+                "    var named: number;\n",
+                "}\n",
+                "export declare function expression(): void;\n",
+                "export declare namespace expression {\n",
+                "    var named: number;\n",
+                "}\n",
+                "export declare const numeric: {\n",
+                "    (): void;\n",
+                "    42: string;\n",
+                "};\n",
+                "export declare const invalid: {\n",
+                "    (): void;\n",
+                "    \"not valid\": boolean;\n",
+                "};\n",
+            )
+        );
+    }
+
+    #[test]
+    fn javascript_promoted_function_expandos_preserve_jsdoc_signatures() {
+        let source = concat!(
+            "/**\n",
+            " * @template T\n",
+            " * @param {T} value\n",
+            " * @returns {T}\n",
+            " */\n",
+            "export const identity = value => value;\n",
+            "identity.extra = 1;\n",
+        );
+        assert_eq!(
+            emit_javascript_declarations_with_semantics(source),
+            concat!(
+                "/**\n",
+                " * @template T\n",
+                " * @param {T} value\n",
+                " * @returns {T}\n",
+                " */\n",
+                "export declare function identity<T>(value: T): T;\n",
+                "export declare namespace identity {\n",
+                "    var extra: number;\n",
                 "}\n",
             )
         );
