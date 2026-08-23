@@ -6445,6 +6445,33 @@ mod tests {
     }
 
     #[test]
+    fn only_variance_exempt_callables_are_admitted_without_function_variance_options() {
+        let mut fixture = function_relation_fixture(concat!(
+            "class Method { run(): void {} } ",
+            "type Callback = () => void;",
+        ));
+        let method = query_class_members(&mut fixture, "Method");
+        let method_type = fixture
+            .store
+            .value_symbol_links(method.instance_properties()[0])
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let (callback, signature) = query_function_alias(&mut fixture, "Callback");
+        resolve_function_return(&mut fixture, signature);
+
+        assert_eq!(
+            fixture
+                .store
+                .admit_callable_relation_type(method_type, None),
+            Ok(true)
+        );
+        assert_eq!(
+            fixture.store.admit_callable_relation_type(callback, None),
+            Err(RelationUnavailable::StructuredSignatures(callback))
+        );
+    }
+
+    #[test]
     fn inherited_and_static_class_methods_retain_callable_relation_semantics() {
         let mut fixture = function_relation_fixture(concat!(
             "class Base { run(): void {} static shared(): void {} } ",
