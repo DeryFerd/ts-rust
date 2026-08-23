@@ -912,7 +912,7 @@ impl<'a> Scanner<'a> {
                 }
                 SyntaxKind::WhitespaceTrivia
             }
-            '\r' | '\n' | '\u{2028}' | '\u{2029}' => {
+            '\r' | '\n' => {
                 if ch == '\r' && self.peek() == Some('\n') {
                     self.bump();
                 }
@@ -3001,6 +3001,32 @@ mod tests {
         );
         assert_eq!(scanner.scan_jsdoc_token().kind, SyntaxKind::OpenBraceToken);
         assert!(scanner.can_follow_jsdoc_at());
+    }
+
+    #[test]
+    fn jsdoc_unicode_line_separators_are_unknown_without_affecting_normal_scanning() {
+        for separator in ['\u{2028}', '\u{2029}'] {
+            let source = format!("{separator}tag");
+            let mut jsdoc = Scanner::new(&source);
+            let token = jsdoc.scan_jsdoc_token();
+            assert_eq!(token.kind, SyntaxKind::Unknown);
+            assert_eq!(token.text, separator.to_string());
+            assert!(!token.flags.contains(TokenFlags::PRECEDING_LINE_BREAK));
+            assert_eq!(jsdoc.scan_jsdoc_token().text, "tag");
+
+            let mut ordinary = Scanner::new(&source);
+            let identifier = ordinary.scan();
+            assert_eq!(identifier.kind, SyntaxKind::Identifier);
+            assert!(identifier.flags.contains(TokenFlags::PRECEDING_LINE_BREAK));
+        }
+
+        for source in ["\rtag", "\ntag", "\r\ntag"] {
+            let mut scanner = Scanner::new(source);
+            let newline = scanner.scan_jsdoc_token();
+            assert_eq!(newline.kind, SyntaxKind::NewLineTrivia);
+            assert!(newline.flags.contains(TokenFlags::PRECEDING_LINE_BREAK));
+            assert_eq!(scanner.scan_jsdoc_token().text, "tag");
+        }
     }
 
     #[test]
