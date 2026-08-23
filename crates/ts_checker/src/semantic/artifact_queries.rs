@@ -1398,19 +1398,112 @@ impl CanonicalCheckerContext<'_> {
                 return Ok(None);
             }
             match &record.data {
-                NodeData::VariableDeclaration(variable) => variable.type_,
-                NodeData::ParameterDeclaration(parameter) => parameter.type_,
-                NodeData::PropertyDeclaration(property) => property.type_,
-                NodeData::PropertySignatureDeclaration(property) => Some(property.type_),
+                NodeData::VariableDeclaration(variable) => variable.type_.map(|annotation| {
+                    NodeRef::new(declaration.arena, declaration.file, annotation)
+                }),
+                NodeData::ParameterDeclaration(parameter) => parameter.type_.map(|annotation| {
+                    NodeRef::new(declaration.arena, declaration.file, annotation)
+                }),
+                NodeData::PropertyDeclaration(property) => property.type_.map(|annotation| {
+                    NodeRef::new(declaration.arena, declaration.file, annotation)
+                }),
+                NodeData::PropertySignatureDeclaration(property) => Some(NodeRef::new(
+                    declaration.arena,
+                    declaration.file,
+                    property.type_,
+                )),
+                NodeData::GetAccessorDeclaration(_) | NodeData::SetAccessorDeclaration(_) => {
+                    self.declaration_file_accessor_annotation(node, symbol)?
+                }
                 _ => None,
             }
-            .map(|annotation| NodeRef::new(declaration.arena, declaration.file, annotation))
         };
         let Some(annotation) = annotation else {
             return Ok(None);
         };
         let type_ = self.get_type_from_type_node(annotation)?;
         self.validate_artifact_type(node, type_).map(Some)
+    }
+
+    fn declaration_file_accessor_annotation(
+        &self,
+        node: NodeRef,
+        symbol: SemanticSymbolId,
+    ) -> Result<Option<NodeRef>, CanonicalArtifactQueryError> {
+        let record = self
+            .store()
+            .symbol(symbol)
+            .ok_or(CanonicalArtifactQueryError::InvalidSymbol { node, symbol })?;
+        if !record.flags().intersects(SymbolFlags::ACCESSOR) {
+            return Err(CanonicalArtifactQueryError::InvalidSymbol { node, symbol });
+        }
+
+        let mut setter = None;
+        for declaration in record.declarations().unwrap_or(&[]) {
+            let (_, bound, record) = self.validated_artifact_node(*declaration)?;
+            if !bound
+                .source_facts()
+                .is_some_and(ts_binder::CanonicalSourceFileFacts::is_declaration_file)
+            {
+                return Ok(None);
+            }
+
+            match &record.data {
+                NodeData::GetAccessorDeclaration(accessor) => {
+                    if record.kind != SyntaxKind::GetAccessor
+                        || !accessor.parameters.nodes.is_empty()
+                        || accessor.parameters.has_trailing_comma
+                    {
+                        return Ok(None);
+                    }
+                    if let Some(annotation) = accessor.type_ {
+                        let annotation =
+                            NodeRef::new(declaration.arena, declaration.file, annotation);
+                        if self.validated_artifact_node(annotation)?.2.parent
+                            != Some(declaration.node)
+                        {
+                            return Err(CanonicalArtifactQueryError::ForeignNode(annotation));
+                        }
+                        return Ok(Some(annotation));
+                    }
+                }
+                NodeData::SetAccessorDeclaration(_) => setter = Some(*declaration),
+                _ => return Ok(None),
+            }
+        }
+
+        let Some(setter) = setter else {
+            return Ok(None);
+        };
+        let (_, _, record) = self.validated_artifact_node(setter)?;
+        let NodeData::SetAccessorDeclaration(accessor) = &record.data else {
+            return Err(CanonicalArtifactQueryError::ForeignNode(setter));
+        };
+        if record.kind != SyntaxKind::SetAccessor
+            || accessor.type_.is_some()
+            || accessor.parameters.has_trailing_comma
+        {
+            return Ok(None);
+        }
+        let [parameter] = accessor.parameters.nodes.as_slice() else {
+            return Ok(None);
+        };
+        let parameter = NodeRef::new(setter.arena, setter.file, *parameter);
+        let (_, _, record) = self.validated_artifact_node(parameter)?;
+        let NodeData::ParameterDeclaration(data) = &record.data else {
+            return Err(CanonicalArtifactQueryError::ForeignNode(parameter));
+        };
+        if record.kind != SyntaxKind::Parameter || record.parent != Some(setter.node) {
+            return Err(CanonicalArtifactQueryError::ForeignNode(parameter));
+        }
+        let Some(annotation) = data.type_ else {
+            return Ok(None);
+        };
+        let annotation = NodeRef::new(parameter.arena, parameter.file, annotation);
+        if self.validated_artifact_node(annotation)?.2.parent != Some(parameter.node) {
+            return Err(CanonicalArtifactQueryError::ForeignNode(annotation));
+        }
+        Ok(Some(annotation))
     }
 }
 
@@ -1544,6 +1637,7 @@ fn supports_type_location(data: &NodeData) -> bool {
                 | NodeData::EnumMember(_)
                 | NodeData::FunctionDeclaration(_)
                 | NodeData::FunctionExpression(_)
+                | NodeData::GetAccessorDeclaration(_)
                 | NodeData::Identifier(_)
                 | NodeData::ImportClause(_)
                 | NodeData::ImportSpecifier(_)
@@ -1567,6 +1661,7 @@ fn supports_type_location(data: &NodeData) -> bool {
                 | NodeData::PropertySignatureDeclaration(_)
                 | NodeData::QualifiedName(_)
                 | NodeData::SatisfiesExpression(_)
+                | NodeData::SetAccessorDeclaration(_)
                 | NodeData::ShorthandPropertyAssignment(_)
                 | NodeData::StringLiteral(_)
                 | NodeData::TypeAliasDeclaration(_)
@@ -1600,7 +1695,7 @@ mod tests {
     };
     use ts_parser::{ParseResult, parse_jsx_source_file, parse_source_file};
 
-    use super::CanonicalCheckerContext;
+    use super::{CanonicalArtifactQueryError, CanonicalCheckerContext};
     use crate::semantic::{
         AliasSymbolLinks, AliasTargetState, CanonicalCheckerOptions,
         CanonicalModuleResolutionEntry, CanonicalModuleResolutionManifestInput,
@@ -1716,6 +1811,145 @@ mod tests {
         }
 
         assert_eq!(names, ["Shape.item", "Model.value", "value"]);
+    }
+
+    #[test]
+    fn declaration_file_accessors_reuse_getter_and_setter_annotations() {
+        let parsed = parse_source_file(concat!(
+            "declare class Model { ",
+            "get value(): number; set value(next: number); ",
+            "get inferred(); set inferred(next: string); ",
+            "set label(next: string); get ready(): boolean; ",
+            "}",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(6_027);
+        let mut context = declaration_context(&parsed, file);
+        let (number, string, boolean) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.number_type,
+                bootstrap.string_type,
+                bootstrap.boolean_type,
+            )
+        };
+        let mut declarations = Vec::new();
+
+        for (node, record) in parsed.arena.iter() {
+            let name = match &record.data {
+                NodeData::GetAccessorDeclaration(accessor) => accessor.name,
+                NodeData::SetAccessorDeclaration(accessor) => accessor.name,
+                _ => continue,
+            };
+            let declaration = NodeRef::new(parsed.arena.id(), file, node);
+            let name = NodeRef::new(parsed.arena.id(), file, name);
+            let NodeData::Identifier(identifier) = &parsed.arena.get(name.node).unwrap().data
+            else {
+                panic!("accessor names must be identifiers")
+            };
+            let expected = match identifier.text.as_str() {
+                "value" => number,
+                "inferred" | "label" => string,
+                "ready" => boolean,
+                _ => panic!("unexpected accessor {}", identifier.text),
+            };
+            let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+
+            assert_eq!(context.get_symbol_at_location(name).unwrap(), Some(symbol));
+            assert_eq!(
+                context.get_symbol_at_location(declaration).unwrap(),
+                Some(symbol)
+            );
+            assert_eq!(context.get_type_at_location(name).unwrap(), expected);
+            assert_eq!(context.get_type_at_location(declaration).unwrap(), expected);
+            assert!(context.store().value_symbol_links(symbol).is_none());
+            declarations.push((declaration, name, symbol, expected));
+        }
+        assert_eq!(declarations.len(), 6);
+        assert_eq!(declarations[0].2, declarations[1].2);
+        assert_eq!(declarations[2].2, declarations[3].2);
+
+        let warm = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().signature_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        for (declaration, name, symbol, expected) in declarations {
+            assert_eq!(context.get_symbol_at_location(name).unwrap(), Some(symbol));
+            assert_eq!(context.get_type_at_location(declaration).unwrap(), expected);
+            assert_eq!(context.get_type_at_location(name).unwrap(), expected);
+        }
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            warm
+        );
+        let source = context.source_file(file).unwrap();
+        assert!(
+            context
+                .store()
+                .source_file_links(source)
+                .is_none_or(|links| !links.type_checked)
+        );
+    }
+
+    #[test]
+    fn unannotated_declaration_file_accessors_reject_without_changing_caches() {
+        let parsed = parse_source_file(concat!(
+            "declare class Model { ",
+            "get missing(); ",
+            "set absent(next); ",
+            "}",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(6_028);
+        let mut context = declaration_context(&parsed, file);
+        let cold = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().signature_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+
+        for (node, record) in parsed.arena.iter() {
+            let name = match &record.data {
+                NodeData::GetAccessorDeclaration(accessor) => accessor.name,
+                NodeData::SetAccessorDeclaration(accessor) => accessor.name,
+                _ => continue,
+            };
+            let declaration = NodeRef::new(parsed.arena.id(), file, node);
+            let name = NodeRef::new(parsed.arena.id(), file, name);
+
+            assert_eq!(
+                context.get_type_at_location(name),
+                Err(CanonicalArtifactQueryError::MissingType {
+                    node: name,
+                    kind: SyntaxKind::Identifier,
+                })
+            );
+            assert_eq!(
+                context.get_type_at_location(declaration),
+                Err(CanonicalArtifactQueryError::MissingType {
+                    node: declaration,
+                    kind: record.kind,
+                })
+            );
+        }
+
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            cold
+        );
     }
 
     #[test]
