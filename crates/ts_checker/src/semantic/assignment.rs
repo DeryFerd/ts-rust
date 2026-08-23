@@ -1559,7 +1559,10 @@ impl AssignmentPlanner<'_, '_> {
         if let Some(type_node) = type_node {
             self.require_parent(type_node, Some(declaration.node))?;
             self.node(type_node)?;
-        } else if javascript_target.is_none() && mutable_target.is_none() {
+        } else if javascript_target.is_none()
+            && mutable_target.is_none()
+            && ambient_target.is_none()
+        {
             return Err(AssignmentPlanError::Unsupported(
                 AssignmentUnsupported::MissingTargetType(declaration),
             ));
@@ -1689,10 +1692,19 @@ impl AssignmentPlanner<'_, '_> {
                 AssignmentSyntaxRole::TargetDeclaration,
             ));
         };
-        if variable.initializer.is_some() {
-            return Err(AssignmentPlanError::Unsupported(
-                AssignmentUnsupported::NonOrdinaryVariable(declaration),
-            ));
+        if let Some(initializer) = variable.initializer {
+            let initializer = self.reference(initializer);
+            self.require_parent(initializer, Some(declaration.node))?;
+            let initializer_node = self.node(initializer)?;
+            if ambient_flags != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+                || variable.type_.is_some()
+                || initializer_node.kind != SyntaxKind::NumericLiteral
+                || initializer_node.flags.0 != 0
+            {
+                return Err(AssignmentPlanError::Unsupported(
+                    AssignmentUnsupported::NonOrdinaryVariable(declaration),
+                ));
+            }
         }
 
         let list = declaration_node

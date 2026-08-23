@@ -756,11 +756,12 @@ enum PlannedVariableInitializer {
     AbsentJavaScript,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct PlannedAmbientVariable {
     symbol: SemanticSymbolId,
     binding: VariableBindingKind,
     type_node: Option<NodeRef>,
+    initializer: Option<PlannedExpression>,
 }
 
 #[derive(Clone, Debug)]
@@ -1002,7 +1003,7 @@ enum PlannedStatement {
     ExternalModuleMarker,
     NamedReexport,
     InvalidModuleSpecifier(NodeRef),
-    AmbientVariables,
+    AmbientVariables(Vec<NodeRef>),
     AmbientOverload,
     Function(usize),
     Arrow(usize),
@@ -1730,8 +1731,17 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 }
                 SyntaxKind::VariableStatement => {
                     if let Some(variables) = preplanned_ambient_variables.remove(&statement) {
+                        let initializers = variables
+                            .iter()
+                            .filter_map(|variable| {
+                                variable
+                                    .initializer
+                                    .as_ref()
+                                    .map(|initializer| initializer.node)
+                            })
+                            .collect();
                         ambient_variables.extend(variables);
-                        statements.push(PlannedStatement::AmbientVariables);
+                        statements.push(PlannedStatement::AmbientVariables(initializers));
                         continue;
                     }
                     let (declaration_list, exported) = {
@@ -4505,21 +4515,26 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         )
         .map_err(Self::variable_plan_error)?;
 
-        if let Some(initializer) = initializer_id.map(|node| self.reference(node)) {
+        let initializer = if let Some(initializer) = initializer_id.map(|node| self.reference(node))
+        {
             let initializer_node = self.node(initializer)?;
-            if initializer_node.parent != Some(declaration.node) {
+            if initializer_node.parent != Some(declaration.node)
+                || initializer_node.kind != SyntaxKind::NumericLiteral
+                || initializer_node.flags.0 != 0
+                || binding != VariableBindingKind::Var
+                || exported
+                || type_id.is_some()
+            {
                 return Err(self.unsupported(
                     initializer,
                     initializer_node.kind,
                     SourceSyntaxRole::VariableInitializer,
                 ));
             }
-            return Err(self.unsupported(
-                initializer,
-                initializer_node.kind,
-                SourceSyntaxRole::VariableInitializer,
-            ));
-        }
+            Some(self.plan_expression(initializer)?)
+        } else {
+            None
+        };
         let type_node = type_id.map(|node| self.reference(node));
         if let Some(type_node) = type_node {
             if self.node(type_node)?.parent != Some(declaration.node) {
@@ -4527,7 +4542,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 return Err(self.unsupported(type_node, kind, SourceSyntaxRole::VariableType));
             }
             self.plan_type_import_annotation_root(type_node)?;
-        } else if !self.allow_implicit_ambient_any {
+        } else if initializer.is_none() && !self.allow_implicit_ambient_any {
             return Err(SourceCheckError::Unsupported(
                 UnsupportedSourceSyntax::MissingVariableType(declaration),
             ));
@@ -4549,6 +4564,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             symbol: variable_symbol,
             binding,
             type_node,
+            initializer,
         })
     }
 
@@ -6886,6 +6902,81 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         debug_assert!(node.is_for(self.arena.id(), self.bound.file_id()));
         SourceCheckError::Unsupported(UnsupportedSourceSyntax::Syntax { node, kind, role })
     }
+}
+
+fn unresolved_named_value_import_is_unused(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    source: SourceFileRef,
+    store: &CanonicalTypeMapperStore,
+    import: &SourceImportPlan,
+    binding: &SourceImportBindingPlan,
+    error: &SourceImportError,
+) -> bool {
+    use super::alias::{CanonicalAliasResolutionError, CanonicalAliasTargetUnavailable};
+
+    let SourceImportError::Alias(CanonicalAliasResolutionError::TargetUnavailable {
+        alias,
+        reason: CanonicalAliasTargetUnavailable::ModuleResolutionUnresolved(specifier),
+    }) = error
+    else {
+        return false;
+    };
+    if *alias != binding.alias_symbol
+        || *specifier != import.module_specifier
+        || source.node_ref() != bound.source_file()
+        || !source.node_ref().is_for(arena.id(), bound.file_id())
+        || store.alias_symbol_links(binding.alias_symbol).is_some()
+        || store.value_symbol_links(binding.alias_symbol).is_some()
+    {
+        return false;
+    }
+    let Some(import_node) = arena.get(import.declaration.node) else {
+        return false;
+    };
+    let NodeData::ImportDeclaration(declaration) = &import_node.data else {
+        return false;
+    };
+    if import_node.kind != SyntaxKind::ImportDeclaration
+        || declaration.module_specifier != import.module_specifier.node
+        || !bound.contains(import.declaration)
+        || !bound.contains(import.module_specifier)
+        || !bound.contains(binding.declaration)
+        || !bound.contains(binding.local_name)
+        || !arena.get(binding.declaration.node).is_some_and(|node| {
+            node.kind == SyntaxKind::ImportSpecifier
+                && matches!(node.data, NodeData::ImportSpecifier(_))
+        })
+    {
+        return false;
+    }
+
+    let mut pending = vec![source.node_ref().node];
+    let mut visited = HashSet::new();
+    let mut found_import = false;
+    while let Some(node_id) = pending.pop() {
+        let node_ref = NodeRef::new(arena.id(), bound.file_id(), node_id);
+        if !visited.insert(node_id) || !bound.contains(node_ref) {
+            return false;
+        }
+        let Some(node) = arena.get(node_id) else {
+            return false;
+        };
+        if !node.data.matches_syntax_kind(node.kind) {
+            return false;
+        }
+        if node_ref == import.declaration {
+            found_import = true;
+            continue;
+        }
+        if let NodeData::Identifier(identifier) = &node.data
+            && identifier.text == binding.local_text
+        {
+            return false;
+        }
+        node.for_each_child(|child| pending.push(child));
+    }
+    found_import
 }
 
 fn import_alias_error_is_unsupported(error: super::alias::CanonicalAliasResolutionError) -> bool {
@@ -12402,8 +12493,22 @@ pub(super) fn check_source_file(
     let mut resolved_imports = HashMap::<SemanticSymbolId, ResolvedSourceImportBinding>::new();
     for import in &value_imports {
         for binding in &import.bindings {
-            let resolved = resolve_source_import_binding(store, alias_host, binding)
-                .map_err(|error| SourcePlanner::import_plan_error(binding.declaration, &error))?;
+            let resolved = match resolve_source_import_binding(store, alias_host, binding) {
+                Ok(resolved) => resolved,
+                Err(error)
+                    if unresolved_named_value_import_is_unused(
+                        arena, bound, source, store, import, binding, &error,
+                    ) =>
+                {
+                    continue;
+                }
+                Err(error) => {
+                    return Err(SourcePlanner::import_plan_error(
+                        binding.declaration,
+                        &error,
+                    ));
+                }
+            };
             if resolved_imports
                 .insert(binding.alias_symbol, resolved)
                 .is_some()
@@ -12703,6 +12808,22 @@ pub(super) fn check_source_file(
             .get_type_from_type_node(type_node);
             merge_retry_diagnostics(diagnostics, annotation_diagnostics);
             declared_type?
+        } else if let Some(initializer) = &variable.initializer {
+            let initializer = check_expression_type(
+                store,
+                host,
+                global_types,
+                source,
+                options,
+                session,
+                diagnostics,
+                &current_flow_types,
+                &preflighted_type_import_value_uses,
+                initializer,
+                None,
+                &mut deferred,
+            )?;
+            inferred_variable_type(store, global_types, variable.binding, initializer.result)?
         } else if options.no_implicit_any {
             return Err(SourceCheckError::Unsupported(
                 UnsupportedSourceSyntax::MissingVariableType(source.node_ref()),
@@ -13186,8 +13307,12 @@ pub(super) fn check_source_file(
             }
             PlannedStatement::ExternalModuleMarker
             | PlannedStatement::NamedReexport
-            | PlannedStatement::AmbientVariables
             | PlannedStatement::AmbientOverload => {}
+            PlannedStatement::AmbientVariables(initializers) => {
+                for initializer in initializers {
+                    issue_node_diagnostic(diagnostics, initializer, 1039)?;
+                }
+            }
             PlannedStatement::InvalidModuleSpecifier(specifier) => {
                 issue_node_diagnostic(diagnostics, specifier, 1141)?;
             }

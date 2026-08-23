@@ -729,6 +729,59 @@ fn checked_inferred_function_imports_keep_return_types_and_warm_identity() {
 }
 
 #[test]
+fn unresolved_unused_imports_remain_unpublished_after_successful_source_checks() {
+    let parsed = parse_source_file("import { value } from 'missing';");
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(28);
+    let (declaration, binding) = import_nodes(&parsed, file);
+    let specifier = import_specifier(&parsed, file, declaration);
+    let mut binder = CanonicalBinder::new();
+    binder
+        .bind_source_file_with_facts(
+            &parsed.arena,
+            parsed.source_file,
+            file,
+            external_facts("\"/project/importer.ts\""),
+        )
+        .unwrap();
+    binder
+        .bind_typescript_declaration_slice(&parsed.arena, file)
+        .unwrap();
+    let mut context = CanonicalCheckerContext::new_with_module_resolutions(
+        binder.finish(),
+        [(file, &parsed.arena)].into_iter().collect(),
+        CanonicalCheckerOptions::default(),
+        CanonicalModuleResolutionManifestInput::new([CanonicalModuleResolutionEntry::unresolved(
+            specifier,
+        )]),
+    )
+    .unwrap();
+    let alias = context.file(file).unwrap().1.symbol(binding).unwrap();
+
+    context.check_source_file(file).unwrap();
+
+    assert!(source_is_checked(&context, file));
+    assert!(context.diagnostics().is_empty());
+    assert!(context.store().alias_symbol_links(alias).is_none());
+    assert!(context.store().value_symbol_links(alias).is_none());
+
+    let warm = (
+        context.store().type_len(),
+        context.store().symbol_len(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
+}
+
+#[test]
 fn unused_imports_resolve_without_eager_value_typing_or_partial_source_publication() {
     let importer = parse_source_file("import { value } from './target';");
     let target = parse_source_file("export const value = 1;");

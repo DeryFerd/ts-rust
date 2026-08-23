@@ -214,6 +214,61 @@ fn canonical_typescript_extension_diagnostics_follow_comment_directives() {
 }
 
 #[test]
+fn canonical_unused_unresolved_imports_preserve_each_ts2307_diagnostic() {
+    let filesystem = MemoryFileSystem::new(true);
+    let source = "import { value } from 'missing';\n";
+    filesystem
+        .write_file("/project/deep/app.ts", source)
+        .unwrap();
+    filesystem.write_file("/project/lib.ts", source).unwrap();
+
+    let program = Program::try_new_with_canonical_checker(
+        &filesystem,
+        "/project",
+        &["deep/app.ts".to_owned(), "lib.ts".to_owned()],
+        CompilerOptions {
+            module: ModuleKind::EsNext,
+            module_specified: true,
+            module_resolution: ModuleResolutionKind::Bundler,
+            lib: Some(vec!["es5".to_owned()]),
+            no_emit: true,
+            ..CompilerOptions::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        program
+            .diagnostics()
+            .iter()
+            .map(|diagnostic| (
+                diagnostic.file_name.as_deref(),
+                diagnostic.code,
+                diagnostic.message.as_str(),
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (
+                Some("/project/deep/app.ts"),
+                Some(2307),
+                "Cannot find module 'missing' or its corresponding type declarations.",
+            ),
+            (
+                Some("/project/lib.ts"),
+                Some(2307),
+                "Cannot find module 'missing' or its corresponding type declarations.",
+            ),
+        ],
+    );
+    for diagnostic in program.diagnostics() {
+        let range = diagnostic.range.unwrap();
+        let start = usize::try_from(range.start.get()).unwrap();
+        let end = usize::try_from(range.end.get()).unwrap();
+        assert_eq!(&source[start..end], "'missing'");
+    }
+}
+
+#[test]
 fn canonical_program_checks_importer_first_array_values_through_bundler_manifest() {
     let fs = MemoryFileSystem::new(true);
     fs.write_file(

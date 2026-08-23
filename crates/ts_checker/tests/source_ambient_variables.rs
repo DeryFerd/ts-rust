@@ -256,6 +256,67 @@ fn ambient_variables_hoist_exact_types_in_scripts_and_external_modules() {
 }
 
 #[test]
+fn initialized_ambient_variables_report_ts1039_and_preserve_inferred_types() {
+    let parsed = parse_source_file(concat!(
+        "const before = value;\n",
+        "declare var value = 4;\n",
+        "const after = value;\n",
+        "value = 5;\n",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(2_150);
+    let mut context = checker_context(&parsed, file, false, CanonicalModuleState::Script);
+    let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+    let initializer = variable_initializer(&parsed, file, "value");
+
+    context.check_source_file(file).unwrap();
+
+    let [diagnostic] = context.diagnostics().as_slice() else {
+        panic!("expected one ambient initializer diagnostic")
+    };
+    assert_eq!(diagnostic.diagnostic.code(), 1039);
+    assert_eq!(
+        diagnostic.diagnostic.render().unwrap(),
+        "Initializers are not allowed in ambient contexts.",
+    );
+    assert_eq!(diagnostic.node, Some(initializer));
+    assert_eq!(diagnostic.range_override, None);
+    for name in ["value", "before", "after"] {
+        let symbol = variable_symbol(&parsed, file, &context, name);
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(symbol)
+                .and_then(|links| links.resolved_type),
+            Some(number),
+            "variable {name}",
+        );
+    }
+    let literal = context
+        .store()
+        .type_node_links(initializer)
+        .and_then(|links| links.resolved_type)
+        .unwrap();
+    assert_eq!(context.type_to_string(literal).unwrap(), "4");
+    assert!(is_type_checked(&context, file));
+
+    let warm = (
+        context.store().type_len(),
+        context.store().symbol_len(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
+}
+
+#[test]
 fn ambient_annotation_can_name_a_later_interface() {
     let parsed = parse_source_file(concat!(
         "const beforeModel = ambientModel;\n",
