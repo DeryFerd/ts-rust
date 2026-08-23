@@ -16,8 +16,9 @@ use ts_diagnostics::{Diagnostic, message_by_code};
 use super::{
     AliasTargetState, CanonicalCheckerDiagnostics, CanonicalCheckerOptions, CanonicalGlobalTypes,
     CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, DeclaredTypeUnavailable,
-    SourceCheckError, SourceCheckProvenanceError, SourceLiteralCacheError, SourceSyntaxRole,
-    TypeData, TypeId, TypeMapper, UnsupportedSourceSyntax, ValueSymbolLinks, VariableInvariant,
+    SourceAssertionError, SourceCheckError, SourceCheckProvenanceError, SourceLiteralCacheError,
+    SourceSyntaxRole, TypeData, TypeId, TypeMapper, TypeNodeLinks, UnsupportedSourceSyntax,
+    ValueSymbolLinks, VariableInvariant,
     alias::{
         CanonicalAliasResolutionEvent, CanonicalAliasResolver, CanonicalAliasTargetHost,
         CanonicalAliasTargetUnavailable, CanonicalImmediateAliasTarget,
@@ -26,7 +27,7 @@ use super::{
     declared::cached_ordinary_type_parameter_owner,
     instantiate::InstantiationSession,
     reference_types::validate_direct_generic_reference,
-    type_nodes::{CanonicalTypeQuery, TypeNodeUnavailable},
+    type_nodes::{CanonicalTypeQuery, TypeNodeUnavailable, normalize_numeric_separators},
     types::{ObjectFlags, TypeFlags},
 };
 
@@ -113,6 +114,7 @@ struct SourceNamespaceImplicitVariablePlan {
     symbol: SemanticSymbolId,
     name: String,
     primary_declaration: bool,
+    initializer: Option<NodeRef>,
 }
 
 /// A complete, read-only namespace declaration and body plan.
@@ -967,7 +969,7 @@ fn plan_namespace_variables(
     arena: &NodeArena,
     bound: &BoundFile,
     store: &CanonicalTypeMapperStore,
-    owner: SemanticSymbolId,
+    namespace: (NodeRef, SemanticSymbolId),
     ambient: bool,
     statement: NodeRef,
     output: (
@@ -975,6 +977,7 @@ fn plan_namespace_variables(
         &mut Vec<SourceNamespaceImplicitVariablePlan>,
     ),
 ) -> Result<(), SourceCheckError> {
+    let (namespace, owner) = namespace;
     let (members, implicit_variables) = output;
     let record = owned_node(arena, bound, store, statement)?;
     let NodeData::VariableStatement(variable) = &record.data else {
@@ -985,9 +988,10 @@ fn plan_namespace_variables(
             },
         ));
     };
-    let (_, declared) =
+    let (exported, declared) =
         modifier_flags(arena, bound, store, statement, variable.modifiers.as_ref())?;
-    if !ambient && !declared {
+    let runtime = !ambient && !declared;
+    if runtime && exported {
         return Err(unsupported(
             statement,
             record.kind,
@@ -1006,6 +1010,13 @@ fn plan_namespace_variables(
     if list_record.parent != Some(statement.node) {
         return Err(invalid_parent(list, statement, list_record.parent));
     }
+    if runtime && (list_record.flags.0 != 0 || declarations.declarations.nodes.len() != 1) {
+        return Err(unsupported(
+            statement,
+            record.kind,
+            SourceSyntaxRole::VariableStatement,
+        ));
+    }
     for declaration in &declarations.declarations.nodes {
         let declaration = child(list, *declaration);
         let declaration_record = owned_node(arena, bound, store, declaration)?;
@@ -1019,7 +1030,14 @@ fn plan_namespace_variables(
         if declaration_record.parent != Some(list.node) {
             return Err(invalid_parent(declaration, list, declaration_record.parent));
         }
-        if variable.initializer.is_some() {
+        if runtime && (variable.type_.is_some() || variable.initializer.is_none()) {
+            return Err(unsupported(
+                statement,
+                record.kind,
+                SourceSyntaxRole::VariableStatement,
+            ));
+        }
+        if !runtime && variable.initializer.is_some() {
             return Err(unsupported(
                 declaration,
                 declaration_record.kind,
@@ -1102,19 +1120,86 @@ fn plan_namespace_variables(
             || symbol_record.members().is_some()
             || symbol_record.exports().is_some()
             || symbol_record.export_symbol().is_some()
+            || runtime
+                && (symbol_record.parent().is_some()
+                    || symbol_record.declarations() != Some(&[declaration])
+                    || value_declaration != Some(declaration)
+                    || declaration_symbol(bound, store, namespace, SymbolFlags::MODULE)? != owner
+                    || bound
+                        .locals(namespace)
+                        .and_then(|locals| store.symbol_table(locals))
+                        .and_then(|locals| locals.get_source(&identifier.text))
+                        .and_then(|candidate| store.get_merged_symbol(candidate))
+                        != Some(symbol))
         {
             return Err(SourceCheckError::Unsupported(
                 UnsupportedSourceSyntax::MissingVariableType(declaration),
             ));
+        }
+        let initializer = variable
+            .initializer
+            .map(|initializer| child(declaration, initializer));
+        if let Some(initializer) = initializer {
+            plan_namespace_numeric_initializer(arena, bound, store, declaration, initializer)?;
         }
         implicit_variables.push(SourceNamespaceImplicitVariablePlan {
             declaration,
             symbol,
             name: identifier.text.clone(),
             primary_declaration: value_declaration == Some(declaration),
+            initializer,
         });
     }
     Ok(())
+}
+
+fn plan_namespace_numeric_initializer(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    initializer: NodeRef,
+) -> Result<ts_jsnum::Number, SourceCheckError> {
+    let record = owned_node(arena, bound, store, initializer)?;
+    if record.parent != Some(declaration.node) {
+        return Err(invalid_parent(initializer, declaration, record.parent));
+    }
+    let NodeData::NumericLiteral(literal) = &record.data else {
+        return Err(unsupported(
+            initializer,
+            record.kind,
+            SourceSyntaxRole::VariableInitializer,
+        ));
+    };
+    if record.kind != SyntaxKind::NumericLiteral
+        || record.flags.0 != 0
+        || literal.token_flags.0 != 0
+    {
+        return Err(SourceCheckError::Unsupported(
+            UnsupportedSourceSyntax::InvalidLiteralFlags(initializer),
+        ));
+    }
+    let value = ts_jsnum::from_string(&literal.text);
+    if value.is_nan() {
+        return Err(SourceCheckError::Unsupported(
+            UnsupportedSourceSyntax::InvalidLiteralSpelling(initializer),
+        ));
+    }
+    if let Some(source) = arena.source_text() {
+        let spelling = source
+            .get(record.range.start.get() as usize..record.range.end.get() as usize)
+            .and_then(normalize_numeric_separators)
+            .ok_or(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::InvalidLiteralSpelling(initializer),
+            ))?;
+        let source_value = ts_jsnum::from_string(&spelling);
+        if source_value.is_nan() || source_value != value {
+            return Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::InvalidLiteralSpelling(initializer),
+            ));
+        }
+    }
+    Ok(value)
 }
 
 fn plan_namespace(
@@ -1332,7 +1417,7 @@ fn plan_namespace(
                                 arena,
                                 bound,
                                 store,
-                                symbol,
+                                (declaration, symbol),
                                 ambient,
                                 statement,
                                 (&mut members, &mut implicit_variables),
@@ -2030,7 +2115,7 @@ pub(super) fn execute_source_namespace(
     if options.no_implicit_any
         && implicit_variables
             .iter()
-            .any(|variable| variable.primary_declaration)
+            .any(|variable| variable.primary_declaration && variable.initializer.is_none())
         && message_by_code(VARIABLE_IMPLICITLY_HAS_ANY_TYPE).is_none()
     {
         return Err(SourceCheckError::MissingDiagnostic(
@@ -2039,21 +2124,69 @@ pub(super) fn execute_source_namespace(
     }
 
     let mut values = Vec::<PendingNamespaceValue>::new();
+    let mut numeric_initializers = Vec::new();
     if !implicit_variables.is_empty() {
-        let any = store
+        let bootstrap = store
             .intrinsic_bootstrap()
-            .map(|bootstrap| bootstrap.any_type)
             .ok_or(SourceCheckError::LiteralCache(
                 SourceLiteralCacheError::BootstrapUninitialized,
             ))?;
+        let any = bootstrap.any_type;
+        let number = bootstrap.number_type;
         for variable in &implicit_variables {
+            let type_ = if let Some(initializer) = variable.initializer {
+                let value = plan_namespace_numeric_initializer(
+                    arena,
+                    bound,
+                    store,
+                    variable.declaration,
+                    initializer,
+                )?;
+                let expected = store
+                    .intrinsic_bootstrap()
+                    .and_then(|bootstrap| bootstrap.cached_number_literal_type(value))
+                    .map(|regular| store.fresh_type_of_literal_type(regular))
+                    .transpose()?;
+                if let Some(links) = store.type_node_links(initializer)
+                    && (links.outer_type_parameters.is_some()
+                        || links
+                            .resolved_type
+                            .is_some_and(|cached| Some(cached) != expected))
+                {
+                    return Err(SourceCheckError::Assertion(
+                        SourceAssertionError::InvalidExpressionCache {
+                            node: initializer,
+                            cached: links.resolved_type,
+                            expected: expected.unwrap_or(number),
+                        },
+                    ));
+                }
+                numeric_initializers.push((initializer, value));
+                number
+            } else {
+                any
+            };
             stage_namespace_value(
                 store,
                 &mut values,
                 variable.declaration,
                 variable.symbol,
-                any,
+                type_,
             )?;
+        }
+        let numbers = numeric_initializers
+            .iter()
+            .map(|(_, value)| *value)
+            .collect::<Vec<_>>();
+        store.prepare_regular_literal_types(&[], &numbers, &[])?;
+        let missing_initializer_links = numeric_initializers
+            .iter()
+            .filter(|(initializer, _)| store.type_node_links(*initializer).is_none())
+            .count();
+        if !store.try_reserve_type_node_links(missing_initializer_links) {
+            return Err(SourceCheckError::LiteralCache(
+                SourceLiteralCacheError::Capacity,
+            ));
         }
     }
 
@@ -2189,6 +2322,27 @@ pub(super) fn execute_source_namespace(
             VariableInvariant::InvalidValueLinks(plan.symbol),
         ));
     }
+    for (initializer, value) in numeric_initializers {
+        let regular = store.regular_number_literal_type(value)?;
+        let fresh = store.fresh_type_of_literal_type(regular)?;
+        let expected = TypeNodeLinks {
+            resolved_type: Some(fresh),
+            ..TypeNodeLinks::default()
+        };
+        if store.type_node_links(initializer) != Some(&expected)
+            && !store.set_type_node_links(initializer, expected)
+        {
+            return Err(SourceCheckError::Assertion(
+                SourceAssertionError::InvalidExpressionCache {
+                    node: initializer,
+                    cached: store
+                        .type_node_links(initializer)
+                        .and_then(|links| links.resolved_type),
+                    expected: fresh,
+                },
+            ));
+        }
+    }
     for value in values {
         let expected = ValueSymbolLinks {
             resolved_type: Some(value.type_),
@@ -2208,7 +2362,7 @@ pub(super) fn execute_source_namespace(
             SourceCheckError::MissingDiagnostic(VARIABLE_IMPLICITLY_HAS_ANY_TYPE),
         )?;
         for variable in implicit_variables {
-            if !variable.primary_declaration {
+            if !variable.primary_declaration || variable.initializer.is_some() {
                 continue;
             }
             super::source::merge_retry_diagnostic(

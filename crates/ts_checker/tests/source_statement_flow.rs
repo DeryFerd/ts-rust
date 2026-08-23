@@ -950,3 +950,55 @@ fn assignments_to_type_only_namespaces_report_ts2708_and_keep_expression_types()
         warm,
     );
 }
+
+#[test]
+fn numeric_runtime_namespace_variables_keep_inferred_and_literal_types() {
+    let parsed = parse_source_file("namespace Values { var count = 10; }");
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(2_161);
+    let mut context = context(&parsed, file);
+    let declarations = variable_declarations(&parsed, file, "count");
+    let [declaration] = declarations.as_slice() else {
+        panic!("expected one namespace variable")
+    };
+    let declaration = *declaration;
+    let initializer = variable_initializer(&parsed, file, declaration);
+    let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+
+    context.check_source_file(file).unwrap();
+
+    assert!(context.diagnostics().is_empty());
+    assert_eq!(
+        context
+            .type_to_string(
+                context
+                    .store()
+                    .value_symbol_links(symbol)
+                    .and_then(|links| links.resolved_type)
+                    .unwrap(),
+            )
+            .unwrap(),
+        "number",
+    );
+    assert_eq!(
+        context
+            .type_to_string(resolved_type(&context, initializer))
+            .unwrap(),
+        "10",
+    );
+
+    let warm = (
+        context.store().type_len(),
+        context.store().symbol_len(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
+}
