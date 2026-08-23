@@ -296,7 +296,6 @@ fn explicit_constructor_keeps_strict_field_initialization_diagnostics() {
 #[test]
 fn unsupported_constructor_parameters_and_nonempty_bodies_leave_classes_cold() {
     for (index, source) in [
-        "class Model { constructor(value: string) {} }",
         "class Model { constructor(public value: string) {} }",
         concat!(
             "class Base { constructor(public value: string) {} } ",
@@ -322,6 +321,57 @@ fn unsupported_constructor_parameters_and_nonempty_bodies_leave_classes_cold() {
         ));
         assert!(context.store().declared_type_links(owner).is_none());
         assert!(context.store().value_symbol_links(owner).is_none());
+    }
+}
+
+#[test]
+fn primitive_constructor_parameters_publish_their_required_signature() {
+    for (index, (annotation, expected)) in [("string", "string"), ("number", "number")]
+        .into_iter()
+        .enumerate()
+    {
+        let source = format!("class Model {{ constructor(value: {annotation}) {{}} }}");
+        let parsed = parse_source_file(&source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(2_120 + u32::try_from(index).unwrap());
+        let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+        let owner = class_symbol(&parsed, file, &context, "Model");
+        let constructor = class_constructor(&parsed, file, "Model");
+
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+
+        let members = context.get_nongeneric_class_members(owner).unwrap();
+        let signature = context
+            .store()
+            .signature(members.default_construct_signature())
+            .unwrap();
+        assert_eq!(signature.declaration(), Some(constructor));
+        assert_eq!(signature.min_argument_count(), 1);
+        let [parameter] = signature.parameters() else {
+            panic!("the constructor must retain its one required parameter")
+        };
+        let parameter_type = context
+            .store()
+            .value_symbol_links(*parameter)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        assert_eq!(context.type_to_string(parameter_type).unwrap(), expected);
+
+        let warm = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.diagnostics().clone(),
+        );
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.diagnostics().clone(),
+            ),
+            warm,
+        );
     }
 }
 

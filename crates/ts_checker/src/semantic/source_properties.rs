@@ -6,7 +6,8 @@
 //! `relater`. Enum values reuse their published member identities. Class
 //! constructors read their validated static member tables without treating
 //! construct signatures as property-only objects. Namespace reexports retain
-//! their export alias while reading the final value symbol. Exact
+//! their export alias while reading the final value symbol. Validated class
+//! getter/setter pairs expose their shared accessor symbol. Exact
 //! two-constituent
 //! unions of source-declared type literals reuse the canonical union-property
 //! adapter. A property missing from any union constituent recovers with
@@ -522,7 +523,10 @@ pub(super) fn check_direct_source_property(
     {
         Some(ClassStaticProperty::Present(property)) => Some(property),
         Some(ClassStaticProperty::Missing) => None,
-        None => store.resolved_own_property(receiver_type, &plan.name)?,
+        None => match resolve_class_instance_accessor(store, plan, receiver_type)? {
+            Some(accessor) => Some(accessor),
+            None => store.resolved_own_property(receiver_type, &plan.name)?,
+        },
     } {
         if property.optional {
             if !plan.is_read() {
@@ -688,6 +692,87 @@ fn resolve_class_static_property(
         optional: flags.contains(SymbolFlags::OPTIONAL),
         readonly: property.check_flags().contains(CheckFlags::READONLY),
     })))
+}
+
+fn resolve_class_instance_accessor(
+    store: &CanonicalTypeMapperStore,
+    plan: &SourcePropertyPlan,
+    receiver_type: TypeId,
+) -> Result<Option<ResolvedOwnProperty>, SourcePropertyError> {
+    let receiver = store
+        .type_payload(receiver_type)
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    let Some(owner) = receiver.symbol() else {
+        return Ok(None);
+    };
+    let owner = store
+        .get_merged_symbol(owner)
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    let class = store
+        .symbol(owner)
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    if !class.flags().contains(SymbolFlags::CLASS)
+        || store
+            .declared_type_links(owner)
+            .and_then(|links| links.declared_type)
+            != Some(receiver_type)
+    {
+        return Ok(None);
+    }
+
+    let structured = receiver
+        .data()
+        .structured()
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    let members = structured
+        .members
+        .and_then(|members| store.symbol_table(members))
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    let Some(symbol) = members.get_source(&plan.name) else {
+        return Ok(None);
+    };
+    let accessor = store
+        .symbol(symbol)
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    if !accessor.flags().intersects(SymbolFlags::ACCESSOR) {
+        return Ok(None);
+    }
+    if classes::validate_class_heritage_members(store, receiver_type)
+        != ClassHeritageMembersValidation::Valid
+        || accessor.flags() != SymbolFlags::ACCESSOR
+        || accessor.parent() != Some(owner)
+        || accessor.name().as_utf8() != Some(plan.name.as_str())
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || structured
+            .properties
+            .as_deref()
+            .is_none_or(|properties| !properties.contains(&symbol))
+    {
+        return Err(SourcePropertyError::InvalidCache(plan.node));
+    }
+
+    let links = store
+        .value_symbol_links(symbol)
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    let type_ = links
+        .resolved_type
+        .filter(|type_| store.type_payload(*type_).is_some())
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    if links
+        != &(ValueSymbolLinks {
+            resolved_type: Some(type_),
+            ..ValueSymbolLinks::default()
+        })
+    {
+        return Err(SourcePropertyError::InvalidCache(plan.node));
+    }
+
+    Ok(Some(ResolvedOwnProperty {
+        symbol,
+        type_,
+        optional: false,
+        readonly: accessor.check_flags().contains(CheckFlags::READONLY),
+    }))
 }
 
 fn resolve_enum_property(
@@ -1868,6 +1953,110 @@ mod tests {
     }
 
     #[test]
+    fn paired_class_accessor_reads_publish_the_shared_symbol_cold_and_warm() {
+        let parsed = parsed(concat!(
+            "class Model { get value(): number { return 1; } set value(next) {} } ",
+            "const model = new Model(); const result = model.value;",
+        ));
+        let file = FileId::new(530);
+        let access = property_access(&parsed, file);
+        let (mut context, owner, instance, _) = published_class(&parsed, file, "Model");
+        let accessor = context
+            .store()
+            .type_payload(instance)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.members)
+            .and_then(|members| context.store().symbol_table(members))
+            .and_then(|members| members.get_source("value"))
+            .unwrap();
+        assert_eq!(
+            context.store().symbol(accessor).unwrap().flags(),
+            SymbolFlags::ACCESSOR,
+        );
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let syntax =
+            plan_direct_source_property_syntax(&parsed.arena, context.store(), access).unwrap();
+        let receiver = PlannedExpression::new(
+            syntax.receiver(),
+            PlannedExpressionKind::Identifier(PlannedIdentifierRead {
+                resolved_symbol: owner,
+                value_symbol: owner,
+                kind: PlannedIdentifierReadKind::DeclaredValue,
+            }),
+        );
+        let plan = finish_direct_source_property_plan(&syntax, receiver).unwrap();
+
+        for _ in 0..2 {
+            assert_eq!(
+                check_direct_source_property(context.store_mut_for_test(), None, &plan, instance),
+                Ok(CheckedSourceProperty {
+                    type_: number,
+                    diagnostic: None,
+                }),
+            );
+        }
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(access)
+                .and_then(|links| links.resolved_symbol),
+            Some(accessor),
+        );
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(access)
+                .and_then(|links| links.resolved_type),
+            Some(number),
+        );
+    }
+
+    #[test]
+    fn poisoned_class_accessor_links_fail_before_access_publication() {
+        let parsed = parsed(concat!(
+            "class Model { get value(): number { return 1; } set value(next) {} } ",
+            "const model = new Model(); const result = model.value;",
+        ));
+        let file = FileId::new(531);
+        let access = property_access(&parsed, file);
+        let (mut context, owner, instance, _) = published_class(&parsed, file, "Model");
+        let accessor = context
+            .store()
+            .type_payload(instance)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.members)
+            .and_then(|members| context.store().symbol_table(members))
+            .and_then(|members| members.get_source("value"))
+            .unwrap();
+        let poison = context.store().intrinsic_bootstrap().unwrap().string_type;
+        assert!(context.store_mut_for_test().set_value_symbol_links(
+            accessor,
+            ValueSymbolLinks {
+                resolved_type: Some(poison),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        let syntax =
+            plan_direct_source_property_syntax(&parsed.arena, context.store(), access).unwrap();
+        let receiver = PlannedExpression::new(
+            syntax.receiver(),
+            PlannedExpressionKind::Identifier(PlannedIdentifierRead {
+                resolved_symbol: owner,
+                value_symbol: owner,
+                kind: PlannedIdentifierReadKind::DeclaredValue,
+            }),
+        );
+        let plan = finish_direct_source_property_plan(&syntax, receiver).unwrap();
+
+        assert_eq!(
+            check_direct_source_property(context.store_mut_for_test(), None, &plan, instance),
+            Err(SourcePropertyError::InvalidCache(access)),
+        );
+        assert!(context.store().type_node_links(access).is_none());
+        assert!(context.store().symbol_node_links(access).is_none());
+    }
+
+    #[test]
     fn optional_class_static_properties_include_undefined_without_losing_readonly() {
         let parsed = parsed(concat!(
             "class Model { static readonly count?: number; } ",
@@ -2039,6 +2228,51 @@ mod tests {
                 diagnostic: None,
             }),
         );
+        assert_eq!(
+            store
+                .symbol_node_links(access)
+                .and_then(|links| links.resolved_symbol),
+            Some(member),
+        );
+    }
+
+    #[test]
+    fn direct_module_namespace_function_exports_preserve_callable_member_identity() {
+        let parsed = parsed("Foo.bar();");
+        let file = FileId::new(532);
+        let access = property_access(&parsed, file);
+        let call = NodeRef::new(
+            parsed.arena.id(),
+            file,
+            parsed.arena.get(access.node).unwrap().parent.unwrap(),
+        );
+        let mut store = registered_store(&parsed, file);
+        let any = store.intrinsic_bootstrap().unwrap().any_type;
+        let (object, module, member, _) =
+            namespace_object(&mut store, "bar", any, SymbolFlags::FUNCTION);
+        let syntax =
+            plan_direct_source_property_call_syntax(&parsed.arena, &store, access, call).unwrap();
+        let name = syntax.name_node();
+        let receiver = PlannedExpression::new(
+            syntax.receiver(),
+            PlannedExpressionKind::Identifier(PlannedIdentifierRead {
+                resolved_symbol: module,
+                value_symbol: module,
+                kind: PlannedIdentifierReadKind::DeclaredValue,
+            }),
+        );
+        let plan = finish_direct_source_property_plan(&syntax, receiver).unwrap();
+
+        assert!(plan.is_call_callee_for(call, name));
+        for _ in 0..2 {
+            assert_eq!(
+                check_direct_source_property(&mut store, None, &plan, object),
+                Ok(CheckedSourceProperty {
+                    type_: any,
+                    diagnostic: None,
+                }),
+            );
+        }
         assert_eq!(
             store
                 .symbol_node_links(access)
