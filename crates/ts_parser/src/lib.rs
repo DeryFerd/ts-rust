@@ -8267,16 +8267,16 @@ impl<'a> Parser<'a> {
         if self.current.kind == SyntaxKind::AssertsKeyword {
             return true;
         }
-        if !matches!(
-            self.current.kind,
-            SyntaxKind::Identifier | SyntaxKind::ThisKeyword
-        ) {
+        if self.current.kind != SyntaxKind::ThisKeyword
+            && !self.token_is_identifier_in_current_context(self.current.kind)
+        {
             return false;
         }
         let checkpoint = self.scanner.mark();
         let next = self.scanner.scan();
         self.scanner.rewind(checkpoint);
         next.kind == SyntaxKind::IsKeyword
+            && !next.flags.contains(ScannerTokenFlags::PRECEDING_LINE_BREAK)
     }
 
     fn parse_type_predicate(&mut self) -> NodeId {
@@ -8292,7 +8292,7 @@ impl<'a> Parser<'a> {
                 &[],
             )
         } else {
-            self.parse_identifier("Expected a predicate parameter name.")
+            self.parse_identifier_in_current_context("Expected a predicate parameter name.")
         };
         let type_node = if self.current.kind == SyntaxKind::IsKeyword {
             self.bump();
@@ -14339,6 +14339,56 @@ export as namespace GlobalName;
             assert_eq!(
                 result.arena.get(predicate.parameter_name).unwrap().parent,
                 Some(predicate_id)
+            );
+        }
+    }
+
+    #[test]
+    fn parses_contextual_keyword_predicates_with_generic_target_types() {
+        let result = parse_source_file(
+            r"
+                declare function isValidElement<P>(object: {} | null | undefined): object is ReactElement<P>;
+                declare function assertValidElement<P>(object: unknown): asserts object is ReactElement<P>;
+                interface Component<P> {
+                    isValid(): this is ReactElement<P>;
+                }
+            ",
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+
+        let predicates = result
+            .arena
+            .iter()
+            .filter_map(|(id, node)| {
+                let NodeData::TypePredicateNode(predicate) = &node.data else {
+                    return None;
+                };
+                Some((id, predicate))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(predicates.len(), 3);
+
+        for (predicate_id, predicate) in predicates {
+            let parameter = result.arena.get(predicate.parameter_name).unwrap();
+            assert_eq!(parameter.parent, Some(predicate_id));
+            assert!(
+                matches!(
+                    &parameter.data,
+                    NodeData::Identifier(identifier) if identifier.text == "object"
+                ) || matches!(&parameter.data, NodeData::ThisTypeNode(_))
+            );
+
+            let target_id = predicate.type_.expect("generic predicate target");
+            let target = result.arena.get(target_id).unwrap();
+            assert_eq!(target.parent, Some(predicate_id));
+            let NodeData::TypeReferenceNode(reference) = &target.data else {
+                panic!("expected generic type reference");
+            };
+            let arguments = reference.type_arguments.as_ref().unwrap();
+            assert_eq!(arguments.nodes.len(), 1);
+            assert_eq!(
+                result.arena.get(arguments.nodes[0]).unwrap().parent,
+                Some(target_id)
             );
         }
     }
