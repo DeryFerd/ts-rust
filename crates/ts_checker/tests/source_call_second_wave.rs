@@ -513,3 +513,49 @@ fn invalid_function_type_parameters_preserve_all_ordered_grammar_diagnostics() {
         warm,
     );
 }
+
+#[test]
+fn contextual_object_property_arrows_use_their_callback_parameter_type() {
+    let library = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
+    let text = concat!(
+        "interface Handler { run: (value: string) => string; }\n",
+        "function accept(handler: Handler): void {}\n",
+        "accept({ run: value => value.missing });\n",
+    );
+    let parsed = parse_source_file(text);
+    assert!(library.diagnostics.is_empty());
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(3_509);
+    let mut context =
+        context_with_options(&library, &parsed, file, CanonicalCheckerOptions::default());
+
+    context.check_source_file(file).unwrap();
+
+    let [diagnostic] = context.diagnostics().as_slice() else {
+        panic!("the contextually typed string parameter must reject its missing property")
+    };
+    assert_eq!(diagnostic.diagnostic.code(), 2339);
+    assert_eq!(
+        node_text(text, &parsed, diagnostic.node.unwrap()),
+        "missing"
+    );
+    assert_eq!(
+        diagnostic.diagnostic.render().unwrap(),
+        "Property 'missing' does not exist on type 'string'.",
+    );
+
+    let warm = (
+        context.store().type_len(),
+        context.store().signature_len(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
+}

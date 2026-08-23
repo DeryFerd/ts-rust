@@ -6700,6 +6700,43 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
     }
 
+    fn is_contextual_object_property_call_argument(
+        &self,
+        store: &CanonicalTypeMapperStore,
+        declaration: NodeRef,
+    ) -> Result<bool, SourceCheckError> {
+        let Some(property) = self
+            .node(declaration)?
+            .parent
+            .map(|node| self.reference(node))
+        else {
+            return Ok(false);
+        };
+        let Some(object) = self.node(property)?.parent.map(|node| self.reference(node)) else {
+            return Ok(false);
+        };
+        let Some(call) = self.node(object)?.parent.map(|node| self.reference(node)) else {
+            return Ok(false);
+        };
+        let record = self.node(call)?;
+        let NodeData::CallExpression(syntax) = &record.data else {
+            return Ok(false);
+        };
+        if record.kind != SyntaxKind::CallExpression
+            || syntax
+                .arguments
+                .nodes
+                .iter()
+                .filter(|argument| **argument == object.node)
+                .count()
+                != 1
+        {
+            return Ok(false);
+        }
+        let syntax = plan_direct_source_call_syntax(self.arena, store, call)?;
+        Ok(syntax.arguments().contains(&object))
+    }
+
     fn plan_nested_arrow_argument(
         &mut self,
         declaration: NodeRef,
@@ -6797,19 +6834,24 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 .map_err(Self::arrow_plan_error)?;
         let expression_statement = plan_array_arrow_identifier_statement(store, host, &callable)
             .map_err(Self::arrow_plan_error)?;
-        let javascript_object_property_arrow = self
+        let is_javascript = self
             .bound
             .source_facts()
-            .is_some_and(ts_binder::CanonicalSourceFileFacts::is_javascript_file)
-            && source_object_property_arrow_symbol(store, host, declaration)
-                .map_err(Self::callable_plan_error)?
-                .is_some();
+            .is_some_and(ts_binder::CanonicalSourceFileFacts::is_javascript_file);
+        let object_property_arrow = source_object_property_arrow_symbol(store, host, declaration)
+            .map_err(Self::callable_plan_error)?
+            .is_some();
+        let javascript_object_property_arrow = is_javascript && object_property_arrow;
+        let contextual_object_property_arrow = !is_javascript
+            && object_property_arrow
+            && self.is_contextual_object_property_call_argument(store, declaration)?;
         if callable
             .parameters
             .iter()
             .any(|parameter| parameter.is_implicit_any())
             && expression_statement.is_none()
             && !javascript_object_property_arrow
+            && !contextual_object_property_arrow
         {
             return Err(SourceCheckError::Unsupported(
                 UnsupportedSourceSyntax::Arrow(declaration),
@@ -11349,6 +11391,7 @@ fn check_expression_type(
             deferred,
             expression.node,
             arrow,
+            contextual_type,
         ),
         PlannedExpressionKind::New(construction) => {
             if contextual_type.is_some() {
@@ -11659,11 +11702,47 @@ fn check_planned_arrow_argument(
     deferred: &mut Vec<DeferredAssertion>,
     expression: NodeRef,
     arrow: &PlannedArrowExpression,
+    contextual_type: Option<TypeId>,
 ) -> Result<CheckedExpressionTypes, SourceCheckError> {
     if arrow.callable.declaration != expression
         || arrow.callable.family != SourceCallableFamily::ArrowFunction
     {
         return Err(SourceCheckError::Arrow(expression));
+    }
+    let contextual_property = if !host
+        .bound_file(expression)
+        .and_then(BoundFile::source_facts)
+        .is_some_and(ts_binder::CanonicalSourceFileFacts::is_javascript_file)
+        && arrow
+            .callable
+            .parameters
+            .iter()
+            .any(|parameter| parameter.is_implicit_any())
+    {
+        source_object_property_arrow_symbol(store, host, expression)
+            .map_err(SourcePlanner::callable_plan_error)?
+    } else {
+        None
+    };
+    if let Some(property) = contextual_property {
+        let contextual_type = contextual_type.ok_or(SourceCheckError::Unsupported(
+            UnsupportedSourceSyntax::Arrow(expression),
+        ))?;
+        return check_contextual_object_property_arrow(
+            store,
+            host,
+            global_types,
+            source,
+            options,
+            session,
+            diagnostics,
+            current_flow_types,
+            preflighted_type_import_value_uses,
+            deferred,
+            arrow,
+            property,
+            contextual_type,
+        );
     }
     let materialized = materialize_checked_source_callable(
         store,
@@ -11774,6 +11853,227 @@ fn check_planned_arrow_argument(
         materialized.type_,
         materialized.type_,
     ))
+}
+
+#[allow(clippy::too_many_arguments)] // Contextual property arrows share source execution state.
+fn check_contextual_object_property_arrow(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source: SourceFileRef,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    current_flow_types: &HashMap<SemanticSymbolId, TypeId>,
+    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    deferred: &mut Vec<DeferredAssertion>,
+    arrow: &PlannedArrowExpression,
+    property: SemanticSymbolId,
+    contextual_type: TypeId,
+) -> Result<CheckedExpressionTypes, SourceCheckError> {
+    let unsupported = || {
+        SourceCheckError::Unsupported(UnsupportedSourceSyntax::Arrow(arrow.callable.declaration))
+    };
+    let [parameter] = arrow.callable.parameters.as_slice() else {
+        return Err(unsupported());
+    };
+    if !parameter.is_implicit_any()
+        || parameter.optional
+        || parameter.rest
+        || parameter.initializer.is_some()
+        || !arrow.parameter_initializers.is_empty()
+        || arrow.expression_statement.is_some()
+        || !arrow.callable.type_parameters.is_empty()
+        || !arrow.callable.return_type.is_inferred()
+        || arrow.callable.flags != super::signatures::SignatureFlags::NONE
+        || arrow.callable.min_argument_count != 1
+        || !store.type_has_function_type_provenance(contextual_type)
+        || !store.source_contextual_callable_anchor_is_exact(
+            arrow.callable.declaration,
+            arrow.callable.owner_symbol,
+            property,
+        )
+    {
+        return Err(unsupported());
+    }
+    let StoredSingleCallableValidation::Valid {
+        callable: target, ..
+    } = validate_stored_single_callable(store, contextual_type)
+    else {
+        return Err(unsupported());
+    };
+    let Some(signature) = store.signature(target.signature) else {
+        return Err(unsupported());
+    };
+    let [parameter_type] = target.parameters.as_slice() else {
+        return Err(unsupported());
+    };
+    if !signature.type_parameters().is_empty()
+        || signature.has_rest_parameter()
+        || target.rest_parameter.is_some()
+    {
+        return Err(unsupported());
+    }
+    let parameter_type = *parameter_type;
+    let PlannedArrowBody::Return {
+        expression: body, ..
+    } = &arrow.body
+    else {
+        return Err(unsupported());
+    };
+
+    let mut flow_types = current_flow_types.clone();
+    if flow_types
+        .insert(parameter.symbol, parameter_type)
+        .is_some()
+    {
+        return Err(SourceCheckError::Variable(
+            VariableInvariant::DuplicateCurrentFlowType(parameter.symbol),
+        ));
+    }
+    let checked = check_expression_type(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        session,
+        diagnostics,
+        &flow_types,
+        preflighted_type_import_value_uses,
+        body,
+        None,
+        deferred,
+    );
+    let checked = match checked {
+        Ok(checked) => checked,
+        Err(SourceCheckError::RelationUnavailable(
+            RelationUnavailable::UnsupportedStructuredType(receiver_type),
+        )) if receiver_type == parameter_type
+            && store
+                .intrinsic_bootstrap()
+                .is_some_and(|bootstrap| receiver_type == bootstrap.string_type) =>
+        {
+            recover_contextual_string_property(
+                store,
+                host,
+                global_types,
+                diagnostics,
+                body,
+                parameter.symbol,
+                receiver_type,
+            )?
+        }
+        Err(error) => return Err(error),
+    };
+    let return_type = widened_fresh_literal_type(store, checked.result)?;
+    let return_type = store.get_widened_type_with_global_types(return_type, global_types)?;
+    let callable = publish_contextual_source_callable(
+        store,
+        &PreparedContextualSourceCallable {
+            declaration: arrow.callable.declaration,
+            owner_symbol: arrow.callable.owner_symbol,
+            variable_symbol: property,
+            contextual_target: contextual_type,
+            parameters: vec![ContextualSourceCallableParameter {
+                declaration: parameter.declaration,
+                symbol: parameter.symbol,
+                type_: parameter_type,
+            }],
+            flags: arrow.callable.flags,
+            min_argument_count: arrow.callable.min_argument_count,
+            return_type,
+        },
+    )
+    .map_err(SourcePlanner::callable_plan_error)?;
+    publish_expression_type(store, arrow.callable.declaration, callable)?;
+    Ok(CheckedExpressionTypes::leaf(callable, callable))
+}
+
+fn recover_contextual_string_property(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    expression: &PlannedExpression,
+    parameter: SemanticSymbolId,
+    receiver_type: TypeId,
+) -> Result<CheckedExpressionTypes, SourceCheckError> {
+    let unsupported = || {
+        SourceCheckError::RelationUnavailable(RelationUnavailable::UnsupportedStructuredType(
+            receiver_type,
+        ))
+    };
+    let PlannedExpressionKind::Property(property) = &expression.kind else {
+        return Err(unsupported());
+    };
+    let PlannedExpressionKind::Identifier(receiver) = &property.receiver.kind else {
+        return Err(unsupported());
+    };
+    if receiver.kind != PlannedIdentifierReadKind::Variable || receiver.value_symbol != parameter {
+        return Err(unsupported());
+    }
+    let Some(record) = host.node(property.node) else {
+        return Err(unsupported());
+    };
+    let NodeData::PropertyAccessExpression(access) = &record.data else {
+        return Err(unsupported());
+    };
+    if record.kind != SyntaxKind::PropertyAccessExpression
+        || access.expression != property.receiver.node.node
+        || access.question_dot_token.is_some()
+    {
+        return Err(unsupported());
+    }
+    let name = NodeRef::new(property.node.arena, property.node.file, access.name);
+    let Some(name_record) = host.node(name) else {
+        return Err(unsupported());
+    };
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(unsupported());
+    };
+    if name_record.kind != SyntaxKind::Identifier
+        || name_record.parent != Some(property.node.node)
+        || identifier.text.is_empty()
+    {
+        return Err(unsupported());
+    }
+    let name_text = identifier.text.clone();
+    let known_wrapper_property = store
+        .type_payload(global_types.string_type)
+        .and_then(TypeRecord::symbol)
+        .and_then(|symbol| store.symbol(symbol))
+        .and_then(ts_binder::semantic::Symbol::members)
+        .and_then(|members| store.symbol_table(members))
+        .is_some_and(|members| members.get_source(&name_text).is_some());
+    if known_wrapper_property
+        || store
+            .symbol_node_links(property.node)
+            .is_some_and(|links| links != &SymbolNodeLinks::default())
+    {
+        return Err(unsupported());
+    }
+    let error_type = store
+        .intrinsic_bootstrap()
+        .ok_or(SourceCheckError::LiteralCache(
+            SourceLiteralCacheError::BootstrapUninitialized,
+        ))?
+        .error_type;
+    preflight_source_expression_cache(store, property.node, error_type)?;
+    publish_expression_type(store, property.node, error_type)?;
+    merge_retry_diagnostic(
+        diagnostics,
+        CanonicalCheckerDiagnostic {
+            node: Some(name),
+            range_override: None,
+            diagnostic: Diagnostic::with_arguments(
+                message_by_code(2339).ok_or(SourceCheckError::MissingDiagnostic(2339))?,
+                [name_text, "string".to_owned()],
+            ),
+            related_information: Vec::new(),
+        },
+    );
+    Ok(CheckedExpressionTypes::leaf(error_type, error_type))
 }
 
 fn check_uncached_conditional_scalar(
@@ -15815,16 +16115,38 @@ pub(super) fn check_source_file(
         )?;
     }
     for arrow in &nested_arrow_callables {
-        session.reset_query();
-        CanonicalTypeQuery::new_with_global_types_and_session(
-            store,
-            host,
-            global_types,
-            options,
-            session,
-            &mut type_import_preflight_diagnostics,
-        )?
-        .preflight_type_of_source_callable(arrow.declaration, arrow.owner_symbol)?;
+        let warm_contextual_property = store
+            .source_callable_type_for_owner(arrow.owner_symbol)
+            .and_then(|callable| {
+                store
+                    .source_callable_provenance(callable)
+                    .filter(|provenance| provenance.contextual_target.is_some())
+                    .map(|provenance| (callable, provenance.contextual_variable))
+            });
+        if let Some((callable, anchor)) = warm_contextual_property {
+            let property = source_object_property_arrow_symbol(store, host, arrow.declaration)
+                .map_err(SourcePlanner::callable_plan_error)?;
+            if anchor != property
+                || property.is_none()
+                || !matches!(
+                    validate_stored_source_callable(store, callable),
+                    StoredSourceCallableValidation::Valid(_)
+                )
+            {
+                return Err(SourceCheckError::Arrow(arrow.declaration));
+            }
+        } else {
+            session.reset_query();
+            CanonicalTypeQuery::new_with_global_types_and_session(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                &mut type_import_preflight_diagnostics,
+            )?
+            .preflight_type_of_source_callable(arrow.declaration, arrow.owner_symbol)?;
+        }
         if let Some(links) = store.type_node_links(arrow.declaration) {
             let expected = TypeNodeLinks {
                 resolved_type: links.resolved_type,
@@ -27506,6 +27828,78 @@ mod tests {
         let warm = observable_state(&context, file);
         mark_source_unchecked(&mut context, file);
         context.check_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn contextual_object_property_arrows_check_body_with_the_callback_parameter_type() {
+        let source = parsed(concat!(
+            "interface Foo { foo: (t: string) => string; } ",
+            "function f2(args: Foo) {} ",
+            "f2({ foo: s => s.hmm });",
+        ));
+        let file = FileId::new(8_338);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                no_implicit_any: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected only the missing string-property diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2339);
+        assert_eq!(node_text(&source, diagnostic.node.unwrap()), "hmm");
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "Property 'hmm' does not exist on type 'string'."
+        );
+
+        let arrow = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ArrowFunction).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let NodeData::ArrowFunction(syntax) = &source.arena.get(arrow.node).unwrap().data else {
+            panic!("expected an object-property arrow")
+        };
+        let [parameter] = syntax.parameters.nodes.as_slice() else {
+            panic!("expected one contextual arrow parameter")
+        };
+        let parameter = NodeRef::new(source.arena.id(), file, *parameter);
+        let (_, bound) = context.file(file).unwrap();
+        let parameter = bound.symbol(parameter).unwrap();
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(parameter)
+                .and_then(|links| links.resolved_type),
+            Some(context.store().intrinsic_bootstrap().unwrap().string_type),
+        );
+        let owner = bound.symbol(arrow).unwrap();
+        let callable = context
+            .store()
+            .source_callable_type_for_owner(owner)
+            .unwrap();
+        let provenance = context
+            .store()
+            .source_callable_provenance(callable)
+            .unwrap();
+        assert!(provenance.contextual_target.is_some());
+        assert!(provenance.contextual_variable.is_some());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
     }
 
