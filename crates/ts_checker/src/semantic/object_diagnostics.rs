@@ -22,12 +22,16 @@ use super::{
     CanonicalCheckerRelatedInformation, CanonicalGlobalTypes, CanonicalTypeFormatFlags,
     CanonicalTypeMapperStore, DeclaredTypeHost, RelationUnavailable, SignatureId,
     TypeDisplayUnavailable, TypeId,
+    array_types::CanonicalArrayTargets,
     formatter::{
         FunctionTypeDisplayUnavailable,
         get_type_names_for_assignability_error_with_host_global_types_and_flags,
         type_to_string_with_host_global_types_and_flags,
     },
-    functions::{StoredFunctionTypeValidation, validate_stored_function_type},
+    functions::{
+        StoredFunctionTypeValidation, function_type_display_projection,
+        validate_stored_function_type,
+    },
     indexed_access_types::{is_template_pattern_index_key, template_pattern_index_matches_name},
     instantiate::InstantiationSession,
     object_members::{
@@ -1055,7 +1059,7 @@ fn generic_assignability_diagnostic(
             flags,
         )?;
     let mut diagnostic = primary(2322, node, vec![source, target])?;
-    diagnostic.diagnostic.details = declared_property_mismatch_details(
+    diagnostic.diagnostic.details = if let Some(details) = tuple_rest_parameter_mismatch_details(
         store,
         host,
         global_types,
@@ -1063,8 +1067,177 @@ fn generic_assignability_diagnostic(
         target_type,
         flags,
         options,
-    )?;
+    )? {
+        details
+    } else {
+        declared_property_mismatch_details(
+            store,
+            host,
+            global_types,
+            source_type,
+            target_type,
+            flags,
+            options,
+        )?
+    };
     Ok(diagnostic)
+}
+
+fn tuple_rest_parameter_mismatch_details(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source_type: TypeId,
+    target_type: TypeId,
+    flags: CanonicalTypeFormatFlags,
+    options: CanonicalCheckerOptions,
+) -> Result<Option<Vec<String>>, SourceCheckError> {
+    if !options.strict_function_types
+        || !matches!(
+            validate_stored_function_type(store, source_type),
+            StoredFunctionTypeValidation::Valid(_)
+        )
+        || !matches!(
+            validate_stored_function_type(store, target_type),
+            StoredFunctionTypeValidation::Valid(_)
+        )
+    {
+        return Ok(None);
+    }
+
+    let array_targets = Some(CanonicalArrayTargets::from_global_types(global_types));
+    let source = function_type_display_projection(store, host, source_type, array_targets)
+        .map_err(|_| invalid_structure(source_type))?;
+    let target = function_type_display_projection(store, host, target_type, array_targets)
+        .map_err(|_| invalid_structure(target_type))?;
+    let [source_parameter] = source.parameters.as_slice() else {
+        return Ok(None);
+    };
+    let [target_parameter] = target.parameters.as_slice() else {
+        return Ok(None);
+    };
+    if source_parameter.optional
+        || target_parameter.optional
+        || !is_terminal_scalar_relation_leaf(store, source_parameter.value_type)
+        || !is_terminal_scalar_relation_leaf(store, target_parameter.value_type)
+        || !valid_labeled_tuple_rest_parameter(
+            store,
+            host,
+            target_type,
+            &target_parameter.name,
+            target_parameter.value_type,
+        )?
+        || store.is_type_assignable_to_with_global_types_and_strict_function_types(
+            target_parameter.value_type,
+            source_parameter.value_type,
+            global_types,
+            options.strict_function_types,
+        )?
+    {
+        return Ok(None);
+    }
+
+    let parameter_message = Diagnostic::with_arguments(
+        message_by_code(2328).ok_or(SourceCheckError::MissingDiagnostic(2328))?,
+        [
+            source_parameter.name.as_str(),
+            target_parameter.name.as_str(),
+        ],
+    )
+    .render()
+    .expect("TS2328 has two formatting arguments");
+    let AssignabilityErrorDisplay { source, target } =
+        get_type_names_for_assignability_error_with_host_global_types_and_flags(
+            store,
+            host,
+            global_types,
+            target_parameter.value_type,
+            source_parameter.value_type,
+            flags,
+        )?;
+    let type_message = Diagnostic::with_arguments(
+        message_by_code(2322).ok_or(SourceCheckError::MissingDiagnostic(2322))?,
+        [source, target],
+    )
+    .render()
+    .expect("TS2322 has two formatting arguments");
+    Ok(Some(vec![
+        format!("  {parameter_message}"),
+        format!("    {type_message}"),
+    ]))
+}
+
+fn valid_labeled_tuple_rest_parameter(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    type_id: TypeId,
+    expected_name: &str,
+    expected_type: TypeId,
+) -> Result<bool, SourceCheckError> {
+    let signature =
+        exact_function_type_signature(store, type_id).ok_or_else(|| invalid_structure(type_id))?;
+    let signature = store
+        .signature(signature)
+        .ok_or_else(|| invalid_structure(type_id))?;
+    let declaration = signature
+        .declaration()
+        .ok_or_else(|| invalid_structure(type_id))?;
+    let function = host
+        .node(declaration)
+        .ok_or_else(|| invalid_structure(type_id))?;
+    let NodeData::FunctionTypeNode(function) = &function.data else {
+        return Err(invalid_structure(type_id));
+    };
+    let [parameter] = function.parameters.nodes.as_slice() else {
+        return Ok(false);
+    };
+    let parameter = NodeRef::new(declaration.arena, declaration.file, *parameter);
+    let parameter_node = host
+        .node(parameter)
+        .ok_or_else(|| invalid_structure(type_id))?;
+    let NodeData::ParameterDeclaration(parameter_data) = &parameter_node.data else {
+        return Err(invalid_structure(type_id));
+    };
+    if parameter_data.dot_dot_dot_token.is_none() {
+        return Ok(false);
+    }
+    let tuple = parameter_data
+        .type_
+        .map(|node| NodeRef::new(parameter.arena, parameter.file, node))
+        .ok_or_else(|| invalid_structure(type_id))?;
+    let tuple_node = host.node(tuple).ok_or_else(|| invalid_structure(type_id))?;
+    let NodeData::TupleTypeNode(tuple_data) = &tuple_node.data else {
+        return Err(invalid_structure(type_id));
+    };
+    let [element] = tuple_data.elements.nodes.as_slice() else {
+        return Err(invalid_structure(type_id));
+    };
+    let element = NodeRef::new(tuple.arena, tuple.file, *element);
+    let element_node = host
+        .node(element)
+        .ok_or_else(|| invalid_structure(type_id))?;
+    let NodeData::NamedTupleMember(member) = &element_node.data else {
+        return Err(invalid_structure(type_id));
+    };
+    let name = NodeRef::new(element.arena, element.file, member.name);
+    let name_node = host.node(name).ok_or_else(|| invalid_structure(type_id))?;
+    let NodeData::Identifier(name) = &name_node.data else {
+        return Err(invalid_structure(type_id));
+    };
+    let annotation = NodeRef::new(element.arena, element.file, member.type_);
+    if parameter_node.parent != Some(declaration.node)
+        || tuple_node.parent != Some(parameter.node)
+        || element_node.parent != Some(tuple.node)
+        || name_node.parent != Some(element.node)
+        || name.text != expected_name
+        || store
+            .type_node_links(annotation)
+            .and_then(|links| links.resolved_type)
+            .is_some_and(|cached| cached != expected_type)
+    {
+        return Err(invalid_structure(type_id));
+    }
+    Ok(true)
 }
 
 pub(super) fn declared_property_mismatch_details(
@@ -1466,6 +1639,67 @@ mod tests {
         });
         assert!(complete.contains(CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT));
         assert!(complete.contains(CanonicalTypeFormatFlags::NO_TRUNCATION));
+    }
+
+    #[test]
+    fn tuple_rest_parameter_mismatch_preserves_labels_and_contravariant_types() {
+        let parsed = parse_source_file(concat!(
+            "declare let target: (...args: [x: number]) => void; ",
+            "declare let source: (a: string) => void; ",
+            "target = source;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(212);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/tuple-rest-diagnostic.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            [(file, &parsed.arena)].into_iter().collect(),
+            CanonicalCheckerOptions {
+                strict_function_types: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        )
+        .unwrap();
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected one tuple-rest parameter mismatch")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2322);
+        assert_eq!(
+            diagnostic.diagnostic.arguments,
+            ["(a: string) => void", "(x: number) => void"],
+        );
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            concat!(
+                "Type '(a: string) => void' is not assignable to type '(x: number) => void'.\n",
+                "  Types of parameters 'a' and 'x' are incompatible.\n",
+                "    Type 'number' is not assignable to type 'string'.",
+            ),
+        );
+        assert!(diagnostic.related_information.is_empty());
+
+        let published = context.diagnostics().clone();
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(context.diagnostics(), &published);
     }
 
     #[test]

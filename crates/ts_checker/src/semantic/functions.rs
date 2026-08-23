@@ -26,7 +26,7 @@ use super::{
         DecoratorSignatureState, EffectsSignatureState, ResolvedSignatureState, SignatureLinks,
         SymbolNodeLinks, TypeAliasLinks, TypeNodeLinks, ValueSymbolLinks,
     },
-    signatures::{Signature, SignatureFlags},
+    signatures::{ElementFlags, Signature, SignatureFlags},
     store::SourceNodeParent,
     type_records::{ConstrainedTypeData, StructuredTypeData, TypeCacheState, TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
@@ -43,6 +43,16 @@ pub(super) struct FunctionParameterPlan {
     identity_node: NodeRef,
     null_literal_identity: bool,
     pub(super) optional: bool,
+    rest_tuple_element: Option<FunctionRestTupleElementPlan>,
+}
+
+/// One required labeled tuple element expanded into a fixed signature parameter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FunctionRestTupleElementPlan {
+    declaration: NodeRef,
+    name: NodeRef,
+    identity_node: NodeRef,
+    null_literal_identity: bool,
 }
 
 /// One inner signature parameter constrained by an outer lexical parameter.
@@ -355,11 +365,6 @@ pub(super) fn plan_function_type(
             )));
         }
         previous_end = parameter_record.range.end;
-        if data.dot_dot_dot_token.is_some() {
-            return Err(FunctionTypeError::Unsupported(
-                FunctionTypeUnsupported::RestParameter(parameter),
-            ));
-        }
         if data.initializer.is_some() {
             return Err(FunctionTypeError::Unsupported(
                 FunctionTypeUnsupported::InitializedParameter(parameter),
@@ -424,6 +429,18 @@ pub(super) fn plan_function_type(
         } else {
             false
         };
+        let rest_tuple_element = match data.dot_dot_dot_token {
+            Some(token) => Some(plan_rest_tuple_parameter(
+                store,
+                host,
+                node,
+                parameter,
+                name,
+                type_node,
+                NodeRef::new(node.arena, node.file, token),
+            )?),
+            None => None,
+        };
 
         let raw_parameter_symbol = bound
             .symbol(parameter)
@@ -454,7 +471,11 @@ pub(super) fn plan_function_type(
             )));
         }
         let identity_node = peel_parenthesized_type(store, host, type_node)?;
-        if type_record.kind == SyntaxKind::LiteralType {
+        let signature_type_record = match rest_tuple_element {
+            Some(element) => preflight_node(store, host, element.identity_node)?,
+            None => type_record,
+        };
+        if signature_type_record.kind == SyntaxKind::LiteralType {
             flags |= SignatureFlags::HAS_LITERAL_TYPES;
         }
         parameters.push(FunctionParameterPlan {
@@ -464,6 +485,7 @@ pub(super) fn plan_function_type(
             identity_node,
             null_literal_identity: is_null_literal_type(store, host, identity_node)?,
             optional,
+            rest_tuple_element,
         });
         if !optional {
             min_argument_count = parameters.len();
@@ -510,6 +532,116 @@ pub(super) fn plan_function_type(
     };
     function_type_state(store, &plan, true)?;
     Ok(plan)
+}
+
+fn plan_rest_tuple_parameter(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    function: NodeRef,
+    parameter: NodeRef,
+    parameter_name: NodeRef,
+    tuple: NodeRef,
+    token: NodeRef,
+) -> Result<FunctionRestTupleElementPlan, FunctionTypeError> {
+    let function_record = preflight_node(store, host, function)?;
+    let NodeData::FunctionTypeNode(function_data) = &function_record.data else {
+        return Err(invariant(FunctionTypeInvariant::InvalidSyntax(function)));
+    };
+    let parameter_record = preflight_node(store, host, parameter)?;
+    let NodeData::ParameterDeclaration(parameter_data) = &parameter_record.data else {
+        return Err(invariant(FunctionTypeInvariant::InvalidParameter(
+            parameter,
+        )));
+    };
+    let token_record = preflight_node(store, host, token)?;
+    let parameter_name_record = preflight_node(store, host, parameter_name)?;
+    if token_record.kind != SyntaxKind::DotDotDotToken
+        || token_record.parent != Some(parameter.node)
+        || token_record.range.start < parameter_record.range.start
+        || token_record.range.end > parameter_name_record.range.start
+    {
+        return Err(invariant(FunctionTypeInvariant::InvalidParameter(
+            parameter,
+        )));
+    }
+    if function_data.parameters.nodes.as_slice() != [parameter.node]
+        || parameter_data.question_token.is_some()
+    {
+        return Err(FunctionTypeError::Unsupported(
+            FunctionTypeUnsupported::RestParameter(parameter),
+        ));
+    }
+
+    let tuple_record = preflight_node(store, host, tuple)?;
+    let NodeData::TupleTypeNode(tuple_data) = &tuple_record.data else {
+        return Err(FunctionTypeError::Unsupported(
+            FunctionTypeUnsupported::RestParameter(parameter),
+        ));
+    };
+    if tuple_record.kind != SyntaxKind::TupleType
+        || tuple_record.parent != Some(parameter.node)
+        || tuple_data.elements.range != tuple_record.range
+    {
+        return Err(invariant(FunctionTypeInvariant::InvalidParameter(
+            parameter,
+        )));
+    }
+    let [element] = tuple_data.elements.nodes.as_slice() else {
+        return Err(FunctionTypeError::Unsupported(
+            FunctionTypeUnsupported::RestParameter(parameter),
+        ));
+    };
+    let declaration = NodeRef::new(tuple.arena, tuple.file, *element);
+    let declaration_record = preflight_node(store, host, declaration)?;
+    let NodeData::NamedTupleMember(member) = &declaration_record.data else {
+        return Err(FunctionTypeError::Unsupported(
+            FunctionTypeUnsupported::RestParameter(parameter),
+        ));
+    };
+    if declaration_record.kind != SyntaxKind::NamedTupleMember
+        || declaration_record.parent != Some(tuple.node)
+        || declaration_record.range.start < tuple_record.range.start
+        || declaration_record.range.end > tuple_record.range.end
+        || member.symbol.is_some()
+    {
+        return Err(invariant(FunctionTypeInvariant::InvalidParameter(
+            parameter,
+        )));
+    }
+    if member.dot_dot_dot_token.is_some() || member.question_token.is_some() {
+        return Err(FunctionTypeError::Unsupported(
+            FunctionTypeUnsupported::RestParameter(parameter),
+        ));
+    }
+
+    let name = NodeRef::new(declaration.arena, declaration.file, member.name);
+    let name_record = preflight_node(store, host, name)?;
+    let NodeData::Identifier(_) = &name_record.data else {
+        return Err(invariant(FunctionTypeInvariant::InvalidParameter(
+            parameter,
+        )));
+    };
+    let element_type = NodeRef::new(declaration.arena, declaration.file, member.type_);
+    let element_type_record = preflight_node(store, host, element_type)?;
+    if name_record.kind != SyntaxKind::Identifier
+        || name_record.parent != Some(declaration.node)
+        || name_record.range.start < declaration_record.range.start
+        || name_record.range.end > declaration_record.range.end
+        || element_type_record.parent != Some(declaration.node)
+        || element_type_record.range.start < name_record.range.end
+        || element_type_record.range.end > declaration_record.range.end
+    {
+        return Err(invariant(FunctionTypeInvariant::InvalidParameter(
+            parameter,
+        )));
+    }
+    let identity_node = peel_parenthesized_type(store, host, element_type)?;
+    Ok(FunctionRestTupleElementPlan {
+        declaration,
+        name,
+        identity_node,
+        null_literal_identity: is_null_literal_type(store, host, identity_node)?,
+    })
 }
 
 fn plan_function_type_parameters(
@@ -873,15 +1005,19 @@ pub(super) fn function_type_display_projection(
             return Err(FunctionTypeDisplayError::Malformed);
         }
     };
+    let signature_id = signature;
     let signature = store
-        .signature(signature)
+        .signature(signature_id)
+        .ok_or(FunctionTypeDisplayError::Malformed)?;
+    let signature_parameter_types = store
+        .callable_signature_parameter_types(signature_id)
         .ok_or(FunctionTypeDisplayError::Malformed)?;
     let return_type = signature.resolved_return_type();
     let mut parameters = Vec::with_capacity(plan.parameters.len());
-    for parameter in &plan.parameters {
-        let value_type = store
-            .value_symbol_links(parameter.symbol)
-            .and_then(|links| links.resolved_type)
+    for (index, parameter) in plan.parameters.iter().enumerate() {
+        let value_type = signature_parameter_types
+            .get(index)
+            .copied()
             .ok_or(FunctionTypeDisplayError::Malformed)?;
         let parameter_node = host
             .node(parameter.declaration)
@@ -889,10 +1025,15 @@ pub(super) fn function_type_display_projection(
         let NodeData::ParameterDeclaration(parameter_data) = &parameter_node.data else {
             return Err(FunctionTypeDisplayError::Malformed);
         };
-        let name = NodeRef::new(
-            parameter.declaration.arena,
-            parameter.declaration.file,
-            parameter_data.name,
+        let name = parameter.rest_tuple_element.map_or_else(
+            || {
+                NodeRef::new(
+                    parameter.declaration.arena,
+                    parameter.declaration.file,
+                    parameter_data.name,
+                )
+            },
+            |element| element.name,
         );
         let name_node = host.node(name).ok_or(FunctionTypeDisplayError::Malformed)?;
         let NodeData::Identifier(identifier) = &name_node.data else {
@@ -1204,6 +1345,7 @@ pub(super) fn publish_parameter_types(
                 || store
                     .validate_cached_array_capability_prepared(*base, global_types, prepared)
                     .is_err()
+                || planned_signature_parameter_type(store, parameter, *base).is_none()
             {
                 return Err(invariant(FunctionTypeInvariant::InvalidParameterCache(
                     parameter.declaration,
@@ -1254,8 +1396,22 @@ pub(super) fn publish_parameter_types(
                     parameter.declaration,
                 )));
             }
+            let signature_type = planned_signature_parameter_type(store, parameter, type_)
+                .ok_or_else(|| {
+                    invariant(FunctionTypeInvariant::InvalidParameterCache(
+                        parameter.declaration,
+                    ))
+                })?;
+            if store
+                .validate_cached_array_capability_prepared(signature_type, global_types, prepared)
+                .is_err()
+            {
+                return Err(invariant(FunctionTypeInvariant::InvalidParameterCache(
+                    parameter.declaration,
+                )));
+            }
             resolved.push((parameter.symbol, type_));
-            function_parameter_types.push(type_);
+            function_parameter_types.push(signature_type);
         }
         expected_parameter_types.push((signature, function_parameter_types));
     }
@@ -1574,17 +1730,30 @@ pub(super) fn validate_stored_function_type(
                     Some(links) if links.resolved_type.is_some() => {
                         let resolved_type =
                             links.resolved_type.expect("the branch checked the type");
+                        let expected = expected_parameter_types
+                            .and_then(|types| types.get(index))
+                            .copied();
                         let valid = links
                             == &(ValueSymbolLinks {
                                 resolved_type: Some(resolved_type),
                                 ..ValueSymbolLinks::default()
                             })
-                            && expected_parameter_types
-                                .and_then(|types| types.get(index))
-                                .copied()
-                                == Some(resolved_type);
+                            && expected.is_some_and(|expected| {
+                                expected == resolved_type
+                                    || signature_record.parameters().len() == 1
+                                        && signature_record.min_argument_count() == 1
+                                        && stored_rest_tuple_parameter_type(
+                                            store,
+                                            declaration,
+                                            resolved_type,
+                                        ) == Some(expected)
+                            });
                         if valid {
                             parameter_edges.push(resolved_type);
+                            if let Some(expected) = expected.filter(|type_| *type_ != resolved_type)
+                            {
+                                parameter_edges.push(expected);
+                            }
                         }
                         valid
                     }
@@ -1956,6 +2125,62 @@ fn default_parameter_links(store: &CanonicalTypeMapperStore, symbol: SemanticSym
         .is_none_or(|links| links == &ValueSymbolLinks::default())
 }
 
+fn planned_signature_parameter_type(
+    store: &CanonicalTypeMapperStore,
+    parameter: &FunctionParameterPlan,
+    value_type: TypeId,
+) -> Option<TypeId> {
+    let Some(element) = parameter.rest_tuple_element else {
+        return Some(value_type);
+    };
+    let signature_type =
+        stored_rest_tuple_parameter_type(store, parameter.declaration, value_type)?;
+    let shape = store.canonical_tuple_shape(value_type).ok().flatten()?;
+    let [info] = shape.element_infos() else {
+        return None;
+    };
+    if info.labeled_declaration() != Some(element.declaration)
+        || cached_annotation_identity(store, element.identity_node, element.null_literal_identity)
+            != Some(signature_type)
+    {
+        return None;
+    }
+    Some(signature_type)
+}
+
+fn stored_rest_tuple_parameter_type(
+    store: &CanonicalTypeMapperStore,
+    parameter: NodeRef,
+    value_type: TypeId,
+) -> Option<TypeId> {
+    let shape = store.canonical_tuple_shape(value_type).ok().flatten()?;
+    let [element_type] = shape.element_types() else {
+        return None;
+    };
+    let [info] = shape.element_infos() else {
+        return None;
+    };
+    let declaration = info.labeled_declaration()?;
+    let SourceNodeParent::Parent(tuple) = store.source_node_parent(declaration)? else {
+        return None;
+    };
+    if shape.is_readonly()
+        || shape.min_length() != 1
+        || shape.fixed_length() != 1
+        || info.flags() != ElementFlags::REQUIRED
+        || store.source_node_kind(declaration) != Some(SyntaxKind::NamedTupleMember)
+        || store.source_node_kind(tuple) != Some(SyntaxKind::TupleType)
+        || store.source_node_parent(tuple) != Some(SourceNodeParent::Parent(parameter))
+        || store
+            .type_node_links(tuple)
+            .and_then(|links| links.resolved_type)
+            != Some(value_type)
+    {
+        return None;
+    }
+    Some(*element_type)
+}
+
 fn validate_parameter_links(
     store: &CanonicalTypeMapperStore,
     plan: &FunctionTypePlan,
@@ -1972,7 +2197,7 @@ fn validate_parameter_links(
             parameter.declaration,
         )));
     };
-    if resolved != expected
+    if planned_signature_parameter_type(store, parameter, resolved) != Some(expected)
         || links
             != &(ValueSymbolLinks {
                 resolved_type: Some(resolved),
@@ -2424,6 +2649,212 @@ mod tests {
                 plan_function_type(&fixture.store, &host, function, None, false, None),
                 Err(FunctionTypeError::Unsupported(
                     FunctionTypeUnsupported::GenericSignature(_)
+                ))
+            ));
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn labeled_tuple_rest_preserves_parameter_value_and_expands_signature() {
+        let mut fixture = fixture(
+            "declare let value: (...args: [x: number]) => void;",
+            FileId::new(95_020),
+        );
+        let function = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionType).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let plan = {
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            plan_function_type(&fixture.store, &host, function, None, false, None).unwrap()
+        };
+        let [parameter] = plan.parameters.as_slice() else {
+            panic!("expected one expanded tuple parameter")
+        };
+        assert_eq!(plan.flags, SignatureFlags::NONE);
+        assert_eq!(plan.min_argument_count, 1);
+        assert!(parameter.rest_tuple_element.is_some());
+        assert_eq!(
+            fixture
+                .parsed
+                .arena
+                .get(parameter.type_node.node)
+                .unwrap()
+                .kind,
+            SyntaxKind::TupleType
+        );
+        assert_eq!(
+            fixture
+                .store
+                .symbol(parameter.symbol)
+                .unwrap()
+                .name()
+                .as_utf8(),
+            Some("args")
+        );
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let function_type = {
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_from_type_node(function)
+            .unwrap()
+        };
+        let tuple_type = fixture
+            .store
+            .value_symbol_links(parameter.symbol)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .type_node_links(parameter.type_node)
+                .and_then(|links| links.resolved_type),
+            Some(tuple_type)
+        );
+        let tuple = fixture
+            .store
+            .canonical_tuple_shape(tuple_type)
+            .unwrap()
+            .unwrap();
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(tuple.element_types(), [number]);
+        let FunctionTypeState::Resolved { signature, .. } =
+            function_type_state(&fixture.store, &plan, false).unwrap()
+        else {
+            panic!("expected resolved expanded function signature")
+        };
+        let signature_record = fixture.store.signature(signature).unwrap();
+        assert_eq!(signature_record.parameters(), [parameter.symbol]);
+        assert_eq!(signature_record.min_argument_count(), 1);
+        assert!(!signature_record.has_rest_parameter());
+        assert_eq!(
+            fixture.store.callable_signature_parameter_types(signature),
+            Some([number].as_slice())
+        );
+        assert!(matches!(
+            validate_stored_function_type(&fixture.store, function_type),
+            StoredFunctionTypeValidation::Valid(_)
+        ));
+
+        let projection = {
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            function_type_display_projection(&fixture.store, &host, function_type, None).unwrap()
+        };
+        assert_eq!(projection.parameters.len(), 1);
+        assert_eq!(projection.parameters[0].name, "x");
+        assert_eq!(projection.parameters[0].value_type, number);
+        assert!(!projection.parameters[0].optional);
+
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        let warm_type = {
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_from_type_node(function)
+            .unwrap()
+        };
+        assert_eq!(warm_type, function_type);
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn unsupported_tuple_rest_shapes_fail_before_publication() {
+        for (index, signature) in [
+            "(...args: [number]) => void",
+            "(...args: [x?: number]) => void",
+            "(...args: [x: number, y: string]) => void",
+            "(...args: number[]) => void",
+            "(prefix: string, ...args: [x: number]) => void",
+            "(...args: [...number[]]) => void",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = format!("declare let value: {signature};");
+            let fixture = fixture(&source, FileId::new(95_030 + u32::try_from(index).unwrap()));
+            let function = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::FunctionType).then_some(NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let before = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+
+            assert!(matches!(
+                plan_function_type(&fixture.store, &host, function, None, false, None),
+                Err(FunctionTypeError::Unsupported(
+                    FunctionTypeUnsupported::RestParameter(_)
                 ))
             ));
             assert_eq!(

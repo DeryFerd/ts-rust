@@ -11,6 +11,15 @@ fn context(
     file: FileId,
     language: CanonicalSourceLanguage,
 ) -> CanonicalCheckerContext<'_> {
+    context_with_options(parsed, file, language, CanonicalCheckerOptions::default())
+}
+
+fn context_with_options(
+    parsed: &ParseResult,
+    file: FileId,
+    language: CanonicalSourceLanguage,
+    options: CanonicalCheckerOptions,
+) -> CanonicalCheckerContext<'_> {
     let mut binder = CanonicalBinder::new();
     binder
         .bind_source_file_with_facts(
@@ -38,12 +47,7 @@ fn context(
             .bind_typescript_declaration_slice(&parsed.arena, file)
             .unwrap();
     }
-    CanonicalCheckerContext::new(
-        binder.finish(),
-        vec![(file, &parsed.arena)],
-        CanonicalCheckerOptions::default(),
-    )
-    .unwrap()
+    CanonicalCheckerContext::new(binder.finish(), vec![(file, &parsed.arena)], options).unwrap()
 }
 
 #[test]
@@ -275,6 +279,93 @@ fn contextual_arrays_accept_nested_object_type_assertions() {
     assert_eq!(
         (context.store().type_len(), context.diagnostics().clone()),
         warm
+    );
+}
+
+#[test]
+fn object_union_assertions_widen_missing_sibling_properties() {
+    let parsed = parse_source_file(concat!(
+        "interface Array<T> {}\n",
+        "interface ReadonlyArray<T> {}\n",
+        "var value = <{ id: number; }[]>[{ foo: 'ready' }, {}];\n",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(8_222);
+    let mut context = context(&parsed, file, CanonicalSourceLanguage::TypeScript);
+
+    context.check_source_file(file).unwrap();
+    assert!(
+        context.diagnostics().is_empty(),
+        "{:?}",
+        context.diagnostics()
+    );
+
+    let warm = (
+        context.store().type_len(),
+        context.store().symbol_len(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
+}
+
+#[test]
+fn labeled_tuple_rest_parameters_name_the_incompatible_parameter() {
+    let parsed = parse_source_file(concat!(
+        "interface Array<T> {}\n",
+        "interface ReadonlyArray<T> {}\n",
+        "declare let target: (...args: [value: number]) => void;\n",
+        "declare let source: (argument: string) => void;\n",
+        "target = source;\n",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(8_223);
+    let mut context = context_with_options(
+        &parsed,
+        file,
+        CanonicalSourceLanguage::TypeScript,
+        CanonicalCheckerOptions {
+            strict_function_types: true,
+            ..CanonicalCheckerOptions::default()
+        },
+    );
+
+    context.check_source_file(file).unwrap();
+
+    let [diagnostic] = context.diagnostics().as_slice() else {
+        panic!("expected one incompatible function assignment")
+    };
+    assert_eq!(diagnostic.diagnostic.code(), 2322);
+    assert_eq!(
+        diagnostic.diagnostic.render().unwrap(),
+        concat!(
+            "Type '(argument: string) => void' is not assignable to type ",
+            "'(value: number) => void'.\n",
+            "  Types of parameters 'argument' and 'value' are incompatible.\n",
+            "    Type 'number' is not assignable to type 'string'.",
+        ),
+    );
+
+    let warm = (
+        context.store().type_len(),
+        context.store().signature_len(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.diagnostics().clone(),
+        ),
+        warm,
     );
 }
 
