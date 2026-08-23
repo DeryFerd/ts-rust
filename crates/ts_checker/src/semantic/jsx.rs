@@ -144,6 +144,11 @@ enum JsxScalarPlan {
         when_true: Box<Self>,
         when_false: Box<Self>,
     },
+    AdjacentElements {
+        node: NodeRef,
+        left: Box<JsxElementPlan>,
+        right: Box<JsxElementPlan>,
+    },
     Element(Box<JsxElementPlan>),
 }
 
@@ -535,8 +540,21 @@ fn plan_jsx_element(
             {
                 return Err(unsupported(closing_node, closing_record.kind));
             }
-            let closing_tag =
-                plan_jsx_tag(arena, bound, store, closing_node, closing_data.tag_name)?;
+            let closing = if recovered_conflict_marker_closing(
+                arena,
+                bound,
+                store,
+                expression,
+                closing_node,
+                closing_data.tag_name,
+            )? {
+                None
+            } else {
+                Some(JsxClosingPlan {
+                    node: closing_node,
+                    tag: plan_jsx_tag(arena, bound, store, closing_node, closing_data.tag_name)?,
+                })
+            };
             Ok(JsxElementPlan {
                 expression,
                 opening,
@@ -545,10 +563,7 @@ fn plan_jsx_element(
                     attributes_node,
                     attributes,
                     type_arguments,
-                    closing: Some(JsxClosingPlan {
-                        node: closing_node,
-                        tag: closing_tag,
-                    }),
+                    closing,
                 },
                 children: plan_jsx_children(
                     arena,
@@ -590,6 +605,49 @@ fn plan_jsx_element(
         }
         _ => Err(unsupported(expression, record.kind)),
     }
+}
+
+fn recovered_conflict_marker_closing(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    expression: NodeRef,
+    closing: NodeRef,
+    name: ts_ast::NodeId,
+) -> Result<bool, SourceCheckError> {
+    let name = child_ref(closing, name);
+    let record = jsx_node(arena, bound, store, name)?;
+    let NodeData::Identifier(identifier) = &record.data else {
+        return Ok(false);
+    };
+    if !identifier.text.is_empty() {
+        return Ok(false);
+    }
+    let closing_record = jsx_node(arena, bound, store, closing)?;
+    let expression_record = jsx_node(arena, bound, store, expression)?;
+    let marker = arena
+        .source_text()
+        .and_then(|source| source.get(record.range.start.get() as usize..))
+        .is_some_and(|source| {
+            source
+                .strip_prefix("\r\n")
+                .or_else(|| source.strip_prefix('\n'))
+                .unwrap_or(source)
+                .starts_with("<<<<<<<")
+        });
+    if record.kind != SyntaxKind::Identifier
+        || record.flags.0 != 1 << 15
+        || identifier.flow_node.is_some()
+        || record.parent != Some(closing.node)
+        || record.range.start != record.range.end
+        || closing_record.flags.0 != 0
+        || closing_record.range != record.range
+        || expression_record.range.end != closing_record.range.end
+        || !marker
+    {
+        return Err(unsupported(name, record.kind));
+    }
+    Ok(true)
 }
 
 fn plan_jsx_tag(
@@ -991,6 +1049,9 @@ fn plan_scalar(
                 name: identifier.text.clone(),
             })
         }
+        NodeData::BinaryExpression(_) if record.kind == SyntaxKind::BinaryExpression => {
+            plan_adjacent_jsx_attribute_elements(arena, bound, store, parent, node)
+        }
         NodeData::PropertyAccessExpression(access)
             if record.kind == SyntaxKind::PropertyAccessExpression
                 && access.question_dot_token.is_none()
@@ -1101,6 +1162,71 @@ fn plan_scalar(
         }
         _ => Err(unsupported(node, record.kind)),
     }
+}
+
+fn plan_adjacent_jsx_attribute_elements(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    parent: NodeRef,
+    node: NodeRef,
+) -> Result<JsxScalarPlan, SourceCheckError> {
+    let record = jsx_node(arena, bound, store, node)?;
+    let NodeData::BinaryExpression(binary) = &record.data else {
+        return Err(unsupported(node, record.kind));
+    };
+    let parent_record = jsx_node(arena, bound, store, parent)?;
+    if binary.symbol.is_some()
+        || binary.type_.is_some()
+        || binary.modifiers.is_some()
+        || binary.facts != 0
+        || !matches!(
+            &parent_record.data,
+            NodeData::JsxAttribute(attribute) if attribute.initializer == Some(node.node)
+        )
+    {
+        return Err(unsupported(node, record.kind));
+    }
+    let left = child_ref(node, binary.left);
+    let right = child_ref(node, binary.right);
+    let comma = child_ref(node, binary.operator_token);
+    let left_record = jsx_node(arena, bound, store, left)?;
+    let right_record = jsx_node(arena, bound, store, right)?;
+    let comma_record = jsx_node(arena, bound, store, comma)?;
+    let adjacent = arena
+        .source_text()
+        .and_then(|source| {
+            source
+                .get(left_record.range.end.get() as usize..right_record.range.start.get() as usize)
+        })
+        .is_some_and(|source| source.trim().is_empty());
+    if left_record.parent != Some(node.node)
+        || right_record.parent != Some(node.node)
+        || comma_record.kind != SyntaxKind::CommaToken
+        || !matches!(&comma_record.data, NodeData::Token(_))
+        || comma_record.parent != Some(node.node)
+        || comma_record.flags.0 != 0
+        || comma_record.range.start != comma_record.range.end
+        || comma_record.range.start != right_record.range.start
+        || left_record.range.start != record.range.start
+        || right_record.range.end != record.range.end
+        || !matches!(
+            &left_record.data,
+            NodeData::JsxElement(_) | NodeData::JsxSelfClosingElement(_) | NodeData::JsxFragment(_)
+        )
+        || !matches!(
+            &right_record.data,
+            NodeData::JsxElement(_) | NodeData::JsxSelfClosingElement(_) | NodeData::JsxFragment(_)
+        )
+        || !adjacent
+    {
+        return Err(unsupported(node, record.kind));
+    }
+    Ok(JsxScalarPlan::AdjacentElements {
+        node,
+        left: Box::new(plan_jsx_element(arena, bound, store, left)?),
+        right: Box::new(plan_jsx_element(arena, bound, store, right)?),
+    })
 }
 
 fn resolve_jsx_namespace(
@@ -1239,6 +1365,9 @@ fn jsx_scalar_needs_intrinsic_elements(scalar: &JsxScalarPlan) -> bool {
             jsx_scalar_needs_intrinsic_elements(condition)
                 || jsx_scalar_needs_intrinsic_elements(when_true)
                 || jsx_scalar_needs_intrinsic_elements(when_false)
+        }
+        JsxScalarPlan::AdjacentElements { left, right, .. } => {
+            jsx_plan_needs_intrinsic_elements(left) || jsx_plan_needs_intrinsic_elements(right)
         }
         JsxScalarPlan::String { .. }
         | JsxScalarPlan::Number { .. }
@@ -3387,6 +3516,12 @@ fn execute_scalar(
             };
             (*node, type_)
         }
+        JsxScalarPlan::AdjacentElements { node, left, right } => {
+            execute_jsx_element(store, arena, bound, namespace, left, options, diagnostics)?;
+            let type_ =
+                execute_jsx_element(store, arena, bound, namespace, right, options, diagnostics)?;
+            (*node, type_)
+        }
         JsxScalarPlan::Element(element) => {
             return execute_jsx_element(
                 store,
@@ -4030,8 +4165,18 @@ mod runtime_tests {
 
     impl RuntimeFixture {
         fn new(source: &str, file: FileId) -> Self {
+            Self::build(source, file, false)
+        }
+
+        fn recovering(source: &str, file: FileId) -> Self {
+            Self::build(source, file, true)
+        }
+
+        fn build(source: &str, file: FileId, allow_parser_diagnostics: bool) -> Self {
             let parsed = parse_jsx_source_file(source);
-            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            if !allow_parser_diagnostics {
+                assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            }
             let mut binder = CanonicalBinder::new();
             binder
                 .bind_source_file_with_facts(
@@ -5989,6 +6134,222 @@ mod runtime_tests {
             assert_eq!(context.diagnostics().len(), 1);
             assert_eq!(context.diagnostics().as_slice()[0].diagnostic.code(), 2874);
         }
+    }
+
+    #[test]
+    fn adjacent_jsx_attribute_elements_keep_parser_and_checker_diagnostic_order() {
+        let source = "const view = <X a=<b/><c/> />;\n";
+        let mut fixture = RuntimeFixture::recovering(source, FileId::new(8_138));
+        let [parser_diagnostic] = fixture.parsed.diagnostics.as_slice() else {
+            panic!("adjacent JSX parents must retain one parser diagnostic")
+        };
+        assert_eq!(parser_diagnostic.code, Some(2657));
+        let expression = fixture.expression("view");
+        let binary = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::BinaryExpression).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        assert_eq!(
+            parser_diagnostic.range,
+            fixture.parsed.arena.get(binary.node).unwrap().range,
+        );
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        fixture.check(expression, CanonicalJsxRuntime::Preserve, &mut diagnostics);
+
+        assert_eq!(
+            diagnostics
+                .as_slice()
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2304, 7026, 7026],
+        );
+        let diagnostic_text = diagnostics
+            .as_slice()
+            .iter()
+            .map(|diagnostic| {
+                let node = fixture
+                    .parsed
+                    .arena
+                    .get(diagnostic.node.unwrap().node)
+                    .unwrap();
+                source
+                    .get(node.range.start.get() as usize..node.range.end.get() as usize)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(diagnostic_text, ["X", "<b/>", "<c/>"]);
+        let error_type = fixture.store.intrinsic_bootstrap().unwrap().error_type;
+        assert_eq!(
+            fixture
+                .store
+                .type_node_links(binary)
+                .and_then(|links| links.resolved_type),
+            Some(error_type),
+        );
+        let cold = (
+            fixture.store.type_len(),
+            fixture.store.symbol_len(),
+            fixture.store.signature_len(),
+            fixture.store.symbol_store().symbol_table_len(),
+            diagnostics.as_slice().to_vec(),
+        );
+        fixture.check(expression, CanonicalJsxRuntime::Preserve, &mut diagnostics);
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.signature_len(),
+                fixture.store.symbol_store().symbol_table_len(),
+                diagnostics.as_slice().to_vec(),
+            ),
+            cold,
+        );
+    }
+
+    #[test]
+    fn conflict_marker_missing_closing_tag_checks_only_the_opening_intrinsic() {
+        let source = "const view = <div>\n<<<<<<< HEAD";
+        let mut fixture = RuntimeFixture::recovering(source, FileId::new(8_139));
+        assert_eq!(
+            fixture
+                .parsed
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [Some(1005), Some(1185)],
+        );
+        let expression = fixture.expression("view");
+        let NodeData::JsxElement(element) =
+            &fixture.parsed.arena.get(expression.node).unwrap().data
+        else {
+            unreachable!("the source contains an unclosed JSX element")
+        };
+        let closing = child_ref(expression, element.closing_element);
+        let NodeData::JsxClosingElement(close) =
+            &fixture.parsed.arena.get(closing.node).unwrap().data
+        else {
+            unreachable!("the parser retains its synthetic JSX closing element")
+        };
+        let missing_name = child_ref(closing, close.tag_name);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        fixture.check(expression, CanonicalJsxRuntime::Preserve, &mut diagnostics);
+
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("only the real JSX opening should produce a semantic diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 7026);
+        let opening = fixture
+            .parsed
+            .arena
+            .get(diagnostic.node.unwrap().node)
+            .unwrap();
+        assert_eq!(
+            source
+                .get(opening.range.start.get() as usize..opening.range.end.get() as usize)
+                .unwrap(),
+            "<div>",
+        );
+        assert!(fixture.store.symbol_node_links(missing_name).is_none());
+        assert!(fixture.store.type_node_links(missing_name).is_none());
+        assert!(fixture.store.jsx_element_links(closing).is_none());
+        let cold = (
+            fixture.store.type_len(),
+            fixture.store.symbol_len(),
+            fixture.store.signature_len(),
+            diagnostics.as_slice().to_vec(),
+        );
+        fixture.check(expression, CanonicalJsxRuntime::Preserve, &mut diagnostics);
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.signature_len(),
+                diagnostics.as_slice().to_vec(),
+            ),
+            cold,
+        );
+    }
+
+    #[test]
+    fn missing_closing_tag_without_a_conflict_marker_remains_unsupported() {
+        let mut fixture = RuntimeFixture::recovering("const view = <div>", FileId::new(8_140));
+        let expression = fixture.expression("view");
+        let host = DeclaredTypeHost::new([(&fixture.parsed.arena, &fixture.bound)]).unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let error = fixture
+            .store
+            .check_jsx_element(
+                &host,
+                expression,
+                CanonicalCheckerOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SourceCheckError::Unsupported(UnsupportedSourceSyntax::Syntax {
+                kind: SyntaxKind::Identifier,
+                ..
+            })
+        ));
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn ordinary_jsx_comma_expression_remains_unsupported() {
+        let mut fixture = RuntimeFixture::new(
+            "const view = <Missing value={(<left />, <right />)} />;\n",
+            FileId::new(8_141),
+        );
+        let expression = fixture.expression("view");
+        let host = DeclaredTypeHost::new([(&fixture.parsed.arena, &fixture.bound)]).unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.symbol_len(),
+            fixture.store.signature_len(),
+        );
+
+        let error = fixture
+            .store
+            .check_jsx_element(
+                &host,
+                expression,
+                CanonicalCheckerOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SourceCheckError::Unsupported(UnsupportedSourceSyntax::Syntax {
+                kind: SyntaxKind::BinaryExpression,
+                ..
+            })
+        ));
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.signature_len(),
+            ),
+            before,
+        );
+        assert!(diagnostics.is_empty());
     }
 
     #[test]

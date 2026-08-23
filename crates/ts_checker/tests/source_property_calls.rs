@@ -125,6 +125,111 @@ fn class_method_calls_use_published_instance_and_static_signatures() {
 }
 
 #[test]
+fn primitive_wrapper_methods_publish_real_library_symbols_and_signatures() {
+    let library = parse_source_file(concat!(
+        "interface Array<T> {}\n",
+        "interface ReadonlyArray<T> {}\n",
+        "interface Number { toFixed(fractionDigits?: number): string; }\n",
+        "interface String { toLowerCase(): string; }\n",
+    ));
+    let source = parse_source_file(concat!(
+        "const rounded = 2..toFixed(0);\n",
+        "const lowered = 'VALUE'.toLowerCase();\n",
+    ));
+    assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+    assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+    let library_file = FileId::new(41);
+    let file = FileId::new(42);
+    let mut binder = CanonicalBinder::new();
+    for (parsed, current, path, declaration, default_library) in [
+        (&library, library_file, "\"/project/lib.d.ts\"", true, true),
+        (
+            &source,
+            file,
+            "\"/project/primitive-methods.ts\"",
+            false,
+            false,
+        ),
+    ] {
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                current,
+                CanonicalSourceFileFacts::new_with_default_library(
+                    EscapedName::source(path),
+                    CanonicalSourceLanguage::TypeScript,
+                    declaration,
+                    default_library,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, current)
+            .unwrap();
+    }
+    let mut context = CanonicalCheckerContext::new(
+        binder.finish(),
+        [(library_file, &library.arena), (file, &source.arena)]
+            .into_iter()
+            .collect(),
+        CanonicalCheckerOptions::default(),
+    )
+    .unwrap();
+
+    context.check_source_file(file).unwrap();
+    assert!(
+        context.diagnostics().is_empty(),
+        "{:?}",
+        context.diagnostics()
+    );
+
+    for access in nodes_of_kind(&source, file, SyntaxKind::PropertyAccessExpression) {
+        let symbol = context
+            .store()
+            .symbol_node_links(access)
+            .and_then(|links| links.resolved_symbol)
+            .expect("primitive method access must retain its real interface member");
+        assert!(
+            context
+                .store()
+                .symbol(symbol)
+                .is_some_and(|record| record.flags().contains(ts_binder::SymbolFlags::METHOD))
+        );
+    }
+    for call in nodes_of_kind(&source, file, SyntaxKind::CallExpression) {
+        let return_type = context
+            .store()
+            .type_node_links(call)
+            .and_then(|links| links.resolved_type)
+            .expect("primitive method call must publish its return type");
+        assert_eq!(context.type_to_string(return_type).unwrap(), "string");
+        assert!(
+            context
+                .store()
+                .signature_links(call)
+                .is_some_and(|links| links.resolved_signature.signature().is_some())
+        );
+    }
+
+    let warm = (
+        context.store().type_len(),
+        context.store().signature_len(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
+}
+
+#[test]
 fn required_own_property_calls_publish_public_links_and_diagnostics() {
     let parsed = parse_source_file(concat!(
         "type API = { fn: (value: number) => string }; ",

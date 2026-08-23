@@ -2,8 +2,9 @@
 //!
 //! The recursively planned receiver must already have a canonical `any` type,
 //! a published enum value, a validated class constructor, an imported
-//! namespace, or belong to the validated own-property object domain in
-//! `relater`. Enum values reuse their published member identities. Class
+//! namespace, an authenticated published scalar-wrapper method, or belong to
+//! the validated own-property object domain in `relater`. Enum values reuse
+//! their published member identities. Class
 //! constructors read their validated static member tables without treating
 //! construct signatures as property-only objects. Namespace reexports retain
 //! their export alias while reading the final value symbol. Validated class
@@ -28,6 +29,7 @@ use super::{
     CanonicalTypeFormatFlags, CanonicalTypeMapperStore, DeclaredTypeHost, RelationUnavailable,
     SymbolNodeLinks, TypeDisplayUnavailable, TypeId, TypeNodeLinks, ValueSymbolLinks,
     bootstrap::UnionReduction,
+    callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
     classes::{self, ClassHeritageMembersValidation},
     enums,
     formatter::type_to_string_with_host_global_types_and_flags,
@@ -36,7 +38,7 @@ use super::{
     source::{PlannedExpression, PlannedExpressionKind},
     spelling::get_spelling_suggestion,
     type_records::{TypeData, TypeRecord},
-    types::TypeFlags,
+    types::{ObjectFlags, TypeFlags},
 };
 
 /// A source property form outside the dependency-closed read slice.
@@ -525,7 +527,15 @@ pub(super) fn check_direct_source_property(
         Some(ClassStaticProperty::Missing) => None,
         None => match resolve_class_instance_accessor(store, plan, receiver_type)? {
             Some(accessor) => Some(accessor),
-            None => store.resolved_own_property(receiver_type, &plan.name)?,
+            None => match resolve_published_scalar_wrapper_method(
+                store,
+                global_types,
+                plan,
+                receiver_type,
+            )? {
+                Some(method) => Some(method),
+                None => store.resolved_own_property(receiver_type, &plan.name)?,
+            },
         },
     } {
         if property.optional {
@@ -591,6 +601,137 @@ pub(super) fn check_direct_source_property(
 
     publish_property_links(store, plan.node, property, type_)?;
     Ok(CheckedSourceProperty { type_, diagnostic })
+}
+
+/// Reads an already-published method without expanding its global interface.
+fn resolve_published_scalar_wrapper_method(
+    store: &CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    plan: &SourcePropertyPlan,
+    receiver_type: TypeId,
+) -> Result<Option<ResolvedOwnProperty>, SourcePropertyError> {
+    let Some(global_types) = global_types else {
+        return Ok(None);
+    };
+    let receiver = store
+        .type_payload(receiver_type)
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    let (wrapper_type, wrapper_name, expected_parameters) = match receiver.flags() {
+        flags
+            if (flags == TypeFlags::STRING || flags == TypeFlags::STRING_LITERAL)
+                && plan.name == "toLowerCase" =>
+        {
+            (global_types.string_type, "String", 0)
+        }
+        flags
+            if (flags == TypeFlags::NUMBER || flags == TypeFlags::NUMBER_LITERAL)
+                && plan.name == "toFixed" =>
+        {
+            (global_types.number_type, "Number", 1)
+        }
+        _ => return Ok(None),
+    };
+    let wrapper = store
+        .type_payload(wrapper_type)
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    let TypeData::Interface(interface) = wrapper.data() else {
+        return Ok(None);
+    };
+    let owner = wrapper
+        .symbol()
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    let owner_record = store
+        .symbol(owner)
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    if wrapper.flags() != TypeFlags::OBJECT
+        || !wrapper.object_flags().contains(ObjectFlags::INTERFACE)
+        || wrapper
+            .object_flags()
+            .intersects(ObjectFlags::CLASS | ObjectFlags::REFERENCE)
+        || wrapper.alias().is_some()
+        || !owner_record.flags().contains(SymbolFlags::INTERFACE)
+        || owner_record.name().as_utf8() != Some(wrapper_name)
+        || store.get_merged_symbol(owner) != Some(owner)
+        || store
+            .declared_type_links(owner)
+            .and_then(|links| links.declared_type)
+            != Some(wrapper_type)
+        || interface
+            .all_type_parameters
+            .as_ref()
+            .is_some_and(|parameters| !parameters.is_empty())
+    {
+        return Err(SourcePropertyError::InvalidCache(plan.node));
+    }
+    let Some(members) = owner_record.members() else {
+        return Ok(None);
+    };
+    let members = store
+        .symbol_table(members)
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    let Some(symbol) = members.get_source(&plan.name) else {
+        return Ok(None);
+    };
+    let Some((authenticated_wrapper, declaration)) =
+        store.authenticated_global_interface_method(symbol)
+    else {
+        return Err(SourcePropertyError::InvalidCache(plan.node));
+    };
+    if authenticated_wrapper != wrapper_type {
+        return Err(SourcePropertyError::InvalidCache(plan.node));
+    }
+
+    let Some(links) = store.value_symbol_links(symbol) else {
+        return Err(RelationUnavailable::UnresolvedPropertyType(symbol).into());
+    };
+    let Some(type_) = links.resolved_type else {
+        return if links == &ValueSymbolLinks::default() {
+            Err(RelationUnavailable::UnresolvedPropertyType(symbol).into())
+        } else {
+            Err(SourcePropertyError::InvalidCache(plan.node))
+        };
+    };
+    if links
+        != &(ValueSymbolLinks {
+            resolved_type: Some(type_),
+            ..ValueSymbolLinks::default()
+        })
+        || store.type_payload(type_).is_none()
+    {
+        return Err(SourcePropertyError::InvalidCache(plan.node));
+    }
+    let StoredCallableSetValidation::Valid { projection, .. } =
+        validate_stored_callable_set(store, type_)
+    else {
+        return Err(SourcePropertyError::InvalidCache(plan.node));
+    };
+    let [callable] = projection.call_signatures.as_ref() else {
+        return Err(SourcePropertyError::InvalidCache(plan.node));
+    };
+    let string_type = store
+        .intrinsic_bootstrap()
+        .ok_or(RelationUnavailable::MissingBootstrap)?
+        .string_type;
+    if projection.owner != type_
+        || !projection.construct_signatures.is_empty()
+        || callable.owner != type_
+        || callable.parameters.len() != expected_parameters
+        || callable.min_argument_count != 0
+        || callable.return_type != Some(string_type)
+        || store
+            .signature(callable.signature)
+            .and_then(super::signatures::Signature::declaration)
+            != Some(declaration)
+    {
+        return Err(SourcePropertyError::InvalidCache(plan.node));
+    }
+
+    Ok(Some(ResolvedOwnProperty {
+        symbol,
+        type_,
+        optional: false,
+        readonly: false,
+    }))
 }
 
 fn resolve_class_static_property(
@@ -1426,11 +1567,14 @@ mod tests {
         CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
         EscapedName, SemanticSymbolId, SymbolData, SymbolFlags,
     };
+    use ts_jsnum::Number;
     use ts_parser::{ParseResult, parse_source_file};
 
     use super::*;
     use crate::semantic::{
         AliasSymbolLinks, AliasTargetState, CanonicalCheckerContext, IntrinsicBootstrapOptions,
+        ResolvedSignatureState, SignatureLinks,
+        signatures::SignatureFlags,
         source::{PlannedExpressionKind, PlannedIdentifierRead, PlannedIdentifierReadKind},
         types::ObjectFlags,
     };
@@ -1701,6 +1845,165 @@ mod tests {
         (context, owner, instance, value)
     }
 
+    fn published_scalar_wrapper_method<'arena>(
+        parsed: &'arena ParseResult,
+        file: FileId,
+        wrapper_name: &str,
+        method_name: &str,
+    ) -> (CanonicalCheckerContext<'arena>, SemanticSymbolId, TypeId) {
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/scalar-properties.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        )
+        .unwrap();
+        let global_types = context.global_types().clone();
+        let (method, declaration, return_annotation, parameter, string, number, undefined) = {
+            let store = context.store();
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            let owner = store
+                .symbol_table(bootstrap.globals)
+                .and_then(|globals| globals.get_source(wrapper_name))
+                .and_then(|owner| store.get_merged_symbol(owner))
+                .unwrap();
+            let method = store
+                .symbol(owner)
+                .and_then(ts_binder::semantic::Symbol::members)
+                .and_then(|members| store.symbol_table(members))
+                .and_then(|members| members.get_source(method_name))
+                .unwrap();
+            let declaration = store.symbol(method).unwrap().declarations().unwrap()[0];
+            let NodeData::MethodSignatureDeclaration(method_data) =
+                &parsed.arena.get(declaration.node).unwrap().data
+            else {
+                panic!("expected one scalar wrapper method declaration")
+            };
+            let return_annotation = NodeRef::new(
+                declaration.arena,
+                declaration.file,
+                method_data.type_.unwrap(),
+            );
+            let parameter = method_data.parameters.nodes.first().map(|node| {
+                let parameter = NodeRef::new(declaration.arena, declaration.file, *node);
+                let NodeData::ParameterDeclaration(parameter_data) =
+                    &parsed.arena.get(parameter.node).unwrap().data
+                else {
+                    panic!("expected the optional numeric method parameter")
+                };
+                let annotation = NodeRef::new(
+                    parameter.arena,
+                    parameter.file,
+                    parameter_data.type_.unwrap(),
+                );
+                (
+                    context.file(file).unwrap().1.symbol(parameter).unwrap(),
+                    annotation,
+                )
+            });
+            (
+                method,
+                declaration,
+                return_annotation,
+                parameter,
+                bootstrap.string_type,
+                bootstrap.number_type,
+                bootstrap.undefined_type,
+            )
+        };
+        let store = context.store_mut_for_test();
+        assert!(store.set_type_node_links(
+            return_annotation,
+            TypeNodeLinks {
+                resolved_type: Some(string),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        if let Some((symbol, annotation)) = parameter {
+            let optional_number = store
+                .expression_union_type_with_global_types(
+                    &global_types,
+                    &[number, undefined],
+                    UnionReduction::Literal,
+                )
+                .unwrap();
+            assert!(store.set_type_node_links(
+                annotation,
+                TypeNodeLinks {
+                    resolved_type: Some(number),
+                    ..TypeNodeLinks::default()
+                },
+            ));
+            assert!(store.set_value_symbol_links(
+                symbol,
+                ValueSymbolLinks {
+                    resolved_type: Some(optional_number),
+                    ..ValueSymbolLinks::default()
+                },
+            ));
+        }
+        let type_ = store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(method))
+            .unwrap();
+        let signature = store
+            .alloc_signature(
+                SignatureFlags::NONE,
+                Some(declaration),
+                Vec::new(),
+                None,
+                parameter.map(|(symbol, _)| symbol).into_iter().collect(),
+                Some(string),
+                None,
+                0,
+            )
+            .unwrap();
+        assert!(store.set_signature_links(
+            declaration,
+            SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(signature),
+                ..SignatureLinks::default()
+            },
+        ));
+        assert!(store.set_value_symbol_links(
+            method,
+            ValueSymbolLinks {
+                resolved_type: Some(type_),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        assert!(store.set_structured_type_members(
+            type_,
+            None,
+            None,
+            Some(vec![signature]),
+            None,
+            None,
+        ));
+        (context, method, type_)
+    }
+
     #[test]
     fn required_own_property_publishes_exact_symbol_and_type_cold_and_warm() {
         let parsed = parsed("const result = object.value;");
@@ -1776,6 +2079,229 @@ mod tests {
             Some(any)
         );
         assert!(store.symbol_node_links(access).is_none());
+    }
+
+    #[test]
+    fn scalar_wrapper_methods_publish_exact_symbols_for_primitive_and_literal_receivers() {
+        for (index, (source, wrapper_name, method_name)) in [
+            (
+                concat!(
+                    "interface Number { toFixed(fractionDigits?: number): string; } ",
+                    "const result = 2..toFixed(0);",
+                ),
+                "Number",
+                "toFixed",
+            ),
+            (
+                concat!(
+                    "interface String { toLowerCase(): string; } ",
+                    "const result = 'VALUE'.toLowerCase();",
+                ),
+                "String",
+                "toLowerCase",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let parsed = parsed(source);
+            let file = FileId::new(540 + u32::try_from(index).unwrap());
+            let access = property_access(&parsed, file);
+            let call = NodeRef::new(
+                parsed.arena.id(),
+                file,
+                parsed.arena.get(access.node).unwrap().parent.unwrap(),
+            );
+            let (mut context, method, callable) =
+                published_scalar_wrapper_method(&parsed, file, wrapper_name, method_name);
+            let global_types = context.global_types().clone();
+            let syntax = plan_direct_source_property_call_syntax(
+                &parsed.arena,
+                context.store(),
+                access,
+                call,
+            )
+            .unwrap();
+            let (receiver, wrapper, receiver_types) = if wrapper_name == "Number" {
+                let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+                let regular = context
+                    .store_mut_for_test()
+                    .regular_number_literal_type(Number::new(2.0))
+                    .unwrap();
+                let fresh = context
+                    .store_mut_for_test()
+                    .fresh_type_of_literal_type(regular)
+                    .unwrap();
+                (
+                    PlannedExpression::new(
+                        syntax.receiver(),
+                        PlannedExpressionKind::Number {
+                            value: Number::new(2.0),
+                            unary_operand: None,
+                        },
+                    ),
+                    global_types.number_type,
+                    [number, regular, fresh],
+                )
+            } else {
+                let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+                let regular = context
+                    .store_mut_for_test()
+                    .regular_string_literal_type("VALUE".to_owned())
+                    .unwrap();
+                let fresh = context
+                    .store_mut_for_test()
+                    .fresh_type_of_literal_type(regular)
+                    .unwrap();
+                (
+                    PlannedExpression::new(
+                        syntax.receiver(),
+                        PlannedExpressionKind::String("VALUE".to_owned()),
+                    ),
+                    global_types.string_type,
+                    [string, regular, fresh],
+                )
+            };
+            let plan = finish_direct_source_property_plan(&syntax, receiver).unwrap();
+
+            for receiver_type in receiver_types {
+                assert_eq!(
+                    check_direct_source_property(
+                        context.store_mut_for_test(),
+                        Some(&global_types),
+                        &plan,
+                        receiver_type,
+                    ),
+                    Ok(CheckedSourceProperty {
+                        type_: callable,
+                        diagnostic: None,
+                    }),
+                    "method {wrapper_name}.{method_name}",
+                );
+            }
+            assert_eq!(
+                context
+                    .store()
+                    .symbol_node_links(access)
+                    .and_then(|links| links.resolved_symbol),
+                Some(method),
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .type_node_links(access)
+                    .and_then(|links| links.resolved_type),
+                Some(callable),
+            );
+            let TypeData::Interface(wrapper) =
+                context.store().type_payload(wrapper).unwrap().data()
+            else {
+                panic!("expected the configured scalar wrapper interface")
+            };
+            assert!(!wrapper.declared_members_resolved);
+        }
+    }
+
+    #[test]
+    fn optional_scalar_wrapper_method_reads_restore_undefined() {
+        let parsed = parsed(concat!(
+            "interface String { toLowerCase(): string; } ",
+            "declare let value: string | undefined; ",
+            "const result = value?.toLowerCase;",
+        ));
+        let file = FileId::new(542);
+        let access = property_access(&parsed, file);
+        let (mut context, method, callable) =
+            published_scalar_wrapper_method(&parsed, file, "String", "toLowerCase");
+        let global_types = context.global_types().clone();
+        let (string, undefined) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.undefined_type)
+        };
+        let receiver_type = context
+            .store_mut_for_test()
+            .expression_union_type_with_global_types(
+                &global_types,
+                &[string, undefined],
+                UnionReduction::Literal,
+            )
+            .unwrap();
+        let syntax =
+            plan_direct_source_property_syntax(&parsed.arena, context.store(), access).unwrap();
+        let plan =
+            finish_direct_source_property_plan(&syntax, identifier_receiver(&syntax, method))
+                .unwrap();
+
+        let checked = check_direct_source_property(
+            context.store_mut_for_test(),
+            Some(&global_types),
+            &plan,
+            receiver_type,
+        )
+        .unwrap();
+        let TypeData::Union(result) = context.store().type_payload(checked.type_).unwrap().data()
+        else {
+            panic!("optional scalar method reads must include undefined")
+        };
+        assert!(result.union.types.contains(&callable));
+        assert!(result.union.types.contains(&undefined));
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(access)
+                .and_then(|links| links.resolved_symbol),
+            Some(method),
+        );
+    }
+
+    #[test]
+    fn malformed_scalar_wrapper_method_cache_fails_before_property_publication() {
+        let parsed = parsed(concat!(
+            "interface String { toLowerCase(): string; } ",
+            "const result = 'VALUE'.toLowerCase();",
+        ));
+        let file = FileId::new(543);
+        let access = property_access(&parsed, file);
+        let call = NodeRef::new(
+            parsed.arena.id(),
+            file,
+            parsed.arena.get(access.node).unwrap().parent.unwrap(),
+        );
+        let (mut context, method, callable) =
+            published_scalar_wrapper_method(&parsed, file, "String", "toLowerCase");
+        let global_types = context.global_types().clone();
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        assert!(context.store_mut_for_test().set_value_symbol_links(
+            method,
+            ValueSymbolLinks {
+                resolved_type: Some(callable),
+                write_type: Some(string),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        let syntax =
+            plan_direct_source_property_call_syntax(&parsed.arena, context.store(), access, call)
+                .unwrap();
+        let plan = finish_direct_source_property_plan(
+            &syntax,
+            PlannedExpression::new(
+                syntax.receiver(),
+                PlannedExpressionKind::String("VALUE".to_owned()),
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            check_direct_source_property(
+                context.store_mut_for_test(),
+                Some(&global_types),
+                &plan,
+                string,
+            ),
+            Err(SourcePropertyError::InvalidCache(access)),
+        );
+        assert!(context.store().type_node_links(access).is_none());
+        assert!(context.store().symbol_node_links(access).is_none());
     }
 
     #[test]

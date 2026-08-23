@@ -317,3 +317,142 @@ fn ambiguous_contextual_array_arrows_report_their_implicit_any_parameter() {
         warm,
     );
 }
+
+#[test]
+fn invalid_interface_constructor_parameters_preserve_all_grammar_diagnostics() {
+    let library = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
+    let text = "interface Invalid { new (public value); }";
+    let parsed = parse_source_file(text);
+    assert!(library.diagnostics.is_empty());
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(3_505);
+    let mut context = context_with_options(
+        &library,
+        &parsed,
+        file,
+        CanonicalCheckerOptions {
+            no_implicit_any: true,
+            ..CanonicalCheckerOptions::default()
+        },
+    );
+
+    context.check_source_file(file).unwrap();
+
+    let actual = context
+        .diagnostics()
+        .as_slice()
+        .iter()
+        .map(|diagnostic| {
+            (
+                diagnostic.diagnostic.code(),
+                node_text(text, &parsed, diagnostic.node.unwrap()),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        [
+            (7013, "new (public value);"),
+            (2369, "public value"),
+            (7006, "public value"),
+        ],
+    );
+
+    let warm = (
+        context.store().type_len(),
+        context.store().signature_len(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
+}
+
+#[test]
+fn generic_signatures_instantiate_against_contextual_rest_parameters() {
+    let library = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
+    let text = concat!(
+        "declare function choose<First, Second>(first?: First, second?: Second): Second;\n",
+        "declare function contextual(...values: string[]): string;\n",
+        "var selected: typeof contextual = choose;\n",
+    );
+    let parsed = parse_source_file(text);
+    assert!(library.diagnostics.is_empty());
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(3_506);
+    let mut context =
+        context_with_options(&library, &parsed, file, CanonicalCheckerOptions::default());
+
+    context.check_source_file(file).unwrap();
+    assert!(
+        context.diagnostics().is_empty(),
+        "{:?}",
+        context.diagnostics()
+    );
+
+    let warm = (
+        context.store().type_len(),
+        context.store().mapper_len(),
+        context.store().signature_len(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().mapper_len(),
+            context.store().signature_len(),
+        ),
+        warm,
+    );
+}
+
+#[test]
+fn computed_object_bindings_report_missing_index_signatures_without_implicit_any() {
+    let library = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
+    let text = concat!(
+        "let propertyName = () => 'missing';\n",
+        "let { [propertyName()]: selected } = {};\n",
+    );
+    let parsed = parse_source_file(text);
+    assert!(library.diagnostics.is_empty());
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(3_507);
+    let mut context =
+        context_with_options(&library, &parsed, file, CanonicalCheckerOptions::default());
+
+    context.check_source_file(file).unwrap();
+
+    let [diagnostic] = context.diagnostics().as_slice() else {
+        panic!("a computed binding on an empty object must report one missing index signature")
+    };
+    assert_eq!(diagnostic.diagnostic.code(), 2537);
+    assert_eq!(
+        node_text(text, &parsed, diagnostic.node.unwrap()),
+        "propertyName()",
+    );
+    assert_eq!(
+        diagnostic.diagnostic.render().unwrap(),
+        "Type '{}' has no matching index signature for type 'string'.",
+    );
+
+    let warm = (
+        context.store().type_len(),
+        context.store().signature_len(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
+}

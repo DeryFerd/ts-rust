@@ -3932,6 +3932,7 @@ impl Program {
             context
                 .check_source_file_with_jsx_runtime(file, runtime)
                 .map_err(|error| CanonicalProgramCheckError::SourceCheck { file_name, error })?;
+            self.add_missing_jsx_option_diagnostics(source, &mut diagnostics);
             checked_sources.push(file);
         }
 
@@ -3974,6 +3975,42 @@ impl Program {
         let mut canonical_queries = CanonicalProgramQueries { context };
         let result = queries(self, &mut canonical_queries);
         Ok((diagnostics, result))
+    }
+
+    fn add_missing_jsx_option_diagnostics(
+        &self,
+        source: &SourceFile,
+        diagnostics: &mut Vec<ProgramDiagnostic>,
+    ) {
+        if self.options.jsx != ts_options::JsxEmit::None
+            || ts_path::is_declaration_file(&source.file_name)
+        {
+            return;
+        }
+
+        let message = message_by_code(17004).expect("TS17004 must be in the generated catalog");
+        diagnostics.extend(
+            source
+                .parse
+                .arena
+                .iter()
+                .filter(|(_, node)| {
+                    matches!(
+                        node.data,
+                        NodeData::JsxOpeningElement(_)
+                            | NodeData::JsxSelfClosingElement(_)
+                            | NodeData::JsxOpeningFragment(_)
+                    )
+                })
+                .map(|(_, node)| ProgramDiagnostic {
+                    file_name: Some(source.file_name.clone()),
+                    range: Some(node.range),
+                    code: Some(message.code()),
+                    category: message.category(),
+                    message: message.text().to_owned(),
+                    related_information: Vec::new(),
+                }),
+        );
     }
 
     fn apply_comment_directives(
@@ -9881,6 +9918,173 @@ mod tests {
             Some("/project/component.tsx")
         );
         assert_eq!(diagnostic.code, Some(2322));
+    }
+
+    #[test]
+    fn canonical_program_reports_missing_jsx_option_for_each_opening() {
+        let fs = MemoryFileSystem::new(true);
+        let source = concat!(
+            "const view = <div><span /></div>;\n",
+            "const fragment = <><span /></>;\n",
+        );
+        fs.write_file("/project/component.tsx", source).unwrap();
+
+        let program = Program::try_new_with_canonical_checker(
+            &fs,
+            "/project",
+            &["component.tsx".to_owned()],
+            CompilerOptions {
+                lib: Some(vec!["es5".to_owned()]),
+                no_emit: true,
+                no_implicit_any: false,
+                ..CompilerOptions::default()
+            },
+        )
+        .unwrap();
+
+        let openings = program
+            .diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == Some(17004))
+            .map(|diagnostic| {
+                assert_eq!(
+                    diagnostic.message,
+                    "Cannot use JSX unless the '--jsx' flag is provided."
+                );
+                let range = diagnostic.range.unwrap();
+                &source[range.start.get() as usize..range.end.get() as usize]
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(openings, ["<div>", "<span />", "<>", "<span />"]);
+    }
+
+    #[test]
+    fn missing_jsx_option_diagnostics_preserve_recovered_opening_ranges() {
+        for (file_name, source, expected) in [
+            ("conflict.tsx", "const value = <div>\n<<<<<<< HEAD", "<div>"),
+            (
+                "input.js",
+                "const value = \"oops\";\nconst result = + <number> value;\n",
+                "<number>",
+            ),
+        ] {
+            let fs = MemoryFileSystem::new(true);
+            let path = format!("/project/{file_name}");
+            fs.write_file(&path, source).unwrap();
+            let program = Program::new_unchecked_with_options_and_checker(
+                &fs,
+                "/project",
+                &[file_name.to_owned()],
+                CompilerOptions {
+                    allow_js: true,
+                    no_emit: true,
+                    ..CompilerOptions::default()
+                },
+                super::ProgramChecker::Canonical,
+            );
+            let parser_diagnostics = program.diagnostics().to_vec();
+            let source_file = program.source_file(&path).unwrap();
+            let mut diagnostics = Vec::new();
+
+            program.add_missing_jsx_option_diagnostics(source_file, &mut diagnostics);
+
+            let [diagnostic] = diagnostics.as_slice() else {
+                panic!("expected one JSX option diagnostic for {file_name}: {diagnostics:?}");
+            };
+            assert_eq!(diagnostic.code, Some(17004));
+            let range = diagnostic.range.unwrap();
+            assert_eq!(
+                &source[range.start.get() as usize..range.end.get() as usize],
+                expected
+            );
+            assert_eq!(program.diagnostics(), parser_diagnostics);
+        }
+    }
+
+    #[test]
+    fn canonical_jsx_option_diagnostics_honor_configured_modes_and_javascript_checking() {
+        for jsx in [ts_options::JsxEmit::Preserve, ts_options::JsxEmit::React] {
+            let fs = MemoryFileSystem::new(true);
+            fs.write_file("/project/component.tsx", "const view = <div />;")
+                .unwrap();
+            let program = Program::try_new_with_canonical_checker(
+                &fs,
+                "/project",
+                &["component.tsx".to_owned()],
+                CompilerOptions {
+                    jsx,
+                    lib: Some(vec!["es5".to_owned()]),
+                    no_emit: true,
+                    no_implicit_any: false,
+                    ..CompilerOptions::default()
+                },
+            )
+            .unwrap();
+            assert!(
+                program
+                    .diagnostics()
+                    .iter()
+                    .all(|diagnostic| diagnostic.code != Some(17004)),
+                "{jsx:?}: {:?}",
+                program.diagnostics()
+            );
+        }
+
+        for check_js in [false, true] {
+            let fs = MemoryFileSystem::new(true);
+            fs.write_file("/project/component.js", "const view = <div />;")
+                .unwrap();
+            let program = Program::try_new_with_canonical_checker(
+                &fs,
+                "/project",
+                &["component.js".to_owned()],
+                CompilerOptions {
+                    allow_js: true,
+                    check_js,
+                    lib: Some(vec!["es5".to_owned()]),
+                    no_emit: true,
+                    no_implicit_any: false,
+                    ..CompilerOptions::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                program
+                    .diagnostics()
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == Some(17004)),
+                check_js,
+                "checkJs={check_js}: {:?}",
+                program.diagnostics()
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_jsx_option_diagnostics_follow_comment_directives() {
+        for directive in ["// @ts-ignore", "// @ts-expect-error"] {
+            let fs = MemoryFileSystem::new(true);
+            let source = format!("{directive}\nconst view = <div />;\n");
+            fs.write_file("/project/component.tsx", &source).unwrap();
+            let program = Program::try_new_with_canonical_checker(
+                &fs,
+                "/project",
+                &["component.tsx".to_owned()],
+                CompilerOptions {
+                    lib: Some(vec!["es5".to_owned()]),
+                    no_emit: true,
+                    no_implicit_any: false,
+                    ..CompilerOptions::default()
+                },
+            )
+            .unwrap();
+
+            assert!(
+                program.diagnostics().is_empty(),
+                "{directive}: {:?}",
+                program.diagnostics()
+            );
+        }
     }
 
     #[test]

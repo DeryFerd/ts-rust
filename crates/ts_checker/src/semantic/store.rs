@@ -40,17 +40,18 @@ use super::{
     },
     relation::{RelationCaches, RelationComparisonResult, RelationKind, RelationStateSnapshot},
     signatures::{
-        CompositeSignature, IndexInfo, IndexInfoArena, Signature, SignatureArena, SignatureFlags,
-        TupleElementInfo, TupleMetadata, TypePredicate, TypePredicateArena, TypePredicateKind,
+        CompositeSignature, IndexFlags, IndexInfo, IndexInfoArena, Signature, SignatureArena,
+        SignatureFlags, TupleElementInfo, TupleMetadata, TypePredicate, TypePredicateArena,
+        TypePredicateKind,
     },
     source_callables::{
         SourceCallableTypeParameterSyntaxProof, source_type_parameter_default_is_assignable,
     },
     type_records::{
-        CacheHashKey, ConditionalRoot, LiteralValue, TypeAlias, TypeCacheState, TypeData,
-        TypeRecord, type_list_key,
+        CacheHashKey, ConditionalRoot, ConstrainedTypeData, LiteralValue, TypeAlias,
+        TypeCacheState, TypeData, TypeRecord, type_list_key,
     },
-    types::TypeFlags,
+    types::{ObjectFlags, TypeFlags},
 };
 
 #[derive(Debug)]
@@ -73,6 +74,7 @@ struct SourceNodeFacts {
     kind: SyntaxKind,
     parent: Option<NodeId>,
     prefix_unary_operator: Option<SyntaxKind>,
+    type_operator: Option<SyntaxKind>,
     exported: bool,
     signature_links_eligible: bool,
 }
@@ -1448,9 +1450,10 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             || !self.source_callable_provenance.is_empty()
             || !self.source_overload_provenance.is_empty()
             || self.signatures.iter().any(|(_, signature)| {
-                signature
-                    .declaration()
-                    .is_some_and(|node| self.node_is_declared_callable_signature(node))
+                signature.declaration().is_some_and(|node| {
+                    self.node_is_declared_callable_signature(node)
+                        || self.node_is_global_interface_method(node)
+                })
             })
     }
 
@@ -1469,6 +1472,248 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             self.source_node_kind(node),
             Some(SyntaxKind::CallSignature | SyntaxKind::ConstructSignature)
         )
+    }
+
+    /// Authenticates one narrowly supported method on its canonical global interface.
+    ///
+    /// Merged global interfaces retain their original binder-owned member parents,
+    /// so parent identity must be compared after the checker merge redirect.
+    pub(super) fn authenticated_global_interface_method(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> Option<(TypeId, NodeRef)> {
+        let method = self.symbol(symbol)?;
+        let global_name = match method.name().as_utf8()? {
+            "toFixed" => "Number",
+            "toLowerCase" => "String",
+            _ => return None,
+        };
+        let [declaration] = method.declarations()? else {
+            return None;
+        };
+        let declaration = *declaration;
+        let SourceNodeParent::Parent(interface_declaration) =
+            self.source_node_parent(declaration)?
+        else {
+            return None;
+        };
+        let bootstrap = self.intrinsic_bootstrap.as_ref()?;
+        let global = self
+            .symbol_table(bootstrap.globals)?
+            .get_source(global_name)?;
+        let owner = self.get_merged_symbol(global)?;
+        let interface = self.symbol(owner)?;
+        let wrapper = self.declared_type_links(owner)?.declared_type?;
+        let members = interface.members()?;
+        let allowed_owner_flags =
+            SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::TRANSIENT;
+        if method.flags() != SymbolFlags::METHOD
+            || method.check_flags() != CheckFlags::NONE
+            || method.value_declaration() != Some(declaration)
+            || method.members().is_some()
+            || method.exports().is_some()
+            || method.export_symbol().is_some()
+            || self.get_merged_symbol(symbol) != Some(symbol)
+            || method
+                .parent()
+                .and_then(|parent| self.get_merged_symbol(parent))
+                != Some(owner)
+            || interface.flags() & SymbolFlags::TYPE != SymbolFlags::INTERFACE
+            || interface.flags().without(allowed_owner_flags) != SymbolFlags::NONE
+            || interface.check_flags() != CheckFlags::NONE
+            || interface.name().as_utf8() != Some(global_name)
+            || interface.parent().is_some()
+            || interface.exports().is_some()
+            || interface.export_symbol().is_some()
+            || interface
+                .declarations()
+                .is_none_or(|declarations| !declarations.contains(&interface_declaration))
+            || self.source_node_kind(interface_declaration)
+                != Some(SyntaxKind::InterfaceDeclaration)
+            || self.source_node_kind(declaration) != Some(SyntaxKind::MethodSignature)
+            || self
+                .symbol_table(members)?
+                .get_source(method.name().as_utf8()?)
+                != Some(symbol)
+            || self.types.get(wrapper).is_none()
+            || self
+                .source_primitive_type_annotation(declaration)
+                .is_none_or(|annotation| {
+                    self.source_node_kind(annotation) != Some(SyntaxKind::StringKeyword)
+                        || self.type_node_links(annotation).is_some_and(|links| {
+                            links != &TypeNodeLinks::default()
+                                && links
+                                    != &TypeNodeLinks {
+                                        resolved_type: Some(bootstrap.string_type),
+                                        outer_type_parameters: None,
+                                    }
+                        })
+                })
+        {
+            return None;
+        }
+
+        Some((wrapper, declaration))
+    }
+
+    fn global_interface_method_for_declaration(
+        &self,
+        declaration: NodeRef,
+    ) -> Option<SemanticSymbolId> {
+        if self.source_node_kind(declaration) != Some(SyntaxKind::MethodSignature) {
+            return None;
+        }
+        let bootstrap = self.intrinsic_bootstrap.as_ref()?;
+        let globals = self.symbol_table(bootstrap.globals)?;
+        for (global_name, method_name) in [("Number", "toFixed"), ("String", "toLowerCase")] {
+            let Some(owner) = globals
+                .get_source(global_name)
+                .and_then(|owner| self.get_merged_symbol(owner))
+            else {
+                continue;
+            };
+            let Some(method) = self
+                .symbol(owner)
+                .and_then(Symbol::members)
+                .and_then(|members| self.symbol_table(members))
+                .and_then(|members| members.get_source(method_name))
+            else {
+                continue;
+            };
+            if self
+                .authenticated_global_interface_method(method)
+                .is_some_and(|(_, candidate)| candidate == declaration)
+            {
+                return Some(method);
+            }
+        }
+        None
+    }
+
+    fn node_is_global_interface_method(&self, node: NodeRef) -> bool {
+        self.global_interface_method_for_declaration(node).is_some()
+    }
+
+    fn global_interface_method_linked_type(&self, signature: SignatureId) -> Option<TypeId> {
+        let signature_record = self.signature(signature)?;
+        let declaration = signature_record.declaration()?;
+        let method = self.global_interface_method_for_declaration(declaration)?;
+        let method_record = self.symbol(method)?;
+        let links = self.value_symbol_links(method)?;
+        let type_ = links.resolved_type?;
+        let bootstrap = self.intrinsic_bootstrap.as_ref()?;
+        if links
+            != &(ValueSymbolLinks {
+                resolved_type: Some(type_),
+                ..ValueSymbolLinks::default()
+            })
+            || self.types.get(type_).is_none()
+            || self.signature_links(declaration)
+                != Some(&SignatureLinks {
+                    resolved_signature: ResolvedSignatureState::Resolved(signature),
+                    ..SignatureLinks::default()
+                })
+            || signature_record.flags() != SignatureFlags::NONE
+            || !signature_record.type_parameters().is_empty()
+            || signature_record.this_parameter().is_some()
+            || signature_record.min_argument_count() != 0
+            || signature_record.resolved_min_argument_count() != -1
+            || signature_record.resolved_return_type() != Some(bootstrap.string_type)
+            || signature_record.resolved_type_predicate().is_some()
+            || signature_record.target().is_some()
+            || signature_record.mapper().is_some()
+            || signature_record.isolated_signature_type().is_some()
+            || signature_record.composite().is_some()
+        {
+            return None;
+        }
+
+        match (
+            method_record.name().as_utf8(),
+            signature_record.parameters(),
+        ) {
+            (Some("toLowerCase"), []) => {}
+            (Some("toFixed"), [parameter]) => {
+                let parameter_record = self.symbol(*parameter)?;
+                let [parameter_declaration] = parameter_record.declarations()? else {
+                    return None;
+                };
+                let parameter_declaration = *parameter_declaration;
+                let annotation = self.source_primitive_type_annotation(parameter_declaration)?;
+                if parameter_record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+                    || parameter_record.check_flags() != CheckFlags::NONE
+                    || parameter_record.name().as_utf8() != Some("fractionDigits")
+                    || parameter_record.value_declaration() != Some(parameter_declaration)
+                    || parameter_record.members().is_some()
+                    || parameter_record.exports().is_some()
+                    || parameter_record.parent().is_some()
+                    || parameter_record.export_symbol().is_some()
+                    || self.get_merged_symbol(*parameter) != Some(*parameter)
+                    || self.source_node_kind(parameter_declaration) != Some(SyntaxKind::Parameter)
+                    || self.source_node_parent(parameter_declaration)
+                        != Some(SourceNodeParent::Parent(declaration))
+                    || self.source_node_kind(annotation) != Some(SyntaxKind::NumberKeyword)
+                    || self.value_symbol_links(*parameter).is_some_and(|links| {
+                        if links == &ValueSymbolLinks::default() {
+                            return false;
+                        }
+                        let Some(type_) = links.resolved_type else {
+                            return true;
+                        };
+                        links
+                            != &ValueSymbolLinks {
+                                resolved_type: Some(type_),
+                                ..ValueSymbolLinks::default()
+                            }
+                            || !bootstrap.options.strict_null_checks
+                                && type_ != bootstrap.number_type
+                    })
+                    || self.type_node_links(annotation).is_some_and(|links| {
+                        links != &TypeNodeLinks::default()
+                            && links
+                                != &TypeNodeLinks {
+                                    resolved_type: Some(bootstrap.number_type),
+                                    outer_type_parameters: None,
+                                }
+                    })
+                    || self
+                        .source_node_facts
+                        .get(&annotation.arena)
+                        .and_then(|facts| facts.get(annotation.node.index().checked_sub(1)?))
+                        .copied()
+                        .flatten()
+                        .is_none_or(|facts| {
+                            facts.kind != SyntaxKind::QuestionToken
+                                || facts.parent != Some(parameter_declaration.node)
+                        })
+                {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+
+        if let Some(parameter_types) = self.callable_signature_parameter_types.get(&signature) {
+            if parameter_types.len() != signature_record.parameters().len() {
+                return None;
+            }
+            for (parameter, parameter_type) in signature_record
+                .parameters()
+                .iter()
+                .copied()
+                .zip(parameter_types)
+            {
+                if self.value_symbol_links(parameter)
+                    != Some(&ValueSymbolLinks {
+                        resolved_type: Some(*parameter_type),
+                        ..ValueSymbolLinks::default()
+                    })
+                {
+                    return None;
+                }
+            }
+        }
+        Some(type_)
     }
 
     fn node_is_source_callable_declaration(&self, node: NodeRef) -> bool {
@@ -1502,6 +1747,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 || self.node_is_source_callable_declaration(node)
                 || self.node_is_source_overload_declaration(node)
                 || self.node_is_declared_callable_signature(node)
+                || self.node_is_global_interface_method(node)
             {
                 return true;
             }
@@ -1524,12 +1770,14 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                         || self.node_is_source_callable_declaration(parent)
                         || self.node_is_source_overload_declaration(parent)
                         || self.node_is_declared_callable_signature(parent)
+                        || self.node_is_global_interface_method(parent)
             )
     }
 
     fn symbol_is_source_callable_owner(&self, symbol: SemanticSymbolId) -> bool {
         self.source_callable_types_by_owner.contains_key(&symbol)
             || self.source_overload_types_by_owner.contains_key(&symbol)
+            || self.authenticated_global_interface_method(symbol).is_some()
     }
 
     fn signature_is_callable(&self, signature: SignatureId) -> bool {
@@ -1538,6 +1786,9 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             .is_some_and(|declaration| {
                 self.node_is_function_type(declaration)
                     || self.node_is_declared_callable_signature(declaration)
+                    || self
+                        .global_interface_method_linked_type(signature)
+                        .is_some()
                     || self
                         .source_callable_type_for_signature(signature)
                         .and_then(|type_| self.source_callable_provenance(type_))
@@ -1571,6 +1822,8 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 .get(&signature)
                 .copied()
                 .filter(|type_| self.type_has_declared_call_set_provenance(*type_))
+        } else if self.node_is_global_interface_method(declaration) {
+            self.global_interface_method_linked_type(signature)
         } else {
             self.source_callable_type_for_signature(signature)
                 .filter(|type_| {
@@ -2055,9 +2308,11 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         let relation_dirty = self.relation_observable_nodes.contains(&node) && changed;
         let dirty = (self.node_is_function_type(node)
             || self.node_is_source_callable_declaration(node)
-            || self.node_is_source_overload_declaration(node))
-            || self.node_is_declared_callable_signature(node);
-        let dirty = dirty && published && changed;
+            || self.node_is_source_overload_declaration(node)
+            || self.node_is_declared_callable_signature(node)
+            || self.node_is_global_interface_method(node))
+            && published
+            && changed;
         self.links.signature.replace_key(node, links);
         if relation_dirty {
             self.mark_relation_inputs_dirty();
@@ -3618,6 +3873,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         };
         let valid_callable = self.node_is_function_type(declaration)
             || self.node_is_declared_callable_signature(declaration)
+            || self.node_is_global_interface_method(declaration)
             || self
                 .source_callable_type_for_signature(id)
                 .and_then(|type_| self.source_callable_provenance(type_))
@@ -3631,7 +3887,22 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                         .iter()
                         .any(|row| row.declaration == declaration && row.signature == id)
                 });
-        if !valid_callable || self.function_signature_return_annotations.contains_key(&id) {
+        let valid_interface_method_annotation = if self.node_is_global_interface_method(declaration)
+        {
+            self.source_primitive_type_annotation(declaration) == Some(annotation)
+                && self.source_node_kind(annotation) == Some(SyntaxKind::StringKeyword)
+                && !null_literal_identity
+                && self.intrinsic_bootstrap.as_ref().is_some_and(|bootstrap| {
+                    self.signature(id).and_then(Signature::resolved_return_type)
+                        == Some(bootstrap.string_type)
+                })
+        } else {
+            true
+        };
+        if !valid_callable
+            || !valid_interface_method_annotation
+            || self.function_signature_return_annotations.contains_key(&id)
+        {
             return false;
         }
         let mut current = annotation;
@@ -3693,6 +3964,19 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 || self
                     .signature(*signature)
                     .is_none_or(|record| record.parameters().len() != types.len())
+                || self.signature(*signature).is_some_and(|record| {
+                    record.declaration().is_some_and(|declaration| {
+                        self.node_is_global_interface_method(declaration)
+                    }) && record.parameters().iter().copied().zip(types).any(
+                        |(parameter, type_)| {
+                            self.value_symbol_links(parameter)
+                                != Some(&ValueSymbolLinks {
+                                    resolved_type: Some(*type_),
+                                    ..ValueSymbolLinks::default()
+                                })
+                        },
+                    )
+                })
                 || !self.valid_optional_types(Some(types))
         }) {
             return false;
@@ -4240,6 +4524,10 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                     NodeData::PrefixUnaryExpression(prefix) => Some(prefix.operator),
                     _ => None,
                 },
+                type_operator: match &node.data {
+                    NodeData::TypeOperatorNode(operator) => Some(operator.operator),
+                    _ => None,
+                },
                 exported: match &node.data {
                     NodeData::TypeAliasDeclaration(declaration) => {
                         declaration.modifiers.as_ref().is_some_and(|modifiers| {
@@ -4373,6 +4661,42 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
 }
 
 impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
+    /// Returns a published global interface method only when its callable
+    /// object, signature, and binder-owned parameter graph remain authentic.
+    pub(super) fn global_interface_method_callable_type(
+        &self,
+        signature: SignatureId,
+    ) -> Option<TypeId> {
+        let type_ = self.global_interface_method_linked_type(signature)?;
+        let declaration = self.signature(signature)?.declaration()?;
+        let method = self.global_interface_method_for_declaration(declaration)?;
+        let record = self.type_payload(type_)?;
+        let TypeData::Object(object) = record.data() else {
+            return None;
+        };
+        if record.flags() != TypeFlags::OBJECT
+            || record.object_flags() != ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
+            || record.symbol() != Some(method)
+            || record.alias().is_some()
+            || object.target.is_some()
+            || object.mapper.is_some()
+            || object.instantiations != TypeCacheState::Unallocated
+            || object.structured.constrained != ConstrainedTypeData::default()
+            || object.structured.members.is_some()
+            || object.structured.properties.is_some()
+            || object.structured.signatures.as_deref() != Some([signature].as_slice())
+            || object.structured.call_signature_count != 1
+            || object.structured.index_infos.is_some()
+            || object
+                .structured
+                .object_type_without_abstract_construct_signatures
+                .is_some()
+        {
+            return None;
+        }
+        Some(type_)
+    }
+
     /// Publishes a dependency-closed batch of local ambient overload groups.
     ///
     /// Every source, binder, cache, and capacity edge is checked before the
@@ -5326,7 +5650,10 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                         .position(|candidate| candidate.provenance.type_parameter == row.constraint)
                     {
                         expected_bases[earlier]
-                    } else if self.source_direct_constraint_has_leaf_base(row.constraint) {
+                    } else if self.source_direct_constraint_has_leaf_base(
+                        row.constraint,
+                        provenance.constraint,
+                    ) {
                         row.constraint
                     } else {
                         return None;
@@ -5360,7 +5687,11 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         Some(states)
     }
 
-    fn source_direct_constraint_has_leaf_base(&self, constraint: TypeId) -> bool {
+    fn source_direct_constraint_has_leaf_base(
+        &self,
+        constraint: TypeId,
+        annotation: Option<NodeRef>,
+    ) -> bool {
         let Some(bootstrap) = self.intrinsic_bootstrap.as_ref() else {
             return false;
         };
@@ -5384,6 +5715,194 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                 self.type_payload(constraint).map(TypeRecord::data),
                 Some(TypeData::Literal(_) | TypeData::UniqueEsSymbol(_))
             )
+            || annotation.is_some_and(|node| {
+                self.source_named_interface_keyof_result_is_exact(node, constraint)
+            })
+    }
+
+    fn source_named_interface_keyof_result_is_exact(&self, node: NodeRef, result: TypeId) -> bool {
+        let Some(facts) = self.source_node_fact(node) else {
+            return false;
+        };
+        if facts.kind != SyntaxKind::TypeOperator
+            || facts.type_operator != Some(SyntaxKind::KeyOfKeyword)
+            || self.type_node_links(node)
+                != Some(&TypeNodeLinks {
+                    resolved_type: Some(result),
+                    outer_type_parameters: None,
+                })
+            || self
+                .symbol_node_links(node)
+                .is_some_and(|links| links != &SymbolNodeLinks::default())
+        {
+            return false;
+        }
+
+        let Some(operand_index) = node
+            .node
+            .index()
+            .checked_sub(1)
+            .and_then(|index| u32::try_from(index).ok())
+        else {
+            return false;
+        };
+        let operand = NodeRef::new(node.arena, node.file, NodeId::new(operand_index));
+        if self.source_node_kind(operand) != Some(SyntaxKind::TypeReference)
+            || self.source_node_parent(operand) != Some(SourceNodeParent::Parent(node))
+        {
+            return false;
+        }
+        let Some(target) = self
+            .type_node_links(operand)
+            .filter(|links| links.outer_type_parameters.is_none())
+            .and_then(|links| links.resolved_type)
+        else {
+            return false;
+        };
+        let Some(owner) = self
+            .symbol_node_links(operand)
+            .and_then(|links| links.resolved_symbol)
+        else {
+            return false;
+        };
+        let Some(record) = self.type_payload(target) else {
+            return false;
+        };
+        let TypeData::Interface(interface) = record.data() else {
+            return false;
+        };
+        if record.flags() != TypeFlags::OBJECT
+            || record.object_flags() != ObjectFlags::INTERFACE | ObjectFlags::MEMBERS_RESOLVED
+            || record.alias().is_some()
+            || record
+                .symbol()
+                .and_then(|symbol| self.get_merged_symbol(symbol))
+                != Some(owner)
+            || self.get_merged_symbol(owner) != Some(owner)
+            || self
+                .symbol(owner)
+                .is_none_or(|symbol| symbol.flags() & SymbolFlags::TYPE != SymbolFlags::INTERFACE)
+            || self
+                .declared_type_links(owner)
+                .and_then(|links| links.declared_type)
+                != Some(target)
+        {
+            return false;
+        }
+        let structured = &interface.reference.object.structured;
+        let Some(member_table) = structured.members else {
+            return false;
+        };
+        let Some(members) = self.symbol_table(member_table) else {
+            return false;
+        };
+        let Some(properties) = structured.properties.as_deref() else {
+            return false;
+        };
+        if properties.is_empty()
+            || properties.len() != members.len()
+            || self.symbol(owner).and_then(Symbol::members) != Some(member_table)
+            || !interface.base_types_resolved
+            || !interface.declared_members_resolved
+            || interface.declared_members != Some(member_table)
+            || interface.resolved_base_types.is_some()
+            || interface.resolved_base_constructor_type.is_some()
+            || interface.declared_call_signatures.is_some()
+            || interface.declared_construct_signatures.is_some()
+            || interface.declared_index_infos.is_some()
+            || structured.signatures.is_some()
+            || structured.call_signature_count != 0
+            || structured.index_infos.is_some()
+        {
+            return false;
+        }
+
+        let key = PropertiesTypeCacheKey::new(
+            target,
+            TypeFlags::STRING_LIKE | TypeFlags::NUMBER_LIKE | TypeFlags::ES_SYMBOL_LIKE,
+            true,
+            record
+                .object_flags()
+                .intersects(ObjectFlags::UNRESOLVED_MEMBERS),
+        );
+        if self.cached_properties_type(key) != Some(result) {
+            return false;
+        }
+
+        let Some(bootstrap) = self.intrinsic_bootstrap.as_ref() else {
+            return false;
+        };
+        let mut keys = Vec::with_capacity(properties.len());
+        for property in properties {
+            let Some(symbol) = self.symbol(*property) else {
+                return false;
+            };
+            let Some(name) = symbol.name().as_utf8() else {
+                return false;
+            };
+            let allowed_flags = SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL;
+            if !symbol.flags().contains(SymbolFlags::PROPERTY)
+                || symbol.flags().without(allowed_flags) != SymbolFlags::NONE
+                || symbol
+                    .parent()
+                    .and_then(|parent| self.get_merged_symbol(parent))
+                    != Some(owner)
+                || members.get_source(name) != Some(*property)
+                || self.get_merged_symbol(*property) != Some(*property)
+            {
+                return false;
+            }
+            let Some(literal) = bootstrap.cached_string_literal_type(name) else {
+                return false;
+            };
+            let Some(literal_record) = self.type_payload(literal) else {
+                return false;
+            };
+            let TypeData::Literal(value) = literal_record.data() else {
+                return false;
+            };
+            if literal_record.flags() != TypeFlags::STRING_LITERAL
+                || literal_record.symbol().is_some()
+                || literal_record.alias().is_some()
+                || value.regular_type != literal
+                || !matches!(&value.value, LiteralValue::String(value) if value == name)
+                || keys.contains(&literal)
+            {
+                return false;
+            }
+            keys.push(literal);
+        }
+
+        if let [only] = keys.as_slice() {
+            result == *only
+        } else {
+            let Some(result_record) = self.type_payload(result) else {
+                return false;
+            };
+            let TypeData::Union(union) = result_record.data() else {
+                return false;
+            };
+            let Some(origin) = union.origin else {
+                return false;
+            };
+            let Some(origin_record) = self.type_payload(origin) else {
+                return false;
+            };
+            let TypeData::Index(index) = origin_record.data() else {
+                return false;
+            };
+            result_record.flags() == TypeFlags::UNION
+                && result_record.symbol().is_none()
+                && result_record.alias().is_none()
+                && union.union.types.len() == keys.len()
+                && keys.iter().all(|key| union.union.types.contains(key))
+                && origin_record.flags() == TypeFlags::INDEX
+                && origin_record.object_flags() == ObjectFlags::NONE
+                && origin_record.symbol().is_none()
+                && origin_record.alias().is_none()
+                && index.target == target
+                && index.index_flags == IndexFlags::NONE
+        }
     }
 
     pub(super) fn source_type_node_result_is_exact(
@@ -5425,6 +5944,10 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                 .symbol_node_links(node)
                 .is_none_or(|links| links == &SymbolNodeLinks::default());
             return result == intrinsic && type_links_valid && symbol_links_valid;
+        }
+
+        if kind == Some(SyntaxKind::TypeOperator) {
+            return self.source_named_interface_keyof_result_is_exact(node, result);
         }
 
         if kind == Some(SyntaxKind::LiteralType) {
@@ -5779,13 +6302,14 @@ mod tests {
     use super::{AstScope, CachedSignatureLookup, SemanticStore, type_list_key};
     use crate::semantic::{
         AccessibleChainCacheKey, AliasSymbolLinks, AliasTargetState, ArrayLiteralLinks,
-        AssertionLinks, CacheHashKey, CanonicalTypeMapperStore, ContainingSymbolLinks,
-        DeclaredTypeHost, DeclaredTypeLinks, DecoratorSignatureState, DeferredSymbolLinks,
-        EffectsSignatureState, EntityNameNode, EnumMemberLinks, EvaluatorResult, EvaluatorValue,
-        ExhaustiveState, ExportTypeLinks, ExtendedContainersState, ExternalEmitHelpers,
-        IntrinsicBootstrapOptions, JsxElementLinks, JsxFlags, LateBoundLinks, MappedSymbolLinks,
-        MarkedAssignmentSymbolLinks, MembersAndExportsLinks, ModuleSymbolLinks, NodeCheckFlags,
-        NodeLinks, OptionalSymbolSequence, OrderedNodeSet, RelationComparisonResult, RelationKind,
+        AssertionLinks, CacheHashKey, CanonicalCheckerContext, CanonicalCheckerOptions,
+        CanonicalTypeMapperStore, ContainingSymbolLinks, DeclaredTypeHost, DeclaredTypeLinks,
+        DecoratorSignatureState, DeferredSymbolLinks, EffectsSignatureState, EntityNameNode,
+        EnumMemberLinks, EvaluatorResult, EvaluatorValue, ExhaustiveState, ExportTypeLinks,
+        ExtendedContainersState, ExternalEmitHelpers, IntrinsicBootstrapOptions, JsxElementLinks,
+        JsxFlags, LateBoundLinks, MappedSymbolLinks, MarkedAssignmentSymbolLinks,
+        MembersAndExportsLinks, ModuleSymbolLinks, NodeCheckFlags, NodeLinks,
+        OptionalSymbolSequence, OrderedNodeSet, RelationComparisonResult, RelationKind,
         ResolvedSignatureState, ReverseMappedSymbolLinks, SignatureLinks, SourceFileLinks,
         SpreadLinks, SwitchStatementLinks, SymbolNodeLinks, SymbolReferenceLinks, TypeAliasLinks,
         TypeNodeLinks, TypeRecord, TypeResolutionTarget, TypeSystemPropertyName, ValueSymbolLinks,
@@ -6125,6 +6649,224 @@ mod tests {
             .find_map(|(id, node)| (node.kind == kind).then_some(id))
             .unwrap_or_else(|| panic!("parsed source must contain {kind:?}"));
         NodeRef::new(arena.id(), file, node)
+    }
+
+    struct GlobalInterfaceMethodFixture {
+        store: CanonicalTypeMapperStore,
+        owner: crate::semantic::SemanticSymbolId,
+        wrapper: crate::semantic::TypeId,
+        method: crate::semantic::SemanticSymbolId,
+        declaration: NodeRef,
+        return_annotation: NodeRef,
+        parameter: Option<(crate::semantic::SemanticSymbolId, NodeRef)>,
+    }
+
+    fn global_interface_method_fixture(
+        global: &str,
+        declaration: &str,
+    ) -> GlobalInterfaceMethodFixture {
+        let original = parse_source_file(&format!("interface {global} {{ {declaration} }}"));
+        let augmentation = parse_source_file(&format!(
+            "interface {global} {{ marker: number }} declare var {global}: any;"
+        ));
+        assert!(
+            original.diagnostics.is_empty(),
+            "{:?}",
+            original.diagnostics
+        );
+        assert!(
+            augmentation.diagnostics.is_empty(),
+            "{:?}",
+            augmentation.diagnostics
+        );
+        let first_file = FileId::new(90_010);
+        let second_file = FileId::new(90_011);
+        let mut binder = CanonicalBinder::new();
+        for (file, parsed) in [(first_file, &original), (second_file, &augmentation)] {
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(format!("\"/global-{}.d.ts\"", file.index())),
+                        CanonicalSourceLanguage::TypeScript,
+                        true,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+
+        let method_declaration =
+            node_ref_of_kind(&original.arena, first_file, SyntaxKind::MethodSignature);
+        let first_interface = node_ref_of_kind(
+            &original.arena,
+            first_file,
+            SyntaxKind::InterfaceDeclaration,
+        );
+        let second_interface = node_ref_of_kind(
+            &augmentation.arena,
+            second_file,
+            SyntaxKind::InterfaceDeclaration,
+        );
+        let first_bound = binder.file(first_file).unwrap();
+        let first_owner = first_bound.symbol(first_interface).unwrap();
+        let method = first_bound.symbol(method_declaration).unwrap();
+        let NodeData::MethodSignatureDeclaration(method_data) =
+            &original.arena.get(method_declaration.node).unwrap().data
+        else {
+            panic!("the global declaration must contain one method signature")
+        };
+        let return_annotation = NodeRef::new(
+            original.arena.id(),
+            first_file,
+            method_data.type_.expect("the method has a return type"),
+        );
+        let parameter = method_data.parameters.nodes.first().map(|node| {
+            let declaration = NodeRef::new(original.arena.id(), first_file, *node);
+            let symbol = first_bound.symbol(declaration).unwrap();
+            (symbol, declaration)
+        });
+        let second_owner = binder
+            .file(second_file)
+            .unwrap()
+            .symbol(second_interface)
+            .unwrap();
+
+        let (symbols, _) = binder.finish().try_into_parts().unwrap();
+        let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
+        for (file, parsed) in [(first_file, &original), (second_file, &augmentation)] {
+            assert!(
+                store
+                    .register_source_file(&parsed.arena, parsed.source_file, file)
+                    .is_some()
+            );
+        }
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        let globals = store.intrinsic_bootstrap().unwrap().globals;
+        assert_eq!(
+            store.merge_global_symbol(globals, first_owner),
+            Ok(first_owner)
+        );
+        let owner = store.merge_global_symbol(globals, second_owner).unwrap();
+        let wrapper = store
+            .alloc_interface_type(ObjectFlags::INTERFACE, Some(owner))
+            .unwrap();
+        assert!(store.set_declared_type_links(
+            owner,
+            DeclaredTypeLinks {
+                declared_type: Some(wrapper),
+                ..DeclaredTypeLinks::default()
+            },
+        ));
+
+        GlobalInterfaceMethodFixture {
+            store,
+            owner,
+            wrapper,
+            method,
+            declaration: method_declaration,
+            return_annotation,
+            parameter,
+        }
+    }
+
+    fn publish_global_interface_method_fixture(
+        fixture: &mut GlobalInterfaceMethodFixture,
+    ) -> (crate::semantic::TypeId, crate::semantic::SignatureId) {
+        let (number, string) = {
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            (bootstrap.number_type, bootstrap.string_type)
+        };
+        let type_ = fixture
+            .store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(fixture.method))
+            .unwrap();
+        let signature = fixture
+            .store
+            .alloc_signature(
+                SignatureFlags::NONE,
+                Some(fixture.declaration),
+                Vec::new(),
+                None,
+                fixture
+                    .parameter
+                    .map(|(symbol, _)| vec![symbol])
+                    .unwrap_or_default(),
+                Some(string),
+                None,
+                0,
+            )
+            .unwrap();
+        assert!(fixture.store.set_signature_links(
+            fixture.declaration,
+            SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(signature),
+                ..SignatureLinks::default()
+            },
+        ));
+        assert!(fixture.store.set_value_symbol_links(
+            fixture.method,
+            ValueSymbolLinks {
+                resolved_type: Some(type_),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        assert!(fixture.store.set_structured_type_members(
+            type_,
+            None,
+            None,
+            Some(vec![signature]),
+            None,
+            None,
+        ));
+        assert!(fixture.store.set_type_node_links(
+            fixture.return_annotation,
+            TypeNodeLinks {
+                resolved_type: Some(string),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        assert!(fixture.store.set_function_signature_return_annotation(
+            signature,
+            fixture.return_annotation,
+            false,
+        ));
+        if let Some((parameter, declaration)) = fixture.parameter {
+            let annotation = fixture
+                .store
+                .source_primitive_type_annotation(declaration)
+                .unwrap();
+            assert!(fixture.store.set_type_node_links(
+                annotation,
+                TypeNodeLinks {
+                    resolved_type: Some(number),
+                    ..TypeNodeLinks::default()
+                },
+            ));
+            assert!(fixture.store.set_value_symbol_links(
+                parameter,
+                ValueSymbolLinks {
+                    resolved_type: Some(number),
+                    ..ValueSymbolLinks::default()
+                },
+            ));
+        }
+        assert!(
+            fixture
+                .store
+                .set_callable_signature_parameter_types_batch(vec![(
+                    signature,
+                    fixture.parameter.map(|_| vec![number]).unwrap_or_default(),
+                )]),
+        );
+        (type_, signature)
     }
 
     fn empty_signature<TypePayload, MapperPayload>(
@@ -7095,6 +7837,281 @@ mod tests {
             },
         ));
         assert!(store.union_cache_needs_validation);
+    }
+
+    #[test]
+    fn global_interface_methods_authenticate_merged_owners_and_publish_callable_caches() {
+        for (global, declaration) in [
+            ("Number", "toFixed(fractionDigits?: number): string;"),
+            ("String", "toLowerCase(): string;"),
+        ] {
+            let mut fixture = global_interface_method_fixture(global, declaration);
+            assert_ne!(
+                fixture.store.symbol(fixture.method).unwrap().parent(),
+                Some(fixture.owner),
+                "global merging preserves the method's original interface parent",
+            );
+            assert_eq!(
+                fixture.store.get_parent_of_symbol(fixture.method),
+                Some(fixture.owner),
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .authenticated_global_interface_method(fixture.method),
+                Some((fixture.wrapper, fixture.declaration)),
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .symbol_store()
+                    .assigned_global_symbol_id(fixture.owner),
+                None,
+            );
+
+            let (type_, signature) = publish_global_interface_method_fixture(&mut fixture);
+            assert_eq!(
+                fixture
+                    .store
+                    .global_interface_method_callable_type(signature),
+                Some(type_),
+            );
+            assert!(fixture.store.signature_is_callable(signature));
+            assert!(
+                fixture
+                    .store
+                    .node_has_callable_ancestor(fixture.return_annotation)
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .symbol_store()
+                    .assigned_global_symbol_id(fixture.owner),
+                None,
+            );
+            if let Some((parameter, _)) = fixture.parameter {
+                assert!(fixture.store.symbol_is_callable_parameter(parameter));
+            }
+        }
+    }
+
+    #[test]
+    fn global_interface_method_cache_mutations_invalidate_callable_validation() {
+        for poison in 0..6 {
+            let mut fixture = global_interface_method_fixture(
+                "Number",
+                "toFixed(fractionDigits?: number): string;",
+            );
+            let (_, signature) = publish_global_interface_method_fixture(&mut fixture);
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            let number = bootstrap.number_type;
+            let string = bootstrap.string_type;
+            fixture.store.union_cache_needs_validation = false;
+
+            match poison {
+                0 => {
+                    assert!(fixture.store.set_value_symbol_links(
+                        fixture.parameter.unwrap().0,
+                        ValueSymbolLinks {
+                            resolved_type: Some(string),
+                            ..ValueSymbolLinks::default()
+                        },
+                    ));
+                }
+                1 => {
+                    assert!(fixture.store.set_value_symbol_links(
+                        fixture.method,
+                        ValueSymbolLinks {
+                            resolved_type: Some(number),
+                            ..ValueSymbolLinks::default()
+                        },
+                    ));
+                }
+                2 => {
+                    assert!(fixture.store.set_type_node_links(
+                        fixture.return_annotation,
+                        TypeNodeLinks {
+                            resolved_type: Some(number),
+                            ..TypeNodeLinks::default()
+                        },
+                    ));
+                }
+                3 => {
+                    assert!(
+                        fixture
+                            .store
+                            .set_signature_resolved_return_type(signature, Some(number),)
+                    );
+                }
+                4 => {
+                    let forged = fixture
+                        .store
+                        .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(fixture.method))
+                        .unwrap();
+                    assert!(fixture.store.set_value_symbol_links(
+                        fixture.method,
+                        ValueSymbolLinks {
+                            resolved_type: Some(forged),
+                            ..ValueSymbolLinks::default()
+                        },
+                    ));
+                }
+                5 => {
+                    let forged = fixture
+                        .store
+                        .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(fixture.owner))
+                        .unwrap();
+                    assert!(fixture.store.set_structured_type_members(
+                        forged,
+                        None,
+                        None,
+                        Some(vec![signature]),
+                        None,
+                        None,
+                    ));
+                    assert!(fixture.store.set_value_symbol_links(
+                        fixture.method,
+                        ValueSymbolLinks {
+                            resolved_type: Some(forged),
+                            ..ValueSymbolLinks::default()
+                        },
+                    ));
+                }
+                _ => unreachable!("poison cases are bounded"),
+            }
+            assert!(fixture.store.union_cache_needs_validation, "case {poison}");
+            assert_eq!(
+                fixture
+                    .store
+                    .global_interface_method_callable_type(signature),
+                None,
+                "case {poison}",
+            );
+        }
+    }
+
+    #[test]
+    fn global_interface_methods_reject_unowned_signatures_and_foreign_globals() {
+        let mut fixture = global_interface_method_fixture("String", "toLowerCase(): string;");
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let globals = bootstrap.globals;
+        let string = bootstrap.string_type;
+        let unowned = fixture
+            .store
+            .alloc_signature(
+                SignatureFlags::NONE,
+                Some(fixture.declaration),
+                Vec::new(),
+                None,
+                Vec::new(),
+                Some(string),
+                None,
+                0,
+            )
+            .unwrap();
+        assert!(
+            !fixture
+                .store
+                .set_callable_signature_parameter_types_batch(vec![(unowned, Vec::new())]),
+        );
+
+        let (_, signature) = publish_global_interface_method_fixture(&mut fixture);
+        let forged = fixture
+            .store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::INTERFACE,
+                EscapedName::source("String"),
+            ))
+            .unwrap();
+        assert!(
+            fixture
+                .store
+                .insert_symbol(globals, EscapedName::source("String"), forged)
+                .is_some(),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .authenticated_global_interface_method(fixture.method),
+            None,
+        );
+        assert_eq!(
+            fixture
+                .store
+                .global_interface_method_callable_type(signature),
+            None,
+        );
+    }
+
+    #[test]
+    fn named_interface_keyof_constraints_require_exact_operator_and_cached_keys() {
+        let parsed = parse_source_file(concat!(
+            "interface Types { first: string; second: number } ",
+            "type Keys = keyof Types;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(90_012);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/named-keyof.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        let keyof = node_ref_of_kind(&parsed.arena, file, SyntaxKind::TypeOperator);
+        let result = context.get_type_from_type_node(keyof).unwrap();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+
+        assert!(
+            context
+                .store()
+                .source_type_node_result_is_exact(keyof, result, &[])
+        );
+        assert!(
+            context
+                .store()
+                .source_direct_constraint_has_leaf_base(result, Some(keyof)),
+        );
+        assert!(
+            !context
+                .store()
+                .source_direct_constraint_has_leaf_base(result, None),
+        );
+
+        let store = context.store_mut_for_test();
+        store.source_node_facts.get_mut(&keyof.arena).unwrap()[keyof.node.index()]
+            .as_mut()
+            .unwrap()
+            .type_operator = Some(SyntaxKind::ReadonlyKeyword);
+        assert!(!store.source_type_node_result_is_exact(keyof, result, &[]));
+        store.source_node_facts.get_mut(&keyof.arena).unwrap()[keyof.node.index()]
+            .as_mut()
+            .unwrap()
+            .type_operator = Some(SyntaxKind::KeyOfKeyword);
+        assert!(store.set_type_node_links(
+            keyof,
+            TypeNodeLinks {
+                resolved_type: Some(number),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        assert!(!store.source_type_node_result_is_exact(keyof, result, &[]));
     }
 
     #[test]

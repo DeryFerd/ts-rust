@@ -973,3 +973,65 @@ fn recursive_mapped_alias_constraints_preserve_the_complete_generic_graph() {
         warm,
     );
 }
+
+#[test]
+fn finite_mapped_records_contextually_type_computed_literal_properties() {
+    let parsed = parse_source_file(concat!(
+        "type Lowercase<Input extends string> = intrinsic;\n",
+        "type Record<Key extends keyof any, Value> = { [Item in Key]: Value };\n",
+        "type Keys = Lowercase<'FIRST' | 'SECOND'>;\n",
+        "const values: Record<Keys, string> = {\n",
+        "  ['first']: 'one',\n",
+        "  ['second']: 'two',\n",
+        "};\n",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(3);
+    let mut binder = CanonicalBinder::new();
+    binder
+        .bind_source_file_with_facts(
+            &parsed.arena,
+            parsed.source_file,
+            file,
+            CanonicalSourceFileFacts::new(
+                EscapedName::source("\"/project/finite-mapped-record.ts\""),
+                CanonicalSourceLanguage::TypeScript,
+                false,
+                CanonicalModuleState::Script,
+            ),
+        )
+        .unwrap();
+    binder
+        .bind_typescript_declaration_slice(&parsed.arena, file)
+        .unwrap();
+    let mut context = CanonicalCheckerContext::new(
+        binder.finish(),
+        vec![(file, &parsed.arena)],
+        CanonicalCheckerOptions::default(),
+    )
+    .unwrap();
+
+    context.check_source_file(file).unwrap();
+    assert!(
+        context.diagnostics().is_empty(),
+        "{:?}",
+        context.diagnostics()
+    );
+
+    let warm = (
+        context.store().type_len(),
+        context.store().mapper_len(),
+        context.store().symbol_len(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().mapper_len(),
+            context.store().symbol_len(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
+}

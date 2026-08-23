@@ -7702,7 +7702,7 @@ impl<'a> Parser<'a> {
                 self.error_current("Expected '</'.");
             } else {
                 self.error_code_at(
-                    TextRange::new(missing_position, missing_position),
+                    TextRange::new(missing_position, self.current.range.end),
                     1005,
                     ["</".to_owned()],
                 );
@@ -12481,7 +12481,14 @@ mod tests {
             .expect("missing JSX closing-tag diagnostic");
         assert_eq!(missing_close.message, "'</' expected.");
         assert_eq!(missing_close.range.start.get(), 15);
-        assert_eq!(missing_close.range.end.get(), 15);
+        assert_eq!(missing_close.range.end.get(), 28);
+        let conflict_marker = result
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == Some(1185))
+            .expect("conflict-marker diagnostic");
+        assert_eq!(conflict_marker.range.start.get(), 16);
+        assert_eq!(conflict_marker.range.end.get(), 23);
         assert_eq!(
             result
                 .diagnostics
@@ -12489,6 +12496,44 @@ mod tests {
                 .map(|diagnostic| diagnostic.code)
                 .collect::<Vec<_>>(),
             [Some(1005), Some(1185)]
+        );
+    }
+
+    #[test]
+    fn conflict_marker_jsx_diagnostic_includes_crlf_and_complete_marker() {
+        let result = parse_jsx_source_file("const x = <div>\r\n<<<<<<< HEAD");
+        let missing_close = result
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == Some(1005))
+            .expect("missing JSX closing-tag diagnostic");
+        assert_eq!(missing_close.range.start.get(), 15);
+        assert_eq!(missing_close.range.end.get(), 29);
+
+        let conflict_marker = result
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == Some(1185))
+            .expect("conflict-marker diagnostic");
+        assert_eq!(conflict_marker.range.start.get(), 17);
+        assert_eq!(conflict_marker.range.end.get(), 24);
+    }
+
+    #[test]
+    fn missing_jsx_closing_tag_at_eof_keeps_zero_width_diagnostic() {
+        let result = parse_jsx_source_file("const x = <div>");
+        let missing_close = result
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == Some(1005))
+            .expect("missing JSX closing-tag diagnostic");
+        assert_eq!(missing_close.range.start.get(), 15);
+        assert_eq!(missing_close.range.end.get(), 15);
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != Some(1185))
         );
     }
 

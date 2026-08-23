@@ -6,13 +6,15 @@
 
 use std::collections::HashSet;
 
-use ts_ast::{NodeArena, NodeRef, SyntaxKind};
+use ts_ast::{Node, NodeArena, NodeData, NodeRef, SyntaxKind};
 use ts_binder::{
     BoundFile, CanonicalNameResolutionError, CanonicalNameResolver, CanonicalResolutionLocation,
     CheckFlags, SemanticSymbolId, SymbolFlags,
 };
 
-use super::{CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, TypeId};
+use super::{
+    CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, TypeId, store::SourceNodeParent,
+};
 
 /// The declaration-list kind that determines a variable symbol's exact binder flags.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -44,9 +46,22 @@ pub(super) struct PlannedIdentifierRead {
     pub(super) value_symbol: SemanticSymbolId,
 }
 
+/// One computed object binding whose symbol belongs to the binding element.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PlannedComputedBindingElement {
+    pub(super) declaration: NodeRef,
+    pub(super) pattern: NodeRef,
+    pub(super) element: NodeRef,
+    pub(super) computed_name: NodeRef,
+    pub(super) key: NodeRef,
+    pub(super) name: NodeRef,
+    pub(super) symbol: SemanticSymbolId,
+}
+
 /// Valid TypeScript symbol routes intentionally outside this source slice.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VariableUnsupported {
+    BindingPattern(NodeRef),
     UnresolvedIdentifier(NodeRef),
     ResolverDeferred {
         node: NodeRef,
@@ -99,6 +114,7 @@ pub enum VariableUnsupported {
 /// Malformed binder, resolver, or sparse-link provenance.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VariableInvariant {
+    InvalidBindingPattern(NodeRef),
     InvalidSymbol(SemanticSymbolId),
     MissingDeclarationSymbol(NodeRef),
     InvalidMergedSymbol(SemanticSymbolId),
@@ -241,6 +257,225 @@ pub(super) fn plan_top_level_variable(
     validate_target_parent(bound, store, merged, exported)?;
     validate_value_links(store, merged)?;
     Ok(merged)
+}
+
+/// Proves one top-level `{ [key]: name }` binding without publishing its type.
+pub(super) fn plan_top_level_computed_binding_element(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    binding: VariableBindingKind,
+    exported: bool,
+) -> Result<PlannedComputedBindingElement, VariablePlanError> {
+    if bound.node_arena_id() != arena.id()
+        || bound.node_arena_revision() != arena.revision()
+        || !declaration.is_for(arena.id(), bound.file_id())
+    {
+        return Err(VariableInvariant::InvalidBindingPattern(declaration).into());
+    }
+    let declaration_record = arena
+        .get(declaration.node)
+        .ok_or(VariableInvariant::InvalidBindingPattern(declaration))?;
+    let NodeData::VariableDeclaration(variable) = &declaration_record.data else {
+        return Err(VariablePlanError::Unsupported(
+            VariableUnsupported::BindingPattern(declaration),
+        ));
+    };
+    let list = declaration_record
+        .parent
+        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+        .ok_or(VariableInvariant::InvalidBindingPattern(declaration))?;
+    let list_record = arena
+        .get(list.node)
+        .ok_or(VariableInvariant::InvalidBindingPattern(list))?;
+    let statement = list_record
+        .parent
+        .map(|node| NodeRef::new(list.arena, list.file, node))
+        .ok_or(VariableInvariant::InvalidBindingPattern(list))?;
+    let source = bound.source_file();
+    let statement_record = binding_child_node(arena, store, statement, source)?;
+    let NodeData::VariableStatement(statement_data) = &statement_record.data else {
+        return Err(VariableInvariant::InvalidBindingPattern(statement).into());
+    };
+    if statement_record.kind != SyntaxKind::VariableStatement
+        || statement_data.declaration_list != list.node
+    {
+        return Err(VariableInvariant::InvalidBindingPattern(statement).into());
+    }
+    let list_record = binding_child_node(arena, store, list, statement)?;
+    let NodeData::VariableDeclarationList(list_data) = &list_record.data else {
+        return Err(VariableInvariant::InvalidBindingPattern(list).into());
+    };
+    let expected_flags = match binding {
+        VariableBindingKind::Var => 0,
+        VariableBindingKind::Let => 1,
+        VariableBindingKind::Const => 1 << 1,
+    };
+    if list_record.kind != SyntaxKind::VariableDeclarationList
+        || list_record.flags.0 != expected_flags
+        || list_data
+            .declarations
+            .nodes
+            .iter()
+            .filter(|node| **node == declaration.node)
+            .count()
+            != 1
+    {
+        return Err(VariableInvariant::InvalidBindingPattern(list).into());
+    }
+    let declaration_record = binding_child_node(arena, store, declaration, list)?;
+    if declaration_record.kind != SyntaxKind::VariableDeclaration
+        || declaration_record.flags.0 != 0
+        || variable.exclamation_token.is_some()
+        || variable.local_symbol.is_some()
+        || variable.symbol.is_some()
+        || variable.facts != 0
+        || bound.symbol(declaration).is_some()
+        || bound.local_symbol(declaration).is_some()
+    {
+        return Err(VariableInvariant::InvalidBindingPattern(declaration).into());
+    }
+
+    let pattern = NodeRef::new(declaration.arena, declaration.file, variable.name);
+    let pattern_record = binding_child_node(arena, store, pattern, declaration)?;
+    let NodeData::BindingPattern(pattern_data) = &pattern_record.data else {
+        return Err(VariablePlanError::Unsupported(
+            VariableUnsupported::BindingPattern(pattern),
+        ));
+    };
+    let [element] = pattern_data.elements.nodes.as_slice() else {
+        return Err(VariablePlanError::Unsupported(
+            VariableUnsupported::BindingPattern(pattern),
+        ));
+    };
+    if pattern_record.kind != SyntaxKind::ObjectBindingPattern
+        || pattern_record.flags.0 != 0
+        || pattern_data.elements.has_trailing_comma
+        || pattern_data.elements.range != pattern_record.range
+        || pattern_data.facts != 0
+    {
+        return Err(VariablePlanError::Unsupported(
+            VariableUnsupported::BindingPattern(pattern),
+        ));
+    }
+
+    let element = NodeRef::new(pattern.arena, pattern.file, *element);
+    let element_record = binding_child_node(arena, store, element, pattern)?;
+    let NodeData::BindingElement(element_data) = &element_record.data else {
+        return Err(VariableInvariant::InvalidBindingPattern(element).into());
+    };
+    if element_record.kind != SyntaxKind::BindingElement
+        || element_record.flags.0 != 0
+        || element_data.dot_dot_dot_token.is_some()
+        || element_data.flow_node.is_some()
+        || element_data.initializer.is_some()
+        || element_data.local_symbol.is_some()
+        || element_data.symbol.is_some()
+        || element_data.facts != 0
+    {
+        return Err(VariablePlanError::Unsupported(
+            VariableUnsupported::BindingPattern(element),
+        ));
+    }
+
+    let computed_name = element_data
+        .property_name
+        .map(|node| NodeRef::new(element.arena, element.file, node))
+        .ok_or(VariablePlanError::Unsupported(
+            VariableUnsupported::BindingPattern(element),
+        ))?;
+    let computed_record = binding_child_node(arena, store, computed_name, element)?;
+    let NodeData::ComputedPropertyName(computed) = &computed_record.data else {
+        return Err(VariablePlanError::Unsupported(
+            VariableUnsupported::BindingPattern(computed_name),
+        ));
+    };
+    if computed_record.kind != SyntaxKind::ComputedPropertyName
+        || computed_record.flags.0 != 0
+        || computed.facts != 0
+    {
+        return Err(VariablePlanError::Unsupported(
+            VariableUnsupported::BindingPattern(computed_name),
+        ));
+    }
+    let key = NodeRef::new(computed_name.arena, computed_name.file, computed.expression);
+    binding_child_node(arena, store, key, computed_name)?;
+
+    let name = element_data
+        .name
+        .map(|node| NodeRef::new(element.arena, element.file, node))
+        .ok_or(VariableInvariant::InvalidBindingPattern(element))?;
+    let name_record = binding_child_node(arena, store, name, element)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(VariablePlanError::Unsupported(
+            VariableUnsupported::BindingPattern(name),
+        ));
+    };
+    if name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+        || computed_record.range.end > name_record.range.start
+    {
+        return Err(VariableInvariant::InvalidBindingPattern(name).into());
+    }
+
+    let symbol = plan_top_level_variable(
+        bound,
+        store,
+        element,
+        name,
+        &identifier.text,
+        binding,
+        exported,
+    )?;
+    let local = bound.local_symbol(element).unwrap_or(symbol);
+    if bound.container(element) != Some(source)
+        || bound.block_scope_container(element) != Some(source)
+        || bound
+            .locals(source)
+            .and_then(|locals| store.symbol_table(locals))
+            .and_then(|locals| locals.get_source(&identifier.text))
+            != Some(local)
+    {
+        return Err(VariableInvariant::InvalidBindingPattern(element).into());
+    }
+
+    Ok(PlannedComputedBindingElement {
+        declaration,
+        pattern,
+        element,
+        computed_name,
+        key,
+        name,
+        symbol,
+    })
+}
+
+fn binding_child_node<'a>(
+    arena: &'a NodeArena,
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+    parent: NodeRef,
+) -> Result<&'a Node, VariablePlanError> {
+    let record = arena
+        .get(node.node)
+        .ok_or(VariableInvariant::InvalidBindingPattern(node))?;
+    let parent_record = arena
+        .get(parent.node)
+        .ok_or(VariableInvariant::InvalidBindingPattern(parent))?;
+    if !node.is_for(parent.arena, parent.file)
+        || record.parent != Some(parent.node)
+        || store.source_node_kind(node) != Some(record.kind)
+        || store.source_node_parent(node) != Some(SourceNodeParent::Parent(parent))
+        || record.range.start < parent_record.range.start
+        || record.range.end > parent_record.range.end
+        || record.range.start > record.range.end
+    {
+        return Err(VariableInvariant::InvalidBindingPattern(node).into());
+    }
+    Ok(record)
 }
 
 /// Resolves one identifier and proves that it reads an already-planned source variable.
@@ -638,7 +873,9 @@ fn single_variable_declaration(
     let mut variable = None;
     for declaration in declarations.iter().copied() {
         match store.source_node_kind(declaration) {
-            Some(SyntaxKind::VariableDeclaration) if variable.is_none() => {
+            Some(SyntaxKind::VariableDeclaration | SyntaxKind::BindingElement)
+                if variable.is_none() =>
+            {
                 variable = Some(declaration);
             }
             Some(SyntaxKind::Parameter)
@@ -771,10 +1008,263 @@ mod tests {
         CanonicalBinder, CanonicalModuleState, CanonicalNameResolverOptions,
         CanonicalSourceFileFacts, CanonicalSourceLanguage, EscapedName,
     };
-    use ts_parser::parse_source_file;
+    use ts_parser::{ParseResult, parse_source_file};
 
     use super::*;
-    use crate::semantic::{IntrinsicBootstrapOptions, production::GlobalMergeCompletion};
+    use crate::semantic::{
+        IntrinsicBootstrapOptions, ValueSymbolLinks, production::GlobalMergeCompletion,
+    };
+
+    struct BindingFixture {
+        parsed: ParseResult,
+        file: ts_ast::FileId,
+        bound: BoundFile,
+        store: CanonicalTypeMapperStore,
+    }
+
+    fn binding_fixture(source: &str, file: u32) -> BindingFixture {
+        let parsed = parse_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(file);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/binding-elements.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let (symbols, mut files) = binder.finish().try_into_parts().unwrap();
+        let bound = files.remove(&file).unwrap();
+        let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
+        assert!(
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .is_some()
+        );
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        BindingFixture {
+            parsed,
+            file,
+            bound,
+            store,
+        }
+    }
+
+    fn binding_declaration(fixture: &BindingFixture) -> NodeRef {
+        fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::VariableDeclaration(declaration) = &record.data else {
+                    return None;
+                };
+                matches!(
+                    fixture.parsed.arena.get(declaration.name)?.data,
+                    NodeData::BindingPattern(_)
+                )
+                .then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .expect("fixture contains a binding-pattern declaration")
+    }
+
+    #[test]
+    fn computed_binding_element_preserves_symbol_identity_reads_and_warm_links() {
+        let mut fixture = binding_fixture(
+            "let key = () => 'name'; let { [key()]: value } = {}; let observed = value;",
+            918,
+        );
+        let declaration = binding_declaration(&fixture);
+        let plan = plan_top_level_computed_binding_element(
+            &fixture.parsed.arena,
+            &fixture.bound,
+            &fixture.store,
+            declaration,
+            VariableBindingKind::Let,
+            false,
+        )
+        .unwrap();
+
+        assert!(fixture.bound.symbol(declaration).is_none());
+        assert_eq!(fixture.bound.symbol(plan.element), Some(plan.symbol));
+        assert_eq!(
+            fixture.store.symbol(plan.symbol).unwrap().declarations(),
+            Some(&[plan.element][..])
+        );
+        assert_eq!(
+            fixture.store.source_node_parent(plan.key),
+            Some(SourceNodeParent::Parent(plan.computed_name))
+        );
+        assert!(fixture.store.value_symbol_links(plan.symbol).is_none());
+        assert_eq!(
+            plan_top_level_variable(
+                &fixture.bound,
+                &fixture.store,
+                plan.element,
+                plan.name,
+                "value",
+                VariableBindingKind::Let,
+                false,
+            ),
+            Ok(plan.symbol)
+        );
+
+        let read = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::Identifier(identifier) = &record.data else {
+                    return None;
+                };
+                (identifier.text == "value" && node != plan.name.node).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let globals = fixture.store.intrinsic_bootstrap().unwrap().globals;
+        assert_eq!(
+            fixture.store.merge_global_symbol(globals, plan.symbol),
+            Ok(plan.symbol)
+        );
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&fixture.parsed.arena, &fixture.bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        assert_eq!(
+            plan_identifier_read(
+                &fixture.parsed.arena,
+                &fixture.bound,
+                &fixture.store,
+                &host,
+                &HashSet::from([plan.symbol]),
+                &HashSet::from([plan.symbol]),
+                read,
+                "value",
+            ),
+            Ok(PlannedIdentifierRead {
+                resolved_symbol: plan.symbol,
+                value_symbol: plan.symbol,
+            })
+        );
+
+        let error = fixture.store.intrinsic_bootstrap().unwrap().error_type;
+        let links = ValueSymbolLinks {
+            resolved_type: Some(error),
+            ..ValueSymbolLinks::default()
+        };
+        assert!(
+            fixture
+                .store
+                .set_value_symbol_links(plan.symbol, links.clone())
+        );
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            plan_top_level_computed_binding_element(
+                &fixture.parsed.arena,
+                &fixture.bound,
+                &fixture.store,
+                declaration,
+                VariableBindingKind::Let,
+                false,
+            ),
+            Ok(plan)
+        );
+        assert_eq!(fixture.store.value_symbol_links(plan.symbol), Some(&links));
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm
+        );
+    }
+
+    #[test]
+    fn unsupported_binding_shapes_and_poisoned_links_stay_fail_closed() {
+        for (index, source) in [
+            "let { name: value } = {};",
+            "let { [key()]: first, [key()]: second } = {};",
+            "let { [key()]: value = 1 } = {};",
+            "let { [key()]: value, } = {};",
+            "let [value] = [];",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture = binding_fixture(source, 920 + u32::try_from(index).unwrap());
+            let declaration = binding_declaration(&fixture);
+            assert!(matches!(
+                plan_top_level_computed_binding_element(
+                    &fixture.parsed.arena,
+                    &fixture.bound,
+                    &fixture.store,
+                    declaration,
+                    VariableBindingKind::Let,
+                    false,
+                ),
+                Err(VariablePlanError::Unsupported(
+                    VariableUnsupported::BindingPattern(_)
+                ))
+            ));
+        }
+
+        let mut fixture = binding_fixture("let { [key()]: value } = {};", 926);
+        let declaration = binding_declaration(&fixture);
+        let plan = plan_top_level_computed_binding_element(
+            &fixture.parsed.arena,
+            &fixture.bound,
+            &fixture.store,
+            declaration,
+            VariableBindingKind::Let,
+            false,
+        )
+        .unwrap();
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let links = ValueSymbolLinks {
+            resolved_type: Some(bootstrap.error_type),
+            write_type: Some(bootstrap.number_type),
+            ..ValueSymbolLinks::default()
+        };
+        assert!(fixture.store.set_value_symbol_links(plan.symbol, links));
+        let poisoned = fixture.store.checker_link_allocated_lengths();
+        assert_eq!(
+            plan_top_level_computed_binding_element(
+                &fixture.parsed.arena,
+                &fixture.bound,
+                &fixture.store,
+                declaration,
+                VariableBindingKind::Let,
+                false,
+            ),
+            Err(VariablePlanError::Invariant(
+                VariableInvariant::InvalidValueLinks(plan.symbol)
+            ))
+        );
+        assert_eq!(fixture.store.checker_link_allocated_lengths(), poisoned);
+    }
 
     #[test]
     fn merged_interface_and_type_only_namespace_preserve_variable_reads() {

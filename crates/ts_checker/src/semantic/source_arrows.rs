@@ -17,20 +17,20 @@ use ts_binder::{
 };
 
 use super::{
+    CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost,
     array_types::CanonicalArrayTargets,
     bootstrap::LiteralTypeCacheError,
     declared::preflight_node,
-    functions::{plan_function_type, FunctionTypeError},
+    functions::{FunctionTypeError, plan_function_type},
     signatures::SignatureFlags,
     source_callables::{
-        plan_source_callable, SourceCallableError, SourceCallableFamily, SourceCallableInvariant,
-        SourceCallablePlan, SourceCallableUnsupported,
+        SourceCallableError, SourceCallableFamily, SourceCallableInvariant, SourceCallablePlan,
+        SourceCallableUnsupported, plan_source_callable,
     },
     variables::{
-        plan_top_level_variable, VariableBindingKind, VariableInvariant, VariablePlanError,
-        VariableUnsupported,
+        VariableBindingKind, VariableInvariant, VariablePlanError, VariableUnsupported,
+        plan_top_level_variable,
     },
-    CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost,
 };
 
 const NODE_FLAG_LET: u32 = 1 << 0;
@@ -2032,13 +2032,13 @@ mod tests {
         BoundFile, CanonicalBinder, CanonicalModuleState, CanonicalNameResolverOptions,
         CanonicalSourceFileFacts, CanonicalSourceLanguage, EscapedName,
     };
-    use ts_parser::{parse_source_file, ParseResult};
+    use ts_parser::{ParseResult, parse_source_file};
 
     use super::*;
     use crate::semantic::{
-        production::GlobalMergeCompletion,
-        source_callables::{source_callable_state, SourceCallableState},
         IntrinsicBootstrapOptions,
+        production::GlobalMergeCompletion,
+        source_callables::{SourceCallableState, source_callable_state},
     };
 
     struct Fixture {
@@ -2077,9 +2077,11 @@ mod tests {
             let (symbols, mut files) = binder.finish().try_into_parts().unwrap();
             let bound = files.remove(&file).unwrap();
             let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
-            assert!(store
-                .register_source_file(&parsed.arena, parsed.source_file, file)
-                .is_some());
+            assert!(
+                store
+                    .register_source_file(&parsed.arena, parsed.source_file, file)
+                    .is_some()
+            );
             store
                 .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
                 .unwrap();
@@ -2246,10 +2248,12 @@ mod tests {
                 ),
                 before,
             );
-            assert!(fixture
-                .store
-                .source_callable_type_for_owner(owner)
-                .is_none());
+            assert!(
+                fixture
+                    .store
+                    .source_callable_type_for_owner(owner)
+                    .is_none()
+            );
         }
     }
 
@@ -2310,10 +2314,12 @@ mod tests {
                 ),
                 before,
             );
-            assert!(fixture
-                .store
-                .source_callable_type_for_owner(owner)
-                .is_none());
+            assert!(
+                fixture
+                    .store
+                    .source_callable_type_for_owner(owner)
+                    .is_none()
+            );
         }
     }
 
@@ -2366,10 +2372,12 @@ mod tests {
                 ),
                 before,
             );
-            assert!(fixture
-                .store
-                .source_callable_type_for_owner(owner)
-                .is_none());
+            assert!(
+                fixture
+                    .store
+                    .source_callable_type_for_owner(owner)
+                    .is_none()
+            );
         }
     }
 
@@ -2423,10 +2431,12 @@ mod tests {
                 fixture.parsed.arena.get(expression.node).unwrap().kind,
                 expected_kind,
             );
-            assert!(fixture
-                .store
-                .source_callable_type_for_owner(owner)
-                .is_none());
+            assert!(
+                fixture
+                    .store
+                    .source_callable_type_for_owner(owner)
+                    .is_none()
+            );
         }
     }
 
@@ -2585,10 +2595,12 @@ mod tests {
                 ),
                 cold,
             );
-            assert!(fixture
-                .store
-                .source_callable_type_for_owner(owner)
-                .is_none());
+            assert!(
+                fixture
+                    .store
+                    .source_callable_type_for_owner(owner)
+                    .is_none()
+            );
         }
     }
 
@@ -2684,10 +2696,12 @@ mod tests {
                 ),
                 cold,
             );
-            assert!(fixture
-                .store
-                .source_callable_type_for_owner(owner)
-                .is_none());
+            assert!(
+                fixture
+                    .store
+                    .source_callable_type_for_owner(owner)
+                    .is_none()
+            );
         }
     }
 
@@ -2739,10 +2753,12 @@ mod tests {
             SourceContextualReturnOrigin::InferredEmptyBody { block }
                 if fixture.parsed.arena.get(block.node).unwrap().kind == SyntaxKind::Block
         ));
-        assert!(fixture
-            .store
-            .source_callable_type_for_owner(plan.owner_symbol)
-            .is_none());
+        assert!(
+            fixture
+                .store
+                .source_callable_type_for_owner(plan.owner_symbol)
+                .is_none()
+        );
     }
 
     #[test]
@@ -2776,10 +2792,12 @@ mod tests {
             resolved.implicit_any_diagnostic_nodes(true),
             vec![plan.parameters[0].declaration]
         );
-        assert!(fixture
-            .store
-            .source_callable_type_for_owner(plan.owner_symbol)
-            .is_none());
+        assert!(
+            fixture
+                .store
+                .source_callable_type_for_owner(plan.owner_symbol)
+                .is_none()
+        );
     }
 
     #[test]
@@ -2931,10 +2949,12 @@ mod tests {
                 SourceArrowInvariant::InvalidInitializer(initializer)
             ))
         );
-        assert!(fixture
-            .store
-            .source_callable_type_for_owner(fixture.bound.symbol(initializer).unwrap())
-            .is_none());
+        assert!(
+            fixture
+                .store
+                .source_callable_type_for_owner(fixture.bound.symbol(initializer).unwrap())
+                .is_none()
+        );
     }
 
     #[test]
@@ -3037,22 +3057,26 @@ mod tests {
             direct_variable.initializer.unwrap(),
         );
         let direct_owner = direct.bound.symbol(direct_arrow).unwrap();
-        assert!(direct
-            .store
-            .symbol(direct_owner)
-            .unwrap()
-            .exports()
-            .is_some());
+        assert!(
+            direct
+                .store
+                .symbol(direct_owner)
+                .unwrap()
+                .exports()
+                .is_some()
+        );
         assert!(matches!(
             direct.plan(0),
             Err(SourceArrowError::Unsupported(
                 SourceArrowUnsupported::Callable(SourceCallableUnsupported::ExpandoProperties(_))
             ))
         ));
-        assert!(direct
-            .store
-            .source_callable_type_for_owner(direct_owner)
-            .is_none());
+        assert!(
+            direct
+                .store
+                .source_callable_type_for_owner(direct_owner)
+                .is_none()
+        );
 
         let contextual = Fixture::new("const foo: () => void = () => {}; foo.bar = 42; export {};");
         assert!(matches!(
@@ -3103,12 +3127,14 @@ mod tests {
         ));
 
         let inferred_return = Fixture::new("const f = (x: number) => x;");
-        assert!(inferred_return
-            .plan(0)
-            .unwrap()
-            .callable
-            .return_type
-            .is_inferred());
+        assert!(
+            inferred_return
+                .plan(0)
+                .unwrap()
+                .callable
+                .return_type
+                .is_inferred()
+        );
 
         let initialized = Fixture::new("const f = (x: number = 0): number => x;");
         let initialized = initialized.plan(0).unwrap();
@@ -3119,10 +3145,11 @@ mod tests {
         let rest = Fixture::new("const f = (head: string, ...values: number[]): string => head;");
         let rest = rest.plan(0).unwrap();
         assert_eq!(rest.callable.min_argument_count, 1);
-        assert!(rest
-            .callable
-            .flags
-            .contains(SignatureFlags::HAS_REST_PARAMETER));
+        assert!(
+            rest.callable
+                .flags
+                .contains(SignatureFlags::HAS_REST_PARAMETER)
+        );
         assert!(rest.callable.parameters[1].rest);
 
         let predicate = Fixture::new("const f = (x: unknown): x is string => true;");

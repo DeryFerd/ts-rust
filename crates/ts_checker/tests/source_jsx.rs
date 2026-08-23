@@ -471,6 +471,62 @@ fn mismatched_intrinsic_closing_tags_remain_semantically_checkable() {
 }
 
 #[test]
+fn adjacent_jsx_attribute_values_check_both_recovered_elements() {
+    let source = "const value = <Missing value=<left/><right/> />;\n";
+    let mut fixture = Fixture::allowing_parser_diagnostics(source, FileId::new(3_720));
+    assert_eq!(fixture.parsed.diagnostics.len(), 1);
+    assert_eq!(fixture.parsed.diagnostics[0].code, Some(2657));
+    let expression = fixture.expression("value");
+    let mut diagnostics = CanonicalCheckerDiagnostics::default();
+    let options = CanonicalCheckerOptions {
+        no_implicit_any: true,
+        ..CanonicalCheckerOptions::default()
+    };
+
+    fixture
+        .check(expression, options, &mut diagnostics)
+        .unwrap();
+
+    let actual = diagnostics
+        .as_slice()
+        .iter()
+        .map(|diagnostic| {
+            let range = fixture
+                .parsed
+                .arena
+                .get(diagnostic.node.unwrap().node)
+                .unwrap()
+                .range;
+            (
+                diagnostic.diagnostic.code(),
+                &source[range.start.get() as usize..range.end.get() as usize],
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        [(2304, "Missing"), (7026, "<left/>"), (7026, "<right/>")],
+    );
+
+    let warm = (
+        fixture.store.type_len(),
+        fixture.store.signature_len(),
+        diagnostics.clone(),
+    );
+    fixture
+        .check(expression, options, &mut diagnostics)
+        .unwrap();
+    assert_eq!(
+        (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            diagnostics,
+        ),
+        warm,
+    );
+}
+
+#[test]
 fn missing_component_uses_ts2552_and_the_declaration_related_record() {
     let mut fixture = Fixture::new("const app = <App />;\n", FileId::new(3_714));
     let expression = fixture.expression("app");

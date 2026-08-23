@@ -484,3 +484,79 @@ fn enum_indices_distinguish_numeric_strings_any_and_const_enum_access() {
         warm,
     );
 }
+
+#[test]
+fn ambient_type_queries_preserve_union_identity_for_index_diagnostics() {
+    let source = concat!(
+        "declare let key: string;\n",
+        "declare let first: { id: 'a' } | { id: 'b' };\n",
+        "declare let second: typeof first | { id: 'c' };\n",
+        "first[key];\n",
+        "second[key];\n",
+    );
+    let library = parse_source_file(LIBRARY);
+    let parsed = parse_source_file(source);
+    assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(31);
+    let mut context = context(&library, FileId::new(30), &parsed, file);
+
+    context.check_source_file(file).unwrap();
+
+    let diagnostics = context
+        .diagnostics()
+        .as_slice()
+        .iter()
+        .map(|diagnostic| {
+            (
+                diagnostic.diagnostic.code(),
+                node_text(source, &parsed, diagnostic.node.unwrap()),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(diagnostics, [(7053, "first[key]"), (7053, "second[key]")]);
+
+    let query = parsed
+        .arena
+        .iter()
+        .find_map(|(node, record)| {
+            matches!(record.data, NodeData::TypeQueryNode(_)).then_some(NodeRef::new(
+                parsed.arena.id(),
+                file,
+                node,
+            ))
+        })
+        .expect("the second declaration queries the first ambient union");
+    let NodeData::TypeQueryNode(query_data) = &parsed.arena.get(query.node).unwrap().data else {
+        unreachable!("the selected node is a type query")
+    };
+    let name = NodeRef::new(parsed.arena.id(), file, query_data.expr_name);
+    assert!(
+        context
+            .store()
+            .symbol_node_links(name)
+            .and_then(|links| links.resolved_symbol)
+            .is_some()
+    );
+    assert_eq!(
+        context
+            .type_to_string(resolved_type(&context, query))
+            .unwrap(),
+        "{ id: \"a\"; } | { id: \"b\"; }",
+    );
+
+    let warm = (
+        context.store().type_len(),
+        context.store().signature_len(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
+}

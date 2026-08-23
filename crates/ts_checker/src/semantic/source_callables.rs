@@ -503,6 +503,690 @@ pub(super) fn valid_source_function_owner_shape(
         && source_function_owner_exports_are_type_only(store, owner_symbol, owner)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GlobalWrapperMethodParameter {
+    declaration: NodeRef,
+    symbol: SemanticSymbolId,
+    annotation: NodeRef,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GlobalWrapperMethodPlan {
+    wrapper: TypeId,
+    owner: SemanticSymbolId,
+    symbol: SemanticSymbolId,
+    declaration: NodeRef,
+    return_annotation: NodeRef,
+    parameter: Option<GlobalWrapperMethodParameter>,
+}
+
+/// Lazily publishes one authenticated scalar-wrapper method without resolving
+/// unrelated standard-library interface members.
+pub(super) fn materialize_global_wrapper_method(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    receiver_type: TypeId,
+    name: &str,
+) -> Result<Option<(SemanticSymbolId, TypeId)>, SourceCallableError> {
+    let Some(plan) = plan_global_wrapper_method(store, host, global_types, receiver_type, name)?
+    else {
+        return Ok(None);
+    };
+
+    if let Some(type_) = validated_global_wrapper_method(store, global_types, plan)? {
+        return Ok(Some((plan.symbol, type_)));
+    }
+
+    let (number, string, undefined, strict_null_checks) = store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| {
+            (
+                bootstrap.number_type,
+                bootstrap.string_type,
+                bootstrap.undefined_type,
+                bootstrap.options.strict_null_checks,
+            )
+        })
+        .ok_or_else(|| invariant(SourceCallableInvariant::Publication(plan.declaration)))?;
+    let strict_optional = strict_null_checks && plan.parameter.is_some();
+    let mut prepared_union = strict_optional
+        .then(|| {
+            store.prepare_type_query_types_with_global_types(&[], &[], &[], 1, 0, global_types)
+        })
+        .transpose()?;
+    let annotation_count = 1 + usize::from(plan.parameter.is_some());
+    let missing_annotations = usize::from(store.type_node_links(plan.return_annotation).is_none())
+        + plan.parameter.map_or(0, |parameter| {
+            usize::from(store.type_node_links(parameter.annotation).is_none())
+        });
+    if !store.try_reserve_types(1)
+        || !store.try_reserve_signatures(1)
+        || !store.try_reserve_signature_links(usize::from(
+            store.signature_links(plan.declaration).is_none(),
+        ))
+        || !store.try_reserve_value_symbol_links(annotation_count)
+        || !store.try_reserve_type_node_links(missing_annotations)
+        || !store.try_reserve_function_signature_return_annotations(1)
+        || !store.try_reserve_callable_signature_parameter_types(1)
+    {
+        return Err(invariant(SourceCallableInvariant::Capacity(
+            plan.declaration,
+        )));
+    }
+
+    let parameter_type = if let Some(prepared) = prepared_union.as_mut() {
+        Some(store.literal_union_type_prepared_with_global_types(
+            global_types,
+            &[number, undefined],
+            None,
+            prepared,
+        )?)
+    } else {
+        plan.parameter.map(|_| number)
+    };
+    let method_type = store
+        .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(plan.symbol))
+        .expect("the authenticated wrapper method reserved its callable type");
+    let signature = store
+        .alloc_signature(
+            SignatureFlags::NONE,
+            Some(plan.declaration),
+            Vec::new(),
+            None,
+            plan.parameter
+                .map(|parameter| vec![parameter.symbol])
+                .unwrap_or_default(),
+            Some(string),
+            None,
+            0,
+        )
+        .expect("the authenticated wrapper method reserved its signature");
+    assert!(store.set_signature_links(
+        plan.declaration,
+        SignatureLinks {
+            resolved_signature: ResolvedSignatureState::Resolved(signature),
+            ..SignatureLinks::default()
+        },
+    ));
+    assert!(store.set_value_symbol_links(
+        plan.symbol,
+        ValueSymbolLinks {
+            resolved_type: Some(method_type),
+            ..ValueSymbolLinks::default()
+        },
+    ));
+    assert!(store.set_structured_type_members(
+        method_type,
+        None,
+        None,
+        Some(vec![signature]),
+        None,
+        None,
+    ));
+    assert!(store.set_type_node_links(
+        plan.return_annotation,
+        TypeNodeLinks {
+            resolved_type: Some(string),
+            ..TypeNodeLinks::default()
+        },
+    ));
+    assert!(store.set_function_signature_return_annotation(
+        signature,
+        plan.return_annotation,
+        false,
+    ));
+    if let Some(parameter) = plan.parameter {
+        assert!(store.set_type_node_links(
+            parameter.annotation,
+            TypeNodeLinks {
+                resolved_type: Some(number),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        assert!(store.set_value_symbol_links(
+            parameter.symbol,
+            ValueSymbolLinks {
+                resolved_type: parameter_type,
+                ..ValueSymbolLinks::default()
+            },
+        ));
+    }
+    assert!(store.set_callable_signature_parameter_types_batch(vec![(
+        signature,
+        parameter_type.into_iter().collect(),
+    )]));
+
+    debug_assert_eq!(
+        validated_global_wrapper_method(store, global_types, plan),
+        Ok(Some(method_type)),
+    );
+    Ok(Some((plan.symbol, method_type)))
+}
+
+fn plan_global_wrapper_method(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    receiver_type: TypeId,
+    name: &str,
+) -> Result<Option<GlobalWrapperMethodPlan>, SourceCallableError> {
+    let Some(receiver) = store.type_payload(receiver_type) else {
+        return Ok(None);
+    };
+    let (wrapper, owner_name, has_parameter) =
+        if receiver.flags().intersects(TypeFlags::NUMBER_LIKE) && name == "toFixed" {
+            (global_types.number_type, "Number", true)
+        } else if receiver.flags().intersects(TypeFlags::STRING_LIKE) && name == "toLowerCase" {
+            (global_types.string_type, "String", false)
+        } else {
+            return Ok(None);
+        };
+    let Some(wrapper_record) = store.type_payload(wrapper) else {
+        return Ok(None);
+    };
+    let TypeData::Interface(interface) = wrapper_record.data() else {
+        return Ok(None);
+    };
+    let Some(owner) = wrapper_record
+        .symbol()
+        .and_then(|owner| store.get_merged_symbol(owner))
+    else {
+        return Ok(None);
+    };
+    let Some(owner_record) = store.symbol(owner) else {
+        return Ok(None);
+    };
+    let globals_match = store
+        .intrinsic_bootstrap()
+        .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+        .and_then(|globals| globals.get_source(owner_name))
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        == Some(owner);
+    let owner_flags =
+        SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::TRANSIENT;
+    if wrapper_record.flags() != TypeFlags::OBJECT
+        || !wrapper_record
+            .object_flags()
+            .intersects(ObjectFlags::INTERFACE)
+        || wrapper_record
+            .object_flags()
+            .intersects(ObjectFlags::REFERENCE)
+        || wrapper_record.alias().is_some()
+        || !owner_record.flags().contains(SymbolFlags::INTERFACE)
+        || owner_record.flags().without(owner_flags) != SymbolFlags::NONE
+        || owner_record.check_flags() != CheckFlags::NONE
+        || owner_record.name().as_utf8() != Some(owner_name)
+        || owner_record.parent().is_some()
+        || owner_record.exports().is_some()
+        || owner_record.export_symbol().is_some()
+        || !globals_match
+        || store
+            .declared_type_links(owner)
+            .and_then(|links| links.declared_type)
+            != Some(wrapper)
+        || interface.outer_type_parameter_count != 0
+        || interface.reference.object.target.is_some()
+        || interface.reference.node.is_some()
+        || interface.reference.resolved_type_arguments.is_some()
+    {
+        return Ok(None);
+    }
+
+    let Some(symbol) = owner_record
+        .members()
+        .and_then(|members| store.symbol_table(members))
+        .and_then(|members| members.get_source(name))
+    else {
+        return Ok(None);
+    };
+    let Some(method) = store.symbol(symbol) else {
+        return Ok(None);
+    };
+    let Some([declaration]) = method.declarations() else {
+        return Ok(None);
+    };
+    let declaration = *declaration;
+    let invalid_owner = || invariant(SourceCallableInvariant::InvalidOwnerSymbol(declaration));
+    if method.flags() != SymbolFlags::METHOD
+        || method.check_flags() != CheckFlags::NONE
+        || method.name().as_utf8() != Some(name)
+        || method.value_declaration() != Some(declaration)
+        || method.members().is_some()
+        || method.exports().is_some()
+        || method.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || method
+            .parent()
+            .and_then(|parent| store.get_merged_symbol(parent))
+            != Some(owner)
+        || !host.symbol_matches(store, declaration, symbol)
+    {
+        return Err(invalid_owner());
+    }
+
+    let bound = host.bound_file(declaration).ok_or_else(invalid_owner)?;
+    if bound.source_facts().is_none_or(|facts| {
+        !facts.is_declaration_file()
+            || !facts.is_default_library()
+            || facts.is_javascript_file()
+            || facts.is_external_or_common_js_module()
+    }) {
+        return Err(invalid_owner());
+    }
+    let record = preflight_node(store, host, declaration)?;
+    let NodeData::MethodSignatureDeclaration(method_data) = &record.data else {
+        return Err(invariant(SourceCallableInvariant::InvalidSyntax(
+            declaration,
+        )));
+    };
+    let Some(SourceNodeParent::Parent(interface_declaration)) =
+        store.source_node_parent(declaration)
+    else {
+        return Err(invalid_owner());
+    };
+    if record.kind != SyntaxKind::MethodSignature
+        || record.flags.0 != 0
+        || method_data.full_signature.is_some()
+        || method_data.next_container.is_some()
+        || method_data.postfix_token.is_some()
+        || method_data.symbol.is_some()
+        || method_data.type_parameters.is_some()
+        || method_data.modifiers.is_some()
+        || method_data.parameters.has_trailing_comma
+        || method_data.parameters.range.start < record.range.start
+        || method_data.parameters.range.end > record.range.end
+        || store.source_node_kind(interface_declaration) != Some(SyntaxKind::InterfaceDeclaration)
+        || owner_record
+            .declarations()
+            .is_none_or(|declarations| !declarations.contains(&interface_declaration))
+        || !host.symbol_matches(store, interface_declaration, owner)
+    {
+        return Err(invariant(SourceCallableInvariant::InvalidSyntax(
+            declaration,
+        )));
+    }
+    let method_name = NodeRef::new(declaration.arena, declaration.file, method_data.name);
+    let method_name_record = preflight_node(store, host, method_name)?;
+    let NodeData::Identifier(method_identifier) = &method_name_record.data else {
+        return Err(invalid_owner());
+    };
+    if method_name_record.kind != SyntaxKind::Identifier
+        || method_name_record.flags.0 != 0
+        || method_name_record.parent != Some(declaration.node)
+        || method_identifier.flow_node.is_some()
+        || method_identifier.text != name
+        || method_name_record.range.start < record.range.start
+        || method_name_record.range.end > method_data.parameters.range.start
+    {
+        return Err(invalid_owner());
+    }
+
+    let return_annotation = method_data
+        .type_
+        .map(|type_| NodeRef::new(declaration.arena, declaration.file, type_))
+        .ok_or_else(|| invariant(SourceCallableInvariant::InvalidSyntax(declaration)))?;
+    let return_record = preflight_node(store, host, return_annotation)?;
+    if return_record.kind != SyntaxKind::StringKeyword
+        || return_record.flags.0 != 0
+        || return_record.parent != Some(declaration.node)
+        || return_record.range.start < method_data.parameters.range.end
+        || return_record.range.end > record.range.end
+    {
+        return Err(invariant(SourceCallableInvariant::InvalidTypeCache(
+            return_annotation,
+        )));
+    }
+
+    let parameter = match (has_parameter, method_data.parameters.nodes.as_slice()) {
+        (false, []) => None,
+        (true, [parameter]) => Some(plan_global_wrapper_method_parameter(
+            store,
+            host,
+            declaration,
+            NodeRef::new(declaration.arena, declaration.file, *parameter),
+        )?),
+        _ => {
+            return Err(invariant(SourceCallableInvariant::InvalidParameter(
+                declaration,
+            )));
+        }
+    };
+    let locals = bound
+        .locals(declaration)
+        .and_then(|locals| store.symbol_table(locals));
+    match parameter {
+        Some(parameter)
+            if locals.and_then(|locals| locals.get_source("fractionDigits"))
+                != Some(parameter.symbol) =>
+        {
+            return Err(invariant(SourceCallableInvariant::InvalidParameterSymbol(
+                parameter.declaration,
+            )));
+        }
+        None if locals.is_some_and(|locals| !locals.is_empty()) => {
+            return Err(invariant(SourceCallableInvariant::InvalidParameter(
+                declaration,
+            )));
+        }
+        _ => {}
+    }
+
+    Ok(Some(GlobalWrapperMethodPlan {
+        wrapper,
+        owner,
+        symbol,
+        declaration,
+        return_annotation,
+        parameter,
+    }))
+}
+
+fn plan_global_wrapper_method_parameter(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    method: NodeRef,
+    declaration: NodeRef,
+) -> Result<GlobalWrapperMethodParameter, SourceCallableError> {
+    let invalid = || invariant(SourceCallableInvariant::InvalidParameter(declaration));
+    let record = preflight_node(store, host, declaration)?;
+    let NodeData::ParameterDeclaration(parameter) = &record.data else {
+        return Err(invalid());
+    };
+    if record.kind != SyntaxKind::Parameter
+        || record.flags.0 != 0
+        || record.parent != Some(method.node)
+        || parameter.dot_dot_dot_token.is_some()
+        || parameter.initializer.is_some()
+        || parameter.symbol.is_some()
+        || parameter.facts != 0
+        || parameter.modifiers.is_some()
+    {
+        return Err(invalid());
+    }
+    let name = NodeRef::new(declaration.arena, declaration.file, parameter.name);
+    let name_record = preflight_node(store, host, name)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(invalid());
+    };
+    if name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(declaration.node)
+        || identifier.flow_node.is_some()
+        || identifier.text != "fractionDigits"
+        || name_record.range.start < record.range.start
+        || name_record.range.end > record.range.end
+    {
+        return Err(invalid());
+    }
+    let annotation = parameter
+        .type_
+        .map(|type_| NodeRef::new(declaration.arena, declaration.file, type_))
+        .ok_or_else(invalid)?;
+    let annotation_record = preflight_node(store, host, annotation)?;
+    if annotation_record.kind != SyntaxKind::NumberKeyword
+        || annotation_record.flags.0 != 0
+        || annotation_record.parent != Some(declaration.node)
+        || annotation_record.range.start < name_record.range.end
+        || annotation_record.range.end > record.range.end
+        || !validate_optional_token(
+            store,
+            host,
+            declaration,
+            parameter.question_token,
+            name_record.range.end,
+            annotation_record.range.start,
+        )?
+    {
+        return Err(invalid());
+    }
+    let symbol = host
+        .bound_file(declaration)
+        .and_then(|bound| bound.symbol(declaration))
+        .ok_or_else(|| invariant(SourceCallableInvariant::InvalidParameterSymbol(declaration)))?;
+    let record = store
+        .symbol(symbol)
+        .ok_or_else(|| invariant(SourceCallableInvariant::InvalidParameterSymbol(declaration)))?;
+    if record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+        || record.check_flags() != CheckFlags::NONE
+        || record.name().as_utf8() != Some("fractionDigits")
+        || record.declarations() != Some(&[declaration])
+        || record.value_declaration() != Some(declaration)
+        || record.members().is_some()
+        || record.exports().is_some()
+        || record.parent().is_some()
+        || record.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+    {
+        return Err(invariant(SourceCallableInvariant::InvalidParameterSymbol(
+            declaration,
+        )));
+    }
+    Ok(GlobalWrapperMethodParameter {
+        declaration,
+        symbol,
+        annotation,
+    })
+}
+
+fn validated_global_wrapper_method(
+    store: &CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    plan: GlobalWrapperMethodPlan,
+) -> Result<Option<TypeId>, SourceCallableError> {
+    if store
+        .type_payload(plan.wrapper)
+        .and_then(TypeRecord::symbol)
+        .and_then(|owner| store.get_merged_symbol(owner))
+        != Some(plan.owner)
+        || store
+            .symbol(plan.owner)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| {
+                store
+                    .symbol(plan.symbol)
+                    .and_then(|symbol| members.get(symbol.name()))
+            })
+            != Some(plan.symbol)
+    {
+        return Err(invariant(SourceCallableInvariant::InvalidOwnerSymbol(
+            plan.declaration,
+        )));
+    }
+    let (number, string, strict_null_checks) = store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| {
+            (
+                bootstrap.number_type,
+                bootstrap.string_type,
+                bootstrap.options.strict_null_checks,
+            )
+        })
+        .ok_or_else(|| invariant(SourceCallableInvariant::Publication(plan.declaration)))?;
+    validate_global_wrapper_annotation(store, plan.return_annotation, string)?;
+    if let Some(parameter) = plan.parameter {
+        validate_global_wrapper_annotation(store, parameter.annotation, number)?;
+    }
+
+    let method_links = store.value_symbol_links(plan.symbol);
+    let signature_links = store.signature_links(plan.declaration);
+    let method_cold = method_links.is_none_or(|links| links == &ValueSymbolLinks::default());
+    let signature_cold = signature_links.is_none_or(|links| links == &SignatureLinks::default());
+    if method_cold && signature_cold {
+        if let Some(parameter) = plan.parameter
+            && !default_parameter_links(store, parameter.symbol)
+        {
+            return Err(invariant(SourceCallableInvariant::InvalidParameterCache(
+                parameter.declaration,
+            )));
+        }
+        return Ok(None);
+    }
+    if method_cold || signature_cold {
+        return Err(invariant(SourceCallableInvariant::InvalidSignatureCache(
+            plan.declaration,
+        )));
+    }
+
+    let method_type = method_links
+        .and_then(|links| links.resolved_type)
+        .ok_or_else(|| invariant(SourceCallableInvariant::InvalidTypeCache(plan.declaration)))?;
+    if method_links
+        != Some(&ValueSymbolLinks {
+            resolved_type: Some(method_type),
+            ..ValueSymbolLinks::default()
+        })
+    {
+        return Err(invariant(SourceCallableInvariant::InvalidTypeCache(
+            plan.declaration,
+        )));
+    }
+    let signature = signature_links
+        .and_then(|links| links.resolved_signature.signature())
+        .ok_or_else(|| {
+            invariant(SourceCallableInvariant::InvalidSignatureCache(
+                plan.declaration,
+            ))
+        })?;
+    if signature_links
+        != Some(&SignatureLinks {
+            resolved_signature: ResolvedSignatureState::Resolved(signature),
+            ..SignatureLinks::default()
+        })
+    {
+        return Err(invariant(SourceCallableInvariant::InvalidSignatureCache(
+            plan.declaration,
+        )));
+    }
+
+    let type_record = store
+        .type_payload(method_type)
+        .ok_or_else(|| invariant(SourceCallableInvariant::InvalidTypeCache(plan.declaration)))?;
+    let TypeData::Object(object) = type_record.data() else {
+        return Err(invariant(SourceCallableInvariant::InvalidTypeCache(
+            plan.declaration,
+        )));
+    };
+    if type_record.flags() != TypeFlags::OBJECT
+        || type_record.object_flags() != (ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED)
+        || type_record.symbol() != Some(plan.symbol)
+        || type_record.alias().is_some()
+        || object.target.is_some()
+        || object.mapper.is_some()
+        || object.instantiations != TypeCacheState::Unallocated
+        || object.structured.constrained != ConstrainedTypeData::default()
+        || object.structured.members.is_some()
+        || object.structured.properties.is_some()
+        || object.structured.signatures.as_deref() != Some(&[signature])
+        || object.structured.call_signature_count != 1
+        || object.structured.index_infos.is_some()
+        || object
+            .structured
+            .object_type_without_abstract_construct_signatures
+            .is_some()
+    {
+        return Err(invariant(SourceCallableInvariant::InvalidTypeCache(
+            plan.declaration,
+        )));
+    }
+    let record = store.signature(signature).ok_or_else(|| {
+        invariant(SourceCallableInvariant::InvalidSignatureCache(
+            plan.declaration,
+        ))
+    })?;
+    let expected_parameters = plan
+        .parameter
+        .map(|parameter| vec![parameter.symbol])
+        .unwrap_or_default();
+    if record.flags() != SignatureFlags::NONE
+        || record.declaration() != Some(plan.declaration)
+        || !record.type_parameters().is_empty()
+        || record.this_parameter().is_some()
+        || record.parameters() != expected_parameters.as_slice()
+        || record.resolved_return_type() != Some(string)
+        || record.resolved_type_predicate().is_some()
+        || record.target().is_some()
+        || record.mapper().is_some()
+        || record.isolated_signature_type().is_some()
+        || record.composite().is_some()
+        || record.min_argument_count() != 0
+        || record.resolved_min_argument_count() != -1
+        || store.function_signature_return_annotation(signature)
+            != Some((plan.return_annotation, false))
+        || store.signature_has_circular_return_type(signature)
+    {
+        return Err(invariant(SourceCallableInvariant::InvalidSignatureCache(
+            plan.declaration,
+        )));
+    }
+
+    let parameter_types = store
+        .callable_signature_parameter_types(signature)
+        .ok_or_else(|| {
+            invariant(SourceCallableInvariant::InvalidParameterCache(
+                plan.declaration,
+            ))
+        })?;
+    match plan.parameter {
+        None if !parameter_types.is_empty() => {
+            return Err(invariant(SourceCallableInvariant::InvalidParameterCache(
+                plan.declaration,
+            )));
+        }
+        Some(parameter) => {
+            let [type_] = parameter_types else {
+                return Err(invariant(SourceCallableInvariant::InvalidParameterCache(
+                    parameter.declaration,
+                )));
+            };
+            if store.value_symbol_links(parameter.symbol)
+                != Some(&ValueSymbolLinks {
+                    resolved_type: Some(*type_),
+                    ..ValueSymbolLinks::default()
+                })
+                || if strict_null_checks {
+                    !valid_optional_type(
+                        store,
+                        Some(CanonicalArrayTargets::from_global_types(global_types)),
+                        number,
+                        *type_,
+                    )
+                } else {
+                    *type_ != number
+                }
+            {
+                return Err(invariant(SourceCallableInvariant::InvalidParameterCache(
+                    parameter.declaration,
+                )));
+            }
+        }
+        None => {}
+    }
+    Ok(Some(method_type))
+}
+
+fn validate_global_wrapper_annotation(
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+    expected: TypeId,
+) -> Result<(), SourceCallableError> {
+    let expected_links = TypeNodeLinks {
+        resolved_type: Some(expected),
+        ..TypeNodeLinks::default()
+    };
+    if store
+        .type_node_links(node)
+        .is_some_and(|links| links != &TypeNodeLinks::default() && links != &expected_links)
+        || store
+            .symbol_node_links(node)
+            .is_some_and(|links| links != &SymbolNodeLinks::default())
+    {
+        return Err(invariant(SourceCallableInvariant::InvalidTypeCache(node)));
+    }
+    Ok(())
+}
+
 /// Plans one exact source callable without publishing semantic records.
 pub(super) fn plan_source_callable(
     store: &CanonicalTypeMapperStore,
@@ -1895,12 +2579,91 @@ fn is_exact_source_type_parameter_bound(
     if source_type_parameter_literal_kind(store, host, bound)?.is_some() {
         return Ok(true);
     }
+    if exact_named_interface_keyof_bound(store, host, bound)? {
+        return Ok(true);
+    }
     for type_parameter in earlier {
         if is_naked_source_type_parameter_annotation(store, host, bound, type_parameter)? {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+fn exact_named_interface_keyof_bound(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    bound: NodeRef,
+) -> Result<bool, SourceCallableError> {
+    let record = preflight_node(store, host, bound)?;
+    let NodeData::TypeOperatorNode(operator) = &record.data else {
+        return Ok(false);
+    };
+    if record.kind != SyntaxKind::TypeOperator || operator.operator != SyntaxKind::KeyOfKeyword {
+        return Ok(false);
+    }
+    let target = NodeRef::new(bound.arena, bound.file, operator.type_);
+    let target_record = preflight_node(store, host, target)?;
+    let NodeData::TypeReferenceNode(reference) = &target_record.data else {
+        return Ok(false);
+    };
+    if target_record.kind != SyntaxKind::TypeReference
+        || target_record.parent != Some(bound.node)
+        || reference.type_arguments.is_some()
+    {
+        return Ok(false);
+    }
+    let name = NodeRef::new(target.arena, target.file, reference.type_name);
+    let name_record = preflight_node(store, host, name)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Ok(false);
+    };
+    if name_record.kind != SyntaxKind::Identifier
+        || name_record.parent != Some(target.node)
+        || identifier.text.is_empty()
+    {
+        return Ok(false);
+    }
+
+    let Some(file) = host.bound_file(bound) else {
+        return Ok(false);
+    };
+    let Some(owner) = file
+        .locals(file.source_file())
+        .and_then(|locals| store.symbol_table(locals))
+        .and_then(|locals| locals.get_source(&identifier.text))
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+    else {
+        return Ok(false);
+    };
+    let Some(interface) = store.symbol(owner) else {
+        return Ok(false);
+    };
+    let Some([declaration]) = interface.declarations() else {
+        return Ok(false);
+    };
+    let declaration = *declaration;
+    if interface.flags() != SymbolFlags::INTERFACE
+        || store.source_node_parent(declaration)
+            != Some(SourceNodeParent::Parent(file.source_file()))
+    {
+        return Ok(false);
+    }
+    let Ok(plan) = super::object_members::plan_interface(store, host, owner) else {
+        return Ok(false);
+    };
+    Ok(plan.node == declaration
+        && plan.declarations.as_slice() == [declaration]
+        && plan.heritage.is_none()
+        && plan.indexes.is_empty()
+        && plan.call_signatures.is_empty()
+        && !plan.properties.is_empty()
+        && plan.properties.iter().all(|property| {
+            matches!(
+                store.source_node_kind(property.declaration),
+                Some(SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature)
+            )
+        }))
 }
 
 fn source_type_parameter_bounds_are_compatible(
@@ -5411,6 +6174,7 @@ mod tests {
     use crate::semantic::{
         CanonicalCheckerContext, CanonicalCheckerDiagnostics, CanonicalCheckerOptions,
         DeclaredTypeLinks, IntrinsicBootstrapOptions,
+        global_types::initialize_global_library_types,
         production::GlobalMergeCompletion,
         source::{SourceCheckError, UnsupportedSourceSyntax},
         source_functions::SourceFunctionUnsupported,
@@ -5652,6 +6416,89 @@ mod tests {
         .unwrap()
     }
 
+    const WRAPPER_METHOD_LIBRARY: &str = concat!(
+        "interface IArguments {} ",
+        "interface Array<T> {} ",
+        "interface Object {} ",
+        "interface Function {} ",
+        "interface String { toLowerCase(): string; } ",
+        "interface Number { toFixed(fractionDigits?: number): string; } ",
+        "interface Boolean {} ",
+        "interface RegExp {} ",
+        "interface ReadonlyArray<T> {} ",
+        "interface ThisType<T> {} ",
+    );
+
+    fn wrapper_method_fixture(
+        source: &str,
+        strict_null_checks: bool,
+        is_default_library: bool,
+    ) -> (QueryFixture, CanonicalGlobalTypes) {
+        let parsed = parse_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(if strict_null_checks { 1_906 } else { 1_905 });
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new_with_default_library(
+                    EscapedName::source("\"/project/lib.wrapper.d.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    true,
+                    is_default_library,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let (symbols, mut files) = binder.finish().try_into_parts().unwrap();
+        let bound = files.remove(&file).unwrap();
+        let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
+        assert!(
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .is_some()
+        );
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions {
+                strict_null_checks,
+                exact_optional_property_types: false,
+            })
+            .unwrap();
+        let globals = store.intrinsic_bootstrap().unwrap().globals;
+        let locals = bound.locals(bound.source_file()).unwrap();
+        let symbols = store
+            .symbol_table(locals)
+            .unwrap()
+            .iter()
+            .map(|(_, symbol)| symbol)
+            .collect::<Vec<_>>();
+        for symbol in symbols {
+            store.merge_global_symbol(globals, symbol).unwrap();
+        }
+        let global_types = {
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&parsed.arena, &bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            initialize_global_library_types(&mut store, &host, globals, false).unwrap()
+        };
+        (
+            QueryFixture {
+                parsed,
+                file,
+                bound,
+                store,
+            },
+            global_types,
+        )
+    }
+
     fn generic_function_parts(
         parsed: &ParseResult,
         file: FileId,
@@ -5742,6 +6589,377 @@ mod tests {
             source_callable_provenance: store.source_callable_provenance_lengths(),
             callable_parameter_types: store.callable_signature_parameter_types_len(),
             checker_links: store.checker_link_allocated_lengths(),
+        }
+    }
+
+    #[test]
+    fn default_library_wrapper_methods_publish_exact_signatures_and_replay_warm() {
+        for (strict_null_checks, transient_owner) in [(false, false), (true, false), (false, true)]
+        {
+            let (mut fixture, global_types) =
+                wrapper_method_fixture(WRAPPER_METHOD_LIBRARY, strict_null_checks, true);
+            if transient_owner {
+                for wrapper in [global_types.number_type, global_types.string_type] {
+                    let owner = fixture
+                        .store
+                        .type_payload(wrapper)
+                        .unwrap()
+                        .symbol()
+                        .unwrap();
+                    let flags = fixture.store.symbol(owner).unwrap().flags();
+                    assert!(fixture.store.set_symbol_flags(
+                        owner,
+                        flags | SymbolFlags::TRANSIENT,
+                        CheckFlags::NONE,
+                    ));
+                }
+            }
+            let (number, string) = {
+                let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+                (bootstrap.number_type, bootstrap.string_type)
+            };
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+
+            let (fixed_symbol, fixed_type) = materialize_global_wrapper_method(
+                &mut fixture.store,
+                &host,
+                &global_types,
+                number,
+                "toFixed",
+            )
+            .unwrap()
+            .unwrap();
+            let fixed_declaration = fixture
+                .store
+                .symbol(fixed_symbol)
+                .unwrap()
+                .value_declaration()
+                .unwrap();
+            let fixed_signature = fixture
+                .store
+                .signature_links(fixed_declaration)
+                .and_then(|links| links.resolved_signature.signature())
+                .unwrap();
+            let signature = fixture.store.signature(fixed_signature).unwrap();
+            assert_eq!(signature.min_argument_count(), 0);
+            assert_eq!(signature.resolved_return_type(), Some(string));
+            let [parameter] = signature.parameters() else {
+                panic!("Number.toFixed must retain its binder-owned parameter")
+            };
+            let parameter_type = fixture
+                .store
+                .value_symbol_links(*parameter)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            assert_eq!(
+                fixture
+                    .store
+                    .callable_signature_parameter_types(fixed_signature),
+                Some([parameter_type].as_slice())
+            );
+            if strict_null_checks {
+                assert!(valid_optional_type(
+                    &fixture.store,
+                    Some(CanonicalArrayTargets::from_global_types(&global_types)),
+                    number,
+                    parameter_type,
+                ));
+                assert_ne!(parameter_type, number);
+            } else {
+                assert_eq!(parameter_type, number);
+            }
+
+            let (lower_symbol, lower_type) = materialize_global_wrapper_method(
+                &mut fixture.store,
+                &host,
+                &global_types,
+                string,
+                "toLowerCase",
+            )
+            .unwrap()
+            .unwrap();
+            let lower_declaration = fixture
+                .store
+                .symbol(lower_symbol)
+                .unwrap()
+                .value_declaration()
+                .unwrap();
+            let lower_signature = fixture
+                .store
+                .signature_links(lower_declaration)
+                .and_then(|links| links.resolved_signature.signature())
+                .unwrap();
+            assert!(
+                fixture
+                    .store
+                    .signature(lower_signature)
+                    .unwrap()
+                    .parameters()
+                    .is_empty()
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .callable_signature_parameter_types(lower_signature),
+                Some([].as_slice())
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .signature(lower_signature)
+                    .unwrap()
+                    .resolved_return_type(),
+                Some(string)
+            );
+
+            let warm = generic_transaction_state(&fixture.store);
+            assert_eq!(
+                materialize_global_wrapper_method(
+                    &mut fixture.store,
+                    &host,
+                    &global_types,
+                    number,
+                    "toFixed",
+                ),
+                Ok(Some((fixed_symbol, fixed_type)))
+            );
+            assert_eq!(
+                materialize_global_wrapper_method(
+                    &mut fixture.store,
+                    &host,
+                    &global_types,
+                    string,
+                    "toLowerCase",
+                ),
+                Ok(Some((lower_symbol, lower_type)))
+            );
+            assert_eq!(generic_transaction_state(&fixture.store), warm);
+        }
+    }
+
+    #[test]
+    fn wrapper_methods_reject_corrupted_parameter_links_without_publication() {
+        let (mut fixture, global_types) =
+            wrapper_method_fixture(WRAPPER_METHOD_LIBRARY, true, true);
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&fixture.parsed.arena, &fixture.bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let (method, _) = materialize_global_wrapper_method(
+            &mut fixture.store,
+            &host,
+            &global_types,
+            number,
+            "toFixed",
+        )
+        .unwrap()
+        .unwrap();
+        let declaration = fixture
+            .store
+            .symbol(method)
+            .unwrap()
+            .value_declaration()
+            .unwrap();
+        let signature = fixture
+            .store
+            .signature_links(declaration)
+            .and_then(|links| links.resolved_signature.signature())
+            .unwrap();
+        let parameter = fixture.store.signature(signature).unwrap().parameters()[0];
+        let original = fixture.store.value_symbol_links(parameter).unwrap().clone();
+        assert!(fixture.store.set_value_symbol_links(
+            parameter,
+            ValueSymbolLinks {
+                resolved_type: Some(number),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        let poisoned = generic_transaction_state(&fixture.store);
+
+        assert!(matches!(
+            materialize_global_wrapper_method(
+                &mut fixture.store,
+                &host,
+                &global_types,
+                number,
+                "toFixed",
+            ),
+            Err(SourceCallableError::Invariant(
+                SourceCallableInvariant::InvalidParameterCache(_)
+            ))
+        ));
+        assert_eq!(generic_transaction_state(&fixture.store), poisoned);
+
+        assert!(fixture.store.set_value_symbol_links(parameter, original));
+        assert!(
+            materialize_global_wrapper_method(
+                &mut fixture.store,
+                &host,
+                &global_types,
+                number,
+                "toFixed",
+            )
+            .unwrap()
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn wrapper_methods_require_default_library_provenance() {
+        let (mut fixture, global_types) =
+            wrapper_method_fixture(WRAPPER_METHOD_LIBRARY, false, false);
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&fixture.parsed.arena, &fixture.bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let before = generic_transaction_state(&fixture.store);
+
+        assert!(matches!(
+            materialize_global_wrapper_method(
+                &mut fixture.store,
+                &host,
+                &global_types,
+                number,
+                "toFixed",
+            ),
+            Err(SourceCallableError::Invariant(
+                SourceCallableInvariant::InvalidOwnerSymbol(_)
+            ))
+        ));
+        assert_eq!(generic_transaction_state(&fixture.store), before);
+        assert_eq!(
+            materialize_global_wrapper_method(
+                &mut fixture.store,
+                &host,
+                &global_types,
+                number,
+                "toLowerCase",
+            ),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn generic_function_accepts_authenticated_named_interface_keyof_constraint() {
+        let mut fixture = QueryFixture::new(
+            concat!(
+                "interface Choices { left: string; right: number } ",
+                "function choose<T extends keyof Choices>(value: T): boolean { return true; }",
+            ),
+            FileId::new(1_907),
+        );
+        let (declaration, type_parameter) = fixture.declaration_and_type_parameter();
+        let owner = fixture.bound.symbol(declaration).unwrap();
+        let globals = fixture.store.intrinsic_bootstrap().unwrap().globals;
+        let interface = fixture
+            .bound
+            .locals(fixture.bound.source_file())
+            .and_then(|locals| fixture.store.symbol_table(locals))
+            .and_then(|locals| locals.get_source("Choices"))
+            .unwrap();
+        assert_eq!(
+            fixture.store.merge_global_symbol(globals, interface),
+            Ok(interface)
+        );
+        let constraint = {
+            let NodeData::TypeParameterDeclaration(parameter) =
+                &fixture.parsed.arena.get(type_parameter.node).unwrap().data
+            else {
+                panic!("the fixture must contain a constrained type parameter")
+            };
+            NodeRef::new(
+                type_parameter.arena,
+                type_parameter.file,
+                parameter.constraint.unwrap(),
+            )
+        };
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&fixture.parsed.arena, &fixture.bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let before = generic_transaction_state(&fixture.store);
+
+        assert!(
+            exact_named_interface_keyof_bound(&fixture.store, &host, constraint).unwrap(),
+            "the cold named-interface keyof proof must accept canonical interface field kinds",
+        );
+        assert_eq!(generic_transaction_state(&fixture.store), before);
+        let plan = plan_source_callable(&fixture.store, &host, declaration, owner, None).unwrap();
+        assert_eq!(plan.type_parameters.len(), 1);
+        assert_eq!(plan.type_parameters[0].constraint, Some(constraint));
+        assert_eq!(generic_transaction_state(&fixture.store), before);
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let type_ = fixture
+            .query_callable(declaration, owner, &mut diagnostics)
+            .unwrap();
+        assert!(matches!(
+            validate_stored_source_callable(&fixture.store, type_),
+            StoredSourceCallableValidation::Valid(_)
+        ));
+        assert!(diagnostics.is_empty());
+        let warm = generic_transaction_state(&fixture.store);
+        assert_eq!(
+            fixture.query_callable(declaration, owner, &mut diagnostics),
+            Ok(type_)
+        );
+        assert_eq!(generic_transaction_state(&fixture.store), warm);
+    }
+
+    #[test]
+    fn generic_keyof_constraint_rejects_nonordinary_interface_targets() {
+        for (index, source) in [
+            concat!(
+                "type Choices = { left: string }; ",
+                "function choose<T extends keyof Choices>(value: T): boolean { return true; }",
+            ),
+            concat!(
+                "interface Choices<T> { left: T } ",
+                "function choose<T extends keyof Choices<string>>(value: T): boolean ",
+                "{ return true; }",
+            ),
+            concat!(
+                "interface Choices { left(): string } ",
+                "function choose<T extends keyof Choices>(value: T): boolean { return true; }",
+            ),
+            concat!(
+                "interface Choices {} ",
+                "function choose<T extends keyof Choices>(value: T): boolean { return true; }",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture =
+                QueryFixture::new(source, FileId::new(1_908 + u32::try_from(index).unwrap()));
+            let (declaration, _) = fixture.declaration_and_type_parameter();
+            let owner = fixture.bound.symbol(declaration).unwrap();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            let before = generic_transaction_state(&fixture.store);
+
+            assert!(
+                matches!(
+                    plan_source_callable(&fixture.store, &host, declaration, owner, None),
+                    Err(SourceCallableError::Unsupported(
+                        SourceCallableUnsupported::GenericSignature(_)
+                    ))
+                ),
+                "source: {source}",
+            );
+            assert_eq!(generic_transaction_state(&fixture.store), before);
         }
     }
 

@@ -17,7 +17,7 @@ use ts_ast::{
     FlowFlags, FlowNode, FlowNodePayload, FlowRef, Node, NodeArena, NodeData, NodeId, NodeRef,
     SyntaxKind,
 };
-use ts_binder::{BoundFile, SemanticSymbolId};
+use ts_binder::{BoundFile, SemanticSymbolId, SymbolFlags};
 use ts_core::{TextPos, TextRange};
 use ts_diagnostics::{Diagnostic, message_by_code};
 
@@ -295,6 +295,8 @@ pub(super) struct SourceSwitchFunctionStatementsSyntax {
     pub(super) body: NodeRef,
     pub(super) switch: SourceControlSwitchSyntax,
     pub(super) returns: Vec<SourceSwitchReturnSyntax>,
+    /// A no-default edge that still requires canonical constraint coverage proof.
+    pub(super) no_match_flow: Option<FlowRef>,
 }
 
 /// One fallthrough arm containing initialized locals only.
@@ -1367,13 +1369,21 @@ impl SyntaxPlanner<'_> {
             ));
         }
 
+        let has_default = switch
+            .clauses
+            .iter()
+            .any(|clause| clause.expression.is_none());
         let returns = self.plan_switch_returns(&switch, declaration)?;
-        self.validate_switch_flow(&switch, &returns)?;
+        if !has_default {
+            self.validate_no_default_switch(&switch)?;
+        }
+        let no_match_flow = self.validate_switch_flow(&switch, &returns, has_default)?;
 
         Ok(SourceSwitchFunctionStatementsSyntax {
             body,
             switch,
             returns,
+            no_match_flow,
         })
     }
 
@@ -1381,7 +1391,8 @@ impl SyntaxPlanner<'_> {
         &self,
         switch: &SourceControlSwitchSyntax,
         returns: &[SourceSwitchReturnSyntax],
-    ) -> Result<(), SourceFunctionStatementsError> {
+        has_default: bool,
+    ) -> Result<Option<FlowRef>, SourceFunctionStatementsError> {
         let declaration = self.callable.declaration;
         let flow = self.bound.flow_graph();
         if flow.container_is_complete(declaration) != Some(true) {
@@ -1401,7 +1412,7 @@ impl SyntaxPlanner<'_> {
         {
             return Err(Self::incomplete_switch_flow(declaration));
         }
-        if flow.container_end(declaration).is_some() {
+        if has_default && flow.container_end(declaration).is_some() {
             return Err(SourceFunctionStatementsInvariant::UnexpectedFlowEnd(declaration).into());
         }
         if flow.container_return(declaration).is_some() {
@@ -1457,7 +1468,241 @@ impl SyntaxPlanner<'_> {
         if returned_clauses.next().is_some() {
             return Err(Self::incomplete_switch_flow(switch.statement));
         }
+
+        let no_match_flow = if has_default {
+            None
+        } else {
+            let no_match_flow = flow
+                .container_end(declaration)
+                .ok_or_else(|| Self::incomplete_switch_flow(switch.statement))?;
+            let no_match = flow
+                .nodes()
+                .get(no_match_flow)
+                .ok_or_else(|| Self::incomplete_switch_flow(switch.statement))?;
+            let payload = FlowNodePayload::SwitchClause {
+                switch_statement: switch.statement,
+                clause_start: 0,
+                clause_end: 0,
+            };
+            if joined_semantic_flow_flags(no_match.flags) != FlowFlags::SWITCH_CLAUSE.bits()
+                || no_match.payload.as_ref() != Some(&payload)
+                || no_match.antecedent != Some(switch_flow)
+                || !no_match.antecedents.is_empty()
+            {
+                return Err(Self::incomplete_switch_flow(switch.statement));
+            }
+            Some(no_match_flow)
+        };
+        Ok(no_match_flow)
+    }
+
+    fn validate_no_default_switch(
+        &self,
+        switch: &SourceControlSwitchSyntax,
+    ) -> Result<(), SourceFunctionStatementsError> {
+        let [type_parameter] = self.callable.type_parameters.as_slice() else {
+            return Err(Self::missing_switch_return(switch.statement));
+        };
+        let [parameter] = self.callable.parameters.as_slice() else {
+            return Err(Self::missing_switch_return(switch.statement));
+        };
+        if !self
+            .callable
+            .type_parameter_syntax
+            .generic_fixed_return_is_exact()
+            || self.bound.symbol(type_parameter.declaration) != Some(type_parameter.symbol)
+            || self.bound.symbol(parameter.declaration) != Some(parameter.symbol)
+        {
+            return Err(Self::missing_switch_return(switch.statement));
+        }
+
+        let parameter_record = self.node(parameter.declaration)?;
+        let NodeData::ParameterDeclaration(parameter_data) = &parameter_record.data else {
+            return Err(Self::missing_switch_return(switch.statement));
+        };
+        let parameter_name = self.reference(parameter_data.name);
+        let parameter_name_record = self.node(parameter_name)?;
+        let NodeData::Identifier(parameter_identifier) = &parameter_name_record.data else {
+            return Err(Self::missing_switch_return(switch.statement));
+        };
+        let discriminant = self.node(switch.expression)?;
+        let NodeData::Identifier(discriminant_identifier) = &discriminant.data else {
+            return Err(Self::missing_switch_return(switch.statement));
+        };
+        if parameter_name_record.kind != SyntaxKind::Identifier
+            || parameter_name_record.parent != Some(parameter.declaration.node)
+            || parameter_identifier.text != discriminant_identifier.text
+        {
+            return Err(Self::missing_switch_return(switch.statement));
+        }
+
+        let Some(annotation) = parameter.explicit_type_node() else {
+            return Err(Self::missing_switch_return(switch.statement));
+        };
+        let annotation_record = self.node(annotation)?;
+        let NodeData::TypeReferenceNode(annotation_data) = &annotation_record.data else {
+            return Err(Self::missing_switch_return(switch.statement));
+        };
+        if annotation_record.kind != SyntaxKind::TypeReference
+            || annotation_record.parent != Some(parameter.declaration.node)
+            || annotation_data.type_arguments.is_some()
+        {
+            return Err(Self::missing_switch_return(switch.statement));
+        }
+        let annotation_name = self.reference(annotation_data.type_name);
+        let annotation_name_record = self.node(annotation_name)?;
+        let NodeData::Identifier(annotation_identifier) = &annotation_name_record.data else {
+            return Err(Self::missing_switch_return(switch.statement));
+        };
+        let type_parameter_record = self.node(type_parameter.declaration)?;
+        let NodeData::TypeParameterDeclaration(type_parameter_data) = &type_parameter_record.data
+        else {
+            return Err(Self::missing_switch_return(switch.statement));
+        };
+        let type_parameter_name = self.reference(type_parameter_data.name);
+        let type_parameter_name_record = self.node(type_parameter_name)?;
+        let NodeData::Identifier(type_parameter_identifier) = &type_parameter_name_record.data
+        else {
+            return Err(Self::missing_switch_return(switch.statement));
+        };
+        if annotation_name_record.kind != SyntaxKind::Identifier
+            || annotation_name_record.parent != Some(annotation.node)
+            || type_parameter_name_record.kind != SyntaxKind::Identifier
+            || type_parameter_name_record.parent != Some(type_parameter.declaration.node)
+            || annotation_identifier.text != type_parameter_identifier.text
+        {
+            return Err(Self::missing_switch_return(switch.statement));
+        }
+
+        let Some(constraint) = type_parameter.constraint else {
+            return Err(Self::missing_switch_return(switch.statement));
+        };
+        let constraint_record = self.node(constraint)?;
+        let NodeData::TypeOperatorNode(operator) = &constraint_record.data else {
+            return Err(Self::missing_switch_return(switch.statement));
+        };
+        if constraint_record.kind != SyntaxKind::TypeOperator
+            || constraint_record.parent != Some(type_parameter.declaration.node)
+            || operator.operator != SyntaxKind::KeyOfKeyword
+        {
+            return Err(Self::missing_switch_return(switch.statement));
+        }
+        let target = self.reference(operator.type_);
+        let target_record = self.node(target)?;
+        let NodeData::TypeReferenceNode(target_data) = &target_record.data else {
+            return Err(Self::missing_switch_return(switch.statement));
+        };
+        if target_record.kind != SyntaxKind::TypeReference
+            || target_record.parent != Some(constraint.node)
+            || target_data.type_arguments.is_some()
+        {
+            return Err(Self::missing_switch_return(switch.statement));
+        }
+        let target_name = self.reference(target_data.type_name);
+        let target_name_record = self.node(target_name)?;
+        let NodeData::Identifier(target_identifier) = &target_name_record.data else {
+            return Err(Self::missing_switch_return(switch.statement));
+        };
+        if target_name_record.kind != SyntaxKind::Identifier
+            || target_name_record.parent != Some(target.node)
+        {
+            return Err(Self::missing_switch_return(switch.statement));
+        }
+
+        let source = self.bound.source_file();
+        let interface_symbol = self
+            .bound
+            .locals(source)
+            .and_then(|locals| self.store.symbol_table(locals))
+            .and_then(|locals| locals.get_source(&target_identifier.text))
+            .and_then(|symbol| self.store.get_merged_symbol(symbol))
+            .and_then(|symbol| self.store.symbol(symbol))
+            .filter(|symbol| symbol.flags() == SymbolFlags::INTERFACE)
+            .ok_or_else(|| Self::missing_switch_return(switch.statement))?;
+        let Some([interface]) = interface_symbol.declarations() else {
+            return Err(Self::missing_switch_return(switch.statement));
+        };
+        let interface_record = self.node(*interface)?;
+        let NodeData::InterfaceDeclaration(interface_data) = &interface_record.data else {
+            return Err(Self::missing_switch_return(switch.statement));
+        };
+        if interface_record.kind != SyntaxKind::InterfaceDeclaration
+            || interface_record.parent != Some(source.node)
+            || interface_data.heritage_clauses.is_some()
+            || interface_data.type_parameters.is_some()
+            || interface_data.members.nodes.is_empty()
+        {
+            return Err(Self::missing_switch_return(switch.statement));
+        }
+
+        let mut keys = HashSet::with_capacity(interface_data.members.nodes.len());
+        for member_id in &interface_data.members.nodes {
+            let member = self.reference(*member_id);
+            let member_record = self.node(member)?;
+            if member_record.parent != Some(interface.node) {
+                return Err(Self::missing_switch_return(switch.statement));
+            }
+            let property_name = match &member_record.data {
+                NodeData::PropertyDeclaration(property)
+                    if member_record.kind == SyntaxKind::PropertyDeclaration
+                        && property.initializer.is_none()
+                        && property.type_.is_some()
+                        && property.symbol.is_none()
+                        && property.facts == 0 =>
+                {
+                    self.reference(property.name)
+                }
+                NodeData::PropertySignatureDeclaration(property)
+                    if member_record.kind == SyntaxKind::PropertySignature
+                        && property.symbol.is_none() =>
+                {
+                    self.reference(property.name)
+                }
+                _ => return Err(Self::missing_switch_return(switch.statement)),
+            };
+            let property_name_record = self.node(property_name)?;
+            let NodeData::Identifier(property_identifier) = &property_name_record.data else {
+                return Err(Self::missing_switch_return(switch.statement));
+            };
+            if property_name_record.kind != SyntaxKind::Identifier
+                || property_name_record.parent != Some(member.node)
+                || !keys.insert(property_identifier.text.as_str())
+            {
+                return Err(Self::missing_switch_return(switch.statement));
+            }
+        }
+
+        let mut cases = HashSet::with_capacity(switch.clauses.len());
+        for clause in &switch.clauses {
+            let Some(expression) = clause.expression else {
+                return Err(Self::missing_switch_return(switch.statement));
+            };
+            let record = self.node(expression)?;
+            let NodeData::StringLiteral(literal) = &record.data else {
+                return Err(self.unsupported(
+                    expression,
+                    record.kind,
+                    SourceFunctionStatementsRole::Condition,
+                ));
+            };
+            if !cases.insert(literal.text.as_str()) {
+                return Err(self.unsupported(
+                    expression,
+                    record.kind,
+                    SourceFunctionStatementsRole::Condition,
+                ));
+            }
+        }
+        if cases != keys {
+            return Err(Self::missing_switch_return(switch.statement));
+        }
         Ok(())
+    }
+
+    fn missing_switch_return(node: NodeRef) -> SourceFunctionStatementsError {
+        SourceFunctionStatementsError::Unsupported(
+            SourceFunctionStatementsUnsupported::MissingReturn(node),
+        )
     }
 
     fn switch_flow_at(
@@ -1536,10 +1781,8 @@ impl SyntaxPlanner<'_> {
                 }
             }
         }
-        if !has_default || returns.is_empty() {
-            return Err(SourceFunctionStatementsError::Unsupported(
-                SourceFunctionStatementsUnsupported::MissingReturn(switch.statement),
-            ));
+        if returns.is_empty() {
+            return Err(Self::missing_switch_return(switch.statement));
         }
         Ok(returns)
     }
@@ -4729,6 +4972,7 @@ mod joined_tests {
         assert_eq!(syntax.body, callable.body);
         assert_eq!(syntax.switch.clauses.len(), 7);
         assert_eq!(syntax.returns.len(), 3);
+        assert!(syntax.no_match_flow.is_none());
         assert_eq!(syntax.returns[0].clause, syntax.switch.clauses[2].clause);
         assert_eq!(syntax.returns[1].clause, syntax.switch.clauses[4].clause);
         assert_eq!(syntax.returns[2].clause, syntax.switch.clauses[6].clause);
@@ -4865,6 +5109,162 @@ mod joined_tests {
                     .kind)
                 .collect::<Vec<_>>(),
             [SyntaxKind::FalseKeyword, SyntaxKind::TrueKeyword],
+        );
+    }
+
+    #[test]
+    fn function_switch_accepts_complete_named_keyof_cases_without_default() {
+        let fixture = JoinedFixture::new(
+            concat!(
+                "interface Choices { left: number; right: number; }\n",
+                "function classify<T extends keyof Choices>(value: T): boolean {\n",
+                "  switch (value) {\n",
+                "    case 'left': return true;\n",
+                "    case 'right': return false;\n",
+                "  }\n",
+                "}\n",
+            ),
+            FileId::new(1_330),
+        );
+        let NodeData::SourceFile(source) = &fixture
+            .parsed
+            .arena
+            .get(fixture.parsed.source_file)
+            .unwrap()
+            .data
+        else {
+            panic!("expected source file")
+        };
+        let NodeData::InterfaceDeclaration(interface) = &fixture
+            .parsed
+            .arena
+            .get(source.statements.nodes[0])
+            .unwrap()
+            .data
+        else {
+            panic!("expected named interface declaration")
+        };
+        assert!(interface.members.nodes.iter().all(|member| {
+            matches!(
+                fixture.parsed.arena.get(*member).unwrap().data,
+                NodeData::PropertyDeclaration(_)
+            )
+        }));
+        let callable = fixture.callable();
+        let syntax = plan_source_switch_function_statements_syntax(
+            &fixture.parsed.arena,
+            &fixture.bound,
+            &fixture.store,
+            &callable,
+        )
+        .unwrap();
+
+        assert_eq!(syntax.switch.clauses.len(), 2);
+        assert_eq!(syntax.returns.len(), 2);
+        let no_match = syntax.no_match_flow.unwrap();
+        assert_eq!(
+            fixture
+                .bound
+                .flow_graph()
+                .container_end(callable.declaration),
+            Some(no_match),
+        );
+        let unmatched = fixture.bound.flow_graph().nodes().get(no_match).unwrap();
+        assert_eq!(
+            joined_semantic_flow_flags(unmatched.flags),
+            FlowFlags::SWITCH_CLAUSE.bits(),
+        );
+        assert_eq!(
+            unmatched.payload,
+            Some(FlowNodePayload::SwitchClause {
+                switch_statement: syntax.switch.statement,
+                clause_start: 0,
+                clause_end: 0,
+            }),
+        );
+        assert_eq!(
+            unmatched.antecedent,
+            fixture.bound.flow_at(syntax.switch.statement),
+        );
+        assert!(unmatched.antecedents.is_empty());
+    }
+
+    #[test]
+    fn function_switch_rejects_incomplete_duplicate_or_nonliteral_named_keyof_cases() {
+        for (index, cases) in [
+            "case 'left': return true;",
+            "case 'left': return true; case 'left': return false; case 'right': return true;",
+            "case 'left': return true; case value: return false;",
+            "case 'left': return true; case 'right': return false; case 'other': return true;",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = format!(
+                "interface Choices {{ left: number; right: number; }}\n\
+                 function classify<T extends keyof Choices>(value: T): boolean {{\n\
+                 switch (value) {{ {cases} }}\n\
+                 }}\n",
+            );
+            let fixture =
+                JoinedFixture::new(&source, FileId::new(1_331 + u32::try_from(index).unwrap()));
+            let callable = fixture.callable();
+            assert!(matches!(
+                plan_source_switch_function_statements_syntax(
+                    &fixture.parsed.arena,
+                    &fixture.bound,
+                    &fixture.store,
+                    &callable,
+                ),
+                Err(SourceFunctionStatementsError::Unsupported(_)),
+            ));
+        }
+    }
+
+    #[test]
+    fn function_switch_replays_named_keyof_no_match_flow_without_publication() {
+        let fixture = JoinedFixture::new(
+            concat!(
+                "interface Choices { first: string; second: number; }\n",
+                "function choose<T extends keyof Choices>(key: T): number {\n",
+                "  switch (key) {\n",
+                "    case 'first': return 1;\n",
+                "    case 'second': return 2;\n",
+                "  }\n",
+                "}\n",
+            ),
+            FileId::new(1_335),
+        );
+        let callable = fixture.callable();
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.mapper_len(),
+        );
+        let first = plan_source_switch_function_statements_syntax(
+            &fixture.parsed.arena,
+            &fixture.bound,
+            &fixture.store,
+            &callable,
+        )
+        .unwrap();
+        let second = plan_source_switch_function_statements_syntax(
+            &fixture.parsed.arena,
+            &fixture.bound,
+            &fixture.store,
+            &callable,
+        )
+        .unwrap();
+
+        assert_eq!(first, second);
+        assert!(first.no_match_flow.is_some());
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.mapper_len(),
+            ),
+            before,
         );
     }
 

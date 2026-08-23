@@ -12,6 +12,7 @@ use ts_binder::{CheckFlags, SymbolFlags};
 
 use super::{
     CanonicalTypeMapperStore, ResolvedSignatureState, SignatureId, SignatureLinks, TypeId,
+    TypeNodeLinks,
     callables::{
         CallableFamily, StoredSingleCallableValidation, ValidatedSingleCallable,
         validate_stored_single_callable_provider,
@@ -22,8 +23,8 @@ use super::{
     signatures::SignatureFlags,
     source_overloads::{StoredSourceOverloadValidation, validate_stored_source_overload},
     store::SourceNodeParent,
-    type_records::TypeData,
-    types::TypeFlags,
+    type_records::{ConstrainedTypeData, TypeCacheState, TypeData},
+    types::{ObjectFlags, TypeFlags},
 };
 
 /// Immutable callable members after provider and store validation.
@@ -130,11 +131,269 @@ pub(super) fn validate_stored_callable_set(
         }
     }
 
+    if let Some(validation) = validate_stored_default_library_method_callable_set(store, type_) {
+        return validation;
+    }
+
     if let Some(validation) = validate_stored_class_method_callable_set(store, type_) {
         return validation;
     }
 
     validate_stored_intersection_callable_set(store, type_)
+}
+
+#[allow(clippy::too_many_lines)] // Keep the complete wrapper and method proof together.
+fn validate_stored_default_library_method_callable_set(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Option<StoredCallableSetValidation> {
+    let method_symbol = store.type_payload(type_)?.symbol()?;
+    let method = store.symbol(method_symbol)?;
+    if !method.flags().contains(SymbolFlags::METHOD) {
+        return None;
+    }
+    let [declaration] = method.declarations()? else {
+        return None;
+    };
+    let declaration = *declaration;
+    if store.source_node_kind(declaration) != Some(SyntaxKind::MethodSignature) {
+        return None;
+    }
+    let (owner_name, method_name, has_parameter) = match method.name().as_utf8() {
+        Some("toFixed") => ("Number", "toFixed", true),
+        Some("toLowerCase") => ("String", "toLowerCase", false),
+        _ => return None,
+    };
+
+    let family = CallableFamily::DeclaredCallSignatures;
+    let authenticated = (|| {
+        let bootstrap = store.intrinsic_bootstrap()?;
+        let (wrapper, authenticated_declaration) =
+            store.authenticated_global_interface_method(method_symbol)?;
+        let wrapper_record = store.type_payload(wrapper)?;
+        let TypeData::Interface(_) = wrapper_record.data() else {
+            return None;
+        };
+        let owner_symbol = method
+            .parent()
+            .and_then(|parent| store.get_merged_symbol(parent))?;
+        let owner = store.symbol(owner_symbol)?;
+        let Some(SourceNodeParent::Parent(owner_declaration)) =
+            store.source_node_parent(declaration)
+        else {
+            return None;
+        };
+        let owner_flags = owner.flags();
+        let allowed_owner_flags =
+            SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::TRANSIENT;
+        let owner_declarations = owner.declarations()?;
+        let global_owner = store
+            .symbol_table(bootstrap.globals)?
+            .get_source(owner_name)
+            .and_then(|symbol| store.get_merged_symbol(symbol));
+        if owner_flags & SymbolFlags::TYPE != SymbolFlags::INTERFACE
+            || owner_flags.without(allowed_owner_flags) != SymbolFlags::NONE
+            || owner.check_flags() != CheckFlags::NONE
+            || owner.parent().is_some()
+            || owner.exports().is_some()
+            || owner.export_symbol().is_some()
+            || authenticated_declaration != declaration
+            || store.get_merged_symbol(owner_symbol) != Some(owner_symbol)
+            || global_owner != Some(owner_symbol)
+            || store
+                .declared_type_links(owner_symbol)
+                .and_then(|links| links.declared_type)
+                != Some(wrapper)
+            || wrapper_record.flags() != TypeFlags::OBJECT
+            || !wrapper_record
+                .object_flags()
+                .contains(ObjectFlags::INTERFACE)
+            || wrapper_record.symbol() != Some(owner_symbol)
+            || wrapper_record.alias().is_some()
+            || !owner_declarations.contains(&owner_declaration)
+            || store.source_node_kind(owner_declaration) != Some(SyntaxKind::InterfaceDeclaration)
+            || owner
+                .members()
+                .and_then(|members| store.symbol_table(members))
+                .and_then(|members| members.get_source(method_name))
+                != Some(method_symbol)
+            || method.flags() != SymbolFlags::METHOD
+            || method.check_flags() != CheckFlags::NONE
+            || method.value_declaration() != Some(declaration)
+            || method
+                .parent()
+                .and_then(|parent| store.get_merged_symbol(parent))
+                != Some(owner_symbol)
+            || method.members().is_some()
+            || method.exports().is_some()
+            || method.export_symbol().is_some()
+            || store.get_merged_symbol(method_symbol) != Some(method_symbol)
+            || store.value_symbol_links(method_symbol)
+                != Some(&ValueSymbolLinks {
+                    resolved_type: Some(type_),
+                    ..ValueSymbolLinks::default()
+                })
+        {
+            return None;
+        }
+
+        let record = store.type_payload(type_)?;
+        let TypeData::Object(object) = record.data() else {
+            return None;
+        };
+        let [signature] = object.structured.signatures.as_deref()? else {
+            return None;
+        };
+        let signature = *signature;
+        if record.flags() != TypeFlags::OBJECT
+            || record.object_flags() != ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
+            || record.alias().is_some()
+            || object.target.is_some()
+            || object.mapper.is_some()
+            || object.instantiations != TypeCacheState::Unallocated
+            || object.structured.constrained != ConstrainedTypeData::default()
+            || object.structured.members.is_some()
+            || object.structured.properties.is_some()
+            || object.structured.call_signature_count != 1
+            || object.structured.index_infos.is_some()
+            || object
+                .structured
+                .object_type_without_abstract_construct_signatures
+                .is_some()
+        {
+            return None;
+        }
+
+        let return_annotation = store.source_primitive_type_annotation(declaration)?;
+        if store.source_node_kind(return_annotation) != Some(SyntaxKind::StringKeyword)
+            || store.type_node_links(return_annotation)
+                != Some(&TypeNodeLinks {
+                    resolved_type: Some(bootstrap.string_type),
+                    ..TypeNodeLinks::default()
+                })
+            || store
+                .function_signature_return_annotation(signature)
+                .is_some_and(|annotation| annotation != (return_annotation, false))
+        {
+            return None;
+        }
+
+        let signature_record = store.signature(signature)?;
+        if signature_record.flags() != SignatureFlags::NONE
+            || signature_record.declaration() != Some(declaration)
+            || !signature_record.type_parameters().is_empty()
+            || signature_record.this_parameter().is_some()
+            || signature_record.parameters().len() != usize::from(has_parameter)
+            || signature_record.min_argument_count() != 0
+            || signature_record.resolved_min_argument_count() != -1
+            || signature_record.resolved_return_type() != Some(bootstrap.string_type)
+            || signature_record.resolved_type_predicate().is_some()
+            || signature_record.target().is_some()
+            || signature_record.mapper().is_some()
+            || signature_record.isolated_signature_type().is_some()
+            || signature_record.composite().is_some()
+            || store.signature_has_circular_return_type(signature)
+            || store.global_interface_method_callable_type(signature) != Some(type_)
+            || store.signature_links(declaration)
+                != Some(&SignatureLinks {
+                    resolved_signature: ResolvedSignatureState::Resolved(signature),
+                    ..SignatureLinks::default()
+                })
+        {
+            return None;
+        }
+
+        let parameter_types = if let Some(&parameter) = signature_record.parameters().first() {
+            let parameter_record = store.symbol(parameter)?;
+            let [parameter_declaration] = parameter_record.declarations()? else {
+                return None;
+            };
+            let parameter_declaration = *parameter_declaration;
+            let parameter_annotation =
+                store.source_primitive_type_annotation(parameter_declaration)?;
+            let parameter_type = store.value_symbol_links(parameter)?.resolved_type?;
+            let expected_type = if bootstrap.options.strict_null_checks {
+                let record = store.type_payload(parameter_type)?;
+                let TypeData::Union(union) = record.data() else {
+                    return None;
+                };
+                (record.flags() == TypeFlags::UNION
+                    && record.symbol().is_none()
+                    && record.alias().is_none()
+                    && union.union.types.len() == 2
+                    && union.union.types.contains(&bootstrap.number_type)
+                    && union.union.types.contains(&bootstrap.undefined_type))
+                .then_some(parameter_type)?
+            } else {
+                bootstrap.number_type
+            };
+            if parameter_record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+                || parameter_record.check_flags() != CheckFlags::NONE
+                || parameter_record.name().as_utf8() != Some("fractionDigits")
+                || parameter_record.value_declaration() != Some(parameter_declaration)
+                || parameter_record.members().is_some()
+                || parameter_record.exports().is_some()
+                || parameter_record.parent().is_some()
+                || parameter_record.export_symbol().is_some()
+                || store.get_merged_symbol(parameter) != Some(parameter)
+                || store.source_node_kind(parameter_declaration) != Some(SyntaxKind::Parameter)
+                || store.source_node_parent(parameter_declaration)
+                    != Some(SourceNodeParent::Parent(declaration))
+                || store.source_node_kind(parameter_annotation) != Some(SyntaxKind::NumberKeyword)
+                || store.type_node_links(parameter_annotation)
+                    != Some(&TypeNodeLinks {
+                        resolved_type: Some(bootstrap.number_type),
+                        ..TypeNodeLinks::default()
+                    })
+                || parameter_type != expected_type
+                || store.value_symbol_links(parameter)
+                    != Some(&ValueSymbolLinks {
+                        resolved_type: Some(expected_type),
+                        ..ValueSymbolLinks::default()
+                    })
+            {
+                return None;
+            }
+            vec![expected_type]
+        } else {
+            Vec::new()
+        };
+        if store
+            .callable_signature_parameter_types(signature)
+            .is_some_and(|cached| cached != parameter_types.as_slice())
+        {
+            return None;
+        }
+
+        let projection =
+            validate_stored_callable_set_projection_with(store, type_, true, |candidate| {
+                (candidate == signature).then(|| parameter_types.clone())
+            })?;
+        let [callable] = projection.call_signatures.as_ref() else {
+            return None;
+        };
+        if !projection.construct_signatures.is_empty()
+            || callable.signature != signature
+            || callable.return_type != Some(bootstrap.string_type)
+            || callable.min_argument_count != 0
+            || callable.rest_parameter.is_some()
+            || !callable.strict_variance_exempt
+        {
+            return None;
+        }
+        let mut edges = parameter_types;
+        edges.push(bootstrap.string_type);
+        Some((projection, edges))
+    })();
+
+    Some(match authenticated {
+        Some((projection, edges)) => StoredCallableSetValidation::Valid {
+            family,
+            projection,
+            edges,
+        },
+        None => StoredCallableSetValidation::Malformed { family },
+    })
 }
 
 fn validate_stored_class_method_callable_set(
@@ -410,16 +669,222 @@ mod tests {
     use ts_ast::{FileId, NodeData, NodeRef};
     use ts_binder::{
         CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
-        EscapedName, SymbolData, SymbolFlags,
+        EscapedName, SemanticSymbolId, SymbolData, SymbolFlags,
     };
-    use ts_parser::parse_source_file;
+    use ts_parser::{ParseResult, parse_source_file};
 
     use super::*;
     use crate::semantic::{
         CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions, SemanticStore,
-        TypeRecord, callables::validate_stored_single_callable, mapper::TypeMapper,
-        types::ObjectFlags,
+        TypeRecord, bootstrap::UnionReduction, callables::validate_stored_single_callable,
+        mapper::TypeMapper, types::ObjectFlags,
     };
+
+    const DEFAULT_LIBRARY_METHODS: &str = concat!(
+        "interface IArguments {} ",
+        "interface Array<T> {} ",
+        "interface Object {} ",
+        "interface Function {} ",
+        "interface String { toLowerCase(): string } ",
+        "interface Number { toFixed(fractionDigits?: number): string } ",
+        "interface Boolean {} ",
+        "interface RegExp {} ",
+        "interface ReadonlyArray<T> {} ",
+        "interface ThisType<T> {}",
+    );
+
+    struct PublishedDefaultLibraryMethod {
+        type_: TypeId,
+        signature: SignatureId,
+        method: SemanticSymbolId,
+        parameter: Option<SemanticSymbolId>,
+        return_annotation: NodeRef,
+    }
+
+    fn default_library_context(
+        parsed: &ParseResult,
+        file: FileId,
+        strict_null_checks: bool,
+    ) -> CanonicalCheckerContext<'_> {
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new_with_default_library(
+                    EscapedName::source("\"/project/lib.es5.d.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    true,
+                    true,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks,
+                    exact_optional_property_types: false,
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        )
+        .unwrap()
+    }
+
+    #[allow(clippy::too_many_lines)] // Preserve the exact test publication order.
+    fn publish_default_library_method(
+        context: &mut CanonicalCheckerContext<'_>,
+        parsed: &ParseResult,
+        owner_name: &str,
+        method_name: &str,
+    ) -> PublishedDefaultLibraryMethod {
+        let global_types = context.global_types().clone();
+        let store = context.store();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let owner = store
+            .symbol_table(bootstrap.globals)
+            .and_then(|globals| globals.get_source(owner_name))
+            .and_then(|owner| store.get_merged_symbol(owner))
+            .unwrap();
+        let method = store
+            .symbol(owner)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get_source(method_name))
+            .unwrap();
+        let declaration = store.symbol(method).unwrap().declarations().unwrap()[0];
+        let NodeData::MethodSignatureDeclaration(method_node) =
+            &parsed.arena.get(declaration.node).unwrap().data
+        else {
+            panic!("expected a default-library method signature")
+        };
+        let return_annotation = NodeRef::new(
+            declaration.arena,
+            declaration.file,
+            method_node.type_.unwrap(),
+        );
+        let parameter = method_node.parameters.nodes.first().map(|parameter| {
+            let declaration = NodeRef::new(declaration.arena, declaration.file, *parameter);
+            let NodeData::ParameterDeclaration(parameter) =
+                &parsed.arena.get(declaration.node).unwrap().data
+            else {
+                panic!("expected the optional fractionDigits parameter")
+            };
+            let annotation = NodeRef::new(
+                declaration.arena,
+                declaration.file,
+                parameter.type_.unwrap(),
+            );
+            let symbol = context
+                .file(declaration.file)
+                .unwrap()
+                .1
+                .symbol(declaration)
+                .unwrap();
+            (symbol, annotation)
+        });
+        let strict = bootstrap.options.strict_null_checks;
+        let number = bootstrap.number_type;
+        let string = bootstrap.string_type;
+        let undefined = bootstrap.undefined_type;
+        let store = context.store_mut_for_test();
+        let parameter_type = parameter.map(|_| {
+            if strict {
+                store
+                    .expression_union_type_with_global_types(
+                        &global_types,
+                        &[number, undefined],
+                        UnionReduction::Literal,
+                    )
+                    .unwrap()
+            } else {
+                number
+            }
+        });
+        assert!(store.set_type_node_links(
+            return_annotation,
+            TypeNodeLinks {
+                resolved_type: Some(string),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        if let Some((symbol, annotation)) = parameter {
+            assert!(store.set_type_node_links(
+                annotation,
+                TypeNodeLinks {
+                    resolved_type: Some(number),
+                    ..TypeNodeLinks::default()
+                },
+            ));
+            assert!(store.set_value_symbol_links(
+                symbol,
+                ValueSymbolLinks {
+                    resolved_type: parameter_type,
+                    ..ValueSymbolLinks::default()
+                },
+            ));
+        }
+        let type_ = store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(method))
+            .unwrap();
+        let signature = store
+            .alloc_signature(
+                SignatureFlags::NONE,
+                Some(declaration),
+                Vec::new(),
+                None,
+                parameter.map(|(symbol, _)| symbol).into_iter().collect(),
+                Some(string),
+                None,
+                0,
+            )
+            .unwrap();
+        assert!(store.set_signature_links(
+            declaration,
+            SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(signature),
+                ..SignatureLinks::default()
+            },
+        ));
+        assert!(store.set_value_symbol_links(
+            method,
+            ValueSymbolLinks {
+                resolved_type: Some(type_),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        assert!(store.set_structured_type_members(
+            type_,
+            None,
+            None,
+            Some(vec![signature]),
+            None,
+            None,
+        ));
+        assert!(store.set_function_signature_return_annotation(
+            signature,
+            return_annotation,
+            false,
+        ));
+        assert!(store.set_callable_signature_parameter_types_batch(vec![(
+            signature,
+            parameter_type.into_iter().collect()
+        ),]));
+        PublishedDefaultLibraryMethod {
+            type_,
+            signature,
+            method,
+            parameter: parameter.map(|(symbol, _)| symbol),
+            return_annotation,
+        }
+    }
 
     fn initialized_store() -> CanonicalTypeMapperStore {
         let mut store = SemanticStore::<TypeRecord, TypeMapper>::new();
@@ -652,6 +1117,276 @@ mod tests {
         assert!(callable.parameters.is_empty());
         assert_eq!(callable.rest_parameter, Some(number));
         assert_eq!(callable.min_argument_count, 0);
+    }
+
+    #[test]
+    fn default_library_method_callables_preserve_arity_variance_and_warm_identity() {
+        for (index, strict) in [false, true].into_iter().enumerate() {
+            let parsed = parse_source_file(DEFAULT_LIBRARY_METHODS);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(4_412 + u32::try_from(index).unwrap());
+            let mut context = default_library_context(&parsed, file, strict);
+
+            for (owner_name, method_name, parameter_count) in
+                [("Number", "toFixed", 1), ("String", "toLowerCase", 0)]
+            {
+                let method =
+                    publish_default_library_method(&mut context, &parsed, owner_name, method_name);
+                let store = context.store();
+                let bootstrap = store.intrinsic_bootstrap().unwrap();
+                let before = (
+                    store.type_len(),
+                    store.signature_len(),
+                    store.symbol_len(),
+                    store.checker_link_allocated_lengths(),
+                );
+                let StoredCallableSetValidation::Valid {
+                    family,
+                    projection,
+                    edges,
+                } = validate_stored_callable_set(store, method.type_)
+                else {
+                    panic!("expected authenticated {owner_name}.{method_name}")
+                };
+                assert_eq!(family, CallableFamily::DeclaredCallSignatures);
+                assert_eq!(projection.owner, method.type_);
+                assert!(projection.construct_signatures.is_empty());
+                let [callable] = projection.call_signatures.as_ref() else {
+                    panic!("expected one default-library method signature")
+                };
+                assert_eq!(callable.signature, method.signature);
+                assert_eq!(callable.parameters.len(), parameter_count);
+                assert_eq!(callable.min_argument_count, 0);
+                assert_eq!(callable.return_type, Some(bootstrap.string_type));
+                assert!(callable.rest_parameter.is_none());
+                assert!(callable.strict_variance_exempt);
+                assert_eq!(edges.last(), Some(&bootstrap.string_type));
+                if let Some(parameter) = method.parameter {
+                    let expected = store
+                        .value_symbol_links(parameter)
+                        .and_then(|links| links.resolved_type)
+                        .unwrap();
+                    assert_eq!(callable.parameters.as_slice(), &[expected]);
+                    assert_eq!(edges.first(), Some(&expected));
+                    if strict {
+                        let TypeData::Union(union) = store.type_payload(expected).unwrap().data()
+                        else {
+                            panic!("strict optional parameters must include undefined")
+                        };
+                        assert!(union.union.types.contains(&bootstrap.number_type));
+                        assert!(union.union.types.contains(&bootstrap.undefined_type));
+                    } else {
+                        assert_eq!(expected, bootstrap.number_type);
+                    }
+                }
+                assert_eq!(
+                    (
+                        store.type_len(),
+                        store.signature_len(),
+                        store.symbol_len(),
+                        store.checker_link_allocated_lengths(),
+                    ),
+                    before,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn default_library_method_callables_authenticate_transient_merged_interface_owners() {
+        let library = parse_source_file(DEFAULT_LIBRARY_METHODS);
+        let augmentation = parse_source_file(concat!(
+            "interface Number { marker: number } declare var Number: any; ",
+            "interface String { marker: string } declare var String: any;",
+        ));
+        assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+        assert!(
+            augmentation.diagnostics.is_empty(),
+            "{:?}",
+            augmentation.diagnostics,
+        );
+        let files = [
+            (FileId::new(4_420), &library),
+            (FileId::new(4_421), &augmentation),
+        ];
+        let mut binder = CanonicalBinder::new();
+        for (file, parsed) in files {
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new_with_default_library(
+                        EscapedName::source(format!("\"/project/lib-{}.d.ts\"", file.index())),
+                        CanonicalSourceLanguage::TypeScript,
+                        true,
+                        true,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+        }
+        for (file, parsed) in files {
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            files
+                .into_iter()
+                .map(|(file, parsed)| (file, &parsed.arena))
+                .collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+
+        for (owner_name, method_name) in [("Number", "toFixed"), ("String", "toLowerCase")] {
+            let method =
+                publish_default_library_method(&mut context, &library, owner_name, method_name);
+            let store = context.store();
+            let original_owner = store.symbol(method.method).unwrap().parent().unwrap();
+            let owner = store.get_merged_symbol(original_owner).unwrap();
+            assert_ne!(original_owner, owner);
+            assert!(
+                store
+                    .symbol(owner)
+                    .unwrap()
+                    .flags()
+                    .contains(SymbolFlags::TRANSIENT)
+            );
+            assert!(matches!(
+                validate_stored_callable_set(store, method.type_),
+                StoredCallableSetValidation::Valid {
+                    family: CallableFamily::DeclaredCallSignatures,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn default_library_method_callables_reject_forged_cache_and_global_ownership() {
+        for poison in 0..5 {
+            let parsed = parse_source_file(DEFAULT_LIBRARY_METHODS);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(4_414 + poison);
+            let mut context = default_library_context(&parsed, file, true);
+            let method = publish_default_library_method(&mut context, &parsed, "Number", "toFixed");
+            let string_wrapper = context.global_types().string_type;
+            let store = context.store_mut_for_test();
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            let number = bootstrap.number_type;
+            let globals = bootstrap.globals;
+            match poison {
+                0 => {
+                    assert!(store.set_value_symbol_links(
+                        method.method,
+                        ValueSymbolLinks {
+                            resolved_type: Some(number),
+                            ..ValueSymbolLinks::default()
+                        },
+                    ));
+                }
+                1 => {
+                    assert!(store.set_signature_flags(method.signature, SignatureFlags::CONSTRUCT));
+                }
+                2 => {
+                    assert!(store.set_value_symbol_links(
+                        method.parameter.unwrap(),
+                        ValueSymbolLinks {
+                            resolved_type: Some(number),
+                            ..ValueSymbolLinks::default()
+                        },
+                    ));
+                }
+                3 => {
+                    assert!(store.set_type_node_links(
+                        method.return_annotation,
+                        TypeNodeLinks {
+                            resolved_type: Some(number),
+                            ..TypeNodeLinks::default()
+                        },
+                    ));
+                }
+                4 => {
+                    let string_owner = store
+                        .type_payload(string_wrapper)
+                        .and_then(TypeRecord::symbol)
+                        .unwrap();
+                    assert!(
+                        store
+                            .insert_symbol(globals, EscapedName::source("Number"), string_owner)
+                            .is_some()
+                    );
+                }
+                _ => unreachable!("poison cases are bounded"),
+            }
+            assert!(
+                matches!(
+                    validate_stored_callable_set(store, method.type_),
+                    StoredCallableSetValidation::Malformed {
+                        family: CallableFamily::DeclaredCallSignatures,
+                    }
+                ),
+                "poison case {poison}",
+            );
+        }
+    }
+
+    #[test]
+    fn inherited_interface_callables_keep_derived_signatures_before_base_signatures() {
+        let parsed = parse_source_file(&format!(
+            "{DEFAULT_LIBRARY_METHODS} \
+             interface Base {{ (): string }} \
+             interface Derived extends Base {{ (key: string): string }}",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(4_419);
+        let mut context = default_library_context(&parsed, file, false);
+        let derived_symbol = {
+            let store = context.store();
+            let globals = store.intrinsic_bootstrap().unwrap().globals;
+            store
+                .symbol_table(globals)
+                .and_then(|globals| globals.get_source("Derived"))
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+                .unwrap()
+        };
+        let derived = context.get_declared_type_of_symbol(derived_symbol).unwrap();
+        let TypeData::Interface(interface) = context.store().type_payload(derived).unwrap().data()
+        else {
+            panic!("expected a derived callable interface")
+        };
+        let expected = interface
+            .reference
+            .object
+            .structured
+            .signatures
+            .as_deref()
+            .unwrap();
+        let StoredCallableSetValidation::Valid {
+            family,
+            projection,
+            edges,
+        } = validate_stored_callable_set(context.store(), derived)
+        else {
+            panic!("expected an authenticated inherited callable interface")
+        };
+
+        assert_eq!(family, CallableFamily::DeclaredCallSignatures);
+        assert_eq!(projection.owner, derived);
+        assert!(projection.construct_signatures.is_empty());
+        assert_eq!(projection.call_signatures.len(), 2);
+        let actual = projection
+            .call_signatures
+            .iter()
+            .map(|callable| callable.signature)
+            .collect::<Vec<_>>();
+        assert_eq!(actual.as_slice(), expected);
+        assert_eq!(projection.call_signatures[0].parameters.len(), 1);
+        assert!(projection.call_signatures[1].parameters.is_empty());
+        assert_eq!(edges.len(), 3);
     }
 
     #[test]

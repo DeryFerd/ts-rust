@@ -287,6 +287,212 @@ pub(super) fn check_direct_source_element(
     )
 }
 
+/// Checks a broad computed object-binding key without using element-access
+/// diagnostic policy or publishing expression caches owned by source checking.
+#[allow(clippy::too_many_arguments)] // Keeps the authenticated binding and type identities explicit.
+pub(super) fn check_computed_binding_element(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    binding: NodeRef,
+    receiver_type: TypeId,
+    index_type: TypeId,
+) -> Result<CheckedSourceElement, SourceElementError> {
+    check_computed_binding_element_worker(
+        store,
+        host,
+        Some(global_types),
+        options,
+        binding,
+        receiver_type,
+        index_type,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // Unit tests omit production-owned global identities.
+fn check_computed_binding_element_worker(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: Option<&CanonicalGlobalTypes>,
+    options: CanonicalCheckerOptions,
+    binding: NodeRef,
+    receiver_type: TypeId,
+    index_type: TypeId,
+) -> Result<CheckedSourceElement, SourceElementError> {
+    let index_node = computed_binding_index_node(store, host, binding, index_type)?;
+    let index = classify_index(store, index_type)?;
+    if !matches!(index.shape, IndexShape::String | IndexShape::Number) {
+        return Err(SourceElementError::Unsupported(
+            SourceElementUnsupported::IndexType(index_type),
+        ));
+    }
+
+    let receiver = store
+        .type_payload(receiver_type)
+        .ok_or(SourceElementError::InvalidType(receiver_type))?;
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(RelationUnavailable::MissingBootstrap)?;
+    let any = bootstrap.any_type;
+    let error = bootstrap.error_type;
+    if receiver_type == any || receiver_type == error {
+        return Ok(CheckedSourceElement {
+            type_: receiver_type,
+            diagnostic: None,
+        });
+    }
+    if receiver.flags() != TypeFlags::OBJECT {
+        return Err(SourceElementError::Unsupported(
+            SourceElementUnsupported::IndexSignatureSurface(receiver_type),
+        ));
+    }
+
+    if let Some(signatures) = resolved_index_signature_surface(store, receiver_type)? {
+        let value = match index.shape {
+            IndexShape::String => signatures.string,
+            IndexShape::Number => signatures.number.or(signatures.string),
+            _ => unreachable!("only broad string and number binding keys were admitted"),
+        };
+        if let Some(value) = value {
+            return Ok(CheckedSourceElement {
+                type_: value,
+                diagnostic: None,
+            });
+        }
+    } else {
+        // Authenticate the existing object graph before claiming it has no
+        // matching index signature.
+        store.resolved_own_property(receiver_type, "")?;
+    }
+
+    let receiver = display_type(store, host, global_types, options, receiver_type)?;
+    let index = display_type(store, host, global_types, options, index_type)?;
+    Ok(CheckedSourceElement {
+        type_: error,
+        diagnostic: Some(CanonicalCheckerDiagnostic {
+            node: Some(index_node),
+            range_override: None,
+            diagnostic: Diagnostic::with_arguments(
+                message_by_code(2537).ok_or(SourceElementError::MissingDiagnostic(2537))?,
+                [receiver, index],
+            ),
+            related_information: Vec::new(),
+        }),
+    })
+}
+
+fn computed_binding_index_node(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    binding: NodeRef,
+    index_type: TypeId,
+) -> Result<NodeRef, SourceElementError> {
+    let invalid = || SourceElementError::InvalidCache(binding);
+    let (arena, bound) = host.source(binding).ok_or_else(invalid)?;
+    let record = host.node(binding).ok_or_else(invalid)?;
+    let NodeData::BindingElement(element) = &record.data else {
+        return Err(unsupported_access(binding));
+    };
+    if !store.contains_node_ref(binding)
+        || record.kind != SyntaxKind::BindingElement
+        || record.flags.0 != 0
+        || element.dot_dot_dot_token.is_some()
+        || element.flow_node.is_some()
+        || element.initializer.is_some()
+        || element.local_symbol.is_some()
+        || element.symbol.is_some()
+        || element.facts != 0
+        || bound
+            .symbol(binding)
+            .is_none_or(|symbol| store.symbol(symbol).is_none())
+    {
+        return Err(unsupported_access(binding));
+    }
+
+    let parent = record
+        .parent
+        .map(|parent| NodeRef::new(binding.arena, binding.file, parent))
+        .ok_or_else(invalid)?;
+    let parent_record = host.node(parent).ok_or_else(invalid)?;
+    let NodeData::BindingPattern(pattern) = &parent_record.data else {
+        return Err(unsupported_access(binding));
+    };
+    if parent_record.kind != SyntaxKind::ObjectBindingPattern
+        || parent_record.flags.0 != 0
+        || pattern.facts != 0
+        || pattern
+            .elements
+            .nodes
+            .iter()
+            .filter(|element| **element == binding.node)
+            .count()
+            != 1
+        || record.range.start < parent_record.range.start
+        || record.range.end > parent_record.range.end
+    {
+        return Err(unsupported_access(binding));
+    }
+
+    let property = element
+        .property_name
+        .map(|property| NodeRef::new(binding.arena, binding.file, property))
+        .ok_or_else(|| unsupported_access(binding))?;
+    let property_record = host.node(property).ok_or_else(invalid)?;
+    let NodeData::ComputedPropertyName(computed) = &property_record.data else {
+        return Err(unsupported_access(binding));
+    };
+    if property_record.kind != SyntaxKind::ComputedPropertyName
+        || property_record.flags.0 != 0
+        || property_record.parent != Some(binding.node)
+        || computed.facts != 0
+        || property_record.range.start < record.range.start
+        || property_record.range.end > record.range.end
+    {
+        return Err(unsupported_access(binding));
+    }
+
+    let name = element
+        .name
+        .map(|name| NodeRef::new(binding.arena, binding.file, name))
+        .ok_or_else(|| unsupported_access(binding))?;
+    let name_record = host.node(name).ok_or_else(invalid)?;
+    if name_record.kind != SyntaxKind::Identifier
+        || !matches!(name_record.data, NodeData::Identifier(_))
+        || name_record.parent != Some(binding.node)
+        || name_record.range.start < property_record.range.end
+        || name_record.range.end > record.range.end
+    {
+        return Err(unsupported_access(binding));
+    }
+
+    let index = NodeRef::new(binding.arena, binding.file, computed.expression);
+    let index_record = host.node(index).ok_or_else(invalid)?;
+    if !store.contains_node_ref(index)
+        || !bound.contains(index)
+        || arena.get(index.node).is_none()
+        || index_record.flags.0 != 0
+        || index_record.parent != Some(property.node)
+        || index_record.range.start < property_record.range.start
+        || index_record.range.end > property_record.range.end
+    {
+        return Err(unsupported_access(binding));
+    }
+    if store.type_node_links(index).is_some_and(|links| {
+        links
+            != &(TypeNodeLinks {
+                resolved_type: links.resolved_type,
+                ..TypeNodeLinks::default()
+            })
+            || links
+                .resolved_type
+                .is_some_and(|cached| cached != index_type)
+    }) {
+        return Err(SourceElementError::InvalidCache(index));
+    }
+    Ok(index)
+}
+
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn check_direct_source_element_with_array_targets(
@@ -1704,6 +1910,62 @@ mod tests {
         .unwrap()
     }
 
+    fn computed_binding_fixture(
+        parsed: &ParseResult,
+        file: FileId,
+    ) -> (CanonicalTypeMapperStore, BoundFile, NodeRef, NodeRef) {
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/computed-binding.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let (symbols, mut files) = binder.finish().try_into_parts().unwrap();
+        let bound = files.remove(&file).unwrap();
+        let binding = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::BindingElement).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let NodeData::BindingElement(element) = &parsed.arena.get(binding.node).unwrap().data
+        else {
+            unreachable!("the selected node is an object binding element")
+        };
+        let property = element.property_name.unwrap();
+        let NodeData::ComputedPropertyName(computed) = &parsed.arena.get(property).unwrap().data
+        else {
+            unreachable!("the binding element has a computed property name")
+        };
+        let index = NodeRef::new(parsed.arena.id(), file, computed.expression);
+        let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
+        assert!(
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .is_some()
+        );
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        (store, bound, binding, index)
+    }
+
     fn published_enum(
         parsed: &ParseResult,
         file: FileId,
@@ -1889,6 +2151,146 @@ mod tests {
             no_implicit_any: true,
             ..CanonicalCheckerOptions::default()
         }
+    }
+
+    #[test]
+    fn computed_binding_broad_keys_emit_ts2537_without_no_implicit_any() {
+        let source = "let foo2 = () => 'bar'; let { [foo2()]: bar3 } = {};";
+        let parsed = parse_fixture(source);
+        let file = FileId::new(640);
+        let (mut store, bound, binding, index) = computed_binding_fixture(&parsed, file);
+        let (string, error) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.error_type)
+        };
+        let object = store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, None)
+            .unwrap();
+        assert!(store.set_structured_type_members(object, None, None, None, None, None));
+        let host = DeclaredTypeHost::new([(&parsed.arena, &bound)]).unwrap();
+
+        for no_implicit_any in [false, true] {
+            let before = (
+                store.type_len(),
+                store.signature_len(),
+                store.checker_link_allocated_lengths(),
+            );
+            let checked = check_computed_binding_element_worker(
+                &mut store,
+                &host,
+                None,
+                CanonicalCheckerOptions {
+                    no_implicit_any,
+                    ..CanonicalCheckerOptions::default()
+                },
+                binding,
+                object,
+                string,
+            )
+            .unwrap();
+
+            assert_eq!(checked.type_, error);
+            let diagnostic = checked.diagnostic.unwrap();
+            assert_eq!(diagnostic.node, Some(index));
+            assert_eq!(diagnostic.diagnostic.code(), 2537);
+            assert_eq!(
+                diagnostic.diagnostic.render().unwrap(),
+                "Type '{}' has no matching index signature for type 'string'."
+            );
+            let range = parsed.arena.get(index.node).unwrap().range;
+            assert_eq!(
+                &source[range.start.get() as usize..range.end.get() as usize],
+                "foo2()"
+            );
+            assert_eq!(
+                (
+                    store.type_len(),
+                    store.signature_len(),
+                    store.checker_link_allocated_lengths(),
+                ),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn computed_binding_uses_matching_index_signatures_without_diagnostics() {
+        let parsed = parse_fixture("let { [key()]: value } = {}; ");
+        let file = FileId::new(641);
+        let (mut store, bound, binding, _) = computed_binding_fixture(&parsed, file);
+        let (string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let object = index_object(&mut store, string, number);
+        let host = DeclaredTypeHost::new([(&parsed.arena, &bound)]).unwrap();
+
+        for index in [string, number] {
+            assert_eq!(
+                check_computed_binding_element_worker(
+                    &mut store,
+                    &host,
+                    None,
+                    CanonicalCheckerOptions::default(),
+                    binding,
+                    object,
+                    index,
+                ),
+                Ok(CheckedSourceElement {
+                    type_: number,
+                    diagnostic: None,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn computed_binding_rejects_poisoned_key_caches_before_diagnostics() {
+        let parsed = parse_fixture("let { [key()]: value } = {}; ");
+        let file = FileId::new(642);
+        let (mut store, bound, binding, index) = computed_binding_fixture(&parsed, file);
+        let (string, number, receiver) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.string_type,
+                bootstrap.number_type,
+                bootstrap.empty_object_type,
+            )
+        };
+        assert!(store.set_type_node_links(
+            index,
+            TypeNodeLinks {
+                resolved_type: Some(number),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        let host = DeclaredTypeHost::new([(&parsed.arena, &bound)]).unwrap();
+        let before = (
+            store.type_len(),
+            store.signature_len(),
+            store.checker_link_allocated_lengths(),
+        );
+
+        assert_eq!(
+            check_computed_binding_element_worker(
+                &mut store,
+                &host,
+                None,
+                CanonicalCheckerOptions::default(),
+                binding,
+                receiver,
+                string,
+            ),
+            Err(SourceElementError::InvalidCache(index))
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.signature_len(),
+                store.checker_link_allocated_lengths(),
+            ),
+            before
+        );
     }
 
     #[test]

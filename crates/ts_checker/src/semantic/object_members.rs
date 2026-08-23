@@ -259,110 +259,172 @@ pub(super) fn validate_stored_declared_call_set(
     let Some(owner_record) = store.symbol(owner) else {
         return StoredDeclaredCallSetValidation::Malformed;
     };
-    let (owner_declaration, structured, members, exact_owner) = match record.data() {
-        TypeData::Object(object) => {
-            let Some([declaration]) = owner_record.declarations() else {
-                return StoredDeclaredCallSetValidation::Malformed;
-            };
-            let alias_valid = match record.alias() {
-                None => true,
-                Some(alias) => store.type_alias(alias).is_some_and(|alias| {
-                    alias.type_arguments().is_none()
-                        && alias.symbol().is_some_and(|symbol| {
-                            store.type_alias_links(symbol).is_some_and(|links| {
-                                links.declared_type == Some(type_)
-                                    && links.type_parameters.is_none()
-                                    && links.instantiations.is_none()
-                            })
-                        })
-                }),
-            };
-            let exact = record.flags() == TypeFlags::OBJECT
-                && record.object_flags() == ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
-                && owner_record.flags() == SymbolFlags::TYPE_LITERAL
-                && owner_record.check_flags() == CheckFlags::NONE
-                && owner_record.name() == InternalSymbolName::Type.as_ref()
-                && owner_record.value_declaration().is_none()
-                && owner_record.exports().is_none()
-                && owner_record.parent().is_none()
-                && owner_record.export_symbol().is_none()
-                && store.get_merged_symbol(owner) == Some(owner)
-                && store.source_node_kind(*declaration) == Some(SyntaxKind::TypeLiteral)
-                && store.type_node_links(*declaration).is_some_and(|links| {
-                    links.resolved_type == Some(type_) && links.outer_type_parameters.is_none()
-                })
-                && alias_valid
-                && valid_object_tail(object);
-            (
-                *declaration,
-                &object.structured,
-                owner_record.members(),
-                exact,
-            )
-        }
-        TypeData::Interface(interface) => {
-            let Some([declaration]) = owner_record.declarations() else {
-                return StoredDeclaredCallSetValidation::Malformed;
-            };
-            let exact = record.flags() == TypeFlags::OBJECT
-                && record.object_flags() == ObjectFlags::INTERFACE | ObjectFlags::MEMBERS_RESOLVED
-                && record.alias().is_none()
-                && owner_record.flags() == SymbolFlags::INTERFACE
-                && owner_record.check_flags() == CheckFlags::NONE
-                && owner_record.name().as_utf8().is_some()
-                && owner_record.value_declaration().is_none()
-                && owner_record.members() == interface.declared_members
-                && owner_record.exports().is_none()
-                && owner_record.export_symbol().is_none()
-                && store.get_merged_symbol(owner) == Some(owner)
-                && store.source_node_kind(*declaration) == Some(SyntaxKind::InterfaceDeclaration)
-                && store
-                    .declared_type_links(owner)
-                    .is_some_and(|links| links.declared_type == Some(type_))
-                && valid_thisless_interface_identity(interface)
-                && interface.base_types_resolved
-                && interface.resolved_base_constructor_type.is_none()
-                && interface.resolved_base_types.is_none()
-                && interface.declared_members_resolved
-                && interface.declared_index_infos.is_none()
-                && match (
-                    interface.declared_call_signatures.as_deref(),
-                    interface.declared_construct_signatures.as_deref(),
-                ) {
-                    (Some(calls), None) => {
-                        calls
-                            == interface
-                                .reference
-                                .object
-                                .structured
-                                .signatures
-                                .as_deref()
-                                .unwrap_or_default()
-                            && interface.reference.object.structured.call_signature_count
-                                == calls.len()
-                    }
-                    (None, Some(constructs)) => {
-                        constructs
-                            == interface
-                                .reference
-                                .object
-                                .structured
-                                .signatures
-                                .as_deref()
-                                .unwrap_or_default()
-                            && interface.reference.object.structured.call_signature_count == 0
-                    }
-                    _ => false,
+    let (owner_declaration, structured, members, exact_owner, inherited_base, own_signature_count) =
+        match record.data() {
+            TypeData::Object(object) => {
+                let Some([declaration]) = owner_record.declarations() else {
+                    return StoredDeclaredCallSetValidation::Malformed;
                 };
-            (
-                *declaration,
-                &interface.reference.object.structured,
-                owner_record.members(),
-                exact,
-            )
-        }
-        _ => return StoredDeclaredCallSetValidation::Malformed,
-    };
+                let alias_valid = match record.alias() {
+                    None => true,
+                    Some(alias) => store.type_alias(alias).is_some_and(|alias| {
+                        alias.type_arguments().is_none()
+                            && alias.symbol().is_some_and(|symbol| {
+                                store.type_alias_links(symbol).is_some_and(|links| {
+                                    links.declared_type == Some(type_)
+                                        && links.type_parameters.is_none()
+                                        && links.instantiations.is_none()
+                                })
+                            })
+                    }),
+                };
+                let exact = record.flags() == TypeFlags::OBJECT
+                    && record.object_flags()
+                        == ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
+                    && owner_record.flags() == SymbolFlags::TYPE_LITERAL
+                    && owner_record.check_flags() == CheckFlags::NONE
+                    && owner_record.name() == InternalSymbolName::Type.as_ref()
+                    && owner_record.value_declaration().is_none()
+                    && owner_record.exports().is_none()
+                    && owner_record.parent().is_none()
+                    && owner_record.export_symbol().is_none()
+                    && store.get_merged_symbol(owner) == Some(owner)
+                    && store.source_node_kind(*declaration) == Some(SyntaxKind::TypeLiteral)
+                    && store.type_node_links(*declaration).is_some_and(|links| {
+                        links.resolved_type == Some(type_) && links.outer_type_parameters.is_none()
+                    })
+                    && alias_valid
+                    && valid_object_tail(object);
+                (
+                    *declaration,
+                    &object.structured,
+                    owner_record.members(),
+                    exact,
+                    None,
+                    object.structured.signatures.as_ref().map_or(0, Vec::len),
+                )
+            }
+            TypeData::Interface(interface) => {
+                let Some([declaration]) = owner_record.declarations() else {
+                    return StoredDeclaredCallSetValidation::Malformed;
+                };
+                let inherited_base = match interface.resolved_base_types.as_deref() {
+                    None => None,
+                    Some([base]) if *base != type_ => Some(*base),
+                    _ => return StoredDeclaredCallSetValidation::Malformed,
+                };
+                let declared_calls = interface.declared_call_signatures.as_deref();
+                let declared_constructs = interface.declared_construct_signatures.as_deref();
+                let own_signature_count = declared_calls.map_or_else(
+                    || declared_constructs.map_or(0, <[SignatureId]>::len),
+                    <[SignatureId]>::len,
+                );
+                let inherited_base_valid = inherited_base.is_none_or(|base| {
+                    let Some(base_record) = store.type_payload(base) else {
+                        return false;
+                    };
+                    let Some(base_owner) = base_record.symbol() else {
+                        return false;
+                    };
+                    let Some(provenance) = store.direct_interface_heritage_provenance(type_) else {
+                        return false;
+                    };
+                    let TypeData::Interface(base_interface) = base_record.data() else {
+                        return false;
+                    };
+                    let Some(base_signatures) = base_interface
+                        .reference
+                        .object
+                        .structured
+                        .signatures
+                        .as_deref()
+                    else {
+                        return false;
+                    };
+                    let Some(signatures) =
+                        interface.reference.object.structured.signatures.as_deref()
+                    else {
+                        return false;
+                    };
+                    provenance.owner_symbol == owner
+                        && provenance.base_symbol == base_owner
+                        && provenance.base_type == base
+                        && provenance.second_base.is_none()
+                        && base_interface.resolved_base_types.is_none()
+                        && declared_constructs.is_none()
+                        && declared_calls.is_some_and(|calls| {
+                            !calls.is_empty()
+                                && signatures.len() == calls.len() + base_signatures.len()
+                                && signatures.starts_with(calls)
+                                && signatures[calls.len()..] == *base_signatures
+                        })
+                        && matches!(
+                            validate_stored_declared_call_set(store, base),
+                            StoredDeclaredCallSetValidation::Valid(_)
+                        )
+                });
+                let exact = record.flags() == TypeFlags::OBJECT
+                    && record.object_flags()
+                        == ObjectFlags::INTERFACE | ObjectFlags::MEMBERS_RESOLVED
+                    && record.alias().is_none()
+                    && owner_record.flags() == SymbolFlags::INTERFACE
+                    && owner_record.check_flags() == CheckFlags::NONE
+                    && owner_record.name().as_utf8().is_some()
+                    && owner_record.value_declaration().is_none()
+                    && owner_record.members() == interface.declared_members
+                    && owner_record.exports().is_none()
+                    && owner_record.export_symbol().is_none()
+                    && store.get_merged_symbol(owner) == Some(owner)
+                    && store.source_node_kind(*declaration)
+                        == Some(SyntaxKind::InterfaceDeclaration)
+                    && store
+                        .declared_type_links(owner)
+                        .is_some_and(|links| links.declared_type == Some(type_))
+                    && valid_thisless_interface_identity(interface)
+                    && interface.base_types_resolved
+                    && interface.resolved_base_constructor_type.is_none()
+                    && inherited_base_valid
+                    && interface.declared_members_resolved
+                    && interface.declared_index_infos.is_none()
+                    && match (declared_calls, declared_constructs) {
+                        (Some(calls), None) => {
+                            let signatures = interface
+                                .reference
+                                .object
+                                .structured
+                                .signatures
+                                .as_deref()
+                                .unwrap_or_default();
+                            signatures.starts_with(calls)
+                                && interface.reference.object.structured.call_signature_count
+                                    == signatures.len()
+                                && (inherited_base.is_some() || signatures == calls)
+                        }
+                        (None, Some(constructs)) => {
+                            inherited_base.is_none()
+                                && constructs
+                                    == interface
+                                        .reference
+                                        .object
+                                        .structured
+                                        .signatures
+                                        .as_deref()
+                                        .unwrap_or_default()
+                                && interface.reference.object.structured.call_signature_count == 0
+                        }
+                        _ => false,
+                    };
+                (
+                    *declaration,
+                    &interface.reference.object.structured,
+                    owner_record.members(),
+                    exact,
+                    inherited_base,
+                    own_signature_count,
+                )
+            }
+            _ => return StoredDeclaredCallSetValidation::Malformed,
+        };
     let Some(signatures) = structured.signatures.as_deref() else {
         return StoredDeclaredCallSetValidation::Malformed;
     };
@@ -370,7 +432,8 @@ pub(super) fn validate_stored_declared_call_set(
     if !exact_owner
         || signatures.is_empty()
         || structured.constrained != ConstrainedTypeData::default()
-        || structured.members != members
+        || inherited_base.is_none() && structured.members != members
+        || inherited_base.is_some() && structured.members == members
         || structured.properties.is_some()
         || !constructs && structured.call_signature_count != signatures.len()
         || structured.index_infos.is_some()
@@ -391,6 +454,16 @@ pub(super) fn validate_stored_declared_call_set(
     let Some(call_symbol) = members.get(name.as_ref()).filter(|_| members.len() == 1) else {
         return StoredDeclaredCallSetValidation::Malformed;
     };
+    if inherited_base.is_some()
+        && structured
+            .members
+            .and_then(|members| store.symbol_table(members))
+            .is_none_or(|members| {
+                members.len() != 1 || members.get(name.as_ref()) != Some(call_symbol)
+            })
+    {
+        return StoredDeclaredCallSetValidation::Malformed;
+    }
     let Some(call_record) = store.symbol(call_symbol) else {
         return StoredDeclaredCallSetValidation::Malformed;
     };
@@ -402,7 +475,9 @@ pub(super) fn validate_stored_declared_call_set(
         || call_record.flags() != SymbolFlags::SIGNATURE
         || call_record.check_flags() != CheckFlags::NONE
         || call_record.name() != name.as_ref()
-        || call_record.declarations() != Some(declarations.as_slice())
+        || own_signature_count == 0
+        || own_signature_count > declarations.len()
+        || call_record.declarations() != Some(&declarations[..own_signature_count])
         || call_record.value_declaration().is_some()
         || call_record.members().is_some()
         || call_record.exports().is_some()
@@ -415,7 +490,9 @@ pub(super) fn validate_stored_declared_call_set(
 
     let mut edges = Vec::new();
     let mut seen_signatures = HashSet::with_capacity(signatures.len());
-    for (signature, declaration) in signatures.iter().copied().zip(declarations) {
+    for (index, (signature, declaration)) in
+        signatures.iter().copied().zip(declarations).enumerate()
+    {
         let Some(signature_record) = store.signature(signature) else {
             return StoredDeclaredCallSetValidation::Malformed;
         };
@@ -431,8 +508,29 @@ pub(super) fn validate_stored_declared_call_set(
             return StoredDeclaredCallSetValidation::Malformed;
         };
         let minimum = usize::try_from(signature_record.min_argument_count()).ok();
+        let provider = if index < own_signature_count {
+            type_
+        } else {
+            let Some(base) = inherited_base else {
+                return StoredDeclaredCallSetValidation::Malformed;
+            };
+            base
+        };
+        let provider_declaration = if provider == type_ {
+            owner_declaration
+        } else {
+            let Some([declaration]) = store
+                .type_payload(provider)
+                .and_then(TypeRecord::symbol)
+                .and_then(|owner| store.symbol(owner))
+                .and_then(ts_binder::semantic::Symbol::declarations)
+            else {
+                return StoredDeclaredCallSetValidation::Malformed;
+            };
+            *declaration
+        };
         if !seen_signatures.insert(signature)
-            || store.declared_call_set_type_for_signature(signature) != Some(type_)
+            || store.declared_call_set_type_for_signature(signature) != Some(provider)
             || store.source_node_kind(declaration)
                 != Some(if constructs {
                     SyntaxKind::ConstructSignature
@@ -440,7 +538,7 @@ pub(super) fn validate_stored_declared_call_set(
                     SyntaxKind::CallSignature
                 })
             || store.source_node_parent(declaration)
-                != Some(SourceNodeParent::Parent(owner_declaration))
+                != Some(SourceNodeParent::Parent(provider_declaration))
             || store.signature_links(declaration)
                 != Some(&SignatureLinks {
                     resolved_signature: ResolvedSignatureState::Resolved(signature),
@@ -1031,7 +1129,17 @@ pub(super) fn plan_interface(
                     kind: SyntaxKind::ExpressionWithTypeArguments,
                 });
             }
-            if let Some(call) = base_plan.call_signatures.first() {
+            if let Some(call) = base_plan.call_signatures.first()
+                && (heritage.bases.len() != 1
+                    || !base_plan.properties.is_empty()
+                    || !plan.properties.is_empty()
+                    || plan.call_signatures.is_empty()
+                    || call.is_construct()
+                    || plan
+                        .call_signatures
+                        .iter()
+                        .any(PlannedCallSignature::is_construct))
+            {
                 return Err(PropertyObjectError::UnsupportedMember {
                     node: call.declaration,
                     kind: call.syntax_kind(),
@@ -1066,7 +1174,17 @@ pub(super) fn plan_interface(
             }
             base_plans.push(base_plan);
         }
-        if let Some(call) = plan.call_signatures.first() {
+        if let Some(call) = plan.call_signatures.first()
+            && (base_plans.len() != 1
+                || base_plans[0].call_signatures.is_empty()
+                || !base_plans[0].properties.is_empty()
+                || !plan.properties.is_empty()
+                || call.is_construct()
+                || base_plans[0]
+                    .call_signatures
+                    .iter()
+                    .any(PlannedCallSignature::is_construct))
+        {
             return Err(PropertyObjectError::UnsupportedMember {
                 node: call.declaration,
                 kind: call.syntax_kind(),
@@ -6000,6 +6118,199 @@ mod generic_publication_tests {
                 fixture.store.checker_link_allocated_lengths(),
             ),
             warm,
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn inherited_interface_call_signatures_keep_their_declared_owner_and_order() {
+        let mut fixture = interface_fixture(
+            concat!(
+                "interface Base { (): string } ",
+                "interface Derived extends Base { (key: string): string }",
+            ),
+            3_721,
+        );
+        let derived_declaration = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::InterfaceDeclaration(interface) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(name) = &fixture.parsed.arena.get(interface.name)?.data
+                else {
+                    return None;
+                };
+                (name.text == "Derived").then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .expect("the fixture contains its derived interface");
+        let derived_symbol = fixture
+            .bound
+            .symbol(derived_declaration)
+            .expect("the derived interface has one binder-owned symbol");
+        let globals = fixture.store.intrinsic_bootstrap().unwrap().globals;
+        fixture
+            .store
+            .merge_global_symbol(globals, derived_symbol)
+            .unwrap();
+        let host = host(&fixture.parsed, &fixture.bound);
+        let base_plan = plan_interface(&fixture.store, &host, fixture.symbol).unwrap();
+        let derived_plan = plan_interface(&fixture.store, &host, derived_symbol).unwrap();
+        assert_eq!(base_plan.call_signatures.len(), 1);
+        assert_eq!(derived_plan.call_signatures.len(), 1);
+        assert_ne!(
+            base_plan.call_signatures[0].symbol,
+            derived_plan.call_signatures[0].symbol,
+        );
+        assert_eq!(
+            fixture
+                .store
+                .symbol(derived_plan.call_signatures[0].symbol)
+                .and_then(ts_binder::semantic::Symbol::declarations),
+            Some([derived_plan.call_signatures[0].declaration].as_slice()),
+        );
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let derived_type = CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalCheckerOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_declared_type_of_symbol(derived_symbol)
+        .unwrap();
+        let base_type = fixture
+            .store
+            .declared_type_links(fixture.symbol)
+            .and_then(|links| links.declared_type)
+            .expect("the direct base is resolved before derived publication");
+        let (members, declared_members, own_signature, inherited_signature) = {
+            let TypeData::Interface(interface) =
+                fixture.store.type_payload(derived_type).unwrap().data()
+            else {
+                panic!("callable heritage must preserve the interface payload")
+            };
+            let [own] = interface.declared_call_signatures.as_deref().unwrap() else {
+                panic!("only the derived call signature belongs to declared members")
+            };
+            let [first, inherited] = interface
+                .reference
+                .object
+                .structured
+                .signatures
+                .as_deref()
+                .unwrap()
+            else {
+                panic!("the resolved interface must retain own and inherited signatures")
+            };
+            assert_eq!(*first, *own);
+            assert_eq!(
+                interface.reference.object.structured.call_signature_count,
+                2
+            );
+            (
+                interface.reference.object.structured.members,
+                interface.declared_members,
+                *own,
+                *inherited,
+            )
+        };
+        assert_ne!(members, declared_members);
+        assert_eq!(
+            fixture
+                .store
+                .declared_call_set_type_for_signature(own_signature),
+            Some(derived_type),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .declared_call_set_type_for_signature(inherited_signature),
+            Some(base_type),
+        );
+        let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        assert_eq!(
+            validate_stored_declared_call_set(&fixture.store, derived_type),
+            StoredDeclaredCallSetValidation::Valid(vec![string, string, string]),
+        );
+
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.symbol_store().symbol_table_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalCheckerOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_declared_type_of_symbol(derived_symbol),
+            Ok(derived_type),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.symbol_store().symbol_table_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+
+        assert!(fixture.store.set_structured_type_members(
+            derived_type,
+            members,
+            None,
+            Some(vec![inherited_signature, own_signature]),
+            None,
+            None,
+        ));
+        assert_eq!(
+            validate_stored_declared_call_set(&fixture.store, derived_type),
+            StoredDeclaredCallSetValidation::Malformed,
+        );
+        assert!(fixture.store.set_structured_type_members(
+            derived_type,
+            members,
+            None,
+            Some(vec![own_signature, inherited_signature]),
+            None,
+            None,
+        ));
+        assert!(fixture.store.set_structured_type_members(
+            derived_type,
+            declared_members,
+            None,
+            Some(vec![own_signature, inherited_signature]),
+            None,
+            None,
+        ));
+        assert_eq!(
+            validate_stored_declared_call_set(&fixture.store, derived_type),
+            StoredDeclaredCallSetValidation::Malformed,
+        );
+        assert!(fixture.store.set_structured_type_members(
+            derived_type,
+            members,
+            None,
+            Some(vec![own_signature, inherited_signature]),
+            None,
+            None,
+        ));
+        assert_eq!(
+            validate_stored_declared_call_set(&fixture.store, derived_type),
+            StoredDeclaredCallSetValidation::Valid(vec![string, string, string]),
         );
         assert!(diagnostics.is_empty());
     }

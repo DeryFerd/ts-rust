@@ -1038,6 +1038,55 @@ fn missing_property_diagnostic(
     }
 }
 
+/// Reports required target properties absent from another declared object.
+pub(super) fn missing_declared_property_diagnostic(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source_type: TypeId,
+    target_type: TypeId,
+    fallback_node: NodeRef,
+    flags: CanonicalTypeFormatFlags,
+) -> Result<Option<CanonicalCheckerDiagnostic>, SourceCheckError> {
+    for type_ in [source_type, target_type] {
+        match validate_resolved_declared_property_type_graph(store, type_) {
+            DeclaredPropertyTypeGraphValidation::Traversable(_) => {}
+            DeclaredPropertyTypeGraphValidation::Opaque => return Ok(None),
+            DeclaredPropertyTypeGraphValidation::Malformed => {
+                return Err(invalid_structure(type_));
+            }
+        }
+    }
+
+    let source = store
+        .resolved_declared_property_object(host, source_type)?
+        .ok_or_else(|| invalid_structure(source_type))?;
+    let target = store
+        .resolved_declared_property_object(host, target_type)?
+        .ok_or_else(|| invalid_structure(target_type))?;
+    let mut missing = Vec::new();
+    for property in target.properties() {
+        if !property.optional && source.get_source(property_name(property)?).is_none() {
+            missing.push(property);
+        }
+    }
+    if missing.is_empty() {
+        return Ok(None);
+    }
+
+    missing_property_diagnostic(
+        store,
+        host,
+        global_types,
+        source_type,
+        target_type,
+        fallback_node,
+        &missing,
+        flags,
+    )
+    .map(Some)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn generic_assignability_diagnostic(
     store: &mut CanonicalTypeMapperStore,
@@ -1639,6 +1688,119 @@ mod tests {
         });
         assert!(complete.contains(CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT));
         assert!(complete.contains(CanonicalTypeFormatFlags::NO_TRUNCATION));
+    }
+
+    #[test]
+    fn declared_object_missing_property_keeps_argument_and_declaration_locations() {
+        let parsed = parse_source_file(concat!(
+            "interface Target { required: number; optional?: string } ",
+            "interface Source { provided: string } ",
+            "declare let argument: Source;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(213);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/declared-missing-property.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            [(file, &parsed.arena)].into_iter().collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new([(&parsed.arena, &bound)]).unwrap();
+        let global_types = context.global_types().clone();
+        let interface_type = |name: &str| {
+            let declaration = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::InterfaceDeclaration(interface) = &record.data else {
+                        return None;
+                    };
+                    let NodeData::Identifier(identifier) = &parsed.arena.get(interface.name)?.data
+                    else {
+                        return None;
+                    };
+                    (identifier.text == name).then_some(NodeRef::new(parsed.arena.id(), file, node))
+                })
+                .unwrap();
+            let symbol = bound.symbol(declaration).unwrap();
+            context
+                .store()
+                .declared_type_links(symbol)
+                .and_then(|links| links.declared_type)
+                .unwrap()
+        };
+        let source_type = interface_type("Source");
+        let target_type = interface_type("Target");
+        let argument = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::TypeReference).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+
+        let diagnostic = missing_declared_property_diagnostic(
+            context.store_mut_for_test(),
+            &host,
+            &global_types,
+            source_type,
+            target_type,
+            argument,
+            CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(diagnostic.node, Some(argument));
+        assert_eq!(diagnostic.diagnostic.code(), 2741);
+        assert_eq!(
+            diagnostic.diagnostic.arguments,
+            ["required", "Source", "Target"],
+        );
+        let [related] = diagnostic.related_information.as_slice() else {
+            panic!("the missing property must retain its declaration")
+        };
+        assert_eq!(related.diagnostic.code(), 2728);
+        assert_eq!(related.diagnostic.arguments, ["required"]);
+        let declaration = parsed
+            .arena
+            .get(
+                related
+                    .node
+                    .expect("the related declaration has a node")
+                    .node,
+            )
+            .unwrap();
+        let NodeData::Identifier(identifier) = &declaration.data else {
+            panic!("the related declaration must point at the property name")
+        };
+        assert_eq!(identifier.text, "required");
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]

@@ -30,11 +30,16 @@ use super::{
     classes::{ClassHeritageMembersValidation, validate_class_heritage_members},
     derived_types::DerivedObjectLiteralValidation,
     enums,
+    generic_calls::{
+        GenericCallVectorError, GenericCallVectorInvariant, GenericCallVectorUnsupported,
+        instantiate_generic_signature_in_context_of,
+    },
     ids::{IndexInfoId, SignatureId, TypeId},
     indexed_access_types::{is_template_pattern_index_key, template_pattern_index_matches_name},
     instantiated_members::{GenericInterfaceMemberError, validate_generic_interface_members},
     intersection_types::IntersectionTypeProjection,
     links::{MembersOrExportsResolutionKind, ValueSymbolLinks},
+    mapped_types::{FiniteRecordMappedProjection, MappedTypeError},
     mapper::TypeMapper,
     relation::{
         ExpandingFlags, IntersectionState, RecursionFlags, RecursionIdentityUnavailable,
@@ -381,6 +386,7 @@ pub(super) struct ResolvedOwnProperty {
 enum ObjectPropertyOrigin {
     Declared,
     ValidatedClass,
+    FiniteMappedRecord(TypeId),
     GenericReference(TypeId),
     Intersection(TypeId),
     FreshObjectLiteral(SemanticSymbolId),
@@ -2707,6 +2713,90 @@ impl<'store> RelaterSession<'store> {
         result
     }
 
+    fn effective_array_rest_element(
+        &self,
+        callable: &ValidatedSingleCallable,
+    ) -> Result<Option<TypeId>, RelationUnavailable> {
+        let Some(rest) = callable.rest_parameter else {
+            return Ok(None);
+        };
+        let Some(global_types) = self.global_types else {
+            return Ok(None);
+        };
+        let array = self
+            .store
+            .canonical_array_reference_with_targets(global_types.array_targets, rest)
+            .map_err(|_| RelationUnavailable::MalformedFunctionType(callable.owner))?;
+        match array {
+            Some(array) if !array.readonly && !array.array_literal => Ok(Some(array.element_type)),
+            Some(_) => Err(RelationUnavailable::MalformedFunctionType(callable.owner)),
+            None => Ok(None),
+        }
+    }
+
+    /// Instantiates an authenticated source generic against its canonical
+    /// string-array rest target through the shared signature cache.
+    fn contextual_generic_rest_source(
+        &mut self,
+        source: &ValidatedSingleCallable,
+        target: &ValidatedSingleCallable,
+        target_rest_element: Option<TypeId>,
+    ) -> Result<Option<ValidatedSingleCallable>, RelationUnavailable> {
+        let source_signature = self
+            .store
+            .signature(source.signature)
+            .ok_or(RelationUnavailable::MalformedFunctionType(source.owner))?;
+        let target_signature = self
+            .store
+            .signature(target.signature)
+            .ok_or(RelationUnavailable::MalformedFunctionType(target.owner))?;
+        if source_signature.type_parameters().is_empty()
+            || !target_signature.type_parameters().is_empty()
+            || target_rest_element != Some(self.bootstrap.string_type)
+            || !target.parameters.is_empty()
+            || source.rest_parameter.is_some()
+            || source.min_argument_count != 0
+            || source_signature.flags() != SignatureFlags::NONE
+            || target_signature.flags() != SignatureFlags::HAS_REST_PARAMETER
+            || target.return_type != target_rest_element
+        {
+            return Ok(None);
+        }
+        instantiate_generic_signature_in_context_of(
+            self.store,
+            source,
+            target,
+            self.global_types.map(|globals| globals.array_targets),
+        )
+        .map(Some)
+        .map_err(|error| match error {
+            GenericCallVectorError::Relation(error) => error,
+            GenericCallVectorError::Unsupported(
+                GenericCallVectorUnsupported::UnresolvedReturnType(signature),
+            ) => RelationUnavailable::UnresolvedSignatureReturn(signature),
+            GenericCallVectorError::Invariant(GenericCallVectorInvariant::MissingBootstrap) => {
+                RelationUnavailable::MissingBootstrap
+            }
+            GenericCallVectorError::Invariant(GenericCallVectorInvariant::Capacity(_)) => {
+                RelationUnavailable::UnionValidationCapacity(source.owner)
+            }
+            GenericCallVectorError::Invariant(GenericCallVectorInvariant::InvalidArrayType {
+                type_,
+                ..
+            }) => RelationUnavailable::MalformedCanonicalArrayReference(type_),
+            GenericCallVectorError::Invariant(_) => {
+                RelationUnavailable::MalformedFunctionType(source.owner)
+            }
+            GenericCallVectorError::Unsupported(_)
+            | GenericCallVectorError::Inference(_)
+            | GenericCallVectorError::Instantiation(_) => RelationUnavailable::StructuralRelation {
+                source: source.owner,
+                target: target.owner,
+                relation: self.relation,
+            },
+        })
+    }
+
     fn compare_signatures_related_worker(
         &mut self,
         source: &ValidatedSingleCallable,
@@ -2714,28 +2804,48 @@ impl<'store> RelaterSession<'store> {
         check_mode: SignatureCheckMode,
         intersection_state: IntersectionState,
     ) -> Result<Ternary, RelationUnavailable> {
-        let target_count = target.parameters.len();
-        let source_has_more_parameters = if check_mode.intersects(SignatureCheckMode::STRICT_ARITY)
-        {
-            source.parameters.len() > target_count
-        } else {
-            source.min_argument_count > target_count
-        };
+        let target_rest_element = self.effective_array_rest_element(target)?;
+        let source_rest_element = self.effective_array_rest_element(source)?;
+        let target_has_effective_rest = target_rest_element.is_some();
+        let target_count = target.parameters.len() + usize::from(target_has_effective_rest);
+        let source_has_more_parameters = !target_has_effective_rest
+            && if check_mode.intersects(SignatureCheckMode::STRICT_ARITY) {
+                source.parameters.len() + usize::from(source_rest_element.is_some()) > target_count
+            } else {
+                source.min_argument_count > target_count
+            };
         if source_has_more_parameters {
             return Ok(Ternary::False);
         }
 
+        let contextual_source =
+            self.contextual_generic_rest_source(source, target, target_rest_element)?;
+        let source = contextual_source.as_ref().unwrap_or(source);
+        let source_rest_element = if contextual_source.is_some() {
+            self.effective_array_rest_element(source)?
+        } else {
+            source_rest_element
+        };
         let strict_variance = !check_mode.intersects(SignatureCheckMode::CALLBACK)
             && !target.strict_variance_exempt
             && self
                 .strict_function_types
                 .ok_or(RelationUnavailable::StructuredSignatures(target.owner))?;
         let mut result = Ternary::True;
-        let parameter_count = source.parameters.len().max(target.parameters.len());
+        let source_count = source.parameters.len() + usize::from(source_rest_element.is_some());
+        let parameter_count = source_count.max(target_count);
         for index in 0..parameter_count {
             let (Some(source_type), Some(target_type)) = (
-                source.parameters.get(index).copied(),
-                target.parameters.get(index).copied(),
+                source
+                    .parameters
+                    .get(index)
+                    .copied()
+                    .or(source_rest_element),
+                target
+                    .parameters
+                    .get(index)
+                    .copied()
+                    .or(target_rest_element),
             ) else {
                 continue;
             };
@@ -3330,6 +3440,28 @@ impl<'store> RelaterSession<'store> {
                     Err(RelationUnavailable::UnsupportedProperty(symbol))
                 };
             }
+            ObjectPropertyOrigin::FiniteMappedRecord(receiver) => {
+                let projection = self.validated_finite_record_mapped_projection(receiver)?;
+                let Some(property) = projection
+                    .properties
+                    .iter()
+                    .find(|property| property.symbol == symbol)
+                else {
+                    return Err(RelationUnavailable::UnsupportedProperty(symbol));
+                };
+                return if property.name.as_ref() == record.name()
+                    && property.optional == record.flags().contains(SymbolFlags::OPTIONAL)
+                    && property.readonly == record.check_flags().contains(CheckFlags::READONLY)
+                    && self.store.get_merged_symbol(symbol) == Some(symbol)
+                    && self.store.value_symbol_links(symbol).is_some_and(|links| {
+                        links.containing_type == Some(receiver)
+                            && links.resolved_type == Some(property.type_)
+                    }) {
+                    Ok(record)
+                } else {
+                    Err(RelationUnavailable::InvalidStructuredMembers(receiver))
+                };
+            }
             ObjectPropertyOrigin::GenericReference(reference)
                 if record.flags().contains(SymbolFlags::TRANSIENT) =>
             {
@@ -3430,7 +3562,8 @@ impl<'store> RelaterSession<'store> {
                 }
                 ObjectPropertyOrigin::FreshObjectLiteral(_)
                 | ObjectPropertyOrigin::DerivedObjectLiteral { .. }
-                | ObjectPropertyOrigin::Intersection(_) => {
+                | ObjectPropertyOrigin::Intersection(_)
+                | ObjectPropertyOrigin::FiniteMappedRecord(_) => {
                     unreachable!("literal property origins return before declared validation")
                 }
             };
@@ -3749,6 +3882,10 @@ impl<'store> RelaterSession<'store> {
             self.intersection_projection(type_id)?;
             return Ok(());
         }
+        if matches!(record.data(), TypeData::Mapped(_)) {
+            self.validated_finite_record_mapped_projection(type_id)?;
+            return Ok(());
+        }
         if record.flags() != TypeFlags::OBJECT || !self.supports_property_object_alias(type_id) {
             return Err(RelationUnavailable::UnsupportedStructuredType(type_id));
         }
@@ -3870,6 +4007,47 @@ impl<'store> RelaterSession<'store> {
             _ => return Err(RelationUnavailable::UnsupportedStructuredType(type_id)),
         }
         Ok(())
+    }
+
+    fn validated_finite_record_mapped_projection(
+        &self,
+        type_id: TypeId,
+    ) -> Result<FiniteRecordMappedProjection, RelationUnavailable> {
+        self.store
+            .finite_record_mapped_projection(type_id)
+            .map_err(|error| match error {
+                MappedTypeError::BootstrapUninitialized => RelationUnavailable::MissingBootstrap,
+                MappedTypeError::InvalidCachedMembers(_)
+                    if self.store.type_payload(type_id).is_some_and(|record| {
+                        !record
+                            .object_flags()
+                            .contains(ObjectFlags::MEMBERS_RESOLVED)
+                    }) =>
+                {
+                    RelationUnavailable::UnresolvedStructuredMembers(type_id)
+                }
+                MappedTypeError::UnsupportedSource(_)
+                | MappedTypeError::UnsupportedConstraint(_)
+                | MappedTypeError::UnsupportedNameType(_)
+                | MappedTypeError::UnsupportedTemplate(_)
+                | MappedTypeError::RecursiveMembers(_)
+                | MappedTypeError::CrossProductTooLarge { .. } => {
+                    RelationUnavailable::UnsupportedStructuredType(type_id)
+                }
+                MappedTypeError::Capacity => RelationUnavailable::UnionValidationCapacity(type_id),
+                MappedTypeError::Declared(_)
+                | MappedTypeError::InvalidDeclaration(_)
+                | MappedTypeError::InvalidSymbol(_)
+                | MappedTypeError::InvalidTypeParameter(_)
+                | MappedTypeError::InvalidMappedType(_)
+                | MappedTypeError::InvalidModifiers
+                | MappedTypeError::InvalidSource(_)
+                | MappedTypeError::InvalidCachedMembers(_)
+                | MappedTypeError::InvalidCachedProperty(_)
+                | MappedTypeError::CircularProperty(_) => {
+                    RelationUnavailable::InvalidStructuredMembers(type_id)
+                }
+            })
     }
 
     fn validate_derived_object_literal(&self, type_id: TypeId) -> DerivedObjectLiteralValidation {
@@ -4210,6 +4388,31 @@ impl<'store> RelaterSession<'store> {
                     error
                 }
             })?;
+        if matches!(
+            self.store.type_payload(type_id).map(TypeRecord::data),
+            Some(TypeData::Mapped(_))
+        ) {
+            let projection = self.validated_finite_record_mapped_projection(type_id)?;
+            self.observe_symbol_table(projection.members);
+            for property in &projection.properties {
+                self.property_symbol(
+                    property.symbol,
+                    ObjectPropertyOrigin::FiniteMappedRecord(type_id),
+                )?;
+            }
+            return Ok(ResolvedObjectMembers {
+                members: Some(projection.members),
+                properties: projection
+                    .properties
+                    .into_iter()
+                    .map(|property| property.symbol)
+                    .collect(),
+                index_infos: Vec::new(),
+                property_origin: ObjectPropertyOrigin::FiniteMappedRecord(type_id),
+                call_signature: None,
+                exact_callable: false,
+            });
+        }
         if let Some(call_signature) = self.project_exact_callable_signature(type_id)? {
             let members = self
                 .store
@@ -6134,11 +6337,11 @@ mod tests {
         ResolvedOwnProperty,
     };
     use crate::semantic::{
-        CanonicalCheckerDiagnostics, CanonicalGlobalTypeInitializationError,
-        CanonicalTypeMapperStore, DeclaredTypeHost, DeclaredTypeLinks, IntrinsicBootstrapOptions,
-        MembersAndExportsLinks, MembersOrExportsResolutionKind, RelationComparisonResult,
-        RelationKind, SignatureId, SignatureLinks, TypeAliasLinks, TypeId, TypeNodeLinks,
-        ValueSymbolLinks,
+        CanonicalCheckerContext, CanonicalCheckerDiagnostics, CanonicalCheckerOptions,
+        CanonicalGlobalTypeInitializationError, CanonicalTypeMapperStore, DeclaredTypeHost,
+        DeclaredTypeLinks, IntrinsicBootstrapOptions, MembersAndExportsLinks,
+        MembersOrExportsResolutionKind, RelationComparisonResult, RelationKind, SignatureId,
+        SignatureLinks, TypeAliasLinks, TypeId, TypeNodeLinks, ValueSymbolLinks,
         array_types::CanonicalArrayTargets,
         classes::{
             ClassMembers, execute_nongeneric_class_member_query, plan_nongeneric_class_member_query,
@@ -6232,6 +6435,78 @@ mod tests {
             files,
             store,
         }
+    }
+
+    fn source_relation_context<'arena>(
+        library: &'arena ParseResult,
+        source: &'arena ParseResult,
+        file: FileId,
+        options: CanonicalCheckerOptions,
+    ) -> CanonicalCheckerContext<'arena> {
+        let library_file = FileId::new(96_450);
+        let mut binder = CanonicalBinder::new();
+        for (parsed, file, path) in [
+            (library, library_file, "\"/relation-lib.d.ts\""),
+            (source, file, "\"/relation-source.ts\""),
+        ] {
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(path),
+                        CanonicalSourceLanguage::TypeScript,
+                        false,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            [(library_file, &library.arena), (file, &source.arena)]
+                .into_iter()
+                .collect(),
+            options,
+        )
+        .unwrap()
+    }
+
+    fn source_function_callable(
+        context: &CanonicalCheckerContext<'_>,
+        source: &ParseResult,
+        file: FileId,
+        name: &str,
+    ) -> (TypeId, SignatureId) {
+        let declaration = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::FunctionDeclaration(function) = &record.data else {
+                    return None;
+                };
+                let identifier = function.name.and_then(|name| source.arena.get(name))?;
+                let NodeData::Identifier(identifier) = &identifier.data else {
+                    return None;
+                };
+                (identifier.text == name).then_some(NodeRef::new(source.arena.id(), file, node))
+            })
+            .unwrap_or_else(|| panic!("missing source function {name}"));
+        let owner = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        let type_ = context
+            .store()
+            .source_callable_type_for_owner(owner)
+            .unwrap();
+        let signature = context
+            .store()
+            .source_callable_provenance(type_)
+            .unwrap()
+            .signature;
+        (type_, signature)
     }
 
     fn relation_host<'a>(arena: &'a NodeArena, bound: &'a BoundFile) -> DeclaredTypeHost<'a> {
@@ -6414,6 +6689,174 @@ mod tests {
         .get_return_type_of_signature(signature)
         .unwrap();
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn generic_source_signatures_infer_canonical_contextual_rest_elements() {
+        for strict_null_checks in [false, true] {
+            let library = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
+            let source = parse_source_file(concat!(
+                "declare function choose<First, Second>(first?: First, second?: Second): Second; ",
+                "declare function contextual(...values: string[]): string;",
+            ));
+            assert!(library.diagnostics.is_empty());
+            assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+            let file = FileId::new(96_451 + u32::from(strict_null_checks));
+            let mut context = source_relation_context(
+                &library,
+                &source,
+                file,
+                CanonicalCheckerOptions {
+                    intrinsic: IntrinsicBootstrapOptions {
+                        strict_null_checks,
+                        exact_optional_property_types: false,
+                    },
+                    strict_function_types: true,
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+            context.check_source_file(file).unwrap();
+            assert!(context.diagnostics().is_empty());
+            let (generic, generic_signature) =
+                source_function_callable(&context, &source, file, "choose");
+            let (contextual, _) = source_function_callable(&context, &source, file, "contextual");
+            let globals = context.global_types().clone();
+            let store = context.store_mut_for_test();
+            let before = (
+                store.mapper_len(),
+                store.signature_len(),
+                store.cached_signature_len(),
+            );
+
+            assert_eq!(
+                store.is_type_assignable_to_with_global_types_and_strict_function_types(
+                    generic, contextual, &globals, true,
+                ),
+                Ok(true),
+            );
+            let warm = (
+                store.mapper_len(),
+                store.signature_len(),
+                store.cached_signature_len(),
+            );
+            assert_eq!(warm, (before.0 + 1, before.1 + 1, before.2 + 1));
+            assert_eq!(
+                store.is_type_assignable_to_with_global_types_and_strict_function_types(
+                    generic, contextual, &globals, true,
+                ),
+                Ok(true),
+            );
+            assert_eq!(
+                (
+                    store.mapper_len(),
+                    store.signature_len(),
+                    store.cached_signature_len()
+                ),
+                warm,
+            );
+
+            let original_return = store
+                .signature(generic_signature)
+                .unwrap()
+                .resolved_return_type();
+            let poison = store.intrinsic_bootstrap().unwrap().number_type;
+            assert!(store.set_signature_resolved_return_type(generic_signature, Some(poison)));
+            let poisoned = store.relation_state_snapshot();
+            assert_eq!(
+                store.is_type_assignable_to_with_global_types_and_strict_function_types(
+                    generic, contextual, &globals, true,
+                ),
+                Err(RelationUnavailable::MalformedFunctionType(generic)),
+            );
+            assert_eq!(store.relation_state_snapshot(), poisoned);
+            assert!(store.set_signature_resolved_return_type(generic_signature, original_return));
+            assert_eq!(
+                store.is_type_assignable_to_with_global_types_and_strict_function_types(
+                    generic, contextual, &globals, true,
+                ),
+                Ok(true),
+            );
+            assert_eq!(
+                (
+                    store.mapper_len(),
+                    store.signature_len(),
+                    store.cached_signature_len()
+                ),
+                warm,
+            );
+        }
+    }
+
+    #[test]
+    fn finite_record_mapped_members_compare_and_reject_poisoned_warm_caches() {
+        let library = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
+        let source = parse_source_file(concat!(
+            "type Record<Key extends keyof any, Value> = { [Entry in Key]: Value }; ",
+            "type Keys = 'second' | 'first'; ",
+            "const value: Record<Keys, string> = ",
+            "{ ['second']: 'two', ['first']: 'one' };",
+        ));
+        assert!(library.diagnostics.is_empty());
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let file = FileId::new(96_454);
+        let mut context =
+            source_relation_context(&library, &source, file, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let (annotation, initializer) = source
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::VariableDeclaration(variable) = &record.data else {
+                    return None;
+                };
+                Some((
+                    NodeRef::new(source.arena.id(), file, variable.type_?),
+                    NodeRef::new(source.arena.id(), file, variable.initializer?),
+                ))
+            })
+            .unwrap();
+        let target = context
+            .store()
+            .type_node_links(annotation)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let object = context
+            .store()
+            .type_node_links(initializer)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let globals = context.global_types().clone();
+        let store = context.store_mut_for_test();
+        let projection = store.finite_record_mapped_projection(target).unwrap();
+
+        assert_eq!(
+            store.is_type_assignable_to_with_global_types(object, target, &globals),
+            Ok(true),
+        );
+        let warm = store.relation_state_snapshot();
+        assert_eq!(
+            store.is_type_assignable_to_with_global_types(object, target, &globals),
+            Ok(true),
+        );
+        assert_eq!(store.relation_state_snapshot(), warm);
+
+        let property = projection.properties[0].symbol;
+        let original = store.value_symbol_links(property).unwrap().clone();
+        let mut poisoned_links = original.clone();
+        poisoned_links.resolved_type = Some(store.intrinsic_bootstrap().unwrap().number_type);
+        assert!(store.set_value_symbol_links(property, poisoned_links));
+        let poisoned = store.relation_state_snapshot();
+        assert_eq!(
+            store.is_type_assignable_to_with_global_types(object, target, &globals),
+            Err(RelationUnavailable::InvalidStructuredMembers(target)),
+        );
+        assert_eq!(store.relation_state_snapshot(), poisoned);
+        assert!(store.set_value_symbol_links(property, original));
+        assert_eq!(
+            store.is_type_assignable_to_with_global_types(object, target, &globals),
+            Ok(true),
+        );
     }
 
     #[test]

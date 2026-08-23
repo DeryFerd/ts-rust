@@ -700,3 +700,71 @@ fn compatible_interface_bases_merge_properties_in_declaration_order() {
         warm,
     );
 }
+
+#[test]
+fn callable_interfaces_keep_derived_signatures_before_inherited_signatures() {
+    let parsed = parse_source_file(concat!(
+        "interface Base { (): string; }\n",
+        "interface Derived extends Base { (value: string): string; }\n",
+        "declare const callable: Derived;\n",
+        "const inherited = callable();\n",
+        "const own = callable('value');\n",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(41);
+    let mut context = checker_context(&parsed, file, "/project/callable-heritage.ts");
+    let derived = interface_symbol(&parsed, file, &context, "Derived");
+
+    context.check_source_file(file).unwrap();
+    assert!(
+        context.diagnostics().is_empty(),
+        "{:?}",
+        context.diagnostics()
+    );
+
+    let TypeData::Interface(interface) = context
+        .store()
+        .type_payload(declared_type(&context, derived))
+        .unwrap()
+        .data()
+    else {
+        panic!("the callable derived interface must retain its interface identity")
+    };
+    let [own, inherited] = interface
+        .reference
+        .object
+        .structured
+        .signatures
+        .as_deref()
+        .unwrap()
+    else {
+        panic!("the derived interface must retain one own and one inherited signature")
+    };
+    assert_eq!(
+        context.store().signature(*own).unwrap().parameters().len(),
+        1
+    );
+    assert!(
+        context
+            .store()
+            .signature(*inherited)
+            .unwrap()
+            .parameters()
+            .is_empty()
+    );
+
+    let warm = (
+        context.store().type_len(),
+        context.store().signature_len(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
+}

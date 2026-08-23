@@ -434,12 +434,6 @@ fn project_validated_direct_call(
         }
         .into());
     }
-    if request.form == DirectCallForm::TaggedTemplate
-        && (callable.min_argument_count == 0
-            || callable.parameters.first() != request.arguments.first())
-    {
-        return Err(DirectCallUnsupported::Form(DirectCallForm::TaggedTemplate).into());
-    }
     for (index, parameter) in callable.parameters.iter().copied().enumerate() {
         if store.type_payload(parameter).is_none() {
             return Err(DirectCallInvariant::InvalidParameterType {
@@ -473,6 +467,21 @@ fn project_validated_direct_call(
         }
     };
     let has_effective_rest = rest_element_type.is_some();
+    if request.form == DirectCallForm::TaggedTemplate {
+        let has_required_template_parameter = callable.min_argument_count != 0
+            && callable.parameters.first() == request.arguments.first();
+        let has_canonical_any_rest = callable.parameters.is_empty()
+            && callable.min_argument_count == 0
+            && global_types.is_some_and(|global_types| {
+                callable.rest_parameter == Some(global_types.any_array_type)
+                    && store
+                        .intrinsic_bootstrap()
+                        .is_some_and(|bootstrap| rest_element_type == Some(bootstrap.any_type))
+            });
+        if !has_required_template_parameter && !has_canonical_any_rest {
+            return Err(DirectCallUnsupported::Form(DirectCallForm::TaggedTemplate).into());
+        }
+    }
 
     let Some(return_type) = callable.return_type else {
         return Err(DirectCallUnsupported::UnresolvedReturnType(callable.signature).into());
@@ -637,12 +646,18 @@ fn check_argument_applicability(
 
 #[cfg(test)]
 mod tests {
-    use ts_binder::{EscapedName, SemanticSymbolId, SymbolData, SymbolFlags};
+    use ts_ast::FileId;
+    use ts_binder::{
+        CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
+        EscapedName, SemanticSymbolId, SymbolData, SymbolFlags,
+    };
+    use ts_parser::{ParseResult, parse_source_file};
 
     use super::*;
     use crate::semantic::{
-        DeclaredTypeLinks, IntrinsicBootstrapOptions, SemanticStore, TypeRecord,
-        mapper::TypeMapper, types::ObjectFlags,
+        CanonicalCheckerContext, CanonicalCheckerOptions, DeclaredTypeLinks,
+        IntrinsicBootstrapOptions, SemanticStore, TypeRecord, mapper::TypeMapper,
+        types::ObjectFlags,
     };
 
     fn initialized_store() -> CanonicalTypeMapperStore {
@@ -651,6 +666,42 @@ mod tests {
             .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
             .unwrap();
         store
+    }
+
+    fn array_context(parsed: &ParseResult) -> CanonicalCheckerContext<'_> {
+        let file = FileId::new(9_411);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/tagged-template-calls.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap()
+    }
+
+    fn context_template_strings_array(context: &mut CanonicalCheckerContext<'_>) -> TypeId {
+        let symbol = context
+            .store()
+            .symbol_table(context.globals())
+            .and_then(|globals| globals.get_source("TemplateStringsArray"))
+            .unwrap();
+        context.get_declared_type_of_symbol(symbol).unwrap()
     }
 
     fn parameter(store: &mut CanonicalTypeMapperStore, name: &str) -> SemanticSymbolId {
@@ -919,6 +970,176 @@ mod tests {
             }
         );
         assert_eq!(resolution.projection.return_type, string);
+    }
+
+    #[test]
+    fn tagged_templates_accept_canonical_any_rest_signatures() {
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} ",
+            "interface ReadonlyArray<T> {} ",
+            "interface TemplateStringsArray {}",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut context = array_context(&parsed);
+        let template = context_template_strings_array(&mut context);
+        let global_types = context.global_types().clone();
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let any = bootstrap.any_type;
+        let number = bootstrap.number_type;
+        let string = bootstrap.string_type;
+        let callable = callable(
+            context.store_mut_for_test(),
+            SignatureFlags::HAS_REST_PARAMETER,
+            &[global_types.any_array_type],
+            0,
+            Some(string),
+        );
+
+        for arguments in [&[template][..], &[template, number, string][..]] {
+            let tagged = DirectCallRequest {
+                form: DirectCallForm::TaggedTemplate,
+                ..request(callable.owner, arguments)
+            };
+            assert_eq!(
+                validate_tagged_template_argument(context.store(), tagged),
+                Ok(())
+            );
+            let before = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+            let resolution = project_validated_direct_call(
+                context.store(),
+                Some(&global_types),
+                tagged,
+                &callable,
+            )
+            .unwrap();
+
+            assert_eq!(
+                resolution.applicability,
+                DirectCallApplicability::Applicable
+            );
+            assert_eq!(resolution.projection.minimum_argument_count, 0);
+            assert_eq!(resolution.projection.maximum_argument_count, 0);
+            assert!(resolution.projection.has_effective_rest);
+            assert_eq!(resolution.projection.return_type, string);
+            assert_eq!(
+                resolution.projection.argument_targets.len(),
+                arguments.len()
+            );
+            assert!(
+                resolution
+                    .projection
+                    .argument_targets
+                    .iter()
+                    .enumerate()
+                    .all(|(index, target)| {
+                        target.index == index
+                            && target.argument_type == arguments[index]
+                            && target.parameter_type == any
+                    })
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+        }
+    }
+
+    #[test]
+    fn tagged_templates_reject_noncanonical_rest_only_signatures() {
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} ",
+            "interface ReadonlyArray<T> {} ",
+            "interface TemplateStringsArray {}",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut context = array_context(&parsed);
+        let template = context_template_strings_array(&mut context);
+        let global_types = context.global_types().clone();
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let number = bootstrap.number_type;
+        let string = bootstrap.string_type;
+        let number_array = context
+            .store_mut_for_test()
+            .create_canonical_array_type(&global_types, number, false)
+            .unwrap();
+        let unsupported = DirectCallError::Unsupported(DirectCallUnsupported::Form(
+            DirectCallForm::TaggedTemplate,
+        ));
+
+        for rest in [number_array, global_types.any_readonly_array_type] {
+            let callable = callable(
+                context.store_mut_for_test(),
+                SignatureFlags::HAS_REST_PARAMETER,
+                &[rest],
+                0,
+                Some(string),
+            );
+            let arguments = [template];
+            let tagged = DirectCallRequest {
+                form: DirectCallForm::TaggedTemplate,
+                ..request(callable.owner, &arguments)
+            };
+            let before = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+
+            assert_eq!(
+                project_validated_direct_call(
+                    context.store(),
+                    Some(&global_types),
+                    tagged,
+                    &callable,
+                ),
+                Err(unsupported),
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+        }
+
+        let callable = callable(
+            context.store_mut_for_test(),
+            SignatureFlags::HAS_REST_PARAMETER,
+            &[global_types.any_array_type],
+            0,
+            Some(string),
+        );
+        let forged_arguments = [number];
+        let forged = DirectCallRequest {
+            form: DirectCallForm::TaggedTemplate,
+            ..request(callable.owner, &forged_arguments)
+        };
+        assert_eq!(
+            validate_tagged_template_argument(context.store(), forged),
+            Err(unsupported),
+        );
+
+        let arguments = [template];
+        let tagged = DirectCallRequest {
+            form: DirectCallForm::TaggedTemplate,
+            ..request(callable.owner, &arguments)
+        };
+        assert_eq!(
+            project_validated_direct_call(context.store(), None, tagged, &callable),
+            Err(DirectCallError::Unsupported(
+                DirectCallUnsupported::RestSignature(callable.signature),
+            )),
+        );
     }
 
     #[test]

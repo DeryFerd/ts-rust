@@ -445,6 +445,142 @@ fn unsupported_class_grammar_reports_exact_modifier_accessor_and_heritage_errors
 }
 
 #[test]
+fn recovered_constructor_diagnostic_underlines_only_its_keyword() {
+    let source = "class Model { value = 42; constructor\n}";
+    let parsed = parse_source_file(source);
+    assert_eq!(parsed.diagnostics.len(), 1);
+    assert_eq!(parsed.diagnostics[0].code, Some(1005));
+    let file = FileId::new(2_140);
+    let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+
+    context.check_source_file(file).unwrap();
+
+    let [diagnostic] = context.diagnostics().as_slice() else {
+        panic!("a recovered constructor must report its missing implementation")
+    };
+    assert_eq!(diagnostic.diagnostic.code(), 2390);
+    let range = diagnostic
+        .range_override
+        .expect("the constructor keyword needs a precise range")
+        .range();
+    assert_eq!(
+        &source[range.start.get() as usize..range.end.get() as usize],
+        "constructor",
+    );
+
+    let warm = context.diagnostics().clone();
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(context.diagnostics(), &warm);
+}
+
+#[test]
+fn indexed_classes_report_only_uninitialized_private_fields() {
+    let source = concat!(
+        "class Model {\n",
+        "  [key: string]: number;\n",
+        "  #missing: boolean;\n",
+        "  #ready = false;\n",
+        "}\n",
+    );
+    let parsed = parse_source_file(source);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(2_141);
+    let mut context = checker_context(
+        &parsed,
+        file,
+        CanonicalCheckerOptions {
+            intrinsic: IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            },
+            strict_property_initialization: true,
+            ..CanonicalCheckerOptions::default()
+        },
+    );
+
+    context.check_source_file(file).unwrap();
+
+    let [diagnostic] = context.diagnostics().as_slice() else {
+        panic!("only the uninitialized private field requires a diagnostic")
+    };
+    assert_eq!(diagnostic.diagnostic.code(), 2564);
+    assert_eq!(diagnostic.diagnostic.arguments, ["#missing"]);
+    let range = parsed
+        .arena
+        .get(diagnostic.node.unwrap().node)
+        .unwrap()
+        .range;
+    assert_eq!(
+        &source[range.start.get() as usize..range.end.get() as usize],
+        "#missing",
+    );
+
+    let warm = context.diagnostics().clone();
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(context.diagnostics(), &warm);
+}
+
+#[test]
+fn recovered_conflict_marker_classes_check_the_live_method_body() {
+    let sources = [
+        concat!(
+            "class Model {\n",
+            "  foo() {\n",
+            "<<<<<<< ours\n",
+            "    a();\n",
+            "  }\n",
+            "=======\n",
+            "    b();\n",
+            "  }\n",
+            ">>>>>>> theirs\n",
+            "  public bar() {}\n",
+            "}\n",
+        ),
+        concat!(
+            "class Model {\n",
+            "  foo() {\n",
+            "<<<<<<< ours\n",
+            "    a();\n",
+            "  }\n",
+            "||||||| base\n",
+            "    c();\n",
+            "  }\n",
+            "=======\n",
+            "    b();\n",
+            "  }\n",
+            ">>>>>>> theirs\n",
+            "  public bar() {}\n",
+            "}\n",
+        ),
+    ];
+
+    for (index, source) in sources.into_iter().enumerate() {
+        let parsed = parse_source_file(source);
+        assert!(!parsed.diagnostics.is_empty());
+        assert!(
+            parsed
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code == Some(1185))
+        );
+        let file = FileId::new(2_142 + u32::try_from(index).unwrap());
+        let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("only the retained unresolved call should be checked")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2304);
+        assert_eq!(diagnostic.diagnostic.arguments, ["a"]);
+
+        let warm = context.diagnostics().clone();
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(context.diagnostics(), &warm);
+    }
+}
+
+#[test]
 fn decorated_constructor_parameter_publishes_its_annotated_signature() {
     let parsed = parse_source_file(concat!(
         "declare function decorate(target: any, key: string | symbol | undefined, index: number): void;\n",

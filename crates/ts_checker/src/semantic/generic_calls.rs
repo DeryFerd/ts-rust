@@ -79,6 +79,7 @@ pub(super) enum GenericCallVectorUnsupported {
         index: usize,
         type_: TypeId,
     },
+    ContextualSignature(SignatureId),
     UnresolvedReturnType(SignatureId),
     InstantiationType {
         signature: SignatureId,
@@ -415,6 +416,161 @@ pub(super) fn resolve_generic_call_vector_with_session(
             store.is_type_subtype_of_with_global_types(source, target, global_types)
         },
     )
+}
+
+/// Instantiates one generic signature against an authenticated rest signature.
+///
+/// Relation comparison already owns the active relation observation, so this
+/// bounded inference path cannot start another relation query. Every inferred
+/// candidate is therefore the same canonical contextual rest element.
+#[allow(clippy::too_many_lines)] // Validate both callable graphs before publishing one signature.
+pub(super) fn instantiate_generic_signature_in_context_of(
+    store: &mut CanonicalTypeMapperStore,
+    source: &ValidatedSingleCallable,
+    contextual: &ValidatedSingleCallable,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<ValidatedSingleCallable, GenericCallVectorError> {
+    for candidate in [source, contextual] {
+        match validate_stored_single_callable(store, candidate.owner) {
+            StoredSingleCallableValidation::NotCallable => {
+                return Err(
+                    GenericCallVectorUnsupported::NotExactSingleCallable(candidate.owner).into(),
+                );
+            }
+            StoredSingleCallableValidation::Pending { .. } => {
+                return Err(GenericCallVectorUnsupported::PendingCallable(candidate.owner).into());
+            }
+            StoredSingleCallableValidation::Malformed { .. } => {
+                return Err(GenericCallVectorInvariant::MalformedCallable(candidate.owner).into());
+            }
+            StoredSingleCallableValidation::Valid { callable, .. } if callable == *candidate => {}
+            StoredSingleCallableValidation::Valid { .. } => {
+                return Err(GenericCallVectorInvariant::CallableSignatureMismatch(
+                    candidate.signature,
+                )
+                .into());
+            }
+        }
+    }
+
+    let contextual_record = store.signature(contextual.signature).ok_or(
+        GenericCallVectorInvariant::InvalidSignature(contextual.signature),
+    )?;
+    if !contextual_record.type_parameters().is_empty()
+        || contextual_record.this_parameter().is_some()
+        || contextual_record.flags() != SignatureFlags::HAS_REST_PARAMETER
+        || !contextual.parameters.is_empty()
+        || contextual.min_argument_count != 0
+    {
+        return Err(GenericCallVectorUnsupported::ContextualSignature(contextual.signature).into());
+    }
+    let (Some(array_targets), Some(rest)) = (array_targets, contextual.rest_parameter) else {
+        return Err(GenericCallVectorUnsupported::ContextualSignature(contextual.signature).into());
+    };
+    let reference = store
+        .canonical_array_reference_with_targets(array_targets, rest)
+        .map_err(|error| GenericCallVectorInvariant::InvalidArrayType {
+            signature: contextual.signature,
+            type_: rest,
+            error,
+        })?;
+    let Some(reference) = reference else {
+        return Err(GenericCallVectorUnsupported::ContextualSignature(contextual.signature).into());
+    };
+    if reference.readonly
+        || reference.array_literal
+        || contextual.return_type != Some(reference.element_type)
+        || contextual_record.resolved_return_type() != contextual.return_type
+    {
+        return Err(GenericCallVectorUnsupported::ContextualSignature(contextual.signature).into());
+    }
+
+    let shape =
+        validate_generic_call_signature_shape(store, source.owner, source, Some(array_targets))?;
+    let sources = shape
+        .type_parameters
+        .iter()
+        .map(|parameter| parameter.type_)
+        .collect::<Vec<_>>();
+    for parameter in &shape.type_parameters {
+        if let Some(constraint) = parameter.constraint {
+            return Err(GenericCallVectorUnsupported::TypeParameterDependency {
+                type_parameter: parameter.type_,
+                dependency: constraint,
+            }
+            .into());
+        }
+    }
+    for (index, template) in shape.parameter_templates.iter().copied().enumerate() {
+        let template = if index >= shape.minimum_argument_count {
+            optional_generic_parameter_template(
+                store,
+                template,
+                &sources,
+                Some(array_targets),
+                shape.signature,
+            )?
+            .unwrap_or(template)
+        } else {
+            template
+        };
+        if !sources.contains(&template) {
+            return Err(GenericCallVectorUnsupported::NonNakedParameter {
+                signature: shape.signature,
+                index,
+                type_: template,
+            }
+            .into());
+        }
+    }
+
+    let mut inference_shape = shape.clone();
+    let mut contextual_arguments = vec![reference.element_type; shape.parameter_templates.len()];
+    if sources.contains(&shape.return_type) {
+        inference_shape.parameter_templates.push(shape.return_type);
+        contextual_arguments.push(reference.element_type);
+    }
+    let mut session = InstantiationSession::new(InstantiationLimits::default());
+    let type_arguments = infer_generic_call_type_arguments(
+        store,
+        &inference_shape,
+        &contextual_arguments,
+        &mut |_, left, right| Ok(left == right),
+        &mut |_, left, right| Ok(left == right),
+        &mut |_, left, right| Ok(left == right),
+        &mut session,
+    )?;
+    let (instantiation, _) =
+        get_or_create_checked_generic_call_vector_shell(store, &shape, &sources, &type_arguments)?;
+    let mut parameters = Vec::with_capacity(shape.parameter_templates.len());
+    for index in 0..shape.parameter_templates.len() {
+        parameters.push(demand_generic_call_vector_parameter(
+            store,
+            &shape,
+            &sources,
+            &type_arguments,
+            instantiation.signature,
+            index,
+            &mut session,
+        )?);
+    }
+    let return_type = demand_generic_call_vector_return(
+        store,
+        &shape,
+        &sources,
+        &type_arguments,
+        instantiation.signature,
+        &mut session,
+    )?;
+    Ok(ValidatedSingleCallable {
+        owner: source.owner,
+        signature: instantiation.signature,
+        parameters,
+        rest_parameter: None,
+        min_argument_count: source.min_argument_count,
+        return_type: Some(return_type),
+        strict_variance_exempt: source.strict_variance_exempt,
+    })
 }
 
 /// Materializes the exact checked signature globally cached by pinned
@@ -4137,7 +4293,7 @@ fn check_identity_argument_applicability(
 
 #[cfg(test)]
 mod tests {
-    use ts_ast::FileId;
+    use ts_ast::{FileId, NodeData};
     use ts_binder::{
         CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
         EscapedName, SymbolData,
@@ -5736,6 +5892,153 @@ mod tests {
             ))
         );
         assert_eq!(vector_cache_graph_counts(store), before);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One source graph proves cold, warm, and forged callables.
+    fn contextual_rest_inference_reuses_checked_signature_inside_an_active_relation() {
+        let library = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
+        let parsed = parse_source_file(concat!(
+            "declare function toInstantiate<A, B>(a?: A, b?: B): B; ",
+            "declare function contextual(...s: string[]): string;",
+        ));
+        assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let library_file = FileId::new(96_400);
+        let file = FileId::new(96_402);
+        let mut binder = CanonicalBinder::new();
+        for (source, source_file, path) in [
+            (
+                &library,
+                library_file,
+                "\"/contextual-generic-rest-lib.d.ts\"",
+            ),
+            (&parsed, file, "\"/contextual-generic-rest.ts\""),
+        ] {
+            binder
+                .bind_source_file_with_facts(
+                    &source.arena,
+                    source.source_file,
+                    source_file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(path),
+                        CanonicalSourceLanguage::TypeScript,
+                        false,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&source.arena, source_file)
+                .unwrap();
+        }
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            [(library_file, &library.arena), (file, &parsed.arena)]
+                .into_iter()
+                .collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        context.check_source_file(file).unwrap();
+        let callable = |expected: &str| {
+            let declaration = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::FunctionDeclaration(function) = &record.data else {
+                        return None;
+                    };
+                    let name = function.name?;
+                    let NodeData::Identifier(identifier) = &parsed.arena.get(name)?.data else {
+                        return None;
+                    };
+                    (identifier.text == expected).then_some(NodeRef::new(
+                        parsed.arena.id(),
+                        file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let owner = context.file(file).unwrap().1.symbol(declaration).unwrap();
+            let type_ = context
+                .store()
+                .source_callable_type_for_owner(owner)
+                .unwrap();
+            match validate_stored_single_callable(context.store(), type_) {
+                StoredSingleCallableValidation::Valid { callable, .. } => callable,
+                other => panic!("expected validated source callable {expected}: {other:?}"),
+            }
+        };
+        let source = callable("toInstantiate");
+        let contextual = callable("contextual");
+        let array_targets = CanonicalArrayTargets::from_global_types(context.global_types());
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let type_parameters = context
+            .store()
+            .signature(source.signature)
+            .unwrap()
+            .type_parameters()
+            .to_vec();
+        let store = context.store_mut_for_test();
+        let before = vector_cache_graph_counts(store);
+        let observation = store.begin_relation_read_observation().unwrap();
+
+        let inferred = instantiate_generic_signature_in_context_of(
+            store,
+            &source,
+            &contextual,
+            Some(array_targets),
+        )
+        .unwrap();
+
+        assert!(store.relation_read_observation_is_active());
+        assert!(store.discard_relation_read_observation(observation));
+        assert_eq!(inferred.owner, source.owner);
+        assert_eq!(inferred.parameters, [string, string]);
+        assert_eq!(inferred.rest_parameter, None);
+        assert_eq!(inferred.min_argument_count, 0);
+        assert_eq!(inferred.return_type, Some(string));
+        assert_eq!(
+            store.cached_signatures_contain(inferred.signature),
+            Some(true)
+        );
+        let instantiated = store.signature(inferred.signature).unwrap();
+        assert_eq!(instantiated.target(), Some(source.signature));
+        let mapper = instantiated.mapper().unwrap();
+        assert_eq!(
+            store.type_mapper_has_exact_endpoints(mapper, &type_parameters, &[string, string]),
+            Some(true),
+        );
+        let after = vector_cache_graph_counts(store);
+        assert_eq!(after.signatures, before.signatures + 1);
+        assert_eq!(after.mappers, before.mappers + 1);
+        assert_eq!(after.cached_signatures, before.cached_signatures + 1);
+
+        let warm = instantiate_generic_signature_in_context_of(
+            store,
+            &source,
+            &contextual,
+            Some(array_targets),
+        )
+        .unwrap();
+        assert_eq!(warm, inferred);
+        assert_eq!(vector_cache_graph_counts(store), after);
+
+        let mut forged = contextual.clone();
+        forged.parameters.push(string);
+        assert_eq!(
+            instantiate_generic_signature_in_context_of(
+                store,
+                &source,
+                &forged,
+                Some(array_targets),
+            ),
+            Err(GenericCallVectorError::Invariant(
+                GenericCallVectorInvariant::CallableSignatureMismatch(contextual.signature),
+            )),
+        );
+        assert_eq!(vector_cache_graph_counts(store), after);
     }
 
     #[test]

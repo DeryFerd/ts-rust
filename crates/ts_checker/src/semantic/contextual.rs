@@ -3,17 +3,19 @@
 //! The pinned checker obtains an object's contextual type once, looks up each
 //! source property by name, and checks ordinary property initializers as
 //! mutable locations. Const-asserted properties retain regular literal types.
-//! This module precomputes that dependency tree without publishing checker
-//! state, so a malformed target cannot leave a partially constructed source
-//! object behind.
+//! Finite mapped `Record` targets retain their authenticated transient member
+//! symbols without inventing source declarations. This module validates the
+//! complete dependency tree before publishing the source object, so a malformed
+//! target cannot leave a partially constructed object behind.
 
 use std::collections::{HashMap, HashSet};
 
-use ts_binder::SemanticSymbolId;
+use ts_binder::{EscapedName, SemanticSymbolId};
 
 use super::{
     CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeHost, RelationUnavailable, TypeId,
     VariableInvariant,
+    mapped_types::{FiniteRecordMappedProjection, MappedTypeError},
     object_members::PlannedProperty,
     relater::ResolvedDeclaredPropertyObject,
     source::{PlannedExpression, PlannedExpressionKind, SourceCheckError, UnsupportedSourceSyntax},
@@ -56,6 +58,45 @@ enum LiteralKind {
     Number,
     BigInt,
     Boolean,
+}
+
+/// Source-declared members and transient mapped members require distinct
+/// projections because mapped properties do not have source declarations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ContextualPropertyObject {
+    Declared(ResolvedDeclaredPropertyObject),
+    FiniteRecord(FiniteRecordMappedProjection),
+}
+
+impl ContextualPropertyObject {
+    fn property_types(&self) -> Vec<TypeId> {
+        match self {
+            Self::Declared(object) => object
+                .properties()
+                .iter()
+                .map(|property| property.type_)
+                .collect(),
+            Self::FiniteRecord(object) => object
+                .properties
+                .iter()
+                .map(|property| property.type_)
+                .collect(),
+        }
+    }
+
+    fn get_source(&self, name: &str) -> Option<TypeId> {
+        match self {
+            Self::Declared(object) => object.get_source(name).map(|property| property.type_),
+            Self::FiniteRecord(object) => {
+                let name = EscapedName::source(name);
+                object
+                    .properties
+                    .iter()
+                    .find(|property| property.name == name)
+                    .map(|property| property.type_)
+            }
+        }
+    }
 }
 
 /// Prepares the contextual decisions for one cached variable initializer.
@@ -236,17 +277,16 @@ fn preflight_contextual_type_graph(
                 }
                 return Ok(());
             }
-            let contextual = store
-                .resolved_declared_property_object(host, contextual_type)?
+            let contextual = resolve_contextual_property_object(store, host, contextual_type)?
                 .ok_or(RelationUnavailable::UnsupportedStructuredType(
                     contextual_type,
                 ))?;
-            for property in contextual.properties() {
+            for property_type in contextual.property_types() {
                 preflight_contextual_type_graph(
                     store,
                     host,
                     global_types,
-                    property.type_,
+                    property_type,
                     validated,
                     visiting,
                 )?;
@@ -463,7 +503,7 @@ fn contextual_objects(
     source_properties: &[PlannedProperty],
     expressions: &[PlannedExpression],
     current_flow_types: &HashMap<SemanticSymbolId, TypeId>,
-) -> Result<Vec<ResolvedDeclaredPropertyObject>, SourceCheckError> {
+) -> Result<Vec<ContextualPropertyObject>, SourceCheckError> {
     let Some(contextual_type) = contextual_type else {
         return Ok(Vec::new());
     };
@@ -488,8 +528,7 @@ fn contextual_objects(
                 .map(TypeRecord::flags)
                 .ok_or(RelationUnavailable::Type(constituent))?;
             if flags.intersects(TypeFlags::OBJECT) {
-                let candidate = store
-                    .resolved_declared_property_object(host, constituent)?
+                let candidate = resolve_contextual_property_object(store, host, constituent)?
                     .ok_or(RelationUnavailable::UnsupportedStructuredType(constituent))?;
                 candidates.push(candidate);
             } else if flags.intersects(TypeFlags::STRUCTURED_OR_INSTANTIABLE) {
@@ -504,13 +543,10 @@ fn contextual_objects(
                 let Some(target) = candidate.get_source(&property.name) else {
                     return Ok(false);
                 };
-                Ok(source_matches_discriminant(
-                    store,
-                    expression,
-                    target.type_,
-                    current_flow_types,
-                )?
-                .is_some())
+                Ok(
+                    source_matches_discriminant(store, expression, target, current_flow_types)?
+                        .is_some(),
+                )
             })?;
             if !discriminates {
                 continue;
@@ -521,12 +557,8 @@ fn contextual_objects(
                     let Some(target) = candidate.get_source(&property.name) else {
                         return Some(Ok(candidate.clone()));
                     };
-                    match source_matches_discriminant(
-                        store,
-                        expression,
-                        target.type_,
-                        current_flow_types,
-                    ) {
+                    match source_matches_discriminant(store, expression, target, current_flow_types)
+                    {
                         Ok(Some(false)) => None,
                         Ok(_) => Some(Ok(candidate.clone())),
                         Err(error) => Some(Err(error)),
@@ -540,10 +572,8 @@ fn contextual_objects(
         return Ok(candidates);
     }
     if flags.intersects(TypeFlags::OBJECT) {
-        return store
-            .resolved_declared_property_object(host, contextual_type)
-            .map(|object| object.into_iter().collect())
-            .map_err(Into::into);
+        return resolve_contextual_property_object(store, host, contextual_type)
+            .map(|object| object.into_iter().collect());
     }
     if flags.intersects(TypeFlags::STRUCTURED_OR_INSTANTIABLE) {
         return Err(RelationUnavailable::UnsupportedStructuredType(contextual_type).into());
@@ -551,23 +581,74 @@ fn contextual_objects(
     Ok(Vec::new())
 }
 
+fn resolve_contextual_property_object(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    contextual_type: TypeId,
+) -> Result<Option<ContextualPropertyObject>, SourceCheckError> {
+    let mapped = matches!(
+        store.type_payload(contextual_type).map(TypeRecord::data),
+        Some(TypeData::Mapped(_))
+    );
+    if mapped {
+        return store
+            .resolve_finite_record_mapped_projection(contextual_type)
+            .map(ContextualPropertyObject::FiniteRecord)
+            .map(Some)
+            .map_err(|error| contextual_mapped_error(contextual_type, error));
+    }
+    store
+        .resolved_declared_property_object(host, contextual_type)
+        .map(|object| object.map(ContextualPropertyObject::Declared))
+        .map_err(Into::into)
+}
+
+fn contextual_mapped_error(contextual_type: TypeId, error: MappedTypeError) -> SourceCheckError {
+    match error {
+        MappedTypeError::Declared(error) => error.into(),
+        MappedTypeError::BootstrapUninitialized => RelationUnavailable::MissingBootstrap.into(),
+        MappedTypeError::UnsupportedSource(_)
+        | MappedTypeError::UnsupportedConstraint(_)
+        | MappedTypeError::UnsupportedNameType(_)
+        | MappedTypeError::UnsupportedTemplate(_)
+        | MappedTypeError::RecursiveMembers(_)
+        | MappedTypeError::CrossProductTooLarge { .. } => {
+            RelationUnavailable::UnsupportedStructuredType(contextual_type).into()
+        }
+        MappedTypeError::Capacity => {
+            RelationUnavailable::UnionValidationCapacity(contextual_type).into()
+        }
+        MappedTypeError::InvalidDeclaration(_)
+        | MappedTypeError::InvalidSymbol(_)
+        | MappedTypeError::InvalidTypeParameter(_)
+        | MappedTypeError::InvalidMappedType(_)
+        | MappedTypeError::InvalidModifiers
+        | MappedTypeError::InvalidSource(_)
+        | MappedTypeError::InvalidCachedMembers(_)
+        | MappedTypeError::InvalidCachedProperty(_)
+        | MappedTypeError::CircularProperty(_) => {
+            RelationUnavailable::InvalidStructuredMembers(contextual_type).into()
+        }
+    }
+}
+
 fn contextual_property_type(
     store: &CanonicalTypeMapperStore,
-    candidates: &[ResolvedDeclaredPropertyObject],
+    candidates: &[ContextualPropertyObject],
     name: &str,
     expression: &PlannedExpression,
     current_flow_types: &HashMap<SemanticSymbolId, TypeId>,
 ) -> Result<Option<TypeId>, SourceCheckError> {
     let mut fallback = None;
     for candidate in candidates {
-        let Some(property) = candidate.get_source(name) else {
+        let Some(property_type) = candidate.get_source(name) else {
             continue;
         };
-        fallback.get_or_insert(property.type_);
-        if source_matches_discriminant(store, expression, property.type_, current_flow_types)?
+        fallback.get_or_insert(property_type);
+        if source_matches_discriminant(store, expression, property_type, current_flow_types)?
             == Some(true)
         {
-            return Ok(Some(property.type_));
+            return Ok(Some(property_type));
         }
     }
     Ok(fallback)
@@ -781,12 +862,12 @@ fn validate_contextual_union(
 
 #[cfg(test)]
 mod tests {
-    use ts_ast::{FileId, NodeArena, NodeId, NodeRef};
+    use ts_ast::{FileId, NodeArena, NodeData, NodeId, NodeRef};
     use ts_binder::{
         CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
-        EscapedName,
+        CheckFlags, EscapedName, SymbolFlags,
     };
-    use ts_parser::parse_source_file;
+    use ts_parser::{ParseResult, parse_source_file};
 
     use super::*;
     use crate::semantic::{
@@ -803,6 +884,281 @@ mod tests {
             })
             .unwrap();
         store
+    }
+
+    fn mapped_record_context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/contextual-record.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            [(file, &parsed.arena)].into_iter().collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap()
+    }
+
+    fn mapped_record_nodes(parsed: &ParseResult, file: FileId) -> (NodeRef, NodeRef) {
+        parsed
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::VariableDeclaration(variable) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(name) = &parsed.arena.get(variable.name)?.data else {
+                    return None;
+                };
+                (name.text == "value").then(|| {
+                    (
+                        NodeRef::new(parsed.arena.id(), file, variable.type_.unwrap()),
+                        NodeRef::new(parsed.arena.id(), file, variable.initializer.unwrap()),
+                    )
+                })
+            })
+            .expect("the fixture contains one annotated object named value")
+    }
+
+    fn mapped_record_expression(
+        parsed: &ParseResult,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        object: NodeRef,
+    ) -> PlannedExpression {
+        let plan = super::super::object_members::plan_object_literal(store, host, object).unwrap();
+        let properties = plan
+            .properties
+            .iter()
+            .map(|property| {
+                let NodeData::StringLiteral(value) =
+                    &parsed.arena.get(property.type_node.node).unwrap().data
+                else {
+                    panic!("mapped object fixture properties have string initializers")
+                };
+                PlannedExpression::new(
+                    property.type_node,
+                    PlannedExpressionKind::String(value.text.clone()),
+                )
+            })
+            .collect();
+        PlannedExpression::new(object, PlannedExpressionKind::Object { plan, properties })
+    }
+
+    #[test]
+    fn finite_record_context_resolves_actual_computed_properties_and_replays_warm() {
+        let parsed = parse_source_file(concat!(
+            "type Record<K extends keyof any, T> = { [P in K]: T }; ",
+            "type Keys = 'second' | 'first'; ",
+            "const value: Record<Keys, 'ready'> = ",
+            "{ ['second']: 'ready', ['first']: 'ready' };",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(1_062);
+        let mut context = mapped_record_context(&parsed, file);
+        let (annotation, object) = mapped_record_nodes(&parsed, file);
+        let target = context.get_type_from_type_node(annotation).unwrap();
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new([(&parsed.arena, &bound)]).unwrap();
+        let expression = mapped_record_expression(&parsed, context.store(), &host, object);
+        let store = context.store_mut_for_test();
+
+        let PlannedExpressionKind::Object { plan, .. } = &expression.kind else {
+            panic!("the contextual fixture retains an object literal")
+        };
+        assert_eq!(
+            plan.properties
+                .iter()
+                .map(|property| property.name.as_str())
+                .collect::<Vec<_>>(),
+            ["second", "first"],
+        );
+
+        assert!(matches!(
+            store.type_payload(target).map(TypeRecord::data),
+            Some(TypeData::Mapped(mapped)) if mapped.object.structured.members.is_none()
+        ));
+        assert!(store.type_node_links(object).is_none());
+
+        let prepared = prepare_expression_context(store, &host, &expression, target).unwrap();
+        assert_eq!(
+            prepared,
+            PreparedExpression::Object(vec![
+                PreparedExpression::Literal(LiteralTreatment::Regular),
+                PreparedExpression::Literal(LiteralTreatment::Regular),
+            ]),
+        );
+
+        let projection = store.finite_record_mapped_projection(target).unwrap();
+        assert_eq!(
+            projection
+                .properties
+                .iter()
+                .map(|property| property.name.as_utf8().unwrap())
+                .collect::<Vec<_>>(),
+            ["first", "second"],
+        );
+        for property in &projection.properties {
+            let symbol = store.symbol(property.symbol).unwrap();
+            assert_eq!(
+                symbol.flags(),
+                SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT
+            );
+            assert!(symbol.check_flags().contains(CheckFlags::MAPPED));
+            assert!(symbol.declarations().is_none());
+            assert_eq!(
+                store
+                    .value_symbol_links(property.symbol)
+                    .and_then(|links| links.resolved_type),
+                Some(property.type_),
+            );
+        }
+        assert!(store.type_node_links(object).is_none());
+
+        let warm = (
+            store.type_len(),
+            store.mapper_len(),
+            store.symbol_len(),
+            store.symbol_store().symbol_table_len(),
+            store.checker_link_allocated_lengths(),
+            store.relation_state_snapshot(),
+            projection.clone(),
+        );
+        assert_eq!(
+            prepare_expression_context(store, &host, &expression, target),
+            Ok(prepared),
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.mapper_len(),
+                store.symbol_len(),
+                store.symbol_store().symbol_table_len(),
+                store.checker_link_allocated_lengths(),
+                store.relation_state_snapshot(),
+                store.finite_record_mapped_projection(target).unwrap(),
+            ),
+            warm,
+        );
+        assert!(store.type_node_links(object).is_none());
+    }
+
+    #[test]
+    fn finite_record_context_rejects_poisoned_property_types_without_source_writes() {
+        let parsed = parse_source_file(concat!(
+            "type Record<K extends keyof any, T> = { [P in K]: T }; ",
+            "const value: Record<'first' | 'second', string> = ",
+            "{ first: 'one', second: 'two' };",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(1_063);
+        let mut context = mapped_record_context(&parsed, file);
+        let (annotation, object) = mapped_record_nodes(&parsed, file);
+        let target = context.get_type_from_type_node(annotation).unwrap();
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new([(&parsed.arena, &bound)]).unwrap();
+        let expression = mapped_record_expression(&parsed, context.store(), &host, object);
+        let store = context.store_mut_for_test();
+        let projection = store
+            .resolve_finite_record_mapped_projection(target)
+            .unwrap();
+        let property = projection.properties.last().unwrap().symbol;
+        let original = store.value_symbol_links(property).unwrap().clone();
+        let mut poisoned = original.clone();
+        poisoned.resolved_type = Some(store.intrinsic_bootstrap().unwrap().number_type);
+        assert!(store.set_value_symbol_links(property, poisoned));
+
+        let before = (
+            store.type_len(),
+            store.mapper_len(),
+            store.symbol_len(),
+            store.symbol_store().symbol_table_len(),
+            store.checker_link_allocated_lengths(),
+            store.relation_state_snapshot(),
+        );
+        assert_eq!(
+            prepare_expression_context(store, &host, &expression, target),
+            Err(SourceCheckError::RelationUnavailable(
+                RelationUnavailable::InvalidStructuredMembers(target),
+            )),
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.mapper_len(),
+                store.symbol_len(),
+                store.symbol_store().symbol_table_len(),
+                store.checker_link_allocated_lengths(),
+                store.relation_state_snapshot(),
+            ),
+            before,
+        );
+        assert!(store.type_node_links(object).is_none());
+
+        assert!(store.set_value_symbol_links(property, original));
+        assert!(prepare_expression_context(store, &host, &expression, target).is_ok());
+        assert!(store.type_node_links(object).is_none());
+    }
+
+    #[test]
+    fn broad_record_context_remains_unsupported_without_member_publication() {
+        let parsed = parse_source_file(concat!(
+            "type Record<K extends keyof any, T> = { [P in K]: T }; ",
+            "const value: Record<string, string> = { first: 'one' };",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(1_064);
+        let mut context = mapped_record_context(&parsed, file);
+        let (annotation, object) = mapped_record_nodes(&parsed, file);
+        let target = context.get_type_from_type_node(annotation).unwrap();
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new([(&parsed.arena, &bound)]).unwrap();
+        let expression = mapped_record_expression(&parsed, context.store(), &host, object);
+        let store = context.store_mut_for_test();
+        let before = (
+            store.type_len(),
+            store.mapper_len(),
+            store.symbol_len(),
+            store.symbol_store().symbol_table_len(),
+            store.checker_link_allocated_lengths(),
+            store.relation_state_snapshot(),
+        );
+
+        assert_eq!(
+            prepare_expression_context(store, &host, &expression, target),
+            Err(SourceCheckError::RelationUnavailable(
+                RelationUnavailable::UnsupportedStructuredType(target),
+            )),
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.mapper_len(),
+                store.symbol_len(),
+                store.symbol_store().symbol_table_len(),
+                store.checker_link_allocated_lengths(),
+                store.relation_state_snapshot(),
+            ),
+            before,
+        );
+        assert!(matches!(
+            store.type_payload(target).map(TypeRecord::data),
+            Some(TypeData::Mapped(mapped)) if mapped.object.structured.members.is_none()
+        ));
+        assert!(store.type_node_links(object).is_none());
     }
 
     #[test]

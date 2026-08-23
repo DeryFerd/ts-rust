@@ -218,6 +218,25 @@ impl ResolvedMappedProperty {
     }
 }
 
+/// Ordered properties of an authenticated finite `Record<K, T>` instance.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct FiniteRecordMappedProjection {
+    pub(super) type_: TypeId,
+    pub(super) declaration: NodeRef,
+    pub(super) members: SymbolTableId,
+    pub(super) properties: Vec<FiniteRecordMappedProperty>,
+}
+
+/// One validated transient property owned by a finite mapped `Record`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct FiniteRecordMappedProperty {
+    pub(super) symbol: SemanticSymbolId,
+    pub(super) name: EscapedName,
+    pub(super) type_: TypeId,
+    pub(super) optional: bool,
+    pub(super) readonly: bool,
+}
+
 /// An invalid mapped record, unsupported input, or poisoned lazy cache.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MappedTypeError {
@@ -1316,6 +1335,66 @@ impl CanonicalTypeMapperStore {
         publish_mapped_members(self, &shape, properties, &indexes)
     }
 
+    /// Validates an existing finite `Record` projection without changing caches.
+    pub(super) fn finite_record_mapped_projection(
+        &self,
+        type_: TypeId,
+    ) -> Result<FiniteRecordMappedProjection, MappedTypeError> {
+        let (declaration, mapped_shape, planned) = finite_record_mapped_shape(self, type_)?;
+        let members = validate_warm_mapped_members(self, &mapped_shape, &planned, &[])?
+            .ok_or(MappedTypeError::InvalidCachedMembers(type_))?;
+        let mut properties = Vec::with_capacity(members.properties.len());
+        for symbol in members.properties {
+            let (containing_type, _, cached_type) = validate_mapped_property_header(self, symbol)?;
+            if containing_type != type_ || cached_type != Some(mapped_shape.template_type) {
+                return Err(MappedTypeError::InvalidCachedProperty(symbol));
+            }
+            let property = self
+                .symbol(symbol)
+                .ok_or(MappedTypeError::InvalidCachedProperty(symbol))?;
+            properties.push(FiniteRecordMappedProperty {
+                symbol,
+                name: property.name().to_owned(),
+                type_: mapped_shape.template_type,
+                optional: property.flags().contains(SymbolFlags::OPTIONAL),
+                readonly: property.check_flags().contains(CheckFlags::READONLY),
+            });
+        }
+        Ok(FiniteRecordMappedProjection {
+            type_,
+            declaration,
+            members: members.members,
+            properties,
+        })
+    }
+
+    /// Resolves finite `Record` members and their values before projection.
+    pub(super) fn resolve_finite_record_mapped_projection(
+        &mut self,
+        type_: TypeId,
+    ) -> Result<FiniteRecordMappedProjection, MappedTypeError> {
+        let (_, mapped_shape, planned) = finite_record_mapped_shape(self, type_)?;
+        if let Some(members) = validate_warm_mapped_members(self, &mapped_shape, &planned, &[])? {
+            for symbol in members.properties() {
+                let (containing_type, _, cached_type) =
+                    validate_mapped_property_header(self, *symbol)?;
+                if containing_type != type_
+                    || cached_type.is_some_and(|cached| cached != mapped_shape.template_type)
+                {
+                    return Err(MappedTypeError::InvalidCachedProperty(*symbol));
+                }
+            }
+        }
+
+        let members = self.resolve_mapped_type_members(type_, MappedTypeModifiers::NONE)?;
+        for symbol in members.properties() {
+            if self.resolve_mapped_symbol_type(*symbol)? != mapped_shape.template_type {
+                return Err(MappedTypeError::InvalidCachedProperty(*symbol));
+            }
+        }
+        self.finite_record_mapped_projection(type_)
+    }
+
     /// Resolves one mapped property and evaluates its value type on demand.
     ///
     /// # Errors
@@ -1395,6 +1474,111 @@ impl CanonicalTypeMapperStore {
         }
         Ok(type_)
     }
+}
+
+fn finite_record_mapped_shape(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Result<(NodeRef, MappedShape, Vec<PlannedMappedProperty>), MappedTypeError> {
+    let record = store
+        .type_payload(type_)
+        .ok_or(MappedTypeError::InvalidMappedType(type_))?;
+    let TypeData::Mapped(mapped) = record.data() else {
+        return Err(MappedTypeError::InvalidMappedType(type_));
+    };
+    let identity = record
+        .alias()
+        .and_then(|identity| store.type_alias(identity))
+        .ok_or(MappedTypeError::InvalidMappedType(type_))?;
+    let owner = identity
+        .symbol()
+        .ok_or(MappedTypeError::InvalidMappedType(type_))?;
+    let owner_record = store
+        .symbol(owner)
+        .ok_or(MappedTypeError::InvalidMappedType(type_))?;
+    let owner_arguments = identity
+        .type_arguments()
+        .ok_or(MappedTypeError::InvalidMappedType(type_))?;
+    let alias = if owner_record.name().as_utf8() == Some("Record") {
+        owner
+    } else {
+        store
+            .intrinsic_bootstrap()
+            .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+            .and_then(|globals| globals.get_source("Record"))
+            .and_then(|alias| store.get_merged_symbol(alias))
+            .ok_or(MappedTypeError::InvalidMappedType(type_))?
+    };
+    let declared = mapped
+        .object
+        .target
+        .ok_or(MappedTypeError::InvalidMappedType(type_))?;
+    let declaration = mapped
+        .declaration
+        .ok_or(MappedTypeError::InvalidMappedType(type_))?;
+    let key = mapped
+        .constraint_type
+        .ok_or(MappedTypeError::InvalidMappedType(type_))?;
+    let value = mapped
+        .template_type
+        .ok_or(MappedTypeError::InvalidMappedType(type_))?;
+    let parameters = store
+        .type_alias_links(alias)
+        .and_then(|links| links.type_parameters.as_deref())
+        .ok_or(MappedTypeError::InvalidSymbol(alias))?;
+    store.validate_record_mapped_alias_instantiation(
+        alias,
+        declared,
+        parameters,
+        &[key, value],
+        type_,
+    )?;
+    if owner != alias {
+        let owner_links = store
+            .type_alias_links(owner)
+            .ok_or(MappedTypeError::InvalidMappedType(type_))?;
+        if owner_links.declared_type != Some(type_)
+            || owner_links.type_parameters.as_deref().unwrap_or_default() != owner_arguments
+        {
+            return Err(MappedTypeError::InvalidMappedType(type_));
+        }
+    }
+
+    let key_record = store
+        .type_payload(key)
+        .ok_or(MappedTypeError::UnsupportedConstraint(key))?;
+    let finite_keys = match key_record.data() {
+        TypeData::Literal(_) | TypeData::UniqueEsSymbol(_) => {
+            escaped_property_name_from_type(store, key).is_some()
+        }
+        TypeData::Union(union) => {
+            !union.union.types.is_empty()
+                && union
+                    .union
+                    .types
+                    .iter()
+                    .all(|key| escaped_property_name_from_type(store, *key).is_some())
+        }
+        _ => false,
+    };
+    if !finite_keys {
+        return Err(MappedTypeError::UnsupportedConstraint(key));
+    }
+
+    let shape = validate_mapped_shape(store, type_)?;
+    let (properties, indexes) = plan_mapped_members(store, &shape, MappedTypeModifiers::NONE)?;
+    if properties.is_empty()
+        || !indexes.is_empty()
+        || properties.iter().any(|property| {
+            property.origin.is_some()
+                || property.optional
+                || property.readonly
+                || property.strip_optional
+        })
+    {
+        return Err(MappedTypeError::UnsupportedConstraint(key));
+    }
+    Ok((declaration, shape, properties))
 }
 
 fn validate_record_mapped_alias_request(
@@ -3832,6 +4016,189 @@ mod tests {
             Ok(members),
         );
         assert_eq!((cache_state(store), store.index_info_len()), warm);
+    }
+
+    #[test]
+    fn finite_record_projection_preserves_owner_identity_and_replays_without_writes() {
+        let parsed = parse_source_file("type Record<K extends keyof any, T> = { [P in K]: T };\n");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut context = checker_context(&parsed);
+        let (alias, declared, parameters) = record_mapped_fixture(&parsed, &mut context);
+        let store = context.store_mut_for_test();
+        let first = store
+            .regular_string_literal_type("i\u{307}spanyol".to_owned())
+            .unwrap();
+        let second = store
+            .regular_string_literal_type("\u{3bf}\u{3c2}".to_owned())
+            .unwrap();
+        let keys = store
+            .alloc_union_type(ObjectFlags::NONE, vec![first, second])
+            .unwrap();
+        let value = store.intrinsic_bootstrap().unwrap().string_type;
+        let arguments = [keys, value];
+        let instantiated = store
+            .instantiate_record_mapped_alias(alias, declared, &parameters, &arguments)
+            .unwrap();
+        let identity = store.alloc_type_alias(Some(alias)).unwrap();
+        assert!(store.set_type_alias_arguments(identity, Some(arguments.to_vec())));
+        assert!(store.set_type_alias(instantiated, Some(identity)));
+
+        let cold = cache_state(store);
+        assert_eq!(
+            store.finite_record_mapped_projection(instantiated),
+            Err(MappedTypeError::InvalidCachedMembers(instantiated)),
+        );
+        assert_eq!(cache_state(store), cold);
+
+        let projection = store
+            .resolve_finite_record_mapped_projection(instantiated)
+            .unwrap();
+        assert_eq!(projection.type_, instantiated);
+        assert_eq!(
+            store.source_node_kind(projection.declaration),
+            Some(SyntaxKind::MappedType),
+        );
+        assert_eq!(projection.properties.len(), 2);
+        for property in &projection.properties {
+            assert_eq!(property.type_, value);
+            assert!(!property.optional);
+            assert!(!property.readonly);
+            assert_eq!(
+                store
+                    .symbol_table(projection.members)
+                    .and_then(|members| members.get(property.name.as_ref())),
+                Some(property.symbol),
+            );
+            let links = store.value_symbol_links(property.symbol).unwrap();
+            assert_eq!(links.containing_type, Some(instantiated));
+            assert_eq!(links.resolved_type, Some(value));
+            assert_eq!(
+                links.name_type,
+                store
+                    .mapped_symbol_links(property.symbol)
+                    .and_then(|links| links.key_type),
+            );
+        }
+
+        let warm = cache_state(store);
+        assert_eq!(
+            store.finite_record_mapped_projection(instantiated),
+            Ok(projection.clone()),
+        );
+        assert_eq!(
+            store.resolve_finite_record_mapped_projection(instantiated),
+            Ok(projection),
+        );
+        assert_eq!(cache_state(store), warm);
+    }
+
+    #[test]
+    fn finite_record_projection_rejects_broad_and_indexed_key_domains_without_writes() {
+        let parsed = parse_source_file("type Record<K extends keyof any, T> = { [P in K]: T };\n");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut context = checker_context(&parsed);
+        let (alias, declared, parameters) = record_mapped_fixture(&parsed, &mut context);
+        let store = context.store_mut_for_test();
+        let (string, number, never) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.string_type,
+                bootstrap.number_type,
+                bootstrap.never_type,
+            )
+        };
+        let literal = store
+            .regular_string_literal_type("fixed".to_owned())
+            .unwrap();
+        let mixed = store
+            .alloc_union_type(ObjectFlags::NONE, vec![string, literal])
+            .unwrap();
+
+        for key in [string, number, never, mixed] {
+            let arguments = [key, number];
+            let instantiated = store
+                .instantiate_record_mapped_alias(alias, declared, &parameters, &arguments)
+                .unwrap();
+            let identity = store.alloc_type_alias(Some(alias)).unwrap();
+            assert!(store.set_type_alias_arguments(identity, Some(arguments.to_vec())));
+            assert!(store.set_type_alias(instantiated, Some(identity)));
+            let cold = cache_state(store);
+
+            assert_eq!(
+                store.finite_record_mapped_projection(instantiated),
+                Err(MappedTypeError::UnsupportedConstraint(key)),
+            );
+            assert_eq!(
+                store.resolve_finite_record_mapped_projection(instantiated),
+                Err(MappedTypeError::UnsupportedConstraint(key)),
+            );
+            assert_eq!(cache_state(store), cold);
+        }
+    }
+
+    #[test]
+    fn finite_record_projection_rejects_forged_property_value_and_owner_caches() {
+        let parsed = parse_source_file("type Record<K extends keyof any, T> = { [P in K]: T };\n");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut context = checker_context(&parsed);
+        let (alias, declared, parameters) = record_mapped_fixture(&parsed, &mut context);
+        let store = context.store_mut_for_test();
+        let key = store
+            .regular_string_literal_type("ready".to_owned())
+            .unwrap();
+        let (value, wrong_value) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let arguments = [key, value];
+        let instantiated = store
+            .instantiate_record_mapped_alias(alias, declared, &parameters, &arguments)
+            .unwrap();
+        let identity = store.alloc_type_alias(Some(alias)).unwrap();
+        assert!(store.set_type_alias_arguments(identity, Some(arguments.to_vec())));
+        assert!(store.set_type_alias(instantiated, Some(identity)));
+        let projection = store
+            .resolve_finite_record_mapped_projection(instantiated)
+            .unwrap();
+        let [property] = projection.properties.as_slice() else {
+            panic!("expected one finite mapped Record property")
+        };
+        let original = store.value_symbol_links(property.symbol).unwrap().clone();
+
+        for (containing_type, resolved_type) in [
+            (Some(instantiated), Some(wrong_value)),
+            (Some(declared), Some(value)),
+        ] {
+            let mut poisoned = original.clone();
+            poisoned.containing_type = containing_type;
+            poisoned.resolved_type = resolved_type;
+            assert!(store.set_value_symbol_links(property.symbol, poisoned));
+            let state = cache_state(store);
+            assert!(matches!(
+                store.finite_record_mapped_projection(instantiated),
+                Err(MappedTypeError::InvalidCachedProperty(_)
+                    | MappedTypeError::InvalidMappedType(_))
+            ));
+            assert!(matches!(
+                store.resolve_finite_record_mapped_projection(instantiated),
+                Err(MappedTypeError::InvalidCachedProperty(_)
+                    | MappedTypeError::InvalidMappedType(_))
+            ));
+            assert_eq!(cache_state(store), state);
+            assert!(store.set_value_symbol_links(property.symbol, original.clone()));
+        }
+
+        assert!(store.set_type_alias_arguments(identity, Some(vec![value, key])));
+        let state = cache_state(store);
+        assert_eq!(
+            store.finite_record_mapped_projection(instantiated),
+            Err(MappedTypeError::InvalidMappedType(instantiated)),
+        );
+        assert_eq!(
+            store.resolve_finite_record_mapped_projection(instantiated),
+            Err(MappedTypeError::InvalidMappedType(instantiated)),
+        );
+        assert_eq!(cache_state(store), state);
     }
 
     #[test]
