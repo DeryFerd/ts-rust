@@ -899,6 +899,15 @@ pub fn parse_project_options(config: &ProjectConfig) -> ParseOptionsResult {
     {
         *base_url = ts_path::resolve_path(directory, &[base_url]);
     }
+    if result.options.base_url.is_none() {
+        for substitutions in result.options.paths.values_mut() {
+            for substitution in substitutions {
+                if !ts_path::is_absolute(substitution) {
+                    *substitution = ts_path::resolve_path(directory, &[substitution]);
+                }
+            }
+        }
+    }
     if let Some(map_root) = &mut result.options.map_root
         && !ts_path::is_absolute(map_root)
     {
@@ -3278,6 +3287,99 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_project_path_substitutions_without_creating_a_base_url() {
+        let config = parse_config_text(
+            "/repo/tsconfig.json",
+            r#"{
+                "compilerOptions": {
+                    "moduleResolution": "bundler",
+                    "paths": { "some-path": ["./some-path/index.ts"] }
+                }
+            }"#,
+        )
+        .value
+        .unwrap();
+        let result = parse_project_options(&config);
+        assert!(result.is_ok(), "{:?}", result.diagnostics);
+        assert!(result.options.base_url.is_none());
+        assert_eq!(
+            result.options.paths.get("some-path"),
+            Some(&vec!["/repo/some-path/index.ts".to_owned()])
+        );
+
+        let resolution = result.options.module_resolution_options();
+        assert!(resolution.base_url.is_none());
+        assert!(!resolution.paths.contains_key("unrelated-package"));
+        assert_eq!(
+            resolution.paths.get("some-path"),
+            Some(&vec!["/repo/some-path/index.ts".to_owned()])
+        );
+    }
+
+    #[test]
+    fn preserves_nested_wildcard_order_and_absolute_path_provenance() {
+        let config = parse_config_text(
+            "/repo/apps/site/tsconfig.json",
+            r#"{
+                "compilerOptions": {
+                    "paths": {
+                        "@app/*": ["./src/*", "../generated/*", "/shared/types/*"],
+                        "inherited": ["/repo/config/original/index.d.ts"]
+                    }
+                }
+            }"#,
+        )
+        .value
+        .unwrap();
+        let result = parse_project_options(&config);
+        assert!(result.is_ok(), "{:?}", result.diagnostics);
+        assert!(result.options.base_url.is_none());
+        assert_eq!(
+            result.options.paths.get("@app/*"),
+            Some(&vec![
+                "/repo/apps/site/src/*".to_owned(),
+                "/repo/apps/generated/*".to_owned(),
+                "/shared/types/*".to_owned(),
+            ])
+        );
+        assert_eq!(
+            result.options.paths.get("inherited"),
+            Some(&vec!["/repo/config/original/index.d.ts".to_owned()])
+        );
+    }
+
+    #[test]
+    fn retains_relative_path_substitutions_with_an_explicit_base_url() {
+        let config = parse_config_text(
+            "/repo/apps/site/tsconfig.json",
+            r#"{
+                "compilerOptions": {
+                    "baseUrl": "../shared",
+                    "paths": {
+                        "@app/*": ["./src/*", "../fallback/*", "/shared/types/*"]
+                    }
+                }
+            }"#,
+        )
+        .value
+        .unwrap();
+        let result = parse_project_options(&config);
+        assert!(result.is_ok(), "{:?}", result.diagnostics);
+        assert_eq!(
+            result.options.base_url.as_deref(),
+            Some("/repo/apps/shared")
+        );
+        assert_eq!(
+            result.options.paths.get("@app/*"),
+            Some(&vec![
+                "./src/*".to_owned(),
+                "../fallback/*".to_owned(),
+                "/shared/types/*".to_owned(),
+            ])
+        );
+    }
+
+    #[test]
     fn validates_path_mapping_patterns_and_substitutions_with_upstream_codes() {
         let config = parse_config_text(
             "/repo/tsconfig.json",
@@ -3326,7 +3428,7 @@ mod tests {
         );
         assert_eq!(
             result.options.paths.get("valid/*"),
-            Some(&vec!["./src/*".to_owned()])
+            Some(&vec!["/repo/src/*".to_owned()])
         );
         assert!(!result.options.paths.contains_key("scalar"));
     }
@@ -3357,11 +3459,11 @@ mod tests {
         );
         assert_eq!(
             result.options.paths.get("mixed"),
-            Some(&vec!["./valid.ts".to_owned()])
+            Some(&vec!["/repo/valid.ts".to_owned()])
         );
         assert_eq!(
             result.options.paths.get("valid"),
-            Some(&vec!["./other.ts".to_owned()])
+            Some(&vec!["/repo/other.ts".to_owned()])
         );
     }
 
