@@ -14,8 +14,8 @@ use ts_binder::{
 };
 
 use super::{
-    source_callables::valid_source_function_owner_shape, CanonicalTypeMapperStore,
-    DeclaredTypeError, DeclaredTypeHost, TypeId,
+    CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, TypeId,
+    source_callables::valid_source_function_owner_shape,
 };
 
 /// Binder identities retained for one exact top-level function declaration.
@@ -729,9 +729,11 @@ mod tests {
         let (symbols, mut files) = binder.finish().try_into_parts().unwrap();
         let bound = files.remove(&file).unwrap();
         let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
-        assert!(store
-            .register_source_file(&parsed.arena, parsed.source_file, file)
-            .is_some());
+        assert!(
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .is_some()
+        );
 
         let function = |expected_name: &str| {
             parsed
