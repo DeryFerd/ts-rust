@@ -1,7 +1,7 @@
 //! Exact syntax and symbol plan for the first interface-heritage slice.
 //!
-//! This module admits one or two direct identifier bases on nongeneric
-//! interfaces, including bases assembled from merged interface declarations.
+//! This module admits one or two nongeneric interface bases, including merged
+//! declarations, authenticated namespace exports, and bounded base chains.
 //! It also authenticates the exact `Record<string, any>` mapped-alias base.
 //! Every base is resolved before publication so member construction retains
 //! its declaration identity and, for mapped bases, its source type arguments.
@@ -46,6 +46,8 @@ pub(super) enum DirectInterfaceHeritageError {
     Unsupported { node: NodeRef, kind: SyntaxKind },
 }
 
+const MAX_INTERFACE_HERITAGE_DEPTH: usize = 16;
+
 pub(super) fn plan_direct_interface_heritage(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -53,6 +55,35 @@ pub(super) fn plan_direct_interface_heritage(
     owner: SemanticSymbolId,
     clauses: &NodeList,
 ) -> Result<DirectInterfaceHeritagePlan, DirectInterfaceHeritageError> {
+    plan_direct_interface_heritage_inner(
+        store,
+        host,
+        declaration,
+        owner,
+        clauses,
+        &mut HashSet::from([owner]),
+        0,
+    )
+}
+
+fn plan_direct_interface_heritage_inner(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    owner: SemanticSymbolId,
+    clauses: &NodeList,
+    active: &mut HashSet<SemanticSymbolId>,
+    depth: usize,
+) -> Result<DirectInterfaceHeritagePlan, DirectInterfaceHeritageError> {
+    if !active.contains(&owner) {
+        return Err(DirectInterfaceHeritageError::Invalid);
+    }
+    if depth >= MAX_INTERFACE_HERITAGE_DEPTH {
+        return Err(DirectInterfaceHeritageError::Unsupported {
+            node: declaration,
+            kind: SyntaxKind::InterfaceDeclaration,
+        });
+    }
     let [clause_id] = clauses.nodes.as_slice() else {
         return Err(DirectInterfaceHeritageError::Unsupported {
             node: declaration,
@@ -111,14 +142,28 @@ pub(super) fn plan_direct_interface_heritage(
         let expression = NodeRef::new(declaration.arena, declaration.file, base.expression);
         let expression_record = preflight_node(store, host, expression)
             .map_err(|_| DirectInterfaceHeritageError::Invalid)?;
-        let NodeData::Identifier(identifier) = &expression_record.data else {
-            return Err(DirectInterfaceHeritageError::Unsupported {
-                node: expression,
-                kind: expression_record.kind,
-            });
+        let identifier = match &expression_record.data {
+            NodeData::Identifier(identifier)
+                if expression_record.kind == SyntaxKind::Identifier =>
+            {
+                Some(identifier)
+            }
+            NodeData::PropertyAccessExpression(_)
+                if expression_record.kind == SyntaxKind::PropertyAccessExpression =>
+            {
+                None
+            }
+            NodeData::QualifiedName(_) if expression_record.kind == SyntaxKind::QualifiedName => {
+                None
+            }
+            _ => {
+                return Err(DirectInterfaceHeritageError::Unsupported {
+                    node: expression,
+                    kind: expression_record.kind,
+                });
+            }
         };
-        if expression_record.kind != SyntaxKind::Identifier
-            || expression_record.parent != Some(node.node)
+        if expression_record.parent != Some(node.node)
             || expression_record.range.start < node_record.range.start
             || expression_record.range.end > node_record.range.end
         {
@@ -128,7 +173,9 @@ pub(super) fn plan_direct_interface_heritage(
         let type_arguments = match base.type_arguments.as_ref() {
             None => Vec::new(),
             Some(arguments) => {
-                if identifier.text != "Record" || clause_data.types.nodes.len() != 1 {
+                if identifier.is_none_or(|identifier| identifier.text != "Record")
+                    || clause_data.types.nodes.len() != 1
+                {
                     return Err(DirectInterfaceHeritageError::Unsupported {
                         node,
                         kind: SyntaxKind::ExpressionWithTypeArguments,
@@ -138,7 +185,7 @@ pub(super) fn plan_direct_interface_heritage(
             }
         };
 
-        let resolved = {
+        let resolved = if let Some(identifier) = identifier {
             let (arena, bound) = host
                 .source(expression)
                 .ok_or(DirectInterfaceHeritageError::Invalid)?;
@@ -156,6 +203,8 @@ pub(super) fn plan_direct_interface_heritage(
                     false,
                 )
                 .map_err(|_| DirectInterfaceHeritageError::Invalid)?
+        } else {
+            Some(resolve_qualified_interface_base(store, host, expression)?)
         };
         let raw = resolved.ok_or(DirectInterfaceHeritageError::Invalid)?;
         let symbol = store
@@ -173,10 +222,10 @@ pub(super) fn plan_direct_interface_heritage(
                 kind: SyntaxKind::Identifier,
             });
         };
-        if symbol == owner || !seen_symbols.insert(symbol) {
+        if active.contains(&symbol) || !seen_symbols.insert(symbol) {
             return Err(DirectInterfaceHeritageError::Unsupported {
                 node: expression,
-                kind: SyntaxKind::Identifier,
+                kind: expression_record.kind,
             });
         }
         if !type_arguments.is_empty() {
@@ -200,7 +249,7 @@ pub(super) fn plan_direct_interface_heritage(
         if symbol_record.flags() != SymbolFlags::INTERFACE {
             return Err(DirectInterfaceHeritageError::Unsupported {
                 node: expression,
-                kind: SyntaxKind::Identifier,
+                kind: expression_record.kind,
             });
         }
         let mut seen_declarations = HashSet::with_capacity(base_declarations.len());
@@ -216,16 +265,43 @@ pub(super) fn plan_direct_interface_heritage(
             };
             if base_declaration_record.kind != SyntaxKind::InterfaceDeclaration
                 || base_interface.type_parameters.is_some()
-                || base_interface.heritage_clauses.is_some()
                 || !host.symbol_matches(store, base_declaration, symbol)
             {
                 return Err(DirectInterfaceHeritageError::Unsupported {
                     node: expression,
-                    kind: SyntaxKind::Identifier,
+                    kind: expression_record.kind,
                 });
             }
             if !seen_declarations.insert(base_declaration) {
                 return Err(DirectInterfaceHeritageError::Invalid);
+            }
+            if let Some(inherited) = base_interface.heritage_clauses.as_ref() {
+                if base_declarations.len() != 1 || !active.insert(symbol) {
+                    return Err(DirectInterfaceHeritageError::Unsupported {
+                        node: expression,
+                        kind: expression_record.kind,
+                    });
+                }
+                let planned = plan_direct_interface_heritage_inner(
+                    store,
+                    host,
+                    base_declaration,
+                    symbol,
+                    inherited,
+                    active,
+                    depth + 1,
+                );
+                assert!(active.remove(&symbol));
+                let planned = planned?;
+                if !matches!(
+                    planned.bases.as_slice(),
+                    [base] if base.kind == DirectInterfaceBaseKind::Interface
+                ) {
+                    return Err(DirectInterfaceHeritageError::Unsupported {
+                        node: expression,
+                        kind: expression_record.kind,
+                    });
+                }
             }
         }
         bases.push(DirectInterfaceBasePlan {
@@ -238,6 +314,216 @@ pub(super) fn plan_direct_interface_heritage(
     }
 
     Ok(DirectInterfaceHeritagePlan { clause, bases })
+}
+
+fn resolve_qualified_interface_base(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    expression: NodeRef,
+) -> Result<SemanticSymbolId, DirectInterfaceHeritageError> {
+    let record = preflight_node(store, host, expression)
+        .map_err(|_| DirectInterfaceHeritageError::Invalid)?;
+    let (namespace_id, name_id) = match &record.data {
+        NodeData::PropertyAccessExpression(access)
+            if record.kind == SyntaxKind::PropertyAccessExpression
+                && access.flow_node.is_none()
+                && access.question_dot_token.is_none()
+                && access.facts == 0 =>
+        {
+            (access.expression, access.name)
+        }
+        NodeData::QualifiedName(qualified)
+            if record.kind == SyntaxKind::QualifiedName
+                && qualified.flow_node.is_none()
+                && qualified.facts == 0 =>
+        {
+            (qualified.left, qualified.right)
+        }
+        _ => return Err(DirectInterfaceHeritageError::Invalid),
+    };
+    let namespace_expression = NodeRef::new(expression.arena, expression.file, namespace_id);
+    let namespace_record = preflight_node(store, host, namespace_expression)
+        .map_err(|_| DirectInterfaceHeritageError::Invalid)?;
+    let name = NodeRef::new(expression.arena, expression.file, name_id);
+    let name_record =
+        preflight_node(store, host, name).map_err(|_| DirectInterfaceHeritageError::Invalid)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(DirectInterfaceHeritageError::Unsupported {
+            node: name,
+            kind: name_record.kind,
+        });
+    };
+    if record.flags.0 != 0
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(expression.node)
+        || identifier.flow_node.is_some()
+        || namespace_record.range.end > name_record.range.start
+        || name_record.range.end > record.range.end
+    {
+        return Err(DirectInterfaceHeritageError::Invalid);
+    }
+
+    let namespace = authenticate_namespace_expression(
+        store,
+        host,
+        namespace_expression,
+        expression,
+        &mut HashSet::new(),
+    )?;
+    let mut callback_host = host
+        .name_resolver_host(store)
+        .map_err(|_| DirectInterfaceHeritageError::Invalid)?;
+    let symbol = callback_host
+        .resolve_entity_name(expression, SymbolFlags::TYPE)
+        .map_err(|_| DirectInterfaceHeritageError::Unsupported {
+            node: expression,
+            kind: record.kind,
+        })?
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .ok_or(DirectInterfaceHeritageError::Unsupported {
+            node: expression,
+            kind: record.kind,
+        })?;
+    if !authenticated_namespace_export(store, namespace, &identifier.text, symbol) {
+        return Err(DirectInterfaceHeritageError::Unsupported {
+            node: expression,
+            kind: record.kind,
+        });
+    }
+    Ok(symbol)
+}
+
+fn authenticate_namespace_expression(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    expression: NodeRef,
+    parent: NodeRef,
+    visited: &mut HashSet<NodeRef>,
+) -> Result<SemanticSymbolId, DirectInterfaceHeritageError> {
+    let record = preflight_node(store, host, expression)
+        .map_err(|_| DirectInterfaceHeritageError::Invalid)?;
+    let parent_record =
+        preflight_node(store, host, parent).map_err(|_| DirectInterfaceHeritageError::Invalid)?;
+    if record.parent != Some(parent.node)
+        || record.flags.0 != 0
+        || record.range.start < parent_record.range.start
+        || record.range.end > parent_record.range.end
+        || !visited.insert(expression)
+    {
+        return Err(DirectInterfaceHeritageError::Invalid);
+    }
+
+    let segment = match &record.data {
+        NodeData::Identifier(identifier)
+            if record.kind == SyntaxKind::Identifier && identifier.flow_node.is_none() =>
+        {
+            None
+        }
+        NodeData::PropertyAccessExpression(access)
+            if record.kind == SyntaxKind::PropertyAccessExpression
+                && access.flow_node.is_none()
+                && access.question_dot_token.is_none()
+                && access.facts == 0 =>
+        {
+            Some((access.expression, access.name))
+        }
+        NodeData::QualifiedName(qualified)
+            if record.kind == SyntaxKind::QualifiedName
+                && qualified.flow_node.is_none()
+                && qualified.facts == 0 =>
+        {
+            Some((qualified.left, qualified.right))
+        }
+        _ => {
+            return Err(DirectInterfaceHeritageError::Unsupported {
+                node: expression,
+                kind: record.kind,
+            });
+        }
+    };
+    let prefix = if let Some((left, name)) = segment {
+        let left = NodeRef::new(expression.arena, expression.file, left);
+        let left_record =
+            preflight_node(store, host, left).map_err(|_| DirectInterfaceHeritageError::Invalid)?;
+        let name = NodeRef::new(expression.arena, expression.file, name);
+        let name_record =
+            preflight_node(store, host, name).map_err(|_| DirectInterfaceHeritageError::Invalid)?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Err(DirectInterfaceHeritageError::Unsupported {
+                node: name,
+                kind: name_record.kind,
+            });
+        };
+        if name_record.kind != SyntaxKind::Identifier
+            || name_record.flags.0 != 0
+            || name_record.parent != Some(expression.node)
+            || identifier.flow_node.is_some()
+            || left_record.range.end > name_record.range.start
+            || name_record.range.end > record.range.end
+        {
+            return Err(DirectInterfaceHeritageError::Invalid);
+        }
+        Some((
+            authenticate_namespace_expression(store, host, left, expression, visited)?,
+            identifier.text.as_str(),
+        ))
+    } else {
+        None
+    };
+
+    let mut callback_host = host
+        .name_resolver_host(store)
+        .map_err(|_| DirectInterfaceHeritageError::Invalid)?;
+    let symbol = callback_host
+        .resolve_entity_name(expression, SymbolFlags::NAMESPACE)
+        .map_err(|_| DirectInterfaceHeritageError::Unsupported {
+            node: expression,
+            kind: record.kind,
+        })?
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .ok_or(DirectInterfaceHeritageError::Unsupported {
+            node: expression,
+            kind: record.kind,
+        })?;
+    if store
+        .symbol(symbol)
+        .is_none_or(|namespace| !namespace.flags().intersects(SymbolFlags::MODULE))
+        || prefix.is_some_and(|(owner, name)| {
+            !authenticated_namespace_export(store, owner, name, symbol)
+        })
+    {
+        return Err(DirectInterfaceHeritageError::Unsupported {
+            node: expression,
+            kind: record.kind,
+        });
+    }
+    Ok(symbol)
+}
+
+fn authenticated_namespace_export(
+    store: &CanonicalTypeMapperStore,
+    namespace: SemanticSymbolId,
+    name: &str,
+    symbol: SemanticSymbolId,
+) -> bool {
+    let Some(owner) = store.symbol(namespace) else {
+        return false;
+    };
+    let exports = store
+        .module_symbol_links(namespace)
+        .and_then(|links| links.resolved_exports)
+        .or_else(|| owner.exports());
+    exports
+        .and_then(|exports| store.symbol_table(exports))
+        .and_then(|exports| exports.get_source(name))
+        .and_then(|export| store.get_merged_symbol(export))
+        == Some(symbol)
+        && store.get_parent_of_symbol(symbol) == Some(namespace)
+        && store
+            .symbol(symbol)
+            .and_then(|symbol| symbol.name().as_utf8())
+            == Some(name)
 }
 
 fn plan_record_type_arguments(
@@ -548,6 +834,204 @@ mod tests {
             interface_symbol(parsed, file, context, expected),
             interface.heritage_clauses.as_ref().unwrap(),
         )
+    }
+
+    #[test]
+    fn qualified_namespace_bases_preserve_export_ownership_and_warm_state() {
+        let cases = [
+            (
+                concat!(
+                    "namespace Types { export interface Base { value: number } }\n",
+                    "interface Derived extends Types.Base { own: number }\n",
+                ),
+                "Types",
+            ),
+            (
+                concat!(
+                    "namespace Outer { export namespace Inner { ",
+                    "export interface Base { value: number } } }\n",
+                    "interface Derived extends Outer.Inner.Base { own: number }\n",
+                ),
+                "Inner",
+            ),
+        ];
+
+        for (index, (source, expected_owner)) in cases.into_iter().enumerate() {
+            let parsed = parse_source_file(source);
+            assert!(
+                parsed.diagnostics.is_empty(),
+                "{index}: {:?}",
+                parsed.diagnostics
+            );
+            let file = FileId::new(8_430 + u32::try_from(index).unwrap());
+            let context = checker_context(&parsed, file);
+            let cold = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().symbol_store().symbol_table_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+
+            let first = heritage_plan(&parsed, file, &context, "Derived").unwrap();
+            let [base] = first.bases.as_slice() else {
+                panic!("{index}: a qualified interface has one authenticated base")
+            };
+            assert_eq!(base.kind, DirectInterfaceBaseKind::Interface);
+            assert!(base.type_arguments.is_empty());
+            assert_eq!(
+                parsed.arena.get(base.expression.node).unwrap().kind,
+                SyntaxKind::QualifiedName
+            );
+            assert_eq!(
+                base.symbol,
+                interface_symbol(&parsed, file, &context, "Base")
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .get_parent_of_symbol(base.symbol)
+                    .and_then(|owner| context.store().symbol(owner))
+                    .and_then(|owner| owner.name().as_utf8()),
+                Some(expected_owner)
+            );
+            assert_eq!(
+                heritage_plan(&parsed, file, &context, "Derived").unwrap(),
+                first
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().symbol_store().symbol_table_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                cold,
+                "{index}: qualified heritage planning published checker state"
+            );
+        }
+    }
+
+    #[test]
+    fn qualified_namespace_bases_reject_private_generic_and_class_exports() {
+        let cases = [
+            concat!(
+                "namespace Types { interface Hidden { value: number } }\n",
+                "interface Derived extends Types.Hidden { own: number }\n",
+            ),
+            concat!(
+                "namespace Types { export interface Base<T> { value: T } }\n",
+                "interface Derived extends Types.Base<number> { own: number }\n",
+            ),
+            concat!(
+                "namespace Types { export class Base {} }\n",
+                "interface Derived extends Types.Base { own: number }\n",
+            ),
+        ];
+
+        for (index, source) in cases.into_iter().enumerate() {
+            let parsed = parse_source_file(source);
+            assert!(
+                parsed.diagnostics.is_empty(),
+                "{index}: {:?}",
+                parsed.diagnostics
+            );
+            let file = FileId::new(8_440 + u32::try_from(index).unwrap());
+            let context = checker_context(&parsed, file);
+            assert!(
+                matches!(
+                    heritage_plan(&parsed, file, &context, "Derived"),
+                    Err(DirectInterfaceHeritageError::Unsupported { .. })
+                ),
+                "{index}: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn qualified_namespace_bases_reject_forged_export_owners() {
+        let parsed = parse_source_file(concat!(
+            "namespace Types { export interface Base { value: number } }\n",
+            "namespace Other { export interface Foreign { value: number } }\n",
+            "interface Derived extends Types.Base { own: number }\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(8_450);
+        let mut context = checker_context(&parsed, file);
+        let original = interface_symbol(&parsed, file, &context, "Base");
+        let foreign = interface_symbol(&parsed, file, &context, "Foreign");
+        let namespace = context.store().get_parent_of_symbol(original).unwrap();
+        let exports = context
+            .store()
+            .symbol(namespace)
+            .unwrap()
+            .exports()
+            .unwrap();
+        assert_eq!(
+            context.store_mut_for_test().insert_symbol(
+                exports,
+                EscapedName::source("Base"),
+                foreign
+            ),
+            Some(Some(original))
+        );
+
+        assert!(matches!(
+            heritage_plan(&parsed, file, &context, "Derived"),
+            Err(DirectInterfaceHeritageError::Unsupported { .. })
+        ));
+    }
+
+    #[test]
+    fn transitive_interface_bases_are_planned_without_publication() {
+        let parsed = parse_source_file(concat!(
+            "interface Root { first: number }\n",
+            "interface Middle extends Root { second: string }\n",
+            "interface Leaf extends Middle { third: boolean }\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(8_451);
+        let context = checker_context(&parsed, file);
+        let cold = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().symbol_store().symbol_table_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+
+        let plan = heritage_plan(&parsed, file, &context, "Leaf").unwrap();
+        let [base] = plan.bases.as_slice() else {
+            panic!("a transitive chain retains only its direct base")
+        };
+        assert_eq!(
+            base.symbol,
+            interface_symbol(&parsed, file, &context, "Middle")
+        );
+        assert_eq!(base.kind, DirectInterfaceBaseKind::Interface);
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().symbol_store().symbol_table_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            cold
+        );
+    }
+
+    #[test]
+    fn transitive_interface_cycles_remain_unsupported() {
+        let parsed = parse_source_file(concat!(
+            "interface Left extends Right { first: number }\n",
+            "interface Right extends Left { second: string }\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(8_452);
+        let context = checker_context(&parsed, file);
+
+        assert!(matches!(
+            heritage_plan(&parsed, file, &context, "Left"),
+            Err(DirectInterfaceHeritageError::Unsupported { .. })
+        ));
     }
 
     #[test]

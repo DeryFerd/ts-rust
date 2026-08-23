@@ -159,12 +159,6 @@ pub(super) fn resolve_direct_interface_members(
             });
         }
         let inherited_base = store.direct_interface_heritage_provenance(base).is_some();
-        if second_base.is_some() && inherited_base {
-            return Err(PropertyObjectError::UnsupportedMember {
-                node: planned.node,
-                kind: SyntaxKind::ExpressionWithTypeArguments,
-            });
-        }
         let surface = if inherited_base {
             validate_direct_heritage_property_interface(store, base)
         } else {
@@ -842,9 +836,6 @@ fn validate_property_interface_worker(
         let inherited_base = store
             .direct_interface_heritage_provenance(base_type)
             .is_some();
-        if base_types.len() == 2 && inherited_base {
-            return None;
-        }
         let base = validate_property_interface_worker(store, base_type, inherited_base, active)?;
         let expected_owner = if index == 0 {
             heritage_provenance.base_symbol
@@ -2393,6 +2384,158 @@ mod tests {
                 prepared.fixture.store.checker_link_allocated_lengths(),
             ),
             warm_state
+        );
+    }
+
+    #[test]
+    fn transitive_interface_bases_preserve_diamond_order_and_reject_warm_poison() {
+        let mut fixture = fixture_with_source(
+            concat!(
+                "interface Root { shared: number }\n",
+                "interface Left extends Root { left: number }\n",
+                "interface Right extends Root { right: number }\n",
+                "interface Leaf extends Left, Right { own: number }\n",
+            ),
+            806,
+        );
+        let root = interface_symbol(&fixture, "Root");
+        let left = interface_symbol(&fixture, "Left");
+        let right = interface_symbol(&fixture, "Right");
+        let leaf = interface_symbol(&fixture, "Leaf");
+        let host = host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        let root_plan = object_members::plan_interface(&fixture.store, &host, root).unwrap();
+        let left_plan = object_members::plan_interface(&fixture.store, &host, left).unwrap();
+        let right_plan = object_members::plan_interface(&fixture.store, &host, right).unwrap();
+        let leaf_plan = indexed_derived_plan(&fixture, &host, leaf, &root_plan);
+        let mut types = Vec::new();
+        for symbol in [root, left, right, leaf] {
+            let flags = fixture.store.symbol(symbol).unwrap().flags();
+            types.push(
+                get_declared_class_interface_or_type_parameter(
+                    &mut fixture.store,
+                    &host,
+                    symbol,
+                    flags,
+                )
+                .unwrap()
+                .unwrap(),
+            );
+        }
+        let [root_type, left_type, right_type, leaf_type] = types.as_slice() else {
+            panic!("the diamond fixture must retain four interface identities")
+        };
+        let (root_type, left_type, right_type, leaf_type) =
+            (*root_type, *left_type, *right_type, *leaf_type);
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        let root_state =
+            object_members::interface_state(&fixture.store, &root_plan, root_type).unwrap();
+        object_members::publish_declared_members(
+            &mut fixture.store,
+            &root_plan,
+            root_state,
+            &[number],
+            &[],
+            &[],
+        )
+        .unwrap();
+        for (plan, type_) in [(&left_plan, left_type), (&right_plan, right_type)] {
+            resolve_direct_interface_members(
+                &mut fixture.store,
+                plan,
+                type_,
+                &[number],
+                &[root_type],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            resolve_direct_interface_members(
+                &mut fixture.store,
+                &leaf_plan,
+                leaf_type,
+                &[number],
+                &[left_type, right_type],
+            ),
+            Ok(leaf_type)
+        );
+        let (members, properties) = {
+            let TypeData::Interface(interface) =
+                fixture.store.type_payload(leaf_type).unwrap().data()
+            else {
+                panic!("the leaf must retain its interface identity")
+            };
+            let properties = interface
+                .reference
+                .object
+                .structured
+                .properties
+                .as_ref()
+                .unwrap();
+            let names = properties
+                .iter()
+                .map(|symbol| {
+                    fixture
+                        .store
+                        .symbol(*symbol)
+                        .unwrap()
+                        .name()
+                        .as_utf8()
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(names, ["own", "left", "shared", "right"]);
+            assert_eq!(
+                interface.resolved_base_types.as_deref(),
+                Some([left_type, right_type].as_slice())
+            );
+            (
+                interface.reference.object.structured.members,
+                properties.clone(),
+            )
+        };
+        assert_eq!(
+            validate_interface_heritage_members(&fixture.store, leaf_type),
+            InterfaceHeritageMembersValidation::Valid
+        );
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.symbol_store().symbol_table_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            resolve_direct_interface_members(
+                &mut fixture.store,
+                &leaf_plan,
+                leaf_type,
+                &[number],
+                &[left_type, right_type],
+            ),
+            Ok(leaf_type)
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.symbol_store().symbol_table_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm
+        );
+        let mut reordered = properties;
+        reordered.swap(1, 3);
+        assert!(fixture.store.set_structured_type_members(
+            leaf_type,
+            members,
+            Some(reordered),
+            None,
+            None,
+            None,
+        ));
+        assert_eq!(
+            validate_interface_heritage_members(&fixture.store, leaf_type),
+            InterfaceHeritageMembersValidation::Malformed
         );
     }
 

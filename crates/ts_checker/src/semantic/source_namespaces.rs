@@ -1021,23 +1021,70 @@ fn plan_namespace_function(
             SourceSyntaxRole::FunctionName,
         ));
     };
-    let Some(body) = function.body else {
-        return Err(unsupported(
-            declaration,
-            record.kind,
-            SourceSyntaxRole::FunctionBody,
-        ));
+    let ambient_declaration = ambient
+        && bound
+            .source_facts()
+            .is_some_and(ts_binder::CanonicalSourceFileFacts::is_declaration_file)
+        && function.body.is_none();
+    let body = if ambient_declaration {
+        let annotation = function
+            .type_
+            .map(|annotation| child(declaration, annotation));
+        let Some(annotation) = annotation else {
+            return Err(unsupported(
+                declaration,
+                record.kind,
+                SourceSyntaxRole::FunctionDeclaration,
+            ));
+        };
+        let annotation_record = owned_node(arena, bound, store, annotation)?;
+        if annotation_record.kind != SyntaxKind::VoidKeyword
+            || annotation_record.flags.0 != 0
+            || annotation_record.parent != Some(declaration.node)
+            || !matches!(annotation_record.data, NodeData::KeywordTypeNode(_))
+        {
+            return Err(unsupported(
+                annotation,
+                annotation_record.kind,
+                SourceSyntaxRole::FunctionDeclaration,
+            ));
+        }
+        declaration
+    } else {
+        let Some(body) = function.body else {
+            return Err(unsupported(
+                declaration,
+                record.kind,
+                SourceSyntaxRole::FunctionBody,
+            ));
+        };
+        let body = child(declaration, body);
+        let body_record = owned_node(arena, bound, store, body)?;
+        let NodeData::Block(block) = &body_record.data else {
+            return Err(unsupported(
+                body,
+                body_record.kind,
+                SourceSyntaxRole::FunctionBody,
+            ));
+        };
+        if body_record.kind != SyntaxKind::Block
+            || body_record.flags.0 != 0
+            || body_record.parent != Some(declaration.node)
+            || block.flow_node.is_some()
+            || block.next_container.is_some()
+            || block.facts != 0
+            || !block.statements.nodes.is_empty()
+            || block.statements.has_trailing_comma
+        {
+            return Err(unsupported(
+                declaration,
+                record.kind,
+                SourceSyntaxRole::FunctionDeclaration,
+            ));
+        }
+        body
     };
-    let body = child(declaration, body);
-    let body_record = owned_node(arena, bound, store, body)?;
-    let NodeData::Block(block) = &body_record.data else {
-        return Err(unsupported(
-            body,
-            body_record.kind,
-            SourceSyntaxRole::FunctionBody,
-        ));
-    };
-    if ambient
+    if ambient != ambient_declaration
         || !exported
         || declared
         || record.kind != SyntaxKind::FunctionDeclaration
@@ -1050,7 +1097,7 @@ fn plan_namespace_function(
         || function.next_container.is_some()
         || function.return_flow_node.is_some()
         || function.symbol.is_some()
-        || function.type_.is_some()
+        || function.type_.is_some() != ambient_declaration
         || function.type_parameters.is_some()
         || function.facts != 0
         || !function.parameters.nodes.is_empty()
@@ -1060,14 +1107,6 @@ fn plan_namespace_function(
         || name_record.parent != Some(declaration.node)
         || identifier.flow_node.is_some()
         || identifier.text.is_empty()
-        || body_record.kind != SyntaxKind::Block
-        || body_record.flags.0 != 0
-        || body_record.parent != Some(declaration.node)
-        || block.flow_node.is_some()
-        || block.next_container.is_some()
-        || block.facts != 0
-        || !block.statements.nodes.is_empty()
-        || block.statements.has_trailing_comma
     {
         return Err(unsupported(
             declaration,
@@ -1136,9 +1175,16 @@ fn plan_namespace_function(
         || callable.export_local != Some(local)
         || !callable.parameters.is_empty()
         || !callable.type_parameters.is_empty()
-        || !callable.return_type.is_inferred()
         || callable.body != body
-        || callable.body_mode.is_ambient()
+        || callable.body_mode.is_ambient() != ambient_declaration
+        || if ambient_declaration {
+            callable.return_type.annotation_identity()
+                != function
+                    .type_
+                    .map(|annotation| (child(declaration, annotation), false))
+        } else {
+            !callable.return_type.is_inferred()
+        }
     {
         return Err(SourceCheckError::Function(
             SourceFunctionInvariant::Callable(declaration),
@@ -1878,13 +1924,6 @@ fn plan_namespace_variables(
     let (exported, declared) =
         modifier_flags(arena, bound, store, statement, variable.modifiers.as_ref())?;
     let runtime = !ambient && !declared;
-    if runtime && exported {
-        return Err(unsupported(
-            statement,
-            record.kind,
-            SourceSyntaxRole::VariableStatement,
-        ));
-    }
     let list = child(statement, variable.declaration_list);
     let list_record = owned_node(arena, bound, store, list)?;
     let NodeData::VariableDeclarationList(declarations) = &list_record.data else {
@@ -1918,6 +1957,13 @@ fn plan_namespace_variables(
             return Err(invalid_parent(declaration, list, declaration_record.parent));
         }
         if runtime && variable.initializer.is_none() {
+            return Err(unsupported(
+                statement,
+                record.kind,
+                SourceSyntaxRole::VariableStatement,
+            ));
+        }
+        if runtime && exported && variable.type_.is_some() {
             return Err(unsupported(
                 statement,
                 record.kind,
@@ -2045,6 +2091,46 @@ fn plan_namespace_variables(
             SourceCheckProvenanceError::MissingDeclarationSymbol(declaration),
         ))?;
         let value_declaration = symbol_record.value_declaration();
+        let valid_runtime_binding = if !runtime {
+            true
+        } else if exported {
+            bound
+                .local_symbol(declaration)
+                .and_then(|local| store.symbol(local).map(|record| (local, record)))
+                .is_some_and(|(local, local_record)| {
+                    store.get_parent_of_symbol(symbol) == Some(owner)
+                        && store.get_merged_symbol(local) == Some(local)
+                        && local_record.flags() == SymbolFlags::EXPORT_VALUE
+                        && local_record.check_flags() == CheckFlags::NONE
+                        && local_record.declarations() == Some(&[declaration])
+                        && local_record.value_declaration().is_none()
+                        && local_record.name().as_utf8() == Some(identifier.text.as_str())
+                        && local_record.members().is_none()
+                        && local_record.exports().is_none()
+                        && local_record.parent().is_none()
+                        && local_record.export_symbol() == Some(symbol)
+                        && bound
+                            .locals(namespace)
+                            .and_then(|locals| store.symbol_table(locals))
+                            .and_then(|locals| locals.get_source(&identifier.text))
+                            == Some(local)
+                        && store
+                            .symbol(owner)
+                            .and_then(ts_binder::semantic::Symbol::exports)
+                            .and_then(|exports| store.symbol_table(exports))
+                            .and_then(|exports| exports.get_source(&identifier.text))
+                            .and_then(|candidate| store.get_merged_symbol(candidate))
+                            == Some(symbol)
+                })
+        } else {
+            symbol_record.parent().is_none()
+                && bound
+                    .locals(namespace)
+                    .and_then(|locals| store.symbol_table(locals))
+                    .and_then(|locals| locals.get_source(&identifier.text))
+                    .and_then(|candidate| store.get_merged_symbol(candidate))
+                    == Some(symbol)
+        };
         if record.flags.0 != 0
             || variable.exclamation_token.is_some()
             || variable.local_symbol.is_some()
@@ -2071,16 +2157,10 @@ fn plan_namespace_variables(
             || symbol_record.exports().is_some()
             || symbol_record.export_symbol().is_some()
             || runtime
-                && (symbol_record.parent().is_some()
-                    || symbol_record.declarations() != Some(&[declaration])
+                && (symbol_record.declarations() != Some(&[declaration])
                     || value_declaration != Some(declaration)
                     || declaration_symbol(bound, store, namespace, SymbolFlags::MODULE)? != owner
-                    || bound
-                        .locals(namespace)
-                        .and_then(|locals| store.symbol_table(locals))
-                        .and_then(|locals| locals.get_source(&identifier.text))
-                        .and_then(|candidate| store.get_merged_symbol(candidate))
-                        != Some(symbol))
+                    || !valid_runtime_binding)
         {
             return Err(SourceCheckError::Unsupported(
                 UnsupportedSourceSyntax::MissingVariableType(declaration),
@@ -3756,13 +3836,30 @@ pub(super) fn execute_source_namespace(
                         SourceLiteralCacheError::BootstrapUninitialized,
                     ))?
                     .void_type;
-                source_callables::publish_inferred_source_callable_return(
-                    store,
-                    &callable_plan,
-                    signature,
-                    void,
-                )
-                .map_err(|error| namespace_callable_error(*declaration, error))?;
+                if callable_plan.body_mode.is_ambient() {
+                    let return_type = CanonicalTypeQuery::new_with_global_types_and_session(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        session,
+                        diagnostics,
+                    )?
+                    .get_return_type_of_signature(signature)?;
+                    if return_type != void {
+                        return Err(SourceCheckError::Function(
+                            SourceFunctionInvariant::Callable(*declaration),
+                        ));
+                    }
+                } else {
+                    source_callables::publish_inferred_source_callable_return(
+                        store,
+                        &callable_plan,
+                        signature,
+                        void,
+                    )
+                    .map_err(|error| namespace_callable_error(*declaration, error))?;
+                }
                 stage_namespace_value(store, &mut values, *declaration, *symbol, callable)?;
             }
         }
@@ -4018,6 +4115,24 @@ mod tests {
         module_state: CanonicalModuleState,
         options: CanonicalCheckerOptions,
     ) -> Fixture {
+        fixture_with_source_facts(source, module_state, options, false)
+    }
+
+    fn declaration_fixture(source: &'static str, module_state: CanonicalModuleState) -> Fixture {
+        fixture_with_source_facts(
+            source,
+            module_state,
+            CanonicalCheckerOptions::default(),
+            true,
+        )
+    }
+
+    fn fixture_with_source_facts(
+        source: &'static str,
+        module_state: CanonicalModuleState,
+        options: CanonicalCheckerOptions,
+        declaration_file: bool,
+    ) -> Fixture {
         let parsed: &'static ParseResult = Box::leak(Box::new(parse_source_file(source)));
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let file = FileId::new(7_401);
@@ -4028,9 +4143,13 @@ mod tests {
                 parsed.source_file,
                 file,
                 CanonicalSourceFileFacts::new(
-                    EscapedName::source("\"/project/namespaces.ts\""),
+                    EscapedName::source(if declaration_file {
+                        "\"/project/namespaces.d.ts\""
+                    } else {
+                        "\"/project/namespaces.ts\""
+                    }),
                     CanonicalSourceLanguage::TypeScript,
-                    false,
+                    declaration_file,
                     module_state,
                 ),
             )
@@ -4194,6 +4313,236 @@ mod tests {
             ),
             warm,
         );
+    }
+
+    #[test]
+    fn exported_ambient_namespace_functions_publish_annotated_void_cold_and_warm() {
+        let mut fixture = declaration_fixture(
+            "declare module \"lib\" { export function fn(): void; }",
+            CanonicalModuleState::Script,
+        );
+        let namespace = plan(&fixture, 0);
+        let [
+            SourceNamespaceMemberPlan::Function {
+                declaration,
+                symbol,
+            },
+        ] = namespace.members.as_slice()
+        else {
+            panic!("the ambient namespace must retain its exported function")
+        };
+        let declaration = *declaration;
+        let symbol = *symbol;
+        let bound = fixture.context.file(fixture.file).unwrap().1;
+        let local = bound.local_symbol(declaration).unwrap();
+
+        assert!(namespace.ambient);
+        assert_eq!(
+            fixture.context.store().get_parent_of_symbol(symbol),
+            Some(namespace.symbol),
+        );
+        assert_eq!(
+            fixture.context.store().symbol(local).unwrap().flags(),
+            SymbolFlags::EXPORT_VALUE,
+        );
+        assert_eq!(
+            fixture
+                .context
+                .store()
+                .symbol(local)
+                .unwrap()
+                .export_symbol(),
+            Some(symbol),
+        );
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+
+        let callable = fixture
+            .context
+            .store()
+            .value_symbol_links(symbol)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let provenance = fixture
+            .context
+            .store()
+            .source_callable_provenance(callable)
+            .unwrap();
+        let void = fixture
+            .context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .void_type;
+        assert_eq!(provenance.declaration, declaration);
+        assert_eq!(provenance.owner_symbol, symbol);
+        assert_eq!(
+            fixture
+                .context
+                .store()
+                .signature(provenance.signature)
+                .and_then(super::super::signatures::Signature::resolved_return_type),
+            Some(void),
+        );
+
+        let warm = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn ambient_namespace_functions_reject_other_returns_and_nondeclaration_files() {
+        for source in [
+            "declare module \"lib\" { export function fn(): string; }",
+            "declare module \"lib\" { export function fn(); }",
+            "declare module \"lib\" { export function fn(value: string): void; }",
+        ] {
+            let fixture = declaration_fixture(source, CanonicalModuleState::Script);
+            let declaration = declaration(&fixture, 0);
+            let (arena, bound) = fixture.context.file(fixture.file).unwrap();
+            let before = fixture.context.store().checker_link_allocated_lengths();
+
+            assert!(matches!(
+                plan_source_namespace(arena, bound, fixture.context.store(), declaration),
+                Err(SourceCheckError::Unsupported(_))
+            ));
+            assert_eq!(
+                fixture.context.store().checker_link_allocated_lengths(),
+                before,
+            );
+        }
+
+        let fixture = fixture(
+            "declare module \"lib\" { export function fn(): void; }",
+            CanonicalModuleState::Script,
+        );
+        let declaration = declaration(&fixture, 0);
+        let (arena, bound) = fixture.context.file(fixture.file).unwrap();
+        assert!(matches!(
+            plan_source_namespace(arena, bound, fixture.context.store(), declaration),
+            Err(SourceCheckError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn exported_runtime_namespace_variables_preserve_fresh_literals_cold_and_warm() {
+        let mut fixture = fixture(
+            "namespace Values { export var value = 1; }",
+            CanonicalModuleState::Script,
+        );
+        let namespace = plan(&fixture, 0);
+        let [variable] = namespace.implicit_variables.as_slice() else {
+            panic!("the namespace must retain its exported numeric variable")
+        };
+        let declaration = variable.declaration;
+        let symbol = variable.symbol;
+        let initializer = variable.initializer.unwrap();
+        let local = fixture
+            .context
+            .file(fixture.file)
+            .unwrap()
+            .1
+            .local_symbol(declaration)
+            .unwrap();
+
+        assert_eq!(
+            fixture.context.store().get_parent_of_symbol(symbol),
+            Some(namespace.symbol),
+        );
+        assert_eq!(
+            fixture.context.store().symbol(local).unwrap().flags(),
+            SymbolFlags::EXPORT_VALUE,
+        );
+        assert_eq!(
+            fixture
+                .context
+                .store()
+                .symbol(local)
+                .unwrap()
+                .export_symbol(),
+            Some(symbol),
+        );
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+
+        let number = fixture
+            .context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .number_type;
+        assert_eq!(
+            fixture
+                .context
+                .store()
+                .value_symbol_links(symbol)
+                .and_then(|links| links.resolved_type),
+            Some(number),
+        );
+        let literal = fixture
+            .context
+            .store()
+            .type_node_links(initializer)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        assert_ne!(literal, number);
+        assert!(matches!(
+            fixture
+                .context
+                .store()
+                .type_payload(literal)
+                .unwrap()
+                .data(),
+            TypeData::Literal(_)
+        ));
+
+        let warm = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn exported_runtime_namespace_variables_reject_other_declaration_shapes() {
+        for source in [
+            "namespace Values { export var value: number = 1; }",
+            "namespace Values { export var value = \"one\"; }",
+            "namespace Values { export let value = 1; }",
+            "namespace Values { export var first = 1, second = 2; }",
+        ] {
+            let fixture = fixture(source, CanonicalModuleState::Script);
+            let declaration = declaration(&fixture, 0);
+            let (arena, bound) = fixture.context.file(fixture.file).unwrap();
+            let before = fixture.context.store().checker_link_allocated_lengths();
+
+            assert!(matches!(
+                plan_source_namespace(arena, bound, fixture.context.store(), declaration),
+                Err(SourceCheckError::Unsupported(_))
+            ));
+            assert_eq!(
+                fixture.context.store().checker_link_allocated_lengths(),
+                before,
+            );
+        }
     }
 
     #[test]

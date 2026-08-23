@@ -42,7 +42,10 @@ use super::{
     },
     inference::{NakedTypeCandidateError, NakedTypeInferenceError},
     instantiate::InstantiationSession,
-    object_diagnostics::exact_optional_property_mismatch_details,
+    object_diagnostics::{
+        callable_assignability_details, exact_optional_property_mismatch_details,
+        excess_object_argument_diagnostic, missing_mapped_index_signature_details,
+    },
     source::{
         PlannedExpression, PlannedExpressionKind, SourceCheckError, UnsupportedSourceSyntax,
         logical_binary_operator_text, merge_retry_diagnostic, merge_retry_diagnostics,
@@ -1855,11 +1858,128 @@ fn collect_array_argument_diagnostics(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn prepare_source_argument_mismatch_diagnostics(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    argument: &PlannedExpression,
+    argument_type: TypeId,
+    parameter_type: TypeId,
+) -> Result<Vec<CanonicalCheckerDiagnostic>, SourceCheckError> {
+    if let Some(diagnostics) =
+        array_argument_diagnostics(store, host, global_types, options, argument, parameter_type)?
+    {
+        return Ok(diagnostics);
+    }
+
+    let flags = source_call_display_flags(options);
+    let exact_optional_mismatch =
+        exact_optional_argument_mismatch(store, options, argument_type, parameter_type);
+    if !exact_optional_mismatch
+        && matches!(
+            argument.unparenthesized().kind,
+            PlannedExpressionKind::Object { .. }
+        )
+        && matches!(
+            super::object_members::validate_resolved_declared_property_type_graph(
+                store,
+                parameter_type,
+            ),
+            super::object_members::DeclaredPropertyTypeGraphValidation::Traversable(_)
+        )
+        && let Some(diagnostic) = excess_object_argument_diagnostic(
+            store,
+            host,
+            global_types,
+            argument,
+            argument_type,
+            parameter_type,
+            flags,
+        )?
+    {
+        return Ok(vec![diagnostic]);
+    }
+
+    for type_ in [argument_type, parameter_type] {
+        let StoredCallableSetValidation::Valid { projection, .. } =
+            validate_stored_callable_set(store, type_)
+        else {
+            continue;
+        };
+        let [callable] = projection.call_signatures.as_ref() else {
+            continue;
+        };
+        if projection.construct_signatures.is_empty() && callable.return_type.is_none() {
+            resolve_signature_return(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                diagnostics,
+                callable.signature,
+            )?;
+        }
+    }
+
+    let display = get_type_names_for_assignability_error_with_host_global_types_and_flags(
+        store,
+        host,
+        global_types,
+        argument_type,
+        parameter_type,
+        flags,
+    )?;
+    let code = if exact_optional_mismatch { 2379 } else { 2345 };
+    let details = if exact_optional_mismatch {
+        exact_optional_property_mismatch_details(
+            store,
+            host,
+            global_types,
+            argument_type,
+            parameter_type,
+            flags,
+        )?
+    } else {
+        let details = callable_assignability_details(
+            store,
+            host,
+            global_types,
+            argument_type,
+            parameter_type,
+            flags,
+            options,
+        )?;
+        if details.is_empty() {
+            missing_mapped_index_signature_details(store, argument_type, parameter_type)?
+        } else {
+            details
+        }
+    };
+
+    Ok(vec![CanonicalCheckerDiagnostic {
+        node: Some(argument.unparenthesized().node),
+        range_override: None,
+        diagnostic: Diagnostic::with_arguments(
+            message_by_code(code).ok_or(SourceCheckError::MissingDiagnostic(code))?,
+            [display.source, display.target],
+        )
+        .with_details(details),
+        related_information: Vec::new(),
+    }])
+}
+
+#[allow(clippy::too_many_arguments)]
 fn prepare_legacy_source_call_diagnostic(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
     options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
     plan: &SourceCallPlan,
     argument_types: &[TypeId],
     resolution: ResolvedLegacySourceCall,
@@ -1945,14 +2065,6 @@ fn prepare_legacy_source_call_diagnostic(
             if argument_types.get(index).copied() != Some(argument_type) {
                 return Err(SourceCheckError::Call(plan.node));
             }
-            let display = get_type_names_for_assignability_error_with_host_global_types_and_flags(
-                store,
-                host,
-                global_types,
-                argument_type,
-                parameter_type,
-                source_call_display_flags(options),
-            )?;
             let argument = plan
                 .arguments
                 .get(
@@ -1961,41 +2073,17 @@ fn prepare_legacy_source_call_diagnostic(
                         .ok_or(SourceCheckError::Call(plan.node))?,
                 )
                 .ok_or(SourceCheckError::Call(plan.node))?;
-            if let Some(diagnostics) = array_argument_diagnostics(
+            return prepare_source_argument_mismatch_diagnostics(
                 store,
                 host,
                 global_types,
                 options,
+                session,
+                diagnostics,
                 argument,
+                argument_type,
                 parameter_type,
-            )? {
-                return Ok(diagnostics);
-            }
-            let exact_optional_mismatch =
-                exact_optional_argument_mismatch(store, options, argument_type, parameter_type);
-            let code = if exact_optional_mismatch { 2379 } else { 2345 };
-            let details = if exact_optional_mismatch {
-                exact_optional_property_mismatch_details(
-                    store,
-                    host,
-                    global_types,
-                    argument_type,
-                    parameter_type,
-                    source_call_display_flags(options),
-                )?
-            } else {
-                Vec::new()
-            };
-            CanonicalCheckerDiagnostic {
-                node: Some(argument.unparenthesized().node),
-                range_override: None,
-                diagnostic: Diagnostic::with_arguments(
-                    message_by_code(code).ok_or(SourceCheckError::MissingDiagnostic(code))?,
-                    [display.source, display.target],
-                )
-                .with_details(details),
-                related_information: Vec::new(),
-            }
+            );
         }
     };
     Ok(vec![diagnostic])
@@ -2039,6 +2127,8 @@ fn prepare_vector_source_call_diagnostic(
     host: &DeclaredTypeHost<'_>,
     global_types: &CanonicalGlobalTypes,
     options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
     plan: &SourceCallPlan,
     argument_types: &[TypeId],
     explicit_type_arguments: Option<&[TypeId]>,
@@ -2159,49 +2249,17 @@ fn prepare_vector_source_call_diagnostic(
                 .arguments
                 .get(index)
                 .ok_or(SourceCheckError::Call(plan.node))?;
-            if let Some(diagnostics) = array_argument_diagnostics(
+            return prepare_source_argument_mismatch_diagnostics(
                 store,
                 host,
                 global_types,
                 options,
+                session,
+                diagnostics,
                 argument,
-                parameter_type,
-            )? {
-                return Ok(diagnostics);
-            }
-            let display = get_type_names_for_assignability_error_with_host_global_types_and_flags(
-                store,
-                host,
-                global_types,
                 argument_type,
                 parameter_type,
-                source_call_display_flags(options),
-            )?;
-            let exact_optional_mismatch =
-                exact_optional_argument_mismatch(store, options, argument_type, parameter_type);
-            let code = if exact_optional_mismatch { 2379 } else { 2345 };
-            let details = if exact_optional_mismatch {
-                exact_optional_property_mismatch_details(
-                    store,
-                    host,
-                    global_types,
-                    argument_type,
-                    parameter_type,
-                    source_call_display_flags(options),
-                )?
-            } else {
-                Vec::new()
-            };
-            CanonicalCheckerDiagnostic {
-                node: Some(argument.unparenthesized().node),
-                range_override: None,
-                diagnostic: Diagnostic::with_arguments(
-                    message_by_code(code).ok_or(SourceCheckError::MissingDiagnostic(code))?,
-                    [display.source, display.target],
-                )
-                .with_details(details),
-                related_information: Vec::new(),
-            }
+            );
         }
     };
     Ok(vec![diagnostic])
@@ -2597,6 +2655,8 @@ pub(super) fn check_direct_source_call(
                 host,
                 global_types,
                 options,
+                session,
+                diagnostics,
                 plan,
                 argument_types,
                 resolution,
@@ -2624,6 +2684,8 @@ pub(super) fn check_direct_source_call(
                 host,
                 global_types,
                 options,
+                session,
+                diagnostics,
                 plan,
                 argument_types,
                 explicit_type_arguments.as_deref(),
@@ -2692,6 +2754,8 @@ pub(super) fn check_direct_source_call(
                 host,
                 global_types,
                 options,
+                session,
+                diagnostics,
                 plan,
                 argument_types,
                 legacy,
@@ -5037,6 +5101,171 @@ mod tests {
                 "a nested modifier-free declaration must not mint export capability"
             );
         }
+    }
+
+    #[test]
+    fn object_argument_excess_properties_use_the_property_span_for_both_call_paths() {
+        let text = concat!(
+            "function accept(value: { known: number }): void {} ",
+            "function identity<T>(value: T): T { return value; } ",
+            "accept({ extra: 1 }); ",
+            "identity<{ known: number }>({ extra: 2 });",
+        );
+        let parsed = parsed(text);
+        let file = FileId::new(474);
+        let mut context = context(&parsed, file);
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+        for diagnostic in diagnostics {
+            assert_eq!(diagnostic.diagnostic.code(), 2353);
+            assert_eq!(
+                diagnostic.diagnostic.render().unwrap(),
+                "Object literal may only specify known properties, and 'extra' does not exist in type '{ known: number; }'."
+            );
+            let node = diagnostic.node.expect("TS2353 must retain its property");
+            let range = parsed.arena.get(node.node).unwrap().range;
+            assert_eq!(
+                &text[usize::try_from(range.start.get()).unwrap()
+                    ..usize::try_from(range.end.get()).unwrap()],
+                "extra"
+            );
+        }
+
+        let calls = calls(&parsed, file);
+        let cold = calls
+            .iter()
+            .map(|call| call_publication_state(&context, *call))
+            .collect::<Vec<_>>();
+        mark_source_unchecked(&mut context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .map(|call| call_publication_state(&context, *call))
+                .collect::<Vec<_>>(),
+            cold,
+        );
+    }
+
+    #[test]
+    fn callable_argument_diagnostics_keep_parameter_and_return_details() {
+        let parsed = parsed(concat!(
+            "function accept(callback: (target: number) => number): void {} ",
+            "function identity<T>(value: T): T { return value; } ",
+            "accept((source: string) => {}); ",
+            "accept((target: number) => {}); ",
+            "identity<(target: number) => number>((source: string) => {}); ",
+            "identity<(target: number) => number>((target: number) => {});",
+        ));
+        let file = FileId::new(475);
+        let mut context = context(&parsed, file);
+
+        context.check_source_file(file).unwrap();
+
+        let actual = context
+            .diagnostics()
+            .as_slice()
+            .iter()
+            .map(|diagnostic| {
+                (
+                    diagnostic.diagnostic.code(),
+                    diagnostic.diagnostic.render().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let parameter = concat!(
+            "Argument of type '(source: string) => void' is not assignable to parameter of type ",
+            "'(target: number) => number'.\n",
+            "  Types of parameters 'source' and 'target' are incompatible.\n",
+            "    Type 'number' is not assignable to type 'string'.",
+        );
+        let return_type = concat!(
+            "Argument of type '(target: number) => void' is not assignable to parameter of type ",
+            "'(target: number) => number'.\n",
+            "  Type 'void' is not assignable to type 'number'.",
+        );
+        assert_eq!(
+            actual,
+            [
+                (2345, parameter.to_owned()),
+                (2345, return_type.to_owned()),
+                (2345, parameter.to_owned()),
+                (2345, return_type.to_owned()),
+            ],
+        );
+
+        let calls = calls(&parsed, file);
+        let cold = calls
+            .iter()
+            .map(|call| call_publication_state(&context, *call))
+            .collect::<Vec<_>>();
+        mark_source_unchecked(&mut context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .map(|call| call_publication_state(&context, *call))
+                .collect::<Vec<_>>(),
+            cold,
+        );
+    }
+
+    #[test]
+    fn mapped_record_argument_diagnostics_explain_the_missing_string_index() {
+        let parsed = parsed(concat!(
+            "type Record<K extends keyof any, T> = { [P in K]: T }; ",
+            "declare const value: unknown; ",
+            "function accept(record: Record<string, string>): void {} ",
+            "function identity<T>(input: T): T { return input; } ",
+            "accept(value || {}); ",
+            "identity<Record<string, string>>(value || {});",
+        ));
+        let file = FileId::new(476);
+        let mut context = context_with_options(
+            &parsed,
+            file,
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+        for diagnostic in diagnostics {
+            assert_eq!(diagnostic.diagnostic.code(), 2345);
+            assert_eq!(
+                diagnostic.diagnostic.render().unwrap(),
+                concat!(
+                    "Argument of type '{}' is not assignable to parameter of type ",
+                    "'Record<string, string>'.\n",
+                    "  Index signature for type 'string' is missing in type '{}'.",
+                ),
+            );
+        }
+
+        let calls = calls(&parsed, file);
+        let cold = calls
+            .iter()
+            .map(|call| call_publication_state(&context, *call))
+            .collect::<Vec<_>>();
+        mark_source_unchecked(&mut context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .map(|call| call_publication_state(&context, *call))
+                .collect::<Vec<_>>(),
+            cold,
+        );
     }
 
     #[test]

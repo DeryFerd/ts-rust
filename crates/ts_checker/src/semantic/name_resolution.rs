@@ -389,15 +389,10 @@ impl<'store, 'arena> ProductionNameResolverHost<'store, 'arena> {
                         true,
                         false,
                     )?;
-                    symbol = alias.and_then(|alias| {
-                        store
-                            .symbol(alias)
-                            .is_some_and(|record| {
-                                record.name() == InternalSymbolName::ExportEquals.as_ref()
-                            })
-                            .then(|| store.get_parent_of_symbol(alias))
-                            .flatten()
-                    });
+                    symbol = alias
+                        .map(|alias| self.export_equals_import_namespace(alias))
+                        .transpose()?
+                        .flatten();
                 }
                 self.resolve_entity_symbol(symbol, meaning)
             }
@@ -466,6 +461,67 @@ impl<'store, 'arena> ProductionNameResolverHost<'store, 'arena> {
         };
         let symbol = self.lookup_name(exports, EscapedNameRef::source(&name), meaning)?;
         self.resolve_entity_symbol(symbol, meaning)
+    }
+
+    fn export_equals_import_namespace(
+        &self,
+        alias: SemanticSymbolId,
+    ) -> Result<Option<SemanticSymbolId>, CanonicalNameResolutionError> {
+        let Some(alias_record) = self.store.symbol(alias) else {
+            return Err(CanonicalNameResolutionError::InvalidHostSymbol(alias));
+        };
+        let Some([declaration]) = alias_record.declarations() else {
+            return Ok(None);
+        };
+        let Some(source) = self.source(*declaration) else {
+            return Ok(None);
+        };
+        let Some(NodeData::ImportEqualsDeclaration(import)) = source
+            .arena
+            .get(declaration.node)
+            .map(|record| &record.data)
+        else {
+            return Ok(None);
+        };
+        if source.bound.symbol(*declaration) != Some(alias)
+            || !matches!(
+                source
+                    .arena
+                    .get(import.module_reference)
+                    .map(|record| &record.data),
+                Some(NodeData::ExternalModuleReference(_))
+            )
+        {
+            return Ok(None);
+        }
+
+        let Some(target) = self.resolved_alias_target(alias)? else {
+            return Ok(None);
+        };
+        let Some(record) = self.store.symbol(target) else {
+            return Err(CanonicalNameResolutionError::InvalidHostSymbol(target));
+        };
+        if record.name() != InternalSymbolName::ExportEquals.as_ref()
+            || record.flags() != SymbolFlags::PROPERTY
+                && record.flags() != SymbolFlags::PROPERTY | SymbolFlags::NAMESPACE_MODULE
+        {
+            return Ok(None);
+        }
+        let Some(module) = self.store.get_parent_of_symbol(target) else {
+            return Ok(None);
+        };
+        let Some(module_record) = self.store.symbol(module) else {
+            return Err(CanonicalNameResolutionError::InvalidHostSymbol(module));
+        };
+        let Some(exports) = module_record
+            .exports()
+            .and_then(|exports| self.store.symbol_table(exports))
+        else {
+            return Ok(None);
+        };
+        Ok((module_record.flags().intersects(SymbolFlags::NAMESPACE)
+            && exports.get(InternalSymbolName::ExportEquals.as_ref()) == Some(target))
+        .then_some(module))
     }
 
     fn resolve_entity_symbol(
@@ -1177,6 +1233,123 @@ mod tests {
         assert_eq!(
             host.resolve_entity_name(entity, SymbolFlags::TYPE),
             Ok(Some(target)),
+        );
+    }
+
+    #[test]
+    fn import_equals_object_exports_resolve_only_their_modules_exported_types() {
+        let target_file = FileId::new(716);
+        let source_file = FileId::new(717);
+        let mut fixture = fixture(&[
+            (
+                target_file,
+                concat!(
+                    "export interface Shape {} ",
+                    "export namespace Deep { export interface Item {} } ",
+                    "interface Hidden {} ",
+                    "export = { value: 1 };",
+                ),
+                CanonicalModuleState::External,
+            ),
+            (
+                source_file,
+                concat!(
+                    "import selected = require('./target'); ",
+                    "type Shape = selected.Shape; ",
+                    "type Item = selected.Deep.Item; ",
+                    "type Hidden = selected.Hidden;",
+                ),
+                CanonicalModuleState::External,
+            ),
+        ]);
+        let alias = declaration_symbol(
+            &fixture,
+            named_declaration(
+                &fixture,
+                source_file,
+                SyntaxKind::ImportEqualsDeclaration,
+                "selected",
+            ),
+        );
+        let module = fixture.files[&target_file]
+            .symbol(fixture.files[&target_file].source_file())
+            .unwrap();
+        let export = fixture
+            .store
+            .symbol(module)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| fixture.store.symbol_table(exports))
+            .and_then(|exports| exports.get(InternalSymbolName::ExportEquals.as_ref()))
+            .unwrap();
+        assert!(fixture.store.set_alias_symbol_links(
+            alias,
+            AliasSymbolLinks {
+                immediate_target: Some(export),
+                alias_target: AliasTargetState::Resolved(export),
+                ..AliasSymbolLinks::default()
+            },
+        ));
+        let shape = declaration_symbol(
+            &fixture,
+            named_declaration(
+                &fixture,
+                target_file,
+                SyntaxKind::InterfaceDeclaration,
+                "Shape",
+            ),
+        );
+        let item = declaration_symbol(
+            &fixture,
+            named_declaration(
+                &fixture,
+                target_file,
+                SyntaxKind::InterfaceDeclaration,
+                "Item",
+            ),
+        );
+        let mut host = production_host(&fixture);
+
+        for _ in 0..2 {
+            assert_eq!(
+                host.resolve_entity_name(
+                    type_alias_entity_name(&fixture, source_file, "Shape"),
+                    SymbolFlags::TYPE,
+                ),
+                Ok(Some(shape)),
+            );
+            assert_eq!(
+                host.resolve_entity_name(
+                    type_alias_entity_name(&fixture, source_file, "Item"),
+                    SymbolFlags::TYPE,
+                ),
+                Ok(Some(item)),
+            );
+            assert_eq!(
+                host.resolve_entity_name(
+                    type_alias_entity_name(&fixture, source_file, "Hidden"),
+                    SymbolFlags::TYPE,
+                ),
+                Ok(None),
+            );
+        }
+
+        drop(host);
+        let source_module = fixture.files[&source_file]
+            .symbol(fixture.files[&source_file].source_file())
+            .unwrap();
+        assert!(fixture.store.set_symbol_relationships(
+            export,
+            None,
+            None,
+            Some(source_module),
+            None,
+        ));
+        assert_eq!(
+            production_host(&fixture).resolve_entity_name(
+                type_alias_entity_name(&fixture, source_file, "Shape"),
+                SymbolFlags::TYPE,
+            ),
+            Ok(None),
         );
     }
 

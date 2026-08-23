@@ -525,15 +525,6 @@ fn unsupported_interface_heritage_shapes_fail_before_semantic_publication() {
             ),
         ),
         (
-            "chain",
-            concat!(
-                "interface Root { root: number }\n",
-                "interface Middle extends Root { middle: number }\n",
-                "interface Leaf extends Middle { leaf: number }\n",
-                "function read(value: Leaf): number { return value.leaf; }\n",
-            ),
-        ),
-        (
             "incompatible-override",
             concat!(
                 "interface Base { value: number }\n",
@@ -590,14 +581,6 @@ fn unsupported_interface_heritage_shapes_fail_before_semantic_publication() {
                 "function read(value: Derived): number { return value.own; }\n",
             ),
         ),
-        (
-            "qualified-base",
-            concat!(
-                "namespace Types { export interface Base { value: number } }\n",
-                "interface Derived extends Types.Base { own: number }\n",
-                "function read(value: Derived): number { return value.own; }\n",
-            ),
-        ),
     ];
 
     for (index, (name, source)) in cases.into_iter().enumerate() {
@@ -633,6 +616,108 @@ fn unsupported_interface_heritage_shapes_fail_before_semantic_publication() {
         );
         assert_eq!(context.check_source_file(file), Err(first), "{name}");
     }
+}
+
+#[test]
+fn transitive_interface_bases_preserve_all_inherited_properties() {
+    let parsed = parse_source_file(concat!(
+        "interface Root { root: number }\n",
+        "interface Middle extends Root { middle: number }\n",
+        "interface Leaf extends Middle { leaf: number }\n",
+        "const item: Leaf = { root: 1, middle: 2, leaf: 3 };\n",
+        "function read(value: Leaf): number { return value.root; }\n",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(44);
+    let mut context = checker_context(&parsed, file, "/project/transitive-interface-base.ts");
+
+    context.check_source_file(file).unwrap();
+    assert!(context.diagnostics().is_empty());
+
+    let root = interface_symbol(&parsed, file, &context, "Root");
+    let leaf = interface_symbol(&parsed, file, &context, "Leaf");
+    assert_eq!(
+        context.is_type_assignable_to(declared_type(&context, leaf), declared_type(&context, root)),
+        Ok(true)
+    );
+    assert_eq!(
+        interface_property_names(&context, declared_type(&context, leaf)),
+        (
+            vec![String::from("leaf")],
+            vec![
+                String::from("leaf"),
+                String::from("middle"),
+                String::from("root"),
+            ],
+        )
+    );
+
+    let warm = (
+        context.store().type_len(),
+        context.store().symbol_len(),
+        context.store().signature_len(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().signature_len(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
+}
+
+#[test]
+fn qualified_namespace_interface_bases_preserve_inherited_properties() {
+    let parsed = parse_source_file(concat!(
+        "namespace Types { export interface Base { value: number } }\n",
+        "interface Derived extends Types.Base { own: number }\n",
+        "const item: Derived = { value: 1, own: 2 };\n",
+        "function read(value: Derived): number { return value.value; }\n",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(43);
+    let mut context = checker_context(&parsed, file, "/project/qualified-interface-base.ts");
+
+    context.check_source_file(file).unwrap();
+    assert!(context.diagnostics().is_empty());
+
+    let base = interface_symbol(&parsed, file, &context, "Base");
+    let derived = interface_symbol(&parsed, file, &context, "Derived");
+    assert_eq!(
+        context.is_type_assignable_to(
+            declared_type(&context, derived),
+            declared_type(&context, base)
+        ),
+        Ok(true)
+    );
+    assert_eq!(
+        interface_property_names(&context, declared_type(&context, derived)),
+        (
+            vec![String::from("own")],
+            vec![String::from("own"), String::from("value")],
+        )
+    );
+
+    let warm = (
+        context.store().type_len(),
+        context.store().symbol_len(),
+        context.store().signature_len(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().signature_len(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
 }
 
 #[test]
@@ -762,6 +847,55 @@ fn callable_interfaces_keep_derived_signatures_before_inherited_signatures() {
     assert_eq!(
         (
             context.store().type_len(),
+            context.store().signature_len(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
+}
+
+#[test]
+fn merged_interface_reports_one_conflicting_inherited_property() {
+    let parsed = parse_source_file(concat!(
+        "interface A { value: string; }\n",
+        "interface B extends A {}\n",
+        "interface C { value: number; }\n",
+        "interface D extends C {}\n",
+        "interface Combined extends B {}\n",
+        "interface Combined extends D {}\n",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(42);
+    let mut context = checker_context(&parsed, file, "/project/conflicting-interface-bases.ts");
+    let combined = interface_symbol(&parsed, file, &context, "Combined");
+
+    context.check_source_file(file).unwrap();
+
+    let [diagnostic] = context.diagnostics().as_slice() else {
+        panic!("expected one conflicting-interface diagnostic")
+    };
+    assert_eq!(diagnostic.diagnostic.code(), 2320);
+    assert_eq!(node_text(&parsed, diagnostic.node.unwrap()), "Combined");
+    assert_eq!(
+        diagnostic.diagnostic.render().unwrap(),
+        concat!(
+            "Interface 'Combined' cannot simultaneously extend types 'B' and 'D'.\n",
+            "  Named property 'value' of types 'B' and 'D' are not identical.",
+        ),
+    );
+    assert!(context.store().declared_type_links(combined).is_none());
+
+    let warm = (
+        context.store().type_len(),
+        context.store().symbol_len(),
+        context.store().signature_len(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().symbol_len(),
             context.store().signature_len(),
             context.diagnostics().clone(),
         ),

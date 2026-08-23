@@ -39,7 +39,7 @@ use super::{
     instantiated_members::{GenericInterfaceMemberError, validate_generic_interface_members},
     intersection_types::IntersectionTypeProjection,
     links::{MembersOrExportsResolutionKind, ValueSymbolLinks},
-    mapped_types::{FiniteRecordMappedProjection, MappedTypeError},
+    mapped_types::{FiniteRecordMappedProjection, MappedTypeError, MappedTypeModifiers},
     mapper::TypeMapper,
     relation::{
         ExpandingFlags, IntersectionState, RecursionFlags, RecursionIdentityUnavailable,
@@ -368,6 +368,15 @@ struct ResolvedObjectMembers {
 enum CanonicalArrayReferenceArguments {
     Related { source: TypeId, target: TypeId },
     Unrelated,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BroadStringRecordMappedState {
+    Unresolved,
+    Resolved {
+        members: SymbolTableId,
+        index: IndexInfoId,
+    },
 }
 
 /// One validated own property from the exact property-only object domain.
@@ -3981,6 +3990,17 @@ impl<'store> RelaterSession<'store> {
             return Ok(());
         }
         if matches!(record.data(), TypeData::Mapped(_)) {
+            match canonical_broad_string_record_mapped_state(
+                self.store,
+                type_id,
+                self.bootstrap.string_type,
+            )? {
+                Some(BroadStringRecordMappedState::Resolved { .. }) => return Ok(()),
+                Some(BroadStringRecordMappedState::Unresolved) => {
+                    return Err(RelationUnavailable::UnresolvedStructuredMembers(type_id));
+                }
+                None => {}
+            }
             self.validated_finite_record_mapped_projection(type_id)?;
             return Ok(());
         }
@@ -4490,6 +4510,24 @@ impl<'store> RelaterSession<'store> {
             self.store.type_payload(type_id).map(TypeRecord::data),
             Some(TypeData::Mapped(_))
         ) {
+            if let Some(state) = canonical_broad_string_record_mapped_state(
+                self.store,
+                type_id,
+                self.bootstrap.string_type,
+            )? {
+                let BroadStringRecordMappedState::Resolved { members, index } = state else {
+                    return Err(RelationUnavailable::UnresolvedStructuredMembers(type_id));
+                };
+                self.observe_symbol_table(members);
+                return Ok(ResolvedObjectMembers {
+                    members: Some(members),
+                    properties: Vec::new(),
+                    index_infos: vec![index],
+                    property_origin: ObjectPropertyOrigin::Declared,
+                    call_signature: None,
+                    exact_callable: false,
+                });
+            }
             let projection = self.validated_finite_record_mapped_projection(type_id)?;
             self.observe_symbol_table(projection.members);
             for property in &projection.properties {
@@ -5668,19 +5706,33 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             }
         }
 
-        let supported_fixed_tuple_relation = if source_flags.intersects(TypeFlags::OBJECT)
-            && target_flags.intersects(TypeFlags::OBJECT)
-        {
-            self.authenticated_declared_construct_pair(
-                source,
-                target,
-                relation,
-                strict_function_types,
-            )?;
-            canonical_fixed_tuple_pair(self, source, target)?.is_some()
-        } else {
-            false
-        };
+        let (supported_fixed_tuple_relation, supported_broad_string_record_relation) =
+            if source_flags.intersects(TypeFlags::OBJECT)
+                && target_flags.intersects(TypeFlags::OBJECT)
+            {
+                self.authenticated_declared_construct_pair(
+                    source,
+                    target,
+                    relation,
+                    strict_function_types,
+                )?;
+                let broad_source = prepare_broad_string_record_mapped_endpoint(
+                    self,
+                    source,
+                    bootstrap.string_type,
+                )?;
+                let broad_target = prepare_broad_string_record_mapped_endpoint(
+                    self,
+                    target,
+                    bootstrap.string_type,
+                )?;
+                (
+                    canonical_fixed_tuple_pair(self, source, target)?.is_some(),
+                    broad_source || broad_target,
+                )
+            } else {
+                (false, false)
+            };
 
         let supported_array_relation = source_flags.intersects(TypeFlags::OBJECT)
             && target_flags.intersects(TypeFlags::OBJECT)
@@ -5694,6 +5746,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             && target_flags.intersects(TypeFlags::OBJECT)
             && !supported_array_relation
             && !supported_fixed_tuple_relation
+            && !supported_broad_string_record_relation
             && (strict_function_types.is_some() || self.claimed_strict_function_types().is_none())
         {
             let key = self
@@ -6244,6 +6297,129 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         }
         Ok(is_unknown_like)
     }
+}
+
+fn prepare_broad_string_record_mapped_endpoint(
+    store: &mut SemanticStore<TypeRecord, TypeMapper>,
+    type_id: TypeId,
+    string_type: TypeId,
+) -> Result<bool, RelationUnavailable> {
+    match canonical_broad_string_record_mapped_state(store, type_id, string_type)? {
+        Some(BroadStringRecordMappedState::Resolved { .. }) => Ok(true),
+        Some(BroadStringRecordMappedState::Unresolved) => {
+            store
+                .resolve_mapped_type_members(type_id, MappedTypeModifiers::NONE)
+                .map_err(|error| match error {
+                    MappedTypeError::BootstrapUninitialized => {
+                        RelationUnavailable::MissingBootstrap
+                    }
+                    MappedTypeError::Capacity => {
+                        RelationUnavailable::UnionValidationCapacity(type_id)
+                    }
+                    _ => RelationUnavailable::InvalidStructuredMembers(type_id),
+                })?;
+            match canonical_broad_string_record_mapped_state(store, type_id, string_type)? {
+                Some(BroadStringRecordMappedState::Resolved { .. }) => Ok(true),
+                Some(BroadStringRecordMappedState::Unresolved) | None => {
+                    Err(RelationUnavailable::InvalidStructuredMembers(type_id))
+                }
+            }
+        }
+        None => Ok(false),
+    }
+}
+
+fn canonical_broad_string_record_mapped_state(
+    store: &SemanticStore<TypeRecord, TypeMapper>,
+    type_id: TypeId,
+    string_type: TypeId,
+) -> Result<Option<BroadStringRecordMappedState>, RelationUnavailable> {
+    let record = store
+        .type_payload(type_id)
+        .ok_or(RelationUnavailable::Type(type_id))?;
+    let TypeData::Mapped(mapped) = record.data() else {
+        return Ok(None);
+    };
+    if mapped.constraint_type != Some(string_type) || mapped.template_type != Some(string_type) {
+        return Ok(None);
+    }
+
+    let invalid = || RelationUnavailable::InvalidStructuredMembers(type_id);
+    let identity = record
+        .alias()
+        .and_then(|identity| store.type_alias(identity))
+        .ok_or_else(invalid)?;
+    let owner = identity.symbol().ok_or_else(invalid)?;
+    let owner_record = store.symbol(owner).ok_or_else(invalid)?;
+    let owner_arguments = identity.type_arguments().ok_or_else(invalid)?;
+    if owner_record.flags() != SymbolFlags::TYPE_ALIAS
+        || store.get_merged_symbol(owner) != Some(owner)
+    {
+        return Err(invalid());
+    }
+    let alias = if owner_record.name().as_utf8() == Some("Record") {
+        owner
+    } else {
+        store
+            .intrinsic_bootstrap()
+            .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+            .and_then(|globals| globals.get_source("Record"))
+            .and_then(|alias| store.get_merged_symbol(alias))
+            .ok_or_else(invalid)?
+    };
+    let declared = mapped.object.target.ok_or_else(invalid)?;
+    let parameters = store
+        .type_alias_links(alias)
+        .and_then(|links| links.type_parameters.as_deref())
+        .ok_or_else(invalid)?;
+    store
+        .validate_record_mapped_alias_instantiation(
+            alias,
+            declared,
+            parameters,
+            &[string_type, string_type],
+            type_id,
+        )
+        .map_err(|_| invalid())?;
+    if owner != alias {
+        let owner_links = store.type_alias_links(owner).ok_or_else(invalid)?;
+        if owner_links.declared_type != Some(type_id)
+            || owner_links.type_parameters.as_deref().unwrap_or_default() != owner_arguments
+        {
+            return Err(invalid());
+        }
+    }
+
+    if !record
+        .object_flags()
+        .contains(ObjectFlags::MEMBERS_RESOLVED)
+    {
+        return Ok(Some(BroadStringRecordMappedState::Unresolved));
+    }
+    let structured = &mapped.object.structured;
+    let members = structured.members.ok_or_else(invalid)?;
+    let table = store.symbol_table(members).ok_or_else(invalid)?;
+    let Some([index]) = structured.index_infos.as_deref() else {
+        return Err(invalid());
+    };
+    let info = store.index_info(*index).ok_or_else(invalid)?;
+    if !table.is_empty()
+        || structured.properties.is_some()
+        || structured.signatures.is_some()
+        || structured.call_signature_count != 0
+        || info.key_type() != string_type
+        || info.value_type() != string_type
+        || info.is_readonly()
+        || info.declaration().is_some()
+        || info.index_symbol().is_some()
+        || !info.components().is_empty()
+    {
+        return Err(invalid());
+    }
+    Ok(Some(BroadStringRecordMappedState::Resolved {
+        members,
+        index: *index,
+    }))
 }
 
 fn canonical_fixed_tuple_pair(
@@ -7008,6 +7184,274 @@ mod tests {
         assert_eq!(
             store.is_type_assignable_to_with_global_types(object, target, &globals),
             Ok(true),
+        );
+    }
+
+    #[test]
+    fn broad_string_records_compare_authenticated_string_indexes() {
+        let mut fixture = function_relation_fixture(concat!(
+            "type Record<Key extends keyof any, Value> = { [Entry in Key]: Value }; ",
+            "type Strings = Record<string, string>; ",
+            "type Numbers = Record<string, number>; ",
+            "type StringIndex = { [name: string]: string };",
+        ));
+        let target = query_declared_relation_alias(&mut fixture, "Strings");
+        let numbers = query_declared_relation_alias(&mut fixture, "Numbers");
+        let indexed = query_declared_relation_alias(&mut fixture, "StringIndex");
+        let (string, number, unknown_empty, intrinsic_empty) = {
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.string_type,
+                bootstrap.number_type,
+                bootstrap.unknown_empty_object_type,
+                bootstrap.empty_object_type,
+            )
+        };
+        let anonymous_empty = alloc_property_object(&mut fixture.store, Vec::new());
+        let matching_property = alloc_typed_property(&mut fixture.store, "value", string, false);
+        let matching = alloc_fresh_property_object(&mut fixture.store, vec![matching_property]);
+        let mismatching_property = alloc_typed_property(&mut fixture.store, "value", number, false);
+        let mismatching =
+            alloc_fresh_property_object(&mut fixture.store, vec![mismatching_property]);
+        let fresh_empty = alloc_fresh_property_object(&mut fixture.store, Vec::new());
+
+        assert!(
+            !fixture
+                .store
+                .type_payload(target)
+                .unwrap()
+                .object_flags()
+                .contains(ObjectFlags::MEMBERS_RESOLVED)
+        );
+        for source in [unknown_empty, intrinsic_empty, anonymous_empty] {
+            assert_eq!(
+                fixture.store.is_type_assignable_to(source, target),
+                Ok(false)
+            );
+        }
+        assert_eq!(
+            fixture.store.is_type_assignable_to(matching, target),
+            Ok(true)
+        );
+        assert_eq!(
+            fixture.store.is_type_assignable_to(mismatching, target),
+            Ok(false)
+        );
+        assert_eq!(
+            fixture.store.is_type_assignable_to(fresh_empty, target),
+            Ok(true)
+        );
+        assert_eq!(
+            fixture.store.is_type_assignable_to(indexed, target),
+            Ok(true)
+        );
+        assert_eq!(
+            fixture.store.is_type_assignable_to(target, indexed),
+            Ok(true)
+        );
+        assert_eq!(
+            fixture.store.is_type_identical_to(target, indexed),
+            Ok(true)
+        );
+        assert_eq!(
+            fixture.store.is_type_assignable_to(unknown_empty, numbers),
+            Err(RelationUnavailable::UnsupportedStructuredType(numbers))
+        );
+    }
+
+    #[test]
+    fn broad_string_record_warm_caches_revalidate_index_and_alias_identity() {
+        let mut fixture = function_relation_fixture(concat!(
+            "type Record<Key extends keyof any, Value> = { [Entry in Key]: Value }; ",
+            "type Strings = Record<string, string>;",
+        ));
+        let target = query_declared_relation_alias(&mut fixture, "Strings");
+        let (string, number, unknown_empty) = {
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.string_type,
+                bootstrap.number_type,
+                bootstrap.unknown_empty_object_type,
+            )
+        };
+
+        assert_eq!(
+            fixture.store.is_type_assignable_to(unknown_empty, target),
+            Ok(false)
+        );
+        let key = fixture
+            .store
+            .relation_key_if_available(
+                unknown_empty,
+                target,
+                super::IntersectionState::NONE,
+                false,
+                false,
+            )
+            .unwrap()
+            .key();
+        assert_eq!(
+            fixture
+                .store
+                .relation_cache_get(RelationKind::Assignable, key),
+            RelationComparisonResult::FAILED
+        );
+        let warm = fixture.store.relation_state_snapshot();
+        assert_eq!(
+            fixture.store.is_type_assignable_to(unknown_empty, target),
+            Ok(false)
+        );
+        assert_eq!(fixture.store.relation_state_snapshot(), warm);
+
+        let (members, index, identity) = {
+            let record = fixture.store.type_payload(target).unwrap();
+            let TypeData::Mapped(mapped) = record.data() else {
+                unreachable!("Record instantiation retains its mapped object")
+            };
+            (
+                mapped.object.structured.members.unwrap(),
+                mapped.object.structured.index_infos.as_ref().unwrap()[0],
+                record.alias().unwrap(),
+            )
+        };
+        let poison_symbol = alloc_symbol(&mut fixture.store, SymbolFlags::PROPERTY, "poison");
+        assert!(
+            fixture
+                .store
+                .set_index_info_symbol(index, Some(poison_symbol))
+        );
+        assert_eq!(
+            fixture
+                .store
+                .relation_cache_get(RelationKind::Assignable, key),
+            RelationComparisonResult::FAILED
+        );
+        let poisoned_index = fixture.store.relation_state_snapshot();
+        assert_eq!(
+            fixture.store.is_type_assignable_to(unknown_empty, target),
+            Err(RelationUnavailable::InvalidStructuredMembers(target))
+        );
+        assert_eq!(fixture.store.relation_state_snapshot(), poisoned_index);
+        assert!(fixture.store.set_index_info_symbol(index, None));
+        assert_eq!(
+            fixture.store.is_type_assignable_to(unknown_empty, target),
+            Ok(false)
+        );
+
+        let wrong_index = fixture
+            .store
+            .alloc_index_info(string, number, false, None, Vec::new())
+            .unwrap();
+        assert!(fixture.store.set_structured_type_members(
+            target,
+            Some(members),
+            None,
+            None,
+            None,
+            Some(vec![wrong_index]),
+        ));
+        let poisoned_value = fixture.store.relation_state_snapshot();
+        assert_eq!(
+            fixture.store.is_type_assignable_to(unknown_empty, target),
+            Err(RelationUnavailable::InvalidStructuredMembers(target))
+        );
+        assert_eq!(fixture.store.relation_state_snapshot(), poisoned_value);
+        assert!(fixture.store.set_structured_type_members(
+            target,
+            Some(members),
+            None,
+            None,
+            None,
+            Some(vec![index]),
+        ));
+        assert_eq!(
+            fixture.store.is_type_assignable_to(unknown_empty, target),
+            Ok(false)
+        );
+
+        let original_arguments = fixture
+            .store
+            .type_alias(identity)
+            .unwrap()
+            .type_arguments()
+            .unwrap()
+            .to_vec();
+        assert!(
+            fixture
+                .store
+                .set_type_alias_arguments(identity, Some(vec![number]))
+        );
+        let poisoned_alias = fixture.store.relation_state_snapshot();
+        assert_eq!(
+            fixture.store.is_type_assignable_to(unknown_empty, target),
+            Err(RelationUnavailable::InvalidStructuredMembers(target))
+        );
+        assert_eq!(fixture.store.relation_state_snapshot(), poisoned_alias);
+        assert!(
+            fixture
+                .store
+                .set_type_alias_arguments(identity, Some(original_arguments))
+        );
+        assert_eq!(
+            fixture.store.is_type_assignable_to(unknown_empty, target),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn malformed_cold_broad_string_records_do_not_publish_index_caches() {
+        let mut fixture = function_relation_fixture(concat!(
+            "type Record<Key extends keyof any, Value> = { [Entry in Key]: Value }; ",
+            "type Strings = Record<string, string>;",
+        ));
+        let target = query_declared_relation_alias(&mut fixture, "Strings");
+        let (number, unknown_empty) = {
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            (bootstrap.number_type, bootstrap.unknown_empty_object_type)
+        };
+        let identity = fixture.store.type_payload(target).unwrap().alias().unwrap();
+        let original_arguments = fixture
+            .store
+            .type_alias(identity)
+            .unwrap()
+            .type_arguments()
+            .unwrap()
+            .to_vec();
+        assert!(
+            fixture
+                .store
+                .set_type_alias_arguments(identity, Some(vec![number]))
+        );
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.symbol_len(),
+            fixture.store.symbol_store().symbol_table_len(),
+            fixture.store.index_info_len(),
+            fixture.store.relation_state_snapshot(),
+        );
+
+        assert_eq!(
+            fixture.store.is_type_assignable_to(unknown_empty, target),
+            Err(RelationUnavailable::InvalidStructuredMembers(target))
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.symbol_store().symbol_table_len(),
+                fixture.store.index_info_len(),
+                fixture.store.relation_state_snapshot(),
+            ),
+            before
+        );
+        assert!(
+            fixture
+                .store
+                .set_type_alias_arguments(identity, Some(original_arguments))
+        );
+        assert_eq!(
+            fixture.store.is_type_assignable_to(unknown_empty, target),
+            Ok(false)
         );
     }
 

@@ -3004,6 +3004,23 @@ pub(super) struct ClassGrammarDiagnosticPlan {
     pub(super) diagnostics: Vec<ClassGrammarDiagnostic>,
 }
 
+/// One exported class with a single JSX-returning arrow instance field.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ExportedJsxArrowClassPlan {
+    pub(super) declaration: NodeRef,
+    pub(super) symbol: SemanticSymbolId,
+    pub(super) export_local: SemanticSymbolId,
+    pub(super) property_declaration: NodeRef,
+    pub(super) property_symbol: SemanticSymbolId,
+    pub(super) arrow: NodeRef,
+    pub(super) arrow_symbol: SemanticSymbolId,
+    pub(super) expression: NodeRef,
+    pub(super) element: NodeRef,
+    instance_members: SymbolTableId,
+    static_members: SymbolTableId,
+    prototype: SemanticSymbolId,
+}
+
 impl ClassMemberQueryPlan {
     pub(super) const fn declaration(&self) -> NodeRef {
         match self {
@@ -3077,6 +3094,316 @@ impl ClassMemberQueryPlan {
             Self::Derived { base, .. } => Some(base.as_ref()),
         }
     }
+}
+
+/// Proves one exported class containing exactly one JSX-returning arrow field.
+pub(super) fn plan_exported_jsx_arrow_class(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+) -> Option<ExportedJsxArrowClassPlan> {
+    if store.get_merged_symbol(symbol)? != symbol {
+        return None;
+    }
+    let owner = store.symbol(symbol)?;
+    let [declaration] = owner.declarations()? else {
+        return None;
+    };
+    let declaration = *declaration;
+    let record = preflight_node(store, host, declaration).ok()?;
+    let NodeData::ClassDeclaration(class) = &record.data else {
+        return None;
+    };
+    if owner.flags() != SymbolFlags::CLASS
+        || owner.check_flags() != CheckFlags::NONE
+        || owner.value_declaration() != Some(declaration)
+        || owner.export_symbol().is_some()
+        || record.kind != SyntaxKind::ClassDeclaration
+        || record.flags.0 & (NODE_FLAG_JSDOC | NODE_FLAG_HAS_ERROR) != 0
+        || !host.symbol_matches(store, declaration, symbol)
+        || class.flow_node.is_some()
+        || class.local_symbol.is_some()
+        || class.symbol.is_some()
+        || class.next_container.is_some()
+        || class.facts != 0
+        || class.type_parameters.is_some()
+        || class.heritage_clauses.is_some()
+        || class.members.has_trailing_comma
+        || class.members.nodes.len() != 1
+        || class.members.range.start < record.range.start
+        || class.members.range.end != record.range.end
+    {
+        return None;
+    }
+    let name = NodeRef::new(declaration.arena, declaration.file, class.name?);
+    let name_record = preflight_node(store, host, name).ok()?;
+    let NodeData::Identifier(name_data) = &name_record.data else {
+        return None;
+    };
+    if name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(declaration.node)
+        || name_data.flow_node.is_some()
+        || name_data.text.is_empty()
+        || owner.name().as_utf8() != Some(name_data.text.as_str())
+    {
+        return None;
+    }
+    let modifiers = class.modifiers.as_ref()?;
+    let [modifier] = modifiers.list.nodes.as_slice() else {
+        return None;
+    };
+    let modifier = NodeRef::new(declaration.arena, declaration.file, *modifier);
+    let modifier_record = preflight_node(store, host, modifier).ok()?;
+    let source_text = host
+        .source(declaration)
+        .and_then(|(arena, _)| arena.source_text())?;
+    if modifiers.flags.0 != 0
+        || modifiers.list.has_trailing_comma
+        || modifiers.list.range.start != record.range.start
+        || modifiers.list.range.end > name_record.range.start
+        || modifier_record.kind != SyntaxKind::ExportKeyword
+        || modifier_record.flags.0 != 0
+        || modifier_record.parent != Some(declaration.node)
+        || !matches!(modifier_record.data, NodeData::Token(_))
+        || modifier_record.range.start != record.range.start
+        || modifier_record.range.end > modifiers.list.range.end
+        || source_text.get(
+            usize::try_from(modifier_record.range.start.get()).ok()?
+                ..usize::try_from(modifier_record.range.end.get()).ok()?,
+        ) != Some("export")
+    {
+        return None;
+    }
+
+    let bound = host.bound_file(declaration)?;
+    if !bound
+        .source_facts()
+        .is_some_and(ts_binder::CanonicalSourceFileFacts::is_external_module)
+        || record.parent != Some(bound.source_file().node)
+    {
+        return None;
+    }
+    let parent = bound.symbol(bound.source_file())?;
+    let parent_record = store.symbol(parent)?;
+    let parent_exports = parent_record
+        .exports()
+        .and_then(|exports| store.symbol_table(exports))?;
+    if parent_record.flags() != SymbolFlags::VALUE_MODULE
+        || owner.parent() != Some(parent)
+        || store.get_merged_symbol(parent) != Some(parent)
+        || parent_exports.get_source(&name_data.text) != Some(symbol)
+    {
+        return None;
+    }
+    let export_local = bound.local_symbol(declaration)?;
+    let local_record = store.symbol(export_local)?;
+    let source_locals = bound
+        .locals(bound.source_file())
+        .and_then(|locals| store.symbol_table(locals))?;
+    if export_local == symbol
+        || local_record.flags() != SymbolFlags::EXPORT_VALUE
+        || local_record.check_flags() != CheckFlags::NONE
+        || local_record.name().as_utf8() != Some(name_data.text.as_str())
+        || local_record.declarations() != Some(&[declaration])
+        || local_record.value_declaration().is_some()
+        || local_record.members().is_some()
+        || local_record.exports().is_some()
+        || local_record.parent().is_some()
+        || local_record.export_symbol() != Some(symbol)
+        || store.get_merged_symbol(export_local) != Some(export_local)
+        || source_locals.get_source(&name_data.text) != Some(export_local)
+        || store.value_symbol_links(export_local).is_some_and(|links| {
+            links != &ValueSymbolLinks::default()
+                && store
+                    .value_symbol_links(symbol)
+                    .and_then(|owner_links| owner_links.resolved_type)
+                    .is_none_or(|type_| {
+                        links
+                            != &(ValueSymbolLinks {
+                                resolved_type: Some(type_),
+                                ..ValueSymbolLinks::default()
+                            })
+                    })
+        })
+    {
+        return None;
+    }
+
+    let instance_members = owner.members()?;
+    let member_table = store.symbol_table(instance_members)?;
+    let static_members = owner.exports()?;
+    let static_table = store.symbol_table(static_members)?;
+    if member_table.len() != 1 || static_table.len() != 1 {
+        return None;
+    }
+    validate_prototype(store, symbol, static_members).ok()?;
+    let prototype = static_table.get_source(PROTOTYPE_NAME)?;
+
+    let property_declaration =
+        NodeRef::new(declaration.arena, declaration.file, class.members.nodes[0]);
+    let property_record = preflight_node(store, host, property_declaration).ok()?;
+    let NodeData::PropertyDeclaration(property) = &property_record.data else {
+        return None;
+    };
+    if property_record.kind != SyntaxKind::PropertyDeclaration
+        || property_record.flags.0 != 0
+        || property_record.parent != Some(declaration.node)
+        || property_record.range.start < class.members.range.start
+        || property_record.range.end > class.members.range.end
+        || property.postfix_token.is_some()
+        || property.symbol.is_some()
+        || property.type_.is_some()
+        || property.facts != 0
+        || property.modifiers.is_some()
+    {
+        return None;
+    }
+    let field_name = NodeRef::new(declaration.arena, declaration.file, property.name);
+    let field_name_record = preflight_node(store, host, field_name).ok()?;
+    let NodeData::Identifier(field_name_data) = &field_name_record.data else {
+        return None;
+    };
+    if field_name_record.kind != SyntaxKind::Identifier
+        || field_name_record.flags.0 != 0
+        || field_name_record.parent != Some(property_declaration.node)
+        || field_name_data.flow_node.is_some()
+        || field_name_data.text.is_empty()
+        || field_name_record.range.start < property_record.range.start
+        || field_name_record.range.end > property_record.range.end
+    {
+        return None;
+    }
+    let property_symbol = bound_symbol(store, host, property_declaration)?;
+    let property_owner = store.symbol(property_symbol)?;
+    if property_owner.flags() != SymbolFlags::PROPERTY
+        || property_owner.check_flags() != CheckFlags::NONE
+        || property_owner.name().as_utf8() != Some(field_name_data.text.as_str())
+        || property_owner.declarations() != Some(&[property_declaration])
+        || property_owner.value_declaration() != Some(property_declaration)
+        || property_owner.members().is_some()
+        || property_owner.exports().is_some()
+        || property_owner.parent() != Some(symbol)
+        || property_owner.export_symbol().is_some()
+        || store.get_merged_symbol(property_symbol) != Some(property_symbol)
+        || member_table.get_source(&field_name_data.text) != Some(property_symbol)
+    {
+        return None;
+    }
+
+    let arrow = NodeRef::new(declaration.arena, declaration.file, property.initializer?);
+    let arrow_record = preflight_node(store, host, arrow).ok()?;
+    let NodeData::ArrowFunction(arrow_data) = &arrow_record.data else {
+        return None;
+    };
+    if arrow_record.kind != SyntaxKind::ArrowFunction
+        || arrow_record.flags.0 != 0
+        || arrow_record.parent != Some(property_declaration.node)
+        || arrow_record.range.start < field_name_record.range.end
+        || arrow_record.range.end > property_record.range.end
+        || arrow_data.asterisk_token.is_some()
+        || arrow_data.end_flow_node.is_some()
+        || arrow_data.flow_node.is_some()
+        || arrow_data.full_signature.is_some()
+        || arrow_data.next_container.is_some()
+        || arrow_data.symbol.is_some()
+        || arrow_data.type_.is_some()
+        || arrow_data.type_parameters.is_some()
+        || arrow_data.facts != 0
+        || arrow_data.modifiers.is_some()
+        || arrow_data.parameters.has_trailing_comma
+        || !arrow_data.parameters.nodes.is_empty()
+    {
+        return None;
+    }
+    let arrow_token = NodeRef::new(
+        arrow.arena,
+        arrow.file,
+        arrow_data.equals_greater_than_token,
+    );
+    let arrow_token_record = preflight_node(store, host, arrow_token).ok()?;
+    if arrow_token_record.kind != SyntaxKind::EqualsGreaterThanToken
+        || arrow_token_record.flags.0 != 0
+        || arrow_token_record.parent != Some(arrow.node)
+        || !matches!(arrow_token_record.data, NodeData::Token(_))
+    {
+        return None;
+    }
+    let arrow_symbol = bound_symbol(store, host, arrow)?;
+    let arrow_owner = store.symbol(arrow_symbol)?;
+    if arrow_symbol == property_symbol
+        || arrow_owner.flags() != SymbolFlags::FUNCTION
+        || arrow_owner.check_flags() != CheckFlags::NONE
+        || arrow_owner.name() != InternalSymbolName::Function.as_ref()
+        || arrow_owner.declarations() != Some(&[arrow])
+        || arrow_owner.value_declaration() != Some(arrow)
+        || arrow_owner.members().is_some()
+        || arrow_owner.exports().is_some()
+        || arrow_owner.parent().is_some()
+        || arrow_owner.export_symbol().is_some()
+        || store.get_merged_symbol(arrow_symbol) != Some(arrow_symbol)
+    {
+        return None;
+    }
+
+    let expression = NodeRef::new(arrow.arena, arrow.file, arrow_data.body);
+    let expression_record = preflight_node(store, host, expression).ok()?;
+    let NodeData::ParenthesizedExpression(parenthesized) = &expression_record.data else {
+        return None;
+    };
+    if expression_record.kind != SyntaxKind::ParenthesizedExpression
+        || expression_record.flags.0 != 0
+        || expression_record.parent != Some(arrow.node)
+        || expression_record.range.start < arrow_token_record.range.end
+        || expression_record.range.end > arrow_record.range.end
+    {
+        return None;
+    }
+    let element = NodeRef::new(expression.arena, expression.file, parenthesized.expression);
+    let element_record = preflight_node(store, host, element).ok()?;
+    let NodeData::JsxFragment(fragment) = &element_record.data else {
+        return None;
+    };
+    if element_record.kind != SyntaxKind::JsxFragment
+        || element_record.flags.0 != 0
+        || element_record.parent != Some(expression.node)
+        || fragment.facts != 0
+        || fragment.children.has_trailing_comma
+        || !fragment.children.nodes.is_empty()
+    {
+        return None;
+    }
+    for (node, kind) in [
+        (fragment.opening_fragment, SyntaxKind::JsxOpeningFragment),
+        (fragment.closing_fragment, SyntaxKind::JsxClosingFragment),
+    ] {
+        let child = NodeRef::new(element.arena, element.file, node);
+        let child_record = preflight_node(store, host, child).ok()?;
+        if child_record.kind != kind
+            || child_record.flags.0 != 0
+            || child_record.parent != Some(element.node)
+        {
+            return None;
+        }
+    }
+    if preflight_class_or_interface_reference(store, host, symbol, SymbolFlags::CLASS).ok()? != 0 {
+        return None;
+    }
+
+    Some(ExportedJsxArrowClassPlan {
+        declaration,
+        symbol,
+        export_local,
+        property_declaration,
+        property_symbol,
+        arrow,
+        arrow_symbol,
+        expression,
+        element,
+        instance_members,
+        static_members,
+        prototype,
+    })
 }
 
 fn primitive_keyword_type(
@@ -7689,6 +8016,381 @@ pub(super) fn preflight_nongeneric_class_member_query(
     }
 }
 
+fn exported_jsx_arrow_callable_is_valid(
+    store: &CanonicalTypeMapperStore,
+    plan: &ExportedJsxArrowClassPlan,
+    arrow_type: TypeId,
+) -> bool {
+    let provenance = store.source_callable_provenance(arrow_type);
+    provenance.is_some_and(|provenance| {
+        provenance.declaration == plan.arrow
+            && provenance.owner_symbol == plan.arrow_symbol
+            && provenance.owner_parent.is_none()
+            && provenance.export_local.is_none()
+            && store.source_callable_type_for_owner(plan.arrow_symbol) == Some(arrow_type)
+            && store.value_symbol_links(plan.arrow_symbol)
+                == Some(&ValueSymbolLinks {
+                    resolved_type: Some(arrow_type),
+                    ..ValueSymbolLinks::default()
+                })
+            && store
+                .signature(provenance.signature)
+                .is_some_and(|signature| {
+                    signature.parameters().is_empty() && signature.min_argument_count() == 0
+                })
+            && matches!(
+                validate_stored_source_callable(store, arrow_type),
+                StoredSourceCallableValidation::Valid(_)
+            )
+    })
+}
+
+fn completed_exported_jsx_arrow_class(
+    store: &CanonicalTypeMapperStore,
+    plan: &ExportedJsxArrowClassPlan,
+    arrow_type: TypeId,
+    instance_type: TypeId,
+    value_type: TypeId,
+) -> Option<ClassMembers> {
+    if !exported_jsx_arrow_callable_is_valid(store, plan, arrow_type)
+        || store.value_symbol_links(plan.symbol)
+            != Some(&ValueSymbolLinks {
+                resolved_type: Some(value_type),
+                ..ValueSymbolLinks::default()
+            })
+        || store.value_symbol_links(plan.property_symbol)
+            != Some(&ValueSymbolLinks {
+                resolved_type: Some(arrow_type),
+                ..ValueSymbolLinks::default()
+            })
+        || store.type_node_links(plan.arrow)
+            != Some(&TypeNodeLinks {
+                resolved_type: Some(arrow_type),
+                ..TypeNodeLinks::default()
+            })
+    {
+        return None;
+    }
+    let bootstrap = store.intrinsic_bootstrap()?;
+    let instance_record = store.type_payload(instance_type)?;
+    let instance = exact_class_instance_identity(store, plan.symbol, instance_type)?;
+    let structured = &instance.reference.object.structured;
+    let field_name = store.symbol(plan.property_symbol)?.name();
+    if instance_record.object_flags()
+        != (ObjectFlags::CLASS | ObjectFlags::REFERENCE | ObjectFlags::MEMBERS_RESOLVED)
+        || store
+            .declared_type_links(plan.symbol)
+            .and_then(|links| links.declared_type)
+            != Some(instance_type)
+        || !instance.base_types_resolved
+        || instance.resolved_base_constructor_type != Some(bootstrap.undefined_type)
+        || instance.resolved_base_types.is_some()
+        || !instance.declared_members_resolved
+        || instance.declared_members != Some(plan.instance_members)
+        || instance.declared_call_signatures.is_some()
+        || instance.declared_construct_signatures.is_some()
+        || instance.declared_index_infos.is_some()
+        || structured.constrained != ConstrainedTypeData::default()
+        || structured.properties.as_deref() != Some(&[plan.property_symbol])
+        || structured.signatures.is_some()
+        || structured.call_signature_count != 0
+        || structured.index_infos.is_some()
+        || structured
+            .object_type_without_abstract_construct_signatures
+            .is_some()
+        || structured.members == Some(plan.instance_members)
+        || structured.members.and_then(|members| {
+            store
+                .symbol_table(members)
+                .filter(|members| members.len() == 1)
+                .and_then(|members| members.get(field_name))
+        }) != Some(plan.property_symbol)
+    {
+        return None;
+    }
+
+    let value_record = store.type_payload(value_type)?;
+    let TypeData::Object(value) = value_record.data() else {
+        return None;
+    };
+    let [signature] = value.structured.signatures.as_deref()? else {
+        return None;
+    };
+    let signature = *signature;
+    if value_record.flags() != TypeFlags::OBJECT
+        || value_record.object_flags() != (ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED)
+        || value_record.symbol() != Some(plan.symbol)
+        || value_record.alias().is_some()
+        || value.target.is_some()
+        || value.mapper.is_some()
+        || value.instantiations != TypeCacheState::Unallocated
+        || value.structured.constrained != ConstrainedTypeData::default()
+        || value.structured.members != Some(plan.static_members)
+        || value.structured.properties.as_deref() != Some(&[plan.prototype])
+        || value.structured.call_signature_count != 0
+        || value.structured.index_infos.is_some()
+        || value
+            .structured
+            .object_type_without_abstract_construct_signatures
+            .is_some()
+        || !exact_construct_signature(store, signature, instance_type, None, None)
+    {
+        return None;
+    }
+
+    Some(ClassMembers {
+        shells: ClassShells {
+            declaration: plan.declaration,
+            symbol: plan.symbol,
+            instance_type,
+            value_type,
+        },
+        base: None,
+        instance_members: structured.members,
+        static_members: plan.static_members,
+        instance_properties: vec![plan.property_symbol],
+        declared_instance_property_count: 1,
+        static_properties: Vec::new(),
+        declared_static_property_count: 0,
+        prototype: plan.prototype,
+        default_construct_signature: signature,
+    })
+}
+
+/// Publishes an authenticated exported class after its arrow callable is complete.
+pub(super) fn execute_exported_jsx_arrow_class(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &ExportedJsxArrowClassPlan,
+    arrow_type: TypeId,
+) -> Result<ClassMembers, ClassError> {
+    if plan_exported_jsx_arrow_class(store, host, plan.symbol).as_ref() != Some(plan) {
+        return Err(invariant(ClassInvariant::InvalidPlan(plan.declaration)));
+    }
+    if !exported_jsx_arrow_callable_is_valid(store, plan, arrow_type) {
+        return Err(invariant(ClassInvariant::InvalidPropertyValueCache(
+            plan.property_symbol,
+        )));
+    }
+    if store.type_node_links(plan.arrow).is_some_and(|links| {
+        links != &TypeNodeLinks::default()
+            && links
+                != &(TypeNodeLinks {
+                    resolved_type: Some(arrow_type),
+                    ..TypeNodeLinks::default()
+                })
+    }) {
+        return Err(invariant(ClassInvariant::InvalidPropertyTypeCache(
+            plan.arrow,
+        )));
+    }
+    if store
+        .value_symbol_links(plan.property_symbol)
+        .is_some_and(|links| {
+            links != &ValueSymbolLinks::default()
+                && links
+                    != &(ValueSymbolLinks {
+                        resolved_type: Some(arrow_type),
+                        ..ValueSymbolLinks::default()
+                    })
+        })
+    {
+        return Err(invariant(ClassInvariant::InvalidPropertyValueCache(
+            plan.property_symbol,
+        )));
+    }
+    let instance = store
+        .declared_type_links(plan.symbol)
+        .and_then(|links| links.declared_type);
+    let value = match store.value_symbol_links(plan.symbol) {
+        None => None,
+        Some(links) if links == &ValueSymbolLinks::default() => None,
+        Some(links) => {
+            let type_ = links
+                .resolved_type
+                .ok_or_else(|| invariant(ClassInvariant::InvalidValueCache(plan.symbol)))?;
+            if links
+                != &(ValueSymbolLinks {
+                    resolved_type: Some(type_),
+                    ..ValueSymbolLinks::default()
+                })
+            {
+                return Err(invariant(ClassInvariant::InvalidValueCache(plan.symbol)));
+            }
+            Some(type_)
+        }
+    };
+    match (instance, value) {
+        (Some(instance_type), Some(value_type)) => {
+            return completed_exported_jsx_arrow_class(
+                store,
+                plan,
+                arrow_type,
+                instance_type,
+                value_type,
+            )
+            .ok_or_else(|| invariant(ClassInvariant::InvalidInstanceCache(plan.symbol)));
+        }
+        (None, Some(_)) => return Err(invariant(ClassInvariant::InvalidValueCache(plan.symbol))),
+        (Some(instance_type), None) => {
+            let Some(instance) = exact_class_instance_identity(store, plan.symbol, instance_type)
+            else {
+                return Err(invariant(ClassInvariant::InvalidInstanceCache(plan.symbol)));
+            };
+            if store.type_payload(instance_type).is_none_or(|record| {
+                record.object_flags() != (ObjectFlags::CLASS | ObjectFlags::REFERENCE)
+            }) || instance.base_types_resolved
+                || instance.resolved_base_constructor_type.is_some()
+                || instance.resolved_base_types.is_some()
+                || instance.declared_members_resolved
+                || instance.declared_members.is_some()
+                || instance.declared_call_signatures.is_some()
+                || instance.declared_construct_signatures.is_some()
+                || instance.declared_index_infos.is_some()
+                || instance.reference.object.structured != StructuredTypeData::default()
+            {
+                return Err(invariant(ClassInvariant::InvalidInstanceCache(plan.symbol)));
+            }
+        }
+        (None, None) => {}
+    }
+    if store
+        .value_symbol_links(plan.property_symbol)
+        .is_some_and(|links| links != &ValueSymbolLinks::default())
+    {
+        return Err(invariant(ClassInvariant::InvalidPropertyValueCache(
+            plan.property_symbol,
+        )));
+    }
+
+    let mut instance_properties = Vec::new();
+    instance_properties
+        .try_reserve_exact(1)
+        .map_err(|_| invariant(ClassInvariant::Capacity(plan.declaration)))?;
+    instance_properties.push(plan.property_symbol);
+    let mut static_properties = Vec::new();
+    static_properties
+        .try_reserve_exact(1)
+        .map_err(|_| invariant(ClassInvariant::Capacity(plan.declaration)))?;
+    static_properties.push(plan.prototype);
+    let mut construct_signatures = Vec::new();
+    construct_signatures
+        .try_reserve_exact(1)
+        .map_err(|_| invariant(ClassInvariant::Capacity(plan.declaration)))?;
+    let prepared_members = PreparedSymbolTable::new(1)
+        .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.declaration)))?;
+    let property_name = store
+        .symbol(plan.property_symbol)
+        .ok_or_else(|| {
+            invariant(ClassInvariant::InvalidPropertySymbol(
+                plan.property_declaration,
+            ))
+        })?
+        .name()
+        .to_owned();
+    let additional_types = 1usize
+        .checked_add(usize::from(instance.is_none()) * 2)
+        .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.declaration)))?;
+    let missing_declared = usize::from(store.declared_type_links(plan.symbol).is_none());
+    let missing_type_nodes = usize::from(store.type_node_links(plan.arrow).is_none());
+    let missing_values = usize::from(store.value_symbol_links(plan.symbol).is_none())
+        .checked_add(usize::from(
+            store.value_symbol_links(plan.property_symbol).is_none(),
+        ))
+        .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.declaration)))?;
+    if !store.try_reserve_types(additional_types)
+        || !store.try_reserve_signatures(1)
+        || !store.try_reserve_checker_symbol_allocations(0, 1)
+        || !store.try_reserve_declared_type_links(missing_declared)
+        || !store.try_reserve_type_node_links(missing_type_nodes)
+        || !store.try_reserve_value_symbol_links(missing_values)
+    {
+        return Err(invariant(ClassInvariant::Capacity(plan.declaration)));
+    }
+
+    let instance_type = store.get_declared_type_of_symbol(host, plan.symbol)?;
+    if instance.is_some_and(|expected| expected != instance_type) {
+        return Err(invariant(ClassInvariant::InvalidInstanceCache(plan.symbol)));
+    }
+    let value_type = store
+        .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(plan.symbol))
+        .ok_or_else(|| invariant(ClassInvariant::Publication(plan.declaration)))?;
+    let undefined_type = store
+        .intrinsic_bootstrap()
+        .ok_or_else(|| invariant(ClassInvariant::BootstrapUnavailable(plan.declaration)))?
+        .undefined_type;
+    assert!(store.set_interface_base_resolution(instance_type, false, Some(undefined_type), None,));
+    assert!(store.set_value_symbol_links(
+        plan.symbol,
+        ValueSymbolLinks {
+            resolved_type: Some(value_type),
+            ..ValueSymbolLinks::default()
+        },
+    ));
+
+    let resolved_members = store.alloc_prepared_symbol_table(prepared_members);
+    assert_eq!(
+        store.insert_symbol(resolved_members, property_name, plan.property_symbol),
+        Some(None),
+    );
+    let signature = store
+        .alloc_signature(
+            SignatureFlags::CONSTRUCT,
+            None,
+            Vec::new(),
+            None,
+            Vec::new(),
+            Some(instance_type),
+            None,
+            0,
+        )
+        .expect("the exported class transaction reserved its construct signature");
+    construct_signatures.push(signature);
+    assert!(store.set_type_node_links(
+        plan.arrow,
+        TypeNodeLinks {
+            resolved_type: Some(arrow_type),
+            ..TypeNodeLinks::default()
+        },
+    ));
+    assert!(store.set_source_property_readonly(plan.property_symbol, false));
+    assert!(store.set_value_symbol_links(
+        plan.property_symbol,
+        ValueSymbolLinks {
+            resolved_type: Some(arrow_type),
+            ..ValueSymbolLinks::default()
+        },
+    ));
+    assert!(store.set_interface_declared_members(
+        instance_type,
+        true,
+        Some(plan.instance_members),
+        None,
+        None,
+        None,
+    ));
+    assert!(store.set_interface_base_resolution(instance_type, true, Some(undefined_type), None,));
+    assert!(store.set_structured_type_members(
+        instance_type,
+        Some(resolved_members),
+        Some(instance_properties),
+        None,
+        None,
+        None,
+    ));
+    assert!(store.set_structured_type_members(
+        value_type,
+        Some(plan.static_members),
+        Some(static_properties),
+        None,
+        Some(construct_signatures),
+        None,
+    ));
+
+    completed_exported_jsx_arrow_class(store, plan, arrow_type, instance_type, value_type)
+        .ok_or_else(|| invariant(ClassInvariant::Publication(plan.declaration)))
+}
+
 /// Store-only proof used before any relation-cache read involving a class.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ClassHeritageMembersValidation {
@@ -7768,6 +8470,29 @@ fn exact_stored_property(
                 && bootstrap.cached_number_literal_type(*number) == Some(property_type)
                 && store.fresh_type_of_literal_type(property_type).is_ok()
         });
+    let arrow_callable = check_flags == CheckFlags::NONE
+        && store
+            .source_callable_provenance(property_type)
+            .is_some_and(|provenance| {
+                provenance.owner_symbol != property
+                    && provenance.owner_parent.is_none()
+                    && provenance.export_local.is_none()
+                    && store.source_node_kind(provenance.declaration)
+                        == Some(SyntaxKind::ArrowFunction)
+                    && store.source_node_parent(provenance.declaration)
+                        == Some(SourceNodeParent::Parent(*declaration))
+                    && store.source_callable_type_for_owner(provenance.owner_symbol)
+                        == Some(property_type)
+                    && store
+                        .signature(provenance.signature)
+                        .is_some_and(|signature| {
+                            signature.parameters().is_empty() && signature.min_argument_count() == 0
+                        })
+                    && matches!(
+                        validate_stored_source_callable(store, property_type),
+                        StoredSourceCallableValidation::Valid(_)
+                    )
+            });
     let source_type_valid = store
         .source_primitive_type_annotation(*declaration)
         .map_or_else(
@@ -7785,6 +8510,26 @@ fn exact_stored_property(
                     declaration.file,
                     ts_ast::NodeId::new(initializer_index),
                 );
+                if store.source_node_kind(initializer) == Some(SyntaxKind::ArrowFunction) {
+                    return flags == SymbolFlags::PROPERTY
+                        && arrow_callable
+                        && store.source_node_parent(initializer)
+                            == Some(SourceNodeParent::Parent(*declaration))
+                        && store.type_node_links(initializer)
+                            == Some(&TypeNodeLinks {
+                                resolved_type: Some(property_type),
+                                ..TypeNodeLinks::default()
+                            })
+                        && store
+                            .source_callable_provenance(property_type)
+                            .is_some_and(|provenance| provenance.declaration == initializer)
+                        && store
+                            .symbol(owner)
+                            .and_then(Symbol::members)
+                            .and_then(|members| store.symbol_table(members))
+                            .and_then(|members| members.get(record.name()))
+                            == Some(property);
+                }
                 let Some(previous_index) = initializer
                     .node
                     .index()
@@ -7913,7 +8658,7 @@ fn exact_stored_property(
                 resolved_type: Some(property_type),
                 ..ValueSymbolLinks::default()
             })
-        && (primitive || readonly_number_literal))
+        && (primitive || readonly_number_literal || arrow_callable))
         .then_some(*declaration)
 }
 
@@ -8283,12 +9028,42 @@ fn stored_class_parts(
         return None;
     };
     let declaration = *declaration;
+    let valid_owner_parent = match owner.parent() {
+        None => true,
+        Some(parent) => {
+            declaration
+                .node
+                .index()
+                .checked_add(1)
+                .and_then(|index| u32::try_from(index).ok())
+                .map(|index| {
+                    NodeRef::new(
+                        declaration.arena,
+                        declaration.file,
+                        ts_ast::NodeId::new(index),
+                    )
+                })
+                .is_some_and(|modifier| {
+                    store.source_node_kind(modifier) == Some(SyntaxKind::ExportKeyword)
+                        && store.source_node_parent(modifier)
+                            == Some(SourceNodeParent::Parent(declaration))
+                })
+                && store.symbol(parent).is_some_and(|module| {
+                    module.flags() == SymbolFlags::VALUE_MODULE
+                        && module
+                            .exports()
+                            .and_then(|exports| store.symbol_table(exports))
+                            .and_then(|exports| exports.get(owner.name()))
+                            == Some(symbol)
+                })
+        }
+    };
     if record.object_flags()
         != (ObjectFlags::CLASS | ObjectFlags::REFERENCE | ObjectFlags::MEMBERS_RESOLVED)
         || owner.flags() != SymbolFlags::CLASS
         || owner.check_flags() != CheckFlags::NONE
         || owner.value_declaration() != Some(declaration)
-        || owner.parent().is_some()
+        || !valid_owner_parent
         || owner.export_symbol().is_some()
         || store.get_merged_symbol(symbol) != Some(symbol)
         || store.source_node_kind(declaration) != Some(SyntaxKind::ClassDeclaration)
@@ -8595,7 +9370,7 @@ mod tests {
         BoundFile, CanonicalBinder, CanonicalModuleState, CanonicalNameResolverOptions,
         CanonicalSourceFileFacts, CanonicalSourceLanguage, EscapedName,
     };
-    use ts_parser::{ParseResult, parse_source_file};
+    use ts_parser::{ParseResult, parse_jsx_source_file, parse_source_file};
 
     use super::*;
     use crate::semantic::{
@@ -8635,6 +9410,19 @@ mod tests {
     }
 
     fn fixture_from_parsed(parsed: ParseResult) -> Fixture {
+        fixture_from_parsed_with_module_state(parsed, CanonicalModuleState::Script)
+    }
+
+    fn external_jsx_fixture(source: &str) -> Fixture {
+        let parsed = parse_jsx_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        fixture_from_parsed_with_module_state(parsed, CanonicalModuleState::External)
+    }
+
+    fn fixture_from_parsed_with_module_state(
+        parsed: ParseResult,
+        module_state: CanonicalModuleState,
+    ) -> Fixture {
         let file = FileId::new(91);
         let mut binder = CanonicalBinder::new();
         binder
@@ -8646,7 +9434,7 @@ mod tests {
                     EscapedName::source("\"/classes.ts\""),
                     CanonicalSourceLanguage::TypeScript,
                     false,
-                    CanonicalModuleState::Script,
+                    module_state,
                 ),
             )
             .unwrap();
@@ -8663,20 +9451,22 @@ mod tests {
         store
             .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
             .unwrap();
-        let bound = files.get(&file).expect("bound source remains available");
-        let source_locals = bound
-            .locals(bound.source_file())
-            .expect("class declarations allocate source locals");
-        let mut global_symbols = store
-            .symbol_table(source_locals)
-            .expect("bound source locals remain store-owned")
-            .iter()
-            .map(|(name, symbol)| (name.as_bytes().to_vec(), symbol))
-            .collect::<Vec<_>>();
-        global_symbols.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-        let globals = store.intrinsic_bootstrap().unwrap().globals;
-        for (_, symbol) in global_symbols {
-            store.merge_global_symbol(globals, symbol).unwrap();
+        if module_state == CanonicalModuleState::Script {
+            let bound = files.get(&file).expect("bound source remains available");
+            let source_locals = bound
+                .locals(bound.source_file())
+                .expect("class declarations allocate source locals");
+            let mut global_symbols = store
+                .symbol_table(source_locals)
+                .expect("bound source locals remain store-owned")
+                .iter()
+                .map(|(name, symbol)| (name.as_bytes().to_vec(), symbol))
+                .collect::<Vec<_>>();
+            global_symbols.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+            let globals = store.intrinsic_bootstrap().unwrap().globals;
+            for (_, symbol) in global_symbols {
+                store.merge_global_symbol(globals, symbol).unwrap();
+            }
         }
         Fixture {
             parsed,
@@ -8762,6 +9552,201 @@ mod tests {
             None,
         ));
         (type_, signature)
+    }
+
+    fn warm_exported_jsx_arrow(fixture: &mut Fixture, plan: &ExportedJsxArrowClassPlan) -> TypeId {
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let (callable, _) = super::super::source_arrows::plan_source_arrow_value(
+            &fixture.store,
+            &host,
+            plan.arrow,
+            None,
+        )
+        .unwrap();
+        let (additional_types, _) =
+            super::super::source_callables::reserve_source_callable_capacities(
+                &mut fixture.store,
+                &[&callable],
+            )
+            .unwrap();
+        assert!(fixture.store.try_reserve_types(additional_types));
+        let pending = super::super::source_callables::begin_source_callable(
+            &mut fixture.store,
+            &callable,
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+        super::super::source_callables::finalize_source_callable_structure(
+            &mut fixture.store,
+            &callable,
+            pending,
+        )
+        .unwrap();
+        let any = fixture.store.intrinsic_bootstrap().unwrap().any_type;
+        super::super::source_callables::publish_inferred_source_callable_return(
+            &mut fixture.store,
+            &callable,
+            pending.signature,
+            any,
+        )
+        .unwrap();
+        pending.type_
+    }
+
+    #[test]
+    fn exported_jsx_arrow_class_preserves_export_field_and_callable_identities() {
+        let mut fixture =
+            external_jsx_fixture("export class LoggedOut { content = () => (<></>); }");
+        let owner = class_symbol(&fixture, "LoggedOut");
+        let plan = {
+            let bound = &fixture.files[&fixture.file];
+            let host = host(&fixture.parsed.arena, bound);
+            let cold = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+            let plan = plan_exported_jsx_arrow_class(&fixture.store, &host, owner)
+                .expect("the exported class retains its exact arrow field");
+            assert_eq!(plan.symbol, owner);
+            assert_ne!(plan.export_local, owner);
+            assert_ne!(plan.property_symbol, plan.arrow_symbol);
+            assert_eq!(
+                bound.local_symbol(plan.declaration),
+                Some(plan.export_local)
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                cold
+            );
+            plan
+        };
+        let arrow_type = warm_exported_jsx_arrow(&mut fixture, &plan);
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+
+        let members =
+            execute_exported_jsx_arrow_class(&mut fixture.store, &host, &plan, arrow_type).unwrap();
+
+        assert_eq!(members.shells().symbol(), owner);
+        assert_eq!(
+            members.declared_instance_properties(),
+            &[plan.property_symbol]
+        );
+        assert!(members.declared_static_properties().is_empty());
+        assert_eq!(members.prototype(), plan.prototype);
+        assert_eq!(
+            fixture.store.value_symbol_links(plan.property_symbol),
+            Some(&ValueSymbolLinks {
+                resolved_type: Some(arrow_type),
+                ..ValueSymbolLinks::default()
+            })
+        );
+        assert_eq!(
+            fixture.store.type_node_links(plan.arrow),
+            Some(&TypeNodeLinks {
+                resolved_type: Some(arrow_type),
+                ..TypeNodeLinks::default()
+            })
+        );
+        assert_eq!(
+            validate_class_heritage_members(&fixture.store, members.shells().instance_type()),
+            ClassHeritageMembersValidation::Valid
+        );
+        assert!(fixture.store.set_value_symbol_links(
+            plan.export_local,
+            ValueSymbolLinks {
+                resolved_type: Some(members.shells().value_type()),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        assert_eq!(
+            execute_exported_jsx_arrow_class(&mut fixture.store, &host, &plan, arrow_type),
+            Ok(members)
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm
+        );
+    }
+
+    #[test]
+    fn exported_jsx_arrow_class_rejects_forged_local_export_and_field_caches() {
+        for poison_local in [false, true] {
+            let mut fixture =
+                external_jsx_fixture("export class LoggedOut { content = () => (<></>); }");
+            let owner = class_symbol(&fixture, "LoggedOut");
+            let plan = {
+                let bound = &fixture.files[&fixture.file];
+                let host = host(&fixture.parsed.arena, bound);
+                plan_exported_jsx_arrow_class(&fixture.store, &host, owner).unwrap()
+            };
+            if poison_local {
+                assert!(fixture.store.set_symbol_relationships(
+                    plan.export_local,
+                    None,
+                    None,
+                    None,
+                    None,
+                ));
+                let bound = &fixture.files[&fixture.file];
+                let host = host(&fixture.parsed.arena, bound);
+                assert!(plan_exported_jsx_arrow_class(&fixture.store, &host, owner).is_none());
+                assert!(fixture.store.declared_type_links(owner).is_none());
+                assert!(fixture.store.value_symbol_links(owner).is_none());
+                continue;
+            }
+
+            let arrow_type = warm_exported_jsx_arrow(&mut fixture, &plan);
+            let wrong = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+            assert!(fixture.store.set_type_node_links(
+                plan.arrow,
+                TypeNodeLinks {
+                    resolved_type: Some(wrong),
+                    ..TypeNodeLinks::default()
+                },
+            ));
+            let bound = &fixture.files[&fixture.file];
+            let host = host(&fixture.parsed.arena, bound);
+            let poisoned = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            assert_eq!(
+                execute_exported_jsx_arrow_class(&mut fixture.store, &host, &plan, arrow_type),
+                Err(invariant(ClassInvariant::InvalidPropertyTypeCache(
+                    plan.arrow
+                )))
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                poisoned
+            );
+            assert!(fixture.store.declared_type_links(owner).is_none());
+            assert!(fixture.store.value_symbol_links(owner).is_none());
+        }
     }
 
     #[test]

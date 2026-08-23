@@ -5461,6 +5461,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     && type_arguments.is_empty()
                     && !self.is_initialized_global_function(symbol)
                     && !self.is_default_library_template_strings_array(symbol)
+                    && !self.is_canonical_global_jsx_element(symbol)
                 {
                     self.plan_property_interface(symbol)?;
                 }
@@ -5874,6 +5875,190 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             .and_then(|globals| globals.get_source(name))
             .and_then(|global| self.store.get_merged_symbol(global))
             == Some(symbol)
+    }
+
+    #[allow(clippy::too_many_lines)] // Namespace and declaration checks form one identity proof.
+    fn is_canonical_global_jsx_element(&self, symbol: SemanticSymbolId) -> bool {
+        let Some(namespace) = self
+            .store
+            .intrinsic_bootstrap()
+            .and_then(|bootstrap| self.store.symbol_table(bootstrap.globals))
+            .and_then(|globals| globals.get_source("JSX"))
+            .and_then(|namespace| self.store.get_merged_symbol(namespace))
+        else {
+            return false;
+        };
+        let Some(namespace_record) = self.store.symbol(namespace) else {
+            return false;
+        };
+        if !namespace_record.flags().intersects(SymbolFlags::NAMESPACE)
+            || namespace_record.name().as_utf8() != Some("JSX")
+            || namespace_record.check_flags() != ts_binder::CheckFlags::NONE
+            || self.store.get_merged_symbol(namespace) != Some(namespace)
+        {
+            return false;
+        }
+
+        let Some(exports) = self
+            .store
+            .module_symbol_links(namespace)
+            .and_then(|links| links.resolved_exports)
+            .or_else(|| namespace_record.exports())
+        else {
+            return false;
+        };
+        let exported = self
+            .store
+            .symbol_table(exports)
+            .and_then(|exports| exports.get_source("Element"))
+            .and_then(|element| self.store.get_merged_symbol(element));
+        if exported != Some(symbol)
+            || namespace_record.exports().is_some_and(|raw_exports| {
+                self.store
+                    .symbol_table(raw_exports)
+                    .and_then(|exports| exports.get_source("Element"))
+                    .and_then(|element| self.store.get_merged_symbol(element))
+                    != Some(symbol)
+            })
+        {
+            return false;
+        }
+
+        let Some(owner) = self.store.symbol(symbol) else {
+            return false;
+        };
+        if !owner.flags().contains(SymbolFlags::INTERFACE)
+            || owner
+                .flags()
+                .without(SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT)
+                != SymbolFlags::NONE
+            || owner.check_flags() != ts_binder::CheckFlags::NONE
+            || owner.name().as_utf8() != Some("Element")
+            || owner.value_declaration().is_some()
+            || owner.exports().is_some()
+            || owner.export_symbol().is_some()
+            || self.store.get_merged_symbol(symbol) != Some(symbol)
+            || self.store.get_parent_of_symbol(symbol) != Some(namespace)
+        {
+            return false;
+        }
+
+        if let Some(declared_type) = self
+            .store
+            .declared_type_links(symbol)
+            .and_then(|links| links.declared_type)
+        {
+            let Some(record) = self.store.type_payload(declared_type) else {
+                return false;
+            };
+            let TypeData::Interface(interface) = record.data() else {
+                return false;
+            };
+            if record.flags() != TypeFlags::OBJECT
+                || !record.object_flags().contains(ObjectFlags::INTERFACE)
+                || record.object_flags().contains(ObjectFlags::CLASS)
+                || record.symbol() != Some(symbol)
+                || record.alias().is_some()
+                || interface.outer_type_parameter_count != 0
+                || interface
+                    .reference
+                    .resolved_type_arguments
+                    .as_ref()
+                    .is_some_and(|arguments| !arguments.is_empty())
+            {
+                return false;
+            }
+        }
+
+        let Some(declarations) = owner.declarations() else {
+            return false;
+        };
+        if declarations.is_empty() {
+            return false;
+        }
+        let mut seen = HashSet::with_capacity(declarations.len());
+        for &declaration in declarations {
+            let Some(record) = self.host.node(declaration) else {
+                return false;
+            };
+            let NodeData::InterfaceDeclaration(interface) = &record.data else {
+                return false;
+            };
+            if !seen.insert(declaration)
+                || record.kind != SyntaxKind::InterfaceDeclaration
+                || interface.type_parameters.is_some()
+                || !self.host.symbol_matches(self.store, declaration, symbol)
+            {
+                return false;
+            }
+            let name = NodeRef::new(declaration.arena, declaration.file, interface.name);
+            let Some(name_record) = self.host.node(name) else {
+                return false;
+            };
+            if name_record.parent != Some(declaration.node)
+                || !matches!(
+                    &name_record.data,
+                    NodeData::Identifier(identifier)
+                        if name_record.kind == SyntaxKind::Identifier
+                            && identifier.text == "Element"
+                            && identifier.flow_node.is_none()
+                )
+            {
+                return false;
+            }
+
+            let Some(block_id) = record.parent else {
+                return false;
+            };
+            let block = NodeRef::new(declaration.arena, declaration.file, block_id);
+            let Some(block_record) = self.host.node(block) else {
+                return false;
+            };
+            let NodeData::ModuleBlock(module_block) = &block_record.data else {
+                return false;
+            };
+            if block_record.kind != SyntaxKind::ModuleBlock
+                || module_block
+                    .statements
+                    .nodes
+                    .iter()
+                    .filter(|candidate| **candidate == declaration.node)
+                    .count()
+                    != 1
+            {
+                return false;
+            }
+
+            let Some(module_id) = block_record.parent else {
+                return false;
+            };
+            let module = NodeRef::new(declaration.arena, declaration.file, module_id);
+            let Some(module_record) = self.host.node(module) else {
+                return false;
+            };
+            let NodeData::ModuleDeclaration(module_data) = &module_record.data else {
+                return false;
+            };
+            let module_name = NodeRef::new(module.arena, module.file, module_data.name);
+            let Some(module_name_record) = self.host.node(module_name) else {
+                return false;
+            };
+            if module_record.kind != SyntaxKind::ModuleDeclaration
+                || module_data.body != Some(block.node)
+                || !self.host.symbol_matches(self.store, module, namespace)
+                || module_name_record.parent != Some(module.node)
+                || !matches!(
+                    &module_name_record.data,
+                    NodeData::Identifier(identifier)
+                        if module_name_record.kind == SyntaxKind::Identifier
+                            && identifier.text == "JSX"
+                            && identifier.flow_node.is_none()
+                )
+            {
+                return false;
+            }
+        }
+        true
     }
 
     fn is_initialized_global_function(&self, symbol: SemanticSymbolId) -> bool {
@@ -9048,6 +9233,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             && preflight_class_or_interface_reference(planner.store, planner.host, symbol, flags)?
                 == 0
             && !planner.is_default_library_template_strings_array(symbol)
+            && !planner.is_canonical_global_jsx_element(symbol)
         {
             planner.plan_property_interface(symbol)?;
         }
@@ -18768,6 +18954,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Binds and validates four real merged source files.
     fn cross_file_default_library_promise_accepts_merged_transient_symbols() {
         let base = parse_source_file("interface Promise<T> { then(value: T): Promise<T>; }");
         let augmentation = parse_source_file("interface Promise<T> { finally(): Promise<T>; }");
@@ -18952,6 +19139,228 @@ mod tests {
             ))
         ));
         assert_eq!(store_state(&fixture.store), before);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Covers both query orders and forged warm identities.
+    fn global_jsx_element_keeps_qualified_heritage_and_members_lazy() {
+        for direct_first in [false, true] {
+            let mut fixture = fixture(concat!(
+                "declare namespace React { ",
+                "interface ReactElement<Value> { value: Value; } ",
+                "} ",
+                "declare namespace JSX { ",
+                "interface Element extends React.ReactElement<any> {} ",
+                "} ",
+                "namespace Ordinary { export interface Element { value: string; } } ",
+                "type Rendered = JSX.Element; ",
+                "type OrdinaryRendered = Ordinary.Element;",
+            ));
+            let element = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Element");
+            let rendered = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Rendered");
+            let ordinary = named_symbol(
+                &fixture,
+                SyntaxKind::TypeAliasDeclaration,
+                "OrdinaryRendered",
+            );
+            let reference = alias_parts(&fixture, "Rendered").2;
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+            let expected = if direct_first {
+                query_declared(
+                    &mut fixture,
+                    element,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                )
+                .unwrap()
+            } else {
+                query_declared(
+                    &mut fixture,
+                    rendered,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                )
+                .unwrap()
+            };
+            assert_eq!(
+                query_declared(
+                    &mut fixture,
+                    rendered,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                ),
+                Ok(expected),
+            );
+            assert_eq!(
+                query_declared(
+                    &mut fixture,
+                    element,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                ),
+                Ok(expected),
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .symbol_node_links(reference)
+                    .and_then(|links| links.resolved_symbol),
+                Some(element),
+            );
+            let TypeData::Interface(interface) =
+                fixture.store.type_payload(expected).unwrap().data()
+            else {
+                panic!("JSX.Element must retain its declared interface identity")
+            };
+            assert!(!interface.declared_members_resolved);
+
+            let ordinary_type = query_declared(
+                &mut fixture,
+                ordinary,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap();
+            let TypeData::Interface(interface) =
+                fixture.store.type_payload(ordinary_type).unwrap().data()
+            else {
+                panic!("the ordinary namespace must retain its interface identity")
+            };
+            assert!(interface.declared_members_resolved);
+
+            let warm = store_state(&fixture.store);
+            assert_eq!(
+                query_node(&mut fixture, reference, &mut diagnostics),
+                Ok(expected)
+            );
+            assert_eq!(
+                query_declared(
+                    &mut fixture,
+                    element,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                ),
+                Ok(expected),
+            );
+            assert_eq!(store_state(&fixture.store), warm);
+            assert!(diagnostics.is_empty());
+
+            let original_links = fixture.store.declared_type_links(element).unwrap().clone();
+            let wrong = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+            let mut forged_links = original_links.clone();
+            forged_links.declared_type = Some(wrong);
+            assert!(fixture.store.set_declared_type_links(element, forged_links));
+            let forged = store_state(&fixture.store);
+            assert!(matches!(
+                query_node(&mut fixture, reference, &mut diagnostics),
+                Err(DeclaredTypeError::Unavailable(
+                    DeclaredTypeUnavailable::InvalidCachedDeclaredType {
+                        symbol,
+                        declared_type,
+                    }
+                )) if symbol == element && declared_type == wrong
+            ));
+            assert_eq!(store_state(&fixture.store), forged);
+            assert!(
+                fixture
+                    .store
+                    .set_declared_type_links(element, original_links)
+            );
+            assert_eq!(
+                query_node(&mut fixture, reference, &mut diagnostics),
+                Ok(expected)
+            );
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn global_jsx_element_rejects_forged_namespace_exports_and_parents() {
+        let mut fixture = fixture(concat!(
+            "declare namespace React { interface ReactElement<Value> {} } ",
+            "declare namespace JSX { ",
+            "interface Element extends React.ReactElement<any> {} ",
+            "interface Decoy {} ",
+            "} ",
+            "type Rendered = JSX.Element;",
+        ));
+        let element = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Element");
+        let decoy = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Decoy");
+        let reference = alias_parts(&fixture, "Rendered").2;
+        let namespace = fixture
+            .store
+            .intrinsic_bootstrap()
+            .and_then(|bootstrap| fixture.store.symbol_table(bootstrap.globals))
+            .and_then(|globals| globals.get_source("JSX"))
+            .unwrap();
+        let exports = fixture.store.symbol(namespace).unwrap().exports().unwrap();
+        let host = post_global_host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        let aliases = HashMap::new();
+        assert!(
+            TypeQueryPlanner::new(&fixture.store, &host, None, None, false, &aliases)
+                .is_canonical_global_jsx_element(element)
+        );
+        assert!(
+            !TypeQueryPlanner::new(&fixture.store, &host, None, None, false, &aliases)
+                .is_canonical_global_jsx_element(decoy)
+        );
+
+        assert_eq!(
+            fixture
+                .store
+                .insert_symbol(exports, EscapedName::source("Element"), decoy),
+            Some(Some(element)),
+        );
+        assert!(
+            !TypeQueryPlanner::new(&fixture.store, &host, None, None, false, &aliases)
+                .is_canonical_global_jsx_element(element)
+        );
+        assert_eq!(
+            fixture
+                .store
+                .insert_symbol(exports, EscapedName::source("Element"), element),
+            Some(Some(decoy)),
+        );
+
+        let (members, owner_exports, parent, export_symbol) = {
+            let record = fixture.store.symbol(element).unwrap();
+            (
+                record.members(),
+                record.exports(),
+                record.parent(),
+                record.export_symbol(),
+            )
+        };
+        assert!(fixture.store.set_symbol_relationships(
+            element,
+            members,
+            owner_exports,
+            None,
+            export_symbol,
+        ));
+        assert!(
+            !TypeQueryPlanner::new(&fixture.store, &host, None, None, false, &aliases)
+                .is_canonical_global_jsx_element(element)
+        );
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let forged = store_state(&fixture.store);
+        assert!(query_node(&mut fixture, reference, &mut diagnostics).is_err());
+        assert_eq!(store_state(&fixture.store), forged);
+        assert!(diagnostics.is_empty());
+
+        assert!(fixture.store.set_symbol_relationships(
+            element,
+            members,
+            owner_exports,
+            parent,
+            export_symbol,
+        ));
+        assert!(query_node(&mut fixture, reference, &mut diagnostics).is_ok());
         assert!(diagnostics.is_empty());
     }
 

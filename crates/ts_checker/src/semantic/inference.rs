@@ -5,11 +5,12 @@
 //! upstream records the source type itself as a covariant candidate. The
 //! bounded Rust branch accepts primitive, literal, unique-symbol, anonymous
 //! primitive-union, and exact resolved nongeneric declared-property-object
-//! candidates, plus canonical Array/ReadonlyArray references when the caller
-//! retains the authoritative global targets. Declared objects are admitted
-//! only as the root candidate, not recursively inside a union. The branch
-//! preserves candidates that do not require widening, including fresh
-//! literals. Widening sentinels remain a typed boundary until the exact final
+//! candidates, authenticated fixed tuples, and canonical Array/ReadonlyArray
+//! references when the caller retains the authoritative global targets.
+//! Declared objects and tuples are admitted only as root candidates or nested
+//! array/tuple elements, not as union constituents. The branch preserves
+//! candidates that do not require widening, including fresh literals.
+//! Widening sentinels remain a typed boundary until the exact final
 //! `getWidenedType` step is available.
 
 #![allow(dead_code)] // Installed ahead of the generic-call dispatch consumer.
@@ -25,6 +26,8 @@ use super::{
     object_members::{
         DeclaredPropertyObjectValidation, validate_resolved_declared_property_object,
     },
+    signatures::ElementFlags,
+    tuple_types::TupleTypeError,
     type_records::TypeData,
     types::{ObjectFlags, TypeFlags},
 };
@@ -79,7 +82,12 @@ pub(super) enum NakedTypeInferenceError {
         candidate: TypeId,
         error: ArrayTypeError,
     },
+    InvalidCanonicalTupleCandidate {
+        candidate: TypeId,
+        error: TupleTypeError,
+    },
     RecursiveArrayCandidate(TypeId),
+    RecursiveTupleCandidate(TypeId),
     MalformedDeclaredPropertyObject(TypeId),
     UnsupportedCandidate(TypeId),
     RequiresWidening(TypeId),
@@ -488,7 +496,7 @@ fn validate_inference_candidate(
     candidate: TypeId,
     allow_declared_object: bool,
     array_targets: Option<CanonicalArrayTargets>,
-    active_arrays: &mut HashSet<TypeId>,
+    active_candidates: &mut HashSet<TypeId>,
 ) -> Result<(), NakedTypeInferenceError> {
     let record = store
         .type_payload(candidate)
@@ -502,7 +510,7 @@ fn validate_inference_candidate(
     if let Some(array_targets) = array_targets {
         match store.canonical_array_reference_with_targets(array_targets, candidate) {
             Ok(Some(reference)) => {
-                if !active_arrays.insert(candidate) {
+                if !active_candidates.insert(candidate) {
                     return Err(NakedTypeInferenceError::RecursiveArrayCandidate(candidate));
                 }
                 let result = validate_inference_candidate(
@@ -510,9 +518,9 @@ fn validate_inference_candidate(
                     reference.element_type,
                     true,
                     Some(array_targets),
-                    active_arrays,
+                    active_candidates,
                 );
-                active_arrays.remove(&candidate);
+                active_candidates.remove(&candidate);
                 return result;
             }
             Ok(None) => {}
@@ -522,6 +530,34 @@ fn validate_inference_candidate(
                     error,
                 });
             }
+        }
+    }
+    match store.canonical_tuple_shape(candidate) {
+        Ok(Some(tuple)) => {
+            if !allow_declared_object || tuple.combined_flags().intersects(ElementFlags::VARIABLE) {
+                return Err(NakedTypeInferenceError::UnsupportedCandidate(candidate));
+            }
+            if !active_candidates.insert(candidate) {
+                return Err(NakedTypeInferenceError::RecursiveTupleCandidate(candidate));
+            }
+            let result = tuple.element_types().iter().try_for_each(|element| {
+                validate_inference_candidate(
+                    store,
+                    *element,
+                    true,
+                    array_targets,
+                    active_candidates,
+                )
+            });
+            active_candidates.remove(&candidate);
+            return result;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            return Err(NakedTypeInferenceError::InvalidCanonicalTupleCandidate {
+                candidate,
+                error,
+            });
         }
     }
     match validate_resolved_declared_property_object(store, candidate) {
@@ -576,7 +612,7 @@ fn validate_inference_candidate(
                         constituent: *constituent,
                     });
                 }
-                validate_inference_candidate(store, *constituent, false, None, active_arrays)?;
+                validate_inference_candidate(store, *constituent, false, None, active_candidates)?;
             }
             Ok(())
         }
@@ -618,8 +654,10 @@ mod tests {
 
     use super::*;
     use crate::semantic::{
-        CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions, SemanticStore,
-        bootstrap::UnionReduction, mapper::TypeMapper, type_records::TypeRecord,
+        CanonicalCheckerContext, CanonicalCheckerOptions, DeclaredTypeLinks,
+        IntrinsicBootstrapOptions, SemanticStore, bootstrap::UnionReduction,
+        declared::type_list_key, mapper::TypeMapper, tuple_types::CanonicalTupleTypeRequest,
+        type_records::TypeRecord,
     };
 
     fn initialized_store_with(strict_null_checks: bool) -> CanonicalTypeMapperStore {
@@ -635,6 +673,57 @@ mod tests {
 
     fn initialized_store() -> CanonicalTypeMapperStore {
         initialized_store_with(false)
+    }
+
+    fn canonical_tuple(
+        store: &mut CanonicalTypeMapperStore,
+        elements: &[TypeId],
+        flags: &[ElementFlags],
+        readonly: bool,
+    ) -> TypeId {
+        let infos = flags
+            .iter()
+            .copied()
+            .map(|flags| store.create_tuple_element_info(flags, None).unwrap())
+            .collect::<Vec<_>>();
+        store
+            .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(elements, &infos, readonly))
+            .unwrap()
+    }
+
+    fn canonical_array_target(store: &mut CanonicalTypeMapperStore, name: &str) -> TypeId {
+        let symbol = store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::INTERFACE,
+                EscapedName::source(name),
+            ))
+            .unwrap();
+        let parameter_symbol = store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::TYPE_PARAMETER,
+                EscapedName::source("T"),
+            ))
+            .unwrap();
+        let parameter = store.alloc_type_parameter(Some(parameter_symbol)).unwrap();
+        assert!(store.set_declared_type_links(
+            parameter_symbol,
+            DeclaredTypeLinks {
+                declared_type: Some(parameter),
+                ..DeclaredTypeLinks::default()
+            },
+        ));
+        let target = store
+            .alloc_interface_type(ObjectFlags::INTERFACE, Some(symbol))
+            .unwrap();
+        let this_type = store.alloc_type_parameter(Some(symbol)).unwrap();
+        assert!(store.initialize_interface_type_parameters(
+            target,
+            vec![parameter, this_type],
+            0,
+            this_type,
+            type_list_key(&[parameter]),
+        ));
+        target
     }
 
     fn infer_preserved(
@@ -658,6 +747,204 @@ mod tests {
 
         assert_eq!(infer_naked_type_parameter(&store, fresh), Ok(fresh));
         assert_ne!(fresh, regular);
+    }
+
+    #[test]
+    fn fixed_tuple_candidates_preserve_nested_and_readonly_identities_without_writes() {
+        let mut store = initialized_store_with(true);
+        let (string, number, undefined) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.string_type,
+                bootstrap.number_type,
+                bootstrap.undefined_type,
+            )
+        };
+        let optional_number = store
+            .literal_union_type(&[number, undefined], None)
+            .unwrap();
+        let mutable = canonical_tuple(
+            &mut store,
+            &[string, number],
+            &[ElementFlags::REQUIRED, ElementFlags::REQUIRED],
+            false,
+        );
+        let readonly = canonical_tuple(
+            &mut store,
+            &[string, number],
+            &[ElementFlags::REQUIRED, ElementFlags::REQUIRED],
+            true,
+        );
+        let optional = canonical_tuple(
+            &mut store,
+            &[string, optional_number],
+            &[ElementFlags::REQUIRED, ElementFlags::OPTIONAL],
+            false,
+        );
+        let nested = canonical_tuple(
+            &mut store,
+            &[mutable, readonly],
+            &[ElementFlags::REQUIRED, ElementFlags::REQUIRED],
+            false,
+        );
+        let empty = canonical_tuple(&mut store, &[], &[], false);
+        let before = (
+            store.type_len(),
+            store.mapper_len(),
+            store.signature_len(),
+            store.canonical_tuple_target_len(),
+            store.intrinsic_bootstrap().unwrap().union_cache_len(),
+        );
+
+        for candidate in [mutable, readonly, optional, nested, empty] {
+            assert_eq!(infer_naked_type_parameter(&store, candidate), Ok(candidate));
+            assert_eq!(
+                infer_preserved(&mut store, &[candidate]),
+                Ok(Some(candidate))
+            );
+            assert_eq!(
+                infer_preserved(&mut store, &[candidate, candidate]),
+                Ok(Some(candidate))
+            );
+        }
+        assert!(
+            !store
+                .canonical_tuple_shape(mutable)
+                .unwrap()
+                .unwrap()
+                .is_readonly()
+        );
+        assert!(
+            store
+                .canonical_tuple_shape(readonly)
+                .unwrap()
+                .unwrap()
+                .is_readonly()
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.mapper_len(),
+                store.signature_len(),
+                store.canonical_tuple_target_len(),
+                store.intrinsic_bootstrap().unwrap().union_cache_len(),
+            ),
+            before
+        );
+    }
+
+    #[test]
+    fn fixed_tuple_elements_are_admitted_inside_authenticated_arrays() {
+        let mut store = initialized_store();
+        let (string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let tuple = canonical_tuple(
+            &mut store,
+            &[string, number],
+            &[ElementFlags::REQUIRED, ElementFlags::REQUIRED],
+            true,
+        );
+        let targets = CanonicalArrayTargets::for_test(
+            canonical_array_target(&mut store, "Array"),
+            canonical_array_target(&mut store, "ReadonlyArray"),
+        );
+        let array = store
+            .create_canonical_array_type_with_targets(targets, tuple, false)
+            .unwrap();
+        let before = (
+            store.type_len(),
+            store.mapper_len(),
+            store.signature_len(),
+            store.canonical_tuple_target_len(),
+        );
+
+        assert_eq!(
+            validate_inference_leaf_with_array_targets(&store, array, targets),
+            Ok(())
+        );
+        assert_eq!(
+            infer_naked_type_parameter_candidates_with_array_targets(
+                &mut store,
+                &[array],
+                InferenceLiteralTreatment::Preserve,
+                targets,
+                CanonicalTypeMapperStore::is_type_strict_subtype_of,
+                CanonicalTypeMapperStore::is_type_subtype_of,
+            ),
+            Ok(Some(array))
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.mapper_len(),
+                store.signature_len(),
+                store.canonical_tuple_target_len(),
+            ),
+            before
+        );
+    }
+
+    #[test]
+    fn malformed_variable_and_unsupported_tuple_candidates_fail_closed() {
+        let mut store = initialized_store();
+        let (string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let rest = canonical_tuple(
+            &mut store,
+            &[string, number],
+            &[ElementFlags::REQUIRED, ElementFlags::REST],
+            false,
+        );
+        let parameter = store.alloc_type_parameter(None).unwrap();
+        let variadic = canonical_tuple(
+            &mut store,
+            &[string, parameter],
+            &[ElementFlags::REQUIRED, ElementFlags::VARIADIC],
+            false,
+        );
+        for candidate in [rest, variadic] {
+            assert_eq!(
+                infer_naked_type_parameter(&store, candidate),
+                Err(NakedTypeInferenceError::UnsupportedCandidate(candidate))
+            );
+        }
+
+        let opaque = store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, None)
+            .unwrap();
+        let opaque_tuple = canonical_tuple(&mut store, &[opaque], &[ElementFlags::REQUIRED], false);
+        assert_eq!(
+            infer_naked_type_parameter(&store, opaque_tuple),
+            Err(NakedTypeInferenceError::UnsupportedCandidate(opaque))
+        );
+
+        let tuple = canonical_tuple(&mut store, &[string], &[ElementFlags::REQUIRED], false);
+        let target = store
+            .canonical_tuple_shape(tuple)
+            .unwrap()
+            .unwrap()
+            .target();
+        let this_type = match store.type_payload(target).unwrap().data() {
+            TypeData::Tuple(tuple) => tuple.interface.this_type.unwrap(),
+            _ => unreachable!("a validated tuple has a canonical tuple target"),
+        };
+        assert!(store.set_resolved_base_constraint(this_type, Some(number)));
+        let before = (store.type_len(), store.canonical_tuple_target_len());
+        assert_eq!(
+            infer_naked_type_parameter(&store, tuple),
+            Err(NakedTypeInferenceError::InvalidCanonicalTupleCandidate {
+                candidate: tuple,
+                error: TupleTypeError::InvalidTargetCache(target),
+            })
+        );
+        assert_eq!(
+            (store.type_len(), store.canonical_tuple_target_len()),
+            before
+        );
     }
 
     #[test]

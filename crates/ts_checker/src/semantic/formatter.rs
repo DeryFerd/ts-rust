@@ -905,7 +905,15 @@ fn display_object_type(
             type_id,
             kind: record.data().kind(),
         })?;
-        return display_mapped_type_alias(store, host, type_id, state);
+        return display_mapped_type_alias(
+            store,
+            host,
+            global_types,
+            type_id,
+            flags,
+            state,
+            visiting,
+        );
     }
     if let Some(global_types) = global_types
         && let Some(array) = store
@@ -1486,8 +1494,11 @@ fn display_validated_class_type(
 fn display_mapped_type_alias(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
+    global_types: Option<&CanonicalGlobalTypes>,
     type_id: TypeId,
+    flags: CanonicalTypeFormatFlags,
     state: &mut DisplayState,
+    visiting: &mut HashSet<TypeId>,
 ) -> Result<String, TypeDisplayUnavailable> {
     let record = store
         .type_payload(type_id)
@@ -1620,7 +1631,50 @@ fn display_mapped_type_alias(
                 host.node(*owner_declaration).map(|node| &node.data),
                 Some(NodeData::TypeAliasDeclaration(_))
             )
-            || owner_links.declared_type != Some(type_id)
+        {
+            return Err(TypeDisplayUnavailable::Alias { type_id, alias });
+        }
+
+        if owner == symbol {
+            if owner_record.name().as_utf8() != Some("Record")
+                || owner_links.declared_type != Some(declared_type)
+                || identity.type_arguments() != Some(type_arguments.as_slice())
+                || store
+                    .intrinsic_bootstrap()
+                    .is_none_or(|bootstrap| type_arguments[0] != bootstrap.string_type)
+            {
+                return Err(TypeDisplayUnavailable::Alias { type_id, alias });
+            }
+            if !visiting.insert(type_id) {
+                return Err(TypeDisplayUnavailable::CyclicType(type_id));
+            }
+            let result = (|| {
+                let mut result = display_alias_name(store, Some(host), type_id, alias, state)?;
+                result.push('<');
+                state.add(2);
+                for (index, argument) in type_arguments.iter().enumerate() {
+                    if index != 0 {
+                        result.push_str(", ");
+                        state.add(2);
+                    }
+                    result.push_str(&display_type_worker(
+                        store,
+                        Some(host),
+                        global_types,
+                        *argument,
+                        flags,
+                        state,
+                        visiting,
+                    )?);
+                }
+                result.push('>');
+                Ok(result)
+            })();
+            visiting.remove(&type_id);
+            return result;
+        }
+
+        if owner_links.declared_type != Some(type_id)
             || identity.type_arguments()
                 != Some(owner_links.type_parameters.as_deref().unwrap_or_default())
         {
@@ -5482,6 +5536,66 @@ mod tests {
             let type_ = context.get_type_from_type_node(node).unwrap();
             assert_eq!(context.type_to_string(type_).unwrap(), name);
         }
+    }
+
+    #[test]
+    fn direct_broad_record_alias_formats_concrete_arguments_and_rejects_forgery() {
+        let parsed = parse_source_file(concat!(
+            "type Record<K extends keyof any, T> = { [P in K]: T }; ",
+            "declare const value: Record<string, string>;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(204);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        let mapped = context
+            .get_type_from_type_node(variable_type_node(&parsed, file, "value"))
+            .unwrap();
+
+        assert_eq!(
+            context.type_to_string(mapped).unwrap(),
+            "Record<string, string>"
+        );
+        let empty = context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .empty_type_literal_type;
+        assert_eq!(
+            context
+                .get_type_names_for_assignability_error(empty, mapped)
+                .unwrap(),
+            AssignabilityErrorDisplay {
+                source: "{}".into(),
+                target: "Record<string, string>".into(),
+            },
+        );
+
+        let alias = context
+            .store()
+            .type_payload(mapped)
+            .unwrap()
+            .alias()
+            .unwrap();
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_alias_arguments(alias, Some(vec![number, string]))
+        );
+        assert_eq!(
+            context.type_to_string(mapped),
+            Err(TypeDisplayUnavailable::MalformedType(mapped)),
+        );
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_alias_arguments(alias, Some(vec![string, string]))
+        );
+        assert_eq!(
+            context.type_to_string(mapped).unwrap(),
+            "Record<string, string>"
+        );
     }
 
     #[test]

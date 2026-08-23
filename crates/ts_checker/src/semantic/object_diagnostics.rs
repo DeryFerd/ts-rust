@@ -23,6 +23,10 @@ use super::{
     CanonicalTypeMapperStore, DeclaredTypeHost, RelationUnavailable, SignatureId,
     TypeDisplayUnavailable, TypeId,
     array_types::CanonicalArrayTargets,
+    callables::{
+        StoredSingleCallableValidation, single_callable_display_projection,
+        validate_stored_single_callable,
+    },
     formatter::{
         FunctionTypeDisplayUnavailable,
         get_type_names_for_assignability_error_with_host_global_types_and_flags,
@@ -46,8 +50,8 @@ use super::{
     },
     spelling::get_spelling_suggestion,
     type_nodes::CanonicalTypeQuery,
-    type_records::TypeData,
-    types::TypeFlags,
+    type_records::{StructuredTypeData, TypeCacheState, TypeData},
+    types::{ObjectFlags, TypeFlags},
 };
 
 /// Builds the complete diagnostic batch for one already-failed assignment.
@@ -988,6 +992,305 @@ fn excess_property_diagnostic(
     }
 }
 
+/// Builds an excess-property diagnostic for an authenticated fresh call argument.
+pub(super) fn excess_object_argument_diagnostic(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    argument: &PlannedExpression,
+    source_type: TypeId,
+    target_type: TypeId,
+    flags: CanonicalTypeFormatFlags,
+) -> Result<Option<CanonicalCheckerDiagnostic>, SourceCheckError> {
+    let argument = argument.unparenthesized();
+    let PlannedExpressionKind::Object { plan, properties } = &argument.kind else {
+        return Ok(None);
+    };
+    if argument.node != plan.node
+        || !plan.spreads.is_empty()
+        || properties.len() != plan.properties.len()
+        || properties
+            .iter()
+            .zip(&plan.properties)
+            .any(|(expression, property)| expression.node != property.type_node)
+    {
+        return Err(invalid_structure(source_type));
+    }
+    let state = super::object_members::object_literal_state(store, plan)
+        .map_err(|_| invalid_structure(source_type))?
+        .ok_or_else(|| invalid_structure(source_type))?;
+    if state.type_id() != source_type || !state.is_resolved() {
+        return Err(invalid_structure(source_type));
+    }
+    let Some(target) = store.resolved_declared_property_object(host, target_type)? else {
+        return Ok(None);
+    };
+    let Some(excess) = first_excess_property(store, host, plan, &target, target_type)? else {
+        return Ok(None);
+    };
+    excess_property_diagnostic(
+        store,
+        host,
+        global_types,
+        &target,
+        target_type,
+        excess,
+        flags,
+    )
+    .map(Some)
+}
+
+/// Reports the missing string index of the canonical unknown-derived empty object.
+pub(super) fn missing_mapped_index_signature_details(
+    store: &CanonicalTypeMapperStore,
+    source_type: TypeId,
+    target_type: TypeId,
+) -> Result<Vec<String>, SourceCheckError> {
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(RelationUnavailable::MissingBootstrap)?;
+    if source_type != bootstrap.unknown_empty_object_type {
+        return Ok(Vec::new());
+    }
+
+    let source = store
+        .type_payload(source_type)
+        .ok_or_else(|| invalid_structure(source_type))?;
+    let TypeData::Object(object) = source.data() else {
+        return Err(invalid_structure(source_type));
+    };
+    if source.flags() != TypeFlags::OBJECT
+        || source.object_flags() != ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
+        || source.symbol().is_some()
+        || source.alias().is_some()
+        || object.target.is_some()
+        || object.mapper.is_some()
+        || object.instantiations != TypeCacheState::Unallocated
+        || object.structured != StructuredTypeData::default()
+    {
+        return Err(invalid_structure(source_type));
+    }
+
+    let target = store
+        .type_payload(target_type)
+        .ok_or_else(|| invalid_structure(target_type))?;
+    let TypeData::Mapped(mapped) = target.data() else {
+        return Ok(Vec::new());
+    };
+    let Some(identity) = target.alias().and_then(|alias| store.type_alias(alias)) else {
+        return Ok(Vec::new());
+    };
+    let Some(alias) = identity.symbol() else {
+        return Err(invalid_structure(target_type));
+    };
+    let global_alias = store
+        .symbol_table(bootstrap.globals)
+        .and_then(|globals| globals.get_source("Record"))
+        .and_then(|global| store.get_merged_symbol(global));
+    if global_alias != Some(alias) {
+        return Ok(Vec::new());
+    }
+    if store
+        .symbol(alias)
+        .is_none_or(|record| record.flags() != SymbolFlags::TYPE_ALIAS)
+    {
+        return Err(invalid_structure(target_type));
+    }
+    let Some(arguments) = identity.type_arguments() else {
+        return Err(invalid_structure(target_type));
+    };
+    if arguments != [bootstrap.string_type, bootstrap.string_type] {
+        return Ok(Vec::new());
+    }
+
+    let links = store
+        .type_alias_links(alias)
+        .ok_or_else(|| invalid_structure(target_type))?;
+    let declared = links
+        .declared_type
+        .ok_or_else(|| invalid_structure(target_type))?;
+    let parameters = links
+        .type_parameters
+        .as_deref()
+        .ok_or_else(|| invalid_structure(target_type))?;
+    store
+        .validate_record_mapped_alias_instantiation(
+            alias,
+            declared,
+            parameters,
+            arguments,
+            target_type,
+        )
+        .map_err(|_| invalid_structure(target_type))?;
+
+    let structured = &mapped.object.structured;
+    let Some(members) = structured.members else {
+        return Err(invalid_structure(target_type));
+    };
+    let Some(table) = store.symbol_table(members) else {
+        return Err(invalid_structure(target_type));
+    };
+    let Some([index]) = structured.index_infos.as_deref() else {
+        return Err(invalid_structure(target_type));
+    };
+    let Some(index) = store.index_info(*index) else {
+        return Err(invalid_structure(target_type));
+    };
+    if !target
+        .object_flags()
+        .contains(ObjectFlags::MEMBERS_RESOLVED)
+        || !table.is_empty()
+        || structured.properties.is_some()
+        || structured.signatures.is_some()
+        || structured.call_signature_count != 0
+        || structured
+            .object_type_without_abstract_construct_signatures
+            .is_some()
+        || index.key_type() != bootstrap.string_type
+        || index.value_type() != bootstrap.string_type
+        || index.is_readonly()
+        || index.declaration().is_some()
+        || index.index_symbol().is_some()
+        || !index.components().is_empty()
+    {
+        return Err(invalid_structure(target_type));
+    }
+
+    let detail = Diagnostic::with_arguments(
+        message_by_code(2329).ok_or(SourceCheckError::MissingDiagnostic(2329))?,
+        ["string", "{}"],
+    )
+    .render()
+    .expect("TS2329 has two formatting arguments");
+    Ok(vec![format!("  {detail}")])
+}
+
+/// Explains one incompatible required callable parameter or return type.
+pub(super) fn callable_assignability_details(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source_type: TypeId,
+    target_type: TypeId,
+    flags: CanonicalTypeFormatFlags,
+    options: CanonicalCheckerOptions,
+) -> Result<Vec<String>, SourceCheckError> {
+    let source_callable = match validate_stored_single_callable(store, source_type) {
+        StoredSingleCallableValidation::Valid { callable, .. } => callable,
+        StoredSingleCallableValidation::NotCallable
+        | StoredSingleCallableValidation::Pending { .. } => return Ok(Vec::new()),
+        StoredSingleCallableValidation::Malformed { .. } => {
+            return Err(invalid_structure(source_type));
+        }
+    };
+    let target_callable = match validate_stored_single_callable(store, target_type) {
+        StoredSingleCallableValidation::Valid { callable, .. } => callable,
+        StoredSingleCallableValidation::NotCallable
+        | StoredSingleCallableValidation::Pending { .. } => return Ok(Vec::new()),
+        StoredSingleCallableValidation::Malformed { .. } => {
+            return Err(invalid_structure(target_type));
+        }
+    };
+    let source = single_callable_display_projection(store, host, source_type, Some(global_types))
+        .map_err(|_| invalid_structure(source_type))?;
+    let target = single_callable_display_projection(store, host, target_type, Some(global_types))
+        .map_err(|_| invalid_structure(target_type))?;
+    let (Some(source), Some(target)) = (source, target) else {
+        return Ok(Vec::new());
+    };
+    let ([source_parameter], [target_parameter]) =
+        (source.parameters.as_slice(), target.parameters.as_slice())
+    else {
+        return Ok(Vec::new());
+    };
+    if source_callable.owner != source_type
+        || target_callable.owner != target_type
+        || source.owner != source_type
+        || target.owner != target_type
+        || source_callable.rest_parameter.is_some()
+        || target_callable.rest_parameter.is_some()
+        || source_callable.parameters.as_slice() != [source_parameter.value_type]
+        || target_callable.parameters.as_slice() != [target_parameter.value_type]
+        || source_parameter.optional
+        || target_parameter.optional
+        || source_callable.min_argument_count != 1
+        || target_callable.min_argument_count != 1
+        || source.return_type != source_callable.return_type
+        || target.return_type != target_callable.return_type
+    {
+        return Ok(Vec::new());
+    }
+
+    let contravariant = store.is_type_assignable_to_with_global_types_and_strict_function_types(
+        target_parameter.value_type,
+        source_parameter.value_type,
+        global_types,
+        options.strict_function_types,
+    )?;
+    let parameter_compatible = contravariant
+        || !options.strict_function_types
+            && store.is_type_assignable_to_with_global_types_and_strict_function_types(
+                source_parameter.value_type,
+                target_parameter.value_type,
+                global_types,
+                options.strict_function_types,
+            )?;
+    if !parameter_compatible {
+        let detail = Diagnostic::with_arguments(
+            message_by_code(2328).ok_or(SourceCheckError::MissingDiagnostic(2328))?,
+            [
+                source_parameter.name.as_str(),
+                target_parameter.name.as_str(),
+            ],
+        )
+        .render()
+        .expect("TS2328 has two formatting arguments");
+        return Ok(vec![
+            format!("  {detail}"),
+            nested_assignability_message(
+                store,
+                host,
+                global_types,
+                target_parameter.value_type,
+                source_parameter.value_type,
+                flags,
+                2,
+            )?,
+        ]);
+    }
+
+    let source_return =
+        source_callable
+            .return_type
+            .ok_or(RelationUnavailable::UnresolvedSignatureReturn(
+                source_callable.signature,
+            ))?;
+    let target_return =
+        target_callable
+            .return_type
+            .ok_or(RelationUnavailable::UnresolvedSignatureReturn(
+                target_callable.signature,
+            ))?;
+    if store.is_type_assignable_to_with_global_types_and_strict_function_types(
+        source_return,
+        target_return,
+        global_types,
+        options.strict_function_types,
+    )? {
+        return Ok(Vec::new());
+    }
+
+    Ok(vec![nested_assignability_message(
+        store,
+        host,
+        global_types,
+        source_return,
+        target_return,
+        flags,
+        1,
+    )?])
+}
+
 #[allow(clippy::too_many_arguments)] // The complete diagnostic record is built transactionally.
 fn missing_property_diagnostic(
     store: &CanonicalTypeMapperStore,
@@ -1896,10 +2199,38 @@ mod tests {
         CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
         EscapedName,
     };
-    use ts_parser::parse_source_file;
+    use ts_parser::{ParseResult, parse_source_file};
 
     use super::*;
-    use crate::semantic::{CanonicalCheckerContext, IntrinsicBootstrapOptions};
+    use crate::semantic::{
+        CanonicalCheckerContext, IntrinsicBootstrapOptions, MappedTypeModifiers,
+    };
+
+    fn diagnostic_context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/assignability-diagnostic.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            [(file, &parsed.arena)].into_iter().collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap()
+    }
 
     #[test]
     fn object_diagnostic_display_flags_preserve_type_to_string_defaults() {
@@ -1913,6 +2244,302 @@ mod tests {
         });
         assert!(complete.contains(CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT));
         assert!(complete.contains(CanonicalTypeFormatFlags::NO_TRUNCATION));
+    }
+
+    #[test]
+    fn unknown_empty_object_reports_only_an_authenticated_record_string_index() {
+        let parsed = parse_source_file(concat!(
+            "type Record<K extends keyof any, T> = { [P in K]: T }; ",
+            "declare let value: Record<string, string>;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(216);
+        let mut context = diagnostic_context(&parsed, file);
+        context.check_source_file(file).unwrap();
+        let annotation = parsed
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::VariableDeclaration(variable) = &record.data else {
+                    return None;
+                };
+                Some(NodeRef::new(parsed.arena.id(), file, variable.type_?))
+            })
+            .unwrap();
+        let target = context.get_type_from_type_node(annotation).unwrap();
+        context
+            .store_mut_for_test()
+            .resolve_mapped_type_members(target, MappedTypeModifiers::NONE)
+            .unwrap();
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let source = bootstrap.unknown_empty_object_type;
+        let ordinary = bootstrap.empty_object_type;
+
+        let before = (
+            context.store().type_len(),
+            context.store().index_info_len(),
+            context.store().relation_state_snapshot(),
+        );
+        assert_eq!(
+            missing_mapped_index_signature_details(context.store(), source, target),
+            Ok(vec![
+                "  Index signature for type 'string' is missing in type '{}'.".to_owned()
+            ]),
+        );
+        assert_eq!(
+            missing_mapped_index_signature_details(context.store(), ordinary, target),
+            Ok(Vec::new()),
+        );
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().index_info_len(),
+                context.store().relation_state_snapshot(),
+            ),
+            before,
+        );
+
+        let index = context
+            .store()
+            .type_payload(target)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.index_infos.as_deref())
+            .and_then(|indexes| indexes.first().copied())
+            .unwrap();
+        let alias = context
+            .store()
+            .type_payload(target)
+            .and_then(super::super::type_records::TypeRecord::alias)
+            .and_then(|alias| context.store().type_alias(alias))
+            .and_then(super::super::type_records::TypeAlias::symbol)
+            .unwrap();
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_index_info_symbol(index, Some(alias))
+        );
+        let poisoned = context.store().relation_state_snapshot();
+        assert!(matches!(
+            missing_mapped_index_signature_details(context.store(), source, target),
+            Err(SourceCheckError::RelationUnavailable(
+                RelationUnavailable::InvalidStructuredMembers(actual)
+            )) if actual == target
+        ));
+        assert_eq!(context.store().relation_state_snapshot(), poisoned);
+    }
+
+    #[test]
+    fn callable_argument_details_distinguish_parameter_and_return_mismatches() {
+        let parsed = parse_source_file(concat!(
+            "const wrongParameter = (s: string) => {}; ",
+            "const wrongReturn = (n: number) => {}; ",
+            "declare let target: (n: number) => number;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(217);
+        let mut context = diagnostic_context(&parsed, file);
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new([(&parsed.arena, &bound)]).unwrap();
+        let global_types = context.global_types().clone();
+        let variable_type = |expected: &str| {
+            let declaration = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::VariableDeclaration(variable) = &record.data else {
+                        return None;
+                    };
+                    let NodeData::Identifier(name) = &parsed.arena.get(variable.name)?.data else {
+                        return None;
+                    };
+                    (name.text == expected).then_some(NodeRef::new(parsed.arena.id(), file, node))
+                })
+                .unwrap();
+            let symbol = bound.symbol(declaration).unwrap();
+            context
+                .store()
+                .value_symbol_links(symbol)
+                .and_then(|links| links.resolved_type)
+                .unwrap()
+        };
+        let wrong_parameter = variable_type("wrongParameter");
+        let wrong_return = variable_type("wrongReturn");
+        let target = variable_type("target");
+        let void = context.store().intrinsic_bootstrap().unwrap().void_type;
+        for callable in [wrong_parameter, wrong_return] {
+            let StoredSingleCallableValidation::Valid { callable, .. } =
+                validate_stored_single_callable(context.store(), callable)
+            else {
+                panic!("an inferred callback must be fully published before diagnostics")
+            };
+            assert_eq!(callable.return_type, Some(void));
+        }
+        let StoredSingleCallableValidation::Valid {
+            callable: target_callable,
+            ..
+        } = validate_stored_single_callable(context.store(), target)
+        else {
+            panic!("the target must retain one authenticated function signature")
+        };
+        let flags = CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT;
+        let options = CanonicalCheckerOptions::default();
+
+        assert_eq!(
+            callable_assignability_details(
+                context.store_mut_for_test(),
+                &host,
+                &global_types,
+                wrong_parameter,
+                target,
+                flags,
+                options,
+            )
+            .unwrap(),
+            [
+                "  Types of parameters 's' and 'n' are incompatible.",
+                "    Type 'number' is not assignable to type 'string'.",
+            ],
+        );
+        assert!(matches!(
+            callable_assignability_details(
+                context.store_mut_for_test(),
+                &host,
+                &global_types,
+                wrong_return,
+                target,
+                flags,
+                options,
+            ),
+            Err(SourceCheckError::RelationUnavailable(
+                RelationUnavailable::UnresolvedSignatureReturn(signature)
+            )) if signature == target_callable.signature
+        ));
+        let expected_return = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(
+            context.get_return_type_of_signature(target_callable.signature),
+            Ok(expected_return),
+        );
+        assert_eq!(
+            callable_assignability_details(
+                context.store_mut_for_test(),
+                &host,
+                &global_types,
+                wrong_return,
+                target,
+                flags,
+                options,
+            )
+            .unwrap(),
+            ["  Type 'void' is not assignable to type 'number'."],
+        );
+        let warmed = context.store().relation_state_snapshot();
+        assert!(
+            callable_assignability_details(
+                context.store_mut_for_test(),
+                &host,
+                &global_types,
+                target,
+                target,
+                flags,
+                options,
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert_eq!(context.store().relation_state_snapshot(), warmed);
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn excess_object_call_argument_retains_its_source_property_location() {
+        let parsed = parse_source_file(concat!(
+            "const value = { b: 5 }; ",
+            "declare let target: { a: number };",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(218);
+        let mut context = diagnostic_context(&parsed, file);
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new([(&parsed.arena, &bound)]).unwrap();
+        let global_types = context.global_types().clone();
+        let object = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ObjectLiteralExpression).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let source_type = context
+            .store()
+            .type_node_links(object)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let target_node = parsed
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::VariableDeclaration(variable) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(name) = &parsed.arena.get(variable.name)?.data else {
+                    return None;
+                };
+                (name.text == "target").then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    variable.type_?,
+                ))
+            })
+            .unwrap();
+        let target_type = context.get_type_from_type_node(target_node).unwrap();
+        let plan =
+            super::super::object_members::plan_object_literal(context.store(), &host, object)
+                .unwrap();
+        let [property] = plan.properties.as_slice() else {
+            panic!("the fresh object must retain its one source property")
+        };
+        let name_node = property.name_node;
+        let value_node = property.type_node;
+        let argument = PlannedExpression::new(
+            object,
+            PlannedExpressionKind::Object {
+                plan,
+                properties: vec![PlannedExpression::new(
+                    value_node,
+                    PlannedExpressionKind::Number {
+                        value: ts_jsnum::Number::new(5.0),
+                        unary_operand: None,
+                    },
+                )],
+            },
+        );
+
+        let diagnostic = excess_object_argument_diagnostic(
+            context.store_mut_for_test(),
+            &host,
+            &global_types,
+            &argument,
+            source_type,
+            target_type,
+            CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(diagnostic.node, Some(name_node));
+        assert_eq!(diagnostic.diagnostic.code(), 2353);
+        assert_eq!(diagnostic.diagnostic.arguments, ["b", "{ a: number; }"]);
+        assert!(diagnostic.related_information.is_empty());
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]

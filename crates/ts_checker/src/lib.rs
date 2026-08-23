@@ -2,6 +2,8 @@
 
 // Keep upstream checker algorithms intact for behavior-by-behavior parity.
 #![allow(clippy::too_many_lines)]
+// The generated libtest registration array exceeds Clippy's 16 KiB limit.
+#![cfg_attr(test, allow(clippy::large_stack_arrays))]
 
 pub mod semantic;
 

@@ -3155,6 +3155,39 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         })
     }
 
+    fn is_authenticated_symbol_owned_empty_anonymous_object(&self, type_: TypeId) -> bool {
+        self.type_payload(type_).is_some_and(|record| {
+            let Some(owner) = record.symbol() else {
+                return false;
+            };
+            let Some(owner_record) = self.symbol(owner) else {
+                return false;
+            };
+            let TypeData::Object(object) = record.data() else {
+                return false;
+            };
+            record.flags() == TypeFlags::OBJECT
+                && record
+                    .object_flags()
+                    .contains(ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED)
+                && self.get_merged_symbol(owner) == Some(owner)
+                && owner_record
+                    .flags()
+                    .intersects(SymbolFlags::OBJECT_LITERAL | SymbolFlags::TYPE_LITERAL)
+                && owner_record.check_flags() == CheckFlags::NONE
+                && Self::valid_supported_property_object_tail(object)
+                && object
+                    .structured
+                    .properties
+                    .as_ref()
+                    .is_none_or(Vec::is_empty)
+                && object.structured.members.is_none_or(|members| {
+                    self.symbol_table(members)
+                        .is_some_and(ts_binder::semantic::SymbolTable::is_empty)
+                })
+        })
+    }
+
     fn remove_union_subtypes(
         &mut self,
         types: &mut Vec<TypeId>,
@@ -3175,6 +3208,16 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         if let Some(global_types) = global_types {
             self.preflight_expression_union_array_object_pairs(types, global_types)?;
         }
+        let (empty_object_type, unknown_empty_object_type) = {
+            let bootstrap = self
+                .intrinsic_bootstrap
+                .as_ref()
+                .ok_or(LiteralTypeCacheError::BootstrapUninitialized)?;
+            (
+                bootstrap.empty_object_type,
+                bootstrap.unknown_empty_object_type,
+            )
+        };
         let has_empty_object = has_object_types
             && types
                 .iter()
@@ -3210,6 +3253,11 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 comparison_count = comparison_count
                     .checked_add(1)
                     .ok_or(LiteralTypeCacheError::Capacity)?;
+                if (source == empty_object_type || source == unknown_empty_object_type)
+                    && self.is_authenticated_symbol_owned_empty_anonymous_object(target)
+                {
+                    continue;
+                }
                 let related = match global_types {
                     Some(global_types) => self.is_type_strict_subtype_of_with_global_types(
                         source,
@@ -6834,6 +6882,52 @@ mod tests {
                 .object_flags()
                 .contains(ObjectFlags::CONTAINS_OBJECT_OR_ARRAY_LITERAL)
         );
+    }
+
+    #[test]
+    fn subtype_reduction_preserves_canonical_empty_objects_over_symbol_owned_empty_objects() {
+        let parsed = parse_source_file("const empty: any = {}; const value: any = { item: 1 };");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(147);
+        let mut context = checker_context(file, &parsed);
+        context.check_source_file(file).unwrap();
+        let fresh = checked_expression_type(&context, variable_initializer(&parsed, file, "empty"));
+        let nonempty =
+            checked_expression_type(&context, variable_initializer(&parsed, file, "value"));
+        let store = context.store_mut_for_test();
+        let (empty_object, unknown_empty_object, empty_type_literal) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.empty_object_type,
+                bootstrap.unknown_empty_object_type,
+                bootstrap.empty_type_literal_type,
+            )
+        };
+
+        assert!(store.is_authenticated_symbol_owned_empty_anonymous_object(fresh));
+        assert!(store.is_authenticated_symbol_owned_empty_anonymous_object(empty_type_literal));
+        assert!(!store.is_authenticated_symbol_owned_empty_anonymous_object(nonempty));
+
+        for canonical in [empty_object, unknown_empty_object] {
+            for target in [fresh, empty_type_literal] {
+                let mut types = Vec::new();
+                store.insert_union_type(&mut types, target).unwrap();
+                store.insert_union_type(&mut types, canonical).unwrap();
+                store.remove_union_subtypes(&mut types, true, None).unwrap();
+                assert_eq!(types, [canonical]);
+            }
+        }
+
+        let warm = store.relation_state_snapshot();
+        assert_eq!(
+            store.expression_union_type(&[unknown_empty_object, fresh], UnionReduction::Subtype),
+            Ok(unknown_empty_object),
+        );
+        assert_eq!(
+            store.expression_union_type(&[fresh, unknown_empty_object], UnionReduction::Subtype),
+            Ok(unknown_empty_object),
+        );
+        assert_eq!(store.relation_state_snapshot(), warm);
     }
 
     #[test]

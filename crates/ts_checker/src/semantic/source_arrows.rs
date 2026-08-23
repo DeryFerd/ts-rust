@@ -1751,7 +1751,7 @@ fn plan_body(
                 return Err(invariant(SourceArrowInvariant::InvalidBody(statement)));
             }
             let Some(expression_id) = return_statement.expression else {
-                return Err(unsupported(SourceArrowUnsupported::BareReturn(statement)));
+                return plan_bare_return_body(store, host, callable, body, statement);
             };
             let expression = NodeRef::new(body.arena, body.file, expression_id);
             let expression_record = preflight_node(store, host, expression)?;
@@ -1768,6 +1768,60 @@ fn plan_body(
             })
         }
         _ => Err(unsupported(SourceArrowUnsupported::ComplexBlock(body))),
+    }
+}
+
+fn plan_bare_return_body(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    callable: &SourceCallablePlan,
+    body: NodeRef,
+    statement: NodeRef,
+) -> Result<SourceArrowBodyPlan, SourceArrowError> {
+    let bound = host.bound_file(callable.declaration).ok_or_else(|| {
+        invariant(SourceArrowInvariant::InvalidOwnerSymbol(
+            callable.declaration,
+        ))
+    })?;
+    let flow = bound.flow_graph();
+    if bound.container(body) != Some(callable.declaration)
+        || bound.block_scope_container(body) != Some(callable.declaration)
+        || bound.container(statement) != Some(callable.declaration)
+        || bound.block_scope_container(statement) != Some(callable.declaration)
+        || bound.flow_container(statement) != Some(callable.declaration)
+        || flow.container_is_complete(callable.declaration) != Some(true)
+        || flow.container_start(callable.declaration).is_none()
+        || flow.container_end(callable.declaration).is_some()
+        || flow.container_return(callable.declaration).is_some()
+    {
+        return Err(invariant(SourceArrowInvariant::InvalidBody(statement)));
+    }
+
+    let Some(mut annotation) = callable.return_type.type_node() else {
+        return Ok(SourceArrowBodyPlan::EmptyBlock { block: body });
+    };
+    loop {
+        let record = preflight_node(store, host, annotation)?;
+        if matches!(
+            record.kind,
+            SyntaxKind::AnyKeyword | SyntaxKind::VoidKeyword | SyntaxKind::UndefinedKeyword
+        ) {
+            return Ok(SourceArrowBodyPlan::EmptyBlock { block: body });
+        }
+        let NodeData::ParenthesizedTypeNode(parenthesized) = &record.data else {
+            return Err(unsupported(SourceArrowUnsupported::BareReturn(statement)));
+        };
+        if record.kind != SyntaxKind::ParenthesizedType {
+            return Err(invariant(SourceArrowInvariant::InvalidBody(annotation)));
+        }
+        let inner = NodeRef::new(annotation.arena, annotation.file, parenthesized.type_);
+        let inner_record = preflight_node(store, host, inner)?;
+        if inner_record.parent != Some(annotation.node)
+            || !range_contains(record.range, inner_record.range)
+        {
+            return Err(invariant(SourceArrowInvariant::InvalidBody(inner)));
+        }
+        annotation = inner;
     }
 }
 
@@ -2255,6 +2309,184 @@ mod tests {
                     .is_none()
             );
         }
+    }
+
+    #[test]
+    fn bare_return_arrows_preserve_void_body_identity_and_remain_read_only() {
+        for (source, inferred) in [
+            ("const value = () => { return; };", true),
+            ("const value = (input: number) => { return; };", true),
+            (
+                "const result = invoke((input: number) => { return; });",
+                true,
+            ),
+            ("const value = (): void => { return; };", false),
+            ("const value = (): undefined => { return; };", false),
+            ("const value = (): any => { return; };", false),
+        ] {
+            let fixture = Fixture::new(source);
+            let declaration = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::ArrowFunction).then_some(NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let owner = fixture.bound.symbol(declaration).unwrap();
+            let before = (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+            let host = fixture.host();
+
+            let (callable, body) =
+                plan_source_arrow_value(&fixture.store, &host, declaration, None).unwrap();
+            let SourceArrowBodyPlan::EmptyBlock { block } = body else {
+                panic!("bare return must preserve the existing void-body plan: {source}")
+            };
+            let NodeData::Block(data) = &fixture.parsed.arena.get(block.node).unwrap().data else {
+                panic!("arrow body must retain its source block")
+            };
+            let [statement_id] = data.statements.nodes.as_slice() else {
+                panic!("bare-return body must retain exactly one statement")
+            };
+            let statement = NodeRef::new(block.arena, block.file, *statement_id);
+
+            assert_eq!(callable.declaration, declaration);
+            assert_eq!(callable.owner_symbol, owner);
+            assert_eq!(callable.return_type.is_inferred(), inferred);
+            assert_eq!(block, callable.body);
+            assert_eq!(fixture.bound.container(block), Some(declaration));
+            assert_eq!(fixture.bound.container(statement), Some(declaration));
+            assert_eq!(fixture.bound.flow_container(statement), Some(declaration));
+            assert_eq!(
+                fixture
+                    .bound
+                    .flow_graph()
+                    .container_is_complete(declaration),
+                Some(true),
+            );
+            assert!(
+                fixture
+                    .bound
+                    .flow_graph()
+                    .container_start(declaration)
+                    .is_some()
+            );
+            assert!(
+                fixture
+                    .bound
+                    .flow_graph()
+                    .container_end(declaration)
+                    .is_none()
+            );
+            assert_eq!(
+                plan_source_arrow_value(&fixture.store, &host, declaration, None),
+                Ok((callable, body)),
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.symbol_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+            assert!(
+                fixture
+                    .store
+                    .source_callable_type_for_owner(owner)
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn bare_return_body_rejects_nonvoid_annotations_and_extra_statements() {
+        for (source, bare_return) in [
+            ("const value = (): number => { return; };", true),
+            ("const value = (): string => { return; };", true),
+            ("const value = () => { return; return; };", false),
+            ("const value = () => { return; 1; };", false),
+        ] {
+            let fixture = Fixture::new(source);
+            assert!(
+                matches!(
+                    (fixture.plan(0), bare_return),
+                    (
+                        Err(SourceArrowError::Unsupported(
+                            SourceArrowUnsupported::BareReturn(_)
+                        )),
+                        true,
+                    ) | (
+                        Err(SourceArrowError::Unsupported(
+                            SourceArrowUnsupported::ComplexBlock(_)
+                        )),
+                        false,
+                    )
+                ),
+                "{source}",
+            );
+        }
+
+        let returned = Fixture::new("const value = (): number => { return 1; };");
+        assert!(matches!(
+            returned.plan(0).unwrap().body,
+            SourceArrowBodyPlan::ReturnExpression { .. }
+        ));
+    }
+
+    #[test]
+    fn malformed_bare_return_is_rejected_before_callable_publication() {
+        let mut parsed = parse_source_file("const value = () => { return; };");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let statement_id = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| (record.kind == SyntaxKind::ReturnStatement).then_some(node))
+            .unwrap();
+        let NodeData::ReturnStatement(statement) = &mut parsed
+            .arena
+            .get_mut(statement_id)
+            .expect("bare return remains in its parsed arena")
+            .data
+        else {
+            unreachable!()
+        };
+        statement.facts = 1;
+        let fixture = Fixture::from_parsed(parsed);
+        let declaration = fixture.declarations()[0];
+        let NodeData::VariableDeclaration(variable) =
+            &fixture.parsed.arena.get(declaration.node).unwrap().data
+        else {
+            unreachable!()
+        };
+        let arrow = NodeRef::new(
+            fixture.parsed.arena.id(),
+            fixture.file,
+            variable.initializer.unwrap(),
+        );
+        let statement = NodeRef::new(fixture.parsed.arena.id(), fixture.file, statement_id);
+        let owner = fixture.bound.symbol(arrow).unwrap();
+
+        assert_eq!(
+            fixture.plan(0),
+            Err(SourceArrowError::Invariant(
+                SourceArrowInvariant::InvalidBody(statement,)
+            )),
+        );
+        assert!(
+            fixture
+                .store
+                .source_callable_type_for_owner(owner)
+                .is_none()
+        );
     }
 
     #[test]
@@ -3097,7 +3329,7 @@ mod tests {
             ))
         ));
 
-        let bare = Fixture::new("const f = (): void => { return; };");
+        let bare = Fixture::new("const f = (): number => { return; };");
         assert!(matches!(
             bare.plan(0),
             Err(SourceArrowError::Unsupported(

@@ -995,8 +995,62 @@ fn assert_module_reexport_shape_is_closed(source_text: &str) {
 }
 
 #[test]
-fn missing_default_star_and_namespace_reexports_remain_typed_boundaries() {
+fn missing_default_and_star_reexports_remain_typed_boundaries() {
     assert_module_reexport_shape_is_closed("export { default as publicValue } from './base';");
     assert_module_reexport_shape_is_closed("export * from './base';");
-    assert_module_reexport_shape_is_closed("export * as values from './base';");
+}
+
+#[test]
+fn namespace_reexports_preserve_their_target_module_identity() {
+    let barrel = parse_source_file("export * as values from './base';");
+    let base = parse_source_file("export const value: number = 1;");
+    let barrel_file = FileId::new(22);
+    let base_file = FileId::new(23);
+    let sources = [
+        Source {
+            parsed: &barrel,
+            file: barrel_file,
+            path: "\"/project/namespace-barrel.ts\"",
+        },
+        Source {
+            parsed: &base,
+            file: base_file,
+            path: "\"/project/namespace-base.ts\"",
+        },
+    ];
+    let mut context = make_context(
+        &sources,
+        &[Route {
+            source: 0,
+            specifier: 0,
+            target: 1,
+        }],
+    );
+    let alias = direct_export_symbol(&context, barrel_file, "values");
+    let target_bound = context.file(base_file).unwrap().1;
+    let target = target_bound.symbol(target_bound.source_file()).unwrap();
+
+    context.check_source_file(barrel_file).unwrap();
+
+    assert!(context.diagnostics().is_empty());
+    assert_alias_chain(&context, alias, target, target, None);
+    assert!(context.store().value_symbol_links(alias).is_none());
+    assert!(context.store().value_symbol_links(target).is_none());
+
+    let warm = (
+        context.store().type_len(),
+        context.store().symbol_len(),
+        context.store().signature_len(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(barrel_file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().signature_len(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
 }

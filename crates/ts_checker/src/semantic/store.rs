@@ -11,8 +11,8 @@ use std::{
 
 use ts_ast::{FileId, NodeArena, NodeArenaId, NodeData, NodeId, NodeRef, SyntaxKind};
 use ts_binder::{
-    AstScope, CheckFlags, EscapedName, SemanticStoreId, SemanticSymbolId, SymbolData, SymbolFlags,
-    SymbolStore, SymbolTableId,
+    AstScope, CheckFlags, EscapedName, InternalSymbolName, SemanticStoreId, SemanticSymbolId,
+    SymbolData, SymbolFlags, SymbolStore, SymbolTableId,
     semantic::{PreparedSymbolTable, Symbol, SymbolTable},
 };
 use ts_parser::{IsolatedEntityName, parse_isolated_entity_name};
@@ -1213,6 +1213,18 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                         variable,
                     )
             }
+            (Some(target), None) => {
+                provenance.family == SourceCallableFamily::ArrowFunction
+                    && provenance.return_provenance == SourceCallableReturnProvenance::Inferred
+                    && target != type_
+                    && self.types.get(target).is_some()
+                    && self.source_direct_call_contextual_callable_is_exact(
+                        provenance.declaration,
+                        provenance.owner_symbol,
+                        provenance.signature,
+                        target,
+                    )
+            }
             _ => false,
         };
         let exact_type_parameters =
@@ -1287,6 +1299,149 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             self.mark_relation_inputs_dirty();
         }
         true
+    }
+
+    fn source_direct_call_contextual_callable_is_exact(
+        &self,
+        declaration: NodeRef,
+        owner_symbol: SemanticSymbolId,
+        signature: SignatureId,
+        contextual_target: TypeId,
+    ) -> bool {
+        let Some(owner) = self.symbol(owner_symbol) else {
+            return false;
+        };
+        let Some(SourceNodeParent::Parent(call)) = self.source_node_parent(declaration) else {
+            return false;
+        };
+        let Some(SourceNodeParent::Parent(statement)) = self.source_node_parent(call) else {
+            return false;
+        };
+        let Some(SourceNodeParent::Parent(source)) = self.source_node_parent(statement) else {
+            return false;
+        };
+        if self.source_node_kind(declaration) != Some(SyntaxKind::ArrowFunction)
+            || self.source_node_kind(call) != Some(SyntaxKind::CallExpression)
+            || self.source_node_kind(statement) != Some(SyntaxKind::ExpressionStatement)
+            || self.source_node_kind(source) != Some(SyntaxKind::SourceFile)
+            || owner.flags() != SymbolFlags::FUNCTION
+            || owner.check_flags() != CheckFlags::NONE
+            || owner.name() != InternalSymbolName::Function.as_ref()
+            || owner.declarations() != Some(&[declaration])
+            || owner.value_declaration() != Some(declaration)
+            || owner.members().is_some()
+            || owner.exports().is_some()
+            || owner.parent().is_some()
+            || owner.export_symbol().is_some()
+            || self.get_merged_symbol(owner_symbol) != Some(owner_symbol)
+        {
+            return false;
+        }
+
+        let Some(record) = self.signature(signature) else {
+            return false;
+        };
+        let [parameter] = record.parameters() else {
+            return false;
+        };
+        let Some(parameter_record) = self.symbol(*parameter) else {
+            return false;
+        };
+        let Some([parameter_declaration]) = parameter_record.declarations() else {
+            return false;
+        };
+        let parameter_declaration = *parameter_declaration;
+        if record.declaration() != Some(declaration)
+            || record.flags() != SignatureFlags::NONE
+            || !record.type_parameters().is_empty()
+            || record.this_parameter().is_some()
+            || record.min_argument_count() != 1
+            || record.resolved_min_argument_count() != -1
+            || record
+                .resolved_return_type()
+                .is_none_or(|type_| self.types.get(type_).is_none())
+            || record.resolved_type_predicate().is_some()
+            || record.target().is_some()
+            || record.mapper().is_some()
+            || record.isolated_signature_type().is_some()
+            || record.composite().is_some()
+            || parameter_record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+            || parameter_record.check_flags() != CheckFlags::NONE
+            || parameter_record.value_declaration() != Some(parameter_declaration)
+            || parameter_record.members().is_some()
+            || parameter_record.exports().is_some()
+            || parameter_record.parent().is_some()
+            || parameter_record.export_symbol().is_some()
+            || self.get_merged_symbol(*parameter) != Some(*parameter)
+            || self.source_node_kind(parameter_declaration) != Some(SyntaxKind::Parameter)
+            || self.source_node_parent(parameter_declaration)
+                != Some(SourceNodeParent::Parent(declaration))
+        {
+            return false;
+        }
+
+        let mut expected_parameter = None;
+        for (target_signature, target_record) in self.signatures.iter() {
+            let Some(target_declaration) = target_record.declaration() else {
+                continue;
+            };
+            let function_type = self.function_type_provenance.contains(&contextual_target)
+                && self.source_node_kind(target_declaration) == Some(SyntaxKind::FunctionType)
+                && self.type_node_links(target_declaration)
+                    == Some(&TypeNodeLinks {
+                        resolved_type: Some(contextual_target),
+                        ..TypeNodeLinks::default()
+                    });
+            let source_callable = self
+                .source_callable_provenance
+                .get(&contextual_target)
+                .is_some_and(|provenance| {
+                    provenance.signature == target_signature
+                        && provenance.declaration == target_declaration
+                });
+            if !function_type && !source_callable {
+                continue;
+            }
+            let Some([target_parameter]) = self
+                .callable_signature_parameter_types
+                .get(&target_signature)
+                .map(Vec::as_slice)
+            else {
+                return false;
+            };
+            let [target_parameter_symbol] = target_record.parameters() else {
+                return false;
+            };
+            if self.signature_links(target_declaration)
+                != Some(&SignatureLinks {
+                    resolved_signature: ResolvedSignatureState::Resolved(target_signature),
+                    ..SignatureLinks::default()
+                })
+                || !target_record.type_parameters().is_empty()
+                || target_record.has_rest_parameter()
+                || target_record.min_argument_count() != 1
+                || self.types.get(*target_parameter).is_none()
+                || self.value_symbol_links(*target_parameter_symbol)
+                    != Some(&ValueSymbolLinks {
+                        resolved_type: Some(*target_parameter),
+                        ..ValueSymbolLinks::default()
+                    })
+                || expected_parameter.replace(*target_parameter).is_some()
+            {
+                return false;
+            }
+        }
+        let Some(expected_parameter) = expected_parameter else {
+            return false;
+        };
+        self.value_symbol_links(*parameter).is_none_or(|links| {
+            links == &ValueSymbolLinks::default()
+                || links
+                    == &ValueSymbolLinks {
+                        resolved_type: Some(expected_parameter),
+                        ..ValueSymbolLinks::default()
+                    }
+        })
     }
 
     /// Proves the exact variable or object-property owner of a contextual arrow.
