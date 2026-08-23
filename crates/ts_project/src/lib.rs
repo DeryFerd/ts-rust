@@ -56,6 +56,74 @@ pub struct BuildResult {
     pub skipped: Vec<String>,
 }
 
+#[derive(Default)]
+struct ProjectBuildPaths {
+    inputs: BTreeSet<String>,
+    outputs: BTreeSet<String>,
+    build_info: BTreeMap<String, (String, String)>,
+}
+
+struct ProjectBuildStatus {
+    dependencies: BTreeMap<String, String>,
+    info: BuildInfo,
+    up_to_date: bool,
+}
+
+impl ProjectBuildPaths {
+    fn add_project(
+        &mut self,
+        file_system: &dyn FileSystem,
+        program: &Program,
+        config_path: &str,
+        build_info_path: &str,
+        incremental: bool,
+    ) -> Option<ProjectDiagnostic> {
+        for source in program.source_files() {
+            let path = canonical_config_path(file_system, &source.file_name);
+            if let Some((_, build_info)) = self.build_info.get(&path) {
+                return Some(project_output_diagnostic(5055, &[build_info]));
+            }
+            self.inputs.insert(path);
+        }
+
+        if !incremental {
+            return None;
+        }
+
+        let path = canonical_config_path(file_system, build_info_path);
+        if self.inputs.contains(&path) {
+            return Some(project_output_diagnostic(5055, &[build_info_path]));
+        }
+        if let Some((referenced_config, _)) = self.build_info.get(&path) {
+            return Some(project_output_diagnostic(
+                6377,
+                &[build_info_path, referenced_config],
+            ));
+        }
+        if self.outputs.contains(&path) {
+            return Some(project_output_diagnostic(5056, &[build_info_path]));
+        }
+        self.build_info
+            .insert(path, (config_path.to_owned(), build_info_path.to_owned()));
+        None
+    }
+
+    fn add_outputs<'a>(
+        &mut self,
+        file_system: &dyn FileSystem,
+        outputs: impl IntoIterator<Item = &'a str>,
+    ) -> Option<ProjectDiagnostic> {
+        for output in outputs {
+            let path = canonical_config_path(file_system, output);
+            if let Some((_, build_info)) = self.build_info.get(&path) {
+                return Some(project_output_diagnostic(5056, &[build_info]));
+            }
+            self.outputs.insert(path);
+        }
+        None
+    }
+}
+
 struct BuildFileSystem<'a> {
     backing: &'a dyn FileSystem,
     outputs: BTreeMap<String, OutputFile>,
@@ -219,7 +287,7 @@ pub fn build_projects(
     overrides: ProgramOptionsOverride,
     incremental: bool,
 ) -> BuildResult {
-    let graph = load_project_graph(file_system, current_directory, roots);
+    let mut graph = load_project_graph(file_system, current_directory, roots);
     if !graph.diagnostics.is_empty() {
         return BuildResult {
             graph,
@@ -230,6 +298,7 @@ pub fn build_projects(
     let mut projects = Vec::new();
     let mut skipped = Vec::new();
     let mut signatures: BTreeMap<String, String> = BTreeMap::new();
+    let mut build_paths = ProjectBuildPaths::default();
     let mut build_file_system = BuildFileSystem::new(file_system);
     for config_path in &graph.projects {
         if is_solution_project(file_system, &graph, config_path) {
@@ -237,51 +306,49 @@ pub fn build_projects(
         }
         let program = Program::from_config_with_options(&build_file_system, config_path, overrides);
         let enabled = incremental || program.options().incremental || program.options().composite;
-        let config_paths = project_config_paths(file_system, config_path);
-        let dependencies = graph
-            .references
-            .get(config_path)
-            .into_iter()
-            .flatten()
-            .filter_map(|path| {
-                signatures
-                    .get(path)
-                    .map(|signature| (path.clone(), signature.clone()))
-            })
-            .collect::<BTreeMap<_, _>>();
         let build_info_path = project_build_info_path(file_system, &program, config_path);
-        let previous = enabled
-            .then(|| {
-                file_system
-                    .read_file(&build_info_path)
-                    .ok()
-                    .and_then(|source| {
-                        BuildInfo::from_json(&source, env!("CARGO_PKG_VERSION")).ok()
-                    })
-            })
-            .flatten();
-        let preliminary = project_build_info(
+        if let Some(diagnostic) = build_paths.add_project(
+            file_system,
             &program,
-            dependencies.clone(),
-            previous
-                .as_ref()
-                .map_or_else(Vec::new, |info| info.outputs.clone()),
+            config_path,
+            &build_info_path,
+            enabled,
+        ) {
+            graph.diagnostics.push(diagnostic);
+            break;
+        }
+        let status = project_build_status(
+            file_system,
+            &graph,
+            config_path,
+            &program,
+            &build_info_path,
+            &signatures,
+            enabled,
         );
-        if enabled
-            && BuildInfo::decision(previous.as_ref(), &preliminary, |path| {
-                output_is_current(file_system, path, &config_paths, &preliminary)
-            }) == BuildDecision::UpToDate
-            && output_is_current(file_system, &build_info_path, &config_paths, &preliminary)
-        {
-            signatures.insert(config_path.clone(), preliminary.project_signature());
+        if status.up_to_date {
+            if let Some(diagnostic) =
+                build_paths.add_outputs(file_system, status.info.outputs.iter().map(String::as_str))
+            {
+                graph.diagnostics.push(diagnostic);
+                break;
+            }
+            signatures.insert(config_path.clone(), status.info.project_signature());
             skipped.push(config_path.clone());
             continue;
         }
         let emit = program.emit();
+        if let Some(diagnostic) = build_paths.add_outputs(
+            file_system,
+            emit.files.iter().map(|output| output.file_name.as_str()),
+        ) {
+            graph.diagnostics.push(diagnostic);
+            break;
+        }
         build_file_system.add_outputs(&emit.files);
         let current = project_build_info(
             &program,
-            dependencies,
+            status.dependencies,
             emit.files
                 .iter()
                 .map(|output| output.file_name.clone())
@@ -304,10 +371,62 @@ pub fn build_projects(
             build_info,
         });
     }
+    if !graph.diagnostics.is_empty() {
+        projects.clear();
+        skipped.clear();
+    }
     BuildResult {
         graph,
         projects,
         skipped,
+    }
+}
+
+fn project_build_status(
+    file_system: &dyn FileSystem,
+    graph: &ProjectGraph,
+    config_path: &str,
+    program: &Program,
+    build_info_path: &str,
+    signatures: &BTreeMap<String, String>,
+    incremental: bool,
+) -> ProjectBuildStatus {
+    let config_paths = project_config_paths(file_system, config_path);
+    let dependencies = graph
+        .references
+        .get(config_path)
+        .into_iter()
+        .flatten()
+        .filter_map(|path| {
+            signatures
+                .get(path)
+                .map(|signature| (path.clone(), signature.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let previous = incremental
+        .then(|| {
+            file_system
+                .read_file(build_info_path)
+                .ok()
+                .and_then(|source| BuildInfo::from_json(&source, env!("CARGO_PKG_VERSION")).ok())
+        })
+        .flatten();
+    let info = project_build_info(
+        program,
+        dependencies.clone(),
+        previous
+            .as_ref()
+            .map_or_else(Vec::new, |info| info.outputs.clone()),
+    );
+    let up_to_date = incremental
+        && BuildInfo::decision(previous.as_ref(), &info, |path| {
+            output_is_current(file_system, path, &config_paths, &info)
+        }) == BuildDecision::UpToDate
+        && output_is_current(file_system, build_info_path, &config_paths, &info);
+    ProjectBuildStatus {
+        dependencies,
+        info,
+        up_to_date,
     }
 }
 
@@ -686,6 +805,15 @@ fn render_message(code: u32, arguments: &[&str]) -> String {
         .unwrap_or_else(|error| error.to_string())
 }
 
+fn project_output_diagnostic(code: u32, arguments: &[&str]) -> ProjectDiagnostic {
+    ProjectDiagnostic {
+        file_name: None,
+        range: None,
+        code,
+        message: render_message(code, arguments),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use ts_compiler::{OutputFile, ProgramOptionsOverride};
@@ -1008,6 +1136,36 @@ mod tests {
             build_info.file_name,
             "/repo/dist/app/tsconfig.app.tsbuildinfo"
         );
+    }
+
+    #[test]
+    fn build_info_collisions_follow_case_insensitive_file_names() {
+        for (build_info_path, expected_code) in [("MAIN.TS", 5055), ("DIST/MAIN.JS", 5056)] {
+            let fs = MemoryFileSystem::new(false);
+            fs.write_file(
+                "/repo/tsconfig.json",
+                &format!(
+                    r#"{{"files":["main.ts"],"compilerOptions":{{"composite":true,"noLib":true,"outDir":"dist","tsBuildInfoFile":"{build_info_path}"}}}}"#
+                ),
+            )
+            .unwrap();
+            fs.write_file("/repo/main.ts", "export const value = 1;\n")
+                .unwrap();
+
+            let result = build_projects(
+                &fs,
+                "/repo",
+                &["tsconfig.json".into()],
+                ProgramOptionsOverride::default(),
+                true,
+            );
+
+            assert_eq!(
+                result.graph.diagnostics[0].code, expected_code,
+                "{build_info_path}"
+            );
+            assert!(result.projects.is_empty());
+        }
     }
 
     #[test]

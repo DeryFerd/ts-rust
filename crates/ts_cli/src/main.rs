@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     env, fs, io,
     path::{Path, PathBuf},
     process::ExitCode,
@@ -92,17 +93,21 @@ fn quiet_requested(args: &[String]) -> bool {
         })
 }
 
+fn build_project_roots(options: &BuildOptions) -> Vec<String> {
+    if options.projects.is_empty() {
+        vec!["tsconfig.json".to_owned()]
+    } else {
+        options.projects.clone()
+    }
+}
+
 fn build(options: &BuildOptions) -> ExitCode {
     let Ok(current_directory) = env::current_dir() else {
         eprintln!("error: could not determine the current directory");
         return exit(ExitStatus::DiagnosticsPresentOutputsSkipped);
     };
     let current_directory_text = current_directory.to_string_lossy();
-    let roots = if options.projects.is_empty() {
-        vec!["tsconfig.json".to_owned()]
-    } else {
-        options.projects.clone()
-    };
+    let roots = build_project_roots(options);
     let file_system = OsFileSystem::default();
     if options.dry {
         return dry_build(file_system, &current_directory_text, &roots, options);
@@ -112,20 +117,28 @@ fn build(options: &BuildOptions) -> ExitCode {
         no_emit: options.no_emit.then_some(true),
         ..ProgramOptionsOverride::default()
     };
-    if options.force
-        && let Err(error) =
-            invalidate_project_build_info(file_system, &current_directory_text, &roots, overrides)
-    {
-        eprintln!("{error}");
-        return exit(ExitStatus::DiagnosticsPresentOutputsSkipped);
-    }
-    let result = build_projects(
+    let mut result = build_projects(
         &file_system,
         &current_directory_text,
         &roots,
         overrides,
         options.incremental,
     );
+    if options.force && result.graph.diagnostics.is_empty() {
+        if let Err(error) =
+            invalidate_project_build_info(file_system, &current_directory_text, &roots, overrides)
+        {
+            eprintln!("{error}");
+            return exit(ExitStatus::DiagnosticsPresentOutputsSkipped);
+        }
+        result = build_projects(
+            &file_system,
+            &current_directory_text,
+            &roots,
+            overrides,
+            options.incremental,
+        );
+    }
     let pretty = options.pretty.unwrap_or(false);
     print_project_diagnostics(
         &result.graph.diagnostics,
@@ -225,11 +238,7 @@ fn clean(options: &BuildOptions) -> ExitCode {
         return exit(ExitStatus::DiagnosticsPresentOutputsSkipped);
     };
     let current_directory_text = current_directory.to_string_lossy();
-    let roots = if options.projects.is_empty() {
-        vec!["tsconfig.json".to_owned()]
-    } else {
-        options.projects.clone()
-    };
+    let roots = build_project_roots(options);
     let file_system = OsFileSystem::default();
     let graph = load_project_graph(&file_system, &current_directory_text, &roots);
     print_project_diagnostics(
@@ -243,6 +252,7 @@ fn clean(options: &BuildOptions) -> ExitCode {
     }
 
     let mut outputs = Vec::new();
+    let mut inputs = BTreeSet::new();
     for config_path in graph.projects {
         let program = Program::from_config_with_options(
             &file_system,
@@ -252,6 +262,12 @@ fn clean(options: &BuildOptions) -> ExitCode {
                 no_emit: Some(false),
                 ..ProgramOptionsOverride::default()
             },
+        );
+        inputs.extend(
+            program
+                .source_files()
+                .iter()
+                .map(|source| file_system.realpath(&source.file_name)),
         );
         outputs.extend(
             program
@@ -263,7 +279,11 @@ fn clean(options: &BuildOptions) -> ExitCode {
         outputs.push(project_build_info_path(&program, &config_path));
     }
 
-    for path in outputs.into_iter().filter(|path| path.is_file()) {
+    for path in outputs
+        .into_iter()
+        .filter(|path| path.is_file())
+        .filter(|path| !inputs.contains(&file_system.realpath(&path.to_string_lossy())))
+    {
         if options.dry {
             if !options.quiet {
                 println!("A non-dry build would delete '{}'", path.display());
@@ -519,18 +539,25 @@ impl WatchCompiler for BuildWatchCompiler {
             no_emit: self.options.no_emit.then_some(true),
             ..ProgramOptionsOverride::default()
         };
-        if self.options.force {
-            invalidate_project_build_info(file_system, &current_directory, &self.roots, overrides)
-                .map_err(WatchError::Compile)?;
-            self.options.force = false;
-        }
-        let result = build_projects(
+        let mut result = build_projects(
             &file_system,
             &current_directory,
             &self.roots,
             overrides,
             self.options.incremental,
         );
+        if self.options.force && result.graph.diagnostics.is_empty() {
+            invalidate_project_build_info(file_system, &current_directory, &self.roots, overrides)
+                .map_err(WatchError::Compile)?;
+            self.options.force = false;
+            result = build_projects(
+                &file_system,
+                &current_directory,
+                &self.roots,
+                overrides,
+                self.options.incremental,
+            );
+        }
         let pretty = self.options.pretty.unwrap_or(false);
         print_project_diagnostics(
             &result.graph.diagnostics,
@@ -603,11 +630,7 @@ fn watch_build(options: BuildOptions) -> ExitCode {
         eprintln!("error: could not determine the current directory");
         return exit(ExitStatus::DiagnosticsPresentOutputsSkipped);
     };
-    let roots = if options.projects.is_empty() {
-        vec!["tsconfig.json".to_owned()]
-    } else {
-        options.projects.clone()
-    };
+    let roots = build_project_roots(&options);
     run_watch(BuildWatchCompiler {
         options,
         current_directory,
@@ -704,9 +727,22 @@ fn invalidate_project_build_info(
     overrides: ProgramOptionsOverride,
 ) -> Result<(), String> {
     let graph = load_project_graph(&file_system, current_directory, roots);
+    let mut inputs = BTreeSet::new();
+    let mut build_info_paths = Vec::new();
     for config_path in graph.projects {
         let program = Program::from_config_with_options(&file_system, &config_path, overrides);
-        let build_info_path = project_build_info_path(&program, &config_path);
+        inputs.extend(
+            program
+                .source_files()
+                .iter()
+                .map(|source| file_system.realpath(&source.file_name)),
+        );
+        build_info_paths.push(project_build_info_path(&program, &config_path));
+    }
+    for build_info_path in build_info_paths
+        .into_iter()
+        .filter(|path| !inputs.contains(&file_system.realpath(&path.to_string_lossy())))
+    {
         if let Err(error) = fs::remove_file(&build_info_path)
             && error.kind() != io::ErrorKind::NotFound
         {

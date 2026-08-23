@@ -177,6 +177,128 @@ fn build_force_rebuilds_an_up_to_date_project() {
 }
 
 #[test]
+fn build_info_cannot_overwrite_project_input() {
+    let directory = TestDirectory::new("build-info-input-collision");
+    fs::write(
+        directory.0.join("tsconfig.json"),
+        r#"{"files":["main.ts"],"compilerOptions":{"composite":true,"noLib":true,"outDir":"dist","tsBuildInfoFile":"main.ts"}}"#,
+    )
+    .unwrap();
+    let source = directory.0.join("main.ts");
+    let original_source = "export const value = 1;\n";
+    fs::write(&source, original_source).unwrap();
+
+    let output = run(&directory.0, &["--build", "--pretty", "false"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("error TS5055:"));
+    assert_eq!(fs::read_to_string(&source).unwrap(), original_source);
+    assert!(!directory.0.join("dist/main.js").exists());
+}
+
+#[test]
+fn forced_build_cannot_delete_project_input() {
+    let directory = TestDirectory::new("force-build-info-input-collision");
+    fs::write(
+        directory.0.join("tsconfig.json"),
+        r#"{"files":["main.ts"],"compilerOptions":{"composite":true,"noLib":true,"outDir":"dist","tsBuildInfoFile":"main.ts"}}"#,
+    )
+    .unwrap();
+    let source = directory.0.join("main.ts");
+    let original_source = "export const value = 1;\n";
+    fs::write(&source, original_source).unwrap();
+
+    let output = run(&directory.0, &["--build", "--force", "--pretty", "false"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("error TS5055:"));
+    assert_eq!(fs::read_to_string(&source).unwrap(), original_source);
+    assert!(!directory.0.join("dist/main.js").exists());
+}
+
+#[test]
+fn build_info_cannot_overwrite_javascript_or_declarations() {
+    for (kind, file_name) in [("javascript", "main.js"), ("declaration", "main.d.ts")] {
+        let directory = TestDirectory::new(&format!("build-info-{kind}-collision"));
+        fs::write(
+            directory.0.join("tsconfig.json"),
+            format!(
+                r#"{{"files":["main.ts"],"compilerOptions":{{"composite":true,"noLib":true,"outDir":"dist","tsBuildInfoFile":"dist/{file_name}"}}}}"#
+            ),
+        )
+        .unwrap();
+        fs::write(directory.0.join("main.ts"), "export const value = 1;\n").unwrap();
+        let output_path = directory.0.join("dist").join(file_name);
+        fs::create_dir_all(output_path.parent().unwrap()).unwrap();
+        fs::write(&output_path, "existing generated output").unwrap();
+
+        for arguments in [
+            &["--build", "--pretty", "false"][..],
+            &["--build", "--force", "--pretty", "false"][..],
+        ] {
+            let output = run(&directory.0, arguments);
+
+            assert_eq!(output.status.code(), Some(1), "{kind}");
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("error TS5056:"),
+                "{kind}: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert_eq!(
+                fs::read_to_string(&output_path).unwrap(),
+                "existing generated output"
+            );
+        }
+    }
+}
+
+#[test]
+fn referenced_projects_cannot_share_build_info() {
+    let directory = TestDirectory::new("shared-build-info");
+    fs::create_dir_all(directory.0.join("lib")).unwrap();
+    fs::create_dir_all(directory.0.join("app")).unwrap();
+    fs::write(
+        directory.0.join("tsconfig.json"),
+        r#"{"files":[],"references":[{"path":"./app"}]}"#,
+    )
+    .unwrap();
+    fs::write(
+        directory.0.join("lib/tsconfig.json"),
+        r#"{"files":["index.ts"],"compilerOptions":{"composite":true,"noLib":true,"outDir":"dist","tsBuildInfoFile":"../shared.tsbuildinfo"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        directory.0.join("app/tsconfig.json"),
+        r#"{"files":["index.ts"],"references":[{"path":"../lib"}],"compilerOptions":{"composite":true,"noLib":true,"outDir":"dist","tsBuildInfoFile":"../shared.tsbuildinfo"}}"#,
+    )
+    .unwrap();
+    fs::write(directory.0.join("lib/index.ts"), "export const lib = 1;\n").unwrap();
+    fs::write(directory.0.join("app/index.ts"), "export const app = 1;\n").unwrap();
+    let build_info = directory.0.join("shared.tsbuildinfo");
+    fs::write(&build_info, "existing incremental state").unwrap();
+
+    for arguments in [
+        &["--build", "--pretty", "false"][..],
+        &["--build", "--force", "--pretty", "false"][..],
+    ] {
+        let output = run(&directory.0, arguments);
+
+        assert_eq!(output.status.code(), Some(1));
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("error TS6377:"),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(
+            fs::read_to_string(&build_info).unwrap(),
+            "existing incremental state"
+        );
+        assert!(!directory.0.join("lib/dist/index.js").exists());
+        assert!(!directory.0.join("app/dist/index.js").exists());
+    }
+}
+
+#[test]
 fn build_clean_removes_outputs_and_incremental_state() {
     let directory = TestDirectory::new("clean");
     fs::write(
@@ -203,6 +325,28 @@ fn build_clean_removes_outputs_and_incremental_state() {
     assert!(!directory.0.join("dist/main.js").exists());
     assert!(!directory.0.join("cache/state.tsbuildinfo").exists());
     assert!(directory.0.join("main.ts").is_file());
+}
+
+#[test]
+fn clean_cannot_delete_project_input_used_as_build_info() {
+    let directory = TestDirectory::new("clean-build-info-input-collision");
+    fs::write(
+        directory.0.join("tsconfig.json"),
+        r#"{"files":["main.ts"],"compilerOptions":{"composite":true,"noLib":true,"outDir":"dist","tsBuildInfoFile":"main.ts"}}"#,
+    )
+    .unwrap();
+    let source = directory.0.join("main.ts");
+    let original_source = "export const value = 1;\n";
+    fs::write(&source, original_source).unwrap();
+    let generated_output = directory.0.join("dist/main.js");
+    fs::create_dir_all(generated_output.parent().unwrap()).unwrap();
+    fs::write(&generated_output, "generated output").unwrap();
+
+    let output = run(&directory.0, &["--build", "--clean", "--pretty", "false"]);
+
+    assert!(output.status.success());
+    assert_eq!(fs::read_to_string(&source).unwrap(), original_source);
+    assert!(!generated_output.exists());
 }
 
 #[test]
