@@ -1374,16 +1374,17 @@ fn resolve_jsx_namespace(
             bootstrap.any_type,
         )
     };
-    let namespace = store
-        .symbol_table(globals)
-        .ok_or(SourceCheckError::Property(location))?
-        .get_source("JSX")
-        .and_then(|symbol| store.get_merged_symbol(symbol))
-        .filter(|symbol| {
-            store
-                .symbol(*symbol)
-                .is_some_and(|record| record.flags().intersects(SymbolFlags::NAMESPACE))
-        });
+    let namespace = resolve_local_jsx_namespace(store, host, location)?.or_else(|| {
+        store
+            .symbol_table(globals)
+            .and_then(|globals| globals.get_source("JSX"))
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            .filter(|symbol| {
+                store
+                    .symbol(*symbol)
+                    .is_some_and(|record| record.flags().intersects(SymbolFlags::NAMESPACE))
+            })
+    });
 
     let mut element_type = error_type;
     let mut intrinsic_elements = None;
@@ -1447,6 +1448,112 @@ fn resolve_jsx_namespace(
         error_type,
         any_type,
     })
+}
+
+fn resolve_local_jsx_namespace(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    location: NodeRef,
+) -> Result<Option<SemanticSymbolId>, SourceCheckError> {
+    let (arena, bound) = host.source(location).ok_or(SourceCheckError::Provenance(
+        SourceCheckProvenanceError::MissingNode(location),
+    ))?;
+    let source = super::SourceFileRef::new(store.id(), bound.source_file());
+    let Some(factory) = store
+        .source_file_links(source)
+        .map(|links| links.local_jsx_namespace.as_str())
+        .filter(|namespace| !namespace.is_empty())
+    else {
+        return Ok(None);
+    };
+
+    let mut current = Some(location);
+    let mut root = None;
+    while let Some(node) = current {
+        root = bound
+            .locals(node)
+            .and_then(|locals| store.symbol_table(locals))
+            .and_then(|locals| locals.get_source(factory));
+        if root.is_some() {
+            break;
+        }
+        current = arena
+            .get(node.node)
+            .and_then(|record| record.parent)
+            .map(|parent| child_ref(node, parent));
+    }
+    let root = root.or_else(|| {
+        store
+            .intrinsic_bootstrap()
+            .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+            .and_then(|globals| globals.get_source(factory))
+    });
+    let Some(root) = root else {
+        return Ok(None);
+    };
+    let root = resolve_local_jsx_namespace_alias(store, root, location)?;
+    let owner = store
+        .symbol(root)
+        .ok_or(SourceCheckError::Property(location))?;
+    if !owner.flags().intersects(SymbolFlags::MODULE) {
+        return Ok(None);
+    }
+    let Some(exports) = store
+        .module_symbol_links(root)
+        .and_then(|links| links.resolved_exports)
+        .or_else(|| owner.exports())
+    else {
+        return Ok(None);
+    };
+    let table = store
+        .symbol_table(exports)
+        .ok_or(SourceCheckError::Property(location))?;
+    let Some(namespace) = table.get_source("JSX") else {
+        return Ok(None);
+    };
+    let namespace = resolve_local_jsx_namespace_alias(store, namespace, location)?;
+    let record = store
+        .symbol(namespace)
+        .ok_or(SourceCheckError::Property(location))?;
+    if !record.flags().intersects(SymbolFlags::NAMESPACE)
+        || record.name().as_utf8() != Some("JSX")
+        || record.exports().is_none()
+    {
+        return Err(SourceCheckError::Property(location));
+    }
+    Ok(Some(namespace))
+}
+
+fn resolve_local_jsx_namespace_alias(
+    store: &CanonicalTypeMapperStore,
+    mut symbol: SemanticSymbolId,
+    location: NodeRef,
+) -> Result<SemanticSymbolId, SourceCheckError> {
+    let mut visited = HashSet::new();
+    loop {
+        symbol = store
+            .get_merged_symbol(symbol)
+            .ok_or(SourceCheckError::Import(location))?;
+        let record = store
+            .symbol(symbol)
+            .ok_or(SourceCheckError::Import(location))?;
+        if !record.flags().contains(SymbolFlags::ALIAS) {
+            return Ok(symbol);
+        }
+        if record.flags() != SymbolFlags::ALIAS || !visited.insert(symbol) {
+            return Err(SourceCheckError::Import(location));
+        }
+        let links = store
+            .alias_symbol_links(symbol)
+            .ok_or(SourceCheckError::Import(location))?;
+        if links.type_only_declaration.is_some() || links.immediate_target.is_none() {
+            return Err(SourceCheckError::Import(location));
+        }
+        symbol = links
+            .alias_target
+            .symbol()
+            .ok_or(SourceCheckError::Import(location))?;
+    }
 }
 
 fn jsx_plan_intrinsic_names(plan: &JsxElementPlan) -> HashSet<String> {
@@ -2949,7 +3056,9 @@ fn resolve_intrinsic_tag(
             symbol
         } else {
             let declarations = if let Some(declaration) = declaration {
-                if !bound.contains(declaration) {
+                if !bound.contains(declaration)
+                    && !authenticated_foreign_intrinsic_index_declaration(store, owner, declaration)
+                {
                     return Err(SourceCheckError::Property(opening));
                 }
                 Some(vec![declaration])
@@ -3011,6 +3120,29 @@ fn resolve_intrinsic_tag(
         attributes_type: namespace.error_type,
         flags: JsxFlags::NONE,
     })
+}
+
+fn authenticated_foreign_intrinsic_index_declaration(
+    store: &CanonicalTypeMapperStore,
+    owner: Option<SemanticSymbolId>,
+    declaration: NodeRef,
+) -> bool {
+    let Some(owner) = owner else {
+        return false;
+    };
+    let Some(super::store::SourceNodeParent::Parent(interface)) =
+        store.source_node_parent(declaration)
+    else {
+        return false;
+    };
+    store.source_node_kind(declaration) == Some(SyntaxKind::IndexSignature)
+        && store.source_node_kind(interface) == Some(SyntaxKind::InterfaceDeclaration)
+        && store.symbol(owner).is_some_and(|record| {
+            record.flags() == SymbolFlags::INTERFACE
+                && record
+                    .declarations()
+                    .is_some_and(|declarations| declarations.contains(&interface))
+        })
 }
 
 fn validate_inherited_record_intrinsic_index(
@@ -4516,11 +4648,13 @@ mod runtime_tests {
         CanonicalBinder, CanonicalModuleState, CanonicalNameResolverOptions,
         CanonicalSourceFileFacts, CanonicalSourceLanguage, EscapedName,
     };
-    use ts_parser::{ParseResult, parse_javascript_source_file, parse_jsx_source_file};
+    use ts_parser::{
+        ParseResult, parse_javascript_source_file, parse_jsx_source_file, parse_source_file,
+    };
 
     use super::*;
     use crate::semantic::{
-        IntrinsicBootstrapOptions,
+        AliasSymbolLinks, AliasTargetState, IntrinsicBootstrapOptions, SourceFileLinks,
         formatter::type_to_string,
         production::{CanonicalJsxRuntime, GlobalMergeCompletion},
     };
@@ -4682,6 +4816,220 @@ mod runtime_tests {
                 )
                 .unwrap();
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep imported aliases and foreign index identity together.
+    fn imported_factory_jsx_namespace_preserves_cross_file_index_identity() {
+        let library = parse_source_file(concat!(
+            "function createElement(element: string, props: any): any {}\n",
+            "namespace JSX { export interface IntrinsicElements { [key: string]: any; } }\n",
+            "export { createElement, JSX };\n",
+        ));
+        let consumer = parse_jsx_source_file(concat!(
+            "import * as MyLib from './library';\n",
+            "const content = <custom-element />;\n",
+        ));
+        assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+        assert!(
+            consumer.diagnostics.is_empty(),
+            "{:?}",
+            consumer.diagnostics
+        );
+        let library_file = FileId::new(8_160);
+        let consumer_file = FileId::new(8_161);
+        let mut binder = CanonicalBinder::new();
+        for (parsed, file, path) in [
+            (&library, library_file, "\"/project/library.ts\""),
+            (&consumer, consumer_file, "\"/project/index.tsx\""),
+        ] {
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(path),
+                        CanonicalSourceLanguage::TypeScript,
+                        false,
+                        CanonicalModuleState::External,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let (symbols, mut files) = binder.finish().try_into_parts().unwrap();
+        let library_bound = files.remove(&library_file).unwrap();
+        let consumer_bound = files.remove(&consumer_file).unwrap();
+        let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
+        store
+            .register_source_file(&library.arena, library.source_file, library_file)
+            .unwrap();
+        let source = store
+            .register_source_file(&consumer.arena, consumer.source_file, consumer_file)
+            .unwrap();
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+
+        let module = library_bound.symbol(library_bound.source_file()).unwrap();
+        let import = consumer_bound
+            .locals(consumer_bound.source_file())
+            .and_then(|locals| store.symbol_table(locals))
+            .and_then(|locals| locals.get_source("MyLib"))
+            .unwrap();
+        let namespace = library_bound
+            .locals(library_bound.source_file())
+            .and_then(|locals| store.symbol_table(locals))
+            .and_then(|locals| locals.get_source("JSX"))
+            .unwrap();
+        let exported = store
+            .symbol(module)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| store.symbol_table(exports))
+            .and_then(|exports| exports.get_source("JSX"))
+            .unwrap();
+        for (alias, target) in [(import, module), (exported, namespace)] {
+            assert!(store.set_alias_symbol_links(
+                alias,
+                AliasSymbolLinks {
+                    immediate_target: Some(target),
+                    alias_target: AliasTargetState::Resolved(target),
+                    ..AliasSymbolLinks::default()
+                },
+            ));
+        }
+        assert!(store.set_source_file_links(
+            source,
+            SourceFileLinks {
+                local_jsx_namespace: "MyLib".to_owned(),
+                ..SourceFileLinks::default()
+            },
+        ));
+        let opening = consumer
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::JsxSelfClosingElement).then_some(NodeRef::new(
+                    consumer.arena.id(),
+                    consumer_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let host = DeclaredTypeHost::new([
+            (&library.arena, &library_bound),
+            (&consumer.arena, &consumer_bound),
+        ])
+        .unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        store
+            .check_jsx_element(
+                &host,
+                opening,
+                CanonicalCheckerOptions {
+                    no_implicit_any: true,
+                    ..CanonicalCheckerOptions::default()
+                },
+                &mut diagnostics,
+            )
+            .unwrap();
+
+        assert!(diagnostics.is_empty());
+        let symbol = store
+            .symbol_node_links(opening)
+            .and_then(|links| links.resolved_symbol)
+            .unwrap();
+        let index = store.symbol(symbol).unwrap();
+        assert_eq!(
+            index
+                .value_declaration()
+                .map(|declaration| declaration.file),
+            Some(library_file),
+        );
+        assert_eq!(
+            store.jsx_element_links(opening).unwrap().jsx_flags,
+            JsxFlags::INTRINSIC_INDEXED_ELEMENT,
+        );
+        let warm = (
+            store.type_len(),
+            store.symbol_len(),
+            store.signature_len(),
+            store.index_info_len(),
+            store.checker_link_allocated_lengths(),
+        );
+        store
+            .check_jsx_element(
+                &host,
+                opening,
+                CanonicalCheckerOptions {
+                    no_implicit_any: true,
+                    ..CanonicalCheckerOptions::default()
+                },
+                &mut diagnostics,
+            )
+            .unwrap();
+        assert_eq!(
+            (
+                store.type_len(),
+                store.symbol_len(),
+                store.signature_len(),
+                store.index_info_len(),
+                store.checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn factory_without_local_jsx_namespace_falls_back_to_global_namespace() {
+        let mut fixture = RuntimeFixture::new(
+            concat!(
+                "declare namespace MyLib { export interface Other {} }\n",
+                "declare namespace JSX { interface IntrinsicElements { div: any; } }\n",
+                "const content = <div />;\n",
+            ),
+            FileId::new(8_162),
+        );
+        let namespace = fixture
+            .bound
+            .locals(fixture.bound.source_file())
+            .and_then(|locals| fixture.store.symbol_table(locals))
+            .and_then(|locals| locals.get_source("JSX"))
+            .unwrap();
+        let globals = fixture.store.intrinsic_bootstrap().unwrap().globals;
+        assert_eq!(
+            fixture
+                .store
+                .insert_symbol(globals, EscapedName::source("JSX"), namespace),
+            Some(None),
+        );
+        let source =
+            super::super::SourceFileRef::new(fixture.store.id(), fixture.bound.source_file());
+        assert!(fixture.store.set_source_file_links(
+            source,
+            SourceFileLinks {
+                local_jsx_namespace: "MyLib".to_owned(),
+                ..SourceFileLinks::default()
+            },
+        ));
+        let expression = fixture.expression("content");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        fixture.check(expression, CanonicalJsxRuntime::Preserve, &mut diagnostics);
+
+        assert!(diagnostics.is_empty());
+        assert_eq!(
+            fixture
+                .store
+                .jsx_element_links(expression)
+                .unwrap()
+                .jsx_flags,
+            JsxFlags::INTRINSIC_NAMED_ELEMENT,
+        );
     }
 
     #[test]

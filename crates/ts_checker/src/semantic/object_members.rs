@@ -152,6 +152,14 @@ pub(super) struct GlobalArrayCallAugmentationPlan {
     pub any_array_type: TypeId,
 }
 
+/// Authenticated identity for a reopened namespace-owned generic interface.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct LazyMergedGenericInterfacePlan {
+    pub symbol: SemanticSymbolId,
+    pub namespace: SemanticSymbolId,
+    pub type_parameter: SemanticSymbolId,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct PropertyObjectPlan {
     pub kind: PropertyObjectKind,
@@ -1664,7 +1672,11 @@ pub(super) fn plan_generic_interface(
     };
     let raw_members = symbol_record.members().ok_or_else(invalid)?;
     let raw_table = store.symbol_table(raw_members).ok_or_else(invalid)?;
-    if symbol_record.flags() != SymbolFlags::INTERFACE
+    if !symbol_record.flags().contains(SymbolFlags::INTERFACE)
+        || symbol_record
+            .flags()
+            .without(SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT)
+            != SymbolFlags::NONE
         || symbol_record.check_flags() != CheckFlags::NONE
         || symbol_record.value_declaration().is_some()
         || symbol_record.exports().is_some()
@@ -1742,7 +1754,14 @@ pub(super) fn plan_generic_interface(
             let parameter_symbol_record = store
                 .symbol(parameter_symbol)
                 .ok_or_else(invalid_declaration)?;
-            if parameter_symbol_record.flags() != SymbolFlags::TYPE_PARAMETER
+            if !parameter_symbol_record
+                .flags()
+                .contains(SymbolFlags::TYPE_PARAMETER)
+                || parameter_symbol_record
+                    .flags()
+                    .without(SymbolFlags::TYPE_PARAMETER | SymbolFlags::TRANSIENT)
+                    != SymbolFlags::NONE
+                || parameter_symbol_record.check_flags() != CheckFlags::NONE
                 || store.get_parent_of_symbol(parameter_symbol) != Some(symbol)
                 || raw_table
                     .get(parameter_symbol_record.name())
@@ -1797,6 +1816,331 @@ pub(super) fn plan_generic_interface(
         return Err(invalid());
     }
     Ok(plan)
+}
+
+/// Validates a reopened generic interface without reading its member annotations.
+///
+/// All declarations must belong to the same authenticated namespace, share one
+/// binder-owned type parameter, and repeat the same optional generic base.
+#[allow(clippy::too_many_lines)] // Declaration, parameter, and warm identity form one proof.
+pub(super) fn plan_lazy_merged_generic_interface(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+) -> Result<LazyMergedGenericInterfacePlan, PropertyObjectError> {
+    let symbol = store
+        .get_merged_symbol(symbol)
+        .ok_or(PropertyObjectError::InvalidInterfaceSymbol(symbol))?;
+    let owner = store
+        .symbol(symbol)
+        .ok_or(PropertyObjectError::InvalidInterfaceSymbol(symbol))?;
+    let declarations = owner
+        .declarations()
+        .filter(|declarations| declarations.len() >= 2)
+        .ok_or(PropertyObjectError::InvalidInterfaceSymbol(symbol))?;
+    let declaration = declarations[0];
+    let invalid = || PropertyObjectError::InvalidInterface {
+        declaration,
+        symbol,
+    };
+    let namespace = store.get_parent_of_symbol(symbol).ok_or_else(invalid)?;
+    let namespace_record = store.symbol(namespace).ok_or_else(invalid)?;
+    let exports = namespace_record
+        .exports()
+        .and_then(|exports| store.symbol_table(exports))
+        .ok_or_else(invalid)?;
+    let members = owner
+        .members()
+        .and_then(|members| store.symbol_table(members))
+        .ok_or_else(invalid)?;
+    if !owner.flags().contains(SymbolFlags::INTERFACE)
+        || owner
+            .flags()
+            .without(SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT)
+            != SymbolFlags::NONE
+        || owner.check_flags() != CheckFlags::NONE
+        || owner.value_declaration().is_some()
+        || owner.exports().is_some()
+        || owner.export_symbol().is_some()
+        || !namespace_record.flags().intersects(SymbolFlags::MODULE)
+        || exports
+            .get(owner.name())
+            .and_then(|export| store.get_merged_symbol(export))
+            != Some(symbol)
+    {
+        return Err(invalid());
+    }
+
+    let mut seen_declarations = HashSet::with_capacity(declarations.len());
+    let mut parameter_declarations = Vec::with_capacity(declarations.len());
+    let mut shared_parameter = None;
+    let mut shared_base = None;
+    for &candidate in declarations {
+        let invalid_declaration = || PropertyObjectError::InvalidInterface {
+            declaration: candidate,
+            symbol,
+        };
+        let record = preflight_node(store, host, candidate).map_err(|_| invalid_declaration())?;
+        let NodeData::InterfaceDeclaration(interface) = &record.data else {
+            return Err(invalid_declaration());
+        };
+        let Some(parameters) = interface.type_parameters.as_ref() else {
+            return Err(invalid_declaration());
+        };
+        let [parameter_id] = parameters.nodes.as_slice() else {
+            return Err(invalid_declaration());
+        };
+        let name = NodeRef::new(candidate.arena, candidate.file, interface.name);
+        let name_record = preflight_node(store, host, name).map_err(|_| invalid_declaration())?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Err(invalid_declaration());
+        };
+        let parent = declared_type_declaration_parent(
+            store,
+            host,
+            candidate,
+            symbol,
+            name,
+            interface.modifiers.as_ref(),
+        )
+        .map_err(|()| invalid_declaration())?;
+        if !seen_declarations.insert(candidate)
+            || record.kind != SyntaxKind::InterfaceDeclaration
+            || record.flags.0 != 0
+            || !host.symbol_matches(store, candidate, symbol)
+            || parent != Some(namespace)
+            || name_record.kind != SyntaxKind::Identifier
+            || name_record.flags.0 != 0
+            || name_record.parent != Some(candidate.node)
+            || identifier.flow_node.is_some()
+            || owner.name().as_utf8() != Some(identifier.text.as_str())
+            || interface.flow_node.is_some()
+            || interface.local_symbol.is_some()
+            || interface.symbol.is_some()
+            || parameters.has_trailing_comma
+            || interface.members.has_trailing_comma
+            || interface.members.range.start < record.range.start
+            || interface.members.range.end != record.range.end
+        {
+            return Err(invalid_declaration());
+        }
+
+        let parameter = NodeRef::new(candidate.arena, candidate.file, *parameter_id);
+        let parameter_record =
+            preflight_node(store, host, parameter).map_err(|_| invalid_declaration())?;
+        let NodeData::TypeParameterDeclaration(parameter_data) = &parameter_record.data else {
+            return Err(invalid_declaration());
+        };
+        let parameter_name = NodeRef::new(parameter.arena, parameter.file, parameter_data.name);
+        let parameter_name_record =
+            preflight_node(store, host, parameter_name).map_err(|_| invalid_declaration())?;
+        let NodeData::Identifier(parameter_identifier) = &parameter_name_record.data else {
+            return Err(invalid_declaration());
+        };
+        let parameter_symbol =
+            bound_symbol(store, host, parameter).ok_or_else(invalid_declaration)?;
+        let parameter_owner = store
+            .symbol(parameter_symbol)
+            .ok_or_else(invalid_declaration)?;
+        if parameter_record.kind != SyntaxKind::TypeParameter
+            || parameter_record.flags.0 != 0
+            || parameter_record.parent != Some(candidate.node)
+            || parameter_data.constraint.is_some()
+            || parameter_data.default_type.is_some()
+            || parameter_data.expression.is_some()
+            || parameter_data.modifiers.is_some()
+            || parameter_data.symbol.is_some()
+            || parameter_name_record.kind != SyntaxKind::Identifier
+            || parameter_name_record.flags.0 != 0
+            || parameter_name_record.parent != Some(parameter.node)
+            || parameter_identifier.flow_node.is_some()
+            || parameter_owner.name().as_utf8() != Some(parameter_identifier.text.as_str())
+            || !parameter_owner
+                .flags()
+                .contains(SymbolFlags::TYPE_PARAMETER)
+            || parameter_owner
+                .flags()
+                .without(SymbolFlags::TYPE_PARAMETER | SymbolFlags::TRANSIENT)
+                != SymbolFlags::NONE
+            || parameter_owner.check_flags() != CheckFlags::NONE
+            || parameter_owner.value_declaration().is_some()
+            || parameter_owner.members().is_some()
+            || parameter_owner.exports().is_some()
+            || parameter_owner.export_symbol().is_some()
+            || store.get_parent_of_symbol(parameter_symbol) != Some(symbol)
+            || members
+                .get(parameter_owner.name())
+                .and_then(|parameter| store.get_merged_symbol(parameter))
+                != Some(parameter_symbol)
+            || shared_parameter.is_some_and(|previous| previous != parameter_symbol)
+        {
+            return Err(invalid_declaration());
+        }
+        shared_parameter = Some(parameter_symbol);
+        parameter_declarations.push(parameter);
+
+        let base = interface
+            .heritage_clauses
+            .as_ref()
+            .map(|clauses| {
+                plan_lazy_merged_generic_interface_base(
+                    store,
+                    host,
+                    candidate,
+                    clauses,
+                    namespace,
+                    parameter_identifier.text.as_str(),
+                )
+            })
+            .transpose()?;
+        match shared_base {
+            None => shared_base = Some(base),
+            Some(previous) if previous != base => return Err(invalid_declaration()),
+            Some(_) => {}
+        }
+    }
+
+    let parameter = shared_parameter.ok_or_else(invalid)?;
+    let parameter_owner = store.symbol(parameter).ok_or_else(invalid)?;
+    if parameter_owner.declarations() != Some(parameter_declarations.as_slice()) {
+        return Err(invalid());
+    }
+    if let Some(target) = store
+        .declared_type_links(symbol)
+        .and_then(|links| links.declared_type)
+    {
+        let record = store.type_payload(target).ok_or_else(invalid)?;
+        let TypeData::Interface(interface) = record.data() else {
+            return Err(invalid());
+        };
+        let reference = validate_direct_generic_reference(store, target).map_err(|_| invalid())?;
+        let [argument] = reference.type_arguments.as_slice() else {
+            return Err(invalid());
+        };
+        if record.flags() != TypeFlags::OBJECT
+            || !record
+                .object_flags()
+                .contains(ObjectFlags::INTERFACE | ObjectFlags::REFERENCE)
+            || record.symbol() != Some(symbol)
+            || record.alias().is_some()
+            || reference.target != target
+            || cached_ordinary_type_parameter_owner(store, *argument) != Some(parameter)
+            || interface.outer_type_parameter_count != 0
+            || interface.declared_members_resolved
+            || interface.reference.object.structured != StructuredTypeData::default()
+        {
+            return Err(invalid());
+        }
+    }
+
+    Ok(LazyMergedGenericInterfacePlan {
+        symbol,
+        namespace,
+        type_parameter: parameter,
+    })
+}
+
+fn plan_lazy_merged_generic_interface_base(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    clauses: &NodeList,
+    namespace: SemanticSymbolId,
+    parameter_name: &str,
+) -> Result<SemanticSymbolId, PropertyObjectError> {
+    let invalid = || PropertyObjectError::UnsupportedMember {
+        node: declaration,
+        kind: SyntaxKind::InterfaceDeclaration,
+    };
+    let [clause_id] = clauses.nodes.as_slice() else {
+        return Err(invalid());
+    };
+    let clause = NodeRef::new(declaration.arena, declaration.file, *clause_id);
+    let clause_record = preflight_node(store, host, clause).map_err(|_| invalid())?;
+    let NodeData::HeritageClause(heritage) = &clause_record.data else {
+        return Err(invalid());
+    };
+    let [base_id] = heritage.types.nodes.as_slice() else {
+        return Err(invalid());
+    };
+    if clauses.has_trailing_comma
+        || clause_record.kind != SyntaxKind::HeritageClause
+        || clause_record.flags.0 != 0
+        || clause_record.parent != Some(declaration.node)
+        || heritage.token != SyntaxKind::ExtendsKeyword
+        || heritage.facts != 0
+        || heritage.types.has_trailing_comma
+    {
+        return Err(invalid());
+    }
+
+    let base = NodeRef::new(declaration.arena, declaration.file, *base_id);
+    let base_record = preflight_node(store, host, base).map_err(|_| invalid())?;
+    let NodeData::ExpressionWithTypeArguments(expression) = &base_record.data else {
+        return Err(invalid());
+    };
+    let Some(arguments) = expression.type_arguments.as_ref() else {
+        return Err(invalid());
+    };
+    let [argument_id] = arguments.nodes.as_slice() else {
+        return Err(invalid());
+    };
+    if base_record.kind != SyntaxKind::ExpressionWithTypeArguments
+        || base_record.flags.0 != 0
+        || base_record.parent != Some(clause.node)
+        || expression.facts != 0
+        || arguments.has_trailing_comma
+    {
+        return Err(invalid());
+    }
+
+    let base_name = NodeRef::new(base.arena, base.file, expression.expression);
+    let base_name_record = preflight_node(store, host, base_name).map_err(|_| invalid())?;
+    let NodeData::Identifier(base_identifier) = &base_name_record.data else {
+        return Err(invalid());
+    };
+    let argument = NodeRef::new(base.arena, base.file, *argument_id);
+    let argument_record = preflight_node(store, host, argument).map_err(|_| invalid())?;
+    let NodeData::TypeReferenceNode(argument_reference) = &argument_record.data else {
+        return Err(invalid());
+    };
+    let argument_name = NodeRef::new(argument.arena, argument.file, argument_reference.type_name);
+    let argument_name_record = preflight_node(store, host, argument_name).map_err(|_| invalid())?;
+    let NodeData::Identifier(argument_identifier) = &argument_name_record.data else {
+        return Err(invalid());
+    };
+    let base_symbol = store
+        .symbol(namespace)
+        .and_then(ts_binder::semantic::Symbol::exports)
+        .and_then(|exports| store.symbol_table(exports))
+        .and_then(|exports| exports.get_source(&base_identifier.text))
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .ok_or_else(invalid)?;
+    let owner = store.symbol(base_symbol).ok_or_else(invalid)?;
+    if base_name_record.kind != SyntaxKind::Identifier
+        || base_name_record.flags.0 != 0
+        || base_name_record.parent != Some(base.node)
+        || base_identifier.flow_node.is_some()
+        || argument_record.kind != SyntaxKind::TypeReference
+        || argument_record.flags.0 != 0
+        || argument_record.parent != Some(base.node)
+        || argument_reference.type_arguments.is_some()
+        || argument_name_record.kind != SyntaxKind::Identifier
+        || argument_name_record.flags.0 != 0
+        || argument_name_record.parent != Some(argument.node)
+        || argument_identifier.flow_node.is_some()
+        || argument_identifier.text != parameter_name
+        || !owner.flags().contains(SymbolFlags::INTERFACE)
+        || owner
+            .flags()
+            .without(SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT)
+            != SymbolFlags::NONE
+        || owner.check_flags() != CheckFlags::NONE
+        || store.get_parent_of_symbol(base_symbol) != Some(namespace)
+    {
+        return Err(invalid());
+    }
+    Ok(base_symbol)
 }
 
 /// Proves a named declared type's local, namespace-exported, or top-level ESM
@@ -1992,12 +2336,23 @@ fn declared_namespace_type_parent(
     }
     if let Some(local) = bound.local_symbol(declaration) {
         let record = store.symbol(local).ok_or_else(invalid)?;
+        let declarations = owner
+            .declarations()
+            .ok_or_else(invalid)?
+            .iter()
+            .copied()
+            .filter(|candidate| {
+                candidate.is_for(declaration.arena, declaration.file)
+                    && bound.local_symbol(*candidate) == Some(local)
+            })
+            .collect::<Vec<_>>();
         if local == symbol
             || store.get_merged_symbol(local) != Some(local)
             || record.flags() != SymbolFlags::NONE
             || record.check_flags() != CheckFlags::NONE
             || record.name().as_utf8() != Some(name)
-            || record.declarations() != Some(&[declaration])
+            || declarations.is_empty()
+            || record.declarations() != Some(declarations.as_slice())
             || record.value_declaration().is_some()
             || record.members().is_some()
             || record.exports().is_some()
@@ -2545,9 +2900,13 @@ fn plan_members(
             table
                 .iter()
                 .filter(|(_, member)| {
-                    store
-                        .symbol(*member)
-                        .is_some_and(|record| record.flags() == SymbolFlags::TYPE_PARAMETER)
+                    store.symbol(*member).is_some_and(|record| {
+                        record.flags().contains(SymbolFlags::TYPE_PARAMETER)
+                            && record
+                                .flags()
+                                .without(SymbolFlags::TYPE_PARAMETER | SymbolFlags::TRANSIENT)
+                                == SymbolFlags::NONE
+                    })
                 })
                 .count()
         } else {
@@ -5218,7 +5577,11 @@ fn valid_generic_publication_target(
         || !(record.object_flags() & !allowed_flags).is_empty()
         || record.symbol() != Some(plan.symbol)
         || record.alias().is_some()
-        || owner.flags() != SymbolFlags::INTERFACE
+        || !owner.flags().contains(SymbolFlags::INTERFACE)
+        || owner
+            .flags()
+            .without(SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT)
+            != SymbolFlags::NONE
         || owner.check_flags() != CheckFlags::NONE
         || owner_declarations != plan.declarations.as_slice()
         || plan.declarations.first().copied() != Some(plan.node)
@@ -7598,6 +7961,172 @@ mod generic_publication_tests {
                 .unwrap();
             assert_eq!(property.type_id(), expected);
         }
+    }
+
+    #[test]
+    fn reopened_namespace_generic_interfaces_keep_inherited_members_cold() {
+        let mut fixture = interface_fixture(
+            concat!(
+                "declare namespace React { ",
+                "interface DOMAttributes<T> { unsupported(value: T): void; } ",
+                "interface HTMLAttributes<T> extends DOMAttributes<T> { id?: string; } ",
+                "interface HTMLAttributes<T> extends DOMAttributes<T> { title?: string; } ",
+                "}",
+            ),
+            3_724,
+        );
+        let namespace = fixture
+            .store
+            .get_parent_of_symbol(fixture.symbol)
+            .expect("the first interface belongs to React");
+        let exports = fixture.store.symbol(namespace).unwrap().exports().unwrap();
+        let symbol = fixture
+            .store
+            .symbol_table(exports)
+            .and_then(|exports| exports.get_source("HTMLAttributes"))
+            .unwrap();
+        let host = host(&fixture.parsed, &fixture.bound);
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.symbol_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        let plan = plan_lazy_merged_generic_interface(&fixture.store, &host, symbol).unwrap();
+
+        assert_eq!(plan.symbol, symbol);
+        assert_eq!(plan.namespace, namespace);
+        assert_eq!(
+            fixture.store.get_parent_of_symbol(plan.type_parameter),
+            Some(symbol),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+        assert!(fixture.store.declared_type_links(symbol).is_none());
+
+        assert!(fixture.store.set_symbol_flags(
+            symbol,
+            SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT,
+            CheckFlags::NONE,
+        ));
+        assert!(fixture.store.set_symbol_flags(
+            plan.type_parameter,
+            SymbolFlags::TYPE_PARAMETER | SymbolFlags::TRANSIENT,
+            CheckFlags::NONE,
+        ));
+        assert_eq!(
+            plan_lazy_merged_generic_interface(&fixture.store, &host, symbol),
+            Ok(plan),
+        );
+
+        let flags = fixture.store.symbol(symbol).unwrap().flags();
+        let target = get_declared_class_interface_or_type_parameter(
+            &mut fixture.store,
+            &host,
+            symbol,
+            flags,
+        )
+        .unwrap()
+        .unwrap();
+        let TypeData::Interface(interface) = fixture.store.type_payload(target).unwrap().data()
+        else {
+            panic!("the reopened interface must retain its generic target")
+        };
+        assert!(!interface.declared_members_resolved);
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.symbol_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            plan_lazy_merged_generic_interface(&fixture.store, &host, symbol),
+            Ok(plan),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn reopened_namespace_generic_interfaces_reject_mismatched_bases_and_parameter_flags() {
+        let mut fixture = interface_fixture(
+            concat!(
+                "declare namespace React { ",
+                "interface First<T> {} ",
+                "interface Second<T> {} ",
+                "interface HTMLAttributes<T> extends First<T> {} ",
+                "interface HTMLAttributes<T> extends Second<T> {} ",
+                "}",
+            ),
+            3_725,
+        );
+        let namespace = fixture.store.get_parent_of_symbol(fixture.symbol).unwrap();
+        let exports = fixture.store.symbol(namespace).unwrap().exports().unwrap();
+        let symbol = fixture
+            .store
+            .symbol_table(exports)
+            .and_then(|exports| exports.get_source("HTMLAttributes"))
+            .unwrap();
+        let host = host(&fixture.parsed, &fixture.bound);
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.symbol_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        assert!(matches!(
+            plan_lazy_merged_generic_interface(&fixture.store, &host, symbol),
+            Err(PropertyObjectError::InvalidInterface { .. }),
+        ));
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+
+        let parameter = fixture
+            .store
+            .symbol(symbol)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| fixture.store.symbol_table(members))
+            .and_then(|members| members.get_source("T"))
+            .unwrap();
+        assert!(fixture.store.set_symbol_flags(
+            parameter,
+            SymbolFlags::TYPE_PARAMETER | SymbolFlags::PROPERTY,
+            CheckFlags::NONE,
+        ));
+        let poisoned = (
+            fixture.store.type_len(),
+            fixture.store.symbol_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert!(matches!(
+            plan_lazy_merged_generic_interface(&fixture.store, &host, symbol),
+            Err(PropertyObjectError::InvalidInterface { .. }),
+        ));
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            poisoned,
+        );
     }
 
     #[test]

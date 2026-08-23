@@ -9,6 +9,7 @@ use super::{
     CanonicalTypeMapperStore, SignatureId, TypeId,
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
     callables::ValidatedSingleCallable,
+    instantiated_members::{GenericInterfaceMemberError, validate_generic_interface_members},
     links::ValueSymbolLinks,
     object_members::{
         DeclaredPropertyObjectValidation, resolved_declared_property_types,
@@ -276,6 +277,19 @@ impl CanonicalTypeMapperStore {
                 Ok(())
             }
             DeclaredPropertyObjectValidation::NotDeclared => {
+                if record.flags() == TypeFlags::OBJECT
+                    && record.object_flags().contains(ObjectFlags::REFERENCE)
+                    && matches!(
+                        record.data(),
+                        TypeData::TypeReference(_) | TypeData::Interface(_)
+                    )
+                {
+                    self.validate_resolved_generic_intersection_constituent(type_)?;
+                    if !output.contains(&type_) {
+                        output.push(type_);
+                    }
+                    return Ok(());
+                }
                 match validate_stored_callable_set(self, type_) {
                     StoredCallableSetValidation::Valid { projection, .. }
                         if !projection.call_signatures.is_empty()
@@ -307,6 +321,67 @@ impl CanonicalTypeMapperStore {
                 Err(IntersectionTypeError::MalformedConstituent(type_))
             }
         }
+    }
+
+    fn validate_resolved_generic_intersection_constituent(
+        &self,
+        type_: TypeId,
+    ) -> Result<(), IntersectionTypeError> {
+        let members = match validate_generic_interface_members(self, type_, None) {
+            Ok(Some(members)) => members,
+            Ok(None)
+            | Err(
+                GenericInterfaceMemberError::UnsupportedTarget(_)
+                | GenericInterfaceMemberError::UnsupportedMember(_)
+                | GenericInterfaceMemberError::UnsupportedPropertyType(_),
+            ) => return Err(IntersectionTypeError::UnsupportedConstituent(type_)),
+            Err(GenericInterfaceMemberError::Capacity(_)) => {
+                return Err(IntersectionTypeError::Capacity);
+            }
+            Err(
+                GenericInterfaceMemberError::Reference(_)
+                | GenericInterfaceMemberError::InvalidTarget(_)
+                | GenericInterfaceMemberError::InvalidMember(_)
+                | GenericInterfaceMemberError::InvalidCachedMembers(_)
+                | GenericInterfaceMemberError::InvalidCachedProperty(_),
+            ) => return Err(IntersectionTypeError::MalformedConstituent(type_)),
+        };
+        let Some(mapper) = members.mapper() else {
+            return Err(IntersectionTypeError::UnsupportedConstituent(type_));
+        };
+        if members.reference() != type_
+            || members.target() == type_
+            || members.properties().is_empty()
+            || members.members().is_none()
+        {
+            return Err(IntersectionTypeError::MalformedConstituent(type_));
+        }
+
+        let mut has_proxy = false;
+        for property in members.properties() {
+            let symbol = self
+                .symbol(*property)
+                .ok_or(IntersectionTypeError::MalformedConstituent(type_))?;
+            let links = self
+                .value_symbol_links(*property)
+                .ok_or(IntersectionTypeError::MalformedConstituent(type_))?;
+            if links.resolved_type.is_none() {
+                return Err(IntersectionTypeError::UnsupportedConstituent(type_));
+            }
+            if symbol.flags().contains(SymbolFlags::TRANSIENT) {
+                has_proxy = true;
+                if links.target.is_none()
+                    || links.mapper != Some(mapper)
+                    || !symbol.check_flags().contains(CheckFlags::INSTANTIATED)
+                {
+                    return Err(IntersectionTypeError::MalformedConstituent(type_));
+                }
+            }
+        }
+        if !has_proxy {
+            return Err(IntersectionTypeError::MalformedConstituent(type_));
+        }
+        Ok(())
     }
 
     pub(super) fn validate_intersection_type(
@@ -986,12 +1061,259 @@ mod tests {
         CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
         EscapedName,
     };
-    use ts_parser::parse_source_file;
+    use ts_parser::{ParseResult, parse_source_file};
 
     use super::*;
     use crate::semantic::{
         CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions,
     };
+
+    fn generic_intersection_context(
+        source: &ParseResult,
+        file: FileId,
+    ) -> CanonicalCheckerContext<'_> {
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &source.arena,
+                source.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/generic-intersections.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&source.arena, file)
+            .unwrap();
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &source.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        context.check_source_file(file).unwrap();
+        context
+    }
+
+    fn generic_intersection_alias(
+        source: &ParseResult,
+        context: &CanonicalCheckerContext<'_>,
+        file: FileId,
+        name: &str,
+    ) -> TypeId {
+        let declaration = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(identifier) = &source.arena.get(alias.name)?.data else {
+                    return None;
+                };
+                (identifier.text == name).then_some(NodeRef::new(source.arena.id(), file, node))
+            })
+            .unwrap();
+        let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        context
+            .store()
+            .type_alias_links(symbol)
+            .and_then(|links| links.declared_type)
+            .unwrap()
+    }
+
+    fn intersection_cache_state(
+        store: &CanonicalTypeMapperStore,
+    ) -> (usize, usize, usize, usize, [usize; 26]) {
+        (
+            store.type_len(),
+            store.mapper_len(),
+            store.symbol_len(),
+            store.symbol_store().symbol_table_len(),
+            store.checker_link_allocated_lengths(),
+        )
+    }
+
+    #[test]
+    fn resolved_generic_interface_intersections_preserve_proxy_properties_and_warm_identity() {
+        let source = parse_source_file(concat!(
+            "interface Base<T> { base: T; shared: string }\n",
+            "interface Extra<T> { extra: T; shared: string }\n",
+            "type Left = Base<string>;\n",
+            "type Right = Extra<number>;\n",
+        ));
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let file = FileId::new(4_402);
+        let mut context = generic_intersection_context(&source, file);
+        let left = generic_intersection_alias(&source, &context, file, "Left");
+        let right = generic_intersection_alias(&source, &context, file, "Right");
+        let store = context.store_mut_for_test();
+        for (reference, names) in [(left, ["base", "shared"]), (right, ["extra", "shared"])] {
+            store
+                .resolve_generic_interface_members(reference, None)
+                .unwrap();
+            for name in names {
+                assert!(
+                    store
+                        .resolve_generic_interface_property(reference, name, None)
+                        .unwrap()
+                        .is_some()
+                );
+            }
+        }
+
+        let intersection = store
+            .canonical_intersection_type(&[left, right], None)
+            .unwrap();
+        let projection = store.validate_intersection_type(intersection).unwrap();
+        assert_eq!(projection.types, [left, right]);
+        assert_eq!(
+            projection
+                .properties
+                .iter()
+                .map(|property| {
+                    store
+                        .symbol(*property)
+                        .and_then(|symbol| symbol.name().as_utf8())
+                        .unwrap()
+                })
+                .collect::<Vec<_>>(),
+            ["base", "shared", "extra"],
+        );
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let (string, number) = (bootstrap.string_type, bootstrap.number_type);
+        assert_eq!(
+            projection
+                .properties
+                .iter()
+                .map(|property| {
+                    store
+                        .value_symbol_links(*property)
+                        .and_then(|links| links.resolved_type)
+                        .unwrap()
+                })
+                .collect::<Vec<_>>(),
+            [string, string, number],
+        );
+
+        let warm = intersection_cache_state(store);
+        assert_eq!(
+            store.canonical_intersection_type(&[left, right], None),
+            Ok(intersection),
+        );
+        assert_eq!(
+            store.validate_intersection_type(intersection),
+            Ok(projection)
+        );
+        assert_eq!(intersection_cache_state(store), warm);
+    }
+
+    #[test]
+    fn generic_interface_intersections_reject_cold_members_and_unresolved_proxy_values() {
+        let source = parse_source_file(concat!(
+            "interface Base<T> { base: T }\n",
+            "interface Extra<T> { extra: T }\n",
+            "type Left = Base<string>;\n",
+            "type Right = Extra<number>;\n",
+        ));
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let file = FileId::new(4_403);
+        let mut context = generic_intersection_context(&source, file);
+        let left = generic_intersection_alias(&source, &context, file, "Left");
+        let right = generic_intersection_alias(&source, &context, file, "Right");
+        let store = context.store_mut_for_test();
+
+        let cold = intersection_cache_state(store);
+        assert_eq!(
+            store.canonical_intersection_type(&[left, right], None),
+            Err(IntersectionTypeError::UnsupportedConstituent(left)),
+        );
+        assert_eq!(intersection_cache_state(store), cold);
+
+        store.resolve_generic_interface_members(left, None).unwrap();
+        store
+            .resolve_generic_interface_members(right, None)
+            .unwrap();
+        let unresolved = intersection_cache_state(store);
+        assert_eq!(
+            store.canonical_intersection_type(&[left, right], None),
+            Err(IntersectionTypeError::UnsupportedConstituent(left)),
+        );
+        assert_eq!(intersection_cache_state(store), unresolved);
+
+        store
+            .resolve_generic_interface_property(left, "base", None)
+            .unwrap();
+        store
+            .resolve_generic_interface_property(right, "extra", None)
+            .unwrap();
+        assert!(
+            store
+                .canonical_intersection_type(&[left, right], None)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn generic_interface_intersections_reject_forged_proxy_caches_without_writes() {
+        let source = parse_source_file(concat!(
+            "interface Base<T> { base: T }\n",
+            "interface Extra<T> { extra: T }\n",
+            "type Left = Base<string>;\n",
+            "type Right = Extra<number>;\n",
+        ));
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let file = FileId::new(4_404);
+        let mut context = generic_intersection_context(&source, file);
+        let left = generic_intersection_alias(&source, &context, file, "Left");
+        let right = generic_intersection_alias(&source, &context, file, "Right");
+        let store = context.store_mut_for_test();
+        let left_property = store
+            .resolve_generic_interface_property(left, "base", None)
+            .unwrap()
+            .unwrap()
+            .symbol();
+        store
+            .resolve_generic_interface_property(right, "extra", None)
+            .unwrap();
+        let intersection = store
+            .canonical_intersection_type(&[left, right], None)
+            .unwrap();
+        let original = store.value_symbol_links(left_property).unwrap().clone();
+        let wrong = store.intrinsic_bootstrap().unwrap().number_type;
+
+        for (mapper, resolved_type) in [
+            (None, original.resolved_type),
+            (original.mapper, Some(wrong)),
+        ] {
+            let mut poisoned = original.clone();
+            poisoned.mapper = mapper;
+            poisoned.resolved_type = resolved_type;
+            assert!(store.set_value_symbol_links(left_property, poisoned));
+            let state = intersection_cache_state(store);
+            assert_eq!(
+                store.canonical_intersection_type(&[left, right], None),
+                Err(IntersectionTypeError::MalformedConstituent(left)),
+            );
+            assert_eq!(
+                store.validate_intersection_type(intersection),
+                Err(IntersectionTypeError::InvalidCachedIntersection(
+                    intersection
+                )),
+            );
+            assert_eq!(intersection_cache_state(store), state);
+            assert!(store.set_value_symbol_links(left_property, original.clone()));
+        }
+
+        assert_eq!(
+            store.canonical_intersection_type(&[left, right], None),
+            Ok(intersection),
+        );
+    }
 
     #[test]
     fn finite_literal_property_unions_reduce_to_existing_canonical_identities() {

@@ -16,8 +16,8 @@ use ts_ast::{
 };
 use ts_binder::{
     BoundFile, CanonicalExtractionError, CanonicalNameResolverOptions,
-    CanonicalPatternAmbientModule, CanonicalProgramBindings, EscapedName, SemanticStoreId,
-    SemanticSymbolId, SymbolFlags, SymbolStore, SymbolTableId,
+    CanonicalPatternAmbientModule, CanonicalProgramBindings, CheckFlags, EscapedName,
+    SemanticStoreId, SemanticSymbolId, SymbolFlags, SymbolStore, SymbolTableId,
 };
 
 use super::{
@@ -1060,6 +1060,217 @@ impl<'arena> CanonicalCheckerContext<'arena> {
         result
     }
 
+    fn jsx_factory_alias_matches(&self, alias: SemanticSymbolId, target: SemanticSymbolId) -> bool {
+        self.store.alias_symbol_links(alias).is_none_or(|links| {
+            links.type_only_declaration.is_none()
+                && links
+                    .immediate_target
+                    .is_none_or(|immediate| immediate == target)
+                && match links.alias_target {
+                    super::AliasTargetState::Unresolved => true,
+                    super::AliasTargetState::Unknown => false,
+                    super::AliasTargetState::Resolved(resolved) => resolved == target,
+                }
+        })
+    }
+
+    fn authenticated_module_jsx_namespace(
+        &self,
+        module: SemanticSymbolId,
+        arena: &NodeArena,
+        bound: &BoundFile,
+    ) -> Option<SemanticSymbolId> {
+        let source = bound.source_file();
+        let export = self
+            .store
+            .symbol(module)?
+            .exports()
+            .and_then(|exports| self.store.symbol_table(exports))?
+            .get_source("JSX")?;
+        let export_record = self.store.symbol(export)?;
+        let namespace = if export_record.flags() == SymbolFlags::ALIAS {
+            let &[declaration] = export_record.declarations()? else {
+                return None;
+            };
+            if !declaration.is_for(arena.id(), bound.file_id())
+                || !bound.contains(declaration)
+                || !self.store.contains_node_ref(declaration)
+                || bound.symbol(declaration) != Some(export)
+                || self.store.get_merged_symbol(export) != Some(export)
+                || export_record.check_flags() != CheckFlags::NONE
+                || export_record.value_declaration().is_some()
+                || export_record.members().is_some()
+                || export_record.exports().is_some()
+                || export_record.parent() != Some(module)
+                || export_record.export_symbol().is_some()
+                || export_record.name().as_bytes() != b"JSX"
+            {
+                return None;
+            }
+
+            let declaration_record = arena.get(declaration.node)?;
+            let NodeData::ExportSpecifier(specifier) = &declaration_record.data else {
+                return None;
+            };
+            let clause = declaration_record.parent?;
+            let clause_record = arena.get(clause)?;
+            let NodeData::NamedExports(exports) = &clause_record.data else {
+                return None;
+            };
+            let statement = clause_record.parent?;
+            let statement_record = arena.get(statement)?;
+            let NodeData::ExportDeclaration(export_declaration) = &statement_record.data else {
+                return None;
+            };
+            let exported_name = arena.get(specifier.name)?;
+            let NodeData::Identifier(exported_name) = &exported_name.data else {
+                return None;
+            };
+            let local_name_id = specifier.property_name.unwrap_or(specifier.name);
+            let local_name_record = arena.get(local_name_id)?;
+            let NodeData::Identifier(local_name) = &local_name_record.data else {
+                return None;
+            };
+            if declaration_record.kind != SyntaxKind::ExportSpecifier
+                || declaration_record.flags.0 != 0
+                || specifier.is_type_only
+                || specifier.local_symbol.is_some()
+                || specifier.symbol.is_some()
+                || specifier.facts != 0
+                || clause_record.kind != SyntaxKind::NamedExports
+                || !exports.elements.nodes.contains(&declaration.node)
+                || statement_record.kind != SyntaxKind::ExportDeclaration
+                || statement_record.parent != Some(source.node)
+                || export_declaration.export_clause != Some(clause)
+                || export_declaration.module_specifier.is_some()
+                || export_declaration.is_type_only
+                || exported_name.text != "JSX"
+                || local_name_record.parent != Some(declaration.node)
+                || local_name.flow_node.is_some()
+                || local_name.text.is_empty()
+            {
+                return None;
+            }
+
+            let namespace = bound
+                .locals(source)
+                .and_then(|locals| self.store.symbol_table(locals))?
+                .get_source(&local_name.text)
+                .and_then(|symbol| self.store.get_merged_symbol(symbol))?;
+            if !self.jsx_factory_alias_matches(export, namespace) {
+                return None;
+            }
+            namespace
+        } else if export_record.flags().intersects(SymbolFlags::NAMESPACE) {
+            export
+        } else {
+            return None;
+        };
+
+        let namespace_record = self.store.symbol(namespace)?;
+        let namespace_name = namespace_record.name().as_utf8()?;
+        if !namespace_record.flags().intersects(SymbolFlags::NAMESPACE)
+            || self.store.get_merged_symbol(namespace) != Some(namespace)
+            || !namespace_record.declarations()?.iter().any(|declaration| {
+                let Some(record) = arena.get(declaration.node) else {
+                    return false;
+                };
+                let NodeData::ModuleDeclaration(module) = &record.data else {
+                    return false;
+                };
+                let Some(NodeData::Identifier(name)) =
+                    arena.get(module.name).map(|record| &record.data)
+                else {
+                    return false;
+                };
+                declaration.is_for(arena.id(), bound.file_id())
+                    && bound.contains(*declaration)
+                    && self.store.contains_node_ref(*declaration)
+                    && bound
+                        .symbol(*declaration)
+                        .and_then(|symbol| self.store.get_merged_symbol(symbol))
+                        == Some(namespace)
+                    && record.kind == SyntaxKind::ModuleDeclaration
+                    && record.parent == Some(source.node)
+                    && name.text == namespace_name
+            })
+        {
+            return None;
+        }
+        Some(namespace)
+    }
+
+    fn authenticated_classic_jsx_factory_source(
+        &self,
+        arena: &NodeArena,
+        bound: &BoundFile,
+        factory_namespace: &str,
+    ) -> Option<SourceFileRef> {
+        let source = bound.source_file();
+        let source_file = self.files.source_file(bound.file_id())?;
+        if source_file.node_ref() != source || factory_namespace.is_empty() {
+            return None;
+        }
+
+        let alias = bound
+            .locals(source)
+            .and_then(|locals| self.store.symbol_table(locals))?
+            .get_source(factory_namespace)
+            .and_then(|symbol| self.store.get_merged_symbol(symbol))?;
+        let alias_record = self.store.symbol(alias)?;
+        let &[declaration] = alias_record.declarations()? else {
+            return None;
+        };
+        let declaration_record = arena.get(declaration.node)?;
+        if !matches!(declaration_record.data, NodeData::NamespaceImport(_)) {
+            return None;
+        }
+        let statement = arena.get(declaration_record.parent?)?.parent?;
+        let statement = NodeRef::new(arena.id(), bound.file_id(), statement);
+        let import = super::source_imports::plan_top_level_named_value_import(
+            arena,
+            bound,
+            &self.store,
+            statement,
+        )
+        .ok()?;
+        if !import.bindings.iter().any(|binding| {
+            binding.declaration == declaration
+                && binding.alias_symbol == alias
+                && binding.imported_text == "*"
+                && binding.local_text == factory_namespace
+        }) {
+            return None;
+        }
+
+        let CanonicalModuleResolutionLookup::Resolved(resolved) =
+            self.module_resolutions.lookup(import.module_specifier)
+        else {
+            return None;
+        };
+        if resolved.is_ambient_module() {
+            return None;
+        }
+        let (target_arena, target_bound) = self.files.snapshot(resolved.target_file())?;
+        let target_source = target_bound.source_file();
+        let module = resolved.target_symbol();
+        let module_record = self.store.symbol(module)?;
+        if target_bound.symbol(target_source) != Some(module)
+            || self.store.get_merged_symbol(module) != Some(module)
+            || !module_record.flags().intersects(SymbolFlags::MODULE)
+            || !module_record
+                .declarations()
+                .is_some_and(|declarations| declarations.contains(&target_source))
+            || !self.jsx_factory_alias_matches(alias, module)
+            || self
+                .authenticated_module_jsx_namespace(module, target_arena, target_bound)
+                .is_none()
+        {
+            return None;
+        }
+        Some(source_file)
+    }
+
     /// Checks one source using its exact, compiler-resolved JSX runtime.
     ///
     /// Automatic runtime availability and custom factory names are Program
@@ -1083,6 +1294,33 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             ))?;
         let diagnostics =
             super::jsx::source_jsx_runtime_diagnostics(&self.store, arena, bound, runtime)?;
+        if let CanonicalJsxRuntimeEvidence::Classic {
+            factory_namespace, ..
+        } = runtime
+            && let Some(source) =
+                self.authenticated_classic_jsx_factory_source(arena, bound, factory_namespace)
+        {
+            let mut links = self
+                .store
+                .source_file_links(source)
+                .cloned()
+                .unwrap_or_default();
+            if !links.local_jsx_namespace.is_empty()
+                && links.local_jsx_namespace != factory_namespace
+            {
+                return Err(SourceCheckError::Provenance(
+                    SourceCheckProvenanceError::SourceLinkPublication(source),
+                ));
+            }
+            if links.local_jsx_namespace.is_empty() {
+                factory_namespace.clone_into(&mut links.local_jsx_namespace);
+                if !self.store.set_source_file_links(source, links) {
+                    return Err(SourceCheckError::Provenance(
+                        SourceCheckProvenanceError::SourceLinkPublication(source),
+                    ));
+                }
+            }
+        }
         let previous = self.options.jsx_runtime;
         self.options.jsx_runtime = runtime.mode();
         let checked = self.check_source_file(file);
@@ -2412,6 +2650,112 @@ mod tests {
         assert!(!options.emit_common_js);
         assert!(!options.no_emit);
         assert!(!options.no_error_truncation);
+    }
+
+    #[test]
+    fn classic_runtime_retains_authenticated_factory_namespaces_and_replays_warm() {
+        let importer = parsed("import * as MyLib from './library';");
+        let library = parsed(concat!(
+            "namespace JSX { export interface IntrinsicElements {} } ",
+            "export { JSX };",
+        ));
+        let importer_file = FileId::new(8_401);
+        let library_file = FileId::new(8_402);
+        let specifier = node_ref(&importer, importer_file, module_specifiers(&importer)[0]);
+        let mut context = external_context(
+            &[(importer_file, &importer), (library_file, &library)],
+            CanonicalModuleResolutionManifestInput::new([
+                CanonicalModuleResolutionEntry::resolved(specifier, esm(library_file)),
+            ]),
+        );
+        let source = context.source_file(importer_file).unwrap();
+        let options = context.options();
+        let namespace_export = direct_export(&context, library_file, "JSX");
+        let runtime = CanonicalJsxRuntimeEvidence::Classic {
+            factory_namespace: "MyLib",
+            fragment_factory_namespace: "MyLib",
+            fragment_factory_required: false,
+            fragment_factory_pragma_required: false,
+        };
+        assert!(context.store().source_file_links(source).is_none());
+        assert!(
+            context
+                .store()
+                .alias_symbol_links(namespace_export)
+                .is_none()
+        );
+
+        context
+            .check_source_file_with_jsx_runtime(importer_file, runtime)
+            .unwrap();
+
+        let links = context.store().source_file_links(source).unwrap();
+        assert_eq!(links.local_jsx_namespace, "MyLib");
+        assert!(links.type_checked);
+        assert_eq!(context.options(), options);
+        assert!(
+            context
+                .store()
+                .alias_symbol_links(namespace_export)
+                .is_none()
+        );
+        let warm = context.store().checker_link_allocated_lengths();
+
+        context
+            .check_source_file_with_jsx_runtime(importer_file, runtime)
+            .unwrap();
+
+        assert_eq!(context.store().checker_link_allocated_lengths(), warm);
+        assert_eq!(
+            context
+                .store()
+                .source_file_links(source)
+                .unwrap()
+                .local_jsx_namespace,
+            "MyLib",
+        );
+        assert_eq!(context.options(), options);
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn classic_runtime_does_not_cache_modules_without_a_binder_owned_jsx_namespace() {
+        let importer = parsed("import * as MyLib from './library';");
+        let library = parsed("export const JSX: number = 1;");
+        let importer_file = FileId::new(8_403);
+        let library_file = FileId::new(8_404);
+        let specifier = node_ref(&importer, importer_file, module_specifiers(&importer)[0]);
+        let mut context = external_context(
+            &[(importer_file, &importer), (library_file, &library)],
+            CanonicalModuleResolutionManifestInput::new([
+                CanonicalModuleResolutionEntry::resolved(specifier, esm(library_file)),
+            ]),
+        );
+        let source = context.source_file(importer_file).unwrap();
+        let options = context.options();
+
+        context
+            .check_source_file_with_jsx_runtime(
+                importer_file,
+                CanonicalJsxRuntimeEvidence::Classic {
+                    factory_namespace: "MyLib",
+                    fragment_factory_namespace: "MyLib",
+                    fragment_factory_required: false,
+                    fragment_factory_pragma_required: false,
+                },
+            )
+            .unwrap();
+
+        assert!(
+            context
+                .store()
+                .source_file_links(source)
+                .unwrap()
+                .local_jsx_namespace
+                .is_empty()
+        );
+        assert_eq!(context.options(), options);
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]

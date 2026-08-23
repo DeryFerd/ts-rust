@@ -2129,11 +2129,14 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                                 .map_err(|error| Self::import_plan_error(statement, &error))?;
                         named_reexports.push(reexport);
                         statements.push(PlannedStatement::NamedReexport);
-                    } else if let Some(export) = self.plan_external_module_marker(statement)? {
-                        local_named_exports.push(export);
-                        statements.push(PlannedStatement::LocalNamedExport);
                     } else {
-                        statements.push(PlannedStatement::ExternalModuleMarker);
+                        let exports = self.plan_external_module_marker(statement)?;
+                        if exports.is_empty() {
+                            statements.push(PlannedStatement::ExternalModuleMarker);
+                        } else {
+                            local_named_exports.extend(exports);
+                            statements.push(PlannedStatement::LocalNamedExport);
+                        }
                     }
                 }
                 SyntaxKind::FunctionDeclaration => {
@@ -5860,7 +5863,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
     fn plan_external_module_marker(
         &self,
         statement: NodeRef,
-    ) -> Result<Option<PlannedLocalNamedExport>, SourceCheckError> {
+    ) -> Result<Vec<PlannedLocalNamedExport>, SourceCheckError> {
         let statement_node = self.node(statement)?;
         let NodeData::ExportDeclaration(export) = &statement_node.data else {
             return Err(SourceCheckError::Provenance(
@@ -5916,165 +5919,231 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     SourceSyntaxRole::ExportDeclaration,
                 ));
             }
-            return Ok(None);
-        }
-
-        let &[binding_node] = exports.elements.nodes.as_slice() else {
-            return Err(self.unsupported(clause, clause_node.kind, SourceSyntaxRole::ExportClause));
-        };
-        let binding = self.reference(binding_node);
-        let binding_record = self.node(binding)?;
-        let NodeData::ExportSpecifier(specifier) = &binding_record.data else {
-            return Err(self.unsupported(clause, clause_node.kind, SourceSyntaxRole::ExportClause));
-        };
-        if binding_record.kind != SyntaxKind::ExportSpecifier
-            || binding_record.flags.0 != 0
-            || binding_record.parent != Some(clause.node)
-            || binding_record.range.start < clause_node.range.start
-            || binding_record.range.end > clause_node.range.end
-            || specifier.property_name.is_some()
-            || specifier.is_type_only
-            || specifier.local_symbol.is_some()
-            || specifier.symbol.is_some()
-            || specifier.facts != 0
-        {
-            return Err(self.unsupported(clause, clause_node.kind, SourceSyntaxRole::ExportClause));
-        }
-
-        let name = self.reference(specifier.name);
-        let name_record = self.node(name)?;
-        let NodeData::Identifier(identifier) = &name_record.data else {
-            return Err(self.unsupported(clause, clause_node.kind, SourceSyntaxRole::ExportClause));
-        };
-        if name_record.kind != SyntaxKind::Identifier
-            || name_record.flags.0 != 0
-            || name_record.parent != Some(binding.node)
-            || name_record.range.start < binding_record.range.start
-            || name_record.range.end > binding_record.range.end
-            || identifier.flow_node.is_some()
-            || identifier.text.is_empty()
-        {
-            return Err(self.unsupported(clause, clause_node.kind, SourceSyntaxRole::ExportClause));
+            return Ok(Vec::new());
         }
 
         let Some((store, _)) = self.semantic else {
             return Err(self.unsupported(clause, clause_node.kind, SourceSyntaxRole::ExportClause));
         };
-        if !store.contains_node_ref(clause)
-            || !store.contains_node_ref(binding)
-            || !store.contains_node_ref(name)
-        {
-            return Err(SourceCheckError::Import(binding));
-        }
-        let Some(local_symbol) = self
-            .bound
-            .locals(self.source.node_ref())
-            .and_then(|locals| store.symbol_table(locals))
-            .and_then(|locals| locals.get_source(&identifier.text))
-        else {
-            return Err(self.unsupported(clause, clause_node.kind, SourceSyntaxRole::ExportClause));
-        };
-        let local_symbol = store
-            .get_merged_symbol(local_symbol)
-            .ok_or(SourceCheckError::Import(binding))?;
-        let local_record = store
-            .symbol(local_symbol)
-            .ok_or(SourceCheckError::Import(binding))?;
-        let is_prior_enum = self.prior_enums.contains(&local_symbol)
-            && matches!(
-                local_record.flags(),
-                SymbolFlags::CONST_ENUM | SymbolFlags::REGULAR_ENUM
-            );
-        let is_prior_named_value_import = self
-            .value_import_bindings
-            .get(&local_symbol)
-            .is_some_and(|import| {
-                local_record.flags() == SymbolFlags::ALIAS
-                    && import.local_text == identifier.text
-                    && import.imported_text == identifier.text
-                    && self.node(import.declaration).is_ok_and(|declaration| {
-                        declaration.kind == SyntaxKind::ImportSpecifier
-                            && declaration.range.end <= statement_node.range.start
-                    })
-            });
-        let is_prior_type_alias = export.is_type_only
-            && local_record.flags() == SymbolFlags::TYPE_ALIAS
-            && local_record.declarations().is_some_and(|declarations| {
-                matches!(
-                    declarations,
-                    [declaration]
-                        if declaration.is_for(self.arena.id(), self.bound.file_id())
-                            && self.node(*declaration).is_ok_and(|record| {
-                                record.kind == SyntaxKind::TypeAliasDeclaration
-                                    && record.parent == Some(self.source.node_ref().node)
-                                    && record.range.end <= statement_node.range.start
-                            })
-                )
-            });
-        if (export.is_type_only && !is_prior_type_alias)
-            || (!export.is_type_only && !is_prior_enum && !is_prior_named_value_import)
-        {
-            return Err(self.unsupported(clause, clause_node.kind, SourceSyntaxRole::ExportClause));
-        }
-
-        let alias = self
-            .bound
-            .symbol(binding)
-            .ok_or(SourceCheckError::Import(binding))?;
         let module = self
             .bound
             .symbol(self.source.node_ref())
-            .ok_or(SourceCheckError::Import(binding))?;
+            .ok_or(SourceCheckError::Import(clause))?;
         let module_record = store
             .symbol(module)
-            .ok_or(SourceCheckError::Import(binding))?;
-        let alias_record = store
-            .symbol(alias)
-            .ok_or(SourceCheckError::Import(binding))?;
-        if module_record
-            .exports()
-            .and_then(|exports| store.symbol_table(exports))
-            .and_then(|exports| exports.get_source(&identifier.text))
-            != Some(alias)
-            || alias_record.flags() != SymbolFlags::ALIAS
-            || alias_record.check_flags() != CheckFlags::NONE
-            || alias_record.declarations() != Some(&[binding])
-            || alias_record.value_declaration().is_some()
-            || alias_record.members().is_some()
-            || alias_record.exports().is_some()
-            || alias_record.parent() != Some(module)
-            || alias_record.export_symbol().is_some()
-            || alias_record.name().as_bytes() != identifier.text.as_bytes()
-            || store.get_merged_symbol(alias) != Some(alias)
-            || store.alias_symbol_links(alias).is_some_and(|links| {
-                links
-                    .immediate_target
-                    .is_some_and(|target| target != local_symbol)
-                    || links
-                        .type_only_declaration
-                        .is_some_and(|marker| !export.is_type_only || marker != binding)
-                    || links
-                        .alias_target
-                        .symbol()
-                        .is_some_and(|target| store.symbol(target).is_none())
-            })
-        {
-            return Err(SourceCheckError::Import(binding));
+            .ok_or(SourceCheckError::Import(clause))?;
+        let mut aliases = HashSet::with_capacity(exports.elements.nodes.len());
+        let mut names = HashSet::with_capacity(exports.elements.nodes.len());
+        let mut planned = Vec::with_capacity(exports.elements.nodes.len());
+        let mut previous_end = clause_node.range.start;
+
+        for &binding_node in &exports.elements.nodes {
+            let binding = self.reference(binding_node);
+            let binding_record = self.node(binding)?;
+            let NodeData::ExportSpecifier(specifier) = &binding_record.data else {
+                return Err(self.unsupported(
+                    clause,
+                    clause_node.kind,
+                    SourceSyntaxRole::ExportClause,
+                ));
+            };
+            if binding_record.kind != SyntaxKind::ExportSpecifier
+                || binding_record.flags.0 != 0
+                || binding_record.parent != Some(clause.node)
+                || binding_record.range.start < previous_end
+                || binding_record.range.end > clause_node.range.end
+                || specifier.property_name.is_some()
+                || specifier.is_type_only
+                || specifier.local_symbol.is_some()
+                || specifier.symbol.is_some()
+                || specifier.facts != 0
+            {
+                return Err(self.unsupported(
+                    clause,
+                    clause_node.kind,
+                    SourceSyntaxRole::ExportClause,
+                ));
+            }
+            previous_end = binding_record.range.end;
+
+            let name = self.reference(specifier.name);
+            let name_record = self.node(name)?;
+            let NodeData::Identifier(identifier) = &name_record.data else {
+                return Err(self.unsupported(
+                    clause,
+                    clause_node.kind,
+                    SourceSyntaxRole::ExportClause,
+                ));
+            };
+            if name_record.kind != SyntaxKind::Identifier
+                || name_record.flags.0 != 0
+                || name_record.parent != Some(binding.node)
+                || name_record.range.start < binding_record.range.start
+                || name_record.range.end > binding_record.range.end
+                || identifier.flow_node.is_some()
+                || identifier.text.is_empty()
+                || !names.insert(identifier.text.as_str())
+            {
+                return Err(self.unsupported(
+                    clause,
+                    clause_node.kind,
+                    SourceSyntaxRole::ExportClause,
+                ));
+            }
+            if !store.contains_node_ref(clause)
+                || !store.contains_node_ref(binding)
+                || !store.contains_node_ref(name)
+            {
+                return Err(SourceCheckError::Import(binding));
+            }
+
+            let Some(local_symbol) = self
+                .bound
+                .locals(self.source.node_ref())
+                .and_then(|locals| store.symbol_table(locals))
+                .and_then(|locals| locals.get_source(&identifier.text))
+            else {
+                return Err(self.unsupported(
+                    clause,
+                    clause_node.kind,
+                    SourceSyntaxRole::ExportClause,
+                ));
+            };
+            let local_symbol = store
+                .get_merged_symbol(local_symbol)
+                .ok_or(SourceCheckError::Import(binding))?;
+            let local_record = store
+                .symbol(local_symbol)
+                .ok_or(SourceCheckError::Import(binding))?;
+            let is_prior_enum = self.prior_enums.contains(&local_symbol)
+                && matches!(
+                    local_record.flags(),
+                    SymbolFlags::CONST_ENUM | SymbolFlags::REGULAR_ENUM
+                );
+            let is_prior_function = self.hoisted_functions.contains(&local_symbol)
+                && local_record.flags() == SymbolFlags::FUNCTION
+                && local_record.declarations().is_some_and(|declarations| {
+                    !declarations.is_empty()
+                        && declarations.iter().all(|declaration| {
+                            declaration.is_for(self.arena.id(), self.bound.file_id())
+                                && self.node(*declaration).is_ok_and(|record| {
+                                    record.kind == SyntaxKind::FunctionDeclaration
+                                        && record.parent == Some(self.source.node_ref().node)
+                                        && record.range.end <= statement_node.range.start
+                                })
+                        })
+                });
+            let is_prior_namespace = local_record.flags().intersects(SymbolFlags::MODULE)
+                && local_record
+                    .flags()
+                    .without(SymbolFlags::MODULE | SymbolFlags::CONST_ENUM_ONLY_MODULE)
+                    == SymbolFlags::NONE
+                && local_record.declarations().is_some_and(|declarations| {
+                    !declarations.is_empty()
+                        && declarations.iter().all(|declaration| {
+                            declaration.is_for(self.arena.id(), self.bound.file_id())
+                                && self.node(*declaration).is_ok_and(|record| {
+                                    record.kind == SyntaxKind::ModuleDeclaration
+                                        && record.parent == Some(self.source.node_ref().node)
+                                        && record.range.end <= statement_node.range.start
+                                })
+                        })
+                });
+            let is_prior_named_value_import = self
+                .value_import_bindings
+                .get(&local_symbol)
+                .is_some_and(|import| {
+                    local_record.flags() == SymbolFlags::ALIAS
+                        && import.local_text == identifier.text
+                        && import.imported_text == identifier.text
+                        && self.node(import.declaration).is_ok_and(|declaration| {
+                            declaration.kind == SyntaxKind::ImportSpecifier
+                                && declaration.range.end <= statement_node.range.start
+                        })
+                });
+            let is_prior_type_alias = export.is_type_only
+                && local_record.flags() == SymbolFlags::TYPE_ALIAS
+                && local_record.declarations().is_some_and(|declarations| {
+                    matches!(
+                        declarations,
+                        [declaration]
+                            if declaration.is_for(self.arena.id(), self.bound.file_id())
+                                && self.node(*declaration).is_ok_and(|record| {
+                                    record.kind == SyntaxKind::TypeAliasDeclaration
+                                        && record.parent == Some(self.source.node_ref().node)
+                                        && record.range.end <= statement_node.range.start
+                                })
+                    )
+                });
+            if (export.is_type_only && !is_prior_type_alias)
+                || (!export.is_type_only
+                    && !is_prior_enum
+                    && !is_prior_function
+                    && !is_prior_namespace
+                    && !is_prior_named_value_import)
+            {
+                return Err(self.unsupported(
+                    clause,
+                    clause_node.kind,
+                    SourceSyntaxRole::ExportClause,
+                ));
+            }
+
+            let alias = self
+                .bound
+                .symbol(binding)
+                .ok_or(SourceCheckError::Import(binding))?;
+            let alias_record = store
+                .symbol(alias)
+                .ok_or(SourceCheckError::Import(binding))?;
+            if !aliases.insert(alias)
+                || module_record
+                    .exports()
+                    .and_then(|exports| store.symbol_table(exports))
+                    .and_then(|exports| exports.get_source(&identifier.text))
+                    != Some(alias)
+                || alias_record.flags() != SymbolFlags::ALIAS
+                || alias_record.check_flags() != CheckFlags::NONE
+                || alias_record.declarations() != Some(&[binding])
+                || alias_record.value_declaration().is_some()
+                || alias_record.members().is_some()
+                || alias_record.exports().is_some()
+                || alias_record.parent() != Some(module)
+                || alias_record.export_symbol().is_some()
+                || alias_record.name().as_bytes() != identifier.text.as_bytes()
+                || store.get_merged_symbol(alias) != Some(alias)
+                || store.alias_symbol_links(alias).is_some_and(|links| {
+                    links
+                        .immediate_target
+                        .is_some_and(|target| target != local_symbol)
+                        || links
+                            .type_only_declaration
+                            .is_some_and(|marker| !export.is_type_only || marker != binding)
+                        || links
+                            .alias_target
+                            .symbol()
+                            .is_some_and(|target| store.symbol(target).is_none())
+                })
+            {
+                return Err(SourceCheckError::Import(binding));
+            }
+
+            planned.push(PlannedLocalNamedExport {
+                clause,
+                local_symbol,
+                binding: SourceNamedReexportBindingPlan {
+                    declaration: binding,
+                    imported_name: name,
+                    exported_name: name,
+                    imported_text: identifier.text.clone(),
+                    exported_text: identifier.text.clone(),
+                    alias_symbol: alias,
+                    syntactic_type_only: export.is_type_only,
+                },
+            });
         }
 
-        Ok(Some(PlannedLocalNamedExport {
-            clause,
-            local_symbol,
-            binding: SourceNamedReexportBindingPlan {
-                declaration: binding,
-                imported_name: name,
-                exported_name: name,
-                imported_text: identifier.text.clone(),
-                exported_text: identifier.text.clone(),
-                alias_symbol: alias,
-                syntactic_type_only: export.is_type_only,
-            },
-        }))
+        Ok(planned)
     }
 
     fn plan_default_alias_export(
@@ -10044,6 +10113,206 @@ fn unresolved_named_value_import_is_unused(
         node.for_each_child(|child| pending.push(child));
     }
     found_import
+}
+
+/// Accepts one unresolved external alias used only by exported ambient members.
+fn unresolved_ambient_import_equals_type_root(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    import: &SourceImportPlan,
+    binding: &SourceImportBindingPlan,
+    error: &SourceImportError,
+    ambient_variables: &[PlannedAmbientVariable],
+) -> Option<NodeRef> {
+    use super::alias::{CanonicalAliasResolutionError, CanonicalAliasTargetUnavailable};
+
+    let SourceImportError::Alias(CanonicalAliasResolutionError::TargetUnavailable {
+        alias,
+        reason: CanonicalAliasTargetUnavailable::ModuleResolutionUnresolved(specifier),
+    }) = error
+    else {
+        return None;
+    };
+    let [variable] = ambient_variables else {
+        return None;
+    };
+    let root = variable.type_node?;
+    let source = bound.source_file();
+    if *alias != binding.alias_symbol
+        || *specifier != import.module_specifier
+        || binding.imported_text != "*"
+        || import.bindings.len() != 1
+        || binding.declaration != import.declaration
+        || !source.is_for(arena.id(), bound.file_id())
+        || bound.source_facts().is_none_or(|facts| {
+            !facts.is_external_module() || facts.is_declaration_file() || facts.is_javascript_file()
+        })
+        || store.alias_symbol_links(binding.alias_symbol).is_some()
+        || store.value_symbol_links(binding.alias_symbol).is_some()
+    {
+        return None;
+    }
+
+    let source_record = arena.get(source.node)?;
+    let NodeData::SourceFile(source_data) = &source_record.data else {
+        return None;
+    };
+    let [import_node, statement] = source_data.statements.nodes.as_slice() else {
+        return None;
+    };
+    if *import_node != import.declaration.node {
+        return None;
+    }
+    let import_record = arena.get(*import_node)?;
+    let NodeData::ImportEqualsDeclaration(import_data) = &import_record.data else {
+        return None;
+    };
+    let external_record = arena.get(import_data.module_reference)?;
+    let NodeData::ExternalModuleReference(external) = &external_record.data else {
+        return None;
+    };
+    if import_record.kind != SyntaxKind::ImportEqualsDeclaration
+        || import_record.parent != Some(source.node)
+        || import_data.is_type_only
+        || import_data.modifiers.is_some()
+        || import_data.name != binding.local_name.node
+        || external_record.kind != SyntaxKind::ExternalModuleReference
+        || external_record.parent != Some(import.declaration.node)
+        || external.expression != import.module_specifier.node
+        || !matches!(
+            arena
+                .get(import.module_specifier.node)
+                .map(|node| &node.data),
+            Some(NodeData::StringLiteral(_))
+        )
+    {
+        return None;
+    }
+
+    let statement_record = arena.get(*statement)?;
+    let NodeData::VariableStatement(statement_data) = &statement_record.data else {
+        return None;
+    };
+    let [export, declare] = statement_data.modifiers.as_ref()?.list.nodes.as_slice() else {
+        return None;
+    };
+    let list_record = arena.get(statement_data.declaration_list)?;
+    let NodeData::VariableDeclarationList(list) = &list_record.data else {
+        return None;
+    };
+    let [declaration] = list.declarations.nodes.as_slice() else {
+        return None;
+    };
+    let declaration_record = arena.get(*declaration)?;
+    let NodeData::VariableDeclaration(variable_data) = &declaration_record.data else {
+        return None;
+    };
+    let root_record = arena.get(root.node)?;
+    let NodeData::TypeLiteralNode(literal) = &root_record.data else {
+        return None;
+    };
+    let declaration = NodeRef::new(root.arena, root.file, *declaration);
+    if statement_record.kind != SyntaxKind::VariableStatement
+        || statement_record.parent != Some(source.node)
+        || import_record.range.end > statement_record.range.start
+        || arena.get(*export)?.kind != SyntaxKind::ExportKeyword
+        || arena.get(*declare)?.kind != SyntaxKind::DeclareKeyword
+        || list_record.parent != Some(*statement)
+        || declaration_record.parent != Some(statement_data.declaration_list)
+        || variable_data.initializer.is_some()
+        || variable_data.type_ != Some(root.node)
+        || root_record.kind != SyntaxKind::TypeLiteral
+        || root_record.parent != Some(declaration.node)
+        || literal.members.nodes.is_empty()
+        || bound
+            .symbol(declaration)
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            != Some(variable.symbol)
+    {
+        return None;
+    }
+
+    let mut alias_uses = HashSet::with_capacity(literal.members.nodes.len());
+    for member in &literal.members.nodes {
+        let member_record = arena.get(*member)?;
+        let reference = match &member_record.data {
+            NodeData::PropertyDeclaration(property)
+                if member_record.kind == SyntaxKind::PropertyDeclaration
+                    && property.initializer.is_none()
+                    && property.modifiers.is_none() =>
+            {
+                property.type_?
+            }
+            NodeData::PropertySignatureDeclaration(property)
+                if member_record.kind == SyntaxKind::PropertySignature =>
+            {
+                property.type_
+            }
+            NodeData::CallSignatureDeclaration(call)
+                if member_record.kind == SyntaxKind::CallSignature
+                    && call.parameters.nodes.is_empty()
+                    && call.type_parameters.is_none() =>
+            {
+                call.type_?
+            }
+            _ => return None,
+        };
+        let reference_record = arena.get(reference)?;
+        let NodeData::TypeReferenceNode(type_reference) = &reference_record.data else {
+            return None;
+        };
+        let qualified_record = arena.get(type_reference.type_name)?;
+        let NodeData::QualifiedName(qualified) = &qualified_record.data else {
+            return None;
+        };
+        let left = arena.get(qualified.left)?;
+        let right = arena.get(qualified.right)?;
+        let (NodeData::Identifier(local), NodeData::Identifier(member_name)) =
+            (&left.data, &right.data)
+        else {
+            return None;
+        };
+        if member_record.parent != Some(root.node)
+            || member_record.flags.0 != 0
+            || reference_record.kind != SyntaxKind::TypeReference
+            || reference_record.flags.0 != 0
+            || reference_record.parent != Some(*member)
+            || type_reference.type_arguments.is_some()
+            || qualified_record.kind != SyntaxKind::QualifiedName
+            || qualified_record.flags.0 != 0
+            || qualified_record.parent != Some(reference)
+            || qualified.flow_node.is_some()
+            || qualified.facts != 0
+            || left.kind != SyntaxKind::Identifier
+            || left.flags.0 != 0
+            || left.parent != Some(type_reference.type_name)
+            || local.flow_node.is_some()
+            || local.text != binding.local_text
+            || right.kind != SyntaxKind::Identifier
+            || right.flags.0 != 0
+            || right.parent != Some(type_reference.type_name)
+            || member_name.flow_node.is_some()
+            || member_name.text.is_empty()
+            || !alias_uses.insert(qualified.left)
+        {
+            return None;
+        }
+    }
+
+    if arena.iter().any(|(node, record)| {
+        matches!(
+            &record.data,
+            NodeData::Identifier(identifier)
+                if identifier.text == binding.local_text
+                    && node != binding.local_name.node
+                    && !alias_uses.contains(&node)
+        )
+    }) {
+        return None;
+    }
+
+    Some(root)
 }
 
 fn unresolved_namespace_import_read(
@@ -17071,8 +17340,12 @@ pub(super) fn check_source_file(
                 } else {
                     matches!(
                         target.flags(),
-                        SymbolFlags::CONST_ENUM | SymbolFlags::REGULAR_ENUM
-                    )
+                        SymbolFlags::CONST_ENUM | SymbolFlags::REGULAR_ENUM | SymbolFlags::FUNCTION
+                    ) || target.flags().intersects(SymbolFlags::MODULE)
+                        && target
+                            .flags()
+                            .without(SymbolFlags::MODULE | SymbolFlags::CONST_ENUM_ONLY_MODULE)
+                            == SymbolFlags::NONE
                 }
             })
             || resolved.type_only_declaration != expected_type_only_marker
@@ -17093,6 +17366,7 @@ pub(super) fn check_source_file(
 
     let mut resolved_imports = HashMap::<SemanticSymbolId, ResolvedSourceImportBinding>::new();
     let mut unresolved_namespace_imports = HashMap::<SemanticSymbolId, NodeRef>::new();
+    let mut unresolved_ambient_import_type_roots = HashSet::<NodeRef>::new();
     for import in &value_imports {
         for binding in &import.bindings {
             if let Some(diagnostic) =
@@ -17120,6 +17394,20 @@ pub(super) fn check_source_file(
                     ));
                 }
                 Err(error) => {
+                    if let Some(root) = unresolved_ambient_import_equals_type_root(
+                        arena,
+                        bound,
+                        store,
+                        import,
+                        binding,
+                        &error,
+                        &ambient_variables,
+                    ) {
+                        if !unresolved_ambient_import_type_roots.insert(root) {
+                            return Err(SourceCheckError::Import(binding.declaration));
+                        }
+                        continue;
+                    }
                     if let Some(read) = unresolved_namespace_import_read(
                         arena, bound, source, store, import, binding, &error,
                     ) {
@@ -17294,6 +17582,16 @@ pub(super) fn check_source_file(
         let Some(type_node) = variable.type_node else {
             continue;
         };
+        if unresolved_ambient_import_type_roots.contains(&type_node) {
+            let error_type = store
+                .intrinsic_bootstrap()
+                .map(|bootstrap| bootstrap.error_type)
+                .ok_or(SourceCheckError::LiteralCache(
+                    SourceLiteralCacheError::BootstrapUninitialized,
+                ))?;
+            preflight_source_expression_cache(store, type_node, error_type)?;
+            continue;
+        }
         if type_import_roots.contains(&type_node) {
             continue;
         }
@@ -17582,24 +17880,35 @@ pub(super) fn check_source_file(
 
     for variable in &ambient_variables {
         let declared_type = if let Some(type_node) = variable.type_node {
-            session.reset_query();
-            let mut annotation_diagnostics = CanonicalCheckerDiagnostics::default();
-            let type_reference_alias_targets: &[CanonicalTypeReferenceAliasTarget] =
-                type_import_capabilities
-                    .get(&type_node)
-                    .map_or_else(|| &[], Vec::as_slice);
-            let declared_type = CanonicalTypeQuery::new_with_global_types_and_session(
-                store,
-                host,
-                global_types,
-                options,
-                session,
-                &mut annotation_diagnostics,
-            )?
-            .with_type_reference_alias_targets(type_reference_alias_targets.iter().copied())?
-            .get_type_from_type_node(type_node);
-            merge_retry_diagnostics(diagnostics, annotation_diagnostics);
-            declared_type?
+            if unresolved_ambient_import_type_roots.contains(&type_node) {
+                let error_type = store
+                    .intrinsic_bootstrap()
+                    .map(|bootstrap| bootstrap.error_type)
+                    .ok_or(SourceCheckError::LiteralCache(
+                        SourceLiteralCacheError::BootstrapUninitialized,
+                    ))?;
+                publish_expression_type(store, type_node, error_type)?;
+                error_type
+            } else {
+                session.reset_query();
+                let mut annotation_diagnostics = CanonicalCheckerDiagnostics::default();
+                let type_reference_alias_targets: &[CanonicalTypeReferenceAliasTarget] =
+                    type_import_capabilities
+                        .get(&type_node)
+                        .map_or_else(|| &[], Vec::as_slice);
+                let declared_type = CanonicalTypeQuery::new_with_global_types_and_session(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    &mut annotation_diagnostics,
+                )?
+                .with_type_reference_alias_targets(type_reference_alias_targets.iter().copied())?
+                .get_type_from_type_node(type_node);
+                merge_retry_diagnostics(diagnostics, annotation_diagnostics);
+                declared_type?
+            }
         } else if let Some(initializer) = &variable.initializer {
             let initializer = check_expression_type(
                 store,
@@ -26375,6 +26684,62 @@ mod tests {
     }
 
     #[test]
+    fn local_named_exports_preserve_function_and_namespace_aliases_in_order() {
+        let source = parsed(concat!(
+            "function createElement(): any {} ",
+            "namespace JSX { export interface IntrinsicElements {} } ",
+            "export { createElement, JSX };",
+        ));
+        let file = FileId::new(8_365);
+        let mut context = context_with_module_state(
+            &[(file, &source)],
+            CanonicalModuleState::External,
+            CanonicalCheckerOptions::default(),
+        );
+        let (_, bound) = context.file(file).unwrap();
+        let module = bound.symbol(bound.source_file()).unwrap();
+        let exports = context
+            .store()
+            .symbol(module)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| context.store().symbol_table(exports))
+            .unwrap();
+        let function_alias = exports.get_source("createElement").unwrap();
+        let namespace_alias = exports.get_source("JSX").unwrap();
+        let function = function_symbol(&context, &source, file, "createElement");
+        let namespace = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ModuleDeclaration).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .and_then(|declaration| bound.symbol(declaration))
+            .unwrap();
+
+        context.check_source_file(file).unwrap();
+
+        for (alias, target) in [(function_alias, function), (namespace_alias, namespace)] {
+            assert_eq!(
+                context
+                    .store()
+                    .alias_symbol_links(alias)
+                    .map(|links| (links.immediate_target, links.alias_target)),
+                Some((Some(target), AliasTargetState::Resolved(target))),
+            );
+            assert!(context.store().value_symbol_links(alias).is_none());
+        }
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
     fn exported_variables_issue_ordered_ts2322_diagnostics_at_identifiers() {
         let source = parsed(concat!(
             "export {}; ",
@@ -28728,6 +29093,71 @@ mod tests {
             context.recheck_source_file(file).unwrap();
             assert_eq!(observable_state(&context, file), warm);
         }
+    }
+
+    #[test]
+    fn unresolved_import_equals_ambient_type_members_recover_without_alias_links() {
+        let source = parsed(concat!(
+            "import a1 = require('garbage'); ",
+            "export declare var a: { ",
+            "test1: a1.connectModule; ",
+            "(): a1.connectExport; ",
+            "};",
+        ));
+        let file = FileId::new(8_366);
+        let declaration = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ImportEqualsDeclaration).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let NodeData::ImportEqualsDeclaration(import) =
+            &source.arena.get(declaration.node).unwrap().data
+        else {
+            panic!("expected one import-equals declaration")
+        };
+        let NodeData::ExternalModuleReference(external) =
+            &source.arena.get(import.module_reference).unwrap().data
+        else {
+            panic!("expected one external require reference")
+        };
+        let specifier = NodeRef::new(source.arena.id(), file, external.expression);
+        let mut context = CanonicalCheckerContext::new_with_module_resolutions(
+            completed_bindings_with_module_state(
+                &[(file, &source)],
+                CanonicalModuleState::External,
+            ),
+            vec![(file, &source.arena)],
+            CanonicalCheckerOptions::default(),
+            CanonicalModuleResolutionManifestInput::new([
+                CanonicalModuleResolutionEntry::unresolved(specifier),
+            ]),
+        )
+        .unwrap();
+        let (_, bound) = context.file(file).unwrap();
+        let alias = bound.symbol(declaration).unwrap();
+        let root = variable_type_node(&source, file, "a");
+
+        context.check_source_file(file).unwrap();
+
+        let error_type = context.store().intrinsic_bootstrap().unwrap().error_type;
+        assert_eq!(
+            variable_value_type(&context, &source, file, "a"),
+            error_type
+        );
+        assert_eq!(resolved_node_type(&context, root), error_type);
+        assert!(context.store().alias_symbol_links(alias).is_none());
+        assert!(context.store().value_symbol_links(alias).is_none());
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
     }
 
     #[test]

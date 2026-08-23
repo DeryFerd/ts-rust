@@ -5462,6 +5462,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     && !self.is_initialized_global_function(symbol)
                     && !self.is_default_library_template_strings_array(symbol)
                     && !self.is_canonical_global_jsx_element(symbol)
+                    && !self.is_default_library_dom_interface_argument(node, symbol)
                 {
                     self.plan_property_interface(symbol)?;
                 }
@@ -5877,6 +5878,492 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             == Some(symbol)
     }
 
+    #[allow(clippy::too_many_lines)] // Validates every DOM interface and value declaration together.
+    fn is_default_library_dom_interface_argument(
+        &self,
+        node: NodeRef,
+        symbol: SemanticSymbolId,
+    ) -> bool {
+        let Some(reference_record) = self.host.node(node) else {
+            return false;
+        };
+        let NodeData::TypeReferenceNode(reference) = &reference_record.data else {
+            return false;
+        };
+        let name = NodeRef::new(node.arena, node.file, reference.type_name);
+        let Some(name_record) = self.host.node(name) else {
+            return false;
+        };
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return false;
+        };
+        if reference_record.kind != SyntaxKind::TypeReference
+            || reference_record.flags.0 != 0
+            || reference.type_arguments.is_some()
+            || name_record.kind != SyntaxKind::Identifier
+            || name_record.flags.0 != 0
+            || name_record.parent != Some(node.node)
+            || identifier.flow_node.is_some()
+            || !(identifier.text.starts_with("HTML") || identifier.text.starts_with("SVG"))
+            || !identifier.text.ends_with("Element")
+            || !self.global_symbol_has_name(symbol, &identifier.text)
+            || !self.is_react_intrinsic_dom_generic_argument(node)
+        {
+            return false;
+        }
+
+        let Some(owner) = self.store.symbol(symbol) else {
+            return false;
+        };
+        let allowed =
+            SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::TRANSIENT;
+        if !owner.flags().contains(SymbolFlags::INTERFACE)
+            || owner.flags().without(allowed) != SymbolFlags::NONE
+            || owner.check_flags() != ts_binder::CheckFlags::NONE
+            || owner.name().as_utf8() != Some(identifier.text.as_str())
+            || owner.parent().is_some()
+            || owner.exports().is_some()
+            || owner.export_symbol().is_some()
+            || self.store.get_merged_symbol(symbol) != Some(symbol)
+        {
+            return false;
+        }
+
+        if let Some(declared) = self
+            .store
+            .declared_type_links(symbol)
+            .and_then(|links| links.declared_type)
+        {
+            let Some(record) = self.store.type_payload(declared) else {
+                return false;
+            };
+            let TypeData::Interface(interface) = record.data() else {
+                return false;
+            };
+            if record.flags() != TypeFlags::OBJECT
+                || !record.object_flags().contains(ObjectFlags::INTERFACE)
+                || record.object_flags().contains(ObjectFlags::CLASS)
+                || record.symbol() != Some(symbol)
+                || record.alias().is_some()
+                || interface.outer_type_parameter_count != 0
+                || interface
+                    .reference
+                    .resolved_type_arguments
+                    .as_ref()
+                    .is_some_and(|arguments| !arguments.is_empty())
+            {
+                return false;
+            }
+        }
+
+        let Some(declarations) = owner.declarations() else {
+            return false;
+        };
+        let mut seen = HashSet::with_capacity(declarations.len());
+        let mut has_interface = false;
+        let mut value_declaration = None;
+        for &declaration in declarations {
+            let Some(bound) = self.host.bound_file(declaration) else {
+                return false;
+            };
+            let Some(facts) = bound.source_facts() else {
+                return false;
+            };
+            let Some(record) = self.host.node(declaration) else {
+                return false;
+            };
+            if !seen.insert(declaration)
+                || !facts.is_default_library()
+                || !facts.is_declaration_file()
+                || facts.is_external_or_common_js_module()
+                || !self.host.symbol_matches(self.store, declaration, symbol)
+            {
+                return false;
+            }
+
+            let declaration_name = match &record.data {
+                NodeData::InterfaceDeclaration(interface)
+                    if record.kind == SyntaxKind::InterfaceDeclaration
+                        && record.parent == Some(bound.source_file().node)
+                        && interface.type_parameters.is_none() =>
+                {
+                    has_interface = true;
+                    interface.name
+                }
+                NodeData::VariableDeclaration(variable)
+                    if record.kind == SyntaxKind::VariableDeclaration
+                        && owner
+                            .flags()
+                            .contains(SymbolFlags::FUNCTION_SCOPED_VARIABLE)
+                        && variable.initializer.is_none()
+                        && variable.exclamation_token.is_none()
+                        && variable.local_symbol.is_none()
+                        && variable.symbol.is_none()
+                        && variable.facts == 0
+                        && value_declaration.replace(declaration).is_none() =>
+                {
+                    let Some(list_id) = record.parent else {
+                        return false;
+                    };
+                    let list = NodeRef::new(declaration.arena, declaration.file, list_id);
+                    let Some(list_record) = self.host.node(list) else {
+                        return false;
+                    };
+                    let NodeData::VariableDeclarationList(variables) = &list_record.data else {
+                        return false;
+                    };
+                    let Some(statement_id) = list_record.parent else {
+                        return false;
+                    };
+                    let statement = NodeRef::new(declaration.arena, declaration.file, statement_id);
+                    let Some(statement_record) = self.host.node(statement) else {
+                        return false;
+                    };
+                    let NodeData::VariableStatement(variable_statement) = &statement_record.data
+                    else {
+                        return false;
+                    };
+                    let Some(modifiers) = variable_statement.modifiers.as_ref() else {
+                        return false;
+                    };
+                    let [modifier] = modifiers.list.nodes.as_slice() else {
+                        return false;
+                    };
+                    let modifier = NodeRef::new(statement.arena, statement.file, *modifier);
+                    let Some(modifier_record) = self.host.node(modifier) else {
+                        return false;
+                    };
+                    if list_record.kind != SyntaxKind::VariableDeclarationList
+                        || list_record.flags.0 != 0
+                        || variables
+                            .declarations
+                            .nodes
+                            .iter()
+                            .filter(|candidate| **candidate == declaration.node)
+                            .count()
+                            != 1
+                        || statement_record.kind != SyntaxKind::VariableStatement
+                        || statement_record.parent != Some(bound.source_file().node)
+                        || variable_statement.declaration_list != list.node
+                        || modifier_record.kind != SyntaxKind::DeclareKeyword
+                        || modifier_record.parent != Some(statement.node)
+                    {
+                        return false;
+                    }
+                    variable.name
+                }
+                _ => return false,
+            };
+            let declaration_name =
+                NodeRef::new(declaration.arena, declaration.file, declaration_name);
+            let Some(declaration_name_record) = self.host.node(declaration_name) else {
+                return false;
+            };
+            if declaration_name_record.parent != Some(declaration.node)
+                || !matches!(
+                    &declaration_name_record.data,
+                    NodeData::Identifier(name)
+                        if declaration_name_record.kind == SyntaxKind::Identifier
+                            && name.text == identifier.text
+                            && name.flow_node.is_none()
+                )
+            {
+                return false;
+            }
+        }
+        has_interface
+            && owner.value_declaration() == value_declaration
+            && owner
+                .flags()
+                .contains(SymbolFlags::FUNCTION_SCOPED_VARIABLE)
+                == value_declaration.is_some()
+    }
+
+    #[allow(clippy::too_many_lines)] // Proves the full React generic and JSX property ancestry.
+    fn is_react_intrinsic_dom_generic_argument(&self, node: NodeRef) -> bool {
+        let mut child = node;
+        let mut outer_is_intrinsic_props = false;
+        let mut seen = HashSet::new();
+        loop {
+            if !seen.insert(child) || seen.len() > 4 {
+                return false;
+            }
+            let Some(child_record) = self.host.node(child) else {
+                return false;
+            };
+            let Some(parent_id) = child_record.parent else {
+                return false;
+            };
+            let parent = NodeRef::new(child.arena, child.file, parent_id);
+            let Some(parent_record) = self.host.node(parent) else {
+                return false;
+            };
+            match &parent_record.data {
+                NodeData::TypeReferenceNode(reference)
+                    if parent_record.kind == SyntaxKind::TypeReference =>
+                {
+                    let Some(arguments) = reference.type_arguments.as_ref() else {
+                        return false;
+                    };
+                    if parent_record.flags.0 != 0
+                        || arguments.nodes.is_empty()
+                        || arguments.has_trailing_comma
+                        || arguments
+                            .nodes
+                            .iter()
+                            .filter(|argument| **argument == child.node)
+                            .count()
+                            != 1
+                    {
+                        return false;
+                    }
+                    let name = NodeRef::new(parent.arena, parent.file, reference.type_name);
+                    let Some(name_record) = self.host.node(name) else {
+                        return false;
+                    };
+                    let NodeData::QualifiedName(qualified) = &name_record.data else {
+                        return false;
+                    };
+                    let react_name = NodeRef::new(name.arena, name.file, qualified.left);
+                    let Some(react_record) = self.host.node(react_name) else {
+                        return false;
+                    };
+                    let NodeData::Identifier(react_identifier) = &react_record.data else {
+                        return false;
+                    };
+                    let member_name = NodeRef::new(name.arena, name.file, qualified.right);
+                    let Some(member_record) = self.host.node(member_name) else {
+                        return false;
+                    };
+                    let NodeData::Identifier(member_identifier) = &member_record.data else {
+                        return false;
+                    };
+                    if name_record.kind != SyntaxKind::QualifiedName
+                        || name_record.parent != Some(parent.node)
+                        || qualified.flow_node.is_some()
+                        || qualified.facts != 0
+                        || react_record.kind != SyntaxKind::Identifier
+                        || react_record.parent != Some(name.node)
+                        || react_identifier.flow_node.is_some()
+                        || react_identifier.text != "React"
+                        || member_record.kind != SyntaxKind::Identifier
+                        || member_record.parent != Some(name.node)
+                        || member_identifier.flow_node.is_some()
+                    {
+                        return false;
+                    }
+
+                    let Ok(mut callback_host) = self.host.name_resolver_host(self.store) else {
+                        return false;
+                    };
+                    let Ok(Some(namespace)) =
+                        callback_host.resolve_entity_name(react_name, SymbolFlags::NAMESPACE)
+                    else {
+                        return false;
+                    };
+                    let Some(namespace) = self.store.get_merged_symbol(namespace) else {
+                        return false;
+                    };
+                    let Some(namespace_record) = self.store.symbol(namespace) else {
+                        return false;
+                    };
+                    let Ok(Some(target)) =
+                        callback_host.resolve_entity_name(name, SymbolFlags::TYPE)
+                    else {
+                        return false;
+                    };
+                    let Some(target) = self.store.get_merged_symbol(target) else {
+                        return false;
+                    };
+                    let exported = self
+                        .store
+                        .module_symbol_links(namespace)
+                        .and_then(|links| links.resolved_exports)
+                        .or_else(|| namespace_record.exports())
+                        .and_then(|exports| self.store.symbol_table(exports))
+                        .and_then(|exports| exports.get_source(&member_identifier.text))
+                        .and_then(|export| self.store.get_merged_symbol(export));
+                    if namespace_record.name().as_utf8() != Some("React")
+                        || !namespace_record.flags().intersects(SymbolFlags::NAMESPACE)
+                        || exported != Some(target)
+                    {
+                        return false;
+                    }
+                    outer_is_intrinsic_props = matches!(
+                        member_identifier.text.as_str(),
+                        "DetailedHTMLProps" | "SVGProps"
+                    );
+                    child = parent;
+                }
+                NodeData::PropertyDeclaration(property)
+                    if parent_record.kind == SyntaxKind::PropertyDeclaration
+                        && property.type_ == Some(child.node)
+                        && outer_is_intrinsic_props =>
+                {
+                    return self.is_canonical_jsx_intrinsic_property(parent);
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)] // Validates JSX exports, declarations, and property ownership.
+    fn is_canonical_jsx_intrinsic_property(&self, property: NodeRef) -> bool {
+        let Some(property_record) = self.host.node(property) else {
+            return false;
+        };
+        let NodeData::PropertyDeclaration(property_data) = &property_record.data else {
+            return false;
+        };
+        let Some(bound) = self.host.bound_file(property) else {
+            return false;
+        };
+        let Some(facts) = bound.source_facts() else {
+            return false;
+        };
+        let Some(interface_id) = property_record.parent else {
+            return false;
+        };
+        let interface = NodeRef::new(property.arena, property.file, interface_id);
+        let Some(interface_record) = self.host.node(interface) else {
+            return false;
+        };
+        let NodeData::InterfaceDeclaration(interface_data) = &interface_record.data else {
+            return false;
+        };
+        let Some(owner) = bound
+            .symbol(interface)
+            .and_then(|owner| self.store.get_merged_symbol(owner))
+        else {
+            return false;
+        };
+        let Some(owner_record) = self.store.symbol(owner) else {
+            return false;
+        };
+        let Some(namespace) = self
+            .store
+            .intrinsic_bootstrap()
+            .and_then(|bootstrap| self.store.symbol_table(bootstrap.globals))
+            .and_then(|globals| globals.get_source("JSX"))
+            .and_then(|namespace| self.store.get_merged_symbol(namespace))
+        else {
+            return false;
+        };
+        let Some(namespace_record) = self.store.symbol(namespace) else {
+            return false;
+        };
+        let exported = self
+            .store
+            .module_symbol_links(namespace)
+            .and_then(|links| links.resolved_exports)
+            .or_else(|| namespace_record.exports())
+            .and_then(|exports| self.store.symbol_table(exports))
+            .and_then(|exports| exports.get_source("IntrinsicElements"))
+            .and_then(|intrinsics| self.store.get_merged_symbol(intrinsics));
+        let name = NodeRef::new(interface.arena, interface.file, interface_data.name);
+        let Some(name_record) = self.host.node(name) else {
+            return false;
+        };
+        let property_name = NodeRef::new(property.arena, property.file, property_data.name);
+        let Some(property_name_record) = self.host.node(property_name) else {
+            return false;
+        };
+        let NodeData::Identifier(property_identifier) = &property_name_record.data else {
+            return false;
+        };
+        let Some(property_symbol) = bound
+            .symbol(property)
+            .and_then(|symbol| self.store.get_merged_symbol(symbol))
+        else {
+            return false;
+        };
+        let Some(property_owner) = self.store.symbol(property_symbol) else {
+            return false;
+        };
+        if !facts.is_declaration_file()
+            || facts.is_default_library()
+            || property_record.flags.0 != 0
+            || property_data.initializer.is_some()
+            || property_data.symbol.is_some()
+            || property_data.facts != 0
+            || interface_record.kind != SyntaxKind::InterfaceDeclaration
+            || interface_data.type_parameters.is_some()
+            || interface_data
+                .members
+                .nodes
+                .iter()
+                .filter(|candidate| **candidate == property.node)
+                .count()
+                != 1
+            || !self.host.symbol_matches(self.store, interface, owner)
+            || !owner_record.flags().contains(SymbolFlags::INTERFACE)
+            || owner_record
+                .flags()
+                .without(SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT)
+                != SymbolFlags::NONE
+            || owner_record.name().as_utf8() != Some("IntrinsicElements")
+            || self.store.get_parent_of_symbol(owner) != Some(namespace)
+            || !namespace_record.flags().intersects(SymbolFlags::NAMESPACE)
+            || namespace_record.name().as_utf8() != Some("JSX")
+            || exported != Some(owner)
+            || !matches!(
+                &name_record.data,
+                NodeData::Identifier(identifier)
+                    if name_record.kind == SyntaxKind::Identifier
+                        && name_record.parent == Some(interface.node)
+                        && identifier.text == "IntrinsicElements"
+                        && identifier.flow_node.is_none()
+            )
+            || property_name_record.kind != SyntaxKind::Identifier
+            || property_name_record.parent != Some(property.node)
+            || property_identifier.flow_node.is_some()
+            || property_identifier.text.is_empty()
+            || !property_owner.flags().contains(SymbolFlags::PROPERTY)
+            || property_owner.name().as_utf8() != Some(property_identifier.text.as_str())
+            || self.store.get_parent_of_symbol(property_symbol) != Some(owner)
+            || owner_record
+                .members()
+                .and_then(|members| self.store.symbol_table(members))
+                .and_then(|members| members.get(property_owner.name()))
+                .and_then(|member| self.store.get_merged_symbol(member))
+                != Some(property_symbol)
+        {
+            return false;
+        }
+
+        let Some(block_id) = interface_record.parent else {
+            return false;
+        };
+        let block = NodeRef::new(interface.arena, interface.file, block_id);
+        let Some(block_record) = self.host.node(block) else {
+            return false;
+        };
+        let NodeData::ModuleBlock(module_block) = &block_record.data else {
+            return false;
+        };
+        let Some(module_id) = block_record.parent else {
+            return false;
+        };
+        let module = NodeRef::new(block.arena, block.file, module_id);
+        let Some(module_record) = self.host.node(module) else {
+            return false;
+        };
+        let NodeData::ModuleDeclaration(module_data) = &module_record.data else {
+            return false;
+        };
+        block_record.kind == SyntaxKind::ModuleBlock
+            && module_block
+                .statements
+                .nodes
+                .iter()
+                .filter(|candidate| **candidate == interface.node)
+                .count()
+                == 1
+            && module_record.kind == SyntaxKind::ModuleDeclaration
+            && module_data.body == Some(block.node)
+            && self.host.symbol_matches(self.store, module, namespace)
+    }
+
     #[allow(clippy::too_many_lines)] // Namespace and declaration checks form one identity proof.
     fn is_canonical_global_jsx_element(&self, symbol: SemanticSymbolId) -> bool {
         let Some(namespace) = self
@@ -6195,6 +6682,29 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 symbol,
                 local_type_parameter_count,
             )?;
+            return Ok(Vec::new());
+        }
+        if declarations.len() > 1
+            && local_type_parameter_count == 1
+            && self.is_react_intrinsic_dom_generic_argument(node)
+        {
+            let merged =
+                object_members::plan_lazy_merged_generic_interface(self.store, self.host, symbol)
+                    .map_err(property_object_error)?;
+            if merged.symbol != symbol
+                || self
+                    .store
+                    .symbol(merged.namespace)
+                    .and_then(|namespace| namespace.name().as_utf8())
+                    != Some("React")
+                || self
+                    .store
+                    .symbol(symbol)
+                    .and_then(|interface| interface.name().as_utf8())
+                    != Some("HTMLAttributes")
+            {
+                return Err(unsupported());
+            }
             return Ok(Vec::new());
         }
         if declarations.len() != 1 {
@@ -12923,6 +13433,149 @@ mod tests {
         store: CanonicalTypeMapperStore,
     }
 
+    struct ReactDomFixture {
+        library: ParseResult,
+        react: ParseResult,
+        source: ParseResult,
+        library_file: FileId,
+        react_file: FileId,
+        source_file: FileId,
+        files: BTreeMap<FileId, BoundFile>,
+        store: CanonicalTypeMapperStore,
+    }
+
+    #[allow(clippy::too_many_lines)] // One fixture binds independent DOM, React, and source files.
+    fn react_dom_fixture(is_default_library: bool) -> ReactDomFixture {
+        let library = parse_source_file(concat!(
+            "interface HTMLElement { root: string; } ",
+            "declare var HTMLElement: unknown; ",
+            "interface HTMLDivElement extends HTMLElement { align: string; } ",
+            "declare var HTMLDivElement: unknown; ",
+            "interface HTMLHeadingElement extends HTMLElement { align: string; } ",
+            "declare var HTMLHeadingElement: unknown;",
+        ));
+        let react = parse_source_file(concat!(
+            "declare namespace React { ",
+            "interface DOMAttributes<Value> {} ",
+            "interface HTMLAttributes<Value> extends DOMAttributes<Value> { id?: string; } ",
+            "interface HTMLAttributes<Value> extends DOMAttributes<Value> { title?: string; } ",
+            "interface DetailedHTMLProps<Attributes, Target> {} ",
+            "} ",
+            "declare namespace JSX { ",
+            "interface IntrinsicElements { ",
+            "div: React.DetailedHTMLProps<React.HTMLAttributes<HTMLDivElement>, HTMLDivElement>; ",
+            "h1: React.DetailedHTMLProps<React.HTMLAttributes<HTMLHeadingElement>, HTMLHeadingElement>; ",
+            "} }",
+        ));
+        let source = parse_source_file(concat!(
+            "let ordinary: HTMLDivElement; ",
+            "let generic: React.HTMLAttributes<HTMLDivElement>;",
+        ));
+        let library_file = FileId::new(91);
+        let react_file = FileId::new(92);
+        let source_file = FileId::new(93);
+        let mut binder = CanonicalBinder::new();
+        for (parsed, file, declaration, default_library) in [
+            (&library, library_file, true, is_default_library),
+            (&react, react_file, true, false),
+            (&source, source_file, false, false),
+        ] {
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new_with_default_library(
+                        EscapedName::source(format!("\"/react-dom-{}.ts\"", file.index())),
+                        CanonicalSourceLanguage::TypeScript,
+                        declaration,
+                        default_library,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let (symbols, files) = binder.finish().try_into_parts().unwrap();
+        let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
+        for (parsed, file) in [
+            (&library, library_file),
+            (&react, react_file),
+            (&source, source_file),
+        ] {
+            assert!(
+                store
+                    .register_source_file(&parsed.arena, parsed.source_file, file)
+                    .is_some()
+            );
+        }
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        let globals = store.intrinsic_bootstrap().unwrap().globals;
+        for bound in files.values() {
+            let symbols = store
+                .symbol_table(bound.locals(bound.source_file()).unwrap())
+                .unwrap()
+                .iter()
+                .map(|(_, symbol)| symbol)
+                .collect::<Vec<_>>();
+            for symbol in symbols {
+                store.merge_global_symbol(globals, symbol).unwrap();
+            }
+        }
+        ReactDomFixture {
+            library,
+            react,
+            source,
+            library_file,
+            react_file,
+            source_file,
+            files,
+            store,
+        }
+    }
+
+    fn react_dom_property_annotation(
+        parsed: &ParseResult,
+        file: FileId,
+        expected: &str,
+    ) -> NodeRef {
+        parsed
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::PropertyDeclaration(property) = &record.data else {
+                    return None;
+                };
+                (identifier_text(&parsed.arena, property.name) == Some(expected))
+                    .then_some(property.type_?)
+                    .map(|node| NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .unwrap_or_else(|| panic!("missing React intrinsic property {expected}"))
+    }
+
+    fn react_dom_type_references(
+        parsed: &ParseResult,
+        file: FileId,
+        expected: &str,
+    ) -> Vec<NodeRef> {
+        parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let NodeData::TypeReferenceNode(reference) = &record.data else {
+                    return None;
+                };
+                (identifier_text(&parsed.arena, reference.type_name) == Some(expected))
+                    .then_some(NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .collect()
+    }
+
     type StoreState = (usize, usize, [usize; 26], usize, usize);
     type LiteralState = (StoreState, usize, usize, usize);
     type UnionState = (LiteralState, usize, usize);
@@ -19140,6 +19793,180 @@ mod tests {
         ));
         assert_eq!(store_state(&fixture.store), before);
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Covers real DOM and reopened React identities together.
+    fn react_intrinsic_dom_arguments_keep_default_library_members_lazy() {
+        let ReactDomFixture {
+            library,
+            react,
+            source,
+            library_file,
+            react_file,
+            source_file,
+            files,
+            mut store,
+        } = react_dom_fixture(true);
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&library.arena, files.get(&library_file).unwrap()),
+                (&react.arena, files.get(&react_file).unwrap()),
+                (&source.arena, files.get(&source_file).unwrap()),
+            ],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let globals = store.intrinsic_bootstrap().unwrap().globals;
+        let div = store
+            .symbol_table(globals)
+            .unwrap()
+            .get_source("HTMLDivElement")
+            .unwrap();
+        let heading = store
+            .symbol_table(globals)
+            .unwrap()
+            .get_source("HTMLHeadingElement")
+            .unwrap();
+        let react_namespace = store
+            .symbol_table(globals)
+            .unwrap()
+            .get_source("React")
+            .unwrap();
+        let html_attributes = store
+            .symbol(react_namespace)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| store.symbol_table(exports))
+            .and_then(|exports| exports.get_source("HTMLAttributes"))
+            .unwrap();
+        assert_eq!(
+            store
+                .symbol(html_attributes)
+                .unwrap()
+                .declarations()
+                .unwrap()
+                .len(),
+            2,
+        );
+        let aliases = HashMap::new();
+        for (name, symbol) in [("HTMLDivElement", div), ("HTMLHeadingElement", heading)] {
+            let references = react_dom_type_references(&react, react_file, name);
+            assert_eq!(references.len(), 2);
+            for reference in references {
+                assert!(
+                    TypeQueryPlanner::new(&store, &host, None, None, false, &aliases)
+                        .is_default_library_dom_interface_argument(reference, symbol)
+                );
+            }
+        }
+        for reference in react_dom_type_references(&source, source_file, "HTMLDivElement") {
+            assert!(
+                !TypeQueryPlanner::new(&store, &host, None, None, false, &aliases)
+                    .is_default_library_dom_interface_argument(reference, div)
+            );
+        }
+
+        let div_annotation = react_dom_property_annotation(&react, react_file, "div");
+        let heading_annotation = react_dom_property_annotation(&react, react_file, "h1");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut resolved = Vec::new();
+        for annotation in [div_annotation, heading_annotation] {
+            let type_ = CanonicalTypeQuery::new(
+                &mut store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_from_type_node(annotation)
+            .unwrap();
+            resolved.push(type_);
+        }
+        for symbol in [div, heading, html_attributes] {
+            let type_ = store
+                .declared_type_links(symbol)
+                .and_then(|links| links.declared_type)
+                .unwrap();
+            let TypeData::Interface(interface) = store.type_payload(type_).unwrap().data() else {
+                panic!("the authenticated interface must retain its declared identity")
+            };
+            assert!(!interface.declared_members_resolved);
+        }
+        let warm = store_state(&store);
+        for (annotation, expected) in [div_annotation, heading_annotation]
+            .into_iter()
+            .zip(resolved)
+        {
+            let actual = CanonicalTypeQuery::new(
+                &mut store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_from_type_node(annotation);
+            assert_eq!(actual, Ok(expected));
+        }
+        assert_eq!(store_state(&store), warm);
+        assert!(diagnostics.is_empty());
+
+        let original_links = store.declared_type_links(div).unwrap().clone();
+        let wrong = store.intrinsic_bootstrap().unwrap().string_type;
+        let mut forged_links = original_links.clone();
+        forged_links.declared_type = Some(wrong);
+        assert!(store.set_declared_type_links(div, forged_links));
+        let forged = store_state(&store);
+        assert!(
+            CanonicalTypeQuery::new(
+                &mut store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_from_type_node(div_annotation)
+            .is_err()
+        );
+        assert_eq!(store_state(&store), forged);
+        assert!(store.set_declared_type_links(div, original_links));
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn react_intrinsic_dom_arguments_reject_non_library_lookalikes() {
+        let ReactDomFixture {
+            library,
+            react,
+            source,
+            library_file,
+            react_file,
+            source_file,
+            files,
+            store,
+        } = react_dom_fixture(false);
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&library.arena, files.get(&library_file).unwrap()),
+                (&react.arena, files.get(&react_file).unwrap()),
+                (&source.arena, files.get(&source_file).unwrap()),
+            ],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let div = store
+            .intrinsic_bootstrap()
+            .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+            .and_then(|globals| globals.get_source("HTMLDivElement"))
+            .unwrap();
+        let aliases = HashMap::new();
+        let before = store_state(&store);
+        for reference in react_dom_type_references(&react, react_file, "HTMLDivElement") {
+            assert!(
+                !TypeQueryPlanner::new(&store, &host, None, None, false, &aliases)
+                    .is_default_library_dom_interface_argument(reference, div)
+            );
+        }
+        assert_eq!(store_state(&store), before);
     }
 
     #[test]
