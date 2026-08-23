@@ -1107,6 +1107,8 @@ enum PlannedStatement {
     NamedReexport,
     DefaultAlias(Box<PlannedDefaultAliasExport>),
     DefaultObject(Box<PlannedDefaultObjectExport>),
+    AmbientExportAssignment(NodeRef),
+    AmbientNamespaceExport,
     InvalidModuleSpecifier(NodeRef),
     AmbientVariables(Vec<(NodeRef, u32)>),
     AmbientOverload,
@@ -1884,7 +1886,6 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         || node.flags.0 != 0
                         || node.parent != Some(self.source.node_ref().node)
                         || export.flow_node.is_some()
-                        || export.is_export_equals
                         || export.symbol.is_some()
                         || export.type_.is_some()
                         || export.facts != 0
@@ -1905,6 +1906,24 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         return Err(self.unsupported(
                             expression,
                             expression_node.kind,
+                            SourceSyntaxRole::Statement,
+                        ));
+                    }
+                    if facts.is_declaration_file()
+                        && expression_node.kind == SyntaxKind::BinaryExpression
+                    {
+                        self.plan_invalid_ambient_export_assignment(
+                            statement,
+                            expression,
+                            export.is_export_equals,
+                        )?;
+                        statements.push(PlannedStatement::AmbientExportAssignment(expression));
+                        continue;
+                    }
+                    if export.is_export_equals {
+                        return Err(self.unsupported(
+                            statement,
+                            SyntaxKind::ExportAssignment,
                             SourceSyntaxRole::Statement,
                         ));
                     }
@@ -1952,6 +1971,17 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         expression,
                         element,
                     });
+                }
+                SyntaxKind::NamespaceExportDeclaration => {
+                    if !is_external_module || !facts.is_declaration_file() {
+                        return Err(self.unsupported(
+                            statement,
+                            SyntaxKind::NamespaceExportDeclaration,
+                            SourceSyntaxRole::Statement,
+                        ));
+                    }
+                    self.plan_ambient_namespace_export(statement)?;
+                    statements.push(PlannedStatement::AmbientNamespaceExport);
                 }
                 SyntaxKind::ExportDeclaration => {
                     if !is_external_module {
@@ -5922,6 +5952,202 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             return Err(SourceCheckError::Import(declaration));
         }
         Ok(owner)
+    }
+
+    fn plan_invalid_ambient_export_assignment(
+        &self,
+        declaration: NodeRef,
+        expression: NodeRef,
+        export_equals: bool,
+    ) -> Result<(), SourceCheckError> {
+        let Some((store, _)) = self.semantic else {
+            return Err(self.unsupported(
+                declaration,
+                SyntaxKind::ExportAssignment,
+                SourceSyntaxRole::Statement,
+            ));
+        };
+        let expression_record = self.node(expression)?;
+        let NodeData::BinaryExpression(binary) = &expression_record.data else {
+            return Err(self.unsupported(
+                expression,
+                expression_record.kind,
+                SourceSyntaxRole::Statement,
+            ));
+        };
+        if expression_record.kind != SyntaxKind::BinaryExpression
+            || expression_record.flags.0 != 0
+            || binary.symbol.is_some()
+            || binary.type_.is_some()
+            || binary.facts != 0
+            || binary.modifiers.is_some()
+        {
+            return Err(self.unsupported(
+                expression,
+                expression_record.kind,
+                SourceSyntaxRole::Statement,
+            ));
+        }
+        let left = self.reference(binary.left);
+        let operator = self.reference(binary.operator_token);
+        let right = self.reference(binary.right);
+        let left_record = self.node(left)?;
+        let operator_record = self.node(operator)?;
+        let right_record = self.node(right)?;
+        let valid_operand = |node: &Node| {
+            matches!(
+                &node.data,
+                NodeData::NumericLiteral(literal)
+                    if node.kind == SyntaxKind::NumericLiteral
+                        && node.flags.0 == 0
+                        && literal.token_flags.0 == 0
+                        && !literal.text.is_empty()
+            )
+        };
+        if !valid_operand(left_record)
+            || !valid_operand(right_record)
+            || left_record.parent != Some(expression.node)
+            || operator_record.parent != Some(expression.node)
+            || right_record.parent != Some(expression.node)
+            || operator_record.kind != SyntaxKind::PlusToken
+            || operator_record.flags.0 != 0
+            || !matches!(operator_record.data, NodeData::Token(_))
+            || left_record.range.start != expression_record.range.start
+            || left_record.range.end > operator_record.range.start
+            || operator_record.range.end > right_record.range.start
+            || right_record.range.end != expression_record.range.end
+        {
+            return Err(self.unsupported(
+                expression,
+                SyntaxKind::BinaryExpression,
+                SourceSyntaxRole::Statement,
+            ));
+        }
+
+        let owner = self
+            .bound
+            .symbol(declaration)
+            .ok_or(SourceCheckError::Import(declaration))?;
+        let module = self
+            .bound
+            .symbol(self.source.node_ref())
+            .ok_or(SourceCheckError::Import(declaration))?;
+        let symbol = store
+            .symbol(owner)
+            .ok_or(SourceCheckError::Import(declaration))?;
+        let name = if export_equals {
+            ts_binder::InternalSymbolName::ExportEquals.as_ref()
+        } else {
+            ts_binder::InternalSymbolName::Default.as_ref()
+        };
+        if symbol.flags() != SymbolFlags::PROPERTY
+            || symbol.check_flags() != CheckFlags::NONE
+            || symbol.name() != name
+            || symbol.declarations() != Some(&[declaration])
+            || symbol.value_declaration() != Some(declaration)
+            || symbol.members().is_some()
+            || symbol.exports().is_some()
+            || symbol.parent() != Some(module)
+            || symbol.export_symbol().is_some()
+            || store.get_merged_symbol(owner) != Some(owner)
+            || store
+                .symbol(module)
+                .and_then(ts_binder::semantic::Symbol::exports)
+                .and_then(|exports| store.symbol_table(exports))
+                .and_then(|exports| exports.get(name))
+                != Some(owner)
+            || store
+                .alias_symbol_links(owner)
+                .is_some_and(|links| links != &super::AliasSymbolLinks::default())
+            || store
+                .value_symbol_links(owner)
+                .is_some_and(|links| links != &ValueSymbolLinks::default())
+            || [expression, left, operator, right].iter().any(|node| {
+                store
+                    .type_node_links(*node)
+                    .is_some_and(|links| links != &TypeNodeLinks::default())
+            })
+        {
+            return Err(SourceCheckError::Import(declaration));
+        }
+        Ok(())
+    }
+
+    fn plan_ambient_namespace_export(&self, declaration: NodeRef) -> Result<(), SourceCheckError> {
+        let Some((store, _)) = self.semantic else {
+            return Err(self.unsupported(
+                declaration,
+                SyntaxKind::NamespaceExportDeclaration,
+                SourceSyntaxRole::Statement,
+            ));
+        };
+        let record = self.node(declaration)?;
+        let NodeData::NamespaceExportDeclaration(export) = &record.data else {
+            return Err(self.unsupported(declaration, record.kind, SourceSyntaxRole::Statement));
+        };
+        let name = self.reference(export.name);
+        let name_record = self.node(name)?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Err(self.unsupported(name, name_record.kind, SourceSyntaxRole::Statement));
+        };
+        if record.kind != SyntaxKind::NamespaceExportDeclaration
+            || record.flags.0 != 0
+            || record.parent != Some(self.source.node_ref().node)
+            || export.flow_node.is_some()
+            || export.symbol.is_some()
+            || export.modifiers.is_some()
+            || name_record.kind != SyntaxKind::Identifier
+            || name_record.flags.0 != 0
+            || name_record.parent != Some(declaration.node)
+            || name_record.range.start < record.range.start
+            || name_record.range.end > record.range.end
+            || identifier.flow_node.is_some()
+            || identifier.text.is_empty()
+        {
+            return Err(self.unsupported(
+                declaration,
+                SyntaxKind::NamespaceExportDeclaration,
+                SourceSyntaxRole::Statement,
+            ));
+        }
+
+        let alias = self
+            .bound
+            .symbol(declaration)
+            .ok_or(SourceCheckError::Import(declaration))?;
+        let module = self
+            .bound
+            .symbol(self.source.node_ref())
+            .ok_or(SourceCheckError::Import(declaration))?;
+        let symbol = store
+            .symbol(alias)
+            .ok_or(SourceCheckError::Import(declaration))?;
+        if self
+            .bound
+            .global_exports()
+            .and_then(|exports| store.symbol_table(exports))
+            .and_then(|exports| exports.get_source(&identifier.text))
+            != Some(alias)
+            || symbol.flags() != SymbolFlags::ALIAS
+            || symbol.check_flags() != CheckFlags::NONE
+            || symbol.name().as_bytes() != identifier.text.as_bytes()
+            || symbol.declarations() != Some(&[declaration])
+            || symbol.value_declaration().is_some()
+            || symbol.members().is_some()
+            || symbol.exports().is_some()
+            || symbol.parent() != Some(module)
+            || symbol.export_symbol().is_some()
+            || store.get_merged_symbol(alias) != Some(alias)
+            || store
+                .alias_symbol_links(alias)
+                .is_some_and(|links| links != &super::AliasSymbolLinks::default())
+            || store
+                .value_symbol_links(alias)
+                .is_some_and(|links| links != &ValueSymbolLinks::default())
+        {
+            return Err(SourceCheckError::Import(declaration));
+        }
+        Ok(())
     }
 
     fn preplan_ambient_variable_statement(
@@ -17614,7 +17840,11 @@ pub(super) fn check_source_file(
             | PlannedStatement::LocalNamedExport
             | PlannedStatement::NamedReexport
             | PlannedStatement::DefaultAlias(_)
+            | PlannedStatement::AmbientNamespaceExport
             | PlannedStatement::AmbientOverload => {}
+            PlannedStatement::AmbientExportAssignment(expression) => {
+                issue_node_diagnostic(diagnostics, expression, 2714)?;
+            }
             PlannedStatement::DefaultObject(export) => {
                 let object = check_expression_type(
                     store,
@@ -22700,6 +22930,76 @@ mod tests {
             let warm = observable_state(&context, file);
             mark_source_unchecked(&mut context, file);
             context.check_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
+    fn ambient_export_assignment_grammar_preserves_namespace_exports_and_diagnostic_order() {
+        for (index, (text, expected)) in [
+            (
+                concat!(
+                    "import './dependency'; ",
+                    "export default 2 + 2; ",
+                    "export as namespace Foo; ",
+                    "declare module 'indirect' { export default typeof Foo.default; }",
+                ),
+                ["2 + 2", "typeof Foo.default"],
+            ),
+            (
+                concat!(
+                    "export = 2 + 2; ",
+                    "export as namespace Foo2; ",
+                    "declare module 'indirect' { export = typeof Foo2; }",
+                ),
+                ["2 + 2", "typeof Foo2"],
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parsed(text);
+            let file = FileId::new(8_349 + u32::try_from(index).unwrap());
+            let mut context = context_with_declaration_facts(
+                file,
+                &source,
+                CanonicalModuleState::External,
+                true,
+                CanonicalCheckerOptions::default(),
+            );
+            let (_, bound) = context.file(file).unwrap();
+            let exports = source
+                .arena
+                .iter()
+                .filter_map(|(node, record)| {
+                    matches!(
+                        record.kind,
+                        SyntaxKind::ExportAssignment | SyntaxKind::NamespaceExportDeclaration
+                    )
+                    .then_some(NodeRef::new(source.arena.id(), file, node))
+                    .and_then(|node| bound.symbol(node))
+                })
+                .collect::<Vec<_>>();
+
+            context.check_source_file(file).unwrap();
+
+            let diagnostics = context.diagnostics().as_slice();
+            assert_eq!(diagnostics.len(), expected.len());
+            for (diagnostic, expected) in diagnostics.iter().zip(expected) {
+                assert_eq!(diagnostic.diagnostic.code(), 2714);
+                assert_eq!(node_text(&source, diagnostic.node.unwrap()), expected);
+                assert_eq!(
+                    diagnostic.diagnostic.render().unwrap(),
+                    "The expression of an export assignment must be an identifier or qualified name in an ambient context.",
+                );
+            }
+            for export in exports {
+                assert!(context.store().value_symbol_links(export).is_none());
+                assert!(context.store().alias_symbol_links(export).is_none());
+            }
+
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
             assert_eq!(observable_state(&context, file), warm);
         }
     }
