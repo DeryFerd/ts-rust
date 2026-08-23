@@ -289,6 +289,7 @@ enum PlannedLiteralType {
 struct TypeQueryPlan {
     arrays: BTreeMap<NodeRef, PlannedArrayType>,
     indexed_accesses: BTreeMap<NodeRef, ConcreteIndexedAccessPlan>,
+    recovered_indexed_accesses: BTreeMap<NodeRef, PlannedRecoveredIndexedAccess>,
     keyofs: BTreeMap<NodeRef, NodeRef>,
     aliases: BTreeMap<SemanticSymbolId, TypeAliasPlan>,
     references: BTreeMap<NodeRef, PlannedTypeReference>,
@@ -298,6 +299,7 @@ struct TypeQueryPlan {
     intersections: BTreeMap<NodeRef, PlannedIntersectionType>,
     conditionals: BTreeMap<NodeRef, PlannedConditionalType>,
     infer_parameters: BTreeMap<NodeRef, SemanticSymbolId>,
+    infer_constraints: BTreeMap<NodeRef, NodeRef>,
     mapped_types: BTreeMap<NodeRef, MappedTypeDeclarationPlan>,
     mapped_indexed_accesses: BTreeMap<NodeRef, PlannedMappedIndexedAccess>,
     type_literals: BTreeMap<NodeRef, PropertyObjectPlan>,
@@ -374,6 +376,12 @@ struct PlannedTemplateType {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PlannedMappedIndexedAccess {
+    object: NodeRef,
+    index: NodeRef,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PlannedRecoveredIndexedAccess {
     object: NodeRef,
     index: NodeRef,
 }
@@ -1469,11 +1477,20 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             ));
         };
         let parameter = NodeRef::new(node.arena, node.file, infer.type_parameter);
-        if preflight_node(self.store, self.host, parameter)?.parent != Some(node.node) {
+        let parameter_record = preflight_node(self.store, self.host, parameter)?;
+        if parameter_record.parent != Some(node.node) {
             return Err(type_node_unavailable(
                 TypeNodeUnavailable::InvalidTypeReference(node),
             ));
         }
+        let NodeData::TypeParameterDeclaration(parameter_data) = &parameter_record.data else {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTypeReference(parameter),
+            ));
+        };
+        let constraint = parameter_data
+            .constraint
+            .map(|constraint| NodeRef::new(parameter.arena, parameter.file, constraint));
         let symbol = self
             .host
             .bound_file(parameter)
@@ -1495,6 +1512,96 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         }
         if let Some(previous) = self.plan.infer_parameters.insert(node, symbol)
             && previous != symbol
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTypeReference(node),
+            ));
+        }
+        if let Some(constraint) = constraint {
+            self.plan_infer_constraint(node, parameter, symbol, constraint)?;
+        }
+        Ok(())
+    }
+
+    fn plan_infer_constraint(
+        &mut self,
+        node: NodeRef,
+        parameter: NodeRef,
+        symbol: SemanticSymbolId,
+        constraint: NodeRef,
+    ) -> Result<(), DeclaredTypeError> {
+        let parameter_record = preflight_node(self.store, self.host, parameter)?;
+        let constraint_record = preflight_node(self.store, self.host, constraint)?;
+        if constraint_record.parent != Some(parameter.node)
+            || constraint_record.range.start <= parameter_record.range.start
+            || constraint_record.range.end != parameter_record.range.end
+            || self
+                .store
+                .type_node_links(constraint)
+                .is_some_and(|links| links.outer_type_parameters.is_some())
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTypeReference(node),
+            ));
+        }
+        let NodeData::TupleTypeNode(tuple) = &constraint_record.data else {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::UnsupportedSyntax {
+                    node: constraint,
+                    kind: constraint_record.kind,
+                },
+            ));
+        };
+        if constraint_record.kind != SyntaxKind::TupleType || tuple.elements.nodes.is_empty() {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::UnsupportedSyntax {
+                    node: constraint,
+                    kind: constraint_record.kind,
+                },
+            ));
+        }
+        for element in &tuple.elements.nodes {
+            let element = NodeRef::new(constraint.arena, constraint.file, *element);
+            let record = preflight_node(self.store, self.host, element)?;
+            if matches!(
+                record.kind,
+                SyntaxKind::OptionalType | SyntaxKind::RestType | SyntaxKind::NamedTupleMember
+            ) {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::UnsupportedSyntax {
+                        node: element,
+                        kind: record.kind,
+                    },
+                ));
+            }
+        }
+        if let Some(parameter) = self
+            .store
+            .declared_type_links(symbol)
+            .and_then(|links| links.declared_type)
+        {
+            let Some(TypeData::TypeParameter(data)) =
+                self.store.type_payload(parameter).map(TypeRecord::data)
+            else {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(node),
+                ));
+            };
+            if let Some(existing) = data.constraint
+                && self
+                    .store
+                    .type_node_links(constraint)
+                    .and_then(|links| links.resolved_type)
+                    != Some(existing)
+            {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(node),
+                ));
+            }
+        }
+        self.plan_type_node_in_context(constraint, None, false)?;
+        if let Some(previous) = self.plan.infer_constraints.insert(node, constraint)
+            && previous != constraint
         {
             return Err(type_node_unavailable(
                 TypeNodeUnavailable::InvalidTypeReference(node),
@@ -2283,6 +2390,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 },
             ));
         }
+        if self.try_plan_recovered_indexed_access_type(node)? {
+            return Ok(());
+        }
         let planned = plan_concrete_indexed_access(self.store, self.host, node)
             .map_err(|error| indexed_access_error(error, node))?;
         if let Some(existing) = self.plan.indexed_accesses.get(&node) {
@@ -2297,6 +2407,118 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         self.plan.indexed_accesses.insert(node, planned.clone());
         self.plan_type_node_in_context(planned.object(), None, false)?;
         self.plan_type_node_in_context(planned.index(), None, false)
+    }
+
+    fn try_plan_recovered_indexed_access_type(
+        &mut self,
+        node: NodeRef,
+    ) -> Result<bool, DeclaredTypeError> {
+        let record = preflight_node(self.store, self.host, node)?;
+        let NodeData::IndexedAccessTypeNode(indexed) = &record.data else {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidIndexedAccessType(node),
+            ));
+        };
+        let object = NodeRef::new(node.arena, node.file, indexed.object_type);
+        let index = NodeRef::new(node.arena, node.file, indexed.index_type);
+        let object_record = preflight_node(self.store, self.host, object)?;
+        let index_record = preflight_node(self.store, self.host, index)?;
+        if object_record.kind != SyntaxKind::AnyKeyword
+            || index_record.kind != SyntaxKind::TupleType
+        {
+            return Ok(false);
+        }
+        let NodeData::TupleTypeNode(tuple) = &index_record.data else {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidIndexedAccessType(index),
+            ));
+        };
+        if !tuple.elements.nodes.is_empty() {
+            return Ok(false);
+        }
+        if record.kind != SyntaxKind::IndexedAccessType
+            || !matches!(object_record.data, NodeData::KeywordTypeNode(_))
+            || object == index
+            || object_record.parent != Some(node.node)
+            || index_record.parent != Some(node.node)
+            || object_record.range.start != record.range.start
+            || object_record.range.end >= index_record.range.start
+            || index_record.range.end >= record.range.end
+            || tuple.elements.range != index_record.range
+            || tuple.elements.has_trailing_comma
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidIndexedAccessType(node),
+            ));
+        }
+
+        self.validate_recovered_indexed_access_links(node, object, index)?;
+        self.plan_type_node_in_context(object, None, false)?;
+        self.plan_type_node_in_context(index, None, false)?;
+        let planned = PlannedRecoveredIndexedAccess { object, index };
+        if let Some(existing) = self.plan.recovered_indexed_accesses.insert(node, planned)
+            && existing != planned
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidIndexedAccessType(node),
+            ));
+        }
+        Ok(true)
+    }
+
+    fn validate_recovered_indexed_access_links(
+        &self,
+        node: NodeRef,
+        object: NodeRef,
+        index: NodeRef,
+    ) -> Result<(), DeclaredTypeError> {
+        let error_type = self
+            .store
+            .intrinsic_bootstrap()
+            .ok_or(DeclaredTypeError::Unavailable(
+                DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
+            ))?
+            .error_type;
+        if self.store.type_node_links(object).is_some_and(|links| {
+            links.resolved_type.is_some() || links.outer_type_parameters.is_some()
+        }) {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidIndexedAccessType(object),
+            ));
+        }
+        if self
+            .store
+            .type_node_links(index)
+            .is_some_and(|links| links.outer_type_parameters.is_some())
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidIndexedAccessType(index),
+            ));
+        }
+        let parent_cached = self.store.type_node_links(node).map_or(Ok(None), |links| {
+            if links.outer_type_parameters.is_some()
+                || links
+                    .resolved_type
+                    .is_some_and(|resolved| resolved != error_type)
+            {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidIndexedAccessType(node),
+                ));
+            }
+            Ok(links.resolved_type)
+        })?;
+        if parent_cached.is_some()
+            && self
+                .store
+                .type_node_links(index)
+                .and_then(|links| links.resolved_type)
+                .is_none()
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidIndexedAccessType(index),
+            ));
+        }
+        Ok(())
     }
 
     fn plan_keyof_type(
@@ -7955,6 +8177,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .arrays
             .len()
             .checked_add(plan.indexed_accesses.len())
+            .and_then(|count| count.checked_add(plan.recovered_indexed_accesses.len()))
             .and_then(|count| count.checked_add(plan.keyofs.len()))
             .and_then(|count| count.checked_add(plan.references.len()))
             .and_then(|count| count.checked_add(plan.type_queries.len()))
@@ -7983,6 +8206,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .arrays
             .keys()
             .chain(plan.indexed_accesses.keys())
+            .chain(plan.recovered_indexed_accesses.keys())
             .chain(plan.keyofs.keys())
             .chain(plan.references.keys())
             .chain(plan.type_queries.keys())
@@ -8684,6 +8908,8 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             SyntaxKind::IndexedAccessType => {
                 if plan.mapped_indexed_accesses.contains_key(&node) {
                     self.execute_mapped_indexed_access_type(node, plan, prepared)
+                } else if plan.recovered_indexed_accesses.contains_key(&node) {
+                    self.execute_recovered_indexed_access_type(node, plan, prepared)
                 } else {
                     self.execute_concrete_indexed_access_type(node, plan, prepared)
                 }
@@ -8718,41 +8944,76 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             SyntaxKind::IntersectionType => self.execute_intersection_type(node, plan, prepared),
             SyntaxKind::ConditionalType => self.execute_conditional_type(node, plan, prepared),
             SyntaxKind::MappedType => self.execute_mapped_type(node, plan, prepared),
-            SyntaxKind::InferType => {
-                let symbol = plan.infer_parameters.get(&node).copied().ok_or_else(|| {
-                    type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node))
-                })?;
-                let resolved = execute_type_parameter(self.store, symbol);
-                if plan
-                    .functions
-                    .values()
-                    .any(|function| function.return_type == node)
-                {
-                    let mut links = self
-                        .store
-                        .type_node_links(node)
-                        .cloned()
-                        .unwrap_or_default();
-                    if links.outer_type_parameters.is_some()
-                        || links.resolved_type.is_some_and(|cached| cached != resolved)
-                    {
-                        return Err(type_node_unavailable(
-                            TypeNodeUnavailable::InvalidTypeReference(node),
-                        ));
-                    }
-                    links.resolved_type = Some(resolved);
-                    if !self.store.set_type_node_links(node, links) {
-                        return Err(type_node_unavailable(
-                            TypeNodeUnavailable::InvalidTypeReference(node),
-                        ));
-                    }
-                }
-                Ok(resolved)
-            }
+            SyntaxKind::InferType => self.execute_infer_type(node, plan, prepared),
             kind => Err(type_node_unavailable(
                 TypeNodeUnavailable::UnsupportedSyntax { node, kind },
             )),
         }
+    }
+
+    fn execute_infer_type(
+        &mut self,
+        node: NodeRef,
+        plan: &TypeQueryPlan,
+        prepared: &mut PreparedTypeQueryTypes,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let symbol = plan.infer_parameters.get(&node).copied().ok_or_else(|| {
+            type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node))
+        })?;
+        let resolved = execute_type_parameter(self.store, symbol);
+        if let Some(constraint) = plan.infer_constraints.get(&node).copied() {
+            let constraint = self.execute_type_node(constraint, plan, prepared)?;
+            let Some(TypeData::TypeParameter(data)) =
+                self.store.type_payload(resolved).map(TypeRecord::data)
+            else {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(node),
+                ));
+            };
+            let existing = data.constraint;
+            let target = data.target;
+            let mapper = data.mapper;
+            let default_type = data.resolved_default_type;
+            if existing.is_some_and(|existing| existing != constraint)
+                || existing.is_none()
+                    && !self.store.set_type_parameter_resolution(
+                        resolved,
+                        Some(constraint),
+                        target,
+                        mapper,
+                        default_type,
+                    )
+            {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(node),
+                ));
+            }
+        }
+        if plan
+            .functions
+            .values()
+            .any(|function| function.return_type == node)
+        {
+            let mut links = self
+                .store
+                .type_node_links(node)
+                .cloned()
+                .unwrap_or_default();
+            if links.outer_type_parameters.is_some()
+                || links.resolved_type.is_some_and(|cached| cached != resolved)
+            {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(node),
+                ));
+            }
+            links.resolved_type = Some(resolved);
+            if !self.store.set_type_node_links(node, links) {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(node),
+                ));
+            }
+        }
+        Ok(resolved)
     }
 
     fn execute_unique_symbol_type(
@@ -9281,6 +9542,78 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         Ok(resolved)
     }
 
+    fn execute_recovered_indexed_access_type(
+        &mut self,
+        node: NodeRef,
+        plan: &TypeQueryPlan,
+        prepared: &mut PreparedTypeQueryTypes,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let indexed = plan
+            .recovered_indexed_accesses
+            .get(&node)
+            .copied()
+            .ok_or_else(|| {
+                type_node_unavailable(TypeNodeUnavailable::MissingPlannedIndexedAccessType(node))
+            })?;
+        let object_type = self.execute_type_node(indexed.object, plan, prepared)?;
+        let index_type = self.execute_type_node(indexed.index, plan, prepared)?;
+        let bootstrap = self
+            .store
+            .intrinsic_bootstrap()
+            .ok_or(DeclaredTypeError::Unavailable(
+                DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
+            ))?;
+        let error_type = bootstrap.error_type;
+        if object_type != bootstrap.any_type
+            || !self
+                .store
+                .canonical_tuple_shape(index_type)
+                .map_err(|_| {
+                    type_node_unavailable(TypeNodeUnavailable::InvalidIndexedAccessType(
+                        indexed.index,
+                    ))
+                })?
+                .is_some_and(|shape| shape.element_infos().is_empty() && !shape.is_readonly())
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidIndexedAccessType(node),
+            ));
+        }
+        if let Some(cached) = self
+            .store
+            .type_node_links(node)
+            .and_then(|links| links.resolved_type)
+        {
+            return if cached == error_type {
+                Ok(cached)
+            } else {
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidIndexedAccessType(node),
+                ))
+            };
+        }
+
+        let mut links = self
+            .store
+            .type_node_links(node)
+            .cloned()
+            .unwrap_or_default();
+        links.resolved_type = Some(error_type);
+        if !self.store.set_type_node_links(node, links) {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidIndexedAccessType(node),
+            ));
+        }
+        self.diagnostics.add(
+            Some(indexed.index),
+            Diagnostic::with_arguments(
+                message_by_code(2538).expect("TS2538 is in the diagnostic catalog"),
+                ["[]"],
+            ),
+        );
+        Ok(error_type)
+    }
+
     fn execute_keyof_type(
         &mut self,
         node: NodeRef,
@@ -9718,7 +10051,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         plan: &TypeQueryPlan,
     ) -> Option<NodeRef> {
         loop {
-            if plan.indexed_accesses.contains_key(&node) {
+            if plan.indexed_accesses.contains_key(&node)
+                || plan.recovered_indexed_accesses.contains_key(&node)
+            {
                 return Some(node);
             }
             let NodeData::ParenthesizedTypeNode(parenthesized) = &self.host.node(node)?.data else {
@@ -14339,6 +14674,162 @@ mod tests {
         assert!(diagnostics.is_empty());
     }
 
+    fn constrained_inferred_parameter_nodes(
+        fixture: &Fixture,
+        name: &str,
+    ) -> (NodeRef, NodeRef, SemanticSymbolId) {
+        let parameter = named_node(fixture, SyntaxKind::TypeParameter, name);
+        let record = fixture.parsed.arena.get(parameter.node).unwrap();
+        let NodeData::TypeParameterDeclaration(data) = &record.data else {
+            unreachable!()
+        };
+        let infer = NodeRef::new(
+            parameter.arena,
+            parameter.file,
+            record
+                .parent
+                .expect("an inferred parameter has an infer node"),
+        );
+        let constraint = NodeRef::new(
+            parameter.arena,
+            parameter.file,
+            data.constraint
+                .expect("the inferred parameter is constrained"),
+        );
+        (infer, constraint, node_symbol(fixture, parameter))
+    }
+
+    #[test]
+    fn inferred_parameter_publishes_fixed_tuple_constraint_once() {
+        let mut fixture =
+            fixture("type Capture<T> = T extends infer Last extends [any, any] ? Last : never;");
+        let (infer, constraint, symbol) = constrained_inferred_parameter_nodes(&fixture, "Last");
+        let any = fixture.store.intrinsic_bootstrap().unwrap().any_type;
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let inferred = query_node(&mut fixture, infer, &mut diagnostics).unwrap();
+        assert_eq!(
+            cached_ordinary_type_parameter_owner(&fixture.store, inferred),
+            Some(symbol),
+        );
+        let TypeData::TypeParameter(parameter) =
+            fixture.store.type_payload(inferred).unwrap().data()
+        else {
+            panic!("infer must publish a type parameter")
+        };
+        let tuple = parameter
+            .constraint
+            .expect("the fixed tuple must be stored");
+        assert_eq!(
+            fixture
+                .store
+                .type_node_links(constraint)
+                .and_then(|links| links.resolved_type),
+            Some(tuple),
+        );
+        let shape = fixture.store.canonical_tuple_shape(tuple).unwrap().unwrap();
+        assert_eq!(shape.element_types(), [any, any]);
+        assert!(
+            shape
+                .element_infos()
+                .iter()
+                .all(|element| element.flags() == ElementFlags::REQUIRED)
+        );
+
+        let warm = (
+            store_state(&fixture.store),
+            fixture.store.canonical_tuple_target_len(),
+            fixture.store.declared_type_links(symbol).cloned(),
+            fixture.store.type_node_links(constraint).cloned(),
+        );
+        assert_eq!(
+            query_node(&mut fixture, infer, &mut diagnostics),
+            Ok(inferred),
+        );
+        assert_eq!(
+            (
+                store_state(&fixture.store),
+                fixture.store.canonical_tuple_target_len(),
+                fixture.store.declared_type_links(symbol).cloned(),
+                fixture.store.type_node_links(constraint).cloned(),
+            ),
+            warm,
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn inferred_parameter_rejects_poisoned_fixed_tuple_constraint_before_writes() {
+        let mut fixture =
+            fixture("type Capture<T> = T extends infer Last extends [any, any] ? Last : never;");
+        let (infer, constraint, symbol) = constrained_inferred_parameter_nodes(&fixture, "Last");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let inferred = query_node(&mut fixture, infer, &mut diagnostics).unwrap();
+        let poison = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        assert!(fixture.store.set_type_parameter_resolution(
+            inferred,
+            Some(poison),
+            None,
+            None,
+            None,
+        ));
+
+        let before = (
+            store_state(&fixture.store),
+            fixture.store.declared_type_links(symbol).cloned(),
+            fixture.store.type_node_links(constraint).cloned(),
+            diagnostics.clone(),
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                query_node(&mut fixture, infer, &mut diagnostics),
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(infer)
+                )),
+            );
+            assert_eq!(
+                (
+                    store_state(&fixture.store),
+                    fixture.store.declared_type_links(symbol).cloned(),
+                    fixture.store.type_node_links(constraint).cloned(),
+                    diagnostics.clone(),
+                ),
+                before,
+            );
+        }
+    }
+
+    #[test]
+    fn inferred_parameter_rejects_non_fixed_tuple_constraints_without_writes() {
+        for (source, expected_kind) in [
+            (
+                "type Capture<T> = T extends infer Last extends string ? Last : never;",
+                SyntaxKind::StringKeyword,
+            ),
+            (
+                "type Capture<T> = T extends infer Last extends [any?] ? Last : never;",
+                SyntaxKind::OptionalType,
+            ),
+            (
+                "type Capture<T> = T extends infer Last extends [...any[]] ? Last : never;",
+                SyntaxKind::RestType,
+            ),
+        ] {
+            let mut fixture = fixture(source);
+            let (infer, _, _) = constrained_inferred_parameter_nodes(&fixture, "Last");
+            let before = store_state(&fixture.store);
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            assert!(matches!(
+                query_node(&mut fixture, infer, &mut diagnostics),
+                Err(DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::UnsupportedSyntax { kind, .. }
+                )) if kind == expected_kind
+            ));
+            assert_eq!(store_state(&fixture.store), before);
+            assert!(diagnostics.is_empty());
+        }
+    }
+
     #[test]
     fn tuple_wrapped_any_conditional_uses_only_the_true_branch() {
         let mut fixture = fixture(concat!(
@@ -17723,6 +18214,314 @@ mod tests {
                 assert!(diagnostics.is_empty());
             }
         }
+    }
+
+    #[test]
+    fn any_indexed_by_empty_tuple_recovers_once_and_preserves_warm_cache() {
+        let mut fixture = fixture("var x: any[[]];");
+        let indexed = variable_type_node(&fixture, "x");
+        let NodeData::IndexedAccessTypeNode(indexed_data) =
+            &fixture.parsed.arena.get(indexed.node).unwrap().data
+        else {
+            panic!("expected an indexed-access annotation")
+        };
+        let object = NodeRef::new(indexed.arena, indexed.file, indexed_data.object_type);
+        let index = NodeRef::new(indexed.arena, indexed.file, indexed_data.index_type);
+        let error = fixture.store.intrinsic_bootstrap().unwrap().error_type;
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        assert_eq!(
+            query_node(&mut fixture, indexed, &mut diagnostics),
+            Ok(error)
+        );
+        assert_eq!(
+            fixture
+                .store
+                .type_node_links(indexed)
+                .and_then(|links| links.resolved_type),
+            Some(error),
+        );
+        let tuple = fixture
+            .store
+            .type_node_links(index)
+            .and_then(|links| links.resolved_type)
+            .expect("the empty tuple index must be cached");
+        let shape = fixture.store.canonical_tuple_shape(tuple).unwrap().unwrap();
+        assert!(shape.element_infos().is_empty());
+        assert!(!shape.is_readonly());
+        assert!(fixture.store.type_node_links(object).is_none());
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics.as_slice()[0].diagnostic.code(), 2538);
+        assert_eq!(diagnostics.as_slice()[0].node, Some(index));
+        assert_eq!(diagnostics.as_slice()[0].diagnostic.arguments, ["[]"]);
+
+        let warm = (
+            store_state(&fixture.store),
+            fixture.store.canonical_tuple_target_len(),
+            fixture.store.type_node_links(indexed).cloned(),
+            fixture.store.type_node_links(index).cloned(),
+            diagnostics.clone(),
+        );
+        assert_eq!(
+            query_node(&mut fixture, indexed, &mut diagnostics),
+            Ok(error)
+        );
+        assert_eq!(
+            (
+                store_state(&fixture.store),
+                fixture.store.canonical_tuple_target_len(),
+                fixture.store.type_node_links(indexed).cloned(),
+                fixture.store.type_node_links(index).cloned(),
+                diagnostics.clone(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn recovered_indexed_access_alias_revalidates_its_cached_tuple() {
+        let mut fixture = fixture("type Bad = any[[]];");
+        let bad = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Bad");
+        let (indexed, _, index) = indexed_access_parts(&fixture, "Bad");
+        let error = fixture.store.intrinsic_bootstrap().unwrap().error_type;
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                bad,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(error),
+        );
+        assert_eq!(diagnostics.len(), 1);
+        let warm = (
+            store_state(&fixture.store),
+            fixture.store.type_alias_links(bad).cloned(),
+            fixture.store.type_node_links(indexed).cloned(),
+            fixture.store.type_node_links(index).cloned(),
+            diagnostics.clone(),
+        );
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                bad,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(error),
+        );
+        assert_eq!(
+            (
+                store_state(&fixture.store),
+                fixture.store.type_alias_links(bad).cloned(),
+                fixture.store.type_node_links(indexed).cloned(),
+                fixture.store.type_node_links(index).cloned(),
+                diagnostics.clone(),
+            ),
+            warm,
+        );
+
+        assert!(
+            fixture
+                .store
+                .set_type_node_links(index, TypeNodeLinks::default())
+        );
+        let poisoned = (
+            store_state(&fixture.store),
+            fixture.store.type_alias_links(bad).cloned(),
+            fixture.store.type_node_links(indexed).cloned(),
+            fixture.store.type_node_links(index).cloned(),
+            diagnostics.clone(),
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                query_declared(
+                    &mut fixture,
+                    bad,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                ),
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidIndexedAccessType(index)
+                )),
+            );
+            assert_eq!(
+                (
+                    store_state(&fixture.store),
+                    fixture.store.type_alias_links(bad).cloned(),
+                    fixture.store.type_node_links(indexed).cloned(),
+                    fixture.store.type_node_links(index).cloned(),
+                    diagnostics.clone(),
+                ),
+                poisoned,
+            );
+        }
+    }
+
+    fn poison_recovered_indexed_access_links(
+        fixture: &mut Fixture,
+        indexed: NodeRef,
+        object: NodeRef,
+        index: NodeRef,
+        corruption: usize,
+    ) -> TypeNodeUnavailable {
+        let (any, error) = {
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            (bootstrap.any_type, bootstrap.error_type)
+        };
+        let (poisoned, links, expected) = match corruption {
+            0 => (
+                object,
+                TypeNodeLinks {
+                    resolved_type: Some(any),
+                    ..TypeNodeLinks::default()
+                },
+                TypeNodeUnavailable::InvalidIndexedAccessType(object),
+            ),
+            1 => (
+                object,
+                TypeNodeLinks {
+                    outer_type_parameters: Some(vec![any]),
+                    ..TypeNodeLinks::default()
+                },
+                TypeNodeUnavailable::InvalidIndexedAccessType(object),
+            ),
+            2 => (
+                indexed,
+                TypeNodeLinks {
+                    resolved_type: Some(any),
+                    ..TypeNodeLinks::default()
+                },
+                TypeNodeUnavailable::InvalidIndexedAccessType(indexed),
+            ),
+            3 => (
+                indexed,
+                TypeNodeLinks {
+                    outer_type_parameters: Some(vec![any]),
+                    ..TypeNodeLinks::default()
+                },
+                TypeNodeUnavailable::InvalidIndexedAccessType(indexed),
+            ),
+            4 => (
+                index,
+                TypeNodeLinks {
+                    outer_type_parameters: Some(vec![any]),
+                    ..TypeNodeLinks::default()
+                },
+                TypeNodeUnavailable::InvalidIndexedAccessType(index),
+            ),
+            5 => (
+                indexed,
+                TypeNodeLinks {
+                    resolved_type: Some(error),
+                    ..TypeNodeLinks::default()
+                },
+                TypeNodeUnavailable::InvalidIndexedAccessType(index),
+            ),
+            6 => (
+                index,
+                TypeNodeLinks {
+                    resolved_type: Some(any),
+                    ..TypeNodeLinks::default()
+                },
+                TypeNodeUnavailable::InvalidCachedTupleType(any),
+            ),
+            _ => unreachable!(),
+        };
+        assert!(fixture.store.set_type_node_links(poisoned, links));
+        expected
+    }
+
+    #[test]
+    fn recovered_indexed_access_rejects_poisoned_links_before_publication() {
+        for corruption in 0..7 {
+            let mut fixture = fixture("var x: any[[]];");
+            let indexed = variable_type_node(&fixture, "x");
+            let NodeData::IndexedAccessTypeNode(indexed_data) =
+                &fixture.parsed.arena.get(indexed.node).unwrap().data
+            else {
+                panic!("expected an indexed-access annotation")
+            };
+            let object = NodeRef::new(indexed.arena, indexed.file, indexed_data.object_type);
+            let index = NodeRef::new(indexed.arena, indexed.file, indexed_data.index_type);
+            let expected = poison_recovered_indexed_access_links(
+                &mut fixture,
+                indexed,
+                object,
+                index,
+                corruption,
+            );
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let before = (
+                store_state(&fixture.store),
+                fixture.store.canonical_tuple_target_len(),
+                fixture.store.type_node_links(indexed).cloned(),
+                fixture.store.type_node_links(object).cloned(),
+                fixture.store.type_node_links(index).cloned(),
+                diagnostics.clone(),
+            );
+            for _ in 0..2 {
+                assert_eq!(
+                    query_node(&mut fixture, indexed, &mut diagnostics),
+                    Err(type_node_unavailable(expected)),
+                    "unexpected result for corruption {corruption}",
+                );
+                assert_eq!(
+                    (
+                        store_state(&fixture.store),
+                        fixture.store.canonical_tuple_target_len(),
+                        fixture.store.type_node_links(indexed).cloned(),
+                        fixture.store.type_node_links(object).cloned(),
+                        fixture.store.type_node_links(index).cloned(),
+                        diagnostics.clone(),
+                    ),
+                    before,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn recovered_indexed_access_accepts_trivia_and_rejects_malformed_empty_tuples() {
+        for source in ["var x: any[[]];", "var x: any[ []];", "var x: any [ [ ] ];"] {
+            let mut fixture = fixture(source);
+            let indexed = variable_type_node(&fixture, "x");
+            let error = fixture.store.intrinsic_bootstrap().unwrap().error_type;
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+            assert_eq!(
+                query_node(&mut fixture, indexed, &mut diagnostics),
+                Ok(error)
+            );
+            assert_eq!(diagnostics.len(), 1);
+            assert_eq!(diagnostics.as_slice()[0].diagnostic.code(), 2538);
+        }
+
+        let mut trailing = fixture_with_mutation("var x: any[[]];", |parsed| {
+            let tuple = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| (record.kind == SyntaxKind::TupleType).then_some(node))
+                .expect("the indexed access has an empty tuple");
+            let NodeData::TupleTypeNode(data) = &mut parsed.arena.get_mut(tuple).unwrap().data
+            else {
+                unreachable!()
+            };
+            data.elements.has_trailing_comma = true;
+        });
+        let indexed = variable_type_node(&trailing, "x");
+        let before = store_state(&trailing.store);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        assert_eq!(
+            query_node(&mut trailing, indexed, &mut diagnostics),
+            Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidIndexedAccessType(indexed)
+            )),
+        );
+        assert_eq!(store_state(&trailing.store), before);
+        assert!(diagnostics.is_empty());
     }
 
     #[test]

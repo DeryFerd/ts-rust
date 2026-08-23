@@ -1,4 +1,4 @@
-use ts_ast::{FileId, NodeData, NodeRef};
+use ts_ast::{FileId, NodeData, NodeRef, SyntaxKind};
 use ts_binder::{
     CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
     EscapedName, SemanticSymbolId,
@@ -156,6 +156,86 @@ fn concrete_inline_indexed_access_types_select_properties_and_applicable_indexes
         ),
         warm,
     );
+}
+
+#[test]
+fn invalid_tuple_index_on_any_reports_ts2538_and_reuses_the_error_type() {
+    for (case, source) in [
+        "var value: any[[]];",
+        "var value: any[ []];",
+        "var value: any [ [ ] ];",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let parsed = parse_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(101 + u32::try_from(case).unwrap());
+        let mut context = context(&parsed, file);
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected one invalid-index diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2538);
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "Type '[]' cannot be used as an index type.",
+        );
+        assert_eq!(diagnostic.range_override, None);
+
+        let index = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::TupleType).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        assert_eq!(diagnostic.node, Some(index));
+
+        let indexed = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::IndexedAccessType).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let error_type = context.store().intrinsic_bootstrap().unwrap().error_type;
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(indexed)
+                .and_then(|links| links.resolved_type),
+            Some(error_type),
+        );
+        assert_eq!(context.type_to_string(error_type).unwrap(), "any");
+
+        let warm = (
+            context.store().type_len(),
+            context.store().index_info_len(),
+            context.store().signature_len(),
+            context.diagnostics().clone(),
+        );
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().index_info_len(),
+                context.store().signature_len(),
+                context.diagnostics().clone(),
+            ),
+            warm,
+        );
+    }
 }
 
 #[test]

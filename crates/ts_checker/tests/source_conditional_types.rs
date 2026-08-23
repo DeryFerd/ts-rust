@@ -318,6 +318,63 @@ fn conditional_tuple_rest_preserves_its_required_suffix() {
 }
 
 #[test]
+fn constrained_variadic_inference_handles_adjacent_rest_elements() {
+    let parsed = parse_source_file(concat!(
+        "interface Array<T> {}\n",
+        "interface ReadonlyArray<T> {}\n",
+        "type Tail<T> = T extends [...(infer Rest)[], ...infer Last extends [any, any]] ? Last : never;\n",
+        "type Head<T> = T extends [...infer First extends [any, any], ...(infer Rest)[]] ? First : never;\n",
+        "type TailPair = Tail<[1, 2]>;\n",
+        "type HeadPair = Head<[1, 2]>;\n",
+        "type TailLong = Tail<[1, 2, 3, 4]>;\n",
+        "type HeadLong = Head<[1, 2, 3, 4]>;\n",
+        "type TooShort = Tail<[1]>;\n",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(7);
+    let mut context = context(&parsed, file);
+
+    context.check_source_file(file).unwrap();
+    assert!(
+        context.diagnostics().is_empty(),
+        "{:?}",
+        context.diagnostics()
+    );
+
+    for (name, expected) in [
+        ("TailPair", "[1, 2]"),
+        ("HeadPair", "[1, 2]"),
+        ("TailLong", "[3, 4]"),
+        ("HeadLong", "[1, 2]"),
+        ("TooShort", "never"),
+    ] {
+        let alias = alias_symbol(&parsed, file, &context, name);
+        assert_eq!(
+            context.type_to_string(alias_type(&context, alias)).unwrap(),
+            expected,
+            "alias {name}",
+        );
+    }
+
+    let warm = (
+        context.store().type_len(),
+        context.store().conditional_root_len(),
+        context.store().mapper_len(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().conditional_root_len(),
+            context.store().mapper_len(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
+}
+
+#[test]
 fn conditional_template_inference_preserves_unicode_code_points() {
     let parsed = parse_source_file(concat!(
         "type First<T extends string> = T extends `${infer Head}${string}` ? Head : never;\n",

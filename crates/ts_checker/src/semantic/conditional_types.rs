@@ -920,10 +920,10 @@ fn evaluate_conditional(
             .ok_or(ConditionalTypeError::MissingBootstrap)?
             .unknown_type;
         for (parameter, candidates) in infer_parameters.iter().zip(candidates) {
-            let inferred = if candidates.is_empty() {
-                unknown_type
-            } else {
-                union_result(store, &candidates, global_types)?
+            let inferred = match candidates.as_slice() {
+                [] => unknown_type,
+                [candidate] => *candidate,
+                _ => union_result(store, &candidates, global_types)?,
             };
             if !inferred_candidate_satisfies_constraint(
                 store,
@@ -1547,18 +1547,25 @@ fn map_type(
 
     if let Some(tuple) = inference_tuple_shape(store, type_)? {
         let mut substituted = Vec::with_capacity(tuple.element_types.len());
-        for element in tuple.element_types {
-            substituted.push(map_type(
-                store,
-                element,
-                parameters,
-                arguments,
-                global_types,
-                session,
-            )?);
+        let mut element_infos = Vec::with_capacity(tuple.element_infos.len());
+        for (element, info) in tuple.element_types.into_iter().zip(tuple.element_infos) {
+            let mapped = map_type(store, element, parameters, arguments, global_types, session)?;
+            if info.flags().intersects(ElementFlags::VARIADIC)
+                && let Some(mapped_tuple) = inference_tuple_shape(store, mapped)?
+                && mapped_tuple
+                    .element_infos
+                    .iter()
+                    .all(|element| !element.flags().intersects(ElementFlags::VARIABLE))
+            {
+                substituted.extend(mapped_tuple.element_types);
+                element_infos.extend(mapped_tuple.element_infos);
+            } else {
+                substituted.push(mapped);
+                element_infos.push(info);
+            }
         }
         let mut request =
-            CanonicalTupleTypeRequest::new(&substituted, &tuple.element_infos, tuple.readonly);
+            CanonicalTupleTypeRequest::new(&substituted, &element_infos, tuple.readonly);
         if let Some(global_types) = global_types {
             request =
                 request.with_array_targets(CanonicalArrayTargets::from_global_types(global_types));
@@ -2019,14 +2026,25 @@ fn infer_from_tuple_types(
                 .then_some(index)
         })
         .collect::<Vec<_>>();
-    if variable_indices.len() > 1 {
-        return Ok(false);
-    }
-
     let source_len = source.element_types.len();
     let target_len = target.element_types.len();
     if source_len < target.min_length {
         return Ok(false);
+    }
+    match variable_indices.as_slice() {
+        [first, second] => {
+            return infer_from_rest_and_variadic_tuple(
+                store,
+                source,
+                target,
+                [*first, *second],
+                context,
+                candidates,
+                session,
+            );
+        }
+        [_, _, _, ..] => return Ok(false),
+        _ => {}
     }
     let Some(variable) = variable_indices.first().copied() else {
         if source_len > target_len {
@@ -2106,6 +2124,123 @@ fn infer_from_tuple_types(
         }
     }
     Ok(true)
+}
+
+fn infer_from_rest_and_variadic_tuple(
+    store: &mut CanonicalTypeMapperStore,
+    source: &InferenceTupleShape,
+    target: &InferenceTupleShape,
+    variable_indices: [usize; 2],
+    context: ConditionalInferenceContext<'_>,
+    candidates: &mut [Vec<TypeId>],
+    session: &mut InstantiationSession,
+) -> Result<bool, ConditionalTypeError> {
+    let [first, second] = variable_indices;
+    if second != first + 1 {
+        return Ok(false);
+    }
+    let (variadic, rest) = match (
+        target.element_infos[first].flags(),
+        target.element_infos[second].flags(),
+    ) {
+        (ElementFlags::VARIADIC, ElementFlags::REST) => (first, second),
+        (ElementFlags::REST, ElementFlags::VARIADIC) => (second, first),
+        _ => return Ok(false),
+    };
+    let variadic_type = target.element_types[variadic];
+    if !context.infer_parameters.contains(&variadic_type) {
+        return Ok(false);
+    }
+    let Some(constraint) = constraints::get_base_constraint_of_type(store, variadic_type)? else {
+        return Ok(false);
+    };
+    validate_conditional_operand(store, constraint, &mut HashSet::new())?;
+    let Some(constraint_shape) = inference_tuple_shape(store, constraint)? else {
+        return Ok(false);
+    };
+    if constraint_shape
+        .element_infos
+        .iter()
+        .chain(&source.element_infos)
+        .any(|info| info.flags().intersects(ElementFlags::VARIABLE))
+    {
+        return Ok(false);
+    }
+
+    let prefix_len = first;
+    let suffix_len = target.element_types.len() - second - 1;
+    let implied_arity = constraint_shape.element_types.len();
+    let Some(minimum_len) = prefix_len
+        .checked_add(suffix_len)
+        .and_then(|length| length.checked_add(implied_arity))
+    else {
+        return Ok(false);
+    };
+    if source.element_types.len() < minimum_len {
+        return Ok(false);
+    }
+    for index in 0..prefix_len {
+        if !infer_from_types(
+            store,
+            source.element_types[index],
+            target.element_types[index],
+            context,
+            candidates,
+            session,
+        )? {
+            return Ok(false);
+        }
+    }
+    for index in 0..suffix_len {
+        let source_index = source.element_types.len() - suffix_len + index;
+        let target_index = second + 1 + index;
+        if !infer_from_types(
+            store,
+            source.element_types[source_index],
+            target.element_types[target_index],
+            context,
+            candidates,
+            session,
+        )? {
+            return Ok(false);
+        }
+    }
+
+    let middle_end = source.element_types.len() - suffix_len;
+    let (variadic_start, rest_start, rest_end) = if variadic == first {
+        (prefix_len, prefix_len + implied_arity, middle_end)
+    } else {
+        (
+            middle_end - implied_arity,
+            prefix_len,
+            middle_end - implied_arity,
+        )
+    };
+    for index in rest_start..rest_end {
+        if !infer_from_types(
+            store,
+            source.element_types[index],
+            target.element_types[rest],
+            context,
+            candidates,
+            session,
+        )? {
+            return Ok(false);
+        }
+    }
+
+    let variadic_end = variadic_start + implied_arity;
+    let mut request = CanonicalTupleTypeRequest::new(
+        &source.element_types[variadic_start..variadic_end],
+        &source.element_infos[variadic_start..variadic_end],
+        false,
+    );
+    if let Some(global_types) = context.global_types {
+        request =
+            request.with_array_targets(CanonicalArrayTargets::from_global_types(global_types));
+    }
+    let captured = store.create_canonical_tuple_type(request)?;
+    infer_from_types(store, captured, variadic_type, context, candidates, session)
 }
 
 #[derive(Clone, Debug)]
@@ -4721,6 +4856,147 @@ mod tests {
                 ),
                 Ok(expected)
             );
+        }
+    }
+
+    #[test]
+    fn tuple_inference_uses_fixed_constraints_for_adjacent_rest_and_variadic_elements() {
+        for (declaration, rest_first) in [
+            (
+                "type Result<T> = T extends [...(infer C)[], ...infer B extends [any, any]] ? B : never;",
+                true,
+            ),
+            (
+                "type Result<T> = T extends [...infer A extends [any, any], ...(infer D)[]] ? A : never;",
+                false,
+            ),
+        ] {
+            let mut fixture = Fixture::new(declaration);
+            let node = fixture.conditional();
+            let parameter = fixture.type_parameter("T");
+            let rest_parameter = fixture.type_parameter(if rest_first { "C" } else { "D" });
+            let variadic_parameter = fixture.type_parameter(if rest_first { "B" } else { "A" });
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            let (any, never) = (bootstrap.any_type, bootstrap.never_type);
+            let required = fixture
+                .store
+                .create_tuple_element_info(ElementFlags::REQUIRED, None)
+                .unwrap();
+            let rest = fixture
+                .store
+                .create_tuple_element_info(ElementFlags::REST, None)
+                .unwrap();
+            let variadic = fixture
+                .store
+                .create_tuple_element_info(ElementFlags::VARIADIC, None)
+                .unwrap();
+            let constraint = fixture
+                .store
+                .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(
+                    &[any, any],
+                    &[required, required],
+                    false,
+                ))
+                .unwrap();
+            assert!(fixture.store.set_type_parameter_resolution(
+                variadic_parameter,
+                Some(constraint),
+                None,
+                None,
+                None,
+            ));
+            let (target_types, target_infos, inferred_parameters) = if rest_first {
+                (
+                    [rest_parameter, variadic_parameter],
+                    [rest, variadic],
+                    [rest_parameter, variadic_parameter],
+                )
+            } else {
+                (
+                    [variadic_parameter, rest_parameter],
+                    [variadic, rest],
+                    [variadic_parameter, rest_parameter],
+                )
+            };
+            let target = fixture
+                .store
+                .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(
+                    &target_types,
+                    &target_infos,
+                    false,
+                ))
+                .unwrap();
+            let branch_types = branches(variadic_parameter, never);
+            let conditional = get_type_from_conditional_type(
+                &mut fixture.store,
+                ConditionalTypeRequest {
+                    node,
+                    check_type: parameter,
+                    extends_type: target,
+                    branches: branch_types,
+                    infer_type_parameters: &inferred_parameters,
+                    outer_type_parameters: &[parameter],
+                    alias: None,
+                },
+                None,
+            )
+            .unwrap();
+
+            let mut values = Vec::new();
+            for value in [1.0, 2.0, 3.0, 4.0] {
+                values.push(
+                    fixture
+                        .store
+                        .regular_number_literal_type(ts_jsnum::Number::new(value))
+                        .unwrap(),
+                );
+            }
+            let expected_long = if rest_first {
+                &values[2..]
+            } else {
+                &values[..2]
+            };
+            let cases: &[(&[TypeId], Option<&[TypeId]>)] = &[
+                (&values[..2], Some(&values[..2])),
+                (&values[..], Some(expected_long)),
+                (&values[..1], None),
+            ];
+            for (elements, expected) in cases {
+                let infos = vec![required; elements.len()];
+                let source = fixture
+                    .store
+                    .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(
+                        elements, &infos, false,
+                    ))
+                    .unwrap();
+                let expected = if let Some(elements) = expected {
+                    let infos = vec![required; elements.len()];
+                    fixture
+                        .store
+                        .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(
+                            elements, &infos, false,
+                        ))
+                        .unwrap()
+                } else {
+                    never
+                };
+                assert_eq!(
+                    get_conditional_type_instantiation(
+                        &mut fixture.store,
+                        ConditionalTypeInstantiation {
+                            conditional_type: conditional,
+                            type_arguments: &[source],
+                            branches: branch_types,
+                            alias: None,
+                            for_constraint: false,
+                        },
+                        None,
+                        None,
+                    ),
+                    Ok(expected),
+                    "rest_first={rest_first}, elements={elements:?}",
+                );
+            }
         }
     }
 

@@ -269,6 +269,14 @@ struct NormalizedTemplate {
     types: Vec<TypeId>,
 }
 
+#[derive(Clone, Copy)]
+struct TemplatePatternCapture {
+    start_segment: usize,
+    start_position: usize,
+    end_segment: usize,
+    end_position: usize,
+}
+
 enum TemplateUnionPlan {
     Existing(TypeId),
     Constituents(Vec<TypeId>),
@@ -430,27 +438,24 @@ impl CanonicalTypeMapperStore {
                 else {
                     return Err(TemplateTypeError::InvalidTemplate(target));
                 };
+                if source_template.types.is_empty()
+                    || source_template.texts.len() != source_template.types.len() + 1
+                {
+                    return Err(TemplateTypeError::InvalidTemplate(source));
+                }
+                if target_template.types.is_empty()
+                    || target_template.texts.len() != target_template.types.len() + 1
+                {
+                    return Err(TemplateTypeError::InvalidTemplate(target));
+                }
                 if source_template.texts != target_template.texts
                     || source_template.types.len() != target_template.types.len()
                 {
-                    if target_template.types.len() != 1
-                        || !source_template.texts[0].starts_with(&target_template.texts[0])
-                        || !source_template
-                            .texts
-                            .last()
-                            .expect("a source template has an ending text")
-                            .ends_with(&target_template.texts[1])
-                    {
-                        return Ok(false);
-                    }
-
-                    let placeholder = target_template.types[0];
-                    let record = self
-                        .type_payload(placeholder)
-                        .ok_or(TemplateTypeError::InvalidType(placeholder))?;
-                    return Ok(record
-                        .flags()
-                        .intersects(TypeFlags::ANY | TypeFlags::STRING));
+                    return self.template_patterns_match_with_different_texts(
+                        source_template,
+                        target_template,
+                        active,
+                    );
                 }
                 source_template
                     .types
@@ -465,6 +470,137 @@ impl CanonicalTypeMapperStore {
             }
             _ => Ok(false),
         }
+    }
+
+    fn template_patterns_match_with_different_texts(
+        &self,
+        source: &super::type_records::TemplateLiteralTypeData,
+        target: &super::type_records::TemplateLiteralTypeData,
+        active: &mut HashSet<TypeId>,
+    ) -> Result<bool, TemplateTypeError> {
+        let last_source = source.texts.len() - 1;
+        let last_target = target.texts.len() - 1;
+        if !source.texts[0].starts_with(&target.texts[0])
+            || !source.texts[last_source].ends_with(&target.texts[last_target])
+        {
+            return Ok(false);
+        }
+        let remaining_end = &source.texts[last_source]
+            [..source.texts[last_source].len() - target.texts[last_target].len()];
+        let mut segment = 0;
+        let mut position = target.texts[0].len();
+
+        for (index, delimiter) in target.texts[1..last_target].iter().enumerate() {
+            let (end_segment, end_position) = if delimiter.is_empty() {
+                let current = if segment == last_source {
+                    remaining_end
+                } else {
+                    source.texts[segment].as_str()
+                };
+                if let Some((character, _)) = split_first_template_code_point(&current[position..])
+                {
+                    (segment, position + character.len())
+                } else if segment < last_source {
+                    (segment + 1, 0)
+                } else {
+                    return Ok(false);
+                }
+            } else {
+                let mut search_segment = segment;
+                let mut search_position = position;
+                loop {
+                    let current = if search_segment == last_source {
+                        remaining_end
+                    } else {
+                        source.texts[search_segment].as_str()
+                    };
+                    if let Some(offset) = current[search_position..].find(delimiter) {
+                        break (search_segment, search_position + offset);
+                    }
+                    search_segment += 1;
+                    if search_segment > last_source {
+                        return Ok(false);
+                    }
+                    search_position = 0;
+                }
+            };
+            if !self.template_pattern_capture_matches(
+                source,
+                remaining_end,
+                TemplatePatternCapture {
+                    start_segment: segment,
+                    start_position: position,
+                    end_segment,
+                    end_position,
+                },
+                target.types[index],
+                active,
+            )? {
+                return Ok(false);
+            }
+            segment = end_segment;
+            position = end_position + delimiter.len();
+        }
+
+        self.template_pattern_capture_matches(
+            source,
+            remaining_end,
+            TemplatePatternCapture {
+                start_segment: segment,
+                start_position: position,
+                end_segment: last_source,
+                end_position: remaining_end.len(),
+            },
+            target.types[last_target - 1],
+            active,
+        )
+    }
+
+    fn template_pattern_capture_matches(
+        &self,
+        source: &super::type_records::TemplateLiteralTypeData,
+        remaining_end: &str,
+        capture: TemplatePatternCapture,
+        target: TypeId,
+        active: &mut HashSet<TypeId>,
+    ) -> Result<bool, TemplateTypeError> {
+        let target_record = self
+            .type_payload(target)
+            .ok_or(TemplateTypeError::InvalidType(target))?;
+        for placeholder in &source.types[capture.start_segment..capture.end_segment] {
+            if self.type_payload(*placeholder).is_none() {
+                return Err(TemplateTypeError::InvalidType(*placeholder));
+            }
+        }
+        if target_record
+            .flags()
+            .intersects(TypeFlags::ANY | TypeFlags::STRING)
+        {
+            return Ok(true);
+        }
+        if capture.start_segment == capture.end_segment {
+            let text = if capture.start_segment + 1 == source.texts.len() {
+                remaining_end
+            } else {
+                source.texts[capture.start_segment].as_str()
+            };
+            return self.template_placeholder_accepts_value(
+                &text[capture.start_position..capture.end_position],
+                target,
+                active,
+            );
+        }
+        if capture.end_segment == capture.start_segment + 1
+            && capture.start_position == source.texts[capture.start_segment].len()
+            && capture.end_position == 0
+        {
+            return self.template_placeholder_type_matches(
+                source.types[capture.start_segment],
+                target,
+                active,
+            );
+        }
+        Ok(false)
     }
 
     fn template_value_matches_pattern(
@@ -1772,6 +1908,171 @@ mod tests {
             store.is_type_matched_by_template_literal_type(wrong_suffix, suffixed_target),
             Ok(false)
         );
+    }
+
+    #[test]
+    fn template_patterns_match_multiple_placeholders_across_source_segments() {
+        let mut store = initialized_store();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let string = bootstrap.string_type;
+        let number = bootstrap.number_type;
+        let target = store
+            .get_template_literal_type(
+                &["<".to_owned(), ".".to_owned(), ">".to_owned()],
+                &[string, string],
+            )
+            .unwrap();
+        let source = store
+            .get_template_literal_type(
+                &[
+                    "<<".to_owned(),
+                    ">.<".to_owned(),
+                    "-".to_owned(),
+                    ">>".to_owned(),
+                ],
+                &[string, number, number],
+            )
+            .unwrap();
+        let missing_delimiter = store
+            .get_template_literal_type(
+                &[
+                    "<<".to_owned(),
+                    "><".to_owned(),
+                    "-".to_owned(),
+                    ">>".to_owned(),
+                ],
+                &[string, number, number],
+            )
+            .unwrap();
+        let wrong_prefix = store
+            .get_template_literal_type(
+                &[
+                    "[[".to_owned(),
+                    ">.<".to_owned(),
+                    "-".to_owned(),
+                    ">>".to_owned(),
+                ],
+                &[string, number, number],
+            )
+            .unwrap();
+        let wrong_suffix = store
+            .get_template_literal_type(
+                &[
+                    "<<".to_owned(),
+                    ">.<".to_owned(),
+                    "-".to_owned(),
+                    "]]".to_owned(),
+                ],
+                &[string, number, number],
+            )
+            .unwrap();
+        let before = store.type_len();
+
+        for (candidate, expected) in [
+            (source, true),
+            (missing_delimiter, false),
+            (wrong_prefix, false),
+            (wrong_suffix, false),
+        ] {
+            assert_eq!(
+                store.is_type_matched_by_template_literal_type(candidate, target),
+                Ok(expected),
+            );
+            assert_eq!(store.type_len(), before);
+        }
+    }
+
+    #[test]
+    fn template_pattern_captures_validate_literals_and_placeholder_types() {
+        let mut store = initialized_store();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let string = bootstrap.string_type;
+        let number = bootstrap.number_type;
+        let target = store
+            .get_template_literal_type(
+                &["id-".to_owned(), ":".to_owned(), "-end".to_owned()],
+                &[number, string],
+            )
+            .unwrap();
+        let literal_number = store
+            .get_template_literal_type(&["id-42:".to_owned(), "-end".to_owned()], &[string])
+            .unwrap();
+        let invalid_number = store
+            .get_template_literal_type(&["id-value:".to_owned(), "-end".to_owned()], &[string])
+            .unwrap();
+        let numeric_placeholder = store
+            .get_template_literal_type(
+                &["id-".to_owned(), ":extra-".to_owned(), "-end".to_owned()],
+                &[number, string],
+            )
+            .unwrap();
+        let string_placeholder = store
+            .get_template_literal_type(
+                &["id-".to_owned(), ":extra-".to_owned(), "-end".to_owned()],
+                &[string, string],
+            )
+            .unwrap();
+        let ambiguous_number = store
+            .get_template_literal_type(
+                &["id-pre".to_owned(), ":".to_owned(), "-end".to_owned()],
+                &[number, string],
+            )
+            .unwrap();
+
+        for (candidate, expected) in [
+            (literal_number, true),
+            (invalid_number, false),
+            (numeric_placeholder, true),
+            (string_placeholder, false),
+            (ambiguous_number, false),
+        ] {
+            assert_eq!(
+                store.is_type_matched_by_template_literal_type(candidate, target),
+                Ok(expected),
+            );
+        }
+    }
+
+    #[test]
+    fn adjacent_template_pattern_captures_preserve_encoded_code_points() {
+        let mut store = initialized_store();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let string = bootstrap.string_type;
+        let number = bootstrap.number_type;
+        let target = store
+            .get_template_literal_type(
+                &["key-".to_owned(), String::new(), "-done".to_owned()],
+                &[string, number],
+            )
+            .unwrap();
+        let emoji = store
+            .get_template_literal_type(&["key-\u{1f600}".to_owned(), "-done".to_owned()], &[number])
+            .unwrap();
+        let encoded = encode_js_string(&JsString::from_units(vec![0xd800]));
+        let lone = store
+            .get_template_literal_type(&[format!("key-{encoded}"), "-done".to_owned()], &[number])
+            .unwrap();
+        let extra_text = store
+            .get_template_literal_type(
+                &["key-\u{1f600}x".to_owned(), "-done".to_owned()],
+                &[number],
+            )
+            .unwrap();
+        let missing_character = store
+            .get_template_literal_type(&["key-".to_owned(), "-done".to_owned()], &[number])
+            .unwrap();
+
+        for (candidate, expected) in [
+            (emoji, true),
+            (lone, true),
+            (extra_text, false),
+            (missing_character, false),
+        ] {
+            assert_eq!(
+                store.is_type_matched_by_template_literal_type(candidate, target),
+                Ok(expected),
+            );
+        }
     }
 
     #[test]

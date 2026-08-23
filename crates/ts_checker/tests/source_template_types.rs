@@ -342,6 +342,52 @@ fn production_checker_resolves_source_template_aliases_and_reuses_cached_nodes()
 }
 
 #[test]
+fn production_checker_matches_templates_with_multiple_target_placeholders() {
+    let parsed = parse_source_file(concat!(
+        "type Source = `<<${string}>.<${number}-${number}>>`;\n",
+        "type Target = `<${string}.${string}>`;\n",
+        "type Matched = Source extends Target ? true : false;\n",
+        "type Rejected = `<<${string}><${number}-${number}>>` extends Target ? true : false;\n",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(8);
+    let mut context = source_context(&parsed, file);
+
+    context.check_source_file(file).unwrap();
+    assert!(
+        context.diagnostics().is_empty(),
+        "{:?}",
+        context.diagnostics()
+    );
+
+    for (name, expected) in [("Matched", "true"), ("Rejected", "false")] {
+        let (alias, _) = source_alias(&parsed, file, &context, name);
+        assert_eq!(
+            context
+                .type_to_string(source_alias_type(&context, alias))
+                .unwrap(),
+            expected,
+            "alias {name}",
+        );
+    }
+
+    let warm = (
+        context.store().type_len(),
+        context.store().conditional_root_len(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().conditional_root_len(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
+}
+
+#[test]
 fn production_checker_applies_intrinsic_string_mappings_from_source_aliases() {
     let parsed = parse_source_file(concat!(
         "type Uppercase<Input extends string> = intrinsic;\n",
