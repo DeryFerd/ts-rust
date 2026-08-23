@@ -64,6 +64,7 @@ use super::{
 pub(super) struct SourceCallPlan {
     pub(super) node: NodeRef,
     pub(super) callee: PlannedExpression,
+    form: DirectCallForm,
     callee_diagnostic_node: NodeRef,
     deferred_error_property: Option<SourcePropertyPlan>,
     type_arguments: Option<SourceTypeArgumentList>,
@@ -98,6 +99,7 @@ struct SourceTypeArgumentList {
 pub(super) struct DirectSourceCallSyntax {
     node: NodeRef,
     callee: NodeRef,
+    form: DirectCallForm,
     callee_form: SourceCallCalleeForm,
     callee_diagnostic_node: NodeRef,
     deferred_error_property: Option<DirectSourcePropertySyntax>,
@@ -153,6 +155,8 @@ pub(super) fn source_call_argument_contextual_type(
         return Ok(None);
     }
 
+    let parameter_index = argument_index + usize::from(plan.form == DirectCallForm::TaggedTemplate);
+
     let StoredCallableSetValidation::Valid { projection, .. } =
         validate_stored_callable_set(store, callee_type)
     else {
@@ -170,7 +174,7 @@ pub(super) fn source_call_argument_contextual_type(
         if !signature.type_parameters().is_empty() {
             return Ok(None);
         }
-        let parameter_type = match callable.parameters.get(argument_index).copied() {
+        let parameter_type = match callable.parameters.get(parameter_index).copied() {
             Some(parameter) => Some(parameter),
             None => callable
                 .rest_parameter
@@ -202,6 +206,9 @@ pub(super) fn plan_direct_source_call_syntax(
             UnsupportedSourceSyntax::Call(node),
         ));
     };
+    if record.kind == SyntaxKind::TaggedTemplateExpression {
+        return plan_tagged_template_source_call_syntax(arena, store, node);
+    }
     let NodeData::CallExpression(call) = &record.data else {
         return Err(SourceCheckError::Unsupported(
             UnsupportedSourceSyntax::Call(node),
@@ -405,10 +412,171 @@ pub(super) fn plan_direct_source_call_syntax(
     Ok(DirectSourceCallSyntax {
         node,
         callee,
+        form: DirectCallForm::Call,
         callee_form,
         callee_diagnostic_node,
         deferred_error_property,
         type_arguments,
+        arguments,
+        argument_arrow_nodes,
+    })
+}
+
+fn plan_tagged_template_source_call_syntax(
+    arena: &NodeArena,
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+) -> Result<DirectSourceCallSyntax, SourceCheckError> {
+    let record = arena.get(node.node).ok_or(SourceCheckError::Call(node))?;
+    let NodeData::TaggedTemplateExpression(tagged) = &record.data else {
+        return Err(SourceCheckError::Unsupported(
+            UnsupportedSourceSyntax::Call(node),
+        ));
+    };
+    if record.flags.0 != 0
+        || tagged.question_dot_token.is_some()
+        || tagged.type_arguments.is_some()
+        || tagged.facts != 0
+    {
+        return Err(SourceCheckError::Unsupported(
+            UnsupportedSourceSyntax::Call(node),
+        ));
+    }
+
+    let callee = NodeRef::new(node.arena, node.file, tagged.tag);
+    let callee_record = arena.get(tagged.tag).ok_or(SourceCheckError::Call(node))?;
+    if callee_record.parent != Some(node.node)
+        || callee_record.kind != SyntaxKind::Identifier
+        || callee_record.flags.0 != 0
+        || !matches!(
+            &callee_record.data,
+            NodeData::Identifier(identifier)
+                if identifier.flow_node.is_none() && !identifier.text.is_empty()
+        )
+    {
+        return Err(SourceCheckError::Unsupported(
+            UnsupportedSourceSyntax::Call(node),
+        ));
+    }
+
+    let template = NodeRef::new(node.arena, node.file, tagged.template);
+    let template_record = arena
+        .get(tagged.template)
+        .ok_or(SourceCheckError::Call(node))?;
+    if template_record.parent != Some(node.node)
+        || template_record.flags.0 != 0
+        || template_record.range.start < callee_record.range.end
+        || template_record.range.end != record.range.end
+    {
+        return Err(SourceCheckError::Unsupported(
+            UnsupportedSourceSyntax::Call(node),
+        ));
+    }
+
+    let arguments = match (&template_record.data, template_record.kind) {
+        (
+            NodeData::NoSubstitutionTemplateLiteral(literal),
+            SyntaxKind::NoSubstitutionTemplateLiteral,
+        ) if literal.symbol.is_none() => Vec::new(),
+        (NodeData::TemplateExpression(expression), SyntaxKind::TemplateExpression) => {
+            if expression.facts != 0
+                || expression.template_spans.has_trailing_comma
+                || expression.template_spans.nodes.is_empty()
+                || expression.template_spans.range.start < template_record.range.start
+                || expression.template_spans.range.end > template_record.range.end
+            {
+                return Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Call(node),
+                ));
+            }
+            let head = arena
+                .get(expression.head)
+                .ok_or(SourceCheckError::Call(node))?;
+            if head.kind != SyntaxKind::TemplateHead
+                || !matches!(&head.data, NodeData::TemplateHead(_))
+                || head.parent != Some(template.node)
+                || head.flags.0 != 0
+                || head.range.start != template_record.range.start
+                || head.range.end != expression.template_spans.range.start
+            {
+                return Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Call(node),
+                ));
+            }
+
+            let mut arguments = Vec::with_capacity(expression.template_spans.nodes.len());
+            let mut previous_end = head.range.end;
+            for (index, span_id) in expression.template_spans.nodes.iter().copied().enumerate() {
+                let span = arena.get(span_id).ok_or(SourceCheckError::Call(node))?;
+                let NodeData::TemplateSpan(span_data) = &span.data else {
+                    return Err(SourceCheckError::Unsupported(
+                        UnsupportedSourceSyntax::Call(node),
+                    ));
+                };
+                let argument = NodeRef::new(node.arena, node.file, span_data.expression);
+                let argument_record = arena
+                    .get(span_data.expression)
+                    .ok_or(SourceCheckError::Call(node))?;
+                let literal = arena
+                    .get(span_data.literal)
+                    .ok_or(SourceCheckError::Call(node))?;
+                let expected_literal_kind = if index + 1 == expression.template_spans.nodes.len() {
+                    SyntaxKind::TemplateTail
+                } else {
+                    SyntaxKind::TemplateMiddle
+                };
+                if span.kind != SyntaxKind::TemplateSpan
+                    || span.parent != Some(template.node)
+                    || span.flags.0 != 0
+                    || span.range.start < previous_end
+                    || span.range.end > template_record.range.end
+                    || argument_record.parent != Some(span_id)
+                    || argument_record.range.start != span.range.start
+                    || literal.kind != expected_literal_kind
+                    || !matches!(
+                        &literal.data,
+                        NodeData::TemplateMiddle(_) | NodeData::TemplateTail(_)
+                    )
+                    || literal.parent != Some(span_id)
+                    || literal.flags.0 != 0
+                    || literal.range.start < argument_record.range.end
+                    || literal.range.end != span.range.end
+                    || !is_supported_call_argument_syntax(arena, argument)
+                {
+                    return Err(SourceCheckError::Unsupported(
+                        UnsupportedSourceSyntax::Call(node),
+                    ));
+                }
+                previous_end = span.range.end;
+                arguments.push(argument);
+            }
+            if previous_end != template_record.range.end {
+                return Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Call(node),
+                ));
+            }
+            arguments
+        }
+        _ => {
+            return Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Call(node),
+            ));
+        }
+    };
+    let argument_arrow_nodes = arguments
+        .iter()
+        .copied()
+        .map(|argument| unparenthesized_arrow_argument_node(arena, argument))
+        .collect();
+    preflight_call_links(store, node)?;
+    Ok(DirectSourceCallSyntax {
+        node,
+        callee,
+        form: DirectCallForm::TaggedTemplate,
+        callee_form: SourceCallCalleeForm::Identifier,
+        callee_diagnostic_node: callee,
+        deferred_error_property: None,
+        type_arguments: None,
         arguments,
         argument_arrow_nodes,
     })
@@ -515,6 +683,7 @@ pub(super) fn finish_direct_source_call_plan(
     Ok(SourceCallPlan {
         node: syntax.node,
         callee,
+        form: syntax.form,
         callee_diagnostic_node: syntax.callee_diagnostic_node,
         deferred_error_property,
         type_arguments: syntax.type_arguments.clone(),
@@ -624,6 +793,9 @@ fn is_supported_call_argument_syntax(arena: &NodeArena, node: NodeRef) -> bool {
         }
         SyntaxKind::ElementAccessExpression => is_context_insensitive_element_syntax(arena, node),
         SyntaxKind::CallExpression => matches!(&record.data, NodeData::CallExpression(_)),
+        SyntaxKind::TaggedTemplateExpression => {
+            matches!(&record.data, NodeData::TaggedTemplateExpression(_))
+        }
         SyntaxKind::ArrowFunction => is_supported_arrow_argument_syntax(arena, node),
         SyntaxKind::ObjectLiteralExpression => {
             matches!(&record.data, NodeData::ObjectLiteralExpression(_))
@@ -1134,6 +1306,7 @@ enum SourceCallResolutionError {
 
 #[derive(Clone, Copy, Debug)]
 struct SourceCallResolutionRequest<'a> {
+    form: DirectCallForm,
     callee_type: TypeId,
     argument_types: &'a [TypeId],
     explicit_type_arguments: Option<&'a [TypeId]>,
@@ -1149,6 +1322,7 @@ fn resolve_source_call_once(
     request: SourceCallResolutionRequest<'_>,
 ) -> Result<ResolvedSourceCall, SourceCallResolutionError> {
     let SourceCallResolutionRequest {
+        form,
         callee_type,
         argument_types,
         explicit_type_arguments,
@@ -1177,7 +1351,7 @@ fn resolve_source_call_once(
     };
     if explicit_type_arguments.is_none() || nongeneric_type_arguments {
         let request = DirectCallRequest {
-            form: DirectCallForm::Call,
+            form,
             optional_chain: false,
             type_argument_count: 0,
             has_spread_argument: false,
@@ -1200,7 +1374,8 @@ fn resolve_source_call_once(
                     ResolvedSourceCall::Legacy(resolved)
                 });
             }
-            Err(DirectCallError::Unsupported(DirectCallUnsupported::GenericSignature(_))) => {}
+            Err(DirectCallError::Unsupported(DirectCallUnsupported::GenericSignature(_)))
+                if form == DirectCallForm::Call => {}
             Err(
                 DirectCallError::Unsupported(DirectCallUnsupported::UnresolvedReturnType(
                     signature,
@@ -1230,7 +1405,7 @@ fn resolve_source_call_once(
         }
     }
     let vector_request = GenericCallVectorRequest {
-        form: DirectCallForm::Call,
+        form,
         optional_chain: false,
         explicit_type_arguments,
         has_spread_argument: false,
@@ -1278,7 +1453,7 @@ fn resolve_source_call_once(
     }
 
     let request = IdentityGenericCallRequest {
-        form: DirectCallForm::Call,
+        form,
         optional_chain: false,
         explicit_type_arguments,
         has_spread_argument: false,
@@ -1670,6 +1845,7 @@ fn prepare_legacy_source_call_diagnostic(
     argument_types: &[TypeId],
     resolution: ResolvedLegacySourceCall,
 ) -> Result<Vec<CanonicalCheckerDiagnostic>, SourceCheckError> {
+    let implicit_arguments = usize::from(plan.form == DirectCallForm::TaggedTemplate);
     let diagnostic = match resolution.applicability {
         DirectCallApplicability::Applicable => return Ok(Vec::new()),
         DirectCallApplicability::TooFewArguments {
@@ -1677,7 +1853,7 @@ fn prepare_legacy_source_call_diagnostic(
             actual,
         } => {
             if expected_at_least != resolution.minimum_argument_count
-                || actual != plan.arguments.len()
+                || actual != plan.arguments.len() + implicit_arguments
                 || actual != argument_types.len()
             {
                 return Err(SourceCheckError::Call(plan.node));
@@ -1715,7 +1891,7 @@ fn prepare_legacy_source_call_diagnostic(
         } => {
             if resolution.has_effective_rest
                 || expected_at_most != resolution.maximum_argument_count
-                || actual != plan.arguments.len()
+                || actual != plan.arguments.len() + implicit_arguments
                 || actual != argument_types.len()
             {
                 return Err(SourceCheckError::Call(plan.node));
@@ -1725,7 +1901,9 @@ fn prepare_legacy_source_call_diagnostic(
                 range_override: Some(extra_argument_diagnostic_range(
                     host,
                     plan,
-                    expected_at_most,
+                    expected_at_most
+                        .checked_sub(implicit_arguments)
+                        .ok_or(SourceCheckError::Call(plan.node))?,
                 )?),
                 diagnostic: Diagnostic::with_arguments(
                     message_by_code(2554).ok_or(SourceCheckError::MissingDiagnostic(2554))?,
@@ -1758,7 +1936,11 @@ fn prepare_legacy_source_call_diagnostic(
             )?;
             let argument = plan
                 .arguments
-                .get(index)
+                .get(
+                    index
+                        .checked_sub(implicit_arguments)
+                        .ok_or(SourceCheckError::Call(plan.node))?,
+                )
                 .ok_or(SourceCheckError::Call(plan.node))?;
             if let Some(diagnostics) = array_argument_diagnostics(
                 store,
@@ -2027,7 +2209,7 @@ fn missing_semicolon_related_information(
     host: &DeclaredTypeHost<'_>,
     plan: &SourceCallPlan,
 ) -> Result<Option<CanonicalCheckerRelatedInformation>, SourceCheckError> {
-    if plan.arguments.len() != 1 {
+    if plan.form != DirectCallForm::Call || plan.arguments.len() != 1 {
         return Ok(None);
     }
 
@@ -2187,6 +2369,38 @@ fn recover_non_callable_source_call(
     Ok(CheckedSourceCall { return_type })
 }
 
+fn tagged_template_argument_type(
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+) -> Result<TypeId, SourceCheckError> {
+    let unsupported = || SourceCheckError::Unsupported(UnsupportedSourceSyntax::Call(node));
+    let symbol = store
+        .intrinsic_bootstrap()
+        .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+        .and_then(|globals| globals.get_source("TemplateStringsArray"))
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .filter(|symbol| {
+            store
+                .symbol(*symbol)
+                .is_some_and(|record| record.flags().contains(SymbolFlags::INTERFACE))
+        })
+        .ok_or_else(unsupported)?;
+    let type_ = store
+        .declared_type_links(symbol)
+        .and_then(|links| links.declared_type)
+        .ok_or_else(unsupported)?;
+    let record = store.type_payload(type_).ok_or_else(unsupported)?;
+    if !matches!(record.data(), TypeData::Interface(_))
+        || record
+            .symbol()
+            .and_then(|owner| store.get_merged_symbol(owner))
+            != Some(symbol)
+    {
+        return Err(unsupported());
+    }
+    Ok(type_)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn check_direct_source_call(
     store: &mut CanonicalTypeMapperStore,
@@ -2200,6 +2414,19 @@ pub(super) fn check_direct_source_call(
     argument_types: &[TypeId],
 ) -> Result<CheckedSourceCall, SourceCheckError> {
     preflight_call_links(store, plan.node)?;
+    if argument_types.len() != plan.arguments.len() {
+        return Err(SourceCheckError::Call(plan.node));
+    }
+    let tagged_argument_types = if plan.form == DirectCallForm::TaggedTemplate {
+        let template = tagged_template_argument_type(store, plan.node)?;
+        let mut arguments = Vec::with_capacity(argument_types.len() + 1);
+        arguments.push(template);
+        arguments.extend_from_slice(argument_types);
+        Some(arguments)
+    } else {
+        None
+    };
+    let argument_types = tagged_argument_types.as_deref().unwrap_or(argument_types);
     let callee_type = if let Some(property) = &plan.deferred_error_property {
         let bootstrap = store
             .intrinsic_bootstrap()
@@ -2251,6 +2478,7 @@ pub(super) fn check_direct_source_call(
             existing_call_signature,
             session,
             SourceCallResolutionRequest {
+                form: plan.form,
                 callee_type,
                 argument_types,
                 explicit_type_arguments: explicit_type_arguments.as_deref(),
@@ -2793,6 +3021,99 @@ mod tests {
                 .store_mut_for_test()
                 .set_source_file_links(source, links)
         );
+    }
+
+    #[test]
+    fn tagged_template_plans_keep_nested_substitutions_and_invalid_escapes() {
+        let parsed = parsed(concat!(
+            "declare function tag(template: TemplateStringsArray, ...values: any[]): string; ",
+            r"const value = tag`ok ${tag`\u`} tail ${tag`\x`}`;",
+        ));
+        let file = FileId::new(491);
+        let context = context(&parsed, file);
+        let mut tags = parsed
+            .arena
+            .iter()
+            .filter(|(_, record)| record.kind == SyntaxKind::TaggedTemplateExpression)
+            .map(|(node, _)| NodeRef::new(parsed.arena.id(), file, node))
+            .collect::<Vec<_>>();
+        tags.sort_by_key(|tag| parsed.arena.get(tag.node).unwrap().range.start);
+        let [outer, first_inner, second_inner] = tags.as_slice() else {
+            panic!("expected one outer and two inner tagged templates")
+        };
+
+        let outer_syntax =
+            plan_direct_source_call_syntax(&parsed.arena, context.store(), *outer).unwrap();
+        assert_eq!(outer_syntax.form, DirectCallForm::TaggedTemplate);
+        assert_eq!(outer_syntax.arguments(), &[*first_inner, *second_inner]);
+
+        let symbol = first_function_symbol(&parsed, &context, file);
+        let arguments = [*first_inner, *second_inner]
+            .into_iter()
+            .map(|node| {
+                let syntax =
+                    plan_direct_source_call_syntax(&parsed.arena, context.store(), node).unwrap();
+                assert!(syntax.arguments().is_empty());
+                let plan = finish_direct_source_call_plan(
+                    &syntax,
+                    identifier_plan(syntax.callee(), symbol),
+                    Vec::new(),
+                )
+                .unwrap();
+                PlannedExpression::new(node, PlannedExpressionKind::Call(Box::new(plan)))
+            })
+            .collect::<Vec<_>>();
+        let plan = finish_direct_source_call_plan(
+            &outer_syntax,
+            identifier_plan(outer_syntax.callee(), symbol),
+            arguments,
+        )
+        .unwrap();
+        assert_eq!(plan.form, DirectCallForm::TaggedTemplate);
+        assert_eq!(plan.arguments.len(), 2);
+    }
+
+    #[test]
+    fn tagged_template_substitution_plans_keep_the_substitution_node() {
+        let text = concat!(
+            "declare function tag(template: TemplateStringsArray, value: number): string; ",
+            "const result: string = tag`value ${'wrong'}`;",
+        );
+        let source = parsed(text);
+        let source_file = FileId::new(493);
+        let context = context(&source, source_file);
+        let wrong_start = text.find("'wrong'").unwrap();
+        let wrong = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::StringLiteral
+                    && record.range.start == TextPos::new(u32::try_from(wrong_start).unwrap()))
+                .then(|| NodeRef::new(source.arena.id(), source_file, node))
+            })
+            .unwrap();
+        let tag = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::TaggedTemplateExpression)
+                    .then(|| NodeRef::new(source.arena.id(), source_file, node))
+            })
+            .unwrap();
+        let syntax = plan_direct_source_call_syntax(&source.arena, context.store(), tag).unwrap();
+        assert_eq!(syntax.arguments(), &[wrong]);
+
+        let symbol = first_function_symbol(&source, &context, source_file);
+        let plan = finish_direct_source_call_plan(
+            &syntax,
+            identifier_plan(syntax.callee(), symbol),
+            vec![PlannedExpression::new(
+                wrong,
+                PlannedExpressionKind::String("wrong".to_owned()),
+            )],
+        )
+        .unwrap();
+        assert_eq!(plan.arguments[0].unparenthesized().node, wrong);
     }
 
     #[test]

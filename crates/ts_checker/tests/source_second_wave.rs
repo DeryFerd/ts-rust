@@ -257,6 +257,54 @@ fn object_property_arrows_publish_callable_values_without_changing_siblings() {
 }
 
 #[test]
+fn direct_unannotated_arrows_report_exact_implicit_any_diagnostics() {
+    let source = "var value = parameter => <any>{};";
+    let parsed = parse_source_file(source);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(8_224);
+    let mut context = context_with_options(
+        &parsed,
+        file,
+        CanonicalSourceLanguage::TypeScript,
+        CanonicalCheckerOptions {
+            no_implicit_any: true,
+            ..CanonicalCheckerOptions::default()
+        },
+    );
+
+    context.check_source_file(file).unwrap();
+
+    let [diagnostic] = context.diagnostics().as_slice() else {
+        panic!("an unannotated direct arrow must report one implicit-any diagnostic")
+    };
+    assert_eq!(diagnostic.diagnostic.code(), 7006);
+    assert_eq!(
+        diagnostic.diagnostic.render().unwrap(),
+        "Parameter 'parameter' implicitly has an 'any' type."
+    );
+    let node = parsed.arena.get(diagnostic.node.unwrap().node).unwrap();
+    assert_eq!(
+        &source[node.range.start.get() as usize..node.range.end.get() as usize],
+        "parameter"
+    );
+
+    let warm = (
+        context.store().type_len(),
+        context.store().signature_len(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
+}
+
+#[test]
 fn contextual_arrays_accept_nested_object_type_assertions() {
     let parsed = parse_source_file(concat!(
         "interface Array<T> {}\n",

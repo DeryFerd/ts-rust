@@ -2,8 +2,8 @@
 //!
 //! Callable construction belongs to `source_callables`; source checking owns
 //! statement order and body execution. This module only proves the exact
-//! top-level function value symbol (including direct-export routing) and the
-//! hoisted identifier route used by source expressions.
+//! top-level or nested function value symbol (including direct-export routing)
+//! and the hoisted identifier route used by source expressions.
 
 use std::collections::HashSet;
 
@@ -14,8 +14,8 @@ use ts_binder::{
 };
 
 use super::{
-    CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, TypeId,
-    source_callables::valid_source_function_owner_shape,
+    source_callables::valid_source_function_owner_shape, CanonicalTypeMapperStore,
+    DeclaredTypeError, DeclaredTypeHost, TypeId,
 };
 
 /// Binder identities retained for one exact top-level function declaration.
@@ -83,6 +83,7 @@ pub enum SourceFunctionUnsupported {
 pub enum SourceFunctionInvariant {
     InvalidSymbol(SemanticSymbolId),
     MissingDeclarationSymbol(NodeRef),
+    MissingEnclosingLocals(NodeRef),
     InvalidMergedSymbol(SemanticSymbolId),
     InvalidSymbolShape(SemanticSymbolId),
     MissingDeclarations(SemanticSymbolId),
@@ -116,6 +117,17 @@ pub enum SourceFunctionInvariant {
     InvalidTargetParent {
         symbol: SemanticSymbolId,
         expected: Option<SemanticSymbolId>,
+        actual: Option<SemanticSymbolId>,
+    },
+    InvalidDeclarationContainer {
+        declaration: NodeRef,
+        expected: NodeRef,
+        actual: Option<NodeRef>,
+    },
+    EnclosingLocalSymbolMismatch {
+        declaration: NodeRef,
+        enclosing_function: NodeRef,
+        expected: SemanticSymbolId,
         actual: Option<SemanticSymbolId>,
     },
     InvalidSymbolNodeCache {
@@ -206,6 +218,48 @@ pub(super) fn plan_top_level_function(
         declaration,
         owner_symbol: merged,
     })
+}
+
+/// Proves one named function declared directly in an enclosing function body.
+pub(super) fn plan_nested_function(
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    name: NodeRef,
+    name_text: &str,
+    enclosing_function: NodeRef,
+) -> Result<PlannedTopLevelFunction, SourceFunctionPlanError> {
+    let actual_container = bound.container(declaration);
+    if actual_container != Some(enclosing_function) {
+        return Err(SourceFunctionInvariant::InvalidDeclarationContainer {
+            declaration,
+            expected: enclosing_function,
+            actual: actual_container,
+        }
+        .into());
+    }
+
+    let function = plan_top_level_function(bound, store, declaration, name, name_text, false)?;
+    let locals =
+        bound
+            .locals(enclosing_function)
+            .ok_or(SourceFunctionInvariant::MissingEnclosingLocals(
+                enclosing_function,
+            ))?;
+    let actual = store
+        .symbol_table(locals)
+        .and_then(|table| table.get_source(name_text));
+    if actual != Some(function.owner_symbol) {
+        return Err(SourceFunctionInvariant::EnclosingLocalSymbolMismatch {
+            declaration,
+            enclosing_function,
+            expected: function.owner_symbol,
+            actual,
+        }
+        .into());
+    }
+
+    Ok(function)
 }
 
 /// Resolves one identifier as a precollected, hoisted source function.
@@ -633,5 +687,103 @@ fn name_resolution_error(
             })
         }
         error => SourceFunctionPlanError::Invariant(SourceFunctionInvariant::NameResolution(error)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ts_ast::{FileId, NodeData};
+    use ts_binder::{
+        CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
+        EscapedName,
+    };
+    use ts_parser::parse_source_file;
+
+    use super::*;
+
+    #[test]
+    fn nested_function_uses_enclosing_locals_and_preserves_variable_shadowing() {
+        let parsed = parse_source_file(concat!(
+            "function outer() { const x = 0; ",
+            "function inner() { var x = 'inner'; } }",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(8_926);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/nested-functions.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let (symbols, mut files) = binder.finish().try_into_parts().unwrap();
+        let bound = files.remove(&file).unwrap();
+        let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
+        assert!(store
+            .register_source_file(&parsed.arena, parsed.source_file, file)
+            .is_some());
+
+        let function = |expected_name: &str| {
+            parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::FunctionDeclaration(function) = &record.data else {
+                        return None;
+                    };
+                    let name = function.name?;
+                    let NodeData::Identifier(identifier) = &parsed.arena.get(name)?.data else {
+                        return None;
+                    };
+                    (identifier.text == expected_name).then_some((
+                        NodeRef::new(parsed.arena.id(), file, node),
+                        NodeRef::new(parsed.arena.id(), file, name),
+                    ))
+                })
+                .unwrap()
+        };
+        let (outer, _) = function("outer");
+        let (inner, name) = function("inner");
+
+        let planned = plan_nested_function(&bound, &store, inner, name, "inner", outer).unwrap();
+        assert_eq!(planned.owner_symbol, bound.symbol(inner).unwrap());
+        assert_eq!(
+            plan_nested_function(&bound, &store, inner, name, "inner", outer),
+            Ok(planned)
+        );
+
+        let shadowed_variables: Vec<_> = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let NodeData::VariableDeclaration(_) = &record.data else {
+                    return None;
+                };
+                bound.symbol(NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .collect();
+        assert_eq!(shadowed_variables.len(), 2);
+        assert_ne!(shadowed_variables[0], shadowed_variables[1]);
+
+        assert_eq!(
+            plan_nested_function(&bound, &store, inner, name, "inner", bound.source_file(),),
+            Err(SourceFunctionPlanError::Invariant(
+                SourceFunctionInvariant::InvalidDeclarationContainer {
+                    declaration: inner,
+                    expected: bound.source_file(),
+                    actual: Some(outer),
+                },
+            ))
+        );
     }
 }

@@ -260,11 +260,19 @@ pub(super) struct SourceFunctionStatementsSyntax {
     pub(super) final_if: SourceFinalIfSyntax,
 }
 
-/// Ordered local declarations with an optional final return statement.
+/// One declaration retained in its original linear function-body order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SourceLinearFunctionStatementSyntax {
+    Local(SourceLocalDeclarationSyntax),
+    Function(NodeRef),
+}
+
+/// Ordered declarations with an optional final return statement.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SourceLinearFunctionStatementsSyntax {
     pub(super) body: NodeRef,
     pub(super) locals: Vec<SourceLocalDeclarationSyntax>,
+    pub(super) statements: Vec<SourceLinearFunctionStatementSyntax>,
     pub(super) return_statement: Option<NodeRef>,
     pub(super) return_expression: Option<NodeRef>,
 }
@@ -1659,24 +1667,34 @@ impl SyntaxPlanner<'_> {
 
         let body = self.callable.body;
         self.validate_range(body, declaration)?;
-        let statements = self.plan_body(body, declaration)?;
+        let body_statements = self.plan_body(body, declaration)?;
         let mut locals = Vec::new();
+        let mut statements = Vec::new();
         let mut return_statement = None;
         let mut return_expression = None;
-        for (index, statement_id) in statements.iter().copied().enumerate() {
+        for (index, statement_id) in body_statements.iter().copied().enumerate() {
             let statement = self.reference(statement_id);
             match self.node(statement)?.kind {
                 SyntaxKind::VariableStatement
                 | SyntaxKind::Block
                 | SyntaxKind::EmptyStatement
                 | SyntaxKind::LabeledStatement => {
-                    locals.extend(self.plan_local_or_block_statement(
-                        statement,
-                        body,
-                        declaration,
-                    )?);
+                    let declarations =
+                        self.plan_local_or_block_statement(statement, body, declaration)?;
+                    statements.extend(
+                        declarations
+                            .iter()
+                            .copied()
+                            .map(SourceLinearFunctionStatementSyntax::Local),
+                    );
+                    locals.extend(declarations);
                 }
-                SyntaxKind::ReturnStatement if index + 1 == statements.len() => {
+                SyntaxKind::FunctionDeclaration => {
+                    statements.push(SourceLinearFunctionStatementSyntax::Function(
+                        self.plan_nested_function_statement(statement, body, declaration)?,
+                    ));
+                }
+                SyntaxKind::ReturnStatement if index + 1 == body_statements.len() => {
                     return_expression = self.plan_linear_return(statement, body, declaration)?;
                     return_statement = Some(statement);
                 }
@@ -1711,9 +1729,134 @@ impl SyntaxPlanner<'_> {
         Ok(SourceLinearFunctionStatementsSyntax {
             body,
             locals,
+            statements,
             return_statement,
             return_expression,
         })
+    }
+
+    fn plan_nested_function_statement(
+        &self,
+        statement: NodeRef,
+        parent: NodeRef,
+        callable: NodeRef,
+    ) -> Result<NodeRef, SourceFunctionStatementsError> {
+        let record = self.node(statement)?;
+        let NodeData::FunctionDeclaration(function) = &record.data else {
+            return Err(self.unsupported(
+                statement,
+                record.kind,
+                SourceFunctionStatementsRole::BodyStatement,
+            ));
+        };
+        if record.kind != SyntaxKind::FunctionDeclaration
+            || record.flags.0 != 0
+            || record.parent != Some(parent.node)
+            || function.modifiers.is_some()
+            || function.asterisk_token.is_some()
+            || function.type_parameters.is_some()
+            || !function.parameters.nodes.is_empty()
+            || function.parameters.has_trailing_comma
+            || function.type_.is_some()
+            || function.flow_node.is_some()
+            || function.full_signature.is_some()
+            || function.local_symbol.is_some()
+            || function.symbol.is_some()
+            || function.end_flow_node.is_some()
+            || function.return_flow_node.is_some()
+            || function.next_container.is_some()
+            || function.facts != 0
+        {
+            return Err(self.unsupported(
+                statement,
+                record.kind,
+                SourceFunctionStatementsRole::BodyStatement,
+            ));
+        }
+        self.validate_range(statement, parent)?;
+        self.validate_container(statement, callable)?;
+        self.validate_block_scope_container(statement, callable)?;
+
+        let name = function
+            .name
+            .map(|node| self.reference(node))
+            .ok_or_else(|| {
+                self.unsupported(
+                    statement,
+                    record.kind,
+                    SourceFunctionStatementsRole::Callable,
+                )
+            })?;
+        let name_record = self.node(name)?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Err(self.unsupported(
+                name,
+                name_record.kind,
+                SourceFunctionStatementsRole::Callable,
+            ));
+        };
+        if name_record.kind != SyntaxKind::Identifier
+            || name_record.flags.0 != 0
+            || identifier.flow_node.is_some()
+            || identifier.text.is_empty()
+        {
+            return Err(self.unsupported(
+                name,
+                name_record.kind,
+                SourceFunctionStatementsRole::Callable,
+            ));
+        }
+        self.validate_parent(
+            name,
+            Some(statement.node),
+            SourceFunctionStatementsRole::Callable,
+        )?;
+        self.validate_range(name, statement)?;
+        self.validate_container(name, statement)?;
+        self.validate_block_scope_container(name, statement)?;
+
+        let body = function
+            .body
+            .map(|node| self.reference(node))
+            .ok_or_else(|| {
+                self.unsupported(
+                    statement,
+                    record.kind,
+                    SourceFunctionStatementsRole::FunctionBody,
+                )
+            })?;
+        self.validate_parent(
+            body,
+            Some(statement.node),
+            SourceFunctionStatementsRole::FunctionBody,
+        )?;
+        self.validate_range(body, statement)?;
+        self.validate_order(name, body)?;
+        self.validate_container(body, statement)?;
+        self.validate_block_scope_container(body, statement)?;
+
+        let symbol = self.bound.symbol(statement).ok_or(
+            SourceFunctionStatementsInvariant::InvalidCallableEdge(statement),
+        )?;
+        let locals = self
+            .bound
+            .locals(callable)
+            .ok_or(SourceFunctionStatementsInvariant::MissingLocals(callable))?;
+        let actual = self
+            .store
+            .symbol_table(locals)
+            .and_then(|table| table.get_source(&identifier.text));
+        if actual != Some(symbol) {
+            return Err(SourceFunctionStatementsInvariant::LocalTableMismatch {
+                declaration: statement,
+                scope: callable,
+                expected: symbol,
+                actual,
+            }
+            .into());
+        }
+
+        Ok(statement)
     }
 
     fn plan_linear_return(
@@ -3659,6 +3802,10 @@ mod joined_tests {
         let fixture = JoinedFixture::new("function avoid() { var x = 1; }", FileId::new(1_190));
         let syntax = fixture.linear_plan().unwrap();
         assert_eq!(syntax.locals.len(), 1);
+        assert_eq!(
+            syntax.statements,
+            [SourceLinearFunctionStatementSyntax::Local(syntax.locals[0])],
+        );
         assert_eq!(syntax.locals[0].binding, VariableBindingKind::Var);
         assert!(syntax.return_statement.is_none());
         assert!(syntax.return_expression.is_none());
@@ -3678,6 +3825,93 @@ mod joined_tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn linear_body_preserves_nested_function_order_and_distinct_shadowed_locals() {
+        let fixture = JoinedFixture::new(
+            concat!(
+                "function outer() {\n",
+                "  const x = 0;\n",
+                "  function inner() {\n",
+                "    var x = \"inner\";\n",
+                "  }\n",
+                "  const after = x;\n",
+                "}\n",
+            ),
+            FileId::new(1_198),
+        );
+        let syntax = fixture.linear_plan().unwrap();
+        assert_eq!(syntax.locals.len(), 2);
+        let [
+            SourceLinearFunctionStatementSyntax::Local(first),
+            SourceLinearFunctionStatementSyntax::Function(inner),
+            SourceLinearFunctionStatementSyntax::Local(after),
+        ] = syntax.statements.as_slice()
+        else {
+            panic!("expected local, nested function, and trailing local in source order")
+        };
+        assert_eq!(*first, syntax.locals[0]);
+        assert_eq!(*after, syntax.locals[1]);
+        assert_eq!(first.binding, VariableBindingKind::Const);
+
+        let outer = fixture.declaration();
+        let outer_locals = fixture.bound.locals(outer).unwrap();
+        let inner_symbol = fixture.bound.symbol(*inner).unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .symbol_table(outer_locals)
+                .and_then(|table| table.get_source("inner")),
+            Some(inner_symbol),
+        );
+
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&fixture.parsed.arena, &fixture.bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let callable =
+            plan_source_callable(&fixture.store, &host, *inner, inner_symbol, None).unwrap();
+        let inner_syntax = plan_source_linear_function_statements_syntax(
+            &fixture.parsed.arena,
+            &fixture.bound,
+            &fixture.store,
+            &callable,
+        )
+        .unwrap();
+        let [shadowed] = inner_syntax.locals.as_slice() else {
+            panic!("expected one function-scoped inner variable")
+        };
+        assert_eq!(shadowed.binding, VariableBindingKind::Var);
+        assert_ne!(shadowed.symbol, first.symbol);
+        assert_eq!(
+            fixture
+                .store
+                .symbol_table(fixture.bound.locals(*inner).unwrap())
+                .and_then(|table| table.get_source("x")),
+            Some(shadowed.symbol),
+        );
+    }
+
+    #[test]
+    fn linear_body_rejects_nested_functions_outside_the_zero_argument_inferred_shape() {
+        for (index, source) in [
+            "function outer() { function inner(value: number) {} }",
+            "function outer() { function inner(): void {} }",
+            "function outer() { function inner<T>() {} }",
+            "function outer() { { function inner() {} } }",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture =
+                JoinedFixture::new(source, FileId::new(1_280 + u32::try_from(index).unwrap()));
+            assert!(matches!(
+                fixture.linear_plan(),
+                Err(SourceFunctionStatementsError::Unsupported(_)),
+            ));
+        }
     }
 
     #[test]

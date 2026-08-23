@@ -615,6 +615,56 @@ fn annotated_numeric_class_fields_preserve_annotation_and_literal_caches() {
 }
 
 #[test]
+fn class_field_initializers_cannot_capture_constructor_parameters() {
+    let source = concat!(
+        "const value = 1;\n",
+        "class Model {\n",
+        "  property = value;\n",
+        "  constructor(value: string) {}\n",
+        "}\n",
+    );
+    let parsed = parse_source_file(source);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(100);
+    let mut context = checker_context(&parsed, file);
+
+    context.check_source_file(file).unwrap();
+
+    let [diagnostic] = context.diagnostics().as_slice() else {
+        panic!("constructor-parameter capture must report one TS2301 diagnostic")
+    };
+    assert_eq!(diagnostic.diagnostic.code(), 2301);
+    assert_eq!(
+        diagnostic.diagnostic.render().unwrap(),
+        "Initializer of instance member variable 'property' cannot reference identifier 'value' declared in the constructor."
+    );
+    let range = parsed
+        .arena
+        .get(diagnostic.node.unwrap().node)
+        .unwrap()
+        .range;
+    assert_eq!(
+        &source[range.start.get() as usize..range.end.get() as usize],
+        "value",
+    );
+
+    let warm = (
+        context.store().type_len(),
+        context.store().signature_len(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
+}
+
+#[test]
 fn later_unannotated_variable_keeps_classes_and_field_diagnostics_cold_across_retries() {
     let parsed = parse_source_file(concat!(
         "class Loose { bare: string; optional?: number; static count: number; }\n",

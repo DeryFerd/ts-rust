@@ -180,6 +180,57 @@ fn variable_initializer(parsed: &ParseResult, file: FileId, declaration: NodeRef
     )
 }
 
+#[test]
+fn nested_function_declarations_preserve_independent_shadowed_variable_scopes() {
+    let source = concat!(
+        "function outer() {\n",
+        "  const value = 0;\n",
+        "  function inner() {\n",
+        "    var value = 'inner';\n",
+        "  }\n",
+        "}\n",
+    );
+    let parsed = parse_source_file(source);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(8_231);
+    let mut context = context(&parsed, file);
+
+    context.check_source_file(file).unwrap();
+    assert!(context.diagnostics().is_empty());
+
+    let declarations = variable_declarations(&parsed, file, "value");
+    let [outer, inner] = declarations.as_slice() else {
+        panic!("nested functions must preserve both shadowed declarations")
+    };
+    let bound = context.file(file).unwrap().1;
+    let outer_symbol = bound.symbol(*outer).unwrap();
+    let inner_symbol = bound.symbol(*inner).unwrap();
+    assert_ne!(outer_symbol, inner_symbol);
+    for (symbol, expected) in [(outer_symbol, "0"), (inner_symbol, "string")] {
+        let type_ = context
+            .store()
+            .value_symbol_links(symbol)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        assert_eq!(context.type_to_string(type_).unwrap(), expected);
+    }
+
+    let warm = (
+        context.store().type_len(),
+        context.store().signature_len(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
+}
+
 fn unique_variable_initializer(parsed: &ParseResult, file: FileId, expected: &str) -> NodeRef {
     let declarations = variable_declarations(parsed, file, expected);
     let [declaration] = declarations.as_slice() else {

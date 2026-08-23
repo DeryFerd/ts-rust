@@ -5211,6 +5211,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     && !flags.contains(SymbolFlags::CLASS)
                     && type_arguments.is_empty()
                     && !self.is_initialized_global_function(symbol)
+                    && !self.is_default_library_template_strings_array(symbol)
                 {
                     self.plan_property_interface(symbol)?;
                 }
@@ -5498,6 +5499,65 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                             .and_then(|owner| self.store.get_merged_symbol(owner))
                             == Some(symbol)
                 })
+    }
+
+    fn is_default_library_template_strings_array(&self, symbol: SemanticSymbolId) -> bool {
+        if !self.global_symbol_has_name(symbol, "TemplateStringsArray") {
+            return false;
+        }
+
+        let Some(record) = self.store.symbol(symbol) else {
+            return false;
+        };
+        let Some([declaration]) = record.declarations() else {
+            return false;
+        };
+        if record.flags() != SymbolFlags::INTERFACE
+            || record.parent().is_some()
+            || record.value_declaration().is_some()
+            || record.export_symbol().is_some()
+        {
+            return false;
+        }
+
+        let Some((_, bound)) = self.host.source(*declaration) else {
+            return false;
+        };
+        let Some(facts) = bound.source_facts() else {
+            return false;
+        };
+        if !facts.is_default_library()
+            || !facts.is_declaration_file()
+            || bound
+                .symbol(*declaration)
+                .and_then(|owner| self.store.get_merged_symbol(owner))
+                != Some(symbol)
+        {
+            return false;
+        }
+
+        let Some(node) = self.host.node(*declaration) else {
+            return false;
+        };
+        let NodeData::InterfaceDeclaration(interface) = &node.data else {
+            return false;
+        };
+        if node.kind != SyntaxKind::InterfaceDeclaration
+            || node.parent != Some(bound.source_file().node)
+            || interface.type_parameters.is_some()
+        {
+            return false;
+        }
+
+        let name = NodeRef::new(declaration.arena, declaration.file, interface.name);
+        self.host.node(name).is_some_and(|name_node| {
+            name_node.parent == Some(declaration.node)
+                && matches!(
+                    &name_node.data,
+                    NodeData::Identifier(identifier)
+                        if identifier.text == "TemplateStringsArray"
+                )
+        })
     }
 
     fn cached_class_or_interface_reference(&self, node: NodeRef) -> bool {
@@ -8250,6 +8310,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             && !flags.contains(SymbolFlags::CLASS)
             && preflight_class_or_interface_reference(planner.store, planner.host, symbol, flags)?
                 == 0
+            && !planner.is_default_library_template_strings_array(symbol)
         {
             planner.plan_property_interface(symbol)?;
         }
@@ -11752,10 +11813,30 @@ mod tests {
         ))
     }
 
+    fn default_library_fixture(source: &str) -> Fixture {
+        fixture_with_source_facts(
+            source,
+            CanonicalModuleState::Script,
+            IntrinsicBootstrapOptions::default(),
+            true,
+            |_| {},
+        )
+    }
+
     fn fixture_with_options(
         source: &str,
         module_state: CanonicalModuleState,
         intrinsic: IntrinsicBootstrapOptions,
+        mutate: impl FnOnce(&mut ParseResult),
+    ) -> Fixture {
+        fixture_with_source_facts(source, module_state, intrinsic, false, mutate)
+    }
+
+    fn fixture_with_source_facts(
+        source: &str,
+        module_state: CanonicalModuleState,
+        intrinsic: IntrinsicBootstrapOptions,
+        is_default_library: bool,
         mutate: impl FnOnce(&mut ParseResult),
     ) -> Fixture {
         let mut parsed = parse_source_file(source);
@@ -11768,10 +11849,11 @@ mod tests {
                 &parsed.arena,
                 parsed.source_file,
                 file,
-                CanonicalSourceFileFacts::new(
+                CanonicalSourceFileFacts::new_with_default_library(
                     EscapedName::source("\"/type-nodes.ts\""),
                     CanonicalSourceLanguage::TypeScript,
-                    false,
+                    is_default_library,
+                    is_default_library,
                     module_state,
                 ),
             )
@@ -19306,6 +19388,140 @@ mod tests {
         );
         assert_eq!(store_state(&fixture.store), warm);
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn default_library_template_strings_array_resolves_identity_without_expanding_members() {
+        let source = concat!(
+            "interface ReadonlyArray<T> { item(value: T): T; } ",
+            "interface TemplateStringsArray extends ReadonlyArray<string> { ",
+            "readonly raw: readonly string[]; } ",
+            "let template: TemplateStringsArray;",
+        );
+
+        for direct_declared_query in [false, true] {
+            let mut fixture = default_library_fixture(source);
+            let template = canonical_fixture_symbol(
+                &fixture,
+                SyntaxKind::InterfaceDeclaration,
+                "TemplateStringsArray",
+            );
+            let reference = variable_type_node(&fixture, "template");
+            let host = post_global_host(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            );
+            assert!(object_members::plan_interface(&fixture.store, &host, template).is_err());
+
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let expected = if direct_declared_query {
+                query_declared(
+                    &mut fixture,
+                    template,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                )
+                .unwrap()
+            } else {
+                query_node(&mut fixture, reference, &mut diagnostics).unwrap()
+            };
+            assert_eq!(
+                fixture
+                    .store
+                    .declared_type_links(template)
+                    .and_then(|links| links.declared_type),
+                Some(expected),
+            );
+            let record = fixture.store.type_payload(expected).unwrap();
+            let TypeData::Interface(interface) = record.data() else {
+                panic!("TemplateStringsArray must retain its declared interface identity")
+            };
+            assert_eq!(record.symbol(), Some(template));
+            assert!(!interface.declared_members_resolved);
+            assert_eq!(
+                query_node(&mut fixture, reference, &mut diagnostics),
+                Ok(expected)
+            );
+            assert_eq!(
+                query_declared(
+                    &mut fixture,
+                    template,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                ),
+                Ok(expected),
+            );
+
+            let warm = store_state(&fixture.store);
+            assert_eq!(
+                query_node(&mut fixture, reference, &mut diagnostics),
+                Ok(expected)
+            );
+            assert_eq!(store_state(&fixture.store), warm);
+            let TypeData::Interface(interface) =
+                fixture.store.type_payload(expected).unwrap().data()
+            else {
+                panic!("TemplateStringsArray must remain an unresolved interface shell")
+            };
+            assert!(!interface.declared_members_resolved);
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn template_strings_array_identity_requires_exact_default_library_declaration() {
+        fn is_authenticated(fixture: &Fixture, symbol: SemanticSymbolId) -> bool {
+            let host = post_global_host(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            );
+            let aliases = HashMap::new();
+            TypeQueryPlanner::new(&fixture.store, &host, None, None, false, &aliases)
+                .is_default_library_template_strings_array(symbol)
+        }
+
+        let ordinary = fixture(concat!(
+            "interface TemplateStringsArray { invoke(): string; } ",
+            "let template: TemplateStringsArray;",
+        ));
+        let symbol = canonical_fixture_symbol(
+            &ordinary,
+            SyntaxKind::InterfaceDeclaration,
+            "TemplateStringsArray",
+        );
+        assert!(!is_authenticated(&ordinary, symbol));
+
+        let merged = default_library_fixture(concat!(
+            "interface TemplateStringsArray { invoke(): string; } ",
+            "interface TemplateStringsArray {} ",
+            "let template: TemplateStringsArray;",
+        ));
+        let symbol = canonical_fixture_symbol(
+            &merged,
+            SyntaxKind::InterfaceDeclaration,
+            "TemplateStringsArray",
+        );
+        assert!(!is_authenticated(&merged, symbol));
+
+        let generic = default_library_fixture(concat!(
+            "interface TemplateStringsArray<T> { invoke(): T; } ",
+            "let template: TemplateStringsArray<string>;",
+        ));
+        let symbol = canonical_fixture_symbol(
+            &generic,
+            SyntaxKind::InterfaceDeclaration,
+            "TemplateStringsArray",
+        );
+        assert!(!is_authenticated(&generic, symbol));
+
+        for mut fixture in [ordinary, merged] {
+            let reference = variable_type_node(&fixture, "template");
+            let before = store_state(&fixture.store);
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            assert!(query_node(&mut fixture, reference, &mut diagnostics).is_err());
+            assert_eq!(store_state(&fixture.store), before);
+            assert!(diagnostics.is_empty());
+        }
     }
 
     #[test]

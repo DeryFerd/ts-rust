@@ -376,6 +376,71 @@ fn primitive_constructor_parameters_publish_their_required_signature() {
 }
 
 #[test]
+fn unsupported_class_grammar_reports_exact_modifier_accessor_and_heritage_errors() {
+    let cases: &[(&str, &[(u32, &str)])] = &[
+        (
+            "class Model { constructor(public static value: number) {} }",
+            &[(1090, "static")],
+        ),
+        (
+            "class Model { constructor(private public value: number) {} }",
+            &[(1028, "public")],
+        ),
+        (
+            "class Model { set value(input = 0) {} static set value(input = 0) {} }",
+            &[(1052, "value"), (1052, "value")],
+        ),
+        (
+            "class First {} class Second {} class Model extends First, Second {}",
+            &[(1174, "Second")],
+        ),
+    ];
+
+    for (index, (source, expected)) in cases.iter().enumerate() {
+        let parsed = parse_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(2_130 + u32::try_from(index).unwrap());
+        let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let actual = context
+            .diagnostics()
+            .as_slice()
+            .iter()
+            .map(|diagnostic| {
+                let range = parsed
+                    .arena
+                    .get(diagnostic.node.unwrap().node)
+                    .unwrap()
+                    .range;
+                (
+                    diagnostic.diagnostic.code(),
+                    &source[range.start.get() as usize..range.end.get() as usize],
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, *expected, "source: {source}");
+
+        let warm = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.diagnostics().clone(),
+        );
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.diagnostics().clone(),
+            ),
+            warm,
+            "source: {source}",
+        );
+    }
+}
+
+#[test]
 fn decorated_constructor_parameter_publishes_its_annotated_signature() {
     let parsed = parse_source_file(concat!(
         "declare function decorate(target: any, key: string | symbol | undefined, index: number): void;\n",
