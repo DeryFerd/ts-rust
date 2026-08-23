@@ -1322,6 +1322,7 @@ pub struct Program {
     package_export_specifiers: BTreeMap<String, String>,
     diagnostics: Vec<ProgramDiagnostic>,
     current_directory: String,
+    config_file_path: Option<String>,
     case_sensitivity: CaseSensitivity,
     options: CompilerOptions,
     checker: ProgramChecker,
@@ -1774,11 +1775,37 @@ impl Program {
         root_names: &[String],
         options: CompilerOptions,
     ) -> Result<Self, CanonicalProgramCheckError> {
-        Self::try_new_with_canonical_checker_and_queries(
+        Self::try_new_with_canonical_checker_with_config_path(
             file_system,
             current_directory,
             root_names,
             options,
+            None,
+        )
+    }
+
+    /// Creates a canonically checked Program with explicit project provenance.
+    ///
+    /// A configuration file only affects provenance when its path is provided
+    /// here. An unrelated configuration on the filesystem is not sufficient.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same construction failures as
+    /// [`Self::try_new_with_canonical_checker`].
+    pub fn try_new_with_canonical_checker_with_config_path(
+        file_system: &dyn FileSystem,
+        current_directory: &str,
+        root_names: &[String],
+        options: CompilerOptions,
+        config_file_path: Option<&str>,
+    ) -> Result<Self, CanonicalProgramCheckError> {
+        Self::try_new_with_canonical_checker_and_queries_with_config_path(
+            file_system,
+            current_directory,
+            root_names,
+            options,
+            config_file_path,
             |_, _| (),
         )
         .map(|(program, _)| program)
@@ -1803,6 +1830,30 @@ impl Program {
         options: CompilerOptions,
         queries: impl FnOnce(&Self, &mut CanonicalProgramQueries<'_>) -> T,
     ) -> Result<(Self, Option<T>), CanonicalProgramCheckError> {
+        Self::try_new_with_canonical_checker_and_queries_with_config_path(
+            file_system,
+            current_directory,
+            root_names,
+            options,
+            None,
+            queries,
+        )
+    }
+
+    /// Checks a Program with explicit project provenance and runs graph queries.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same construction failures as
+    /// [`Self::try_new_with_canonical_checker_and_queries`].
+    pub fn try_new_with_canonical_checker_and_queries_with_config_path<T>(
+        file_system: &dyn FileSystem,
+        current_directory: &str,
+        root_names: &[String],
+        options: CompilerOptions,
+        config_file_path: Option<&str>,
+        queries: impl FnOnce(&Self, &mut CanonicalProgramQueries<'_>) -> T,
+    ) -> Result<(Self, Option<T>), CanonicalProgramCheckError> {
         let mut program = Self::new_unchecked_with_options_and_checker(
             file_system,
             current_directory,
@@ -1810,9 +1861,17 @@ impl Program {
             options,
             ProgramChecker::Canonical,
         );
+        program.config_file_path = config_file_path.map(|path| {
+            if is_absolute(path) {
+                ts_path::normalize_path(path)
+            } else {
+                resolve_path(&program.current_directory, &[path])
+            }
+        });
         program.load_remaining_program_graph(file_system);
-        if program.options.printer_settings().emit_javascript {
-            let diagnostics = program.canonical_javascript_output_diagnostics();
+        let settings = program.options.printer_settings();
+        if settings.emit_javascript || settings.emit_declarations {
+            let diagnostics = program.canonical_output_diagnostics();
             program.diagnostics.extend(diagnostics);
         }
         let mut result = None;
@@ -1847,7 +1906,7 @@ impl Program {
         self.load_module_graph(file_system, resolution_options);
     }
 
-    fn canonical_javascript_output_diagnostics(&self) -> Vec<ProgramDiagnostic> {
+    fn canonical_output_diagnostics(&self) -> Vec<ProgramDiagnostic> {
         let source_names = self
             .source_files
             .iter()
@@ -1868,34 +1927,57 @@ impl Program {
             &self.current_directory,
             self.case_sensitivity,
         );
+        let bundle_emits_javascript = self.options.out_file.is_none()
+            || self.bundle_sources().into_iter().any(|source| {
+                matches!(self.options.module, ModuleKind::Amd | ModuleKind::System)
+                    || !source_is_external_module(source)
+            });
         let mut checked_paths = BTreeSet::new();
 
-        self.source_files
-            .iter()
-            .filter(|source| {
-                !source.is_default_library
-                    && !ts_path::is_declaration_file(&source.file_name)
-                    && self.source_should_emit(source)
-            })
-            .filter_map(|source| {
-                let paths = if self.options.out_file.is_some() {
-                    ts_outputpaths::bundle_output_paths(&self.options, &self.current_directory)?
-                } else {
-                    ts_outputpaths::output_paths(
-                        &source.file_name,
-                        &self.options,
-                        &self.current_directory,
-                        &common_source_directory,
-                        self.case_sensitivity,
-                    )
+        let mut diagnostics = Vec::new();
+        for source in self.source_files.iter().filter(|source| {
+            !source.is_default_library
+                && !ts_path::is_declaration_file(&source.file_name)
+                && self.source_should_emit(source)
+        }) {
+            let paths = if self.options.out_file.is_some() {
+                let Some(paths) =
+                    ts_outputpaths::bundle_output_paths(&self.options, &self.current_directory)
+                else {
+                    continue;
                 };
-                let file_name = paths.javascript?;
+                paths
+            } else {
+                ts_outputpaths::output_paths(
+                    &source.file_name,
+                    &self.options,
+                    &self.current_directory,
+                    &common_source_directory,
+                    self.case_sensitivity,
+                )
+            };
+            for file_name in [
+                paths.javascript.filter(|_| bundle_emits_javascript),
+                paths.declaration,
+            ]
+            .into_iter()
+            .flatten()
+            {
                 let canonical =
                     canonicalize(&file_name, &self.current_directory, self.case_sensitivity);
-                (self.output_overwrites_input(&file_name) && checked_paths.insert(canonical))
-                    .then(|| output_overwrites_input_diagnostic(&file_name))
-            })
-            .collect()
+                if self.output_overwrites_input(&file_name) && checked_paths.insert(canonical) {
+                    let mut diagnostic = output_overwrites_input_diagnostic(&file_name);
+                    if self.config_file_path.is_none() {
+                        let advice =
+                            message_by_code(5068).expect("TS5068 must be in the generated catalog");
+                        diagnostic.message.push_str("\n  ");
+                        diagnostic.message.push_str(advice.text());
+                    }
+                    diagnostics.push(diagnostic);
+                }
+            }
+        }
+        diagnostics
     }
 
     /// Creates a Program from the explicit `files` list in a tsconfig.
@@ -1943,6 +2025,7 @@ impl Program {
         let Some(config) = parsed.value else {
             return Self {
                 diagnostics: config_diagnostics,
+                config_file_path: Some(ts_path::normalize_path(config_path)),
                 ..Self::default()
             };
         };
@@ -2054,6 +2137,7 @@ impl Program {
             &roots,
             options_result.options,
         );
+        program.config_file_path = Some(config.path);
         config_diagnostics.append(&mut program.diagnostics);
         program.diagnostics = config_diagnostics;
         program
@@ -2067,6 +2151,12 @@ impl Program {
     #[must_use]
     pub fn diagnostics(&self) -> &[ProgramDiagnostic] {
         &self.diagnostics
+    }
+
+    /// Returns the configuration file that originated this Program, if any.
+    #[must_use]
+    pub fn config_file_path(&self) -> Option<&str> {
+        self.config_file_path.as_deref()
     }
 
     #[must_use]
@@ -2158,6 +2248,7 @@ impl Program {
             &self.current_directory,
             self.case_sensitivity,
         );
+        let mut checked_paths = BTreeSet::new();
         for (source_index, source_file) in self.source_files.iter().enumerate() {
             if source_file.is_default_library
                 || ts_path::is_declaration_file(&source_file.file_name)
@@ -2181,6 +2272,11 @@ impl Program {
             if settings.emit_javascript
                 && javascript_output_overwrites_input
                 && let Some(file_name) = paths.javascript.as_deref()
+                && checked_paths.insert(canonicalize(
+                    file_name,
+                    &self.current_directory,
+                    self.case_sensitivity,
+                ))
             {
                 output
                     .diagnostics
@@ -2393,9 +2489,16 @@ impl Program {
                     continue;
                 };
                 if self.output_overwrites_input(declaration_file_name) {
-                    output
-                        .diagnostics
-                        .push(output_overwrites_input_diagnostic(declaration_file_name));
+                    let canonical = canonicalize(
+                        declaration_file_name,
+                        &self.current_directory,
+                        self.case_sensitivity,
+                    );
+                    if checked_paths.insert(canonical) {
+                        output
+                            .diagnostics
+                            .push(output_overwrites_input_diagnostic(declaration_file_name));
+                    }
                     continue;
                 }
                 if (self.options.isolated_declarations
@@ -2555,11 +2658,21 @@ impl Program {
             self.case_sensitivity,
         );
 
+        let mut checked_paths = BTreeSet::new();
         let javascript_output_overwrites_input = paths
             .javascript
             .as_deref()
             .is_some_and(|file_name| self.output_overwrites_input(file_name));
-        if javascript_output_overwrites_input && let Some(file_name) = paths.javascript.as_deref() {
+        if settings.emit_javascript
+            && !javascript_sources.is_empty()
+            && javascript_output_overwrites_input
+            && let Some(file_name) = paths.javascript.as_deref()
+            && checked_paths.insert(canonicalize(
+                file_name,
+                &self.current_directory,
+                self.case_sensitivity,
+            ))
+        {
             output
                 .diagnostics
                 .push(output_overwrites_input_diagnostic(file_name));
@@ -2841,9 +2954,16 @@ impl Program {
             if let Some(declaration_file_name) = paths.declaration.as_deref()
                 && self.output_overwrites_input(declaration_file_name)
             {
-                output
-                    .diagnostics
-                    .push(output_overwrites_input_diagnostic(declaration_file_name));
+                let canonical = canonicalize(
+                    declaration_file_name,
+                    &self.current_directory,
+                    self.case_sensitivity,
+                );
+                if checked_paths.insert(canonical) {
+                    output
+                        .diagnostics
+                        .push(output_overwrites_input_diagnostic(declaration_file_name));
+                }
                 if self.options.no_emit_on_error {
                     output.files.clear();
                 }

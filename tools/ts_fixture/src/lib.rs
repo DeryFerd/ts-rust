@@ -3619,7 +3619,11 @@ fn expanded_option_values(case: &Case) -> (BTreeMap<String, Vec<String>>, Vec<St
             }
             vec![raw_value.to_owned()]
         };
-        if !rust_applies_compiler_option(name) {
+        let suppressed_unused_labels = name.eq_ignore_ascii_case("allowUnusedLabels")
+            && values
+                .iter()
+                .all(|value| value.eq_ignore_ascii_case("true"));
+        if !rust_applies_compiler_option(name) && !suppressed_unused_labels {
             unsupported_details.push(format!(
                 "compiler option {name} is configured as {raw_value:?}, but Rust does not apply it"
             ));
@@ -4330,7 +4334,8 @@ fn compile_case_variant(
     walk_semantic_artifacts: bool,
 ) -> Result<Compilation, FixtureCompilationFailure> {
     let file_system = MemoryFileSystem::new(fixture_case_sensitive(case));
-    let project_directory = project_config_unit(case).and_then(|(path, _)| {
+    let project_config_path = project_config_unit(case).map(|(path, _)| path);
+    let project_directory = project_config_path.as_deref().and_then(|path| {
         path.rsplit_once('/')
             .map(|(directory, _)| directory.to_owned())
     });
@@ -4411,7 +4416,7 @@ fn compile_case_variant(
     // Compiler baselines generally assume libraries. Keeping this enabled is
     // important for diagnostic fidelity even though syntax-only corpus tests
     // use the cheaper parser path directly.
-    if project_config_unit(case).is_none() && case.directive_values("noLib").next().is_none() {
+    if project_config_path.is_none() && case.directive_values("noLib").next().is_none() {
         compiler_options.no_lib = false;
     }
     let current_directory = virtual_unit_root(case);
@@ -4427,11 +4432,12 @@ fn compile_case_variant(
         ),
         FixtureChecker::Canonical if walk_semantic_artifacts => {
             let (program, rendered) = catch_canonical_checker_unwind(|| {
-                ts_compiler::Program::try_new_with_canonical_checker_and_queries(
+                ts_compiler::Program::try_new_with_canonical_checker_and_queries_with_config_path(
                     &file_system,
                     &current_directory,
                     &roots,
                     compiler_options,
+                    project_config_path.as_deref(),
                     |program, queries| artifacts::render_program(case, program, queries),
                 )
             })?;
@@ -4450,11 +4456,12 @@ fn compile_case_variant(
         }
         FixtureChecker::Canonical => (
             catch_canonical_checker_unwind(|| {
-                ts_compiler::Program::try_new_with_canonical_checker(
+                ts_compiler::Program::try_new_with_canonical_checker_with_config_path(
                     &file_system,
                     &current_directory,
                     &roots,
                     compiler_options,
+                    project_config_path.as_deref(),
                 )
             })?,
             None,
@@ -6196,6 +6203,146 @@ mod tests {
     }
 
     #[test]
+    fn canonical_javascript_overwrite_advice_respects_virtual_project_configuration() {
+        let inferred = Case::parse(
+            "inferredOverwrite.ts",
+            concat!(
+                "// @allowJs: true\n",
+                "// @noCheck: true\n",
+                "// @filename: input.js\n",
+                "const value = 1;\n",
+            ),
+        )
+        .unwrap();
+        let configured = Case::parse(
+            "configuredOverwrite.ts",
+            concat!(
+                "// @allowJs: true\n",
+                "// @noCheck: true\n",
+                "// @filename: tsconfig.json\n",
+                "{}\n",
+                "// @filename: input.js\n",
+                "const value = 1;\n",
+            ),
+        )
+        .unwrap();
+        let advice = ts_diagnostics::message_by_code(5068).unwrap().text();
+
+        for (case, expects_advice) in [(&inferred, true), (&configured, false)] {
+            for walk_semantic_artifacts in [false, true] {
+                let mut variant = expand_option_matrix(case).remove(0);
+                let compilation = super::compile_case_variant(
+                    case,
+                    &mut variant,
+                    FixtureChecker::Canonical,
+                    walk_semantic_artifacts,
+                )
+                .unwrap();
+                let diagnostic = compilation
+                    .diagnostics
+                    .iter()
+                    .find(|diagnostic| diagnostic.code == Some(5055))
+                    .unwrap();
+
+                assert_eq!(diagnostic.message.contains(advice), expects_advice);
+                assert_eq!(compilation.diagnostic_text.contains(advice), expects_advice);
+                assert_eq!(
+                    compilation.semantic_artifacts.is_some(),
+                    walk_semantic_artifacts
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_checked_javascript_overwrite_diagnostics_match_artifact_walk() {
+        let advice = ts_diagnostics::message_by_code(5068).unwrap().text();
+        let primary = ts_diagnostics::message_by_code(5055)
+            .unwrap()
+            .format(&["/workspace/app/input.js".to_owned()])
+            .unwrap();
+
+        for (name, configuration, expects_advice) in [
+            ("inferredOverwrite.ts", "", true),
+            (
+                "configuredOverwrite.ts",
+                "// @filename: tsconfig.json\n{}\n",
+                false,
+            ),
+            (
+                "javascriptProjectOverwrite.ts",
+                concat!(
+                    "// @filename: jsconfig.json\n",
+                    "{\"compilerOptions\":{\"noEmit\":false}}\n",
+                ),
+                false,
+            ),
+        ] {
+            let case = Case::parse(
+                name,
+                format!(
+                    concat!(
+                        "// @currentDirectory: /workspace/app\n",
+                        "// @allowJs: true\n",
+                        "// @checkJs: true\n",
+                        "// @lib: es5\n",
+                        "{}",
+                        "// @filename: input.js\n",
+                        "const value = 1;\n",
+                    ),
+                    configuration,
+                ),
+            )
+            .unwrap();
+            let mut diagnostic_variant = expand_option_matrix(&case).remove(0);
+            let diagnostics_only = super::compile_case_variant(
+                &case,
+                &mut diagnostic_variant,
+                FixtureChecker::Canonical,
+                false,
+            )
+            .unwrap();
+            let mut artifact_variant = expand_option_matrix(&case).remove(0);
+            let with_artifacts = super::compile_case_variant(
+                &case,
+                &mut artifact_variant,
+                FixtureChecker::Canonical,
+                true,
+            )
+            .unwrap();
+
+            assert_eq!(
+                diagnostics_only.diagnostics, with_artifacts.diagnostics,
+                "{name}"
+            );
+            assert_eq!(
+                diagnostics_only.diagnostic_text, with_artifacts.diagnostic_text,
+                "{name}"
+            );
+
+            let [diagnostic] = diagnostics_only.diagnostics.as_slice() else {
+                panic!(
+                    "expected one overwrite diagnostic for {name}: {:?}",
+                    diagnostics_only.diagnostics
+                );
+            };
+            assert_eq!(diagnostic.code, Some(5055), "{name}");
+            let expected = if expects_advice {
+                format!("{primary}\n  {advice}")
+            } else {
+                primary.clone()
+            };
+            assert_eq!(diagnostic.message, expected, "{name}");
+
+            let artifacts = with_artifacts.semantic_artifacts.unwrap();
+            assert!(artifacts.types.is_ok(), "{name}: {:?}", artifacts.types);
+            assert!(artifacts.symbols.is_ok(), "{name}: {:?}", artifacts.symbols);
+            assert!(!artifacts.walk.types.is_empty(), "{name}");
+            assert!(!artifacts.walk.symbols.is_empty(), "{name}");
+        }
+    }
+
+    #[test]
     fn canonical_checker_retains_typed_failures_as_variant_unsupported_details() {
         let case = Case::parse(
             "unsupported.ts",
@@ -7790,6 +7937,47 @@ mod tests {
         assert!(options.strict_function_types);
         assert!(options.strict_function_types_specified);
         assert!(!options.no_error_truncation);
+    }
+
+    #[test]
+    fn only_applies_unused_label_suppression_to_enabled_variants() {
+        for (setting, expected_values, supported) in [
+            ("true", &["true"][..], true),
+            ("false", &["false"][..], false),
+            ("true, false", &["true", "false"][..], false),
+        ] {
+            let case = Case::parse(
+                "unusedLabels.ts",
+                format!(
+                    "// @target: es2015\n// @allowUnusedLabels: {setting}\nouter:\ninner:\nwhile (true) {{ break outer; }}\n"
+                ),
+            )
+            .unwrap();
+            let variants = expand_option_matrix(&case);
+            assert_eq!(variants.len(), expected_values.len(), "{setting}");
+
+            for (variant, expected) in variants.iter().zip(expected_values) {
+                assert_eq!(variant.values["allowUnusedLabels"], *expected, "{setting}");
+                assert_eq!(
+                    variant.unsupported_details.is_empty(),
+                    supported,
+                    "{setting}: {:?}",
+                    variant.unsupported_details
+                );
+                if !supported {
+                    assert_eq!(
+                        variant.unsupported_details,
+                        [format!(
+                            "compiler option allowUnusedLabels is configured as {setting:?}, but Rust does not apply it"
+                        )]
+                    );
+                }
+                assert_eq!(
+                    fixture_compiler_options(&case, variant).allow_unused_labels,
+                    Some(*expected == "true")
+                );
+            }
+        }
     }
 
     #[test]
