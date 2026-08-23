@@ -1259,6 +1259,11 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             SyntaxKind::TypeReference => {
                 self.plan_type_reference(node, alias_owner, union_constituent)
             }
+            SyntaxKind::ExpressionWithTypeArguments
+                if alias_owner.is_none() && !union_constituent =>
+            {
+                self.plan_record_heritage_reference(node)
+            }
             SyntaxKind::TypeQuery => self.plan_value_type_query(node),
             SyntaxKind::UnionType => self.plan_union_type(node, alias_owner),
             SyntaxKind::IntersectionType => self.plan_intersection_type(node, alias_owner),
@@ -4898,13 +4903,30 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         union_constituent: bool,
     ) -> Result<(), DeclaredTypeError> {
         let record = preflight_node(self.store, self.host, node)?;
-        let NodeData::TypeReferenceNode(reference) = &record.data else {
-            return Err(type_node_unavailable(
-                TypeNodeUnavailable::InvalidTypeReference(node),
-            ));
+        let (name_id, arguments, record_heritage) = match &record.data {
+            NodeData::TypeReferenceNode(reference) if record.kind == SyntaxKind::TypeReference => (
+                reference.type_name,
+                reference.type_arguments.as_ref(),
+                false,
+            ),
+            NodeData::ExpressionWithTypeArguments(reference)
+                if record.kind == SyntaxKind::ExpressionWithTypeArguments
+                    && reference.facts == 0 =>
+            {
+                (
+                    reference.expression,
+                    reference.type_arguments.as_ref(),
+                    true,
+                )
+            }
+            _ => {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(node),
+                ));
+            }
         };
 
-        let name = NodeRef::new(node.arena, node.file, reference.type_name);
+        let name = NodeRef::new(node.arena, node.file, name_id);
         let name_node = preflight_node(self.store, self.host, name)?;
         if name_node.parent != Some(node.node) {
             return Err(type_node_unavailable(
@@ -4939,7 +4961,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         };
         let mut type_arguments = Vec::new();
         let mut previous_end = name_node.range.end;
-        if let Some(arguments) = &reference.type_arguments {
+        if let Some(arguments) = arguments {
             if arguments.nodes.is_empty()
                 || arguments.has_trailing_comma
                 || arguments.range.start < name_node.range.end
@@ -4968,6 +4990,22 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 previous_end = argument_node.range.end;
                 type_arguments.push(argument);
             }
+        }
+        if record_heritage
+            && (qualified
+                || name_text != "Record"
+                || type_arguments.len() != 2
+                || preflight_node(self.store, self.host, type_arguments[0])?.kind
+                    != SyntaxKind::StringKeyword
+                || preflight_node(self.store, self.host, type_arguments[1])?.kind
+                    != SyntaxKind::AnyKeyword)
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::UnsupportedSyntax {
+                    node,
+                    kind: SyntaxKind::ExpressionWithTypeArguments,
+                },
+            ));
         }
 
         let cached_type = self
@@ -5147,6 +5185,11 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 DeclaredTypeError::Unavailable(DeclaredTypeUnavailable::SymbolNotOwned(symbol))
             })?
             .flags();
+        if record_heritage && flags != SymbolFlags::TYPE_ALIAS {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::UnsupportedReferenceTarget { node, symbol },
+            ));
+        }
         if malformed_alias_merge(flags) {
             return Err(DeclaredTypeError::Unavailable(
                 DeclaredTypeUnavailable::AliasMergedWithDeclaredSymbol(symbol),
@@ -5416,6 +5459,57 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         Ok(())
     }
 
+    fn plan_record_heritage_reference(&mut self, node: NodeRef) -> Result<(), DeclaredTypeError> {
+        let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node));
+        let record = preflight_node(self.store, self.host, node)?;
+        let NodeData::ExpressionWithTypeArguments(expression) = &record.data else {
+            return Err(invalid());
+        };
+        let clause = record
+            .parent
+            .map(|parent| NodeRef::new(node.arena, node.file, parent))
+            .ok_or_else(&invalid)?;
+        let clause_record = preflight_node(self.store, self.host, clause)?;
+        let NodeData::HeritageClause(heritage) = &clause_record.data else {
+            return Err(invalid());
+        };
+        let owner = clause_record
+            .parent
+            .map(|parent| NodeRef::new(node.arena, node.file, parent))
+            .ok_or_else(&invalid)?;
+        let owner_record = preflight_node(self.store, self.host, owner)?;
+        let NodeData::InterfaceDeclaration(interface) = &owner_record.data else {
+            return Err(invalid());
+        };
+        if record.kind != SyntaxKind::ExpressionWithTypeArguments
+            || expression.facts != 0
+            || clause_record.kind != SyntaxKind::HeritageClause
+            || heritage.token != SyntaxKind::ExtendsKeyword
+            || heritage.facts != 0
+            || heritage.types.has_trailing_comma
+            || heritage
+                .types
+                .nodes
+                .iter()
+                .filter(|base| **base == node.node)
+                .count()
+                != 1
+            || owner_record.kind != SyntaxKind::InterfaceDeclaration
+            || interface.heritage_clauses.as_ref().is_none_or(|clauses| {
+                clauses.has_trailing_comma
+                    || clauses
+                        .nodes
+                        .iter()
+                        .filter(|candidate| **candidate == clause.node)
+                        .count()
+                        != 1
+            })
+        {
+            return Err(invalid());
+        }
+        self.plan_type_reference(node, None, false)
+    }
+
     fn authoritative_global_array_target(
         &self,
         symbol: SemanticSymbolId,
@@ -5627,9 +5721,30 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             .parent
             .map(|parent| NodeRef::new(declaration.arena, declaration.file, parent))
             .ok_or_else(unsupported)?;
-        if preflight_node(self.store, self.host, parent)?.kind != SyntaxKind::SourceFile {
-            return Err(unsupported());
-        }
+        let namespace_owned = match preflight_node(self.store, self.host, parent)?.kind {
+            SyntaxKind::SourceFile => false,
+            SyntaxKind::ModuleBlock
+                if matches!(declaration_node.data, NodeData::InterfaceDeclaration(_)) =>
+            {
+                self.preflight_namespace_generic_reference_owner(
+                    node,
+                    symbol,
+                    declaration,
+                    parent,
+                )?;
+                true
+            }
+            _ => return Err(unsupported()),
+        };
+        let parameter_members = namespace_owned
+            .then(|| {
+                self.store
+                    .symbol(symbol)
+                    .and_then(ts_binder::semantic::Symbol::members)
+                    .and_then(|members| self.store.symbol_table(members))
+                    .ok_or_else(&unsupported)
+            })
+            .transpose()?;
         for parameter in &parameters.nodes {
             let parameter = NodeRef::new(declaration.arena, declaration.file, *parameter);
             let parameter_node = preflight_node(self.store, self.host, parameter)?;
@@ -5645,6 +5760,94 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             {
                 return Err(unsupported());
             }
+            if let Some(members) = parameter_members {
+                let parameter_symbol = self
+                    .host
+                    .bound_file(parameter)
+                    .and_then(|bound| bound.symbol(parameter))
+                    .and_then(|parameter| self.store.get_merged_symbol(parameter))
+                    .ok_or_else(&unsupported)?;
+                let parameter_record = self
+                    .store
+                    .symbol(parameter_symbol)
+                    .ok_or_else(&unsupported)?;
+                if parameter_record.flags() != SymbolFlags::TYPE_PARAMETER
+                    || self.store.get_parent_of_symbol(parameter_symbol) != Some(symbol)
+                    || members.get(parameter_record.name()) != Some(parameter_symbol)
+                {
+                    return Err(unsupported());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn preflight_namespace_generic_reference_owner(
+        &self,
+        node: NodeRef,
+        symbol: SemanticSymbolId,
+        declaration: NodeRef,
+        block: NodeRef,
+    ) -> Result<(), DeclaredTypeError> {
+        let unsupported = || {
+            type_node_unavailable(TypeNodeUnavailable::GenericReferenceUnsupported { node, symbol })
+        };
+        let block_record = preflight_node(self.store, self.host, block)?;
+        let NodeData::ModuleBlock(module_block) = &block_record.data else {
+            return Err(unsupported());
+        };
+        let namespace = block_record
+            .parent
+            .map(|parent| NodeRef::new(block.arena, block.file, parent))
+            .ok_or_else(&unsupported)?;
+        let namespace_record = preflight_node(self.store, self.host, namespace)?;
+        let NodeData::ModuleDeclaration(namespace_data) = &namespace_record.data else {
+            return Err(unsupported());
+        };
+        if block_record.kind != SyntaxKind::ModuleBlock
+            || module_block.facts != 0
+            || module_block.statements.has_trailing_comma
+            || module_block
+                .statements
+                .nodes
+                .iter()
+                .filter(|statement| **statement == declaration.node)
+                .count()
+                != 1
+            || namespace_record.kind != SyntaxKind::ModuleDeclaration
+            || namespace_data.body != Some(block.node)
+        {
+            return Err(unsupported());
+        }
+
+        let namespace_symbol = self
+            .host
+            .bound_file(namespace)
+            .and_then(|bound| bound.symbol(namespace))
+            .and_then(|namespace| self.store.get_merged_symbol(namespace))
+            .ok_or_else(&unsupported)?;
+        let namespace_owner = self
+            .store
+            .symbol(namespace_symbol)
+            .ok_or_else(&unsupported)?;
+        let reference_owner = self.store.symbol(symbol).ok_or_else(&unsupported)?;
+        if !namespace_owner.flags().intersects(SymbolFlags::MODULE)
+            || namespace_owner
+                .declarations()
+                .is_none_or(|declarations| !declarations.contains(&namespace))
+            || !self
+                .host
+                .symbol_matches(self.store, namespace, namespace_symbol)
+            || !self.host.symbol_matches(self.store, declaration, symbol)
+            || self.store.get_parent_of_symbol(symbol) != Some(namespace_symbol)
+            || namespace_owner
+                .exports()
+                .and_then(|exports| self.store.symbol_table(exports))
+                .and_then(|exports| exports.get(reference_owner.name()))
+                .and_then(|export| self.store.get_merged_symbol(export))
+                != Some(symbol)
+        {
+            return Err(unsupported());
         }
         Ok(())
     }
@@ -9234,7 +9437,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     },
                 )),
             },
-            SyntaxKind::TypeReference => self.execute_type_reference(node, plan, prepared),
+            SyntaxKind::TypeReference | SyntaxKind::ExpressionWithTypeArguments => {
+                self.execute_type_reference(node, plan, prepared)
+            }
             SyntaxKind::TypeQuery => self.execute_value_type_query(node, plan),
             SyntaxKind::UnionType => self.execute_union_type(node, plan, prepared),
             SyntaxKind::IntersectionType => self.execute_intersection_type(node, plan, prepared),
@@ -14475,6 +14680,113 @@ mod tests {
     }
 
     #[test]
+    fn record_interface_heritage_preserves_its_mapped_alias_and_index_arguments() {
+        let mut fixture = fixture(concat!(
+            "type Record<K extends keyof any, T> = { [P in K]: T }; ",
+            "interface IntrinsicElements extends Record<string, any> {}",
+        ));
+        let record = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Record");
+        let heritage =
+            fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, syntax)| {
+                    (syntax.kind == SyntaxKind::ExpressionWithTypeArguments)
+                        .then_some(NodeRef::new(fixture.parsed.arena.id(), fixture.file, node))
+                })
+                .expect("the interface must have one heritage expression");
+        let arguments = {
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            [bootstrap.string_type, bootstrap.any_type]
+        };
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let mapped = query_node(&mut fixture, heritage, &mut diagnostics).unwrap();
+        let links = fixture.store.type_alias_links(record).unwrap();
+        let declared = links.declared_type.unwrap();
+        let parameters = links.type_parameters.as_deref().unwrap();
+        assert!(matches!(
+            fixture.store.type_payload(mapped).map(TypeRecord::data),
+            Some(TypeData::Mapped(_))
+        ));
+        assert!(valid_record_mapped_alias_identity(
+            &fixture.store,
+            record,
+            &arguments,
+            mapped,
+        ));
+        assert_eq!(
+            fixture.store.validate_record_mapped_alias_instantiation(
+                record, declared, parameters, &arguments, mapped,
+            ),
+            Ok(()),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .type_node_links(heritage)
+                .and_then(|links| links.resolved_type),
+            Some(mapped),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .symbol_node_links(heritage)
+                .and_then(|links| links.resolved_symbol),
+            Some(record),
+        );
+
+        let warm = union_state(&fixture.store);
+        assert_eq!(
+            query_node(&mut fixture, heritage, &mut diagnostics),
+            Ok(mapped),
+        );
+        assert_eq!(union_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn unsupported_interface_heritage_arguments_fail_before_semantic_writes() {
+        for source in [
+            concat!(
+                "type Record<K extends keyof any, T> = { [P in K]: T }; ",
+                "interface IntrinsicElements extends Record<number, any> {}",
+            ),
+            concat!(
+                "type Record<K extends keyof any, T> = { [P in K]: T }; ",
+                "interface IntrinsicElements extends Record<string, string> {}",
+            ),
+            "interface Other<K, T> {} interface IntrinsicElements extends Other<string, any> {}",
+        ] {
+            let mut fixture = fixture(source);
+            let heritage = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, syntax)| {
+                    (syntax.kind == SyntaxKind::ExpressionWithTypeArguments)
+                        .then_some(NodeRef::new(fixture.parsed.arena.id(), fixture.file, node))
+                })
+                .unwrap();
+            let before = union_state(&fixture.store);
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+            assert_eq!(
+                query_node(&mut fixture, heritage, &mut diagnostics),
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::UnsupportedSyntax {
+                        node: heritage,
+                        kind: SyntaxKind::ExpressionWithTypeArguments,
+                    },
+                )),
+            );
+            assert_eq!(union_state(&fixture.store), before);
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
     fn generic_mapped_aliases_require_the_exact_record_declaration() {
         let cases = [
             (
@@ -17444,6 +17756,215 @@ mod tests {
             .unwrap();
         }
         assert_eq!(store_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn qualified_generic_namespace_interfaces_preserve_target_and_argument_identities() {
+        let mut fixture = fixture(concat!(
+            "namespace Shapes { ",
+            "export interface Box<T> {} ",
+            "export namespace Deep { export interface Pair<Left, Right> {} } ",
+            "} ",
+            "type Text = Shapes.Box<string>; ",
+            "type Again = Shapes.Box<string>; ",
+            "type Mixed = Shapes.Deep.Pair<string, number>;",
+        ));
+        let box_symbol = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Box");
+        let pair_symbol = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Pair");
+        let text = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Text");
+        let again = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Again");
+        let mixed = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Mixed");
+        let (string, number) = {
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let text_type = query_declared(
+            &mut fixture,
+            text,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                again,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(text_type),
+        );
+        let mixed_type = query_declared(
+            &mut fixture,
+            mixed,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        for (resolved, symbol, arguments) in [
+            (text_type, box_symbol, &[string][..]),
+            (mixed_type, pair_symbol, &[string, number][..]),
+        ] {
+            let reference = validate_direct_generic_reference(&fixture.store, resolved).unwrap();
+            assert_eq!(
+                Some(reference.target),
+                fixture
+                    .store
+                    .declared_type_links(symbol)
+                    .and_then(|links| links.declared_type),
+            );
+            assert_eq!(reference.type_arguments.as_slice(), arguments);
+        }
+        for (name, symbol) in [
+            ("Text", box_symbol),
+            ("Again", box_symbol),
+            ("Mixed", pair_symbol),
+        ] {
+            let reference = alias_parts(&fixture, name).2;
+            assert_eq!(
+                fixture
+                    .store
+                    .symbol_node_links(reference)
+                    .and_then(|links| links.resolved_symbol),
+                Some(symbol),
+            );
+        }
+
+        let warm = store_state(&fixture.store);
+        for (symbol, expected) in [(text, text_type), (again, text_type), (mixed, mixed_type)] {
+            assert_eq!(
+                query_declared(
+                    &mut fixture,
+                    symbol,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                ),
+                Ok(expected),
+            );
+        }
+        assert_eq!(store_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn qualified_generic_namespace_interface_arity_diagnostics_are_warm_and_exact() {
+        let mut fixture = fixture(concat!(
+            "namespace Shapes { export interface Box<T> {} } ",
+            "type Missing = Shapes.Box; ",
+            "type Extra = Shapes.Box<string, number>;",
+        ));
+        let missing = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Missing");
+        let extra = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Extra");
+        let error = fixture.store.intrinsic_bootstrap().unwrap().error_type;
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        for alias in [missing, extra] {
+            assert_eq!(
+                query_declared(
+                    &mut fixture,
+                    alias,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                ),
+                Ok(error),
+            );
+        }
+        assert_eq!(
+            diagnostics
+                .as_slice()
+                .iter()
+                .map(|diagnostic| (
+                    diagnostic.diagnostic.code(),
+                    diagnostic.diagnostic.arguments.clone(),
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (2314, vec!["Box<T>".to_owned(), "1".to_owned()]),
+                (2314, vec!["Box<T>".to_owned(), "1".to_owned()]),
+            ],
+        );
+
+        let warm = store_state(&fixture.store);
+        for alias in [missing, extra] {
+            assert_eq!(
+                query_declared(
+                    &mut fixture,
+                    alias,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                ),
+                Ok(error),
+            );
+        }
+        assert_eq!(store_state(&fixture.store), warm);
+        assert_eq!(diagnostics.len(), 2);
+    }
+
+    #[test]
+    fn forged_generic_namespace_interface_owner_fails_before_semantic_writes() {
+        let mut fixture = fixture(concat!(
+            "namespace Shapes { export interface Box<T> {} } ",
+            "type Text = Shapes.Box<string>;",
+        ));
+        let box_symbol = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Box");
+        let text = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Text");
+        let reference = alias_parts(&fixture, "Text").2;
+        let (members, exports, parent, export_symbol) = {
+            let record = fixture.store.symbol(box_symbol).unwrap();
+            (
+                record.members(),
+                record.exports(),
+                record.parent(),
+                record.export_symbol(),
+            )
+        };
+        assert!(parent.is_some());
+        assert!(fixture.store.set_symbol_relationships(
+            box_symbol,
+            members,
+            exports,
+            None,
+            export_symbol,
+        ));
+        let before = store_state(&fixture.store);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                text,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Err(type_node_unavailable(
+                TypeNodeUnavailable::GenericReferenceUnsupported {
+                    node: reference,
+                    symbol: box_symbol,
+                },
+            )),
+        );
+        assert_eq!(store_state(&fixture.store), before);
+        assert!(diagnostics.is_empty());
+
+        assert!(fixture.store.set_symbol_relationships(
+            box_symbol,
+            members,
+            exports,
+            parent,
+            export_symbol,
+        ));
+        assert!(
+            query_declared(
+                &mut fixture,
+                text,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .is_ok()
+        );
         assert!(diagnostics.is_empty());
     }
 

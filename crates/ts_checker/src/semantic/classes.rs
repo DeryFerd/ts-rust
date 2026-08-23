@@ -2987,11 +2987,11 @@ pub(super) struct ClassConstructorParameterInitializerReference<'a> {
 }
 
 /// One authenticated class grammar error that does not require class publication.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct ClassGrammarDiagnostic {
     pub(super) node: NodeRef,
     pub(super) code: u32,
-    pub(super) argument: Option<&'static str>,
+    pub(super) argument: Option<String>,
 }
 
 /// A class whose supported behavior consists entirely of grammar diagnostics.
@@ -4054,7 +4054,9 @@ fn plan_constructor_modifier_grammar_diagnostic(
         return None;
     }
     let (code, argument) = match (first_record.kind, second_record.kind) {
-        (SyntaxKind::PublicKeyword, SyntaxKind::StaticKeyword) => (1090, Some("static")),
+        (SyntaxKind::PublicKeyword, SyntaxKind::StaticKeyword) => {
+            (1090, Some(String::from("static")))
+        }
         (SyntaxKind::PrivateKeyword, SyntaxKind::PublicKeyword) => (1028, None),
         _ => return None,
     };
@@ -4225,6 +4227,155 @@ fn plan_multiple_base_grammar_diagnostic(
     })
 }
 
+fn plan_duplicate_property_accessor_grammar_diagnostics(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    declaration: NodeRef,
+    first: NodeRef,
+    second: NodeRef,
+) -> Option<[ClassGrammarDiagnostic; 2]> {
+    let owner_record = store.symbol(owner)?;
+    let members = owner_record
+        .members()
+        .and_then(|members| store.symbol_table(members))?;
+    if members.len() != 1 {
+        return None;
+    }
+
+    let mut names = Vec::new();
+    names.try_reserve_exact(2).ok()?;
+    let mut previous_end = preflight_node(store, host, declaration).ok()?.range.start;
+    let mut merged_symbol = None;
+    for (index, member) in [first, second].into_iter().enumerate() {
+        let member_record = preflight_node(store, host, member).ok()?;
+        let NodeData::PropertyDeclaration(property) = &member_record.data else {
+            return None;
+        };
+        if member_record.kind != SyntaxKind::PropertyDeclaration
+            || member_record.flags.0 != 0
+            || member_record.parent != Some(declaration.node)
+            || member_record.range.start < previous_end
+            || property.symbol.is_some()
+            || property.facts != 0
+            || property.postfix_token.is_some()
+        {
+            return None;
+        }
+        previous_end = member_record.range.end;
+        let (name, name_text) = accessor_name(store, host, member, property.name).ok()?;
+        let name_record = preflight_node(store, host, name).ok()?;
+        if name_record.range.start < member_record.range.start
+            || name_record.range.end > member_record.range.end
+        {
+            return None;
+        }
+        match (index, property.modifiers.as_ref()) {
+            (0, None) => {}
+            (1, Some(modifiers)) => {
+                let [modifier] = modifiers.list.nodes.as_slice() else {
+                    return None;
+                };
+                let modifier = NodeRef::new(member.arena, member.file, *modifier);
+                let modifier_record = preflight_node(store, host, modifier).ok()?;
+                if modifiers.flags.0 != 0
+                    || modifiers.list.has_trailing_comma
+                    || modifiers.list.range.start != member_record.range.start
+                    || modifiers.list.range.end > name_record.range.start
+                    || modifier_record.kind != SyntaxKind::AccessorKeyword
+                    || modifier_record.flags.0 != 0
+                    || modifier_record.parent != Some(member.node)
+                    || !matches!(modifier_record.data, NodeData::Token(_))
+                    || modifier_record.range.start < modifiers.list.range.start
+                    || modifier_record.range.end > modifiers.list.range.end
+                {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+
+        let annotation = NodeRef::new(member.arena, member.file, property.type_?);
+        let annotation_record = preflight_node(store, host, annotation).ok()?;
+        if annotation_record.kind != SyntaxKind::NumberKeyword
+            || annotation_record.flags.0 != 0
+            || annotation_record.parent != Some(member.node)
+            || annotation_record.range.start < name_record.range.end
+            || annotation_record.range.end > member_record.range.end
+            || !matches!(annotation_record.data, NodeData::KeywordTypeNode(_))
+        {
+            return None;
+        }
+        let initializer = NodeRef::new(member.arena, member.file, property.initializer?);
+        let initializer_record = preflight_node(store, host, initializer).ok()?;
+        let NodeData::NumericLiteral(literal) = &initializer_record.data else {
+            return None;
+        };
+        let spelling_matches = host
+            .source(initializer)
+            .and_then(|(arena, _)| arena.source_text())
+            .is_none_or(|source| {
+                source.get(
+                    initializer_record.range.start.get() as usize
+                        ..initializer_record.range.end.get() as usize,
+                ) == Some(literal.text.as_str())
+            });
+        if initializer_record.kind != SyntaxKind::NumericLiteral
+            || initializer_record.flags.0 != 0
+            || initializer_record.parent != Some(member.node)
+            || initializer_record.range.start < annotation_record.range.end
+            || initializer_record.range.end > member_record.range.end
+            || literal.token_flags.0 != 0
+            || ts_jsnum::from_string(&literal.text).is_nan()
+            || !spelling_matches
+        {
+            return None;
+        }
+
+        let symbol = bound_symbol(store, host, member)?;
+        if merged_symbol.is_some_and(|expected| expected != symbol)
+            || members.get_source(&name_text) != Some(symbol)
+        {
+            return None;
+        }
+        merged_symbol = Some(symbol);
+        names.push((name, name_text));
+    }
+
+    let symbol = merged_symbol?;
+    let symbol_record = store.symbol(symbol)?;
+    let [(first_name, first_text), (second_name, second_text)] = names.as_slice() else {
+        return None;
+    };
+    if first_text != second_text
+        || symbol_record.flags() != (SymbolFlags::PROPERTY | SymbolFlags::ACCESSOR)
+        || symbol_record.check_flags() != CheckFlags::NONE
+        || symbol_record.name().as_utf8() != Some(first_text.as_str())
+        || symbol_record.declarations() != Some(&[first, second])
+        || symbol_record.value_declaration() != Some(first)
+        || symbol_record.members().is_some()
+        || symbol_record.exports().is_some()
+        || symbol_record.parent() != Some(owner)
+        || symbol_record.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+    {
+        return None;
+    }
+
+    Some([
+        ClassGrammarDiagnostic {
+            node: *first_name,
+            code: 2300,
+            argument: Some(first_text.clone()),
+        },
+        ClassGrammarDiagnostic {
+            node: *second_name,
+            code: 2300,
+            argument: Some(second_text.clone()),
+        },
+    ])
+}
+
 /// Authenticates supported class grammar failures without publishing class types.
 pub(super) fn plan_class_grammar_diagnostics(
     store: &CanonicalTypeMapperStore,
@@ -4326,6 +4477,28 @@ pub(super) fn plan_class_grammar_diagnostics(
             symbol,
             declaration,
             NodeRef::new(declaration.arena, declaration.file, *constructor),
+        )?);
+    } else if let [first, second] = class.members.nodes.as_slice()
+        && preflight_node(
+            store,
+            host,
+            NodeRef::new(declaration.arena, declaration.file, *first),
+        )
+        .ok()?
+        .kind
+            == SyntaxKind::PropertyDeclaration
+    {
+        if export_table.len() != 1 {
+            return None;
+        }
+        diagnostics.try_reserve_exact(2).ok()?;
+        diagnostics.extend(plan_duplicate_property_accessor_grammar_diagnostics(
+            store,
+            host,
+            symbol,
+            declaration,
+            NodeRef::new(declaration.arena, declaration.file, *first),
+            NodeRef::new(declaration.arena, declaration.file, *second),
         )?);
     } else {
         if class.members.nodes.is_empty() || class.members.nodes.len() > 2 {
@@ -7951,6 +8124,8 @@ mod tests {
             panic!("C retains its class declaration")
         };
         let property = NodeRef::new(declaration.arena, declaration.file, class.members.nodes[0]);
+        let accessor = NodeRef::new(declaration.arena, declaration.file, class.members.nodes[1]);
+        let property_symbol = bound.symbol(property).unwrap();
         let cold = (
             fixture.store.type_len(),
             fixture.store.signature_len(),
@@ -7960,6 +8135,52 @@ mod tests {
         assert_eq!(
             plan_nongeneric_class_member_query(&fixture.store, &host, owner),
             Err(unsupported(ClassUnsupported::DuplicateProperty(property)))
+        );
+        assert_eq!(bound.symbol(accessor), Some(property_symbol));
+        assert_eq!(
+            fixture.store.symbol(property_symbol).unwrap().flags(),
+            SymbolFlags::PROPERTY | SymbolFlags::ACCESSOR
+        );
+        assert_eq!(
+            fixture
+                .store
+                .symbol(property_symbol)
+                .unwrap()
+                .declarations(),
+            Some([property, accessor].as_slice())
+        );
+        let grammar = plan_class_grammar_diagnostics(&fixture.store, &host, owner)
+            .expect("the exact merged duplicate retains two checker grammar diagnostics");
+        assert_eq!(grammar.declaration, declaration);
+        assert_eq!(grammar.symbol, owner);
+        assert_eq!(grammar.diagnostics.len(), 2);
+        assert_eq!(
+            grammar
+                .diagnostics
+                .iter()
+                .map(|diagnostic| (diagnostic.code, diagnostic.argument.as_deref()))
+                .collect::<Vec<_>>(),
+            [(2300, Some("y")), (2300, Some("y"))]
+        );
+        let first_name = match &fixture.parsed.arena.get(property.node).unwrap().data {
+            NodeData::PropertyDeclaration(property) => {
+                NodeRef::new(declaration.arena, declaration.file, property.name)
+            }
+            _ => unreachable!("the first duplicate remains a property"),
+        };
+        let second_name = match &fixture.parsed.arena.get(accessor.node).unwrap().data {
+            NodeData::PropertyDeclaration(property) => {
+                NodeRef::new(declaration.arena, declaration.file, property.name)
+            }
+            _ => unreachable!("the second duplicate remains an auto-accessor"),
+        };
+        assert_eq!(
+            grammar
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.node)
+                .collect::<Vec<_>>(),
+            [first_name, second_name]
         );
         assert_eq!(
             (
@@ -7971,6 +8192,55 @@ mod tests {
         );
         assert!(fixture.store.declared_type_links(owner).is_none());
         assert!(fixture.store.value_symbol_links(owner).is_none());
+    }
+
+    #[test]
+    fn duplicate_property_grammar_rejects_forged_merged_symbol_provenance() {
+        for poison_flags in [false, true] {
+            let mut fixture = fixture("class C { y: number = 2; accessor y: number = 3; }");
+            let owner = class_symbol(&fixture, "C");
+            let declaration = class_node(&fixture, "C");
+            let NodeData::ClassDeclaration(class) =
+                &fixture.parsed.arena.get(declaration.node).unwrap().data
+            else {
+                panic!("C retains its class declaration")
+            };
+            let first = NodeRef::new(declaration.arena, declaration.file, class.members.nodes[0]);
+            let second = NodeRef::new(declaration.arena, declaration.file, class.members.nodes[1]);
+            let bound = &fixture.files[&fixture.file];
+            let merged = bound.symbol(first).unwrap();
+            if poison_flags {
+                assert!(fixture.store.set_symbol_flags(
+                    merged,
+                    SymbolFlags::PROPERTY,
+                    CheckFlags::NONE,
+                ));
+            } else {
+                assert!(fixture.store.set_symbol_declarations(
+                    merged,
+                    Some(vec![second, first]),
+                    Some(first),
+                ));
+            }
+            let host = host(&fixture.parsed.arena, bound);
+            let cold = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            assert!(plan_class_grammar_diagnostics(&fixture.store, &host, owner).is_none());
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                cold
+            );
+            assert!(fixture.store.declared_type_links(owner).is_none());
+            assert!(fixture.store.value_symbol_links(owner).is_none());
+        }
     }
 
     #[test]

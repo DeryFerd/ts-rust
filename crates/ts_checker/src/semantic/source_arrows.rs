@@ -17,20 +17,20 @@ use ts_binder::{
 };
 
 use super::{
-    CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost,
     array_types::CanonicalArrayTargets,
     bootstrap::LiteralTypeCacheError,
     declared::preflight_node,
-    functions::{FunctionTypeError, plan_function_type},
+    functions::{plan_function_type, FunctionTypeError},
     signatures::SignatureFlags,
     source_callables::{
-        SourceCallableError, SourceCallableFamily, SourceCallableInvariant, SourceCallablePlan,
-        SourceCallableUnsupported, plan_source_callable,
+        plan_source_callable, SourceCallableError, SourceCallableFamily, SourceCallableInvariant,
+        SourceCallablePlan, SourceCallableUnsupported,
     },
     variables::{
-        VariableBindingKind, VariableInvariant, VariablePlanError, VariableUnsupported,
-        plan_top_level_variable,
+        plan_top_level_variable, VariableBindingKind, VariableInvariant, VariablePlanError,
+        VariableUnsupported,
     },
+    CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost,
 };
 
 const NODE_FLAG_LET: u32 = 1 << 0;
@@ -1733,6 +1733,13 @@ fn plan_body(
             {
                 return Err(invariant(SourceArrowInvariant::InvalidBody(statement)));
             }
+            if matches!(statement_record.data, NodeData::ExpressionStatement(_)) {
+                return if plan_array_arrow_identifier_statement(store, host, callable)?.is_some() {
+                    Ok(SourceArrowBodyPlan::EmptyBlock { block: body })
+                } else {
+                    Err(unsupported(SourceArrowUnsupported::ComplexBlock(body)))
+                };
+            }
             let NodeData::ReturnStatement(return_statement) = &statement_record.data else {
                 return Err(unsupported(SourceArrowUnsupported::ComplexBlock(body)));
             };
@@ -1762,6 +1769,106 @@ fn plan_body(
         }
         _ => Err(unsupported(SourceArrowUnsupported::ComplexBlock(body))),
     }
+}
+
+/// Returns one parameter-read statement from a single-element array arrow.
+///
+/// The existing empty-block body plan keeps this expression-free statement's
+/// inferred return as `void`. Source execution can use these nodes to check and
+/// cache the identifier without treating it as an arrow return value.
+pub(super) fn plan_array_arrow_identifier_statement(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    callable: &SourceCallablePlan,
+) -> Result<Option<(NodeRef, NodeRef, NodeRef)>, SourceArrowError> {
+    let [parameter] = callable.parameters.as_slice() else {
+        return Ok(None);
+    };
+    if callable.family != SourceCallableFamily::ArrowFunction
+        || !callable.return_type.is_inferred()
+        || parameter.optional
+        || parameter.rest
+        || parameter.initializer.is_some()
+    {
+        return Ok(None);
+    }
+
+    let declaration_record = preflight_node(store, host, callable.declaration)?;
+    let Some(array_id) = declaration_record.parent else {
+        return Ok(None);
+    };
+    let array = NodeRef::new(
+        callable.declaration.arena,
+        callable.declaration.file,
+        array_id,
+    );
+    let array_record = preflight_node(store, host, array)?;
+    let NodeData::ArrayLiteralExpression(elements) = &array_record.data else {
+        return Ok(None);
+    };
+    if array_record.kind != SyntaxKind::ArrayLiteralExpression
+        || !range_contains(array_record.range, declaration_record.range)
+    {
+        return Err(invariant(SourceArrowInvariant::InvalidInitializer(array)));
+    }
+    if elements.elements.nodes.as_slice() != [callable.declaration.node] {
+        return Ok(None);
+    }
+
+    let block = callable.body;
+    let block_record = preflight_node(store, host, block)?;
+    let NodeData::Block(body) = &block_record.data else {
+        return Ok(None);
+    };
+    if block_record.kind != SyntaxKind::Block
+        || block_record.parent != Some(callable.declaration.node)
+        || !range_contains(declaration_record.range, block_record.range)
+        || block_record.flags.0 != 0
+        || body.flow_node.is_some()
+        || body.next_container.is_some()
+        || body.statements.has_trailing_comma
+        || body.facts != 0
+    {
+        return Err(invariant(SourceArrowInvariant::InvalidBody(block)));
+    }
+    let [statement_id] = body.statements.nodes.as_slice() else {
+        return Ok(None);
+    };
+    let statement = NodeRef::new(block.arena, block.file, *statement_id);
+    let statement_record = preflight_node(store, host, statement)?;
+    let NodeData::ExpressionStatement(data) = &statement_record.data else {
+        return Ok(None);
+    };
+    if statement_record.kind != SyntaxKind::ExpressionStatement
+        || statement_record.parent != Some(block.node)
+        || !range_contains(block_record.range, statement_record.range)
+        || statement_record.flags.0 != 0
+        || data.flow_node.is_some()
+    {
+        return Err(invariant(SourceArrowInvariant::InvalidBody(statement)));
+    }
+
+    let expression = NodeRef::new(statement.arena, statement.file, data.expression);
+    let expression_record = preflight_node(store, host, expression)?;
+    let NodeData::Identifier(identifier) = &expression_record.data else {
+        return Ok(None);
+    };
+    if expression_record.kind != SyntaxKind::Identifier
+        || expression_record.parent != Some(statement.node)
+        || !range_contains(statement_record.range, expression_record.range)
+        || expression_record.flags.0 != 0
+        || identifier.flow_node.is_some()
+    {
+        return Err(invariant(SourceArrowInvariant::InvalidBody(expression)));
+    }
+    let symbol = store
+        .symbol(parameter.symbol)
+        .ok_or_else(|| invariant(SourceArrowInvariant::InvalidOwnerSymbol(expression)))?;
+    if symbol.name().as_bytes() != identifier.text.as_bytes() {
+        return Ok(None);
+    }
+
+    Ok(Some((block, statement, expression)))
 }
 
 fn is_concise_expression(kind: SyntaxKind) -> bool {
@@ -1925,13 +2032,13 @@ mod tests {
         BoundFile, CanonicalBinder, CanonicalModuleState, CanonicalNameResolverOptions,
         CanonicalSourceFileFacts, CanonicalSourceLanguage, EscapedName,
     };
-    use ts_parser::{ParseResult, parse_source_file};
+    use ts_parser::{parse_source_file, ParseResult};
 
     use super::*;
     use crate::semantic::{
-        IntrinsicBootstrapOptions,
         production::GlobalMergeCompletion,
-        source_callables::{SourceCallableState, source_callable_state},
+        source_callables::{source_callable_state, SourceCallableState},
+        IntrinsicBootstrapOptions,
     };
 
     struct Fixture {
@@ -1970,11 +2077,9 @@ mod tests {
             let (symbols, mut files) = binder.finish().try_into_parts().unwrap();
             let bound = files.remove(&file).unwrap();
             let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
-            assert!(
-                store
-                    .register_source_file(&parsed.arena, parsed.source_file, file)
-                    .is_some()
-            );
+            assert!(store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .is_some());
             store
                 .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
                 .unwrap();
@@ -2141,12 +2246,130 @@ mod tests {
                 ),
                 before,
             );
-            assert!(
-                fixture
-                    .store
-                    .source_callable_type_for_owner(owner)
-                    .is_none()
+            assert!(fixture
+                .store
+                .source_callable_type_for_owner(owner)
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn array_arrow_identifier_statement_preserves_void_body_and_exact_nodes() {
+        for source in [
+            "const callbacks = [(value: number) => { value; }];",
+            "const result = invoke([(value: string) => { value; },]);",
+        ] {
+            let fixture = Fixture::new(source);
+            let declaration = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::ArrowFunction).then_some(NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let owner = fixture.bound.symbol(declaration).unwrap();
+            let before = (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.checker_link_allocated_lengths(),
             );
+            let host = fixture.host();
+
+            let (callable, body) =
+                plan_source_arrow_value(&fixture.store, &host, declaration, None).unwrap();
+            let (block, statement, expression) =
+                plan_array_arrow_identifier_statement(&fixture.store, &host, &callable)
+                    .unwrap()
+                    .unwrap();
+
+            assert_eq!(callable.owner_symbol, owner);
+            assert!(callable.return_type.is_inferred());
+            assert_eq!(body, SourceArrowBodyPlan::EmptyBlock { block });
+            assert_eq!(
+                fixture.parsed.arena.get(block.node).unwrap().kind,
+                SyntaxKind::Block
+            );
+            assert_eq!(
+                fixture.parsed.arena.get(statement.node).unwrap().kind,
+                SyntaxKind::ExpressionStatement,
+            );
+            assert_eq!(
+                fixture.parsed.arena.get(expression.node).unwrap().kind,
+                SyntaxKind::Identifier,
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.symbol_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+            assert!(fixture
+                .store
+                .source_callable_type_for_owner(owner)
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn array_arrow_identifier_statements_reject_other_blocks_without_publication() {
+        for source in [
+            "const direct = (value: number) => { value; };",
+            "const callbacks = [(value: number) => { other; }];",
+            "const callbacks = [(value: number) => { 1; }];",
+            "const callbacks = [(first: number, second: number) => { first; }];",
+            "const callbacks = [(value: number): void => { value; }];",
+            "const callbacks = [(value: number) => { value; value; }];",
+            "const callbacks = [(value: number) => { value; }, 1];",
+        ] {
+            let fixture = Fixture::new(source);
+            let declaration = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::ArrowFunction).then_some(NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let owner = fixture.bound.symbol(declaration).unwrap();
+            let before = (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+            let host = fixture.host();
+
+            assert!(
+                matches!(
+                    plan_source_arrow_value(&fixture.store, &host, declaration, None),
+                    Err(SourceArrowError::Unsupported(
+                        SourceArrowUnsupported::ComplexBlock(_)
+                    ))
+                ),
+                "{source}",
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.symbol_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+            assert!(fixture
+                .store
+                .source_callable_type_for_owner(owner)
+                .is_none());
         }
     }
 
@@ -2200,12 +2423,10 @@ mod tests {
                 fixture.parsed.arena.get(expression.node).unwrap().kind,
                 expected_kind,
             );
-            assert!(
-                fixture
-                    .store
-                    .source_callable_type_for_owner(owner)
-                    .is_none()
-            );
+            assert!(fixture
+                .store
+                .source_callable_type_for_owner(owner)
+                .is_none());
         }
     }
 
@@ -2364,12 +2585,10 @@ mod tests {
                 ),
                 cold,
             );
-            assert!(
-                fixture
-                    .store
-                    .source_callable_type_for_owner(owner)
-                    .is_none()
-            );
+            assert!(fixture
+                .store
+                .source_callable_type_for_owner(owner)
+                .is_none());
         }
     }
 
@@ -2465,12 +2684,10 @@ mod tests {
                 ),
                 cold,
             );
-            assert!(
-                fixture
-                    .store
-                    .source_callable_type_for_owner(owner)
-                    .is_none()
-            );
+            assert!(fixture
+                .store
+                .source_callable_type_for_owner(owner)
+                .is_none());
         }
     }
 
@@ -2522,12 +2739,10 @@ mod tests {
             SourceContextualReturnOrigin::InferredEmptyBody { block }
                 if fixture.parsed.arena.get(block.node).unwrap().kind == SyntaxKind::Block
         ));
-        assert!(
-            fixture
-                .store
-                .source_callable_type_for_owner(plan.owner_symbol)
-                .is_none()
-        );
+        assert!(fixture
+            .store
+            .source_callable_type_for_owner(plan.owner_symbol)
+            .is_none());
     }
 
     #[test]
@@ -2561,12 +2776,10 @@ mod tests {
             resolved.implicit_any_diagnostic_nodes(true),
             vec![plan.parameters[0].declaration]
         );
-        assert!(
-            fixture
-                .store
-                .source_callable_type_for_owner(plan.owner_symbol)
-                .is_none()
-        );
+        assert!(fixture
+            .store
+            .source_callable_type_for_owner(plan.owner_symbol)
+            .is_none());
     }
 
     #[test]
@@ -2718,12 +2931,10 @@ mod tests {
                 SourceArrowInvariant::InvalidInitializer(initializer)
             ))
         );
-        assert!(
-            fixture
-                .store
-                .source_callable_type_for_owner(fixture.bound.symbol(initializer).unwrap())
-                .is_none()
-        );
+        assert!(fixture
+            .store
+            .source_callable_type_for_owner(fixture.bound.symbol(initializer).unwrap())
+            .is_none());
     }
 
     #[test]
@@ -2826,26 +3037,22 @@ mod tests {
             direct_variable.initializer.unwrap(),
         );
         let direct_owner = direct.bound.symbol(direct_arrow).unwrap();
-        assert!(
-            direct
-                .store
-                .symbol(direct_owner)
-                .unwrap()
-                .exports()
-                .is_some()
-        );
+        assert!(direct
+            .store
+            .symbol(direct_owner)
+            .unwrap()
+            .exports()
+            .is_some());
         assert!(matches!(
             direct.plan(0),
             Err(SourceArrowError::Unsupported(
                 SourceArrowUnsupported::Callable(SourceCallableUnsupported::ExpandoProperties(_))
             ))
         ));
-        assert!(
-            direct
-                .store
-                .source_callable_type_for_owner(direct_owner)
-                .is_none()
-        );
+        assert!(direct
+            .store
+            .source_callable_type_for_owner(direct_owner)
+            .is_none());
 
         let contextual = Fixture::new("const foo: () => void = () => {}; foo.bar = 42; export {};");
         assert!(matches!(
@@ -2896,14 +3103,12 @@ mod tests {
         ));
 
         let inferred_return = Fixture::new("const f = (x: number) => x;");
-        assert!(
-            inferred_return
-                .plan(0)
-                .unwrap()
-                .callable
-                .return_type
-                .is_inferred()
-        );
+        assert!(inferred_return
+            .plan(0)
+            .unwrap()
+            .callable
+            .return_type
+            .is_inferred());
 
         let initialized = Fixture::new("const f = (x: number = 0): number => x;");
         let initialized = initialized.plan(0).unwrap();
@@ -2914,11 +3119,10 @@ mod tests {
         let rest = Fixture::new("const f = (head: string, ...values: number[]): string => head;");
         let rest = rest.plan(0).unwrap();
         assert_eq!(rest.callable.min_argument_count, 1);
-        assert!(
-            rest.callable
-                .flags
-                .contains(SignatureFlags::HAS_REST_PARAMETER)
-        );
+        assert!(rest
+            .callable
+            .flags
+            .contains(SignatureFlags::HAS_REST_PARAMETER));
         assert!(rest.callable.parameters[1].rest);
 
         let predicate = Fixture::new("const f = (x: unknown): x is string => true;");

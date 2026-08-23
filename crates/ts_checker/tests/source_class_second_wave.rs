@@ -394,6 +394,10 @@ fn unsupported_class_grammar_reports_exact_modifier_accessor_and_heritage_errors
             "class First {} class Second {} class Model extends First, Second {}",
             &[(1174, "Second")],
         ),
+        (
+            "class Model { value: number = 2; accessor value: number = 3; }",
+            &[(2300, "value"), (2300, "value")],
+        ),
     ];
 
     for (index, (source, expected)) in cases.iter().enumerate() {

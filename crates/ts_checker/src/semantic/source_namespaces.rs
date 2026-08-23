@@ -16,18 +16,21 @@ use ts_diagnostics::{Diagnostic, message_by_code};
 use super::{
     AliasTargetState, CanonicalCheckerDiagnostics, CanonicalCheckerOptions, CanonicalGlobalTypes,
     CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, DeclaredTypeUnavailable,
-    SourceAssertionError, SourceCheckError, SourceCheckProvenanceError, SourceLiteralCacheError,
-    SourceObjectLiteralError, SourceSyntaxRole, SymbolNodeLinks, TypeData, TypeId, TypeMapper,
-    TypeNodeLinks, UnsupportedSourceSyntax, ValueSymbolLinks, VariableInvariant,
+    SourceAssertionError, SourceCheckError, SourceCheckProvenanceError, SourceFunctionInvariant,
+    SourceLiteralCacheError, SourceObjectLiteralError, SourceSyntaxRole, SymbolNodeLinks, TypeData,
+    TypeId, TypeMapper, TypeNodeLinks, UnsupportedSourceSyntax, ValueSymbolLinks,
+    VariableInvariant,
     alias::{
         CanonicalAliasResolutionEvent, CanonicalAliasResolver, CanonicalAliasTargetHost,
         CanonicalAliasTargetUnavailable, CanonicalImmediateAliasTarget,
     },
+    array_types::CanonicalArrayTargets,
     bootstrap::UnionReduction,
     declared::cached_ordinary_type_parameter_owner,
     instantiate::InstantiationSession,
     object_members::{self, PropertyObjectError, PropertyObjectPlan},
     reference_types::validate_direct_generic_reference,
+    source_callables::{self, SourceCallableError},
     type_nodes::{CanonicalTypeQuery, TypeNodeUnavailable, normalize_numeric_separators},
     types::{ObjectFlags, TypeFlags},
 };
@@ -59,6 +62,10 @@ pub(super) enum SourceNamespaceMemberPlan {
         generic: Option<SourceNamespaceGenericInterfacePlan>,
     },
     EmptyEnum {
+        declaration: NodeRef,
+        symbol: SemanticSymbolId,
+    },
+    Function {
         declaration: NodeRef,
         symbol: SemanticSymbolId,
     },
@@ -622,6 +629,123 @@ fn plan_generic_interface_property(
     })
 }
 
+fn plan_jsx_record_interface_heritage(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+    declaration: NodeRef,
+    clauses: &ts_ast::NodeList,
+) -> Result<Vec<NodeRef>, SourceCheckError> {
+    let invalid = |node: NodeRef, kind: SyntaxKind| {
+        unsupported(node, kind, SourceSyntaxRole::InterfaceDeclaration)
+    };
+    let declaration_record = owned_node(arena, bound, store, declaration)?;
+    let NodeData::InterfaceDeclaration(interface) = &declaration_record.data else {
+        return Err(invalid(declaration, declaration_record.kind));
+    };
+    let name = child(declaration, interface.name);
+    let name_record = owned_node(arena, bound, store, name)?;
+    let NodeData::Identifier(interface_name) = &name_record.data else {
+        return Err(invalid(name, name_record.kind));
+    };
+    if store
+        .symbol(owner)
+        .and_then(|symbol| symbol.name().as_utf8())
+        != Some("JSX")
+        || interface_name.text != "IntrinsicElements"
+        || interface.type_parameters.is_some()
+        || !interface.members.nodes.is_empty()
+        || clauses.has_trailing_comma
+        || clauses.nodes.len() != 1
+    {
+        let clause = clauses
+            .nodes
+            .first()
+            .copied()
+            .map_or(declaration, |clause| child(declaration, clause));
+        let kind = arena
+            .get(clause.node)
+            .map_or(declaration_record.kind, |record| record.kind);
+        return Err(invalid(clause, kind));
+    }
+
+    let clause = child(declaration, clauses.nodes[0]);
+    let clause_record = owned_node(arena, bound, store, clause)?;
+    let NodeData::HeritageClause(heritage) = &clause_record.data else {
+        return Err(invalid(clause, clause_record.kind));
+    };
+    if clause_record.kind != SyntaxKind::HeritageClause
+        || clause_record.flags.0 != 0
+        || clause_record.parent != Some(declaration.node)
+        || heritage.token != SyntaxKind::ExtendsKeyword
+        || heritage.facts != 0
+        || heritage.types.has_trailing_comma
+        || heritage.types.nodes.len() != 1
+    {
+        return Err(invalid(clause, clause_record.kind));
+    }
+
+    let base = child(clause, heritage.types.nodes[0]);
+    let base_record = owned_node(arena, bound, store, base)?;
+    let NodeData::ExpressionWithTypeArguments(reference) = &base_record.data else {
+        return Err(invalid(base, base_record.kind));
+    };
+    let Some(arguments) = reference.type_arguments.as_ref() else {
+        return Err(invalid(base, base_record.kind));
+    };
+    if base_record.kind != SyntaxKind::ExpressionWithTypeArguments
+        || base_record.flags.0 != 0
+        || base_record.parent != Some(clause.node)
+        || reference.facts != 0
+        || arguments.has_trailing_comma
+        || arguments.nodes.len() != 2
+    {
+        return Err(invalid(base, base_record.kind));
+    }
+
+    let record_name = child(base, reference.expression);
+    let record_name_node = owned_node(arena, bound, store, record_name)?;
+    let NodeData::Identifier(record_identifier) = &record_name_node.data else {
+        return Err(invalid(record_name, record_name_node.kind));
+    };
+    let record_symbol = store
+        .intrinsic_bootstrap()
+        .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+        .and_then(|globals| globals.get_source("Record"))
+        .and_then(|symbol| store.get_merged_symbol(symbol));
+    if record_name_node.kind != SyntaxKind::Identifier
+        || record_name_node.flags.0 != 0
+        || record_name_node.parent != Some(base.node)
+        || record_identifier.flow_node.is_some()
+        || record_identifier.text != "Record"
+        || record_symbol
+            .and_then(|symbol| store.symbol(symbol))
+            .is_none_or(|symbol| symbol.flags() != SymbolFlags::TYPE_ALIAS)
+    {
+        return Err(invalid(record_name, record_name_node.kind));
+    }
+
+    let mut annotations = Vec::with_capacity(arguments.nodes.len());
+    for (argument, expected) in arguments
+        .nodes
+        .iter()
+        .zip([SyntaxKind::StringKeyword, SyntaxKind::AnyKeyword])
+    {
+        let argument = child(base, *argument);
+        let record = owned_node(arena, bound, store, argument)?;
+        if record.kind != expected
+            || record.flags.0 != 0
+            || record.parent != Some(base.node)
+            || !matches!(record.data, NodeData::KeywordTypeNode(_))
+        {
+            return Err(invalid(argument, record.kind));
+        }
+        annotations.push(argument);
+    }
+    Ok(annotations)
+}
+
 fn plan_interface_member(
     arena: &NodeArena,
     bound: &BoundFile,
@@ -638,10 +762,7 @@ fn plan_interface_member(
             },
         ));
     };
-    if record.flags.0 != 0
-        || interface.heritage_clauses.is_some()
-        || interface.members.has_trailing_comma
-    {
+    if record.flags.0 != 0 || interface.members.has_trailing_comma {
         let node = interface
             .heritage_clauses
             .as_ref()
@@ -666,6 +787,16 @@ fn plan_interface_member(
     validate_symbol_parent(store, declaration, symbol, Some(owner))?;
 
     let mut annotations = Vec::new();
+    if let Some(heritage) = &interface.heritage_clauses {
+        annotations.extend(plan_jsx_record_interface_heritage(
+            arena,
+            bound,
+            store,
+            owner,
+            declaration,
+            heritage,
+        )?);
+    }
     let mut generic = interface
         .type_parameters
         .as_ref()
@@ -830,6 +961,191 @@ fn plan_type_alias_member(
         declaration,
         symbol,
         annotation,
+    })
+}
+
+fn namespace_callable_error(declaration: NodeRef, error: SourceCallableError) -> SourceCheckError {
+    match error {
+        SourceCallableError::Unsupported(_) => unsupported(
+            declaration,
+            SyntaxKind::FunctionDeclaration,
+            SourceSyntaxRole::FunctionDeclaration,
+        ),
+        SourceCallableError::Invariant(_) => {
+            SourceCheckError::Function(SourceFunctionInvariant::Callable(declaration))
+        }
+        SourceCallableError::DeclaredType(error) => SourceCheckError::DeclaredType(error),
+        SourceCallableError::LiteralCache(error) => error.into(),
+    }
+}
+
+fn plan_namespace_function(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    namespace: (NodeRef, SemanticSymbolId),
+    ambient: bool,
+    declaration: NodeRef,
+) -> Result<SourceNamespaceMemberPlan, SourceCheckError> {
+    let (namespace, owner) = namespace;
+    let record = owned_node(arena, bound, store, declaration)?;
+    let NodeData::FunctionDeclaration(function) = &record.data else {
+        return Err(unsupported(
+            declaration,
+            record.kind,
+            SourceSyntaxRole::FunctionDeclaration,
+        ));
+    };
+    let (exported, declared) = modifier_flags(
+        arena,
+        bound,
+        store,
+        declaration,
+        function.modifiers.as_ref(),
+    )?;
+    let Some(name) = function.name else {
+        return Err(unsupported(
+            declaration,
+            record.kind,
+            SourceSyntaxRole::FunctionName,
+        ));
+    };
+    let name = child(declaration, name);
+    let name_record = owned_node(arena, bound, store, name)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(unsupported(
+            name,
+            name_record.kind,
+            SourceSyntaxRole::FunctionName,
+        ));
+    };
+    let Some(body) = function.body else {
+        return Err(unsupported(
+            declaration,
+            record.kind,
+            SourceSyntaxRole::FunctionBody,
+        ));
+    };
+    let body = child(declaration, body);
+    let body_record = owned_node(arena, bound, store, body)?;
+    let NodeData::Block(block) = &body_record.data else {
+        return Err(unsupported(
+            body,
+            body_record.kind,
+            SourceSyntaxRole::FunctionBody,
+        ));
+    };
+    if ambient
+        || !exported
+        || declared
+        || record.kind != SyntaxKind::FunctionDeclaration
+        || record.flags.0 != 0
+        || function.asterisk_token.is_some()
+        || function.end_flow_node.is_some()
+        || function.flow_node.is_some()
+        || function.full_signature.is_some()
+        || function.local_symbol.is_some()
+        || function.next_container.is_some()
+        || function.return_flow_node.is_some()
+        || function.symbol.is_some()
+        || function.type_.is_some()
+        || function.type_parameters.is_some()
+        || function.facts != 0
+        || !function.parameters.nodes.is_empty()
+        || function.parameters.has_trailing_comma
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(declaration.node)
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+        || body_record.kind != SyntaxKind::Block
+        || body_record.flags.0 != 0
+        || body_record.parent != Some(declaration.node)
+        || block.flow_node.is_some()
+        || block.next_container.is_some()
+        || block.facts != 0
+        || !block.statements.nodes.is_empty()
+        || block.statements.has_trailing_comma
+    {
+        return Err(unsupported(
+            declaration,
+            record.kind,
+            SourceSyntaxRole::FunctionDeclaration,
+        ));
+    }
+
+    let symbol = declaration_symbol(bound, store, declaration, SymbolFlags::FUNCTION)?;
+    let function_record = store.symbol(symbol).ok_or(SourceCheckError::Provenance(
+        SourceCheckProvenanceError::MissingDeclarationSymbol(declaration),
+    ))?;
+    let local = bound
+        .local_symbol(declaration)
+        .ok_or(SourceCheckError::Provenance(
+            SourceCheckProvenanceError::MissingDeclarationSymbol(declaration),
+        ))?;
+    let local_record = store.symbol(local).ok_or(SourceCheckError::Provenance(
+        SourceCheckProvenanceError::MissingDeclarationSymbol(declaration),
+    ))?;
+    if function_record.flags() != SymbolFlags::FUNCTION
+        || function_record.check_flags() != CheckFlags::NONE
+        || function_record.declarations() != Some(&[declaration])
+        || function_record.value_declaration() != Some(declaration)
+        || function_record.name().as_utf8() != Some(identifier.text.as_str())
+        || function_record.members().is_some()
+        || function_record.exports().is_some()
+        || function_record.export_symbol().is_some()
+        || store.get_parent_of_symbol(symbol) != Some(owner)
+        || store.get_merged_symbol(local) != Some(local)
+        || local_record.flags() != SymbolFlags::EXPORT_VALUE
+        || local_record.check_flags() != CheckFlags::NONE
+        || local_record.declarations() != Some(&[declaration])
+        || local_record.value_declaration().is_some()
+        || local_record.name().as_utf8() != Some(identifier.text.as_str())
+        || local_record.members().is_some()
+        || local_record.exports().is_some()
+        || local_record.parent().is_some()
+        || local_record.export_symbol() != Some(symbol)
+        || store
+            .symbol(owner)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| store.symbol_table(exports))
+            .and_then(|exports| exports.get_source(&identifier.text))
+            .and_then(|candidate| store.get_merged_symbol(candidate))
+            != Some(symbol)
+        || bound
+            .locals(namespace)
+            .and_then(|locals| store.symbol_table(locals))
+            .and_then(|locals| locals.get_source(&identifier.text))
+            != Some(local)
+    {
+        return Err(SourceCheckError::Provenance(
+            SourceCheckProvenanceError::MissingDeclarationSymbol(declaration),
+        ));
+    }
+    let host = DeclaredTypeHost::new([(arena, bound)]).map_err(DeclaredTypeError::from)?;
+    let array_targets = store
+        .source_callable_type_for_owner(symbol)
+        .and_then(|type_| store.source_callable_provenance(type_))
+        .and_then(|provenance| provenance.array_targets);
+    let callable =
+        source_callables::plan_source_callable(store, &host, declaration, symbol, array_targets)
+            .map_err(|error| namespace_callable_error(declaration, error))?;
+    if callable.owner_parent != Some(owner)
+        || callable.export_local != Some(local)
+        || !callable.parameters.is_empty()
+        || !callable.type_parameters.is_empty()
+        || !callable.return_type.is_inferred()
+        || callable.body != body
+        || callable.body_mode.is_ambient()
+    {
+        return Err(SourceCheckError::Function(
+            SourceFunctionInvariant::Callable(declaration),
+        ));
+    }
+
+    Ok(SourceNamespaceMemberPlan::Function {
+        declaration,
+        symbol,
     })
 }
 
@@ -2094,6 +2410,16 @@ fn plan_namespace(
                                 symbol: member_symbol,
                             });
                         }
+                        SyntaxKind::FunctionDeclaration => {
+                            members.push(plan_namespace_function(
+                                arena,
+                                bound,
+                                store,
+                                (declaration, symbol),
+                                ambient,
+                                statement,
+                            )?);
+                        }
                         SyntaxKind::VariableStatement => {
                             plan_namespace_variables(
                                 arena,
@@ -2200,7 +2526,8 @@ fn namespace_annotations<'plan>(
                 annotations.extend(interface_annotations);
                 declarations.push(member);
             }
-            SourceNamespaceMemberPlan::EmptyEnum { .. } => declarations.push(member),
+            SourceNamespaceMemberPlan::EmptyEnum { .. }
+            | SourceNamespaceMemberPlan::Function { .. } => declarations.push(member),
         }
     }
     diagnostics.extend(plan.diagnostics.iter().copied());
@@ -2840,6 +3167,27 @@ pub(super) fn execute_source_namespace(
             VARIABLE_IMPLICITLY_HAS_ANY_TYPE,
         ));
     }
+    for declaration in &declarations {
+        let SourceNamespaceMemberPlan::Function {
+            declaration,
+            symbol,
+        } = declaration
+        else {
+            continue;
+        };
+        session.reset_query();
+        let mut staged = CanonicalCheckerDiagnostics::default();
+        CanonicalTypeQuery::new_with_global_types_and_session(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            &mut staged,
+        )?
+        .preflight_type_of_source_callable(*declaration, *symbol)?;
+        debug_assert!(staged.is_empty());
+    }
 
     let mut values = Vec::<PendingNamespaceValue>::new();
     let mut numeric_initializers = Vec::new();
@@ -3143,15 +3491,26 @@ pub(super) fn execute_source_namespace(
                 generic,
                 ..
             } => {
-                let target = CanonicalTypeQuery::new_with_global_types_and_session(
-                    store,
-                    host,
-                    global_types,
-                    options,
-                    session,
-                    diagnostics,
-                )?
-                .get_declared_type_of_symbol(*symbol)?;
+                let heritage = host.node(*declaration).is_some_and(|record| {
+                    matches!(
+                        &record.data,
+                        NodeData::InterfaceDeclaration(interface)
+                            if interface.heritage_clauses.is_some()
+                    )
+                });
+                let target = if heritage {
+                    store.get_declared_type_of_symbol(host, *symbol)?
+                } else {
+                    CanonicalTypeQuery::new_with_global_types_and_session(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        session,
+                        diagnostics,
+                    )?
+                    .get_declared_type_of_symbol(*symbol)?
+                };
                 if let Some(generic) = generic {
                     let mut property_types = Vec::with_capacity(generic.properties.len());
                     for property in &generic.properties {
@@ -3200,6 +3559,51 @@ pub(super) fn execute_source_namespace(
             } => {
                 super::enums::get_enum_semantics(store, host, *symbol)
                     .map_err(|error| namespace_enum_error(*declaration, error))?;
+            }
+            SourceNamespaceMemberPlan::Function {
+                declaration,
+                symbol,
+            } => {
+                let callable = CanonicalTypeQuery::new_with_global_types_and_session(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    diagnostics,
+                )?
+                .get_type_of_source_callable(*declaration, *symbol)?;
+                let signature = store
+                    .source_callable_provenance(callable)
+                    .filter(|provenance| {
+                        provenance.declaration == *declaration && provenance.owner_symbol == *symbol
+                    })
+                    .map(|provenance| provenance.signature)
+                    .ok_or(SourceCheckError::Function(
+                        SourceFunctionInvariant::Callable(*declaration),
+                    ))?;
+                let callable_plan = source_callables::plan_source_callable(
+                    store,
+                    host,
+                    *declaration,
+                    *symbol,
+                    Some(CanonicalArrayTargets::from_global_types(global_types)),
+                )
+                .map_err(|error| namespace_callable_error(*declaration, error))?;
+                let void = store
+                    .intrinsic_bootstrap()
+                    .ok_or(SourceCheckError::LiteralCache(
+                        SourceLiteralCacheError::BootstrapUninitialized,
+                    ))?
+                    .void_type;
+                source_callables::publish_inferred_source_callable_return(
+                    store,
+                    &callable_plan,
+                    signature,
+                    void,
+                )
+                .map_err(|error| namespace_callable_error(*declaration, error))?;
+                stage_namespace_value(store, &mut values, *declaration, *symbol, callable)?;
             }
         }
     }
@@ -3565,6 +3969,156 @@ mod tests {
         assert!(leaf.members.is_empty());
         assert_ne!(outer.symbol, middle.symbol);
         assert_ne!(middle.symbol, leaf.symbol);
+    }
+
+    #[test]
+    fn exported_namespace_functions_publish_inferred_void_cold_and_warm() {
+        let mut fixture = fixture(
+            "export namespace Values { export function read() {} }",
+            CanonicalModuleState::External,
+        );
+        let namespace = plan(&fixture, 0);
+        let [
+            SourceNamespaceMemberPlan::Function {
+                declaration,
+                symbol,
+            },
+        ] = namespace.members.as_slice()
+        else {
+            panic!("the namespace must retain its exported function")
+        };
+        let declaration = *declaration;
+        let symbol = *symbol;
+
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+
+        let callable = fixture
+            .context
+            .store()
+            .value_symbol_links(symbol)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let provenance = fixture
+            .context
+            .store()
+            .source_callable_provenance(callable)
+            .unwrap();
+        let expected = fixture
+            .context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .void_type;
+        assert_eq!(provenance.declaration, declaration);
+        assert_eq!(provenance.owner_symbol, symbol);
+        assert_eq!(
+            fixture
+                .context
+                .store()
+                .signature(provenance.signature)
+                .and_then(super::super::signatures::Signature::resolved_return_type),
+            Some(expected),
+        );
+
+        let warm = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn exported_namespace_functions_replay_importer_published_callable_capabilities() {
+        let mut fixture = fixture(
+            "export namespace Values { export function read() {} }",
+            CanonicalModuleState::External,
+        );
+        let namespace = plan(&fixture, 0);
+        let [
+            SourceNamespaceMemberPlan::Function {
+                declaration,
+                symbol,
+            },
+        ] = namespace.members.as_slice()
+        else {
+            panic!("the namespace must retain its exported function")
+        };
+        let declaration = *declaration;
+        let symbol = *symbol;
+        let bound = fixture.context.file(fixture.file).unwrap().1.clone();
+        let global_types = fixture.context.global_types().clone();
+        let options = fixture.context.options();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&fixture.parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(options.name_resolution),
+        )
+        .unwrap();
+        {
+            let store = fixture.context.store_mut_for_test();
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            let error = bootstrap.error_type;
+            let void = bootstrap.void_type;
+            let mut session =
+                InstantiationSession::new_recovering(store, InstantiationLimits::default(), error)
+                    .unwrap();
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let callable = CanonicalTypeQuery::new_with_global_types_and_session(
+                store,
+                &host,
+                &global_types,
+                options,
+                &mut session,
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_of_source_callable(declaration, symbol)
+            .unwrap();
+            let signature = store
+                .source_callable_provenance(callable)
+                .unwrap()
+                .signature;
+            let callable_plan = source_callables::plan_source_callable(
+                store,
+                &host,
+                declaration,
+                symbol,
+                Some(CanonicalArrayTargets::from_global_types(&global_types)),
+            )
+            .unwrap();
+            source_callables::publish_inferred_source_callable_return(
+                store,
+                &callable_plan,
+                signature,
+                void,
+            )
+            .unwrap();
+            assert!(diagnostics.is_empty());
+        }
+
+        assert_eq!(plan(&fixture, 0), namespace);
+        let warm = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
     }
 
     #[test]

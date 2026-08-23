@@ -37,7 +37,8 @@ use super::{
         InstantiationError, InstantiationLimits, InstantiationSession,
         instantiate_type_with_session, instantiate_type_with_vector_and_session,
     },
-    signatures::SignatureFlags,
+    keyof_types::{cached_nongeneric_keyof_type, plan_nongeneric_keyof_type},
+    signatures::{IndexFlags, SignatureFlags},
     source_callables::{StoredSourceCallableValidation, validate_stored_source_callable},
     store::CachedSignatureLookup,
     type_records::TypeData,
@@ -1370,7 +1371,11 @@ fn validate_generic_constraint_dependency(
         TypeData::Intrinsic(_) | TypeData::Literal(_) | TypeData::UniqueEsSymbol(_) => {
             Ok(constraint)
         }
-        TypeData::Union(union) if record.alias().is_none() && union.origin.is_none() => {
+        TypeData::Union(union)
+            if record.alias().is_none()
+                && (union.origin.is_none()
+                    || authenticated_nongeneric_keyof_union(store, constraint)) =>
+        {
             for constituent in &union.union.types {
                 let base =
                     validate_generic_constraint_dependency(store, *constituent, earlier, owner)?;
@@ -1413,7 +1418,11 @@ fn validate_generic_type_parameter_dependency(
         {
             Ok(())
         }
-        TypeData::Union(union) if record.alias().is_none() && union.origin.is_none() => {
+        TypeData::Union(union)
+            if record.alias().is_none()
+                && (union.origin.is_none()
+                    || authenticated_nongeneric_keyof_union(store, dependency)) =>
+        {
             for constituent in &union.union.types {
                 validate_generic_type_parameter_dependency(store, *constituent, earlier, owner)?;
             }
@@ -1425,6 +1434,41 @@ fn validate_generic_type_parameter_dependency(
         }
         .into()),
     }
+}
+
+/// Recognizes only the exact root-cached result of `keyof` on a named object.
+fn authenticated_nongeneric_keyof_union(store: &CanonicalTypeMapperStore, type_: TypeId) -> bool {
+    let Some(record) = store.type_payload(type_) else {
+        return false;
+    };
+    let TypeData::Union(union) = record.data() else {
+        return false;
+    };
+    if record.alias().is_some() {
+        return false;
+    }
+    let Some(origin) = union.origin else {
+        return false;
+    };
+    let Some(origin_record) = store.type_payload(origin) else {
+        return false;
+    };
+    let TypeData::Index(index) = origin_record.data() else {
+        return false;
+    };
+    if origin_record.flags() != TypeFlags::INDEX
+        || origin_record.object_flags() != ObjectFlags::NONE
+        || origin_record.symbol().is_some()
+        || origin_record.alias().is_some()
+        || index.index_flags != IndexFlags::NONE
+    {
+        return false;
+    }
+    let Ok(plan) = plan_nongeneric_keyof_type(store, index.target) else {
+        return false;
+    };
+    plan.retains_index_origin()
+        && cached_nongeneric_keyof_type(store, &plan).is_ok_and(|cached| cached == Some(type_))
 }
 
 fn validate_generic_mapper_type(
@@ -1908,6 +1952,9 @@ fn instantiate_generic_call_type(
     array_targets: Option<CanonicalArrayTargets>,
     session: &mut InstantiationSession,
 ) -> Result<TypeId, InstantiationError> {
+    if authenticated_nongeneric_keyof_union(store, type_) {
+        return Ok(type_);
+    }
     instantiate_type_with_vector_and_session(store, type_, sources, targets, array_targets, session)
 }
 
@@ -4090,14 +4137,19 @@ fn check_identity_argument_applicability(
 
 #[cfg(test)]
 mod tests {
-    use ts_binder::{EscapedName, SymbolData};
+    use ts_ast::FileId;
+    use ts_binder::{
+        CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
+        EscapedName, SymbolData,
+    };
     use ts_jsnum::Number;
+    use ts_parser::parse_source_file;
 
     use super::*;
     use crate::semantic::{
-        DeclaredTypeLinks, IntrinsicBootstrapOptions, SemanticStore,
-        instantiate::InstantiationLimits, mapper::TypeMapper, type_records::TypeRecord,
-        types::ObjectFlags,
+        CanonicalCheckerContext, CanonicalCheckerOptions, DeclaredTypeLinks,
+        IntrinsicBootstrapOptions, SemanticStore, instantiate::InstantiationLimits,
+        mapper::TypeMapper, type_records::TypeRecord, types::ObjectFlags,
     };
 
     const EXACT_SOURCE: IdentityTypeParameterCacheProvenance =
@@ -5491,6 +5543,199 @@ mod tests {
         assert!(data.union.types.contains(&c_regular));
         assert!(!data.union.types.contains(&b));
         assert!(!data.union.types.contains(&c));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One source graph proves cache identity and call outcomes.
+    fn named_keyof_constraints_preserve_origin_and_reject_forged_cache_identities() {
+        let parsed =
+            parse_source_file("interface Types { a: string; b: number } type Keys = keyof Types;");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(96_401);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/generic-keyof.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            [(file, &parsed.arena)].into_iter().collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        let keyof = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::TypeOperator).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let constraint = context.get_type_from_type_node(keyof).unwrap();
+        let store = context.store_mut_for_test();
+        let (interface, keys) = {
+            let TypeData::Union(union) = store.type_payload(constraint).unwrap().data() else {
+                panic!("named keyof must retain its property-key union")
+            };
+            let origin = union
+                .origin
+                .expect("named keyof must retain an index origin");
+            let TypeData::Index(index) = store.type_payload(origin).unwrap().data() else {
+                panic!("named keyof origin must be an index type")
+            };
+            (index.target, union.union.types.clone())
+        };
+        assert!(authenticated_nongeneric_keyof_union(store, constraint));
+
+        let (callable, _) = vector_callable(
+            store,
+            &["T"],
+            &[Some(GenericTypeSpec::Exact(constraint))],
+            &[None],
+            &[0],
+            |_, parameters| parameters[0],
+        );
+        let a = store.regular_string_literal_type("a".into()).unwrap();
+        let b = store.regular_string_literal_type("b".into()).unwrap();
+        let c = store.regular_string_literal_type("c".into()).unwrap();
+
+        let inferred =
+            project_vector(store, &callable, vector_request(callable.owner, None, &[a])).unwrap();
+        assert_eq!(
+            inferred.applicability,
+            GenericCallVectorApplicability::Applicable
+        );
+        assert_eq!(inferred.projection.instantiation.type_arguments, [a]);
+        let cached_counts = vector_cache_graph_counts(store);
+        let warm =
+            project_vector(store, &callable, vector_request(callable.owner, None, &[a])).unwrap();
+        assert_eq!(warm.projection, inferred.projection);
+        assert_eq!(vector_cache_graph_counts(store), cached_counts);
+
+        let explicit = project_vector(
+            store,
+            &callable,
+            vector_request(callable.owner, Some(&[b]), &[b]),
+        )
+        .unwrap();
+        assert_eq!(
+            explicit.applicability,
+            GenericCallVectorApplicability::Applicable
+        );
+        assert_eq!(explicit.projection.instantiation.type_arguments, [b]);
+
+        let rejected = project_vector(
+            store,
+            &callable,
+            vector_request(callable.owner, Some(&[c]), &[c]),
+        )
+        .unwrap();
+        assert_eq!(
+            rejected.applicability,
+            GenericCallVectorApplicability::ExplicitTypeArgumentConstraint {
+                index: 0,
+                type_argument: c,
+                constraint,
+            }
+        );
+
+        let inferred_rejection =
+            project_vector(store, &callable, vector_request(callable.owner, None, &[c])).unwrap();
+        assert_eq!(
+            inferred_rejection.applicability,
+            GenericCallVectorApplicability::ArgumentNotAssignable {
+                index: 0,
+                argument_type: c,
+                parameter_type: constraint,
+            }
+        );
+        assert_eq!(
+            inferred_rejection
+                .checked_instantiation
+                .as_ref()
+                .unwrap()
+                .type_arguments,
+            [constraint]
+        );
+        assert_eq!(
+            demand_vector_return(
+                store,
+                &callable,
+                &inferred_rejection,
+                &inferred_rejection.projection.instantiation,
+            ),
+            constraint
+        );
+
+        let (defaulted, _) = vector_callable_with_minimum(
+            store,
+            &["V"],
+            &[None],
+            &[Some(GenericTypeSpec::Exact(constraint))],
+            &[0],
+            0,
+            |_, parameters| parameters[0],
+        );
+        let defaulted_result = project_vector(
+            store,
+            &defaulted,
+            vector_request(defaulted.owner, None, &[]),
+        )
+        .unwrap();
+        assert_eq!(
+            defaulted_result.applicability,
+            GenericCallVectorApplicability::Applicable
+        );
+        assert_eq!(
+            defaulted_result.projection.instantiation.type_arguments,
+            [constraint]
+        );
+
+        let mut prepared = store.prepare_type_query_types(&[], &[], &[], 1, 0).unwrap();
+        let forged_origin = store.alloc_index_type(interface, IndexFlags::NONE).unwrap();
+        let forged = store
+            .literal_union_type_prepared_with_index_origin(&keys, forged_origin, &mut prepared)
+            .unwrap();
+        assert_ne!(forged, constraint);
+        assert!(!authenticated_nongeneric_keyof_union(store, forged));
+        let (forged_callable, parameters) = vector_callable(
+            store,
+            &["U"],
+            &[Some(GenericTypeSpec::Exact(forged))],
+            &[None],
+            &[0],
+            |_, parameters| parameters[0],
+        );
+        let before = vector_cache_graph_counts(store);
+        assert_eq!(
+            project_vector(
+                store,
+                &forged_callable,
+                vector_request(forged_callable.owner, None, &[a]),
+            ),
+            Err(GenericCallVectorError::Unsupported(
+                GenericCallVectorUnsupported::TypeParameterDependency {
+                    type_parameter: parameters[0],
+                    dependency: forged,
+                }
+            ))
+        );
+        assert_eq!(vector_cache_graph_counts(store), before);
     }
 
     #[test]

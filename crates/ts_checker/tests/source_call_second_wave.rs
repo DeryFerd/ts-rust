@@ -13,6 +13,26 @@ fn context<'arena>(
     source: &'arena ParseResult,
     file: FileId,
 ) -> CanonicalCheckerContext<'arena> {
+    context_with_options(
+        library,
+        source,
+        file,
+        CanonicalCheckerOptions {
+            intrinsic: IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            },
+            ..CanonicalCheckerOptions::default()
+        },
+    )
+}
+
+fn context_with_options<'arena>(
+    library: &'arena ParseResult,
+    source: &'arena ParseResult,
+    file: FileId,
+    options: CanonicalCheckerOptions,
+) -> CanonicalCheckerContext<'arena> {
     let library_file = FileId::new(3_500);
     let mut binder = CanonicalBinder::new();
     for (parsed, file, path) in [
@@ -41,13 +61,7 @@ fn context<'arena>(
         [(library_file, &library.arena), (file, &source.arena)]
             .into_iter()
             .collect(),
-        CanonicalCheckerOptions {
-            intrinsic: IntrinsicBootstrapOptions {
-                strict_null_checks: true,
-                ..IntrinsicBootstrapOptions::default()
-            },
-            ..CanonicalCheckerOptions::default()
-        },
+        options,
     )
     .unwrap()
 }
@@ -231,6 +245,62 @@ fn nested_noncallable_calls_report_missing_semicolon_information() {
             );
         }
     }
+
+    let warm = (
+        context.store().type_len(),
+        context.store().signature_len(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
+}
+
+#[test]
+fn ambiguous_contextual_array_arrows_report_their_implicit_any_parameter() {
+    let library = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
+    let text = concat!(
+        "type Record<K extends keyof any, T> = { [P in K]: T };\n",
+        "declare function accept(value: ",
+        "Record<string, (value: string) => void> | Array<(value: number) => void>): void;\n",
+        "accept([(value) => { value; }]);\n",
+    );
+    let parsed = parse_source_file(text);
+    assert!(library.diagnostics.is_empty());
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(3_504);
+    let mut context = context_with_options(
+        &library,
+        &parsed,
+        file,
+        CanonicalCheckerOptions {
+            intrinsic: IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            },
+            no_implicit_any: true,
+            strict_function_types: true,
+            ..CanonicalCheckerOptions::default()
+        },
+    );
+
+    context.check_source_file(file).unwrap();
+
+    let [diagnostic] = context.diagnostics().as_slice() else {
+        panic!("ambiguous contextual array arrow must report one implicit-any error")
+    };
+    assert_eq!(diagnostic.diagnostic.code(), 7006);
+    assert_eq!(
+        diagnostic.diagnostic.render().unwrap(),
+        "Parameter 'value' implicitly has an 'any' type.",
+    );
+    assert_eq!(node_text(text, &parsed, diagnostic.node.unwrap()), "value");
 
     let warm = (
         context.store().type_len(),

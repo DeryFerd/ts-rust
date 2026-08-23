@@ -31,6 +31,7 @@ use super::{
         type_to_string_with_host_and_flags,
     },
     indexed_access_types::template_pattern_index_matches_name,
+    mapped_types::MappedTypeModifiers,
     production::{CanonicalJsxRuntime, CanonicalJsxRuntimeEvidence},
     signatures::SignatureFlags,
     source::merge_retry_diagnostic,
@@ -197,6 +198,12 @@ struct JsxNamespaceIndex {
     declaration: NodeRef,
     key_type: TypeId,
     value_type: TypeId,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct JsxRecordHeritage {
+    node: NodeRef,
+    alias: SemanticSymbolId,
 }
 
 impl CanonicalTypeMapperStore {
@@ -1303,7 +1310,7 @@ fn resolve_namespace_interface(
     options: CanonicalCheckerOptions,
     diagnostics: &mut CanonicalCheckerDiagnostics,
 ) -> Result<TypeId, SourceCheckError> {
-    let (declaration, members, member_nodes) = {
+    let (declaration, members, member_nodes, heritage) = {
         let record = store
             .symbol(symbol)
             .ok_or_else(|| invalid_namespace_symbol(symbol))?;
@@ -1324,7 +1331,6 @@ fn resolve_namespace_interface(
             || record.flags() != SymbolFlags::INTERFACE
             || record.check_flags() != CheckFlags::NONE
             || interface.type_parameters.is_some()
-            || interface.heritage_clauses.is_some()
             || interface.members.has_trailing_comma
             || !host.symbol_matches(store, *declaration, symbol)
         {
@@ -1334,8 +1340,24 @@ fn resolve_namespace_interface(
             *declaration,
             record.members(),
             interface.members.nodes.clone(),
+            interface.heritage_clauses.clone(),
         )
     };
+
+    if let Some(heritage) = heritage {
+        return resolve_record_intrinsic_namespace_interface(
+            store,
+            host,
+            namespace,
+            symbol,
+            declaration,
+            members,
+            &member_nodes,
+            &heritage,
+            options,
+            diagnostics,
+        );
+    }
 
     let mut properties = Vec::new();
     let mut indexes = Vec::new();
@@ -1532,6 +1554,342 @@ fn resolve_namespace_interface(
         return Err(SourceCheckError::Property(declaration));
     }
     Ok(type_)
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Keep inherited index publication atomic.
+fn resolve_record_intrinsic_namespace_interface(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    namespace: SemanticSymbolId,
+    symbol: SemanticSymbolId,
+    declaration: NodeRef,
+    members: Option<super::SymbolTableId>,
+    member_nodes: &[ts_ast::NodeId],
+    heritage: &ts_ast::NodeList,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+) -> Result<TypeId, SourceCheckError> {
+    let inherited = plan_record_intrinsic_heritage(
+        store,
+        host,
+        namespace,
+        symbol,
+        declaration,
+        members,
+        member_nodes,
+        heritage,
+    )?;
+    let mapped = CanonicalTypeQuery::new(store, host, options, diagnostics)?
+        .get_type_from_type_node(inherited.node)?;
+    let (string_type, any_type) = {
+        let bootstrap = store
+            .intrinsic_bootstrap()
+            .ok_or(SourceCheckError::LiteralCache(
+                SourceLiteralCacheError::BootstrapUninitialized,
+            ))?;
+        (bootstrap.string_type, bootstrap.any_type)
+    };
+    validate_record_intrinsic_base(
+        store,
+        inherited.alias,
+        mapped,
+        string_type,
+        any_type,
+        inherited.node,
+    )?;
+    store
+        .resolve_mapped_type_members(mapped, MappedTypeModifiers::NONE)
+        .map_err(|_| unsupported(inherited.node, SyntaxKind::ExpressionWithTypeArguments))?;
+    let mapped_index = {
+        let record = store
+            .type_payload(mapped)
+            .ok_or(SourceCheckError::Property(inherited.node))?;
+        let super::TypeData::Mapped(mapped_record) = record.data() else {
+            return Err(SourceCheckError::Property(inherited.node));
+        };
+        if !record
+            .object_flags()
+            .contains(ObjectFlags::INSTANTIATED_MAPPED | ObjectFlags::MEMBERS_RESOLVED)
+            || mapped_record
+                .object
+                .structured
+                .properties
+                .as_ref()
+                .is_some_and(|properties| !properties.is_empty())
+        {
+            return Err(SourceCheckError::Property(inherited.node));
+        }
+        let [index] = mapped_record
+            .object
+            .structured
+            .index_infos
+            .as_deref()
+            .unwrap_or_default()
+        else {
+            return Err(SourceCheckError::Property(inherited.node));
+        };
+        let index_record = store
+            .index_info(*index)
+            .ok_or(SourceCheckError::Property(inherited.node))?;
+        if index_record.key_type() != string_type
+            || index_record.value_type() != any_type
+            || index_record.is_readonly()
+            || index_record.declaration().is_some()
+            || index_record.index_symbol().is_some()
+            || !index_record.components().is_empty()
+        {
+            return Err(SourceCheckError::Property(inherited.node));
+        }
+        *index
+    };
+
+    let type_ = store.get_declared_type_of_symbol(host, symbol)?;
+    let state = {
+        let record = store
+            .type_payload(type_)
+            .ok_or(SourceCheckError::Property(declaration))?;
+        let super::TypeData::Interface(interface) = record.data() else {
+            return Err(SourceCheckError::Property(declaration));
+        };
+        if record.flags() != TypeFlags::OBJECT
+            || !record.object_flags().contains(ObjectFlags::INTERFACE)
+            || record.symbol() != Some(symbol)
+            || record.alias().is_some()
+            || interface.resolved_base_constructor_type.is_some()
+        {
+            return Err(SourceCheckError::Property(declaration));
+        }
+        if interface.base_types_resolved {
+            Some((
+                interface.resolved_base_types.clone(),
+                interface.declared_members_resolved,
+                interface.declared_members,
+                interface.declared_index_infos.clone(),
+                interface.reference.object.structured.clone(),
+                record.object_flags(),
+            ))
+        } else {
+            if interface.resolved_base_types.is_some()
+                || interface.declared_members_resolved
+                || interface.declared_members.is_some()
+                || interface.declared_index_infos.is_some()
+                || interface.reference.object.structured
+                    != super::type_records::StructuredTypeData::default()
+            {
+                return Err(SourceCheckError::Property(declaration));
+            }
+            None
+        }
+    };
+    if let Some((bases, declared, declared_members, declared_indexes, structured, flags)) = state {
+        let [base] = bases.as_deref().unwrap_or_default() else {
+            return Err(SourceCheckError::Property(declaration));
+        };
+        let [index] = structured.index_infos.as_deref().unwrap_or_default() else {
+            return Err(SourceCheckError::Property(declaration));
+        };
+        let index_record = store
+            .index_info(*index)
+            .ok_or(SourceCheckError::Property(declaration))?;
+        if *base != mapped
+            || !declared
+            || declared_members != members
+            || declared_indexes.is_some()
+            || structured.members != members
+            || structured.properties.is_some()
+            || structured.signatures.is_some()
+            || structured.call_signature_count != 0
+            || !flags.contains(ObjectFlags::MEMBERS_RESOLVED)
+            || *index == mapped_index
+            || index_record.key_type() != string_type
+            || index_record.value_type() != any_type
+            || index_record.is_readonly()
+            || index_record.declaration().is_some()
+            || !index_record.components().is_empty()
+        {
+            return Err(SourceCheckError::Property(declaration));
+        }
+        if let Some(index_symbol) = index_record.index_symbol() {
+            validate_index_symbol(
+                store,
+                index_symbol,
+                Some(symbol),
+                None,
+                any_type,
+                declaration,
+            )?;
+        }
+        return Ok(type_);
+    }
+
+    if !store.try_reserve_index_infos(1) {
+        return Err(SourceCheckError::Property(declaration));
+    }
+    let index = store
+        .alloc_index_info(string_type, any_type, false, None, Vec::new())
+        .ok_or(SourceCheckError::Property(declaration))?;
+    if !store.set_interface_base_resolution(type_, true, None, Some(vec![mapped]))
+        || !store.set_interface_declared_members(type_, true, members, None, None, None)
+        || !store.set_structured_type_members(type_, members, None, None, None, Some(vec![index]))
+    {
+        return Err(SourceCheckError::Property(declaration));
+    }
+    Ok(type_)
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Heritage syntax requires one complete proof.
+fn plan_record_intrinsic_heritage(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    namespace: SemanticSymbolId,
+    symbol: SemanticSymbolId,
+    declaration: NodeRef,
+    members: Option<super::SymbolTableId>,
+    member_nodes: &[ts_ast::NodeId],
+    heritage: &ts_ast::NodeList,
+) -> Result<JsxRecordHeritage, SourceCheckError> {
+    let unsupported_interface = || unsupported(declaration, SyntaxKind::InterfaceDeclaration);
+    if store
+        .symbol(namespace)
+        .and_then(|record| record.name().as_utf8())
+        != Some("JSX")
+        || store
+            .symbol(symbol)
+            .and_then(|record| record.name().as_utf8())
+            != Some("IntrinsicElements")
+        || !member_nodes.is_empty()
+        || members
+            .and_then(|members| store.symbol_table(members))
+            .is_some_and(|members| !members.is_empty())
+        || heritage.has_trailing_comma
+        || heritage.nodes.len() != 1
+    {
+        return Err(unsupported_interface());
+    }
+    let clause = child_ref(declaration, heritage.nodes[0]);
+    let clause_record = host
+        .node(clause)
+        .ok_or(SourceCheckError::Property(clause))?;
+    let NodeData::HeritageClause(clause_data) = &clause_record.data else {
+        return Err(unsupported(clause, clause_record.kind));
+    };
+    if clause_record.kind != SyntaxKind::HeritageClause
+        || clause_record.parent != Some(declaration.node)
+        || clause_record.flags.0 != 0
+        || clause_data.token != SyntaxKind::ExtendsKeyword
+        || clause_data.facts != 0
+        || clause_data.types.has_trailing_comma
+        || clause_data.types.nodes.len() != 1
+    {
+        return Err(unsupported(clause, clause_record.kind));
+    }
+    let node = child_ref(clause, clause_data.types.nodes[0]);
+    let record = host.node(node).ok_or(SourceCheckError::Property(node))?;
+    let NodeData::ExpressionWithTypeArguments(expression) = &record.data else {
+        return Err(unsupported(node, record.kind));
+    };
+    let Some(arguments) = expression.type_arguments.as_ref() else {
+        return Err(unsupported(node, record.kind));
+    };
+    if record.kind != SyntaxKind::ExpressionWithTypeArguments
+        || record.parent != Some(clause.node)
+        || record.flags.0 != 0
+        || expression.facts != 0
+        || arguments.has_trailing_comma
+        || arguments.nodes.len() != 2
+    {
+        return Err(unsupported(node, record.kind));
+    }
+    let name = child_ref(node, expression.expression);
+    let name_record = host.node(name).ok_or(SourceCheckError::Property(name))?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(unsupported(name, name_record.kind));
+    };
+    if name_record.kind != SyntaxKind::Identifier
+        || name_record.parent != Some(node.node)
+        || name_record.flags.0 != 0
+        || identifier.flow_node.is_some()
+        || identifier.text != "Record"
+    {
+        return Err(unsupported(name, name_record.kind));
+    }
+    for (argument, expected) in arguments
+        .nodes
+        .iter()
+        .zip([SyntaxKind::StringKeyword, SyntaxKind::AnyKeyword])
+    {
+        let argument = child_ref(node, *argument);
+        let argument_record = host
+            .node(argument)
+            .ok_or(SourceCheckError::Property(argument))?;
+        if argument_record.kind != expected
+            || !matches!(&argument_record.data, NodeData::KeywordTypeNode(_))
+            || argument_record.parent != Some(node.node)
+            || argument_record.flags.0 != 0
+        {
+            return Err(unsupported(argument, argument_record.kind));
+        }
+    }
+    let alias = host
+        .name_resolver_host(store)?
+        .resolve_entity_name(name, SymbolFlags::TYPE)
+        .map_err(super::DeclaredTypeError::from)?
+        .and_then(|alias| store.get_merged_symbol(alias))
+        .ok_or_else(unsupported_interface)?;
+    let global = store
+        .intrinsic_bootstrap()
+        .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+        .and_then(|globals| globals.get_source("Record"))
+        .and_then(|global| store.get_merged_symbol(global));
+    if Some(alias) != global
+        || store
+            .symbol(alias)
+            .is_none_or(|record| record.flags() != SymbolFlags::TYPE_ALIAS)
+    {
+        return Err(unsupported_interface());
+    }
+    Ok(JsxRecordHeritage { node, alias })
+}
+
+fn validate_record_intrinsic_base(
+    store: &CanonicalTypeMapperStore,
+    alias: SemanticSymbolId,
+    mapped: TypeId,
+    string_type: TypeId,
+    any_type: TypeId,
+    node: NodeRef,
+) -> Result<(), SourceCheckError> {
+    let record = store
+        .type_payload(mapped)
+        .ok_or(SourceCheckError::Property(node))?;
+    let identity = record
+        .alias()
+        .and_then(|identity| store.type_alias(identity))
+        .ok_or(SourceCheckError::Property(node))?;
+    if identity.symbol() != Some(alias)
+        || identity.type_arguments() != Some([string_type, any_type].as_slice())
+    {
+        return Err(SourceCheckError::Property(node));
+    }
+    let links = store
+        .type_alias_links(alias)
+        .ok_or(SourceCheckError::Property(node))?;
+    let declared = links
+        .declared_type
+        .ok_or(SourceCheckError::Property(node))?;
+    let parameters = links
+        .type_parameters
+        .as_deref()
+        .ok_or(SourceCheckError::Property(node))?;
+    store
+        .validate_record_mapped_alias_instantiation(
+            alias,
+            declared,
+            parameters,
+            &[string_type, any_type],
+            mapped,
+        )
+        .map_err(|_| SourceCheckError::Property(node))
 }
 
 fn jsx_namespace_property_name(
@@ -2136,10 +2494,22 @@ fn resolve_intrinsic_tag(
             validate_index_symbol(store, symbol, owner, declaration, value_type, opening)?;
             symbol
         } else {
-            let declaration =
-                declaration.ok_or_else(|| unsupported(opening, SyntaxKind::IndexSignature))?;
-            if !bound.contains(declaration)
-                || !store.try_reserve_checker_symbol_allocations(1, 0)
+            let declarations = if let Some(declaration) = declaration {
+                if !bound.contains(declaration) {
+                    return Err(SourceCheckError::Property(opening));
+                }
+                Some(vec![declaration])
+            } else {
+                validate_inherited_record_intrinsic_index(
+                    store,
+                    intrinsic_elements,
+                    index,
+                    owner,
+                    opening,
+                )?;
+                None
+            };
+            if !store.try_reserve_checker_symbol_allocations(1, 0)
                 || !store.try_reserve_value_symbol_links(1)
             {
                 return Err(SourceCheckError::Property(opening));
@@ -2149,8 +2519,8 @@ fn resolve_intrinsic_tag(
                     flags: SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT,
                     check_flags: CheckFlags::INDEX_SYMBOL,
                     name: EscapedName::internal(InternalSymbolName::Index),
-                    declarations: Some(vec![declaration]),
-                    value_declaration: Some(declaration),
+                    declarations,
+                    value_declaration: declaration,
                     members: None,
                     exports: None,
                     parent: owner,
@@ -2187,6 +2557,75 @@ fn resolve_intrinsic_tag(
         attributes_type: namespace.error_type,
         flags: JsxFlags::NONE,
     })
+}
+
+fn validate_inherited_record_intrinsic_index(
+    store: &CanonicalTypeMapperStore,
+    intrinsics: TypeId,
+    index: super::IndexInfoId,
+    owner: Option<SemanticSymbolId>,
+    location: NodeRef,
+) -> Result<(), SourceCheckError> {
+    let invalid = || unsupported(location, SyntaxKind::IndexSignature);
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(SourceCheckError::LiteralCache(
+            SourceLiteralCacheError::BootstrapUninitialized,
+        ))?;
+    let string_type = bootstrap.string_type;
+    let any_type = bootstrap.any_type;
+    let alias = store
+        .symbol_table(bootstrap.globals)
+        .and_then(|globals| globals.get_source("Record"))
+        .and_then(|alias| store.get_merged_symbol(alias))
+        .ok_or_else(invalid)?;
+    let record = store.type_payload(intrinsics).ok_or_else(invalid)?;
+    let super::TypeData::Interface(interface) = record.data() else {
+        return Err(invalid());
+    };
+    let [base] = interface.resolved_base_types.as_deref().unwrap_or_default() else {
+        return Err(invalid());
+    };
+    let [derived_index] = interface
+        .reference
+        .object
+        .structured
+        .index_infos
+        .as_deref()
+        .unwrap_or_default()
+    else {
+        return Err(invalid());
+    };
+    let mapped_index = store
+        .type_payload(*base)
+        .and_then(|record| record.data().structured())
+        .and_then(|structured| structured.index_infos.as_deref())
+        .and_then(|indexes| match indexes {
+            [index] => Some(*index),
+            _ => None,
+        })
+        .ok_or_else(invalid)?;
+    let derived = store.index_info(*derived_index).ok_or_else(invalid)?;
+    let original = store.index_info(mapped_index).ok_or_else(invalid)?;
+    if record.symbol() != owner
+        || !interface.base_types_resolved
+        || *derived_index != index
+        || *derived_index == mapped_index
+        || derived.key_type() != string_type
+        || derived.value_type() != any_type
+        || derived.is_readonly()
+        || derived.declaration().is_some()
+        || !derived.components().is_empty()
+        || original.key_type() != string_type
+        || original.value_type() != any_type
+        || original.is_readonly()
+        || original.declaration().is_some()
+        || original.index_symbol().is_some()
+        || !original.components().is_empty()
+    {
+        return Err(invalid());
+    }
+    validate_record_intrinsic_base(store, alias, *base, string_type, any_type, location)
 }
 
 fn validate_index_symbol(
@@ -4076,6 +4515,233 @@ mod runtime_tests {
         )
         .unwrap();
 
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep mapped, inherited, and JSX index identities together.
+    fn inherited_record_intrinsics_keep_the_mapped_index_unmodified() {
+        let mut fixture = RuntimeFixture::new(
+            concat!(
+                "type Record<K extends keyof any, T> = { [P in K]: T };\n",
+                "declare namespace JSX {\n",
+                "  interface IntrinsicElements extends Record<string, any> {}\n",
+                "}\n",
+                "const first = <a />;\n",
+                "const second = <b />;\n",
+            ),
+            FileId::new(8_136),
+        );
+        let globals = fixture.store.intrinsic_bootstrap().unwrap().globals;
+        let locals = fixture.bound.locals(fixture.bound.source_file()).unwrap();
+        for name in ["Record", "JSX"] {
+            let symbol = fixture
+                .store
+                .symbol_table(locals)
+                .and_then(|locals| locals.get_source(name))
+                .unwrap();
+            assert_eq!(
+                fixture
+                    .store
+                    .insert_symbol(globals, EscapedName::source(name), symbol),
+                Some(None),
+            );
+        }
+        let namespace = fixture
+            .store
+            .symbol_table(globals)
+            .and_then(|globals| globals.get_source("JSX"))
+            .unwrap();
+        let exports = fixture.store.symbol(namespace).unwrap().exports().unwrap();
+        let intrinsics = fixture
+            .store
+            .symbol_table(exports)
+            .and_then(|exports| exports.get_source("IntrinsicElements"))
+            .unwrap();
+        let first = fixture.expression("first");
+        let second = fixture.expression("second");
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&fixture.parsed.arena, &fixture.bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        fixture
+            .store
+            .check_jsx_element(
+                &host,
+                first,
+                CanonicalCheckerOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap();
+
+        let type_ = fixture
+            .store
+            .declared_type_links(intrinsics)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let super::super::TypeData::Interface(interface) =
+            fixture.store.type_payload(type_).unwrap().data()
+        else {
+            unreachable!("IntrinsicElements retains its declared interface")
+        };
+        assert!(interface.declared_index_infos.is_none());
+        let [base] = interface.resolved_base_types.as_deref().unwrap() else {
+            panic!("IntrinsicElements retains its authenticated Record base")
+        };
+        let [derived_index] = interface
+            .reference
+            .object
+            .structured
+            .index_infos
+            .as_deref()
+            .unwrap()
+        else {
+            panic!("IntrinsicElements exposes one inherited string index")
+        };
+        let derived_index = *derived_index;
+        let super::super::TypeData::Mapped(mapped) =
+            fixture.store.type_payload(*base).unwrap().data()
+        else {
+            unreachable!("the inherited base is an authenticated mapped Record")
+        };
+        let [mapped_index] = mapped.object.structured.index_infos.as_deref().unwrap() else {
+            panic!("Record<string, any> owns one string index")
+        };
+        let mapped_index = *mapped_index;
+        assert_ne!(derived_index, mapped_index);
+        let original = fixture.store.index_info(mapped_index).unwrap();
+        let inherited = fixture.store.index_info(derived_index).unwrap();
+        assert!(original.index_symbol().is_none());
+        let symbol = inherited.index_symbol().unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .jsx_element_links(first)
+                .map(|links| links.jsx_flags),
+            Some(JsxFlags::INTRINSIC_INDEXED_ELEMENT),
+        );
+
+        let cold = (
+            fixture.store.type_len(),
+            fixture.store.symbol_len(),
+            fixture.store.mapper_len(),
+            fixture.store.index_info_len(),
+        );
+        fixture
+            .store
+            .check_jsx_element(
+                &host,
+                first,
+                CanonicalCheckerOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap();
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.mapper_len(),
+                fixture.store.index_info_len(),
+            ),
+            cold,
+        );
+        fixture
+            .store
+            .check_jsx_element(
+                &host,
+                second,
+                CanonicalCheckerOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .index_info(derived_index)
+                .and_then(super::super::signatures::IndexInfo::index_symbol),
+            Some(symbol),
+        );
+        assert!(
+            fixture
+                .store
+                .index_info(mapped_index)
+                .unwrap()
+                .index_symbol()
+                .is_none()
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn record_intrinsics_reject_non_string_keys_before_publication() {
+        let mut fixture = RuntimeFixture::new(
+            concat!(
+                "type Record<K extends keyof any, T> = { [P in K]: T };\n",
+                "declare namespace JSX {\n",
+                "  interface IntrinsicElements extends Record<number, any> {}\n",
+                "}\n",
+                "const view = <a />;\n",
+            ),
+            FileId::new(8_137),
+        );
+        let globals = fixture.store.intrinsic_bootstrap().unwrap().globals;
+        let locals = fixture.bound.locals(fixture.bound.source_file()).unwrap();
+        for name in ["Record", "JSX"] {
+            let symbol = fixture
+                .store
+                .symbol_table(locals)
+                .and_then(|locals| locals.get_source(name))
+                .unwrap();
+            assert_eq!(
+                fixture
+                    .store
+                    .insert_symbol(globals, EscapedName::source(name), symbol),
+                Some(None),
+            );
+        }
+        let expression = fixture.expression("view");
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&fixture.parsed.arena, &fixture.bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.symbol_len(),
+            fixture.store.mapper_len(),
+            fixture.store.index_info_len(),
+        );
+
+        let error = fixture
+            .store
+            .check_jsx_element(
+                &host,
+                expression,
+                CanonicalCheckerOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SourceCheckError::Unsupported(UnsupportedSourceSyntax::Syntax {
+                kind: SyntaxKind::NumberKeyword,
+                ..
+            })
+        ));
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.mapper_len(),
+                fixture.store.index_info_len(),
+            ),
+            before,
+        );
         assert!(diagnostics.is_empty());
     }
 

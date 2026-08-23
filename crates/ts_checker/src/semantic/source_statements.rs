@@ -260,14 +260,18 @@ pub(super) struct SourceFunctionStatementsSyntax {
     pub(super) final_if: SourceFinalIfSyntax,
 }
 
-/// One declaration retained in its original linear function-body order.
+/// One supported statement retained in its original function-body order.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SourceLinearFunctionStatementSyntax {
     Local(SourceLocalDeclarationSyntax),
     Function(NodeRef),
+    Expression {
+        statement: NodeRef,
+        expression: NodeRef,
+    },
 }
 
-/// Ordered declarations with an optional final return statement.
+/// Ordered local statements with an optional final return statement.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SourceLinearFunctionStatementsSyntax {
     pub(super) body: NodeRef,
@@ -1694,6 +1698,14 @@ impl SyntaxPlanner<'_> {
                         self.plan_nested_function_statement(statement, body, declaration)?,
                     ));
                 }
+                SyntaxKind::ExpressionStatement => {
+                    let expression =
+                        self.plan_linear_expression_statement(statement, body, declaration)?;
+                    statements.push(SourceLinearFunctionStatementSyntax::Expression {
+                        statement,
+                        expression,
+                    });
+                }
                 SyntaxKind::ReturnStatement if index + 1 == body_statements.len() => {
                     return_expression = self.plan_linear_return(statement, body, declaration)?;
                     return_statement = Some(statement);
@@ -1857,6 +1869,179 @@ impl SyntaxPlanner<'_> {
         }
 
         Ok(statement)
+    }
+
+    fn plan_linear_expression_statement(
+        &self,
+        statement: NodeRef,
+        parent: NodeRef,
+        callable: NodeRef,
+    ) -> Result<NodeRef, SourceFunctionStatementsError> {
+        let record = self.node(statement)?;
+        let NodeData::ExpressionStatement(data) = &record.data else {
+            return Err(self.unsupported(
+                statement,
+                record.kind,
+                SourceFunctionStatementsRole::BodyStatement,
+            ));
+        };
+        if record.kind != SyntaxKind::ExpressionStatement
+            || record.flags.0 != 0
+            || record.parent != Some(parent.node)
+            || data.flow_node.is_some()
+        {
+            return Err(self.unsupported(
+                statement,
+                record.kind,
+                SourceFunctionStatementsRole::BodyStatement,
+            ));
+        }
+        self.validate_range(statement, parent)?;
+        self.validate_container(statement, callable)?;
+        self.validate_block_scope_container(statement, callable)?;
+
+        let expression = self.reference(data.expression);
+        let expression_record = self.node(expression)?;
+        self.validate_parent(
+            expression,
+            Some(statement.node),
+            SourceFunctionStatementsRole::BodyStatement,
+        )?;
+        self.validate_range(expression, statement)?;
+        self.validate_container(expression, callable)?;
+        self.validate_block_scope_container(expression, callable)?;
+        if expression_record.flags.0 != 0 {
+            return Err(self.unsupported(
+                expression,
+                expression_record.kind,
+                SourceFunctionStatementsRole::BodyStatement,
+            ));
+        }
+
+        match &expression_record.data {
+            NodeData::Identifier(identifier)
+                if expression_record.kind == SyntaxKind::Identifier
+                    && !identifier.text.is_empty()
+                    && identifier.flow_node.is_none() => {}
+            NodeData::CallExpression(call)
+                if expression_record.kind == SyntaxKind::CallExpression
+                    && call.question_dot_token.is_none()
+                    && call.symbol.is_none()
+                    && call.facts == 0 =>
+            {
+                let callee = self.reference(call.expression);
+                let callee_record = self.node(callee)?;
+                if !matches!(
+                    callee_record.kind,
+                    SyntaxKind::Identifier | SyntaxKind::PropertyAccessExpression
+                ) || callee_record.flags.0 != 0
+                {
+                    return Err(self.unsupported(
+                        callee,
+                        callee_record.kind,
+                        SourceFunctionStatementsRole::BodyStatement,
+                    ));
+                }
+                self.validate_parent(
+                    callee,
+                    Some(expression.node),
+                    SourceFunctionStatementsRole::BodyStatement,
+                )?;
+                self.validate_range(callee, expression)?;
+                self.validate_container(callee, callable)?;
+                self.validate_block_scope_container(callee, callable)?;
+            }
+            NodeData::BinaryExpression(binary)
+                if expression_record.kind == SyntaxKind::BinaryExpression
+                    && binary.symbol.is_none()
+                    && binary.type_.is_none()
+                    && binary.facts == 0
+                    && binary.modifiers.is_none() =>
+            {
+                self.validate_linear_assignment_expression(expression, callable)?;
+            }
+            _ => {
+                return Err(self.unsupported(
+                    expression,
+                    expression_record.kind,
+                    SourceFunctionStatementsRole::BodyStatement,
+                ));
+            }
+        }
+
+        let actual = self.bound.flow_container(statement);
+        if actual != Some(callable) {
+            return Err(SourceFunctionStatementsInvariant::InvalidFlowContainer {
+                node: statement,
+                expected: callable,
+                actual,
+            }
+            .into());
+        }
+        Ok(expression)
+    }
+
+    fn validate_linear_assignment_expression(
+        &self,
+        expression: NodeRef,
+        callable: NodeRef,
+    ) -> Result<(), SourceFunctionStatementsError> {
+        let record = self.node(expression)?;
+        let NodeData::BinaryExpression(binary) = &record.data else {
+            return Err(self.unsupported(
+                expression,
+                record.kind,
+                SourceFunctionStatementsRole::BodyStatement,
+            ));
+        };
+        let left = self.reference(binary.left);
+        let operator = self.reference(binary.operator_token);
+        let right = self.reference(binary.right);
+        for node in [left, operator, right] {
+            self.validate_parent(
+                node,
+                Some(expression.node),
+                SourceFunctionStatementsRole::BodyStatement,
+            )?;
+            self.validate_range(node, expression)?;
+            self.validate_container(node, callable)?;
+            self.validate_block_scope_container(node, callable)?;
+        }
+        self.validate_order(left, operator)?;
+        self.validate_order(operator, right)?;
+
+        let target = self.node(left)?;
+        let NodeData::Identifier(identifier) = &target.data else {
+            return Err(self.unsupported(
+                left,
+                target.kind,
+                SourceFunctionStatementsRole::BodyStatement,
+            ));
+        };
+        if target.kind != SyntaxKind::Identifier
+            || target.flags.0 != 0
+            || identifier.text.is_empty()
+            || identifier.flow_node.is_some()
+        {
+            return Err(self.unsupported(
+                left,
+                target.kind,
+                SourceFunctionStatementsRole::BodyStatement,
+            ));
+        }
+
+        let token = self.node(operator)?;
+        if token.kind != SyntaxKind::EqualsToken
+            || token.flags.0 != 0
+            || !matches!(token.data, NodeData::Token(_))
+        {
+            return Err(self.unsupported(
+                operator,
+                token.kind,
+                SourceFunctionStatementsRole::BodyStatement,
+            ));
+        }
+        Ok(())
     }
 
     fn plan_linear_return(
@@ -2175,11 +2360,23 @@ impl SyntaxPlanner<'_> {
         for &statement_id in &block.statements.nodes {
             let statement = self.reference(statement_id);
             if directive_prologue && self.node(statement)?.kind == SyntaxKind::ExpressionStatement {
-                self.validate_directive_statement(statement, body, declaration)?;
-            } else {
-                directive_prologue = false;
-                statements.push(statement_id);
+                let NodeData::ExpressionStatement(expression_statement) =
+                    &self.node(statement)?.data
+                else {
+                    return Err(self.unsupported(
+                        statement,
+                        SyntaxKind::ExpressionStatement,
+                        SourceFunctionStatementsRole::BodyStatement,
+                    ));
+                };
+                let expression = self.reference(expression_statement.expression);
+                if self.node(expression)?.kind == SyntaxKind::StringLiteral {
+                    self.validate_directive_statement(statement, body, declaration)?;
+                    continue;
+                }
             }
+            directive_prologue = false;
+            statements.push(statement_id);
         }
         Ok(statements)
     }
@@ -3907,6 +4104,104 @@ mod joined_tests {
         {
             let fixture =
                 JoinedFixture::new(source, FileId::new(1_280 + u32::try_from(index).unwrap()));
+            assert!(matches!(
+                fixture.linear_plan(),
+                Err(SourceFunctionStatementsError::Unsupported(_)),
+            ));
+        }
+    }
+
+    #[test]
+    fn linear_body_retains_identifier_assignment_and_call_statements_in_source_order() {
+        let fixture = JoinedFixture::new(
+            concat!(
+                "function effects(value: number): void {\n",
+                "  \"use strict\";\n",
+                "  value;\n",
+                "  const saved = value;\n",
+                "  value = 1;\n",
+                "  consume(saved);\n",
+                "}\n",
+            ),
+            FileId::new(1_290),
+        );
+        let syntax = fixture.linear_plan().unwrap();
+        assert_eq!(syntax.locals.len(), 1);
+        let [
+            SourceLinearFunctionStatementSyntax::Expression {
+                statement: read_statement,
+                expression: read,
+            },
+            SourceLinearFunctionStatementSyntax::Local(saved),
+            SourceLinearFunctionStatementSyntax::Expression {
+                statement: assignment_statement,
+                expression: assignment,
+            },
+            SourceLinearFunctionStatementSyntax::Expression {
+                statement: call_statement,
+                expression: call,
+            },
+        ] = syntax.statements.as_slice()
+        else {
+            panic!("expected read, local, assignment, and call in source order")
+        };
+        assert_eq!(*saved, syntax.locals[0]);
+        assert_eq!(
+            fixture.parsed.arena.get(read.node).unwrap().kind,
+            SyntaxKind::Identifier,
+        );
+        assert_eq!(
+            fixture.parsed.arena.get(assignment.node).unwrap().kind,
+            SyntaxKind::BinaryExpression,
+        );
+        assert_eq!(
+            fixture.parsed.arena.get(call.node).unwrap().kind,
+            SyntaxKind::CallExpression,
+        );
+        for statement in [*read_statement, *assignment_statement, *call_statement] {
+            assert_eq!(
+                fixture.bound.flow_container(statement),
+                Some(fixture.declaration()),
+            );
+        }
+    }
+
+    #[test]
+    fn linear_body_accepts_a_leading_call_after_a_real_directive_prologue() {
+        for (index, source) in [
+            "function invoke(): void { consume(); }",
+            "function invoke(): void { \"use strict\"; consume(); }",
+            "function invoke(): void { object.consume(); }",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture =
+                JoinedFixture::new(source, FileId::new(1_291 + u32::try_from(index).unwrap()));
+            let syntax = fixture.linear_plan().unwrap();
+            assert!(syntax.locals.is_empty());
+            assert!(matches!(
+                syntax.statements.as_slice(),
+                [SourceLinearFunctionStatementSyntax::Expression { .. }],
+            ));
+        }
+    }
+
+    #[test]
+    fn linear_body_rejects_unsupported_expression_targets_and_loop_statements() {
+        for (index, source) in [
+            "function invalid(value: number): void { value += 1; }",
+            "function invalid(value: number): void { value.property = 1; }",
+            "function invalid(value: number): void { value.property; }",
+            "function invalid(value: number): void { consume?.(value); }",
+            "function invalid(value: number): void { while (value) { value; } }",
+            "function invalid(value: number): void { { value; } }",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture =
+                JoinedFixture::new(source, FileId::new(1_300 + u32::try_from(index).unwrap()));
             assert!(matches!(
                 fixture.linear_plan(),
                 Err(SourceFunctionStatementsError::Unsupported(_)),

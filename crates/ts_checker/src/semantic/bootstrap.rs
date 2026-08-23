@@ -2358,6 +2358,125 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         result
     }
 
+    fn validate_supported_record_mapped_union_constituent(
+        &self,
+        type_: TypeId,
+        record: &TypeRecord,
+        mapped: &super::type_records::MappedTypeData,
+        array_validation: UnionArrayValidation<'_>,
+        visiting: &mut HashSet<TypeId>,
+        allowed_pending: &HashSet<TypeId>,
+    ) -> Result<(), LiteralTypeCacheError> {
+        let invalid = || LiteralTypeCacheError::InvalidCachedUnion(type_);
+        let unsupported = || LiteralTypeCacheError::UnsupportedUnionConstituent(type_);
+        if !record
+            .object_flags()
+            .contains(ObjectFlags::INSTANTIATED_MAPPED)
+        {
+            return Err(unsupported());
+        }
+
+        let identity = record
+            .alias()
+            .and_then(|identity| self.type_alias(identity))
+            .ok_or_else(invalid)?;
+        let alias = identity.symbol().ok_or_else(invalid)?;
+        let alias_record = self.symbol(alias).ok_or_else(invalid)?;
+        if alias_record.name().as_utf8() != Some("Record") {
+            return Err(unsupported());
+        }
+        let Some([key, value]) = identity.type_arguments() else {
+            return Err(invalid());
+        };
+        let bootstrap = self.intrinsic_bootstrap.as_ref().ok_or_else(invalid)?;
+        if *key != bootstrap.string_type {
+            return Err(unsupported());
+        }
+
+        let target = mapped.object.target.ok_or_else(invalid)?;
+        let links = self.type_alias_links(alias).ok_or_else(invalid)?;
+        let parameters = links.type_parameters.as_deref().ok_or_else(invalid)?;
+        if links.declared_type != Some(target)
+            || links.instantiations.as_ref().is_none_or(|instantiations| {
+                !instantiations.values().any(|cached| *cached == type_)
+            })
+            || self
+                .validate_record_mapped_alias_instantiation(
+                    alias,
+                    target,
+                    parameters,
+                    &[*key, *value],
+                    type_,
+                )
+                .is_err()
+        {
+            return Err(invalid());
+        }
+
+        let (projection, edges) = match validate_stored_callable_set(self, *value) {
+            StoredCallableSetValidation::Valid {
+                family: CallableFamily::FunctionType,
+                projection,
+                edges,
+            } => (projection, edges),
+            StoredCallableSetValidation::Pending {
+                family: CallableFamily::FunctionType,
+            } if allowed_pending.contains(value) => {
+                if !visiting.insert(type_) {
+                    return Err(invalid());
+                }
+                let result = self
+                    .validate_union_constituent_worker(
+                        *key,
+                        array_validation,
+                        visiting,
+                        allowed_pending,
+                    )
+                    .and_then(|()| {
+                        self.validate_union_constituent_worker(
+                            *value,
+                            array_validation,
+                            visiting,
+                            allowed_pending,
+                        )
+                    });
+                visiting.remove(&type_);
+                return result;
+            }
+            StoredCallableSetValidation::Valid { .. }
+            | StoredCallableSetValidation::NotCallable => return Err(unsupported()),
+            StoredCallableSetValidation::Malformed { .. }
+            | StoredCallableSetValidation::Pending { .. } => return Err(invalid()),
+        };
+        let [callable] = projection.call_signatures.as_ref() else {
+            return Err(invalid());
+        };
+        if !projection.construct_signatures.is_empty()
+            || callable.parameters.as_slice() != [bootstrap.string_type]
+            || callable.rest_parameter.is_some()
+            || callable.min_argument_count != 1
+            || callable
+                .return_type
+                .is_some_and(|return_type| return_type != bootstrap.void_type)
+        {
+            return Err(unsupported());
+        }
+
+        if !visiting.insert(type_) {
+            return Err(invalid());
+        }
+        let result = std::iter::once(*key).chain(edges).try_for_each(|nested| {
+            self.validate_union_constituent_worker(
+                nested,
+                array_validation,
+                visiting,
+                allowed_pending,
+            )
+        });
+        visiting.remove(&type_);
+        result
+    }
+
     fn validate_union_constituent_worker(
         &self,
         type_: TypeId,
@@ -2632,6 +2751,14 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             }
             TypeData::TypeReference(_) => self.validate_supported_canonical_array(
                 type_,
+                array_validation,
+                visiting,
+                allowed_pending,
+            ),
+            TypeData::Mapped(mapped) => self.validate_supported_record_mapped_union_constituent(
+                type_,
+                record,
+                mapped,
                 array_validation,
                 visiting,
                 allowed_pending,
@@ -6429,6 +6556,147 @@ mod tests {
         assert_eq!(
             store.validate_union_constituent(forged),
             Err(LiteralTypeCacheError::UnsupportedUnionConstituent(forged)),
+        );
+    }
+
+    #[test]
+    fn record_callback_union_constituents_validate_pending_and_warm_caches() {
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {}\n",
+            "type Record<K extends keyof any, T> = { [P in K]: T };\n",
+            "declare function accept(value: ",
+            "Record<string, (value: string) => void> | ",
+            "Array<(value: number) => void>): void;\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(146);
+        let mut context = checker_context(file, &parsed);
+        context.check_source_file(file).unwrap();
+
+        let union_node = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::UnionType).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .expect("the callable parameter has one union annotation");
+        let union = context
+            .store()
+            .type_node_links(union_node)
+            .and_then(|links| links.resolved_type)
+            .expect("the callable parameter union was checked");
+        let mapped = union_types(context.store(), union)
+            .iter()
+            .copied()
+            .find(|type_| {
+                matches!(
+                    context.store().type_payload(*type_).map(TypeRecord::data),
+                    Some(TypeData::Mapped(_))
+                )
+            })
+            .expect("the union retains its Record constituent");
+        let targets = CanonicalArrayTargets::from_global_types(context.global_types());
+        assert_eq!(
+            context
+                .store()
+                .validate_union_constituent_with_array_targets(targets, union),
+            Ok(()),
+        );
+
+        let warm = (
+            context.store().type_len(),
+            context.store().mapper_len(),
+            context.store().signature_len(),
+            context
+                .store()
+                .intrinsic_bootstrap()
+                .unwrap()
+                .union_cache_len(),
+        );
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().mapper_len(),
+                context.store().signature_len(),
+                context
+                    .store()
+                    .intrinsic_bootstrap()
+                    .unwrap()
+                    .union_cache_len(),
+            ),
+            warm,
+        );
+
+        let store = context.store_mut_for_test();
+        let (alias, parameter) = {
+            let mapped_record = record(store, mapped);
+            let TypeData::Mapped(data) = mapped_record.data() else {
+                unreachable!("mapped constituent was identified above")
+            };
+            (
+                store
+                    .type_alias(mapped_record.alias().unwrap())
+                    .unwrap()
+                    .symbol()
+                    .unwrap(),
+                data.type_parameter.unwrap(),
+            )
+        };
+        let (constraint, target, instantiation_mapper, default_type) = {
+            let TypeData::TypeParameter(data) = record(store, parameter).data() else {
+                unreachable!("Record instantiation retains a cloned type parameter")
+            };
+            (
+                data.constraint,
+                data.target,
+                data.mapper,
+                data.resolved_default_type,
+            )
+        };
+        assert!(store.set_type_parameter_resolution(
+            parameter,
+            constraint,
+            target,
+            None,
+            default_type,
+        ));
+        assert_eq!(
+            store.validate_union_constituent_with_array_targets(targets, mapped),
+            Err(LiteralTypeCacheError::InvalidCachedUnion(mapped)),
+        );
+        assert!(store.set_type_parameter_resolution(
+            parameter,
+            constraint,
+            target,
+            instantiation_mapper,
+            default_type,
+        ));
+        assert_eq!(
+            store.validate_union_constituent_with_array_targets(targets, mapped),
+            Ok(()),
+        );
+
+        let original_links = store.type_alias_links(alias).unwrap().clone();
+        let mut poisoned_links = original_links.clone();
+        poisoned_links
+            .instantiations
+            .as_mut()
+            .unwrap()
+            .retain(|_, cached| *cached != mapped);
+        assert!(store.set_type_alias_links(alias, poisoned_links));
+        assert_eq!(
+            store.validate_union_constituent_with_array_targets(targets, mapped),
+            Err(LiteralTypeCacheError::InvalidCachedUnion(mapped)),
+        );
+        assert!(store.set_type_alias_links(alias, original_links));
+        assert_eq!(
+            store.validate_union_constituent_with_array_targets(targets, mapped),
+            Ok(()),
         );
     }
 

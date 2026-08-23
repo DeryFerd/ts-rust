@@ -1,20 +1,21 @@
 //! Structured-member publication for direct, nongeneric interface bases.
 //!
-//! One or two property-only bases preserve declaration and source-base order.
-//! Shared base properties must have identical types and modifiers. Compatible
-//! derived properties replace inherited properties; incompatible overrides
-//! remain an explicit unsupported boundary until TS2430 is ported.
+//! One or two direct bases preserve declaration and source-base order. A
+//! single base can also provide its authenticated declared index signatures.
+//! Shared base properties or methods must have identical types and modifiers.
+//! Compatible derived members replace inherited members; incompatible
+//! overrides remain unsupported until TS2430 is ported.
 
 use std::collections::{HashMap, HashSet};
 
 use ts_ast::{NodeRef, SyntaxKind};
 use ts_binder::{
-    CheckFlags, EscapedName, SemanticSymbolId, SymbolFlags, SymbolTableId,
+    CheckFlags, EscapedName, InternalSymbolName, SemanticSymbolId, SymbolFlags, SymbolTableId,
     semantic::PreparedSymbolTable,
 };
 
 use super::{
-    CanonicalTypeMapperStore, TypeId,
+    CanonicalTypeMapperStore, IndexInfoId, TypeId,
     links::ValueSymbolLinks,
     object_members::{
         DirectInterfaceDeclaredState, PropertyObjectError, PropertyObjectKind, PropertyObjectPlan,
@@ -37,6 +38,13 @@ struct ValidatedInterfaceSurface {
     owner: SemanticSymbolId,
     declared_properties: Vec<SemanticSymbolId>,
     properties: Vec<SemanticSymbolId>,
+    index_infos: Vec<IndexInfoId>,
+}
+
+struct ValidatedDeclaredMembers {
+    properties: Vec<SemanticSymbolId>,
+    index_symbol: Option<SemanticSymbolId>,
+    index_infos: Vec<IndexInfoId>,
 }
 
 fn invalid(plan: &PropertyObjectPlan, type_: TypeId) -> PropertyObjectError {
@@ -82,7 +90,8 @@ fn matching_inherited_property_contract(
 /// Resolves and publishes one or two direct interface bases.
 ///
 /// `base_types` must match the canonical symbols retained by the syntax plan.
-/// Each base must be a fully resolved, nongeneric, property-only interface.
+/// Each base must be a fully resolved, nongeneric interface. One direct base
+/// may also provide authenticated index signatures.
 /// All allocations and sparse-link slots are staged before semantic mutation.
 pub(super) fn resolve_direct_interface_members(
     store: &mut CanonicalTypeMapperStore,
@@ -135,10 +144,6 @@ pub(super) fn resolve_direct_interface_members(
                     .signatures
                     .as_ref()
                     .is_some_and(|set| !set.is_empty())
-                || structured
-                    .index_infos
-                    .as_ref()
-                    .is_some_and(|set| !set.is_empty())
         }) {
             return Err(PropertyObjectError::UnsupportedMember {
                 node: planned.node,
@@ -161,7 +166,40 @@ pub(super) fn resolve_direct_interface_members(
         if surface.owner != planned.symbol {
             return Err(invalid(plan, type_));
         }
+        if second_base.is_some() && !surface.index_infos.is_empty() {
+            return Err(PropertyObjectError::UnsupportedMember {
+                node: planned.node,
+                kind: SyntaxKind::ExpressionWithTypeArguments,
+            });
+        }
         base_surfaces.push(surface);
+    }
+
+    let inherited_index_infos = base_surfaces
+        .first()
+        .filter(|_| second_base.is_none())
+        .map(|surface| surface.index_infos.as_slice())
+        .unwrap_or_default();
+    if !plan.properties.is_empty()
+        && inherited_index_infos.iter().any(|index| {
+            let Some(info) = store.index_info(*index) else {
+                return true;
+            };
+            let Some(bootstrap) = store.intrinsic_bootstrap() else {
+                return true;
+            };
+            info.key_type() != bootstrap.string_type
+                || plan
+                    .properties
+                    .iter()
+                    .zip(property_types)
+                    .any(|(property, type_)| property.optional || *type_ != info.value_type())
+        })
+    {
+        return Err(PropertyObjectError::UnsupportedMember {
+            node: plan.node,
+            kind: SyntaxKind::InterfaceDeclaration,
+        });
     }
 
     let declared_state =
@@ -267,6 +305,8 @@ pub(super) fn resolve_direct_interface_members(
             || !validate_planned_interface_heritage_members(store, plan, type_)
             || interface.reference.object.structured.properties.as_deref()
                 != (!expected_properties.is_empty()).then_some(expected_properties.as_slice())
+            || interface.reference.object.structured.index_infos.as_deref()
+                != (!inherited_index_infos.is_empty()).then_some(inherited_index_infos)
             || !exact_member_table(
                 store,
                 &expected_entries,
@@ -283,6 +323,11 @@ pub(super) fn resolve_direct_interface_members(
         .try_reserve_exact(base_types.len())
         .map_err(|_| capacity(plan))?;
     staged_base_types.extend_from_slice(base_types);
+    let mut staged_index_infos = Vec::new();
+    staged_index_infos
+        .try_reserve_exact(inherited_index_infos.len())
+        .map_err(|_| capacity(plan))?;
+    staged_index_infos.extend_from_slice(inherited_index_infos);
     let prepared_members = if expected_entries.is_empty() {
         None
     } else {
@@ -333,7 +378,7 @@ pub(super) fn resolve_direct_interface_members(
         (!expected_properties.is_empty()).then_some(expected_properties),
         None,
         None,
-        None,
+        (!staged_index_infos.is_empty()).then_some(staged_index_infos),
     ));
     Ok(type_)
 }
@@ -518,7 +563,6 @@ fn validate_property_interface_worker(
         || interface.resolved_base_constructor_type.is_some()
         || interface.declared_call_signatures.is_some()
         || interface.declared_construct_signatures.is_some()
-        || interface.declared_index_infos.is_some()
     {
         return None;
     }
@@ -526,7 +570,6 @@ fn validate_property_interface_worker(
     if structured.constrained != ConstrainedTypeData::default()
         || structured.call_signature_count != 0
         || structured.signatures.is_some()
-        || structured.index_infos.is_some()
         || structured
             .object_type_without_abstract_construct_signatures
             .is_some()
@@ -534,8 +577,16 @@ fn validate_property_interface_worker(
         return None;
     }
 
-    let declared_properties =
-        declared_properties(store, owner, owner_declarations, interface.declared_members)?;
+    let declared = declared_members(
+        store,
+        owner,
+        owner_declarations,
+        interface.declared_members,
+        interface.declared_index_infos.as_deref(),
+    )?;
+    if requires_direct_base && !declared.index_infos.is_empty() {
+        return None;
+    }
     let base_types = match (
         requires_direct_base,
         interface.resolved_base_types.as_deref(),
@@ -561,6 +612,7 @@ fn validate_property_interface_worker(
         _ => return None,
     };
     let mut base_properties = Vec::new();
+    let mut inherited_index_infos = Vec::new();
     let mut inherited_by_name = HashMap::new();
     for (index, base_type) in base_types.iter().copied().enumerate() {
         let inherited_base = store
@@ -575,9 +627,10 @@ fn validate_property_interface_worker(
         } else {
             heritage_provenance.second_base?.0
         };
-        if base.owner != expected_owner {
+        if base.owner != expected_owner || base_types.len() == 2 && !base.index_infos.is_empty() {
             return None;
         }
+        inherited_index_infos.extend_from_slice(&base.index_infos);
         for property in base.properties {
             let name = store.symbol(property)?.name().to_owned();
             if let Some(previous) = inherited_by_name.get(&name).copied() {
@@ -591,12 +644,13 @@ fn validate_property_interface_worker(
         }
     }
 
-    let total = declared_properties
+    let total = declared
+        .properties
         .len()
         .checked_add(base_properties.len())?;
     let mut expected = Vec::with_capacity(total);
     let mut seen_names = HashSet::with_capacity(total);
-    for property in &declared_properties {
+    for property in &declared.properties {
         let record = store.symbol(*property)?;
         if !seen_names.insert(record.name().to_owned()) {
             return None;
@@ -609,30 +663,74 @@ fn validate_property_interface_worker(
             expected.push(*property);
         }
     }
+    if !declared.properties.is_empty()
+        && inherited_index_infos.iter().any(|index| {
+            let Some(info) = store.index_info(*index) else {
+                return true;
+            };
+            let Some(bootstrap) = store.intrinsic_bootstrap() else {
+                return true;
+            };
+            info.key_type() != bootstrap.string_type
+                || declared.properties.iter().any(|property| {
+                    store
+                        .symbol(*property)
+                        .is_none_or(|record| record.flags().contains(SymbolFlags::OPTIONAL))
+                        || store
+                            .value_symbol_links(*property)
+                            .and_then(|links| links.resolved_type)
+                            != Some(info.value_type())
+                })
+        })
+    {
+        return None;
+    }
+    let expected_index_infos = if requires_direct_base {
+        inherited_index_infos
+    } else {
+        declared.index_infos
+    };
     let actual = structured.properties.as_deref().unwrap_or_default();
     if actual.is_empty() != structured.properties.is_none()
         || actual != expected.as_slice()
-        || !exact_property_table(store, &expected, structured.members)
+        || structured.index_infos.as_deref()
+            != (!expected_index_infos.is_empty()).then_some(expected_index_infos.as_slice())
+        || !exact_property_table(
+            store,
+            &expected,
+            structured.members,
+            if requires_direct_base {
+                None
+            } else {
+                declared.index_symbol
+            },
+        )
     {
         return None;
     }
     let result = ValidatedInterfaceSurface {
         owner,
-        declared_properties,
+        declared_properties: declared.properties,
         properties: expected,
+        index_infos: expected_index_infos,
     };
     assert!(active.remove(&type_));
     Some(result)
 }
 
-fn declared_properties(
+fn declared_members(
     store: &CanonicalTypeMapperStore,
     owner: SemanticSymbolId,
     owner_declarations: &[NodeRef],
     members: Option<SymbolTableId>,
-) -> Option<Vec<SemanticSymbolId>> {
+    indexes: Option<&[IndexInfoId]>,
+) -> Option<ValidatedDeclaredMembers> {
     let Some(members) = members else {
-        return Some(Vec::new());
+        return indexes.is_none().then_some(ValidatedDeclaredMembers {
+            properties: Vec::new(),
+            index_symbol: None,
+            index_infos: Vec::new(),
+        });
     };
     let table = store.symbol_table(members)?;
     if table.is_empty() {
@@ -640,6 +738,7 @@ fn declared_properties(
     }
     let mut properties = Vec::with_capacity(table.len());
     let mut seen_declarations = HashSet::with_capacity(table.len());
+    let mut index_symbol = None;
     for (name, property) in table.iter() {
         let record = store.symbol(property)?;
         let declarations = record
@@ -665,10 +764,19 @@ fn declared_properties(
             }
         }
         let (owner_index, declaration) = earliest?;
-        if record.name() != name
-            || store.get_parent_of_symbol(property) != Some(owner)
-            || !valid_property_symbol(store, property)
-        {
+        if record.name() != name || store.get_parent_of_symbol(property) != Some(owner) {
+            return None;
+        }
+        if name == InternalSymbolName::Index.as_ref() {
+            if index_symbol.is_some()
+                || !valid_index_symbol(store, owner, owner_declarations, property, indexes?)
+            {
+                return None;
+            }
+            index_symbol = Some(property);
+            continue;
+        }
+        if !valid_property_symbol(store, property) {
             return None;
         }
         properties.push((owner_index, declaration, property));
@@ -680,12 +788,83 @@ fn declared_properties(
     {
         return None;
     }
-    Some(
-        properties
+    if index_symbol.is_some() != indexes.is_some() || indexes.is_some_and(<[IndexInfoId]>::is_empty)
+    {
+        return None;
+    }
+    Some(ValidatedDeclaredMembers {
+        properties: properties
             .into_iter()
             .map(|(_, _, property)| property)
             .collect(),
-    )
+        index_symbol,
+        index_infos: indexes.unwrap_or_default().to_vec(),
+    })
+}
+
+fn valid_index_symbol(
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+    owner_declarations: &[NodeRef],
+    symbol: SemanticSymbolId,
+    indexes: &[IndexInfoId],
+) -> bool {
+    let Some(record) = store.symbol(symbol) else {
+        return false;
+    };
+    let Some(declarations) = record
+        .declarations()
+        .filter(|declarations| !declarations.is_empty())
+    else {
+        return false;
+    };
+    let Some(bootstrap) = store.intrinsic_bootstrap() else {
+        return false;
+    };
+    if record.flags() != SymbolFlags::SIGNATURE
+        || record.check_flags() != CheckFlags::NONE
+        || record.name() != InternalSymbolName::Index.as_ref()
+        || record.value_declaration().is_some()
+        || record.members().is_some()
+        || record.exports().is_some()
+        || record.parent() != Some(owner)
+        || record.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || declarations.len() != indexes.len()
+    {
+        return false;
+    }
+    let mut seen_indexes = HashSet::with_capacity(indexes.len());
+    let mut seen_keys = HashSet::with_capacity(indexes.len());
+    indexes
+        .iter()
+        .zip(declarations)
+        .all(|(index, declaration)| {
+            let Some(info) = store.index_info(*index) else {
+                return false;
+            };
+            let Some(SourceNodeParent::Parent(parent)) = store.source_node_parent(*declaration)
+            else {
+                return false;
+            };
+            let key = info.key_type();
+            let valid_key = key == bootstrap.string_type
+                || key == bootstrap.number_type
+                || key == bootstrap.es_symbol_type
+                || store
+                    .type_payload(key)
+                    .is_some_and(|record| record.flags() == TypeFlags::TEMPLATE_LITERAL);
+            seen_indexes.insert(*index)
+                && seen_keys.insert(key)
+                && owner_declarations.contains(&parent)
+                && declaration.is_for(parent.arena, parent.file)
+                && store.source_node_kind(*declaration) == Some(SyntaxKind::IndexSignature)
+                && valid_key
+                && store.type_payload(info.value_type()).is_some()
+                && info.declaration() == Some(*declaration)
+                && info.index_symbol().is_none()
+                && info.components().is_empty()
+        })
 }
 
 fn valid_property_symbol(store: &CanonicalTypeMapperStore, property: SemanticSymbolId) -> bool {
@@ -698,14 +877,22 @@ fn valid_property_symbol(store: &CanonicalTypeMapperStore, property: SemanticSym
     else {
         return false;
     };
-    let expected_flags = SymbolFlags::PROPERTY
-        | if record.flags().contains(SymbolFlags::OPTIONAL) {
-            SymbolFlags::OPTIONAL
-        } else {
-            SymbolFlags::NONE
-        };
+    let method = record.flags().contains(SymbolFlags::METHOD);
+    let expected_flags = if method {
+        SymbolFlags::METHOD
+    } else {
+        SymbolFlags::PROPERTY
+    } | if record.flags().contains(SymbolFlags::OPTIONAL) {
+        SymbolFlags::OPTIONAL
+    } else {
+        SymbolFlags::NONE
+    };
     record.flags() == expected_flags
-        && record.check_flags().bits() & !CheckFlags::READONLY.bits() == 0
+        && if method {
+            record.check_flags() == CheckFlags::NONE
+        } else {
+            record.check_flags().bits() & !CheckFlags::READONLY.bits() == 0
+        }
         && record
             .value_declaration()
             .is_some_and(|declaration| declarations.contains(&declaration))
@@ -715,10 +902,14 @@ fn valid_property_symbol(store: &CanonicalTypeMapperStore, property: SemanticSym
         && record.export_symbol().is_none()
         && store.get_merged_symbol(property) == Some(property)
         && declarations.iter().all(|declaration| {
-            matches!(
-                store.source_node_kind(*declaration),
-                Some(SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature)
-            )
+            if method {
+                store.source_node_kind(*declaration) == Some(SyntaxKind::MethodSignature)
+            } else {
+                matches!(
+                    store.source_node_kind(*declaration),
+                    Some(SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature)
+                )
+            }
         })
         && store.value_symbol_links(property).is_some_and(|links| {
             let Some(type_) = links.resolved_type else {
@@ -737,22 +928,27 @@ fn exact_property_table(
     store: &CanonicalTypeMapperStore,
     properties: &[SemanticSymbolId],
     members: Option<SymbolTableId>,
+    index_symbol: Option<SemanticSymbolId>,
 ) -> bool {
-    if properties.is_empty() {
+    if properties.is_empty() && index_symbol.is_none() {
         return members.is_none();
     }
     let Some(table) = members.and_then(|members| store.symbol_table(members)) else {
         return false;
     };
-    table.len() == properties.len()
+    table.len()
+        == properties
+            .len()
+            .saturating_add(usize::from(index_symbol.is_some()))
         && properties.iter().all(|property| {
             store
                 .symbol(*property)
                 .is_some_and(|record| table.get(record.name()) == Some(*property))
         })
+        && table.get(InternalSymbolName::Index.as_ref()) == index_symbol
         && table
             .iter()
-            .all(|(_, property)| properties.contains(&property))
+            .all(|(_, property)| properties.contains(&property) || index_symbol == Some(property))
 }
 
 fn exact_member_table(
@@ -804,7 +1000,8 @@ mod tests {
         DeclaredTypeHost,
         bootstrap::IntrinsicBootstrapOptions,
         declared::get_declared_class_interface_or_type_parameter,
-        object_members::{self, PropertyObjectState},
+        interface_heritage::plan_direct_interface_heritage,
+        object_members::{self, PlannedProperty, PropertyObjectState},
         production::GlobalMergeCompletion,
         relater::RelationUnavailable,
         relation::{IntersectionState, RelationComparisonResult, RelationKind},
@@ -812,6 +1009,12 @@ mod tests {
 
     const SOURCE: &str = concat!(
         "interface Base { first: number; second: number }\n",
+        "interface Other { other: number }\n",
+        "interface Derived extends Base { own: number }\n",
+    );
+
+    const INDEXED_SOURCE: &str = concat!(
+        "interface Base { [key: string]: number; first: number; second: number }\n",
         "interface Other { other: number }\n",
         "interface Derived extends Base { own: number }\n",
     );
@@ -833,9 +1036,13 @@ mod tests {
     }
 
     fn fixture() -> Fixture {
-        let parsed = parse_source_file(SOURCE);
+        fixture_with_source(SOURCE, 801)
+    }
+
+    fn fixture_with_source(source: &str, file: u32) -> Fixture {
+        let parsed = parse_source_file(source);
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
-        let file = FileId::new(801);
+        let file = FileId::new(file);
         let mut binder = CanonicalBinder::new();
         binder
             .bind_source_file_with_facts(
@@ -922,7 +1129,102 @@ mod tests {
     }
 
     fn prepare() -> PreparedFixture {
-        let mut fixture = fixture();
+        prepare_fixture(fixture())
+    }
+
+    fn prepare_indexed() -> PreparedFixture {
+        prepare_fixture(fixture_with_source(INDEXED_SOURCE, 802))
+    }
+
+    fn indexed_derived_plan(
+        fixture: &Fixture,
+        host: &DeclaredTypeHost<'_>,
+        symbol: SemanticSymbolId,
+        template: &PropertyObjectPlan,
+    ) -> PropertyObjectPlan {
+        let owner = fixture.store.symbol(symbol).unwrap();
+        let [declaration] = owner.declarations().unwrap() else {
+            panic!("the indexed inheritance fixture has one derived declaration")
+        };
+        let declaration = *declaration;
+        let NodeData::InterfaceDeclaration(interface) =
+            &fixture.parsed.arena.get(declaration.node).unwrap().data
+        else {
+            panic!("the derived symbol must retain its interface declaration")
+        };
+        let [property_node] = interface.members.nodes.as_slice() else {
+            panic!("the derived interface has one source property")
+        };
+        let property_declaration =
+            NodeRef::new(declaration.arena, declaration.file, *property_node);
+        let (property_name, property_type, postfix_token, modifiers) = match &fixture
+            .parsed
+            .arena
+            .get(property_declaration.node)
+            .unwrap()
+            .data
+        {
+            NodeData::PropertyDeclaration(property) => (
+                property.name,
+                property
+                    .type_
+                    .expect("the derived source property has a type annotation"),
+                property.postfix_token,
+                property.modifiers.as_ref(),
+            ),
+            NodeData::PropertySignatureDeclaration(property) => (
+                property.name,
+                property.type_,
+                property.postfix_token,
+                property.modifiers.as_ref(),
+            ),
+            _ => panic!("the derived source member must be an interface property"),
+        };
+        assert!(postfix_token.is_none());
+        assert!(modifiers.is_none());
+        let name_node = NodeRef::new(declaration.arena, declaration.file, property_name);
+        let NodeData::Identifier(name) = &fixture.parsed.arena.get(name_node.node).unwrap().data
+        else {
+            panic!("the derived source property has an identifier name")
+        };
+        let bound = fixture.files.get(&fixture.file).unwrap();
+        let property_symbol = bound.symbol(property_declaration).unwrap();
+        assert_eq!(
+            fixture.store.get_merged_symbol(property_symbol),
+            Some(property_symbol)
+        );
+        let heritage = plan_direct_interface_heritage(
+            &fixture.store,
+            host,
+            declaration,
+            symbol,
+            interface.heritage_clauses.as_ref().unwrap(),
+        )
+        .unwrap();
+
+        let mut plan = template.clone();
+        plan.node = declaration;
+        plan.declarations = vec![declaration];
+        plan.symbol = symbol;
+        plan.members = owner.members();
+        plan.properties = vec![PlannedProperty {
+            declaration: property_declaration,
+            symbol: property_symbol,
+            name_node,
+            type_node: NodeRef::new(declaration.arena, declaration.file, property_type),
+            optional: false,
+            readonly: false,
+            name: name.text.clone(),
+        }];
+        plan.spreads.clear();
+        plan.indexes.clear();
+        plan.call_signatures.clear();
+        plan.alias_symbol = None;
+        plan.heritage = Some(heritage);
+        plan
+    }
+
+    fn prepare_fixture(mut fixture: Fixture) -> PreparedFixture {
         let base = interface_symbol(&fixture, "Base");
         let other = interface_symbol(&fixture, "Other");
         let derived = interface_symbol(&fixture, "Derived");
@@ -932,7 +1234,18 @@ mod tests {
         );
         let base_plan = object_members::plan_interface(&fixture.store, &host, base).unwrap();
         let other_plan = object_members::plan_interface(&fixture.store, &host, other).unwrap();
-        let derived_plan = object_members::plan_interface(&fixture.store, &host, derived).unwrap();
+        let derived_plan = if base_plan.indexes.is_empty() {
+            object_members::plan_interface(&fixture.store, &host, derived).unwrap()
+        } else {
+            assert!(matches!(
+                object_members::plan_interface(&fixture.store, &host, derived),
+                Err(PropertyObjectError::UnsupportedMember {
+                    kind: SyntaxKind::IndexSignature,
+                    ..
+                })
+            ));
+            indexed_derived_plan(&fixture, &host, derived, &other_plan)
+        };
         let base_flags = fixture.store.symbol(base).unwrap().flags();
         let other_flags = fixture.store.symbol(other).unwrap().flags();
         let derived_flags = fixture.store.symbol(derived).unwrap().flags();
@@ -961,18 +1274,17 @@ mod tests {
         .unwrap()
         .unwrap();
         let number_type = fixture.store.intrinsic_bootstrap().unwrap().number_type;
-        for (plan, type_, count) in [
-            (&base_plan, base_type, 2usize),
-            (&other_plan, other_type, 1usize),
-        ] {
+        let string_type = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        for (plan, type_) in [(&base_plan, base_type), (&other_plan, other_type)] {
             let state = object_members::interface_state(&fixture.store, plan, type_).unwrap();
             assert_eq!(state, PropertyObjectState::Shell(type_));
+            let indexes = vec![(string_type, number_type); plan.indexes.len()];
             object_members::publish_declared_members(
                 &mut fixture.store,
                 plan,
                 state,
-                &vec![number_type; count],
-                &[],
+                &vec![number_type; plan.properties.len()],
+                &indexes,
                 &[],
             )
             .unwrap();
@@ -985,6 +1297,202 @@ mod tests {
             derived_type,
             number_type,
         }
+    }
+
+    #[test]
+    fn inherited_indexes_keep_source_identity_and_exact_cold_and_warm_members() {
+        let mut prepared = prepare_indexed();
+        let base_index = {
+            let TypeData::Interface(base) = prepared
+                .fixture
+                .store
+                .type_payload(prepared.base_type)
+                .unwrap()
+                .data()
+            else {
+                panic!("the indexed base must retain its interface type")
+            };
+            let [index] = base.declared_index_infos.as_deref().unwrap() else {
+                panic!("the indexed base must publish one source index")
+            };
+            *index
+        };
+        let before_indexes = prepared.fixture.store.index_info_len();
+
+        assert_eq!(
+            resolve_direct_interface_members(
+                &mut prepared.fixture.store,
+                &prepared.derived_plan,
+                prepared.derived_type,
+                &[prepared.number_type],
+                &[prepared.base_type],
+            ),
+            Ok(prepared.derived_type)
+        );
+
+        let TypeData::Interface(derived) = prepared
+            .fixture
+            .store
+            .type_payload(prepared.derived_type)
+            .unwrap()
+            .data()
+        else {
+            panic!("the derived interface must retain its interface type")
+        };
+        assert_eq!(derived.declared_index_infos, None);
+        assert_eq!(
+            derived.reference.object.structured.index_infos.as_deref(),
+            Some(&[base_index][..])
+        );
+        let members = prepared
+            .fixture
+            .store
+            .symbol_table(derived.reference.object.structured.members.unwrap())
+            .unwrap();
+        assert_eq!(members.len(), 3);
+        assert_eq!(members.get(InternalSymbolName::Index.as_ref()), None);
+        let property_names = derived
+            .reference
+            .object
+            .structured
+            .properties
+            .as_deref()
+            .unwrap()
+            .iter()
+            .map(|property| {
+                prepared
+                    .fixture
+                    .store
+                    .symbol(*property)
+                    .unwrap()
+                    .name()
+                    .as_utf8()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(property_names, ["own", "first", "second"]);
+        assert_eq!(prepared.fixture.store.index_info_len(), before_indexes);
+        assert!(validate_planned_interface_heritage_members(
+            &prepared.fixture.store,
+            &prepared.derived_plan,
+            prepared.derived_type,
+        ));
+
+        let warm_state = (
+            prepared.fixture.store.type_len(),
+            prepared.fixture.store.index_info_len(),
+            prepared.fixture.store.symbol_store().symbol_table_len(),
+            prepared.fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            resolve_direct_interface_members(
+                &mut prepared.fixture.store,
+                &prepared.derived_plan,
+                prepared.derived_type,
+                &[prepared.number_type],
+                &[prepared.base_type],
+            ),
+            Ok(prepared.derived_type)
+        );
+        assert_eq!(
+            (
+                prepared.fixture.store.type_len(),
+                prepared.fixture.store.index_info_len(),
+                prepared.fixture.store.symbol_store().symbol_table_len(),
+                prepared.fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm_state
+        );
+    }
+
+    #[test]
+    fn poisoned_inherited_indexes_fail_without_republishing_members() {
+        let mut prepared = prepare_indexed();
+        resolve_direct_interface_members(
+            &mut prepared.fixture.store,
+            &prepared.derived_plan,
+            prepared.derived_type,
+            &[prepared.number_type],
+            &[prepared.base_type],
+        )
+        .unwrap();
+        let (members, properties, index) = {
+            let TypeData::Interface(interface) = prepared
+                .fixture
+                .store
+                .type_payload(prepared.derived_type)
+                .unwrap()
+                .data()
+            else {
+                panic!("the derived interface must retain its interface type")
+            };
+            (
+                interface.reference.object.structured.members,
+                interface.reference.object.structured.properties.clone(),
+                interface
+                    .reference
+                    .object
+                    .structured
+                    .index_infos
+                    .as_ref()
+                    .unwrap()[0],
+            )
+        };
+        assert!(prepared.fixture.store.set_structured_type_members(
+            prepared.derived_type,
+            members,
+            properties.clone(),
+            None,
+            None,
+            None,
+        ));
+        let before = derived_state(
+            &prepared.fixture.store,
+            prepared.derived_type,
+            prepared.derived_plan.properties[0].symbol,
+        );
+        assert_eq!(
+            validate_interface_heritage_members(&prepared.fixture.store, prepared.derived_type),
+            InterfaceHeritageMembersValidation::Malformed,
+        );
+        assert!(
+            resolve_direct_interface_members(
+                &mut prepared.fixture.store,
+                &prepared.derived_plan,
+                prepared.derived_type,
+                &[prepared.number_type],
+                &[prepared.base_type],
+            )
+            .is_err()
+        );
+        assert_eq!(
+            derived_state(
+                &prepared.fixture.store,
+                prepared.derived_type,
+                prepared.derived_plan.properties[0].symbol,
+            ),
+            before
+        );
+
+        assert!(prepared.fixture.store.set_structured_type_members(
+            prepared.derived_type,
+            members,
+            properties,
+            None,
+            None,
+            Some(vec![index]),
+        ));
+        let own = prepared.derived_plan.properties[0].symbol;
+        assert!(
+            prepared
+                .fixture
+                .store
+                .set_index_info_symbol(index, Some(own))
+        );
+        assert_eq!(
+            validate_interface_heritage_members(&prepared.fixture.store, prepared.derived_type),
+            InterfaceHeritageMembersValidation::Malformed,
+        );
     }
 
     fn derived_state(

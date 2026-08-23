@@ -106,6 +106,7 @@ pub(super) struct DirectSourceCallSyntax {
     type_arguments: Option<SourceTypeArgumentList>,
     arguments: Vec<NodeRef>,
     argument_arrow_nodes: Vec<Option<NodeRef>>,
+    array_argument_arrow_nodes: Vec<Vec<NodeRef>>,
 }
 
 impl DirectSourceCallSyntax {
@@ -270,6 +271,11 @@ pub(super) fn plan_direct_source_call_syntax(
                 let receiver = NodeRef::new(node.arena, node.file, property.expression);
                 if call.arguments.nodes.is_empty()
                     && call.type_arguments.is_none()
+                    && !matches!(
+                        &name_record.data,
+                        NodeData::Identifier(identifier)
+                            if matches!(identifier.text.as_str(), "toFixed" | "toLowerCase")
+                    )
                     && arena
                         .get(receiver.node)
                         .is_some_and(|record| record.kind == SyntaxKind::CallExpression)
@@ -393,6 +399,7 @@ pub(super) fn plan_direct_source_call_syntax(
 
     let mut arguments = Vec::with_capacity(call.arguments.nodes.len());
     let mut argument_arrow_nodes = Vec::with_capacity(call.arguments.nodes.len());
+    let mut array_argument_arrow_nodes = Vec::with_capacity(call.arguments.nodes.len());
     for argument_id in &call.arguments.nodes {
         let argument = NodeRef::new(node.arena, node.file, *argument_id);
         let Some(argument_record) = arena.get(*argument_id) else {
@@ -405,7 +412,14 @@ pub(super) fn plan_direct_source_call_syntax(
                 UnsupportedSourceSyntax::Call(node),
             ));
         }
+        let mut array_arrows = Vec::new();
+        if !collect_array_argument_arrow_syntax(arena, argument, &mut array_arrows) {
+            return Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Call(node),
+            ));
+        }
         argument_arrow_nodes.push(unparenthesized_arrow_argument_node(arena, argument));
+        array_argument_arrow_nodes.push(array_arrows);
         arguments.push(argument);
     }
     preflight_call_links(store, node)?;
@@ -419,6 +433,7 @@ pub(super) fn plan_direct_source_call_syntax(
         type_arguments,
         arguments,
         argument_arrow_nodes,
+        array_argument_arrow_nodes,
     })
 }
 
@@ -568,6 +583,17 @@ fn plan_tagged_template_source_call_syntax(
         .copied()
         .map(|argument| unparenthesized_arrow_argument_node(arena, argument))
         .collect();
+    let array_argument_arrow_nodes = arguments
+        .iter()
+        .copied()
+        .map(|argument| {
+            let mut arrows = Vec::new();
+            collect_array_argument_arrow_syntax(arena, argument, &mut arrows).then_some(arrows)
+        })
+        .collect::<Option<Vec<_>>>()
+        .ok_or(SourceCheckError::Unsupported(
+            UnsupportedSourceSyntax::Call(node),
+        ))?;
     preflight_call_links(store, node)?;
     Ok(DirectSourceCallSyntax {
         node,
@@ -579,6 +605,7 @@ fn plan_tagged_template_source_call_syntax(
         type_arguments: None,
         arguments,
         argument_arrow_nodes,
+        array_argument_arrow_nodes,
     })
 }
 
@@ -652,19 +679,24 @@ pub(super) fn finish_direct_source_call_plan(
         || !exact_callee
         || arguments.len() != syntax.arguments.len()
         || syntax.argument_arrow_nodes.len() != syntax.arguments.len()
+        || syntax.array_argument_arrow_nodes.len() != syntax.arguments.len()
         || !arguments
             .iter()
             .zip(&syntax.arguments)
             .zip(&syntax.argument_arrow_nodes)
-            .all(|((argument, syntax_node), syntax_arrow)| {
+            .zip(&syntax.array_argument_arrow_nodes)
+            .all(|(((argument, syntax_node), syntax_arrow), array_arrows)| {
                 let unparenthesized = argument.unparenthesized();
                 let exact_arrow = match (&unparenthesized.kind, syntax_arrow) {
                     (PlannedExpressionKind::Arrow(_), Some(node)) => unparenthesized.node == *node,
                     (PlannedExpressionKind::Arrow(_), None) | (_, Some(_)) => false,
                     (_, None) => true,
                 };
+                let mut planned_array_arrows = Vec::new();
+                collect_array_argument_arrow_plans(argument, &mut planned_array_arrows);
                 argument.node == *syntax_node
                     && exact_arrow
+                    && &planned_array_arrows == array_arrows
                     && is_supported_call_argument_plan(argument)
             })
     {
@@ -718,6 +750,65 @@ fn unparenthesized_arrow_argument_node(arena: &NodeArena, mut node: NodeRef) -> 
             (NodeData::ArrowFunction(_), SyntaxKind::ArrowFunction) => return Some(node),
             _ => return None,
         }
+    }
+}
+
+fn collect_array_argument_arrow_syntax(
+    arena: &NodeArena,
+    node: NodeRef,
+    arrows: &mut Vec<NodeRef>,
+) -> bool {
+    let Some(record) = arena.get(node.node) else {
+        return false;
+    };
+    match (&record.data, record.kind) {
+        (NodeData::ParenthesizedExpression(parenthesized), SyntaxKind::ParenthesizedExpression) => {
+            let inner = NodeRef::new(node.arena, node.file, parenthesized.expression);
+            arena.get(inner.node).is_some_and(|inner_record| {
+                inner_record.parent == Some(node.node)
+                    && collect_array_argument_arrow_syntax(arena, inner, arrows)
+            })
+        }
+        (NodeData::ArrayLiteralExpression(array), SyntaxKind::ArrayLiteralExpression) => {
+            if record.flags.0 != 0 || array.facts != 0 {
+                return false;
+            }
+            for element_id in &array.elements.nodes {
+                let element = NodeRef::new(node.arena, node.file, *element_id);
+                let Some(element_record) = arena.get(*element_id) else {
+                    return false;
+                };
+                if element_record.parent != Some(node.node)
+                    || !collect_array_argument_arrow_syntax(arena, element, arrows)
+                {
+                    return false;
+                }
+            }
+            true
+        }
+        (NodeData::ArrowFunction(_), SyntaxKind::ArrowFunction) => {
+            if !is_supported_arrow_argument_syntax(arena, node) {
+                return false;
+            }
+            arrows.push(node);
+            true
+        }
+        _ => true,
+    }
+}
+
+fn collect_array_argument_arrow_plans(expression: &PlannedExpression, arrows: &mut Vec<NodeRef>) {
+    match &expression.kind {
+        PlannedExpressionKind::Parenthesized(inner) => {
+            collect_array_argument_arrow_plans(inner, arrows);
+        }
+        PlannedExpressionKind::Array(elements) => {
+            for element in elements {
+                collect_array_argument_arrow_plans(element, arrows);
+            }
+        }
+        PlannedExpressionKind::Arrow(_) => arrows.push(expression.node),
+        _ => {}
     }
 }
 
@@ -3216,6 +3307,181 @@ mod tests {
             assert!(context.store().type_node_links(call).is_none());
             assert!(context.store().signature_links(call).is_none());
         }
+    }
+
+    #[test]
+    fn wrapper_method_calls_keep_property_callees_after_call_receivers() {
+        let parsed = parsed(concat!(
+            "declare function makeNumber(): number; ",
+            "declare function makeString(): string; ",
+            "const fixed = makeNumber().toFixed(); ",
+            "const lower = makeString().toLowerCase(); ",
+            "const ordinary = makeString().toString();",
+        ));
+        let file = FileId::new(465);
+        let context = context(&parsed, file);
+        let property_calls = calls(&parsed, file)
+            .into_iter()
+            .filter_map(|call| {
+                let NodeData::CallExpression(data) = &parsed.arena.get(call.node)?.data else {
+                    return None;
+                };
+                let property = parsed.arena.get(data.expression)?;
+                let NodeData::PropertyAccessExpression(access) = &property.data else {
+                    return None;
+                };
+                let NodeData::Identifier(name) = &parsed.arena.get(access.name)?.data else {
+                    return None;
+                };
+                Some((call, data.expression, name.text.as_str()))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(property_calls.len(), 3);
+
+        for (call, property, name) in property_calls {
+            let syntax = plan_direct_source_call_syntax(&parsed.arena, context.store(), call)
+                .expect("well-formed wrapper methods must retain their property callee");
+            if matches!(name, "toFixed" | "toLowerCase") {
+                assert_eq!(
+                    syntax.callee_form(),
+                    SourceCallCalleeForm::RequiredOwnProperty
+                );
+                assert_eq!(syntax.callee().node, property);
+                assert!(syntax.deferred_error_property.is_none());
+            } else {
+                assert_eq!(name, "toString");
+                assert_eq!(syntax.callee_form(), SourceCallCalleeForm::Identifier);
+                assert!(syntax.deferred_error_property.is_some());
+            }
+            assert!(context.store().type_node_links(call).is_none());
+            assert!(context.store().signature_links(call).is_none());
+        }
+    }
+
+    #[test]
+    fn call_plan_authenticates_arrows_nested_in_array_arguments() {
+        let parsed = parsed(concat!(
+            "function take(values: any): void {} ",
+            "take([() => 1, [((value: number) => value)]]);",
+        ));
+        let file = FileId::new(466);
+        let context = context(&parsed, file);
+        let call_nodes = calls(&parsed, file);
+        let [call] = call_nodes.as_slice() else {
+            panic!("fixture must contain one call with nested array arrows")
+        };
+        let syntax = plan_direct_source_call_syntax(&parsed.arena, context.store(), *call)
+            .expect("nested array arrows must pass call syntax validation");
+        let mut expected = parsed
+            .arena
+            .iter()
+            .filter(|(_, record)| record.kind == SyntaxKind::ArrowFunction)
+            .map(|(node, _)| NodeRef::new(parsed.arena.id(), file, node))
+            .collect::<Vec<_>>();
+        expected.sort_by_key(|node| parsed.arena.get(node.node).unwrap().range.start);
+
+        assert_eq!(syntax.argument_arrow_nodes, vec![None]);
+        assert_eq!(syntax.array_argument_arrow_nodes, vec![expected]);
+        assert!(context.store().type_node_links(*call).is_none());
+        assert!(context.store().signature_links(*call).is_none());
+    }
+
+    #[test]
+    fn array_arrow_argument_validation_rejects_forged_arrow_and_array_ownership() {
+        for poison in 0..3 {
+            let mut parsed = parsed("function take(values: any): void {} take([() => 1]);");
+            let file = FileId::new(467 + poison);
+            let call_nodes = calls(&parsed, file);
+            let [call] = call_nodes.as_slice() else {
+                panic!("fixture must contain one direct call")
+            };
+            let call = *call;
+            let (array, arrow, body) = {
+                let NodeData::CallExpression(call_data) =
+                    &parsed.arena.get(call.node).unwrap().data
+                else {
+                    unreachable!("the selected node is a call")
+                };
+                let [array] = call_data.arguments.nodes.as_slice() else {
+                    panic!("fixture must contain one array argument")
+                };
+                let NodeData::ArrayLiteralExpression(array_data) =
+                    &parsed.arena.get(*array).unwrap().data
+                else {
+                    unreachable!("the argument is an array")
+                };
+                let [arrow] = array_data.elements.nodes.as_slice() else {
+                    panic!("fixture must contain one arrow element")
+                };
+                let NodeData::ArrowFunction(arrow_data) = &parsed.arena.get(*arrow).unwrap().data
+                else {
+                    unreachable!("the selected element is an arrow")
+                };
+                (*array, *arrow, arrow_data.body)
+            };
+            match poison {
+                0 => {
+                    let NodeData::ArrowFunction(arrow_data) =
+                        &mut parsed.arena.get_mut(arrow).unwrap().data
+                    else {
+                        unreachable!("the selected element is an arrow")
+                    };
+                    arrow_data.facts = 1;
+                }
+                1 => parsed.arena.get_mut(body).unwrap().parent = Some(array),
+                2 => parsed.arena.get_mut(arrow).unwrap().parent = Some(call.node),
+                _ => unreachable!("only authenticated arrow fields and ownership are mutated"),
+            }
+
+            let store = CanonicalTypeMapperStore::new();
+            assert!(matches!(
+                plan_direct_source_call_syntax(&parsed.arena, &store, call),
+                Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::Call(node)))
+                    if node == call
+            ));
+            assert!(store.type_node_links(call).is_none());
+            assert!(store.signature_links(call).is_none());
+        }
+    }
+
+    #[test]
+    fn finished_call_plan_rejects_scalar_plans_for_nested_array_arrows() {
+        let parsed = parsed("function take(values: any): void {} take([() => 1]);");
+        let file = FileId::new(470);
+        let context = context(&parsed, file);
+        let call_nodes = calls(&parsed, file);
+        let [call] = call_nodes.as_slice() else {
+            panic!("fixture must contain one direct call")
+        };
+        let call = *call;
+        let syntax = plan_direct_source_call_syntax(&parsed.arena, context.store(), call)
+            .expect("the fixture contains an authenticated nested arrow");
+        let [array] = syntax.arguments() else {
+            panic!("the fixture call has one array argument")
+        };
+        let [arrow] = syntax.array_argument_arrow_nodes[0].as_slice() else {
+            panic!("the array argument contains one authenticated arrow")
+        };
+        let forged = PlannedExpression::new(
+            *array,
+            PlannedExpressionKind::Array(vec![PlannedExpression::new(
+                *arrow,
+                PlannedExpressionKind::String("forged".into()),
+            )]),
+        );
+        let symbol = first_function_symbol(&parsed, &context, file);
+
+        assert!(matches!(
+            finish_direct_source_call_plan(
+                &syntax,
+                identifier_plan(syntax.callee(), symbol),
+                vec![forged],
+            ),
+            Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::Call(node)))
+                if node == call
+        ));
+        assert!(context.store().type_node_links(call).is_none());
+        assert!(context.store().signature_links(call).is_none());
     }
 
     #[test]

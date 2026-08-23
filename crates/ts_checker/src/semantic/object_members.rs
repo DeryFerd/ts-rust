@@ -61,6 +61,14 @@ pub(super) struct PlannedProperty {
     pub name: String,
 }
 
+/// One unbound object spread and its position among source-owned properties.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PlannedObjectSpread {
+    pub declaration: NodeRef,
+    pub expression: NodeRef,
+    pub property_index: usize,
+}
+
 const fn source_property_check_flags(readonly: bool) -> CheckFlags {
     if readonly {
         CheckFlags::READONLY
@@ -140,6 +148,7 @@ pub(super) struct PropertyObjectPlan {
     pub symbol: SemanticSymbolId,
     pub members: Option<SymbolTableId>,
     pub properties: Vec<PlannedProperty>,
+    pub spreads: Vec<PlannedObjectSpread>,
     pub indexes: Vec<PlannedIndexSignature>,
     pub call_signatures: Vec<PlannedCallSignature>,
     pub alias_symbol: Option<SemanticSymbolId>,
@@ -149,6 +158,10 @@ pub(super) struct PropertyObjectPlan {
 impl PropertyObjectPlan {
     pub(super) fn property_type_nodes(&self) -> impl ExactSizeIterator<Item = NodeRef> + '_ {
         self.properties.iter().map(|property| property.type_node)
+    }
+
+    pub(super) fn spread_expression_nodes(&self) -> impl ExactSizeIterator<Item = NodeRef> + '_ {
+        self.spreads.iter().map(|spread| spread.expression)
     }
 
     pub(super) fn index_type_nodes(
@@ -1561,6 +1574,7 @@ fn plan_members(
         symbol,
         members,
         properties: Vec::new(),
+        spreads: Vec::new(),
         indexes: Vec::new(),
         call_signatures: Vec::new(),
         alias_symbol,
@@ -1572,13 +1586,25 @@ fn plan_members(
             count.checked_add(members.nodes.len())
         })
         .ok_or(PropertyObjectError::Capacity(node))?;
+    let direct_member_count = if kind == PropertyObjectKind::ObjectLiteral {
+        member_nodes
+            .nodes
+            .iter()
+            .filter(|member| {
+                let member = NodeRef::new(node.arena, node.file, **member);
+                store.source_node_kind(member) != Some(SyntaxKind::SpreadAssignment)
+            })
+            .count()
+    } else {
+        member_count
+    };
     if kind != PropertyObjectKind::ObjectLiteral
         && (member_nodes.has_trailing_comma
             || additional_members
                 .iter()
                 .any(|(_, members)| members.has_trailing_comma))
         || policy != TypeLiteralMemberPolicy::GenericInterface
-            && members.is_some() == (member_count == 0)
+            && members.is_some() == (direct_member_count == 0)
         || policy == TypeLiteralMemberPolicy::GenericInterface && members.is_none()
     {
         return Err(invalid_plan(&provisional));
@@ -1619,6 +1645,7 @@ fn plan_members(
     let mut seen_names = HashSet::new();
     let mut planned_symbol_declarations = HashMap::<SemanticSymbolId, Vec<NodeRef>>::new();
     let mut properties = Vec::with_capacity(member_count);
+    let mut spreads = Vec::new();
     let mut indexes = Vec::with_capacity(1);
     let mut call_signatures = Vec::with_capacity(member_count);
     for (member_owner, member) in member_entries {
@@ -1627,7 +1654,9 @@ fn plan_members(
         let admitted_kind = match kind {
             PropertyObjectKind::ObjectLiteral => matches!(
                 member_record.kind,
-                SyntaxKind::PropertyAssignment | SyntaxKind::ShorthandPropertyAssignment
+                SyntaxKind::PropertyAssignment
+                    | SyntaxKind::ShorthandPropertyAssignment
+                    | SyntaxKind::SpreadAssignment
             ),
             PropertyObjectKind::TypeLiteral => matches!(
                 member_record.kind,
@@ -1651,6 +1680,32 @@ fn plan_members(
                 node: member,
                 kind: member_record.kind,
             });
+        }
+        if member_record.kind == SyntaxKind::SpreadAssignment {
+            let NodeData::SpreadAssignment(spread) = &member_record.data else {
+                return Err(invalid_plan(&provisional));
+            };
+            let expression = NodeRef::new(member.arena, member.file, spread.expression);
+            let expression_record =
+                preflight_node(store, host, expression).map_err(|_| invalid_plan(&provisional))?;
+            if kind != PropertyObjectKind::ObjectLiteral
+                || spread.symbol.is_some()
+                || host
+                    .bound_file(member)
+                    .and_then(|bound| bound.symbol(member))
+                    .is_some()
+                || expression_record.parent != Some(member.node)
+                || expression_record.range.start < member_record.range.start
+                || expression_record.range.end > member_record.range.end
+            {
+                return Err(invalid_plan(&provisional));
+            }
+            spreads.push(PlannedObjectSpread {
+                declaration: member,
+                expression,
+                property_index: properties.len(),
+            });
+            continue;
         }
         if matches!(
             member_record.kind,
@@ -2076,6 +2131,7 @@ fn plan_members(
 
     Ok(PropertyObjectPlan {
         properties,
+        spreads,
         indexes,
         call_signatures,
         ..provisional
@@ -2600,6 +2656,14 @@ pub(super) fn object_literal_state(
     });
     if links.outer_type_parameters.is_some() || links.resolved_type.is_none() {
         return Err(invalid_cache(plan, type_));
+    }
+    if !plan.spreads.is_empty()
+        && store
+            .intrinsic_bootstrap()
+            .is_some_and(|bootstrap| type_ == bootstrap.any_type)
+        && unresolved_property_links(store, plan)
+    {
+        return Ok(Some(PropertyObjectState::Resolved(type_)));
     }
     match validate_object_record(store, plan, type_) {
         Some(state @ PropertyObjectState::Resolved(_)) => Ok(Some(state)),
@@ -4883,6 +4947,9 @@ pub(super) fn publish_object_literal(
     property_types: &[TypeId],
 ) -> Result<TypeId, PropertyObjectError> {
     debug_assert_eq!(plan.kind, PropertyObjectKind::ObjectLiteral);
+    if !plan.spreads.is_empty() {
+        return Err(PropertyObjectError::InvalidObjectLiteral(plan.node));
+    }
     if let Some(state) = object_literal_state(store, plan)? {
         validate_resolved_property_types(store, plan, property_types)?;
         return Ok(state.type_id());
@@ -5016,6 +5083,58 @@ pub(super) fn publish_object_literal(
     links.resolved_type = Some(type_);
     assert!(store.set_type_node_links(plan.node, links));
     Ok(type_)
+}
+
+/// Publishes a spread literal only when every operand is the canonical `any`.
+///
+/// Object spread absorbs `any` upstream. Direct properties keep their original
+/// binder symbols and are still checked by the source caller before this cache
+/// is published. Concrete donor objects remain closed until their member
+/// ownership and overwrite diagnostics are implemented together.
+pub(super) fn publish_object_literal_with_spreads(
+    store: &mut CanonicalTypeMapperStore,
+    plan: &PropertyObjectPlan,
+    property_types: &[TypeId],
+    spread_types: &[TypeId],
+) -> Result<TypeId, PropertyObjectError> {
+    if plan.kind != PropertyObjectKind::ObjectLiteral
+        || plan.spreads.is_empty()
+        || plan.spreads.len() != spread_types.len()
+        || plan.properties.len() != property_types.len()
+        || property_types
+            .iter()
+            .any(|type_| store.type_payload(*type_).is_none())
+        || !unresolved_property_links(store, plan)
+    {
+        return Err(PropertyObjectError::InvalidObjectLiteral(plan.node));
+    }
+    let any = store
+        .intrinsic_bootstrap()
+        .ok_or(PropertyObjectError::InvalidObjectLiteral(plan.node))?
+        .any_type;
+    if spread_types.iter().any(|type_| *type_ != any) {
+        return Err(PropertyObjectError::UnsupportedMember {
+            node: plan.spreads[0].declaration,
+            kind: SyntaxKind::SpreadAssignment,
+        });
+    }
+    if let Some(state) = object_literal_state(store, plan)? {
+        return if state.type_id() == any {
+            Ok(any)
+        } else {
+            Err(invalid_cache(plan, state.type_id()))
+        };
+    }
+    if !store.try_reserve_type_node_links(usize::from(store.type_node_links(plan.node).is_none())) {
+        return Err(PropertyObjectError::Capacity(plan.node));
+    }
+    let mut links = store
+        .type_node_links(plan.node)
+        .cloned()
+        .unwrap_or_default();
+    links.resolved_type = Some(any);
+    assert!(store.set_type_node_links(plan.node, links));
+    Ok(any)
 }
 
 #[cfg(test)]
@@ -5230,6 +5349,141 @@ mod generic_publication_tests {
             store.symbol_store().symbol_table_len(),
             store.checker_link_allocated_lengths(),
         )
+    }
+
+    #[test]
+    fn object_spreads_preserve_unbound_operands_and_direct_property_positions() {
+        let (fixture, object) = object_fixture(concat!(
+            "declare const source: any; ",
+            "const value = { ...source, first: 1, ...source, last: 2 };",
+        ));
+        let host = host(&fixture.parsed, &fixture.bound);
+        let plan = plan_object_literal(&fixture.store, &host, object).unwrap();
+
+        assert_eq!(
+            plan.properties
+                .iter()
+                .map(|property| property.name.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "last"],
+        );
+        assert_eq!(
+            plan.spreads
+                .iter()
+                .map(|spread| spread.property_index)
+                .collect::<Vec<_>>(),
+            [0, 1],
+        );
+        assert_eq!(
+            plan.spread_expression_nodes().collect::<Vec<_>>(),
+            plan.spreads
+                .iter()
+                .map(|spread| spread.expression)
+                .collect::<Vec<_>>(),
+        );
+        for spread in &plan.spreads {
+            assert_eq!(fixture.bound.symbol(spread.declaration), None);
+            assert_eq!(
+                fixture.store.source_node_parent(spread.expression),
+                Some(SourceNodeParent::Parent(spread.declaration)),
+            );
+        }
+    }
+
+    #[test]
+    fn object_spreads_absorb_canonical_any_without_allocating_member_symbols() {
+        let (mut fixture, object) = object_fixture(concat!(
+            "declare const source: any; ",
+            "const value = { first: 1, ...source, last: 2 };",
+        ));
+        let host = host(&fixture.parsed, &fixture.bound);
+        let plan = plan_object_literal(&fixture.store, &host, object).unwrap();
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let any = bootstrap.any_type;
+        let number = bootstrap.number_type;
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.symbol_len(),
+            fixture.store.symbol_store().symbol_table_len(),
+        );
+
+        assert_eq!(
+            publish_object_literal(&mut fixture.store, &plan, &[number, number]),
+            Err(PropertyObjectError::InvalidObjectLiteral(object)),
+        );
+        assert_eq!(
+            publish_object_literal_with_spreads(
+                &mut fixture.store,
+                &plan,
+                &[number, number],
+                &[any],
+            ),
+            Ok(any),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.symbol_store().symbol_table_len(),
+            ),
+            before,
+        );
+        assert_eq!(
+            object_literal_state(&fixture.store, &plan),
+            Ok(Some(PropertyObjectState::Resolved(any))),
+        );
+        assert!(plan.properties.iter().all(|property| {
+            fixture
+                .store
+                .value_symbol_links(property.symbol)
+                .is_none_or(|links| links == &ValueSymbolLinks::default())
+        }));
+        let warm = fixture.store.checker_link_allocated_lengths();
+        assert_eq!(
+            publish_object_literal_with_spreads(
+                &mut fixture.store,
+                &plan,
+                &[number, number],
+                &[any],
+            ),
+            Ok(any),
+        );
+        assert_eq!(fixture.store.checker_link_allocated_lengths(), warm);
+    }
+
+    #[test]
+    fn concrete_object_spreads_fail_before_publishing_partial_caches() {
+        let (mut fixture, object) = object_fixture(concat!(
+            "declare const source: any; ",
+            "const value = { ...source };",
+        ));
+        let host = host(&fixture.parsed, &fixture.bound);
+        let plan = plan_object_literal(&fixture.store, &host, object).unwrap();
+        let unknown = fixture.store.intrinsic_bootstrap().unwrap().unknown_type;
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.symbol_len(),
+            fixture.store.symbol_store().symbol_table_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        assert_eq!(
+            publish_object_literal_with_spreads(&mut fixture.store, &plan, &[], &[unknown]),
+            Err(PropertyObjectError::UnsupportedMember {
+                node: plan.spreads[0].declaration,
+                kind: SyntaxKind::SpreadAssignment,
+            }),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.symbol_store().symbol_table_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+        assert!(fixture.store.type_node_links(object).is_none());
     }
 
     #[test]

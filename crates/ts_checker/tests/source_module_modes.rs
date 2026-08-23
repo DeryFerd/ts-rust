@@ -379,3 +379,58 @@ fn mixed_module_modes_remain_an_explicit_boundary() {
         AliasTargetState::Unresolved
     );
 }
+
+#[test]
+fn chained_import_equals_resolves_nested_exported_namespace_functions() {
+    let importer = parse_source_file(concat!(
+        "import namespaceValue = require('./target');\n",
+        "import alias = namespaceValue;\n",
+        "alias.members.execute();\n",
+    ));
+    let target = parse_source_file("export namespace members { export function execute() {} }");
+    let files = [
+        Source {
+            parsed: &importer,
+            file: FileId::new(50),
+            path: "\"/project/nested-namespace-importer.ts\"",
+        },
+        Source {
+            parsed: &target,
+            file: FileId::new(51),
+            path: "\"/project/nested-namespace-target.ts\"",
+        },
+    ];
+    let mut checker = context(&files, &[common_js(0, 1)]);
+
+    checker.check_source_file(files[0].file).unwrap();
+    assert!(checker.diagnostics().is_empty());
+
+    let first = alias_symbol(&checker, files[0], "namespaceValue");
+    let second = alias_symbol(&checker, files[0], "alias");
+    assert!(matches!(
+        checker.resolve_alias(first).unwrap().target,
+        AliasTargetState::Resolved(_)
+    ));
+    assert_eq!(
+        checker.resolve_alias(first).unwrap().target,
+        checker.resolve_alias(second).unwrap().target,
+    );
+
+    checker.check_source_file(files[1].file).unwrap();
+    assert!(checker.diagnostics().is_empty());
+
+    let warm = (
+        checker.store().type_len(),
+        checker.store().signature_len(),
+        checker.diagnostics().clone(),
+    );
+    checker.recheck_source_file(files[0].file).unwrap();
+    assert_eq!(
+        (
+            checker.store().type_len(),
+            checker.store().signature_len(),
+            checker.diagnostics().clone(),
+        ),
+        warm,
+    );
+}

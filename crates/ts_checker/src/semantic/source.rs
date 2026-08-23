@@ -88,8 +88,9 @@ use super::{
     source_arrows::{
         ResolvedSourceContextualArrowPlan, SourceArrowBodyPlan, SourceArrowError, SourceArrowPlan,
         SourceContextualArrowError, SourceContextualArrowPlan, SourceContextualParameterOrigin,
-        SourceContextualSignatureShape, plan_contextual_source_arrow, plan_source_arrow,
-        plan_source_arrow_value, resolve_contextual_arrow_parameter_origins,
+        SourceContextualSignatureShape, plan_array_arrow_identifier_statement,
+        plan_contextual_source_arrow, plan_source_arrow, plan_source_arrow_value,
+        resolve_contextual_arrow_parameter_origins,
     },
     source_callables::{
         ContextualSourceCallableParameter, PreparedContextualSourceCallable,
@@ -499,6 +500,7 @@ impl From<ArrayTypeError> for SourceCheckError {
 pub(super) struct PlannedExpression {
     pub(super) node: NodeRef,
     pub(super) kind: PlannedExpressionKind,
+    object_spreads: Vec<PlannedExpression>,
     used_before_assignment: bool,
 }
 
@@ -507,6 +509,7 @@ impl PlannedExpression {
         Self {
             node,
             kind,
+            object_spreads: Vec::new(),
             used_before_assignment: false,
         }
     }
@@ -814,6 +817,7 @@ struct PlannedArrow {
 pub(super) struct PlannedArrowExpression {
     callable: SourceCallablePlan,
     parameter_initializers: Vec<PlannedParameterInitializer>,
+    expression_statement: Option<PlannedExpression>,
     body: PlannedArrowBody,
 }
 
@@ -875,6 +879,10 @@ struct PlannedLinearFunctionStatements {
 enum PlannedLinearFunctionStatement {
     Local(usize),
     Function(Box<PlannedFunction>),
+    Expression {
+        statement: NodeRef,
+        expression: Box<PlannedExpression>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -4099,6 +4107,17 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         },
                     )));
                 }
+                SourceLinearFunctionStatementSyntax::Expression {
+                    statement,
+                    expression,
+                } => {
+                    self.primitive_binary_position_roots.insert(expression);
+                    let expression = self.plan_expression(expression)?;
+                    statements.push(PlannedLinearFunctionStatement::Expression {
+                        statement,
+                        expression: Box::new(expression),
+                    });
+                }
             }
         }
         if expected_locals.next().is_some() || !nested_callables.is_empty() {
@@ -4109,9 +4128,15 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         let return_expression = return_expression
             .map(|expression| self.plan_expression(expression))
             .transpose()?;
-        let points = locals
+        let points = statements
             .iter()
-            .map(|local| local.name)
+            .filter_map(|statement| match statement {
+                PlannedLinearFunctionStatement::Local(index) => {
+                    locals.get(*index).map(|local| local.name)
+                }
+                PlannedLinearFunctionStatement::Function(_) => None,
+                PlannedLinearFunctionStatement::Expression { statement, .. } => Some(*statement),
+            })
             .chain(return_statement)
             .collect::<Vec<_>>();
         let assignments = locals
@@ -5694,6 +5719,12 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 {
                     argument = parent;
                 }
+                NodeData::ArrayLiteralExpression(array)
+                    if record.kind == SyntaxKind::ArrayLiteralExpression
+                        && array.elements.nodes.as_slice() == [argument.node] =>
+                {
+                    argument = parent;
+                }
                 NodeData::CallExpression(call)
                     if record.kind == SyntaxKind::CallExpression
                         && call
@@ -5751,10 +5782,13 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         let (callable, body) =
             plan_source_arrow_value(store, host, declaration, self.array_targets)
                 .map_err(Self::arrow_plan_error)?;
+        let expression_statement = plan_array_arrow_identifier_statement(store, host, &callable)
+            .map_err(Self::arrow_plan_error)?;
         if callable
             .parameters
             .iter()
             .any(|parameter| parameter.is_implicit_any())
+            && expression_statement.is_none()
         {
             return Err(SourceCheckError::Unsupported(
                 UnsupportedSourceSyntax::Arrow(declaration),
@@ -5781,6 +5815,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 self.plan_parameter_initializers_and_enter_scope(&callable)?;
             let body_prior_variables = self.prior_variables.clone();
             let body_readable_variables = self.readable_variables.clone();
+            let expression_statement = expression_statement
+                .map(|(_, _, expression)| self.plan_expression(expression))
+                .transpose();
             let body = match body {
                 SourceArrowBodyPlan::EmptyBlock { block } => {
                     match self.function_empty_body_return_supported(callable.return_type) {
@@ -5803,6 +5840,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             self.prior_variables = body_prior_variables;
             self.readable_variables = body_readable_variables;
             self.leave_callable_parameter_scope(&callable)?;
+            let expression_statement = expression_statement?;
             let body = body?;
             if matches!(body, PlannedArrowBody::ReturnJsx { .. }) {
                 return Err(SourceCheckError::Unsupported(
@@ -5812,6 +5850,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             Ok(PlannedArrowExpression {
                 callable,
                 parameter_initializers,
+                expression_statement,
                 body,
             })
         })();
@@ -7449,13 +7488,93 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         let plan = super::object_members::plan_object_literal(store, host, expression)
             .map_err(|error| self.object_plan_error(error))?;
         let mut properties = Vec::with_capacity(plan.properties.len());
-        for initializer in plan.property_type_nodes() {
+        let mut spreads = Vec::with_capacity(plan.spread_expression_nodes().len());
+        let mut spread_index = 0;
+        for (index, initializer) in plan.property_type_nodes().enumerate() {
+            while plan
+                .spreads
+                .get(spread_index)
+                .is_some_and(|spread| spread.property_index == index)
+            {
+                let spread = plan.spreads[spread_index];
+                spreads.push(self.plan_object_spread_expression(spread)?);
+                spread_index += 1;
+            }
             properties.push(self.plan_expression(initializer)?);
         }
-        Ok(PlannedExpression::new(
+        while let Some(spread) = plan.spreads.get(spread_index) {
+            if spread.property_index != plan.properties.len() {
+                return Err(self.unsupported(
+                    spread.declaration,
+                    SyntaxKind::SpreadAssignment,
+                    SourceSyntaxRole::ObjectProperty,
+                ));
+            }
+            spreads.push(self.plan_object_spread_expression(*spread)?);
+            spread_index += 1;
+        }
+        let mut expression = PlannedExpression::new(
             expression,
             PlannedExpressionKind::Object { plan, properties },
-        ))
+        );
+        expression.object_spreads = spreads;
+        Ok(expression)
+    }
+
+    fn plan_object_spread_expression(
+        &mut self,
+        spread: super::object_members::PlannedObjectSpread,
+    ) -> Result<PlannedExpression, SourceCheckError> {
+        let mut operand = spread.expression;
+        loop {
+            let record = self.node(operand)?;
+            let NodeData::ParenthesizedExpression(parenthesized) = &record.data else {
+                break;
+            };
+            let inner = self.reference(parenthesized.expression);
+            let inner_record = self.node(inner)?;
+            if record.kind != SyntaxKind::ParenthesizedExpression
+                || record.flags.0 != 0
+                || inner_record.parent != Some(operand.node)
+                || inner_record.range.start < record.range.start
+                || inner_record.range.end > record.range.end
+            {
+                return Err(self.unsupported(
+                    spread.declaration,
+                    SyntaxKind::SpreadAssignment,
+                    SourceSyntaxRole::ObjectProperty,
+                ));
+            }
+            operand = inner;
+        }
+        let record = self.node(operand)?;
+        if record.kind == SyntaxKind::ObjectLiteralExpression {
+            return Err(self.unsupported(operand, record.kind, SourceSyntaxRole::ObjectLiteral));
+        }
+        if record.kind == SyntaxKind::BinaryExpression {
+            let NodeData::BinaryExpression(binary) = &record.data else {
+                return Err(self.unsupported(
+                    spread.declaration,
+                    SyntaxKind::SpreadAssignment,
+                    SourceSyntaxRole::ObjectProperty,
+                ));
+            };
+            let operator = self.reference(binary.operator_token);
+            let left = self.reference(binary.left);
+            let right = self.reference(binary.right);
+            if self.node(operator)?.kind != SyntaxKind::AmpersandAmpersandToken
+                || self.node(left)?.kind != SyntaxKind::Identifier
+                || self.node(right)?.kind != SyntaxKind::ObjectLiteralExpression
+            {
+                return Err(self.unsupported(
+                    spread.declaration,
+                    SyntaxKind::SpreadAssignment,
+                    SourceSyntaxRole::ObjectProperty,
+                ));
+            }
+            self.primitive_binary_position_roots.insert(operand);
+        }
+        self.plan_expression(spread.expression)
     }
 
     fn object_plan_error(
@@ -8675,11 +8794,28 @@ where
                 .map_err(source_object_execution_error)?;
             let mut checked_properties = Vec::with_capacity(properties.len());
             let mut property_types = Vec::with_capacity(properties.len());
-            for ((property, prepared), property_plan) in properties
+            let mut spread_types = Vec::with_capacity(plan.spreads.len());
+            let mut spread_index = 0;
+            for (index, ((property, prepared), property_plan)) in properties
                 .iter()
                 .zip(prepared_properties)
                 .zip(&plan.properties)
+                .enumerate()
             {
+                while plan
+                    .spreads
+                    .get(spread_index)
+                    .is_some_and(|spread| spread.property_index == index)
+                {
+                    let spread = expression.object_spreads.get(spread_index).ok_or(
+                        SourceCheckError::ObjectLiteral(SourceObjectLiteralError::InvalidCache {
+                            node: expression.node,
+                            type_: None,
+                        }),
+                    )?;
+                    spread_types.push(check_nested_expression(store, spread, None)?.result);
+                    spread_index += 1;
+                }
                 let const_preparation = property_plan
                     .readonly
                     .then(|| prepare_const_object_property(property, prepared))
@@ -8696,9 +8832,55 @@ where
                 property_types.push(checked.result);
                 checked_properties.push(checked);
             }
-            let object =
+            while let Some(spread) = plan.spreads.get(spread_index) {
+                if spread.property_index != properties.len() {
+                    return Err(SourceCheckError::Unsupported(
+                        UnsupportedSourceSyntax::Syntax {
+                            node: spread.declaration,
+                            kind: SyntaxKind::SpreadAssignment,
+                            role: SourceSyntaxRole::ObjectProperty,
+                        },
+                    ));
+                }
+                let expression = expression.object_spreads.get(spread_index).ok_or(
+                    SourceCheckError::ObjectLiteral(SourceObjectLiteralError::InvalidCache {
+                        node: plan.node,
+                        type_: None,
+                    }),
+                )?;
+                spread_types.push(check_nested_expression(store, expression, None)?.result);
+                spread_index += 1;
+            }
+            if spread_index != expression.object_spreads.len() {
+                return Err(SourceCheckError::ObjectLiteral(
+                    SourceObjectLiteralError::InvalidCache {
+                        node: expression.node,
+                        type_: None,
+                    },
+                ));
+            }
+            let object = if plan.spreads.is_empty() {
                 super::object_members::publish_object_literal(store, plan, &property_types)
-                    .map_err(source_object_execution_error)?;
+                    .map_err(source_object_execution_error)?
+            } else {
+                super::object_members::publish_object_literal_with_spreads(
+                    store,
+                    plan,
+                    &property_types,
+                    &spread_types,
+                )
+                .map_err(|error| match error {
+                    super::object_members::PropertyObjectError::UnsupportedMember {
+                        node,
+                        kind,
+                    } => SourceCheckError::Unsupported(UnsupportedSourceSyntax::Syntax {
+                        node,
+                        kind,
+                        role: SourceSyntaxRole::ObjectProperty,
+                    }),
+                    error => source_object_execution_error(error),
+                })?
+            };
             Ok(CheckedExpressionTypes {
                 raw: object,
                 result: object,
@@ -10162,6 +10344,13 @@ fn check_planned_arrow_argument(
         &arrow.callable,
         &HashMap::new(),
     )?;
+    if options.no_implicit_any {
+        let arena = host
+            .source(arrow.callable.declaration)
+            .map(|(arena, _)| arena)
+            .ok_or(SourceCheckError::Arrow(arrow.callable.declaration))?;
+        issue_implicit_any_parameter_diagnostics(arena, host, diagnostics, &arrow.callable, None)?;
+    }
     preflight_source_expression_cache(store, expression, materialized.type_)?;
     let flow_types = check_callable_parameter_initializers(
         store,
@@ -10177,6 +10366,22 @@ fn check_planned_arrow_argument(
         &arrow.callable,
         &arrow.parameter_initializers,
     )?;
+    if let Some(statement) = &arrow.expression_statement {
+        check_expression_type(
+            store,
+            host,
+            global_types,
+            source,
+            options,
+            session,
+            diagnostics,
+            &flow_types,
+            preflighted_type_import_value_uses,
+            statement,
+            None,
+            deferred,
+        )?;
+    }
 
     if arrow.callable.return_type.is_inferred() {
         let expression = match &arrow.body {
@@ -11651,6 +11856,28 @@ fn check_planned_linear_function_statements(
                     &function.callable,
                     materialized.signature,
                     expression,
+                )?;
+            }
+            PlannedLinearFunctionStatement::Expression {
+                statement,
+                expression,
+            } => {
+                let snapshot = frame
+                    .snapshot_at(store, global_types, *statement)
+                    .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
+                check_expression_type(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    snapshot.types(),
+                    preflighted_type_import_value_uses,
+                    expression,
+                    None,
+                    deferred,
                 )?;
             }
         }
@@ -13656,6 +13883,21 @@ fn preflight_source_namespace_annotations(
                     .preflight_type_from_type_node(*annotation)?;
                 }
             }
+            SourceNamespaceMemberPlan::Function {
+                declaration,
+                symbol,
+            } => {
+                session.reset_query();
+                CanonicalTypeQuery::new_with_global_types_and_session(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    diagnostics,
+                )?
+                .preflight_type_of_source_callable(*declaration, *symbol)?;
+            }
             SourceNamespaceMemberPlan::EmptyEnum { .. } => {}
         }
     }
@@ -14019,7 +14261,8 @@ pub(super) fn check_source_file(
             if let PlannedFunctionBody::Linear(statements) = &function.body {
                 pending.extend(statements.statements.iter().rev().filter_map(|statement| {
                     match statement {
-                        PlannedLinearFunctionStatement::Local(_) => None,
+                        PlannedLinearFunctionStatement::Local(_)
+                        | PlannedLinearFunctionStatement::Expression { .. } => None,
                         PlannedLinearFunctionStatement::Function(function) => {
                             Some(function.as_ref())
                         }
