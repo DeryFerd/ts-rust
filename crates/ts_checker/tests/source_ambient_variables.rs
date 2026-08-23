@@ -317,6 +317,62 @@ fn initialized_ambient_variables_report_ts1039_and_preserve_inferred_types() {
 }
 
 #[test]
+fn ambient_const_initializers_follow_literal_and_annotation_rules() {
+    let parsed = parse_source_file(concat!(
+        "declare const valid = true;\n",
+        "declare const c1: boolean = true;\n",
+        "declare const c2: number = 0;\n",
+        "declare const c3 = null, c4: string = \"\", c5: any = 0;\n",
+        "declare namespace M { const c6 = 0; const c7: number = 7; }\n",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(2_151);
+    let mut context = checker_context(&parsed, file, false, CanonicalModuleState::Script);
+
+    context.check_source_file(file).unwrap();
+
+    let expected = [
+        ("c1", 1039),
+        ("c2", 1039),
+        ("c3", 1254),
+        ("c4", 1039),
+        ("c5", 1039),
+        ("c7", 1039),
+    ];
+    assert_eq!(context.diagnostics().len(), expected.len());
+    for (diagnostic, (name, code)) in context.diagnostics().as_slice().iter().zip(expected) {
+        assert_eq!(diagnostic.diagnostic.code(), code, "variable {name}");
+        assert_eq!(
+            diagnostic.node,
+            Some(variable_initializer(&parsed, file, name)),
+            "variable {name}",
+        );
+    }
+    assert_eq!(
+        context.diagnostics().as_slice()[2]
+            .diagnostic
+            .render()
+            .unwrap(),
+        "A 'const' initializer in an ambient context must be a string or numeric literal or literal enum reference.",
+    );
+
+    let warm = (
+        context.store().type_len(),
+        context.store().symbol_len(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
+}
+
+#[test]
 fn ambient_annotation_can_name_a_later_interface() {
     let parsed = parse_source_file(concat!(
         "const beforeModel = ambientModel;\n",
@@ -598,11 +654,6 @@ fn declaration_file_and_exported_ambient_variables_publish_canonical_types() {
 #[test]
 fn ambient_variable_forms_outside_the_exact_leaf_remain_typed_boundaries() {
     for (index, (source, declaration_file, module_state)) in [
-        (
-            "declare const initialized: number = 1;",
-            false,
-            CanonicalModuleState::Script,
-        ),
         (
             "declare const { value }: { value: number };",
             false,

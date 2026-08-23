@@ -2147,19 +2147,28 @@ fn validate_owner_name_and_export_route(
                 None if owner.parent().is_none()
                     && (view.modifiers.is_none() || body_mode.is_ambient()) => {}
                 Some(local) if view.modifiers.is_some() => {
-                    let raw_source_owner = bound.symbol(bound.source_file()).ok_or_else(|| {
+                    let parent = owner.parent().ok_or_else(|| {
                         invariant(SourceCallableInvariant::InvalidExportRoute(declaration))
                     })?;
-                    let source_owner =
-                        store.get_merged_symbol(raw_source_owner).ok_or_else(|| {
-                            invariant(SourceCallableInvariant::InvalidExportRoute(declaration))
-                        })?;
+                    let source_parent = bound.symbol(bound.source_file()).is_some_and(|source| {
+                        source == parent && store.get_merged_symbol(source) == Some(source)
+                    });
+                    let namespace_parent = body_mode.is_ambient()
+                        && bound
+                            .source_facts()
+                            .is_some_and(CanonicalSourceFileFacts::is_declaration_file)
+                        && valid_declaration_file_namespace_export_parent(
+                            store,
+                            host,
+                            declaration,
+                            owner,
+                            parent,
+                        );
                     let local_record = store.symbol(local).ok_or_else(|| {
                         invariant(SourceCallableInvariant::InvalidExportRoute(declaration))
                     })?;
-                    if source_owner != raw_source_owner
-                        || owner.parent() != Some(source_owner)
-                        || store.get_merged_symbol(source_owner) != Some(source_owner)
+                    if !(source_parent || namespace_parent)
+                        || store.get_merged_symbol(parent) != Some(parent)
                         || store.get_merged_symbol(local) != Some(local)
                         || local_record.flags() != SymbolFlags::EXPORT_VALUE
                         || local_record.check_flags() != CheckFlags::NONE
@@ -2185,6 +2194,44 @@ fn validate_owner_name_and_export_route(
         }
     }
     Ok(())
+}
+
+fn valid_declaration_file_namespace_export_parent(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    owner: &ts_binder::semantic::Symbol,
+    parent: SemanticSymbolId,
+) -> bool {
+    let Some(SourceNodeParent::Parent(block)) = store.source_node_parent(declaration) else {
+        return false;
+    };
+    if store.source_node_kind(block) != Some(SyntaxKind::ModuleBlock) {
+        return false;
+    }
+    let Some(SourceNodeParent::Parent(namespace)) = store.source_node_parent(block) else {
+        return false;
+    };
+    if store.source_node_kind(namespace) != Some(SyntaxKind::ModuleDeclaration)
+        || !host.symbol_matches(store, namespace, parent)
+    {
+        return false;
+    }
+    let Some(namespace_record) = store.symbol(parent) else {
+        return false;
+    };
+    namespace_record.flags().intersects(SymbolFlags::MODULE)
+        && namespace_record.check_flags() == CheckFlags::NONE
+        && namespace_record
+            .declarations()
+            .is_some_and(|declarations| declarations.contains(&namespace))
+        && namespace_record
+            .exports()
+            .and_then(|exports| store.symbol_table(exports))
+            .and_then(|exports| exports.get(owner.name()))
+            == host
+                .bound_file(declaration)
+                .and_then(|bound| bound.symbol(declaration))
 }
 
 fn validate_optional_token(
@@ -7035,6 +7082,80 @@ mod tests {
             );
             assert!(diagnostics.is_empty(), "{source}: {diagnostics:?}");
         }
+    }
+
+    #[test]
+    fn declaration_file_namespace_exports_publish_ambient_callables_cold_and_warm() {
+        let mut fixture = QueryFixture::with_source_facts(
+            "declare module Foo { export function bar(): void; }",
+            FileId::new(1_185),
+            true,
+            CanonicalModuleState::Script,
+        );
+        let declaration = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionDeclaration).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let namespace = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ModuleDeclaration).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .and_then(|node| fixture.bound.symbol(node))
+            .unwrap();
+        let owner = fixture.bound.symbol(declaration).unwrap();
+        let export_local = fixture.bound.local_symbol(declaration).unwrap();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&fixture.parsed.arena, &fixture.bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let plan = plan_source_callable(&fixture.store, &host, declaration, owner, None).unwrap();
+        assert_eq!(plan.body_mode, SourceCallableBodyMode::AmbientDeclaration);
+        assert_eq!(plan.owner_parent, Some(namespace));
+        assert_eq!(plan.export_local, Some(export_local));
+        drop(host);
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let callable = fixture
+            .query_callable(declaration, owner, &mut diagnostics)
+            .unwrap();
+        let signature = fixture
+            .store
+            .source_callable_provenance(callable)
+            .unwrap()
+            .signature;
+        let expected = fixture.store.intrinsic_bootstrap().unwrap().void_type;
+        assert_eq!(
+            fixture.query_return(signature, &mut diagnostics),
+            Ok(expected)
+        );
+        assert!(matches!(
+            validate_stored_source_callable(&fixture.store, callable),
+            StoredSourceCallableValidation::Valid(_)
+        ));
+
+        let warm = publication_state(&fixture.store);
+        assert_eq!(
+            fixture.query_callable(declaration, owner, &mut diagnostics),
+            Ok(callable),
+        );
+        assert_eq!(publication_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
     }
 
     #[test]

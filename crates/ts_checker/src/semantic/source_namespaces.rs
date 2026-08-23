@@ -17,8 +17,8 @@ use super::{
     AliasTargetState, CanonicalCheckerDiagnostics, CanonicalCheckerOptions, CanonicalGlobalTypes,
     CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, DeclaredTypeUnavailable,
     SourceAssertionError, SourceCheckError, SourceCheckProvenanceError, SourceLiteralCacheError,
-    SourceObjectLiteralError, SourceSyntaxRole, TypeData, TypeId, TypeMapper, TypeNodeLinks,
-    UnsupportedSourceSyntax, ValueSymbolLinks, VariableInvariant,
+    SourceObjectLiteralError, SourceSyntaxRole, SymbolNodeLinks, TypeData, TypeId, TypeMapper,
+    TypeNodeLinks, UnsupportedSourceSyntax, ValueSymbolLinks, VariableInvariant,
     alias::{
         CanonicalAliasResolutionEvent, CanonicalAliasResolver, CanonicalAliasTargetHost,
         CanonicalAliasTargetUnavailable, CanonicalImmediateAliasTarget,
@@ -119,12 +119,40 @@ struct SourceNamespaceImplicitVariablePlan {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+enum SourceNamespaceAmbientInitializer {
+    String(String),
+    EnumMember {
+        owner: SemanticSymbolId,
+        member: SemanticSymbolId,
+        receiver: NodeRef,
+        name: NodeRef,
+        key: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SourceNamespaceAmbientVariablePlan {
+    declaration: NodeRef,
+    symbol: SemanticSymbolId,
+    initializer: NodeRef,
+    value: SourceNamespaceAmbientInitializer,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct SourceNamespaceObjectInitializerPlan {
     declaration: NodeRef,
     symbol: SemanticSymbolId,
     interface: SemanticSymbolId,
     annotation: NodeRef,
     object: PropertyObjectPlan,
+}
+
+struct NamespaceVariablePlans<'a> {
+    members: &'a mut Vec<SourceNamespaceMemberPlan>,
+    implicit_variables: &'a mut Vec<SourceNamespaceImplicitVariablePlan>,
+    ambient_variables: &'a mut Vec<SourceNamespaceAmbientVariablePlan>,
+    object_initializers: &'a mut Vec<SourceNamespaceObjectInitializerPlan>,
+    diagnostics: &'a mut Vec<NamespaceDiagnosticPlan>,
 }
 
 /// A complete, read-only namespace declaration and body plan.
@@ -137,6 +165,7 @@ pub(super) struct SourceNamespacePlan {
     pub(super) members: Vec<SourceNamespaceMemberPlan>,
     imports: Vec<SourceNamespaceImportPlan>,
     implicit_variables: Vec<SourceNamespaceImplicitVariablePlan>,
+    ambient_variables: Vec<SourceNamespaceAmbientVariablePlan>,
     object_initializers: Vec<SourceNamespaceObjectInitializerPlan>,
     diagnostics: Vec<NamespaceDiagnosticPlan>,
 }
@@ -1228,6 +1257,280 @@ fn plan_namespace_object_initializer(
     })
 }
 
+fn plan_namespace_ambient_initializer(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    namespace: SemanticSymbolId,
+    variable: (NodeRef, SemanticSymbolId, NodeRef),
+    members: &[SourceNamespaceMemberPlan],
+) -> Result<SourceNamespaceAmbientVariablePlan, SourceCheckError> {
+    let (declaration, symbol, initializer) = variable;
+    let declaration_record = owned_node(arena, bound, store, declaration)?;
+    let NodeData::VariableDeclaration(variable) = &declaration_record.data else {
+        return Err(unsupported(
+            declaration,
+            declaration_record.kind,
+            SourceSyntaxRole::VariableDeclaration,
+        ));
+    };
+    let name = child(declaration, variable.name);
+    let name_record = owned_node(arena, bound, store, name)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(unsupported(
+            name,
+            name_record.kind,
+            SourceSyntaxRole::VariableName,
+        ));
+    };
+    let symbol_record = store.symbol(symbol).ok_or(SourceCheckError::Provenance(
+        SourceCheckProvenanceError::MissingDeclarationSymbol(declaration),
+    ))?;
+    if declaration_record.kind != SyntaxKind::VariableDeclaration
+        || declaration_record.flags.0 != 0
+        || variable.exclamation_token.is_some()
+        || variable.local_symbol.is_some()
+        || variable.symbol.is_some()
+        || variable.type_.is_some()
+        || variable.facts != 0
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(declaration.node)
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+        || symbol_record.flags() != SymbolFlags::BLOCK_SCOPED_VARIABLE
+        || symbol_record.check_flags() != CheckFlags::NONE
+        || symbol_record.declarations() != Some(&[declaration])
+        || symbol_record.value_declaration() != Some(declaration)
+        || symbol_record.name().as_utf8() != Some(identifier.text.as_str())
+        || symbol_record.members().is_some()
+        || symbol_record.exports().is_some()
+        || symbol_record.export_symbol().is_some()
+        || store.get_parent_of_symbol(symbol) != Some(namespace)
+        || store
+            .symbol(namespace)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| store.symbol_table(exports))
+            .and_then(|exports| exports.get_source(&identifier.text))
+            .and_then(|candidate| store.get_merged_symbol(candidate))
+            != Some(symbol)
+    {
+        return Err(unsupported(
+            declaration,
+            declaration_record.kind,
+            SourceSyntaxRole::VariableDeclaration,
+        ));
+    }
+
+    let initializer_record = owned_node(arena, bound, store, initializer)?;
+    if initializer_record.parent != Some(declaration.node) || initializer_record.flags.0 != 0 {
+        return Err(unsupported(
+            initializer,
+            initializer_record.kind,
+            SourceSyntaxRole::VariableInitializer,
+        ));
+    }
+    let value = match &initializer_record.data {
+        NodeData::StringLiteral(literal)
+            if initializer_record.kind == SyntaxKind::StringLiteral
+                && literal.token_flags.0 == 0 =>
+        {
+            SourceNamespaceAmbientInitializer::String(literal.text.clone())
+        }
+        NodeData::NoSubstitutionTemplateLiteral(literal)
+            if initializer_record.kind == SyntaxKind::NoSubstitutionTemplateLiteral
+                && literal.token_flags.0 == 0
+                && literal.template_flags.0 == 0
+                && literal.symbol.is_none() =>
+        {
+            SourceNamespaceAmbientInitializer::String(literal.text.clone())
+        }
+        NodeData::PropertyAccessExpression(access)
+            if initializer_record.kind == SyntaxKind::PropertyAccessExpression
+                && access.flow_node.is_none()
+                && access.question_dot_token.is_none()
+                && access.facts == 0 =>
+        {
+            plan_namespace_ambient_enum_member(
+                arena,
+                bound,
+                store,
+                initializer,
+                (
+                    child(initializer, access.expression),
+                    child(initializer, access.name),
+                ),
+                false,
+                members,
+            )?
+        }
+        NodeData::ElementAccessExpression(access)
+            if initializer_record.kind == SyntaxKind::ElementAccessExpression
+                && access.flow_node.is_none()
+                && access.question_dot_token.is_none()
+                && access.facts == 0 =>
+        {
+            plan_namespace_ambient_enum_member(
+                arena,
+                bound,
+                store,
+                initializer,
+                (
+                    child(initializer, access.expression),
+                    child(initializer, access.argument_expression),
+                ),
+                true,
+                members,
+            )?
+        }
+        _ => {
+            return Err(unsupported(
+                initializer,
+                initializer_record.kind,
+                SourceSyntaxRole::VariableInitializer,
+            ));
+        }
+    };
+
+    Ok(SourceNamespaceAmbientVariablePlan {
+        declaration,
+        symbol,
+        initializer,
+        value,
+    })
+}
+
+fn plan_namespace_ambient_enum_member(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    access: NodeRef,
+    nodes: (NodeRef, NodeRef),
+    computed: bool,
+    members: &[SourceNamespaceMemberPlan],
+) -> Result<SourceNamespaceAmbientInitializer, SourceCheckError> {
+    let (receiver, name) = nodes;
+    let receiver_record = owned_node(arena, bound, store, receiver)?;
+    let NodeData::Identifier(identifier) = &receiver_record.data else {
+        return Err(unsupported(
+            receiver,
+            receiver_record.kind,
+            SourceSyntaxRole::VariableInitializer,
+        ));
+    };
+    if receiver_record.kind != SyntaxKind::Identifier
+        || receiver_record.flags.0 != 0
+        || receiver_record.parent != Some(access.node)
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+    {
+        return Err(unsupported(
+            receiver,
+            receiver_record.kind,
+            SourceSyntaxRole::VariableInitializer,
+        ));
+    }
+    let name_record = owned_node(arena, bound, store, name)?;
+    if name_record.flags.0 != 0 || name_record.parent != Some(access.node) {
+        return Err(unsupported(
+            name,
+            name_record.kind,
+            SourceSyntaxRole::VariableInitializer,
+        ));
+    }
+    let (member_name, key) = match &name_record.data {
+        NodeData::Identifier(identifier)
+            if !computed
+                && name_record.kind == SyntaxKind::Identifier
+                && identifier.flow_node.is_none()
+                && !identifier.text.is_empty() =>
+        {
+            (identifier.text.as_str(), None)
+        }
+        NodeData::StringLiteral(literal)
+            if computed
+                && name_record.kind == SyntaxKind::StringLiteral
+                && literal.token_flags.0 == 0 =>
+        {
+            (literal.text.as_str(), Some(literal.text.clone()))
+        }
+        NodeData::NoSubstitutionTemplateLiteral(literal)
+            if computed
+                && name_record.kind == SyntaxKind::NoSubstitutionTemplateLiteral
+                && literal.token_flags.0 == 0
+                && literal.template_flags.0 == 0
+                && literal.symbol.is_none() =>
+        {
+            (literal.text.as_str(), Some(literal.text.clone()))
+        }
+        _ => {
+            return Err(unsupported(
+                name,
+                name_record.kind,
+                SourceSyntaxRole::VariableInitializer,
+            ));
+        }
+    };
+    let mut candidates = members.iter().filter_map(|member| match member {
+        SourceNamespaceMemberPlan::EmptyEnum { symbol, .. }
+            if store
+                .symbol(*symbol)
+                .and_then(|record| record.name().as_utf8())
+                == Some(identifier.text.as_str()) =>
+        {
+            Some(*symbol)
+        }
+        _ => None,
+    });
+    let Some(owner) = candidates.next() else {
+        return Err(unsupported(
+            receiver,
+            receiver_record.kind,
+            SourceSyntaxRole::VariableInitializer,
+        ));
+    };
+    let member = store
+        .symbol(owner)
+        .and_then(ts_binder::semantic::Symbol::exports)
+        .and_then(|exports| store.symbol_table(exports))
+        .and_then(|exports| exports.get_source(member_name))
+        .and_then(|member| store.get_merged_symbol(member));
+    let Some(member) = member else {
+        return Err(unsupported(
+            name,
+            name_record.kind,
+            SourceSyntaxRole::VariableInitializer,
+        ));
+    };
+    if candidates.next().is_some()
+        || store.symbol(member).is_none_or(|record| {
+            record.flags() != SymbolFlags::ENUM_MEMBER || record.parent() != Some(owner)
+        })
+        || store
+            .symbol_node_links(receiver)
+            .is_some_and(|links| links.resolved_symbol.is_some_and(|cached| cached != owner))
+        || store
+            .symbol_node_links(access)
+            .is_some_and(|links| links.resolved_symbol.is_some_and(|cached| cached != member))
+    {
+        return Err(unsupported(
+            access,
+            arena
+                .get(access.node)
+                .map_or(SyntaxKind::Unknown, |record| record.kind),
+            SourceSyntaxRole::VariableInitializer,
+        ));
+    }
+
+    Ok(SourceNamespaceAmbientInitializer::EnumMember {
+        owner,
+        member,
+        receiver,
+        name,
+        key,
+    })
+}
+
 fn plan_namespace_variables(
     arena: &NodeArena,
     bound: &BoundFile,
@@ -1235,14 +1538,16 @@ fn plan_namespace_variables(
     namespace: (NodeRef, SemanticSymbolId),
     ambient: bool,
     statement: NodeRef,
-    output: (
-        &mut Vec<SourceNamespaceMemberPlan>,
-        &mut Vec<SourceNamespaceImplicitVariablePlan>,
-        &mut Vec<SourceNamespaceObjectInitializerPlan>,
-    ),
+    output: NamespaceVariablePlans<'_>,
 ) -> Result<(), SourceCheckError> {
     let (namespace, owner) = namespace;
-    let (members, implicit_variables, object_initializers) = output;
+    let NamespaceVariablePlans {
+        members,
+        implicit_variables,
+        ambient_variables,
+        object_initializers,
+        diagnostics,
+    } = output;
     let record = owned_node(arena, bound, store, statement)?;
     let NodeData::VariableStatement(variable) = &record.data else {
         return Err(SourceCheckError::Provenance(
@@ -1301,12 +1606,42 @@ fn plan_namespace_variables(
                 SourceSyntaxRole::VariableStatement,
             ));
         }
-        if !runtime && variable.initializer.is_some() {
-            return Err(unsupported(
-                declaration,
-                declaration_record.kind,
-                SourceSyntaxRole::VariableInitializer,
-            ));
+        let initialized_ambient_export = !runtime
+            && ambient
+            && exported
+            && !declared
+            && list_record.flags.0 == NODE_FLAG_CONST
+            && declarations.declarations.nodes.len() == 1
+            && variable.type_.is_none()
+            && variable.initializer.is_some_and(|initializer| {
+                arena.get(initializer).is_some_and(|record| {
+                    matches!(
+                        record.kind,
+                        SyntaxKind::StringLiteral
+                            | SyntaxKind::NoSubstitutionTemplateLiteral
+                            | SyntaxKind::PropertyAccessExpression
+                            | SyntaxKind::ElementAccessExpression
+                    )
+                })
+            });
+        if !runtime && let Some(initializer) = variable.initializer {
+            if !ambient || list_record.flags.0 != NODE_FLAG_CONST {
+                return Err(unsupported(
+                    declaration,
+                    declaration_record.kind,
+                    SourceSyntaxRole::VariableInitializer,
+                ));
+            }
+            let initializer = child(declaration, initializer);
+            if !initialized_ambient_export {
+                plan_namespace_numeric_initializer(arena, bound, store, declaration, initializer)?;
+                if variable.type_.is_some() {
+                    diagnostics.push(NamespaceDiagnosticPlan {
+                        node: initializer,
+                        code: 1039,
+                    });
+                }
+            }
         }
         let symbol = declaration_symbol(bound, store, declaration, SymbolFlags::VARIABLE)?;
         validate_symbol_parent(store, declaration, symbol, Some(owner))?;
@@ -1316,6 +1651,23 @@ fn plan_namespace_variables(
             return Err(SourceCheckError::Variable(
                 VariableInvariant::InvalidValueLinks(symbol),
             ));
+        }
+        if initialized_ambient_export {
+            let initializer = child(
+                declaration,
+                variable
+                    .initializer
+                    .expect("an initialized ambient export retains its initializer"),
+            );
+            ambient_variables.push(plan_namespace_ambient_initializer(
+                arena,
+                bound,
+                store,
+                owner,
+                (declaration, symbol, initializer),
+                members,
+            )?);
+            continue;
         }
         if let Some(annotation) = variable.type_ {
             let annotation = child(declaration, annotation);
@@ -1506,6 +1858,30 @@ fn cached_namespace_numeric_literal(
         .map_err(Into::into)
 }
 
+fn cached_namespace_string_literal(
+    store: &CanonicalTypeMapperStore,
+    value: &str,
+) -> Result<Option<TypeId>, SourceCheckError> {
+    let Some(regular) = store
+        .intrinsic_bootstrap()
+        .and_then(|bootstrap| bootstrap.cached_string_literal_type(value))
+    else {
+        return Ok(None);
+    };
+    if matches!(
+        store
+            .type_payload(regular)
+            .map(super::type_records::TypeRecord::data),
+        Some(TypeData::Literal(literal)) if literal.fresh_type.is_none()
+    ) {
+        return Ok(None);
+    }
+    store
+        .fresh_type_of_literal_type(regular)
+        .map(Some)
+        .map_err(Into::into)
+}
+
 fn plan_namespace(
     arena: &NodeArena,
     bound: &BoundFile,
@@ -1635,6 +2011,7 @@ fn plan_namespace(
     let mut members = Vec::new();
     let mut imports = Vec::new();
     let mut implicit_variables = Vec::new();
+    let mut ambient_variables = Vec::new();
     let mut object_initializers = Vec::new();
     if let Some(body) = namespace.body {
         let body = child(declaration, body);
@@ -1725,11 +2102,13 @@ fn plan_namespace(
                                 (declaration, symbol),
                                 ambient,
                                 statement,
-                                (
-                                    &mut members,
-                                    &mut implicit_variables,
-                                    &mut object_initializers,
-                                ),
+                                NamespaceVariablePlans {
+                                    members: &mut members,
+                                    implicit_variables: &mut implicit_variables,
+                                    ambient_variables: &mut ambient_variables,
+                                    object_initializers: &mut object_initializers,
+                                    diagnostics: &mut diagnostics,
+                                },
                             )?;
                         }
                         SyntaxKind::ImportEqualsDeclaration => {
@@ -1767,6 +2146,7 @@ fn plan_namespace(
         members,
         imports,
         implicit_variables,
+        ambient_variables,
         object_initializers,
         diagnostics,
     })
@@ -1846,6 +2226,18 @@ fn namespace_implicit_variables<'plan>(
     for member in &plan.members {
         if let SourceNamespaceMemberPlan::Namespace(nested) = member {
             namespace_implicit_variables(nested, variables);
+        }
+    }
+}
+
+fn namespace_ambient_variables<'plan>(
+    plan: &'plan SourceNamespacePlan,
+    variables: &mut Vec<&'plan SourceNamespaceAmbientVariablePlan>,
+) {
+    variables.extend(&plan.ambient_variables);
+    for member in &plan.members {
+        if let SourceNamespaceMemberPlan::Namespace(nested) = member {
+            namespace_ambient_variables(nested, variables);
         }
     }
 }
@@ -2418,6 +2810,7 @@ pub(super) fn execute_source_namespace(
     let mut declarations = Vec::new();
     let mut planned_diagnostics = Vec::new();
     let mut implicit_variables = Vec::new();
+    let mut ambient_variables = Vec::new();
     let mut object_initializers = Vec::new();
     namespace_annotations(
         plan,
@@ -2426,6 +2819,7 @@ pub(super) fn execute_source_namespace(
         &mut planned_diagnostics,
     );
     namespace_implicit_variables(plan, &mut implicit_variables);
+    namespace_ambient_variables(plan, &mut ambient_variables);
     namespace_object_initializers(plan, &mut object_initializers);
     implicit_variables.sort_by_key(|variable| {
         host.node(variable.declaration)
@@ -2449,7 +2843,10 @@ pub(super) fn execute_source_namespace(
 
     let mut values = Vec::<PendingNamespaceValue>::new();
     let mut numeric_initializers = Vec::new();
-    if !implicit_variables.is_empty() || !object_initializers.is_empty() {
+    if !implicit_variables.is_empty()
+        || !ambient_variables.is_empty()
+        || !object_initializers.is_empty()
+    {
         let bootstrap = store
             .intrinsic_bootstrap()
             .ok_or(SourceCheckError::LiteralCache(
@@ -2457,6 +2854,8 @@ pub(super) fn execute_source_namespace(
             ))?;
         let any = bootstrap.any_type;
         let number = bootstrap.number_type;
+        let string = bootstrap.string_type;
+        let mut strings = Vec::new();
         for variable in &implicit_variables {
             let type_ = if let Some(initializer) = variable.initializer {
                 let value = plan_namespace_numeric_initializer(
@@ -2544,16 +2943,138 @@ pub(super) fn execute_source_namespace(
                 numeric_initializers.push((property.type_node, value));
             }
         }
+        for variable in &ambient_variables {
+            match &variable.value {
+                SourceNamespaceAmbientInitializer::String(value) => {
+                    let expected = cached_namespace_string_literal(store, value)?;
+                    if let Some(links) = store.type_node_links(variable.initializer)
+                        && (links.outer_type_parameters.is_some()
+                            || links
+                                .resolved_type
+                                .is_some_and(|cached| Some(cached) != expected))
+                    {
+                        return Err(SourceCheckError::Assertion(
+                            SourceAssertionError::InvalidExpressionCache {
+                                node: variable.initializer,
+                                cached: links.resolved_type,
+                                expected: expected.unwrap_or(string),
+                            },
+                        ));
+                    }
+                    if let Some(links) = store.value_symbol_links(variable.symbol)
+                        && links != &ValueSymbolLinks::default()
+                        && links.resolved_type != expected
+                    {
+                        return Err(SourceCheckError::Variable(
+                            VariableInvariant::InvalidValueLinks(variable.symbol),
+                        ));
+                    }
+                    strings.push(value.clone());
+                }
+                SourceNamespaceAmbientInitializer::EnumMember {
+                    owner,
+                    member,
+                    receiver,
+                    name,
+                    key,
+                } => {
+                    let receiver_type = store
+                        .value_symbol_links(*owner)
+                        .and_then(|links| links.resolved_type);
+                    let member_type = store
+                        .value_symbol_links(*member)
+                        .and_then(|links| links.resolved_type);
+                    for (node, expected) in [
+                        (*receiver, receiver_type),
+                        (variable.initializer, member_type),
+                    ] {
+                        if let Some(links) = store.type_node_links(node)
+                            && (links.outer_type_parameters.is_some()
+                                || links
+                                    .resolved_type
+                                    .is_some_and(|cached| Some(cached) != expected))
+                        {
+                            return Err(SourceCheckError::Assertion(
+                                SourceAssertionError::InvalidExpressionCache {
+                                    node,
+                                    cached: links.resolved_type,
+                                    expected: expected.unwrap_or(any),
+                                },
+                            ));
+                        }
+                    }
+                    if let Some(links) = store.value_symbol_links(variable.symbol)
+                        && links != &ValueSymbolLinks::default()
+                        && links.resolved_type != member_type
+                    {
+                        return Err(SourceCheckError::Variable(
+                            VariableInvariant::InvalidValueLinks(variable.symbol),
+                        ));
+                    }
+                    if let Some(key) = key {
+                        let expected = cached_namespace_string_literal(store, key)?;
+                        if let Some(links) = store.type_node_links(*name)
+                            && (links.outer_type_parameters.is_some()
+                                || links
+                                    .resolved_type
+                                    .is_some_and(|cached| Some(cached) != expected))
+                        {
+                            return Err(SourceCheckError::Assertion(
+                                SourceAssertionError::InvalidExpressionCache {
+                                    node: *name,
+                                    cached: links.resolved_type,
+                                    expected: expected.unwrap_or(string),
+                                },
+                            ));
+                        }
+                        strings.push(key.clone());
+                    }
+                }
+            }
+        }
         let numbers = numeric_initializers
             .iter()
             .map(|(_, value)| *value)
             .collect::<Vec<_>>();
-        store.prepare_regular_literal_types(&[], &numbers, &[])?;
+        store.prepare_regular_literal_types(&strings, &numbers, &[])?;
         let missing_initializer_links = numeric_initializers
             .iter()
             .filter(|(initializer, _)| store.type_node_links(*initializer).is_none())
-            .count();
+            .count()
+            + ambient_variables
+                .iter()
+                .map(|variable| match &variable.value {
+                    SourceNamespaceAmbientInitializer::String(_) => {
+                        usize::from(store.type_node_links(variable.initializer).is_none())
+                    }
+                    SourceNamespaceAmbientInitializer::EnumMember {
+                        receiver,
+                        name,
+                        key,
+                        ..
+                    } => {
+                        usize::from(store.type_node_links(variable.initializer).is_none())
+                            + usize::from(store.type_node_links(*receiver).is_none())
+                            + usize::from(key.is_some() && store.type_node_links(*name).is_none())
+                    }
+                })
+                .sum::<usize>();
         if !store.try_reserve_type_node_links(missing_initializer_links) {
+            return Err(SourceCheckError::LiteralCache(
+                SourceLiteralCacheError::Capacity,
+            ));
+        }
+        let missing_symbol_links = ambient_variables
+            .iter()
+            .filter_map(|variable| match &variable.value {
+                SourceNamespaceAmbientInitializer::EnumMember { receiver, .. } => Some(
+                    usize::from(store.symbol_node_links(*receiver).is_none())
+                        + usize::from(store.symbol_node_links(variable.initializer).is_none()),
+                ),
+                SourceNamespaceAmbientInitializer::String(_) => None,
+            })
+            .sum();
+        if !store.try_reserve_symbol_node_links(missing_symbol_links) {
             return Err(SourceCheckError::LiteralCache(
                 SourceLiteralCacheError::Capacity,
             ));
@@ -2683,6 +3204,58 @@ pub(super) fn execute_source_namespace(
         }
     }
 
+    let mut ambient_expression_types = Vec::<(NodeRef, TypeId)>::new();
+    let mut ambient_expression_symbols = Vec::<(NodeRef, SemanticSymbolId)>::new();
+    for variable in ambient_variables {
+        let type_ = match &variable.value {
+            SourceNamespaceAmbientInitializer::String(value) => {
+                let regular = store.regular_string_literal_type(value.clone())?;
+                let fresh = store.fresh_type_of_literal_type(regular)?;
+                ambient_expression_types.push((variable.initializer, fresh));
+                fresh
+            }
+            SourceNamespaceAmbientInitializer::EnumMember {
+                owner,
+                member,
+                receiver,
+                name,
+                key,
+            } => {
+                let receiver_type = store
+                    .value_symbol_links(*owner)
+                    .and_then(|links| links.resolved_type)
+                    .ok_or(SourceCheckError::Enum(*receiver))?;
+                let member_name = store
+                    .symbol(*member)
+                    .and_then(|record| record.name().as_utf8())
+                    .ok_or(SourceCheckError::Enum(variable.initializer))?;
+                let (resolved, type_) =
+                    super::enums::enum_value_member_type(store, receiver_type, member_name)
+                        .ok_or(SourceCheckError::Enum(variable.initializer))?;
+                if resolved != *member {
+                    return Err(SourceCheckError::Enum(variable.initializer));
+                }
+                ambient_expression_types.push((*receiver, receiver_type));
+                ambient_expression_symbols.push((*receiver, *owner));
+                if let Some(key) = key {
+                    let regular = store.regular_string_literal_type(key.clone())?;
+                    let fresh = store.fresh_type_of_literal_type(regular)?;
+                    ambient_expression_types.push((*name, fresh));
+                }
+                ambient_expression_types.push((variable.initializer, type_));
+                ambient_expression_symbols.push((variable.initializer, *member));
+                type_
+            }
+        };
+        stage_namespace_value(
+            store,
+            &mut values,
+            variable.declaration,
+            variable.symbol,
+            type_,
+        )?;
+    }
+
     let missing_value_links = values
         .iter()
         .filter(|value| store.value_symbol_links(value.symbol).is_none())
@@ -2709,6 +3282,43 @@ pub(super) fn execute_source_namespace(
                         .type_node_links(initializer)
                         .and_then(|links| links.resolved_type),
                     expected: fresh,
+                },
+            ));
+        }
+    }
+    for (node, type_) in ambient_expression_types {
+        let expected = TypeNodeLinks {
+            resolved_type: Some(type_),
+            ..TypeNodeLinks::default()
+        };
+        if store.type_node_links(node) != Some(&expected)
+            && !store.set_type_node_links(node, expected)
+        {
+            return Err(SourceCheckError::Assertion(
+                SourceAssertionError::InvalidExpressionCache {
+                    node,
+                    cached: store
+                        .type_node_links(node)
+                        .and_then(|links| links.resolved_type),
+                    expected: type_,
+                },
+            ));
+        }
+    }
+    for (node, symbol) in ambient_expression_symbols {
+        let expected = SymbolNodeLinks {
+            resolved_symbol: Some(symbol),
+        };
+        if store.symbol_node_links(node) != Some(&expected)
+            && !store.set_symbol_node_links(node, expected)
+        {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidSymbolNodeCache {
+                    node,
+                    cached: store
+                        .symbol_node_links(node)
+                        .and_then(|links| links.resolved_symbol),
+                    expected: symbol,
                 },
             ));
         }
