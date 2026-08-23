@@ -81,6 +81,17 @@ impl Case {
                 raw_line
             };
 
+            if line_index == 0
+                && line
+                    .strip_prefix(b"\xef\xbb\xbf")
+                    .and_then(|line| std::str::from_utf8(line).ok())
+                    .and_then(parse_directive_line)
+                    .is_some_and(|(name, _)| is_compiler_option_directive(name))
+            {
+                byte_offset += raw_line.len() + usize::from(has_line_ending);
+                continue;
+            }
+
             if let Some((line_text, name, value)) =
                 std::str::from_utf8(line).ok().and_then(|text| {
                     parse_directive_line(text).map(|(name, value)| (text, name, value))
@@ -4788,11 +4799,14 @@ fn bom_prefixed_compiler_directive(case: &Case) -> Option<(&str, &str)> {
     let source = case.source_text.as_str()?.strip_prefix('\u{feff}')?;
     let first_line = source.lines().next()?;
     let (name, value) = parse_directive_line(first_line)?;
+    is_compiler_option_directive(name).then_some((name, value))
+}
+
+fn is_compiler_option_directive(name: &str) -> bool {
     COMPILER_OPTION_NAMES
         .iter()
         .chain(LIST_OPTION_NAMES)
         .any(|option| option.eq_ignore_ascii_case(name))
-        .then_some((name, value))
 }
 
 fn project_configuration_unsupported_details(case: &Case) -> Vec<String> {
@@ -5811,9 +5825,8 @@ impl UnitBuilder {
 }
 
 fn parse_directive_line(line: &str) -> Option<(&str, &str)> {
-    // The pinned Go regexp begins `^//`: indented comments and UTF-8 BOM
-    // prefixed lines remain source, as do hyphenated TypeScript pragmas such as
-    // `@ts-nocheck` because the harness name grammar is `\w+`.
+    // The pinned Go regexp begins `^//`: indented comments remain source, as do
+    // hyphenated TypeScript pragmas because the harness name grammar is `\w+`.
     let comment = line
         .strip_prefix("//")?
         .trim_start_matches(is_pinned_regex_whitespace);
@@ -6621,12 +6634,13 @@ mod tests {
     }
 
     #[test]
-    fn preserves_a_bom_prefixed_directive_as_source() {
-        let case = Case::parse("bom.ts", "\u{feff}// @target: es2015\nconst value = 1;").unwrap();
+    fn removes_a_bom_prefixed_directive_without_changing_fixture_identity() {
+        let case = Case::parse("bom.ts", "\u{feff}// @target: es2015\n\nconst value = 1;").unwrap();
         assert!(case.directives.is_empty());
+        assert!(case.source_text.as_scannable_str().starts_with('\u{feff}'));
         assert_eq!(
             case.units[0].source_text.as_scannable_str(),
-            "\u{feff}// @target: es2015\nconst value = 1;"
+            "const value = 1;"
         );
     }
 
@@ -6644,11 +6658,9 @@ mod tests {
         let variant = expand_option_matrix(&case).remove(0);
         assert_eq!(variant.values.len(), 1);
         assert_eq!(variant.values["target"], "es2015");
-        assert!(
-            case.units[0]
-                .source_text
-                .as_scannable_str()
-                .starts_with('\u{feff}')
+        assert_eq!(
+            case.units[0].source_text.as_scannable_str(),
+            "function value(parameter) {}\n"
         );
         let options = fixture_compiler_options(&case, &variant);
         assert!(!options.strict);
