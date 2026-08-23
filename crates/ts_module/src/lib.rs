@@ -240,6 +240,7 @@ impl<'a, F: FileSystem + ?Sized> Resolver<'a, F> {
             extension_priority: ExtensionPriority::All,
             specifier_uses_ts_extension: is_typescript_extension(specifier),
             candidate_ending_is_from_config: false,
+            active_package_targets: BTreeSet::new(),
         };
         state.import_condition = mode.map_or_else(
             || state.use_import_condition(containing_file),
@@ -296,6 +297,7 @@ impl<'a, F: FileSystem + ?Sized> Resolver<'a, F> {
             extension_priority: ExtensionPriority::Types,
             specifier_uses_ts_extension: is_typescript_extension(name),
             candidate_ending_is_from_config: false,
+            active_package_targets: BTreeSet::new(),
         };
         state.import_condition = state.use_import_condition(containing_file);
         let containing_directory = directory_path(containing_file);
@@ -323,6 +325,7 @@ struct ResolutionState<'a, 'fs, F: FileSystem + ?Sized> {
     extension_priority: ExtensionPriority,
     specifier_uses_ts_extension: bool,
     candidate_ending_is_from_config: bool,
+    active_package_targets: BTreeSet<(String, String)>,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -742,7 +745,7 @@ impl<F: FileSystem + ?Sized> ResolutionState<'_, '_, F> {
                         && !target.starts_with("../")
                         && !is_absolute(target)
                         && let Some(resolved) =
-                            self.resolve_node_modules(&expanded, package_directory)
+                            self.resolve_bare_package_target(&expanded, package_directory)
                     {
                         return PackageTargetResolution::Resolved(resolved);
                     }
@@ -802,6 +805,27 @@ impl<F: FileSystem + ?Sized> ResolutionState<'_, '_, F> {
             Value::Null => PackageTargetResolution::Blocked,
             Value::Bool(_) | Value::Number(_) => PackageTargetResolution::NotMatched,
         }
+    }
+
+    fn resolve_bare_package_target(
+        &mut self,
+        specifier: &str,
+        package_directory: &str,
+    ) -> Option<ResolvedModule> {
+        let key = (normalize_path(package_directory), specifier.to_owned());
+        if !self.active_package_targets.insert(key.clone()) {
+            return None;
+        }
+        let resolved = if is_absolute_uri_specifier(specifier) {
+            self.resolve_path_mapping(specifier)
+        } else {
+            self.resolve_paths_or_base_url(specifier)
+                .or_else(|| self.resolve_package_imports_or_self(specifier, package_directory))
+                .or_else(|| self.resolve_node_modules(specifier, package_directory))
+                .or_else(|| self.resolve_from_type_roots(specifier, package_directory))
+        };
+        self.active_package_targets.remove(&key);
+        resolved
     }
 
     fn resolve_candidate_with_package(
@@ -956,13 +980,14 @@ impl<F: FileSystem + ?Sized> ResolutionState<'_, '_, F> {
     ) -> Option<ResolvedModule> {
         for candidate in self.module_suffix_candidates(path) {
             if self.resolver.file_system.file_exists(&candidate) {
+                let is_external_library_import = external || candidate.contains("/node_modules/");
                 let resolved_file_name = self.resolver.file_system.realpath(&candidate);
                 return Some(ResolvedModule {
                     extension: ts_path::extension_from_path(&resolved_file_name),
                     resolved_file_name,
                     resolved_using_ts_extension: self.specifier_uses_ts_extension
                         && !self.candidate_ending_is_from_config,
-                    is_external_library_import: external,
+                    is_external_library_import,
                     package_json: package_json.map(str::to_owned),
                 });
             }
@@ -1959,6 +1984,56 @@ mod tests {
     }
 
     #[test]
+    fn paths_into_node_modules_remain_external_before_symlink_resolution() {
+        let filesystem = fs(&[
+            ("/repo/node_modules/direct/index.d.ts", ""),
+            ("/workspace/linked/index.d.ts", ""),
+            ("/repo/src/local.d.ts", ""),
+        ]);
+        filesystem.add_directory_link("/workspace/linked", "/repo/node_modules/linked");
+        let resolver = Resolver::new(
+            &filesystem,
+            ResolutionOptions {
+                mode: ResolutionMode::Bundler,
+                base_url: Some("/repo".into()),
+                paths: BTreeMap::from([
+                    (
+                        "direct".into(),
+                        vec!["./node_modules/direct/index.d.ts".into()],
+                    ),
+                    (
+                        "linked".into(),
+                        vec!["./node_modules/linked/index.d.ts".into()],
+                    ),
+                    ("local".into(), vec!["./src/local.d.ts".into()]),
+                ]),
+                ..ResolutionOptions::default()
+            },
+        );
+
+        let direct = resolver
+            .resolve("direct", "/repo/main.ts")
+            .resolved
+            .unwrap();
+        assert_eq!(
+            direct.resolved_file_name,
+            "/repo/node_modules/direct/index.d.ts"
+        );
+        assert!(direct.is_external_library_import);
+
+        let linked = resolver
+            .resolve("linked", "/repo/main.ts")
+            .resolved
+            .unwrap();
+        assert_eq!(linked.resolved_file_name, "/workspace/linked/index.d.ts");
+        assert!(linked.is_external_library_import);
+
+        let local = resolver.resolve("local", "/repo/main.ts").resolved.unwrap();
+        assert_eq!(local.resolved_file_name, "/repo/src/local.d.ts");
+        assert!(!local.is_external_library_import);
+    }
+
+    #[test]
     fn configured_path_extensions_do_not_count_as_imported_typescript_extensions() {
         let fs = fs(&[("/repo/some-path/index.d.ts", "")]);
         let resolver = Resolver::new(
@@ -2669,6 +2744,96 @@ mod tests {
             "/repo/node_modules/dependency/entry.d.ts"
         );
         assert!(dependency.is_external_library_import);
+    }
+
+    #[test]
+    fn package_imports_can_resolve_the_current_package_through_self_exports() {
+        let filesystem = fs(&[
+            (
+                "/repo/package.json",
+                r##"{"name":"package","type":"module","exports":"./index.cjs","imports":{"#type":"package"}}"##,
+            ),
+            ("/repo/index.cts", "export const value = 1;"),
+        ]);
+        let resolver = Resolver::new(
+            &filesystem,
+            ResolutionOptions {
+                mode: ResolutionMode::NodeNext,
+                ..ResolutionOptions::default()
+            },
+        );
+
+        let target = resolver
+            .resolve_with_mode("#type", "/repo/index.ts", ModuleFormat::Esm)
+            .resolved
+            .unwrap();
+        assert_eq!(target.resolved_file_name, "/repo/index.cts");
+        assert_eq!(target.package_json.as_deref(), Some("/repo/package.json"));
+        assert!(!target.is_external_library_import);
+    }
+
+    #[test]
+    fn package_imports_apply_paths_to_bare_package_targets() {
+        let filesystem = fs(&[
+            (
+                "/repo/package.json",
+                r##"{"imports":{"#dependency":"workspace-alias"}}"##,
+            ),
+            ("/repo/src/dependency.ts", "export const value = 1;"),
+        ]);
+        let resolver = Resolver::new(
+            &filesystem,
+            ResolutionOptions {
+                mode: ResolutionMode::Bundler,
+                base_url: Some("/repo".into()),
+                paths: BTreeMap::from([(
+                    "workspace-alias".into(),
+                    vec!["./src/dependency.ts".into()],
+                )]),
+                ..ResolutionOptions::default()
+            },
+        );
+
+        let dependency = resolver
+            .resolve("#dependency", "/repo/main.ts")
+            .resolved
+            .unwrap();
+        assert_eq!(dependency.resolved_file_name, "/repo/src/dependency.ts");
+        assert!(!dependency.is_external_library_import);
+    }
+
+    #[test]
+    fn cyclic_package_import_maps_fail_without_recursive_resolution() {
+        let filesystem = fs(&[(
+            "/repo/package.json",
+            r##"{"name":"package","exports":"package","imports":{"#self":"package","#first":"#second","#second":"#first"}}"##,
+        )]);
+        let resolver = Resolver::new(
+            &filesystem,
+            ResolutionOptions {
+                mode: ResolutionMode::NodeNext,
+                ..ResolutionOptions::default()
+            },
+        );
+
+        assert!(
+            resolver
+                .resolve("#self", "/repo/index.ts")
+                .resolved
+                .is_none()
+        );
+        assert!(
+            resolver
+                .resolve("#first", "/repo/index.ts")
+                .resolved
+                .is_none()
+        );
+        assert!(
+            resolver
+                .resolve("#second", "/repo/index.ts")
+                .resolved
+                .is_none()
+        );
     }
 
     #[test]
