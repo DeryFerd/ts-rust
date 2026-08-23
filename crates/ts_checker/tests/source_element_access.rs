@@ -324,3 +324,54 @@ fn boolean_index_reports_the_complete_boolean_type() {
         "Type 'boolean' cannot be used as an index type.",
     );
 }
+
+#[test]
+fn const_enum_element_access_preserves_member_identity_and_missing_diagnostics() {
+    let source = concat!(
+        "const enum Status { Ready = 1 }\n",
+        "const value = Status[\"Ready\"];\n",
+        "const missing = Status[\"Missing\"];\n",
+    );
+    let library = parse_source_file(LIBRARY);
+    let parsed = parse_source_file(source);
+    assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(25);
+    let mut context = context(&library, FileId::new(24), &parsed, file);
+
+    context.check_source_file(file).unwrap();
+
+    let value = variable_initializer(&parsed, file, "value");
+    assert_eq!(
+        context
+            .type_to_string(resolved_type(&context, value))
+            .unwrap(),
+        "Status.Ready",
+    );
+    assert!(
+        context
+            .store()
+            .symbol_node_links(value)
+            .and_then(|links| links.resolved_symbol)
+            .is_some()
+    );
+    let [diagnostic] = context.diagnostics().as_slice() else {
+        panic!("expected one missing enum-member diagnostic")
+    };
+    assert_eq!(diagnostic.diagnostic.code(), 2339);
+    assert_eq!(
+        diagnostic.diagnostic.arguments,
+        ["Missing", "typeof Status"]
+    );
+    assert_eq!(
+        node_text(source, &parsed, diagnostic.node.unwrap()),
+        "\"Missing\""
+    );
+
+    let warm = (context.store().type_len(), context.diagnostics().clone());
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (context.store().type_len(), context.diagnostics().clone()),
+        warm
+    );
+}

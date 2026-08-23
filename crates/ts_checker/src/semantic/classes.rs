@@ -16,6 +16,7 @@
 //! Empty zero-argument methods retain their canonical callable identities.
 //! Direct classes can also retain one string-to-number index signature.
 //! Definite annotated fields admit one authenticated ambient-function decorator.
+//! One direct getter/setter pair can expose an annotated numeric property.
 //! Nonempty executable bodies, general heritage, and non-primitive annotations
 //! remain later class stages.
 
@@ -27,10 +28,12 @@ use ts_binder::{
     InternalSymbolName, SemanticSymbolId, SymbolFlags, SymbolTableId,
     semantic::{PreparedSymbolTable, Symbol},
 };
+use ts_jsnum::Number;
 
 use super::{
     CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, IndexInfoId,
     ResolvedSignatureState, SignatureId, SignatureLinks, TypeId,
+    bootstrap::LiteralTypeCacheError,
     declared::{preflight_class_or_interface_reference, preflight_node, type_list_key},
     links::{TypeNodeLinks, ValueSymbolLinks},
     signatures::SignatureFlags,
@@ -75,6 +78,20 @@ struct ClassMethodPlan {
     name: String,
     side: ClassPropertySide,
     return_type_node: Option<NodeRef>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ClassAccessorPlan {
+    getter: NodeRef,
+    setter: NodeRef,
+    symbol: SemanticSymbolId,
+    name_node: NodeRef,
+    name: String,
+    type_node: NodeRef,
+    return_expression: NodeRef,
+    literal_text: String,
+    setter_parameter: NodeRef,
+    setter_parameter_symbol: SemanticSymbolId,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -149,6 +166,7 @@ pub(super) struct ClassDeclarationPlan {
     base: Option<DirectClassBasePlan>,
     implementations: Vec<DirectClassImplementationPlan>,
     constructor: Option<ClassConstructorPlan>,
+    accessor: Option<ClassAccessorPlan>,
     index: Option<ClassIndexSignaturePlan>,
     instance_members: Option<SymbolTableId>,
     static_members: SymbolTableId,
@@ -1139,6 +1157,292 @@ fn plan_method(
     })
 }
 
+fn accessor_member_error(node: NodeRef, kind: SyntaxKind) -> ClassError {
+    unsupported(ClassUnsupported::Member { node, kind })
+}
+
+fn accessor_name(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    name: ts_ast::NodeId,
+) -> Result<(NodeRef, String), ClassError> {
+    let name = NodeRef::new(declaration.arena, declaration.file, name);
+    let record = preflight_node(store, host, name)?;
+    let NodeData::Identifier(identifier) = &record.data else {
+        return Err(unsupported(ClassUnsupported::PropertyName {
+            node: name,
+            kind: record.kind,
+        }));
+    };
+    if record.kind != SyntaxKind::Identifier
+        || record.flags.0 != 0
+        || record.parent != Some(declaration.node)
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+    {
+        return Err(invariant(ClassInvariant::InvalidName(name)));
+    }
+    Ok((name, identifier.text.clone()))
+}
+
+fn plan_numeric_getter_return(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    getter: NodeRef,
+    body: NodeRef,
+) -> Result<(NodeRef, String), ClassError> {
+    let reject = || accessor_member_error(getter, SyntaxKind::GetAccessor);
+    let body_record = preflight_node(store, host, body)?;
+    let NodeData::Block(block) = &body_record.data else {
+        return Err(reject());
+    };
+    if body_record.kind != SyntaxKind::Block
+        || body_record.flags.0 != 0
+        || body_record.parent != Some(getter.node)
+        || block.facts != 0
+        || block.statements.has_trailing_comma
+        || block.statements.nodes.len() != 1
+    {
+        return Err(reject());
+    }
+    let statement = NodeRef::new(body.arena, body.file, block.statements.nodes[0]);
+    let statement_record = preflight_node(store, host, statement)?;
+    let NodeData::ReturnStatement(return_statement) = &statement_record.data else {
+        return Err(reject());
+    };
+    if statement_record.kind != SyntaxKind::ReturnStatement
+        || statement_record.flags.0 != 0
+        || statement_record.parent != Some(body.node)
+        || return_statement.flow_node.is_some()
+        || return_statement.facts != 0
+    {
+        return Err(reject());
+    }
+    let Some(expression) = return_statement.expression else {
+        return Err(reject());
+    };
+    let expression = NodeRef::new(statement.arena, statement.file, expression);
+    let expression_record = preflight_node(store, host, expression)?;
+    let NodeData::NumericLiteral(literal) = &expression_record.data else {
+        return Err(reject());
+    };
+    let spelling_matches = host
+        .source(expression)
+        .and_then(|(arena, _)| arena.source_text())
+        .is_none_or(|source| {
+            source.get(
+                expression_record.range.start.get() as usize
+                    ..expression_record.range.end.get() as usize,
+            ) == Some(literal.text.as_str())
+        });
+    if expression_record.kind != SyntaxKind::NumericLiteral
+        || expression_record.flags.0 != 0
+        || expression_record.parent != Some(statement.node)
+        || literal.token_flags.0 != 0
+        || ts_jsnum::from_string(&literal.text).is_nan()
+        || !spelling_matches
+    {
+        return Err(reject());
+    }
+    Ok((expression, literal.text.clone()))
+}
+
+fn plan_unannotated_setter_parameter(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    setter: NodeRef,
+) -> Result<(NodeRef, SemanticSymbolId), ClassError> {
+    let reject = || accessor_member_error(setter, SyntaxKind::SetAccessor);
+    let record = preflight_node(store, host, setter)?;
+    let NodeData::SetAccessorDeclaration(accessor) = &record.data else {
+        return Err(reject());
+    };
+    if record.kind != SyntaxKind::SetAccessor
+        || record.flags.0 != 0
+        || accessor.asterisk_token.is_some()
+        || accessor.end_flow_node.is_some()
+        || accessor.flow_node.is_some()
+        || accessor.full_signature.is_some()
+        || accessor.next_container.is_some()
+        || accessor.postfix_token.is_some()
+        || accessor.symbol.is_some()
+        || accessor.type_.is_some()
+        || accessor.type_parameters.is_some()
+        || accessor.facts != 0
+        || accessor.modifiers.is_some()
+        || accessor.parameters.has_trailing_comma
+        || accessor.parameters.nodes.len() != 1
+    {
+        return Err(reject());
+    }
+    let Some(body) = accessor.body else {
+        return Err(reject());
+    };
+    let body = NodeRef::new(setter.arena, setter.file, body);
+    let body_record = preflight_node(store, host, body)?;
+    let NodeData::Block(block) = &body_record.data else {
+        return Err(reject());
+    };
+    if body_record.kind != SyntaxKind::Block
+        || body_record.flags.0 != 0
+        || body_record.parent != Some(setter.node)
+        || body_record.range.end != record.range.end
+        || block.facts != 0
+        || block.statements.has_trailing_comma
+        || !block.statements.nodes.is_empty()
+    {
+        return Err(reject());
+    }
+
+    let parameter = NodeRef::new(setter.arena, setter.file, accessor.parameters.nodes[0]);
+    let parameter_record = preflight_node(store, host, parameter)?;
+    let NodeData::ParameterDeclaration(data) = &parameter_record.data else {
+        return Err(reject());
+    };
+    if parameter_record.kind != SyntaxKind::Parameter
+        || parameter_record.flags.0 != 0
+        || parameter_record.parent != Some(setter.node)
+        || data.dot_dot_dot_token.is_some()
+        || data.initializer.is_some()
+        || data.question_token.is_some()
+        || data.symbol.is_some()
+        || data.type_.is_some()
+        || data.facts != 0
+        || data.modifiers.is_some()
+    {
+        return Err(reject());
+    }
+    let (name, text) = accessor_name(store, host, parameter, data.name)?;
+    if text == "this" || preflight_node(store, host, name)?.range.end > parameter_record.range.end {
+        return Err(reject());
+    }
+    let symbol = bound_symbol(store, host, parameter)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(parameter)))?;
+    let symbol_record = store
+        .symbol(symbol)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(parameter)))?;
+    let locals = host
+        .bound_file(setter)
+        .and_then(|bound| bound.locals(setter))
+        .and_then(|locals| store.symbol_table(locals));
+    if symbol_record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+        || symbol_record.check_flags() != CheckFlags::NONE
+        || symbol_record.name().as_utf8() != Some(text.as_str())
+        || symbol_record.declarations() != Some(&[parameter])
+        || symbol_record.value_declaration() != Some(parameter)
+        || symbol_record.members().is_some()
+        || symbol_record.exports().is_some()
+        || symbol_record.parent().is_some()
+        || symbol_record.export_symbol().is_some()
+        || locals.is_none_or(|locals| locals.len() != 1 || locals.get_source(&text) != Some(symbol))
+    {
+        return Err(invariant(ClassInvariant::InvalidPropertySymbol(parameter)));
+    }
+    Ok((parameter, symbol))
+}
+
+fn plan_class_accessor_pair(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    getter: NodeRef,
+    setter: NodeRef,
+    instance_members: Option<SymbolTableId>,
+) -> Result<ClassAccessorPlan, ClassError> {
+    let reject = || accessor_member_error(getter, SyntaxKind::GetAccessor);
+    let getter_record = preflight_node(store, host, getter)?;
+    let NodeData::GetAccessorDeclaration(accessor) = &getter_record.data else {
+        return Err(reject());
+    };
+    if getter_record.kind != SyntaxKind::GetAccessor
+        || getter_record.flags.0 != 0
+        || accessor.asterisk_token.is_some()
+        || accessor.end_flow_node.is_some()
+        || accessor.flow_node.is_some()
+        || accessor.full_signature.is_some()
+        || accessor.next_container.is_some()
+        || accessor.postfix_token.is_some()
+        || accessor.symbol.is_some()
+        || accessor.type_parameters.is_some()
+        || accessor.facts != 0
+        || accessor.modifiers.is_some()
+        || !accessor.parameters.nodes.is_empty()
+        || accessor.parameters.has_trailing_comma
+    {
+        return Err(reject());
+    }
+    let (name_node, name) = accessor_name(store, host, getter, accessor.name)?;
+    let Some(type_node) = accessor.type_ else {
+        return Err(reject());
+    };
+    let type_node = NodeRef::new(getter.arena, getter.file, type_node);
+    let type_record = preflight_node(store, host, type_node)?;
+    if type_record.kind != SyntaxKind::NumberKeyword
+        || type_record.flags.0 != 0
+        || type_record.parent != Some(getter.node)
+        || !matches!(type_record.data, NodeData::KeywordTypeNode(_))
+    {
+        return Err(reject());
+    }
+    let Some(body) = accessor.body else {
+        return Err(reject());
+    };
+    let body = NodeRef::new(getter.arena, getter.file, body);
+    let (return_expression, literal_text) = plan_numeric_getter_return(store, host, getter, body)?;
+
+    let setter_record = preflight_node(store, host, setter)?;
+    let NodeData::SetAccessorDeclaration(setter_data) = &setter_record.data else {
+        return Err(reject());
+    };
+    if setter_record.parent != getter_record.parent {
+        return Err(reject());
+    }
+    let (_, setter_name) = accessor_name(store, host, setter, setter_data.name)?;
+    if setter_name != name {
+        return Err(reject());
+    }
+    let (setter_parameter, setter_parameter_symbol) =
+        plan_unannotated_setter_parameter(store, host, setter)?;
+
+    let symbol = bound_symbol(store, host, getter)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(getter)))?;
+    let setter_symbol = bound_symbol(store, host, setter)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(setter)))?;
+    let symbol_record = store
+        .symbol(symbol)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(getter)))?;
+    let members = instance_members.and_then(|table| store.symbol_table(table));
+    if setter_symbol != symbol
+        || symbol_record.flags() != SymbolFlags::ACCESSOR
+        || symbol_record.check_flags() != CheckFlags::NONE
+        || symbol_record.name().as_utf8() != Some(name.as_str())
+        || symbol_record.declarations() != Some(&[getter, setter])
+        || symbol_record.value_declaration() != Some(getter)
+        || symbol_record.members().is_some()
+        || symbol_record.exports().is_some()
+        || symbol_record.parent() != Some(owner)
+        || symbol_record.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || members.and_then(|members| members.get_source(&name)) != Some(symbol)
+    {
+        return Err(invariant(ClassInvariant::InvalidPropertySymbol(getter)));
+    }
+
+    Ok(ClassAccessorPlan {
+        getter,
+        setter,
+        symbol,
+        name_node,
+        name,
+        type_node,
+        return_expression,
+        literal_text,
+        setter_parameter,
+        setter_parameter_symbol,
+    })
+}
+
 fn plan_class_index_signature(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -1898,9 +2202,10 @@ fn plan_class_declaration(
     let mut instance_names = HashSet::new();
     let mut static_names = HashSet::new();
     let mut constructor = None;
+    let mut accessor = None;
     let mut index = None;
     let mut previous_end = class.members.range.start;
-    for member in &class.members.nodes {
+    for (member_index, member) in class.members.nodes.iter().enumerate() {
         let member = NodeRef::new(declaration.arena, declaration.file, *member);
         let member_record = preflight_node(store, host, member)?;
         if member_record.parent != Some(declaration.node)
@@ -1911,6 +2216,12 @@ fn plan_class_declaration(
             return Err(invariant(ClassInvariant::InvalidProperty(member)));
         }
         previous_end = member_record.range.end;
+        if accessor
+            .as_ref()
+            .is_some_and(|accessor: &ClassAccessorPlan| accessor.setter == member)
+        {
+            continue;
+        }
         if member_record.kind == SyntaxKind::Constructor {
             if base.is_some() || constructor.is_some() {
                 return Err(unsupported(ClassUnsupported::Member {
@@ -1927,8 +2238,24 @@ fn plan_class_declaration(
             )?);
             continue;
         }
+        if member_record.kind == SyntaxKind::GetAccessor {
+            if base.is_some() || accessor.is_some() || index.is_some() {
+                return Err(accessor_member_error(member, SyntaxKind::GetAccessor));
+            }
+            let Some(setter) = class.members.nodes.get(member_index + 1).copied() else {
+                return Err(accessor_member_error(member, SyntaxKind::GetAccessor));
+            };
+            let setter = NodeRef::new(declaration.arena, declaration.file, setter);
+            let planned =
+                plan_class_accessor_pair(store, host, symbol, member, setter, instance_members)?;
+            if !instance_names.insert(planned.name.clone()) {
+                return Err(unsupported(ClassUnsupported::DuplicateProperty(member)));
+            }
+            accessor = Some(planned);
+            continue;
+        }
         if member_record.kind == SyntaxKind::IndexSignature {
-            if base.is_some() || index.is_some() {
+            if base.is_some() || index.is_some() || accessor.is_some() {
                 return Err(unsupported(ClassUnsupported::Member {
                     node: member,
                     kind: SyntaxKind::IndexSignature,
@@ -1995,7 +2322,7 @@ fn plan_class_declaration(
         }
     }
     if let Some(index) = index
-        && (!instance_properties.is_empty() || !instance_methods.is_empty())
+        && (!instance_properties.is_empty() || !instance_methods.is_empty() || accessor.is_some())
     {
         return Err(unsupported(ClassUnsupported::Member {
             node: index.declaration,
@@ -2008,6 +2335,7 @@ fn plan_class_declaration(
         .len()
         .checked_add(instance_methods.len())
         .and_then(|count| count.checked_add(usize::from(constructor.is_some())))
+        .and_then(|count| count.checked_add(usize::from(accessor.is_some())))
         .and_then(|count| count.checked_add(usize::from(index.is_some())))
         .ok_or_else(|| invariant(ClassInvariant::Capacity(declaration)))?;
     if instance_members.is_some() == (expected_instance_members == 0)
@@ -2038,6 +2366,7 @@ fn plan_class_declaration(
         base,
         implementations,
         constructor,
+        accessor,
         index,
         instance_members,
         static_members,
@@ -2065,6 +2394,7 @@ pub(super) struct ClassMemberPlan {
     class: ClassDeclarationPlan,
     property_types: Vec<TypeId>,
     method_return_types: Vec<TypeId>,
+    accessor_type: Option<TypeId>,
     index_types: Option<(TypeId, TypeId)>,
     uninitialized_instance_properties: Vec<NodeRef>,
 }
@@ -2333,6 +2663,141 @@ fn validate_method_cache_state(
     )))
 }
 
+fn exact_accessor_getter_signature(
+    store: &CanonicalTypeMapperStore,
+    getter: NodeRef,
+    type_: TypeId,
+) -> Option<SignatureId> {
+    let links = store.signature_links(getter)?;
+    let ResolvedSignatureState::Resolved(signature) = links.resolved_signature else {
+        return None;
+    };
+    let record = store.signature(signature)?;
+    (links
+        == &(SignatureLinks {
+            resolved_signature: ResolvedSignatureState::Resolved(signature),
+            ..SignatureLinks::default()
+        })
+        && record.flags() == SignatureFlags::NONE
+        && record.declaration() == Some(getter)
+        && record.type_parameters().is_empty()
+        && record.parameters().is_empty()
+        && record.this_parameter().is_none()
+        && record.min_argument_count() == 0
+        && record.resolved_min_argument_count() == -1
+        && record.resolved_return_type() == Some(type_)
+        && record.resolved_type_predicate().is_none()
+        && record.target().is_none()
+        && record.mapper().is_none()
+        && record.isolated_signature_type().is_none()
+        && record.composite().is_none())
+    .then_some(signature)
+}
+
+fn accessor_literal_number(accessor: &ClassAccessorPlan) -> Number {
+    ts_jsnum::from_string(&accessor.literal_text)
+}
+
+fn accessor_fresh_literal_type(
+    store: &CanonicalTypeMapperStore,
+    accessor: &ClassAccessorPlan,
+) -> Option<TypeId> {
+    let regular = store
+        .intrinsic_bootstrap()?
+        .cached_number_literal_type(accessor_literal_number(accessor))?;
+    store.fresh_type_of_literal_type(regular).ok()
+}
+
+fn validate_accessor_cache_state(
+    store: &CanonicalTypeMapperStore,
+    accessor: &ClassAccessorPlan,
+    type_: TypeId,
+) -> Result<(), ClassError> {
+    validate_index_type_cache(store, accessor.type_node, type_)?;
+    for symbol in [accessor.symbol, accessor.setter_parameter_symbol] {
+        if store.value_symbol_links(symbol).is_some_and(|links| {
+            links != &ValueSymbolLinks::default()
+                && links
+                    != &(ValueSymbolLinks {
+                        resolved_type: Some(type_),
+                        ..ValueSymbolLinks::default()
+                    })
+        }) {
+            return Err(invariant(ClassInvariant::InvalidPropertyValueCache(symbol)));
+        }
+    }
+    if store.signature_links(accessor.getter).is_some_and(|links| {
+        links != &SignatureLinks::default()
+            && exact_accessor_getter_signature(store, accessor.getter, type_).is_none()
+    }) {
+        return Err(invariant(ClassInvariant::InvalidPropertyValueCache(
+            accessor.symbol,
+        )));
+    }
+    if store
+        .signature_links(accessor.setter)
+        .is_some_and(|links| links != &SignatureLinks::default())
+    {
+        return Err(invariant(ClassInvariant::InvalidPropertyValueCache(
+            accessor.symbol,
+        )));
+    }
+    if let Some(links) = store.type_node_links(accessor.return_expression)
+        && links != &TypeNodeLinks::default()
+        && accessor_fresh_literal_type(store, accessor).is_none_or(|fresh| {
+            links
+                != &(TypeNodeLinks {
+                    resolved_type: Some(fresh),
+                    ..TypeNodeLinks::default()
+                })
+        })
+    {
+        return Err(invariant(ClassInvariant::InvalidPropertyTypeCache(
+            accessor.return_expression,
+        )));
+    }
+    Ok(())
+}
+
+fn exact_accessor_state(
+    store: &CanonicalTypeMapperStore,
+    accessor: &ClassAccessorPlan,
+    type_: TypeId,
+) -> bool {
+    let Some(fresh) = accessor_fresh_literal_type(store, accessor) else {
+        return false;
+    };
+    store.type_node_links(accessor.type_node)
+        == Some(&TypeNodeLinks {
+            resolved_type: Some(type_),
+            ..TypeNodeLinks::default()
+        })
+        && store.type_node_links(accessor.return_expression)
+            == Some(&TypeNodeLinks {
+                resolved_type: Some(fresh),
+                ..TypeNodeLinks::default()
+            })
+        && [accessor.symbol, accessor.setter_parameter_symbol]
+            .into_iter()
+            .all(|symbol| {
+                store.value_symbol_links(symbol)
+                    == Some(&ValueSymbolLinks {
+                        resolved_type: Some(type_),
+                        ..ValueSymbolLinks::default()
+                    })
+            })
+        && exact_accessor_getter_signature(store, accessor.getter, type_).is_some()
+        && store.source_node_kind(accessor.name_node) == Some(SyntaxKind::Identifier)
+        && store.source_node_parent(accessor.name_node)
+            == Some(SourceNodeParent::Parent(accessor.getter))
+        && store.source_node_kind(accessor.setter_parameter) == Some(SyntaxKind::Parameter)
+        && store.source_node_parent(accessor.setter_parameter)
+            == Some(SourceNodeParent::Parent(accessor.setter))
+        && store
+            .signature_links(accessor.setter)
+            .is_none_or(|links| links == &SignatureLinks::default())
+}
+
 fn uninitialized_instance_properties(
     store: &CanonicalTypeMapperStore,
     class: &ClassDeclarationPlan,
@@ -2470,6 +2935,21 @@ fn plan_index_types(
     Ok(Some((key_type, value_type)))
 }
 
+fn plan_accessor_type(
+    store: &CanonicalTypeMapperStore,
+    accessor: Option<&ClassAccessorPlan>,
+) -> Result<Option<TypeId>, ClassError> {
+    let Some(accessor) = accessor else {
+        return Ok(None);
+    };
+    let number = store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| bootstrap.number_type)
+        .ok_or_else(|| invariant(ClassInvariant::BootstrapUnavailable(accessor.getter)))?;
+    validate_accessor_cache_state(store, accessor, number)?;
+    Ok(Some(number))
+}
+
 /// Preflights the first exact class-member cut.
 ///
 /// Every property must have one direct primitive keyword annotation. This
@@ -2509,6 +2989,7 @@ fn plan_class_members(
         validate_method_cache_state(store, method, return_type)?;
         method_return_types.push(return_type);
     }
+    let accessor_type = plan_accessor_type(store, class.accessor.as_ref())?;
     let index_types = plan_index_types(store, class.index.as_ref())?;
     let uninitialized_instance_properties =
         uninitialized_instance_properties(store, &class, &property_types)?;
@@ -2516,6 +2997,7 @@ fn plan_class_members(
         class,
         property_types,
         method_return_types,
+        accessor_type,
         index_types,
         uninitialized_instance_properties,
     })
@@ -2545,6 +3027,7 @@ pub(super) fn plan_nongeneric_class_member_query(
     };
     let base_plan = plan_nongeneric_class_members(store, host, base.symbol)?;
     if base_plan.constructor_visibility() == ClassConstructorVisibility::Private
+        || base_plan.class.accessor.is_some()
         || base_plan.class.index.is_some()
     {
         return Err(unsupported(ClassUnsupported::Heritage(base.expression)));
@@ -2568,6 +3051,7 @@ fn prototype_symbol(
 fn planned_class_member_entries(
     properties: &[ClassPropertyPlan],
     methods: &[ClassMethodPlan],
+    accessor: Option<&ClassAccessorPlan>,
 ) -> Vec<(EscapedName, SemanticSymbolId)> {
     let mut entries = properties
         .iter()
@@ -2585,6 +3069,13 @@ fn planned_class_member_entries(
                 method.symbol,
             )
         }))
+        .chain(accessor.into_iter().map(|accessor| {
+            (
+                accessor.getter,
+                EscapedName::source(accessor.name.as_str()),
+                accessor.symbol,
+            )
+        }))
         .collect::<Vec<_>>();
     entries.sort_unstable_by_key(|(declaration, _, _)| *declaration);
     entries
@@ -2598,8 +3089,9 @@ fn exact_member_table(
     table: Option<SymbolTableId>,
     properties: &[ClassPropertyPlan],
     methods: &[ClassMethodPlan],
+    accessor: Option<&ClassAccessorPlan>,
 ) -> bool {
-    let entries = planned_class_member_entries(properties, methods);
+    let entries = planned_class_member_entries(properties, methods, accessor);
     match (table, entries.is_empty()) {
         (None, true) => true,
         (Some(table), false) => store.symbol_table(table).is_some_and(|table| {
@@ -2759,6 +3251,7 @@ fn completed_class_members(
     let instance_properties = planned_class_member_entries(
         &plan.class.instance_properties,
         &plan.class.instance_methods,
+        plan.class.accessor.as_ref(),
     )
     .into_iter()
     .map(|(_, symbol)| symbol)
@@ -2782,6 +3275,7 @@ fn completed_class_members(
             instance_structured.members,
             &plan.class.instance_properties,
             &plan.class.instance_methods,
+            plan.class.accessor.as_ref(),
         )
     {
         return None;
@@ -2792,11 +3286,14 @@ fn completed_class_members(
         return None;
     };
     let prototype = prototype_symbol(store, &plan.class)?;
-    let static_properties =
-        planned_class_member_entries(&plan.class.static_properties, &plan.class.static_methods)
-            .into_iter()
-            .map(|(_, symbol)| symbol)
-            .collect::<Vec<_>>();
+    let static_properties = planned_class_member_entries(
+        &plan.class.static_properties,
+        &plan.class.static_methods,
+        None,
+    )
+    .into_iter()
+    .map(|(_, symbol)| symbol)
+    .collect::<Vec<_>>();
     let mut all_static_properties = static_properties.clone();
     all_static_properties.push(prototype);
     let [default_construct_signature] = value.structured.signatures.as_deref()? else {
@@ -2862,6 +3359,16 @@ fn completed_class_members(
     }
     if plan
         .class
+        .accessor
+        .as_ref()
+        .zip(plan.accessor_type)
+        .is_some_and(|(accessor, type_)| !exact_accessor_state(store, accessor, type_))
+        || plan.class.accessor.is_some() != plan.accessor_type.is_some()
+    {
+        return None;
+    }
+    if plan
+        .class
         .methods
         .iter()
         .zip(&plan.method_return_types)
@@ -2915,16 +3422,22 @@ fn prepare_derived_member_surfaces(
     let own_instance_entries = planned_class_member_entries(
         &plan.class.instance_properties,
         &plan.class.instance_methods,
+        plan.class.accessor.as_ref(),
     );
     let inherited_instance_entries = planned_class_member_entries(
         &base_plan.class.instance_properties,
         &base_plan.class.instance_methods,
+        base_plan.class.accessor.as_ref(),
     );
-    let own_static_entries =
-        planned_class_member_entries(&plan.class.static_properties, &plan.class.static_methods);
+    let own_static_entries = planned_class_member_entries(
+        &plan.class.static_properties,
+        &plan.class.static_methods,
+        None,
+    );
     let inherited_static_entries = planned_class_member_entries(
         &base_plan.class.static_properties,
         &base_plan.class.static_methods,
+        None,
     );
     let instance_capacity = own_instance_entries
         .len()
@@ -3245,6 +3758,7 @@ fn cached_primitive_member_plan(
         validate_method_cache_state(store, method, return_type).ok()?;
         method_return_types.push(return_type);
     }
+    let accessor_type = plan_accessor_type(store, class.accessor.as_ref()).ok()?;
     let index_types = plan_index_types(store, class.index.as_ref()).ok()?;
     let uninitialized_instance_properties =
         uninitialized_instance_properties(store, class, &property_types).ok()?;
@@ -3252,6 +3766,7 @@ fn cached_primitive_member_plan(
         class: class.clone(),
         property_types,
         method_return_types,
+        accessor_type,
         index_types,
         uninitialized_instance_properties,
     })
@@ -3623,6 +4138,66 @@ fn publish_class_methods(
     }
 }
 
+fn publish_class_accessor(store: &mut CanonicalTypeMapperStore, plan: &ClassMemberPlan) {
+    let Some(accessor) = plan.class.accessor.as_ref() else {
+        return;
+    };
+    let type_ = plan
+        .accessor_type
+        .expect("an admitted accessor retains its numeric getter type");
+    let regular = store
+        .regular_number_literal_type(accessor_literal_number(accessor))
+        .expect("the class transaction prepared its numeric getter literal");
+    let fresh = store
+        .fresh_type_of_literal_type(regular)
+        .expect("the prepared numeric getter literal retains its fresh type");
+    let signature =
+        exact_accessor_getter_signature(store, accessor.getter, type_).unwrap_or_else(|| {
+            store
+                .alloc_signature(
+                    SignatureFlags::NONE,
+                    Some(accessor.getter),
+                    Vec::new(),
+                    None,
+                    Vec::new(),
+                    Some(type_),
+                    None,
+                    0,
+                )
+                .expect("the class transaction reserved its getter signature")
+        });
+    assert!(store.set_signature_links(
+        accessor.getter,
+        SignatureLinks {
+            resolved_signature: ResolvedSignatureState::Resolved(signature),
+            ..SignatureLinks::default()
+        },
+    ));
+    assert!(store.set_type_node_links(
+        accessor.type_node,
+        TypeNodeLinks {
+            resolved_type: Some(type_),
+            ..TypeNodeLinks::default()
+        },
+    ));
+    assert!(store.set_type_node_links(
+        accessor.return_expression,
+        TypeNodeLinks {
+            resolved_type: Some(fresh),
+            ..TypeNodeLinks::default()
+        },
+    ));
+    for symbol in [accessor.symbol, accessor.setter_parameter_symbol] {
+        assert!(store.set_value_symbol_links(
+            symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(type_),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+    }
+}
+
 /// Installs the exact primitive-property member graph and default constructor
 /// for a previously preflighted class.
 ///
@@ -3643,6 +4218,7 @@ pub(super) fn execute_nongeneric_class_members(
     let additional_types = usize::from(cold_value)
         .checked_add(usize::from(cold_instance) * 2)
         .and_then(|count| count.checked_add(plan.class.methods.len()))
+        .and_then(|count| count.checked_add(usize::from(plan.class.accessor.is_some()) * 2))
         .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
 
     let prototype = prototype_symbol(store, &plan.class)
@@ -3650,9 +4226,13 @@ pub(super) fn execute_nongeneric_class_members(
     let planned_instance_entries = planned_class_member_entries(
         &plan.class.instance_properties,
         &plan.class.instance_methods,
+        plan.class.accessor.as_ref(),
     );
-    let planned_static_entries =
-        planned_class_member_entries(&plan.class.static_properties, &plan.class.static_methods);
+    let planned_static_entries = planned_class_member_entries(
+        &plan.class.static_properties,
+        &plan.class.static_methods,
+        None,
+    );
     let prepared_instance_members = if planned_instance_entries.is_empty() {
         None
     } else {
@@ -3721,9 +4301,16 @@ pub(super) fn execute_nongeneric_class_members(
             .filter(|type_node| store.type_node_links(*type_node).is_none())
             .count()
     });
+    let missing_accessor_type_node_links = plan.class.accessor.as_ref().map_or(0, |accessor| {
+        [accessor.type_node, accessor.return_expression]
+            .into_iter()
+            .filter(|node| store.type_node_links(*node).is_none())
+            .count()
+    });
     let missing_type_node_links = missing_property_type_node_links
         .checked_add(missing_method_type_node_links)
         .and_then(|count| count.checked_add(missing_index_type_node_links))
+        .and_then(|count| count.checked_add(missing_accessor_type_node_links))
         .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
     let missing_property_value_links = plan
         .class
@@ -3739,6 +4326,12 @@ pub(super) fn execute_nongeneric_class_members(
         .iter()
         .filter(|method| store.value_symbol_links(method.symbol).is_none())
         .count();
+    let missing_accessor_value_links = plan.class.accessor.as_ref().map_or(0, |accessor| {
+        [accessor.symbol, accessor.setter_parameter_symbol]
+            .into_iter()
+            .filter(|symbol| store.value_symbol_links(*symbol).is_none())
+            .count()
+    });
     let missing_constructor_signature_links = usize::from(
         plan.class
             .constructor
@@ -3750,19 +4343,40 @@ pub(super) fn execute_nongeneric_class_members(
         .iter()
         .filter(|method| store.signature_links(method.declaration).is_none())
         .count();
+    let missing_accessor_signature_links = usize::from(
+        plan.class
+            .accessor
+            .as_ref()
+            .is_some_and(|accessor| store.signature_links(accessor.getter).is_none()),
+    );
     let missing_signature_links = missing_constructor_signature_links
         .checked_add(missing_method_signature_links)
+        .and_then(|count| count.checked_add(missing_accessor_signature_links))
         .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
     let missing_value_links = missing_property_value_links
         .checked_add(missing_owner_value_link)
         .and_then(|count| count.checked_add(missing_method_value_links))
+        .and_then(|count| count.checked_add(missing_accessor_value_links))
         .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
     let signature_count = plan
         .class
         .methods
         .len()
         .checked_add(1)
+        .and_then(|count| count.checked_add(usize::from(plan.class.accessor.is_some())))
         .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
+    if let Some(accessor) = plan.class.accessor.as_ref() {
+        store
+            .prepare_regular_literal_types(&[], &[accessor_literal_number(accessor)], &[])
+            .map_err(|error| match error {
+                LiteralTypeCacheError::Capacity => {
+                    invariant(ClassInvariant::Capacity(plan.class.declaration))
+                }
+                _ => invariant(ClassInvariant::InvalidPropertyTypeCache(
+                    accessor.return_expression,
+                )),
+            })?;
+    }
     if !store.try_reserve_types(additional_types)
         || !store.try_reserve_signatures(signature_count)
         || !store.try_reserve_index_infos(usize::from(plan.class.index.is_some()))
@@ -3862,6 +4476,7 @@ pub(super) fn execute_nongeneric_class_members(
         declared_index_infos.push(info);
         resolved_index_infos.push(info);
     }
+    publish_class_accessor(store, plan);
     publish_class_methods(store, plan, method_signature_lists);
     assert!(store.set_interface_declared_members(
         shells.instance_type,
@@ -4474,14 +5089,54 @@ fn exact_stored_method(
     .then_some(*declaration)
 }
 
+fn exact_stored_accessor(
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+    owner_declaration: NodeRef,
+    accessor: SemanticSymbolId,
+) -> Option<NodeRef> {
+    let record = store.symbol(accessor)?;
+    let [getter, setter] = record.declarations()? else {
+        return None;
+    };
+    let getter = *getter;
+    let setter = *setter;
+    let number = store.intrinsic_bootstrap()?.number_type;
+    (record.flags() == SymbolFlags::ACCESSOR
+        && record.check_flags() == CheckFlags::NONE
+        && record.value_declaration() == Some(getter)
+        && record.members().is_none()
+        && record.exports().is_none()
+        && record.parent() == Some(owner)
+        && record.export_symbol().is_none()
+        && store.get_merged_symbol(accessor) == Some(accessor)
+        && store.source_node_kind(getter) == Some(SyntaxKind::GetAccessor)
+        && store.source_node_kind(setter) == Some(SyntaxKind::SetAccessor)
+        && store.source_node_parent(getter) == Some(SourceNodeParent::Parent(owner_declaration))
+        && store.source_node_parent(setter) == Some(SourceNodeParent::Parent(owner_declaration))
+        && store.value_symbol_links(accessor)
+            == Some(&ValueSymbolLinks {
+                resolved_type: Some(number),
+                ..ValueSymbolLinks::default()
+            })
+        && exact_accessor_getter_signature(store, getter, number).is_some()
+        && store
+            .signature_links(setter)
+            .is_none_or(|links| links == &SignatureLinks::default()))
+    .then_some(getter)
+}
+
 fn exact_stored_class_member(
     store: &CanonicalTypeMapperStore,
     owner: SemanticSymbolId,
     owner_declaration: NodeRef,
     member: SemanticSymbolId,
 ) -> Option<NodeRef> {
-    if store.symbol(member)?.flags() == SymbolFlags::METHOD {
+    let flags = store.symbol(member)?.flags();
+    if flags == SymbolFlags::METHOD {
         exact_stored_method(store, owner, owner_declaration, member)
+    } else if flags == SymbolFlags::ACCESSOR {
+        exact_stored_accessor(store, owner, owner_declaration, member)
     } else {
         exact_stored_property(store, owner, owner_declaration, member)
     }
@@ -5114,6 +5769,113 @@ mod tests {
             None,
         ));
         (type_, signature)
+    }
+
+    #[test]
+    fn numeric_accessor_pair_shares_one_property_and_replays_warm() {
+        let mut fixture =
+            fixture("class Model { get value(): number { return 1; } set value(v) {} }");
+        let owner = class_symbol(&fixture, "Model");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
+        let ClassMemberQueryPlan::Direct(class) = &plan else {
+            panic!("a paired accessor belongs to one direct class")
+        };
+        let accessor = class.class.accessor.as_ref().unwrap().clone();
+
+        let members =
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan).unwrap();
+
+        assert_eq!(members.instance_properties(), &[accessor.symbol]);
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        for symbol in [accessor.symbol, accessor.setter_parameter_symbol] {
+            assert_eq!(
+                fixture.store.value_symbol_links(symbol),
+                Some(&ValueSymbolLinks {
+                    resolved_type: Some(number),
+                    ..ValueSymbolLinks::default()
+                })
+            );
+        }
+        assert_eq!(
+            fixture.store.symbol(accessor.symbol).unwrap().flags(),
+            SymbolFlags::ACCESSOR
+        );
+        assert!(exact_accessor_getter_signature(&fixture.store, accessor.getter, number).is_some());
+        assert!(fixture.store.signature_links(accessor.setter).is_none());
+        assert_eq!(
+            fixture
+                .store
+                .type_payload(
+                    fixture
+                        .store
+                        .type_node_links(accessor.return_expression)
+                        .and_then(|links| links.resolved_type)
+                        .unwrap(),
+                )
+                .unwrap()
+                .flags(),
+            TypeFlags::NUMBER_LITERAL
+        );
+        assert_eq!(
+            validate_class_heritage_members(&fixture.store, members.shells().instance_type()),
+            ClassHeritageMembersValidation::Valid
+        );
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        assert_eq!(
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan),
+            Ok(members)
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm
+        );
+    }
+
+    #[test]
+    fn unsupported_accessor_pairs_leave_class_state_cold() {
+        for source in [
+            "class Model { get value(): number { return 1; } }",
+            "class Model { get value(): number { return 1; } set value(v: number) {} }",
+            "class Model { get value(): string { return 1; } set value(v) {} }",
+            "class Model { static get value(): number { return 1; } static set value(v) {} }",
+            "class Model { get value(): number { return 1; } set value(v) { return; } }",
+        ] {
+            let fixture = fixture(source);
+            let owner = class_symbol(&fixture, "Model");
+            let bound = &fixture.files[&fixture.file];
+            let host = host(&fixture.parsed.arena, bound);
+            let cold = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            assert!(matches!(
+                plan_nongeneric_class_member_query(&fixture.store, &host, owner),
+                Err(ClassError::Unsupported(ClassUnsupported::Member { .. }))
+            ));
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                cold
+            );
+            assert!(fixture.store.declared_type_links(owner).is_none());
+            assert!(fixture.store.value_symbol_links(owner).is_none());
+        }
     }
 
     #[test]

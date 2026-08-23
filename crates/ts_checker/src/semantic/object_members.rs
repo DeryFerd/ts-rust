@@ -933,30 +933,61 @@ pub(super) fn plan_interface(
                 kind: SyntaxKind::IndexSignature,
             });
         }
-        let [base] = heritage.bases.as_slice() else {
+        if !matches!(heritage.bases.as_slice(), [_] | [_, _]) {
             return Err(PropertyObjectError::UnsupportedMember {
                 node: heritage.clause,
                 kind: SyntaxKind::HeritageClause,
             });
-        };
-        let base_plan = plan_interface(store, host, base.symbol)?;
-        if let Some(index) = base_plan.indexes.first() {
-            return Err(PropertyObjectError::UnsupportedMember {
-                node: index.declaration,
-                kind: SyntaxKind::IndexSignature,
-            });
         }
-        if base_plan.heritage.is_some() {
-            return Err(PropertyObjectError::UnsupportedMember {
-                node: base.node,
-                kind: SyntaxKind::ExpressionWithTypeArguments,
-            });
-        }
-        if let Some(call) = base_plan.call_signatures.first() {
-            return Err(PropertyObjectError::UnsupportedMember {
-                node: call.declaration,
-                kind: call.syntax_kind(),
-            });
+        let mut base_plans = Vec::<PropertyObjectPlan>::with_capacity(heritage.bases.len());
+        for base in &heritage.bases {
+            let base_plan = plan_interface(store, host, base.symbol)?;
+            if let Some(index) = base_plan.indexes.first() {
+                return Err(PropertyObjectError::UnsupportedMember {
+                    node: index.declaration,
+                    kind: SyntaxKind::IndexSignature,
+                });
+            }
+            if base_plan.heritage.is_some() {
+                return Err(PropertyObjectError::UnsupportedMember {
+                    node: base.node,
+                    kind: SyntaxKind::ExpressionWithTypeArguments,
+                });
+            }
+            if let Some(call) = base_plan.call_signatures.first() {
+                return Err(PropertyObjectError::UnsupportedMember {
+                    node: call.declaration,
+                    kind: call.syntax_kind(),
+                });
+            }
+            for previous in &base_plans {
+                for property in &base_plan.properties {
+                    let Some(inherited) = previous
+                        .properties
+                        .iter()
+                        .find(|inherited| inherited.name == property.name)
+                    else {
+                        continue;
+                    };
+                    if inherited.optional != property.optional
+                        || inherited.readonly != property.readonly
+                        || !equivalent_merged_property_annotations(
+                            store,
+                            host,
+                            inherited.type_node,
+                            property.type_node,
+                        )
+                    {
+                        return Err(PropertyObjectError::UnsupportedMember {
+                            node: property.declaration,
+                            kind: store
+                                .source_node_kind(property.declaration)
+                                .unwrap_or(SyntaxKind::PropertySignature),
+                        });
+                    }
+                }
+            }
+            base_plans.push(base_plan);
         }
         if let Some(call) = plan.call_signatures.first() {
             return Err(PropertyObjectError::UnsupportedMember {
@@ -970,41 +1001,43 @@ pub(super) fn plan_interface(
                 kind: SyntaxKind::HeritageClause,
             });
         }
-        for property in &plan.properties {
-            let Some(base_property) = base_plan
-                .properties
-                .iter()
-                .find(|base| base.name == property.name)
-            else {
-                continue;
-            };
-            let own_kind = store.source_node_kind(property.type_node);
-            let base_kind = store.source_node_kind(base_property.type_node);
-            let same_primitive = own_kind == base_kind
-                && matches!(
-                    own_kind,
-                    Some(
-                        SyntaxKind::AnyKeyword
-                            | SyntaxKind::UnknownKeyword
-                            | SyntaxKind::StringKeyword
-                            | SyntaxKind::NumberKeyword
-                            | SyntaxKind::BooleanKeyword
-                            | SyntaxKind::BigIntKeyword
-                            | SyntaxKind::SymbolKeyword
-                            | SyntaxKind::VoidKeyword
-                            | SyntaxKind::NeverKeyword
-                    )
-                );
-            let compatible = same_primitive
-                || own_kind == Some(SyntaxKind::AnyKeyword)
-                    && base_kind != Some(SyntaxKind::NeverKeyword);
-            if !compatible || property.optional && !base_property.optional {
-                return Err(PropertyObjectError::UnsupportedMember {
-                    node: property.declaration,
-                    kind: store
-                        .source_node_kind(property.declaration)
-                        .unwrap_or(SyntaxKind::PropertySignature),
-                });
+        for base_plan in &base_plans {
+            for property in &plan.properties {
+                let Some(base_property) = base_plan
+                    .properties
+                    .iter()
+                    .find(|base| base.name == property.name)
+                else {
+                    continue;
+                };
+                let own_kind = store.source_node_kind(property.type_node);
+                let base_kind = store.source_node_kind(base_property.type_node);
+                let same_primitive = own_kind == base_kind
+                    && matches!(
+                        own_kind,
+                        Some(
+                            SyntaxKind::AnyKeyword
+                                | SyntaxKind::UnknownKeyword
+                                | SyntaxKind::StringKeyword
+                                | SyntaxKind::NumberKeyword
+                                | SyntaxKind::BooleanKeyword
+                                | SyntaxKind::BigIntKeyword
+                                | SyntaxKind::SymbolKeyword
+                                | SyntaxKind::VoidKeyword
+                                | SyntaxKind::NeverKeyword
+                        )
+                    );
+                let compatible = same_primitive
+                    || own_kind == Some(SyntaxKind::AnyKeyword)
+                        && base_kind != Some(SyntaxKind::NeverKeyword);
+                if !compatible || property.optional && !base_property.optional {
+                    return Err(PropertyObjectError::UnsupportedMember {
+                        node: property.declaration,
+                        kind: store
+                            .source_node_kind(property.declaration)
+                            .unwrap_or(SyntaxKind::PropertySignature),
+                    });
+                }
             }
         }
     }

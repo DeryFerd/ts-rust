@@ -19,7 +19,7 @@ use ts_diagnostics::{Diagnostic, message_by_code};
 use super::{
     ArrayTypeError, CanonicalCheckerDiagnostic, CanonicalCheckerOptions, CanonicalGlobalTypes,
     CanonicalTypeFormatFlags, CanonicalTypeMapperStore, DeclaredTypeHost, RelationUnavailable,
-    SymbolNodeLinks, TypeDisplayUnavailable, TypeId, TypeNodeLinks,
+    SymbolNodeLinks, TypeDisplayUnavailable, TypeId, TypeNodeLinks, ValueSymbolLinks,
     array_types::CanonicalArrayTargets,
     bootstrap::{LiteralTypeCacheError, UnionReduction},
     enums,
@@ -29,7 +29,7 @@ use super::{
     member_resolution::UnionPropertyError,
     source::PlannedExpression,
     store::SourceNodeParent,
-    type_records::{LiteralValue, TypeCacheState, TypeData, TypeRecord},
+    type_records::{LiteralValue, StructuredTypeData, TypeCacheState, TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
 };
 
@@ -715,6 +715,7 @@ enum ElementDiagnostic {
     NumberIndexRequired,
     InvalidIndexType,
     MissingLiteralProperty,
+    MissingConstEnumProperty,
     MissingBroadIndex,
     NegativeTupleIndex,
     TupleIndexOutOfBounds { length: usize, index: usize },
@@ -809,6 +810,11 @@ fn resolve_object_element(
     }
 
     if let Some(name) = index.property_name.as_deref() {
+        if let Some(resolution) =
+            resolve_enum_element(store, plan, receiver_type, name, error_type)?
+        {
+            return Ok(resolution);
+        }
         if store
             .type_payload(receiver_type)
             .is_some_and(|record| record.flags().intersects(TypeFlags::UNION))
@@ -900,6 +906,107 @@ fn resolve_object_element(
             ElementDiagnostic::MissingBroadIndex
         },
     ))
+}
+
+fn resolve_enum_element(
+    store: &CanonicalTypeMapperStore,
+    plan: &SourceElementPlan,
+    receiver_type: TypeId,
+    name: &str,
+    error_type: TypeId,
+) -> Result<Option<ElementResolution>, SourceElementError> {
+    if !matches!(
+        store.source_node_kind(plan.index.node),
+        Some(SyntaxKind::StringLiteral | SyntaxKind::NoSubstitutionTemplateLiteral)
+    ) {
+        return Ok(None);
+    }
+    let receiver = store
+        .type_payload(receiver_type)
+        .ok_or(SourceElementError::InvalidCache(plan.node))?;
+    let Some(owner) = receiver.symbol() else {
+        return Ok(None);
+    };
+    let owner_record = store
+        .symbol(owner)
+        .ok_or(SourceElementError::InvalidCache(plan.node))?;
+    if !owner_record.flags().intersects(SymbolFlags::ENUM) {
+        return Ok(None);
+    }
+    let TypeData::Object(value) = receiver.data() else {
+        return Err(SourceElementError::InvalidCache(plan.node));
+    };
+    let [declaration] = owner_record.declarations().unwrap_or_default() else {
+        return Err(SourceElementError::InvalidCache(plan.node));
+    };
+    let declared = store
+        .declared_type_links(owner)
+        .and_then(|links| links.declared_type)
+        .ok_or(SourceElementError::InvalidCache(plan.node))?;
+    let empty_enum = store.type_payload(declared).is_some_and(|declared| {
+        declared.flags() == TypeFlags::ENUM && declared.symbol() == Some(owner)
+    });
+    if !matches!(
+        owner_record.flags(),
+        SymbolFlags::REGULAR_ENUM | SymbolFlags::CONST_ENUM
+    ) || owner_record.check_flags() != CheckFlags::NONE
+        || owner_record.value_declaration() != Some(*declaration)
+        || owner_record.members().is_some()
+        || owner_record.exports().is_some() == empty_enum
+        || owner_record.export_symbol().is_some()
+        || store.get_merged_symbol(owner) != Some(owner)
+        || store.source_node_kind(*declaration) != Some(SyntaxKind::EnumDeclaration)
+        || receiver.flags() != TypeFlags::OBJECT
+        || receiver.object_flags() != ObjectFlags::ANONYMOUS
+        || receiver.alias().is_some()
+        || value.structured != StructuredTypeData::default()
+        || value.target.is_some()
+        || value.mapper.is_some()
+        || value.instantiations != TypeCacheState::Unallocated
+        || store.value_symbol_links(owner)
+            != Some(&ValueSymbolLinks {
+                resolved_type: Some(receiver_type),
+                ..ValueSymbolLinks::default()
+            })
+        || enums::canonical_enum_type_owner(store, declared) != Some(owner)
+    {
+        return Err(SourceElementError::InvalidCache(plan.node));
+    }
+
+    let member = match owner_record.exports() {
+        Some(exports) => {
+            let exports = store
+                .symbol_table(exports)
+                .ok_or(SourceElementError::InvalidCache(plan.node))?;
+            if exports.is_empty() {
+                return Err(SourceElementError::InvalidCache(plan.node));
+            }
+            exports.get_source(name)
+        }
+        None => None,
+    };
+    let Some(member) = member else {
+        return Ok(Some(ElementResolution::diagnostic(
+            error_type,
+            if owner_record.flags() == SymbolFlags::CONST_ENUM {
+                ElementDiagnostic::MissingConstEnumProperty
+            } else {
+                ElementDiagnostic::MissingLiteralProperty
+            },
+        )));
+    };
+    let (resolved, type_) = enums::enum_value_member_type(store, receiver_type, name)
+        .ok_or(SourceElementError::InvalidCache(plan.node))?;
+    if resolved != member
+        || store.value_symbol_links(member)
+            != Some(&ValueSymbolLinks {
+                resolved_type: Some(type_),
+                ..ValueSymbolLinks::default()
+            })
+    {
+        return Err(SourceElementError::InvalidCache(plan.node));
+    }
+    Ok(Some(ElementResolution::success(type_, Some(member))))
 }
 
 fn optional_element_read_type(
@@ -1183,6 +1290,7 @@ fn prepare_element_diagnostic(
         && !matches!(
             kind,
             ElementDiagnostic::InvalidIndexType
+                | ElementDiagnostic::MissingConstEnumProperty
                 | ElementDiagnostic::NegativeTupleIndex
                 | ElementDiagnostic::TupleIndexOutOfBounds { .. }
         )
@@ -1234,6 +1342,21 @@ fn prepare_element_diagnostic(
             ),
             related_information: Vec::new(),
         },
+        ElementDiagnostic::MissingConstEnumProperty => {
+            let property = classify_index(store, index_type)?
+                .property_name
+                .ok_or(SourceElementError::InvalidType(index_type))?;
+            let receiver = display_type(store, host, global_types, options, receiver_type)?;
+            CanonicalCheckerDiagnostic {
+                node: Some(plan.index.node),
+                range_override: None,
+                diagnostic: Diagnostic::with_arguments(
+                    message_by_code(2339).ok_or(SourceElementError::MissingDiagnostic(2339))?,
+                    [property, receiver],
+                ),
+                related_information: Vec::new(),
+            }
+        }
         ElementDiagnostic::MissingLiteralProperty | ElementDiagnostic::MissingBroadIndex => {
             let index = display_type(store, host, global_types, options, index_type)?;
             let receiver = display_type(store, host, global_types, options, receiver_type)?;
@@ -1443,6 +1566,88 @@ mod tests {
             syntax,
             identifier(syntax.receiver(), receiver_symbol),
             PlannedExpression::new(syntax.index(), index),
+        )
+        .unwrap()
+    }
+
+    fn published_enum(
+        parsed: &ParseResult,
+        file: FileId,
+    ) -> (
+        CanonicalTypeMapperStore,
+        BoundFile,
+        enums::CanonicalEnumSemantics,
+    ) {
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/enum-element-access.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let (symbols, mut files) = binder.finish().try_into_parts().unwrap();
+        let bound = files.remove(&file).unwrap();
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::EnumDeclaration).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let owner = bound.symbol(declaration).unwrap();
+        let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
+        assert!(
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .is_some()
+        );
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        let enumeration = {
+            let host = DeclaredTypeHost::new([(&parsed.arena, &bound)]).unwrap();
+            enums::get_enum_semantics(&mut store, &host, owner).unwrap()
+        };
+        (store, bound, enumeration)
+    }
+
+    fn enum_element_plan(
+        parsed: &ParseResult,
+        file: FileId,
+        store: &CanonicalTypeMapperStore,
+        owner: SemanticSymbolId,
+        name: &str,
+    ) -> SourceElementPlan {
+        let access = element_access(parsed, file);
+        let syntax = plan_direct_source_element_syntax(&parsed.arena, store, access).unwrap();
+        finish_direct_source_element_plan(
+            syntax,
+            PlannedExpression::new(
+                syntax.receiver(),
+                PlannedExpressionKind::Identifier(PlannedIdentifierRead {
+                    resolved_symbol: owner,
+                    value_symbol: owner,
+                    kind: PlannedIdentifierReadKind::DeclaredValue,
+                }),
+            ),
+            PlannedExpression::new(
+                syntax.index(),
+                PlannedExpressionKind::String(name.to_owned()),
+            ),
         )
         .unwrap()
     }
@@ -1680,6 +1885,176 @@ mod tests {
                 Ok(expected.clone())
             );
             assert_eq!(classify_index(&store, member.fresh_type), Ok(expected));
+        }
+    }
+
+    #[test]
+    fn enum_string_element_reads_publish_exact_member_links_cold_and_warm() {
+        for (offset, declaration) in [(0, "enum"), (1, "const enum")] {
+            let parsed = parse_fixture(&format!(
+                "{declaration} Status {{ Ready = 1 }} const result = Status[\"Ready\"];"
+            ));
+            let file = FileId::new(621 + offset);
+            let (mut store, bound, enumeration) = published_enum(&parsed, file);
+            let member = &enumeration.members[0];
+            let index = store.regular_string_literal_type("Ready".into()).unwrap();
+            let plan = enum_element_plan(&parsed, file, &store, enumeration.symbol, "Ready");
+            let host = DeclaredTypeHost::new([(&parsed.arena, &bound)]).unwrap();
+            let targets =
+                CanonicalArrayTargets::for_single_target_validation(enumeration.value_type);
+
+            for _ in 0..2 {
+                assert_eq!(
+                    check_direct_source_element_with_array_targets(
+                        &mut store,
+                        &host,
+                        targets,
+                        CanonicalCheckerOptions::default(),
+                        &plan,
+                        enumeration.value_type,
+                        index,
+                    ),
+                    Ok(CheckedSourceElement {
+                        type_: member.fresh_type,
+                        diagnostic: None,
+                    }),
+                );
+            }
+            assert_eq!(
+                store
+                    .type_node_links(plan.node)
+                    .and_then(|links| links.resolved_type),
+                Some(member.fresh_type),
+            );
+            assert_eq!(
+                store
+                    .symbol_node_links(plan.node)
+                    .and_then(|links| links.resolved_symbol),
+                Some(member.symbol),
+            );
+        }
+    }
+
+    #[test]
+    fn missing_const_enum_elements_issue_direct_ts2339_on_the_string_index() {
+        for (offset, declaration, no_implicit_any, expected_code) in [
+            (0, "const enum", false, Some(2339)),
+            (1, "const enum", true, Some(2339)),
+            (2, "enum", false, None),
+            (3, "enum", true, Some(7053)),
+        ] {
+            let parsed = parse_fixture(&format!(
+                "{declaration} Status {{ Ready }} const result = Status[\"Missing\"];"
+            ));
+            let file = FileId::new(623 + offset);
+            let (mut store, bound, enumeration) = published_enum(&parsed, file);
+            let index = store.regular_string_literal_type("Missing".into()).unwrap();
+            let plan = enum_element_plan(&parsed, file, &store, enumeration.symbol, "Missing");
+            let host = DeclaredTypeHost::new([(&parsed.arena, &bound)]).unwrap();
+            let options = CanonicalCheckerOptions {
+                no_implicit_any,
+                ..CanonicalCheckerOptions::default()
+            };
+            let checked = check_direct_source_element_with_array_targets(
+                &mut store,
+                &host,
+                CanonicalArrayTargets::for_single_target_validation(enumeration.value_type),
+                options,
+                &plan,
+                enumeration.value_type,
+                index,
+            )
+            .unwrap();
+
+            assert_eq!(
+                checked
+                    .diagnostic
+                    .as_ref()
+                    .map(|diagnostic| diagnostic.diagnostic.code()),
+                expected_code,
+            );
+            if let Some(diagnostic) = checked.diagnostic {
+                if expected_code == Some(2339) {
+                    assert_eq!(diagnostic.node, Some(plan.index.node));
+                    assert_eq!(
+                        diagnostic.diagnostic.render().unwrap(),
+                        "Property 'Missing' does not exist on type 'typeof Status'.",
+                    );
+                } else {
+                    assert_eq!(diagnostic.node, Some(plan.node));
+                }
+            }
+            assert_eq!(
+                checked.type_,
+                store.intrinsic_bootstrap().unwrap().error_type,
+            );
+            assert!(store.symbol_node_links(plan.node).is_none());
+        }
+    }
+
+    #[test]
+    fn poisoned_enum_element_owner_exports_and_member_links_fail_closed() {
+        #[derive(Clone, Copy)]
+        enum Poison {
+            OwnerValue,
+            Exports,
+            MemberValue,
+        }
+
+        for (offset, poison) in [Poison::OwnerValue, Poison::Exports, Poison::MemberValue]
+            .into_iter()
+            .enumerate()
+        {
+            let parsed =
+                parse_fixture("const enum Status { Ready = 1 } const result = Status[\"Ready\"];");
+            let file = FileId::new(627 + u32::try_from(offset).unwrap());
+            let (mut store, bound, enumeration) = published_enum(&parsed, file);
+            let member = &enumeration.members[0];
+            let index = store.regular_string_literal_type("Ready".into()).unwrap();
+            let plan = enum_element_plan(&parsed, file, &store, enumeration.symbol, "Ready");
+            let error = store.intrinsic_bootstrap().unwrap().error_type;
+            match poison {
+                Poison::OwnerValue => assert!(store.set_value_symbol_links(
+                    enumeration.symbol,
+                    ValueSymbolLinks {
+                        resolved_type: Some(error),
+                        ..ValueSymbolLinks::default()
+                    },
+                )),
+                Poison::Exports => {
+                    let exports = store.alloc_symbol_table();
+                    assert!(store.set_symbol_relationships(
+                        enumeration.symbol,
+                        None,
+                        Some(exports),
+                        None,
+                        None,
+                    ));
+                }
+                Poison::MemberValue => assert!(store.set_value_symbol_links(
+                    member.symbol,
+                    ValueSymbolLinks {
+                        resolved_type: Some(error),
+                        ..ValueSymbolLinks::default()
+                    },
+                )),
+            }
+            let host = DeclaredTypeHost::new([(&parsed.arena, &bound)]).unwrap();
+
+            assert_eq!(
+                check_direct_source_element_with_array_targets(
+                    &mut store,
+                    &host,
+                    CanonicalArrayTargets::for_single_target_validation(enumeration.value_type),
+                    CanonicalCheckerOptions::default(),
+                    &plan,
+                    enumeration.value_type,
+                    index,
+                ),
+                Err(SourceElementError::InvalidCache(plan.node)),
+            );
+            assert!(store.type_node_links(plan.node).is_none());
+            assert!(store.symbol_node_links(plan.node).is_none());
         }
     }
 

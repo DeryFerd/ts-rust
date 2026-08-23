@@ -1,10 +1,11 @@
-//! Structured-member publication for one direct, nongeneric interface base.
+//! Structured-member publication for direct, nongeneric interface bases.
 //!
-//! The first heritage capability supports one base with property-only members.
-//! Compatible derived properties replace inherited properties. Incompatible
-//! overrides remain an explicit unsupported boundary until TS2430 is ported.
+//! One or two property-only bases preserve declaration and source-base order.
+//! Shared base properties must have identical types and modifiers. Compatible
+//! derived properties replace inherited properties; incompatible overrides
+//! remain an explicit unsupported boundary until TS2430 is ported.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use ts_ast::{NodeRef, SyntaxKind};
 use ts_binder::{
@@ -49,12 +50,40 @@ fn capacity(plan: &PropertyObjectPlan) -> PropertyObjectError {
     PropertyObjectError::Capacity(plan.node)
 }
 
-/// Resolves and publishes the exact one-base interface-heritage capability.
+fn matching_inherited_property_contract(
+    store: &CanonicalTypeMapperStore,
+    first: SemanticSymbolId,
+    second: SemanticSymbolId,
+) -> bool {
+    let Some(first_record) = store.symbol(first) else {
+        return false;
+    };
+    let Some(second_record) = store.symbol(second) else {
+        return false;
+    };
+    let Some(first_type) = store
+        .value_symbol_links(first)
+        .and_then(|links| links.resolved_type)
+    else {
+        return false;
+    };
+    let Some(second_type) = store
+        .value_symbol_links(second)
+        .and_then(|links| links.resolved_type)
+    else {
+        return false;
+    };
+    first_record.name() == second_record.name()
+        && first_record.flags() == second_record.flags()
+        && first_record.check_flags() == second_record.check_flags()
+        && first_type == second_type
+}
+
+/// Resolves and publishes one or two direct interface bases.
 ///
-/// `base_types` must contain the one type whose canonical symbol was retained
-/// by the syntax plan. The base must be a fully resolved, no-heritage,
-/// property-only interface. All owned allocations and sparse-link slots are
-/// staged before the first observable semantic mutation.
+/// `base_types` must match the canonical symbols retained by the syntax plan.
+/// Each base must be a fully resolved, nongeneric, property-only interface.
+/// All allocations and sparse-link slots are staged before semantic mutation.
 pub(super) fn resolve_direct_interface_members(
     store: &mut CanonicalTypeMapperStore,
     plan: &PropertyObjectPlan,
@@ -65,12 +94,23 @@ pub(super) fn resolve_direct_interface_members(
     let Some(heritage) = plan.heritage.as_ref() else {
         return Err(invalid(plan, type_));
     };
-    let [planned_base] = heritage.bases.as_slice() else {
+    if !matches!(heritage.bases.as_slice(), [_] | [_, _])
+        || heritage.bases.len() != base_types.len()
+    {
         return Err(invalid(plan, type_));
-    };
-    let [base_type] = base_types else {
+    }
+    let planned_base = &heritage.bases[0];
+    let base_type = base_types[0];
+    let second_base = heritage
+        .bases
+        .get(1)
+        .zip(base_types.get(1))
+        .map(|(base, type_)| (base.symbol, *type_));
+    if second_base
+        .is_some_and(|(symbol, type_)| symbol == planned_base.symbol || type_ == base_type)
+    {
         return Err(invalid(plan, type_));
-    };
+    }
     if plan.kind != PropertyObjectKind::Interface
         || !plan.indexes.is_empty()
         || !plan.call_signatures.is_empty()
@@ -78,51 +118,64 @@ pub(super) fn resolve_direct_interface_members(
         return Err(invalid(plan, type_));
     }
 
-    let base_record = store
-        .type_payload(*base_type)
+    let mut base_surfaces = Vec::new();
+    base_surfaces
+        .try_reserve_exact(base_types.len())
+        .map_err(|_| capacity(plan))?;
+    for (planned, base) in heritage.bases.iter().zip(base_types.iter().copied()) {
+        let base_record = store
+            .type_payload(base)
+            .ok_or_else(|| invalid(plan, type_))?;
+        if base_record.symbol() != Some(planned.symbol) {
+            return Err(invalid(plan, type_));
+        }
+        if base_record.data().structured().is_some_and(|structured| {
+            structured.call_signature_count != 0
+                || structured
+                    .signatures
+                    .as_ref()
+                    .is_some_and(|set| !set.is_empty())
+                || structured
+                    .index_infos
+                    .as_ref()
+                    .is_some_and(|set| !set.is_empty())
+        }) {
+            return Err(PropertyObjectError::UnsupportedMember {
+                node: planned.node,
+                kind: SyntaxKind::ExpressionWithTypeArguments,
+            });
+        }
+        let inherited_base = store.direct_interface_heritage_provenance(base).is_some();
+        if second_base.is_some() && inherited_base {
+            return Err(PropertyObjectError::UnsupportedMember {
+                node: planned.node,
+                kind: SyntaxKind::ExpressionWithTypeArguments,
+            });
+        }
+        let surface = if inherited_base {
+            validate_direct_heritage_property_interface(store, base)
+        } else {
+            validate_no_heritage_property_interface(store, base)
+        }
         .ok_or_else(|| invalid(plan, type_))?;
-    if base_record.symbol() != Some(planned_base.symbol) {
-        return Err(invalid(plan, type_));
-    }
-    if base_record.data().structured().is_some_and(|structured| {
-        structured.call_signature_count != 0
-            || structured
-                .signatures
-                .as_ref()
-                .is_some_and(|set| !set.is_empty())
-            || structured
-                .index_infos
-                .as_ref()
-                .is_some_and(|set| !set.is_empty())
-    }) {
-        return Err(PropertyObjectError::UnsupportedMember {
-            node: planned_base.node,
-            kind: SyntaxKind::ExpressionWithTypeArguments,
-        });
-    }
-    let base_surface = if store
-        .direct_interface_heritage_provenance(*base_type)
-        .is_some()
-    {
-        validate_direct_heritage_property_interface(store, *base_type)
-    } else {
-        validate_no_heritage_property_interface(store, *base_type)
-    }
-    .ok_or_else(|| invalid(plan, type_))?;
-    if base_surface.owner != planned_base.symbol {
-        return Err(invalid(plan, type_));
+        if surface.owner != planned.symbol {
+            return Err(invalid(plan, type_));
+        }
+        base_surfaces.push(surface);
     }
 
     let declared_state =
         prepare_direct_interface_declared_properties(store, plan, type_, property_types)?;
-    let total_properties = plan
-        .properties
-        .len()
-        .checked_add(base_surface.properties.len())
+    let total_properties = base_surfaces
+        .iter()
+        .try_fold(plan.properties.len(), |count, base| {
+            count.checked_add(base.properties.len())
+        })
         .ok_or_else(|| capacity(plan))?;
     let mut expected_properties = Vec::new();
     let mut expected_entries = Vec::new();
     let mut seen_names = HashSet::new();
+    let mut inherited_by_name = HashMap::new();
     expected_properties
         .try_reserve_exact(total_properties)
         .map_err(|_| capacity(plan))?;
@@ -130,6 +183,9 @@ pub(super) fn resolve_direct_interface_members(
         .try_reserve_exact(total_properties)
         .map_err(|_| capacity(plan))?;
     seen_names
+        .try_reserve(total_properties)
+        .map_err(|_| capacity(plan))?;
+    inherited_by_name
         .try_reserve(total_properties)
         .map_err(|_| capacity(plan))?;
 
@@ -149,23 +205,32 @@ pub(super) fn resolve_direct_interface_members(
         expected_entries.push((name, property.symbol));
         expected_properties.push(property.symbol);
     }
-    for &property in &base_surface.properties {
-        let record = store.symbol(property).ok_or_else(|| invalid(plan, type_))?;
-        let name = record.name().to_owned();
-        if !seen_names.insert(name.clone()) {
-            continue;
+    for (planned, surface) in heritage.bases.iter().zip(&base_surfaces) {
+        for &property in &surface.properties {
+            let record = store.symbol(property).ok_or_else(|| invalid(plan, type_))?;
+            let name = record.name().to_owned();
+            if let Some(previous) = inherited_by_name.get(&name).copied() {
+                if !matching_inherited_property_contract(store, previous, property) {
+                    return Err(PropertyObjectError::UnsupportedMember {
+                        node: planned.node,
+                        kind: SyntaxKind::ExpressionWithTypeArguments,
+                    });
+                }
+                continue;
+            }
+            inherited_by_name.insert(name.clone(), property);
+            if seen_names.insert(name.clone()) {
+                expected_entries.push((name, property));
+                expected_properties.push(property);
+            }
         }
-        expected_entries.push((name, property));
-        expected_properties.push(property);
     }
 
     for (index, property) in plan.properties.iter().enumerate() {
-        let base_property = base_surface.properties.iter().copied().find(|base| {
-            store
-                .symbol(*base)
-                .is_some_and(|record| record.name().as_utf8() == Some(property.name.as_str()))
-        });
-        let Some(base_property) = base_property else {
+        let Some(base_property) = inherited_by_name
+            .get(&EscapedName::source(&property.name))
+            .copied()
+        else {
             continue;
         };
         let own_type = *property_types
@@ -215,9 +280,9 @@ pub(super) fn resolve_direct_interface_members(
 
     let mut staged_base_types = Vec::new();
     staged_base_types
-        .try_reserve_exact(1)
+        .try_reserve_exact(base_types.len())
         .map_err(|_| capacity(plan))?;
-    staged_base_types.push(*base_type);
+    staged_base_types.extend_from_slice(base_types);
     let prepared_members = if expected_entries.is_empty() {
         None
     } else {
@@ -250,7 +315,8 @@ pub(super) fn resolve_direct_interface_members(
         DirectInterfaceHeritageProvenance {
             owner_symbol: plan.symbol,
             base_symbol: planned_base.symbol,
-            base_type: *base_type,
+            base_type,
+            second_base,
         },
     ));
     publish_prepared_direct_interface_declared_properties(
@@ -275,8 +341,7 @@ pub(super) fn resolve_direct_interface_members(
 /// Plan-aware warm-cache proof used by contextual typing and diagnostics.
 ///
 /// In addition to exact final member reconstruction, this verifies that the
-/// cached base type's canonical symbol is the one resolved by the retained
-/// syntax plan.
+/// cached base types and canonical symbols exactly match the syntax plan.
 pub(super) fn validate_planned_interface_heritage_members(
     store: &CanonicalTypeMapperStore,
     plan: &PropertyObjectPlan,
@@ -285,30 +350,43 @@ pub(super) fn validate_planned_interface_heritage_members(
     let Some(heritage) = plan.heritage.as_ref() else {
         return false;
     };
-    let [planned_base] = heritage.bases.as_slice() else {
+    if !matches!(heritage.bases.as_slice(), [_] | [_, _]) {
         return false;
-    };
+    }
+    let planned_base = &heritage.bases[0];
     let Some(record) = store.type_payload(type_) else {
         return false;
     };
     let TypeData::Interface(interface) = record.data() else {
         return false;
     };
-    let Some([base_type]) = interface.resolved_base_types.as_deref() else {
+    let Some(base_types) = interface.resolved_base_types.as_deref() else {
         return false;
     };
+    if base_types.len() != heritage.bases.len() {
+        return false;
+    }
+    let base_type = base_types[0];
+    let second_base = heritage
+        .bases
+        .get(1)
+        .zip(base_types.get(1))
+        .map(|(base, type_)| (base.symbol, *type_));
     let expected_provenance = DirectInterfaceHeritageProvenance {
         owner_symbol: plan.symbol,
         base_symbol: planned_base.symbol,
-        base_type: *base_type,
+        base_type,
+        second_base,
     };
     if record.symbol() != Some(plan.symbol)
         || interface.declared_members != plan.members
         || store.direct_interface_heritage_provenance(type_) != Some(expected_provenance)
-        || store
-            .type_payload(*base_type)
-            .and_then(super::type_records::TypeRecord::symbol)
-            != Some(planned_base.symbol)
+        || heritage.bases.iter().zip(base_types).any(|(base, type_)| {
+            store
+                .type_payload(*type_)
+                .and_then(super::type_records::TypeRecord::symbol)
+                != Some(base.symbol)
+        })
     {
         return false;
     }
@@ -411,6 +489,7 @@ fn validate_property_interface_worker(
             owner_symbol: owner,
             base_symbol: owner,
             base_type: type_,
+            second_base: None,
         }
     };
     let owner_record = store.symbol(owner)?;
@@ -457,29 +536,60 @@ fn validate_property_interface_worker(
 
     let declared_properties =
         declared_properties(store, owner, owner_declarations, interface.declared_members)?;
-    let base_properties = match (
+    let base_types = match (
         requires_direct_base,
         interface.resolved_base_types.as_deref(),
+        heritage_provenance.second_base,
     ) {
-        (false, None) => Vec::new(),
-        (true, Some([base_type]))
+        (false, None, None) => &[][..],
+        (true, Some([base_type]), None)
             if *base_type != type_ && *base_type == heritage_provenance.base_type =>
         {
-            let base = validate_property_interface_worker(
-                store,
-                *base_type,
-                store
-                    .direct_interface_heritage_provenance(*base_type)
-                    .is_some(),
-                active,
-            )?;
-            if base.owner != heritage_provenance.base_symbol {
-                return None;
-            }
-            base.properties
+            interface.resolved_base_types.as_deref()?
+        }
+        (true, Some([first, second]), Some((second_symbol, second_type)))
+            if *first != type_
+                && *second != type_
+                && *first != *second
+                && *first == heritage_provenance.base_type
+                && *second == second_type
+                && second_symbol != owner
+                && second_symbol != heritage_provenance.base_symbol =>
+        {
+            interface.resolved_base_types.as_deref()?
         }
         _ => return None,
     };
+    let mut base_properties = Vec::new();
+    let mut inherited_by_name = HashMap::new();
+    for (index, base_type) in base_types.iter().copied().enumerate() {
+        let inherited_base = store
+            .direct_interface_heritage_provenance(base_type)
+            .is_some();
+        if base_types.len() == 2 && inherited_base {
+            return None;
+        }
+        let base = validate_property_interface_worker(store, base_type, inherited_base, active)?;
+        let expected_owner = if index == 0 {
+            heritage_provenance.base_symbol
+        } else {
+            heritage_provenance.second_base?.0
+        };
+        if base.owner != expected_owner {
+            return None;
+        }
+        for property in base.properties {
+            let name = store.symbol(property)?.name().to_owned();
+            if let Some(previous) = inherited_by_name.get(&name).copied() {
+                if !matching_inherited_property_contract(store, previous, property) {
+                    return None;
+                }
+                continue;
+            }
+            inherited_by_name.insert(name, property);
+            base_properties.push(property);
+        }
+    }
 
     let total = declared_properties
         .len()
@@ -1134,6 +1244,7 @@ mod tests {
                         owner_symbol: base_owner,
                         base_symbol: prepared.derived_plan.symbol,
                         base_type: prepared.derived_type,
+                        second_base: None,
                     },
                 )
         );

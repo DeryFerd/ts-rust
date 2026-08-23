@@ -869,7 +869,13 @@ fn evaluate_conditional(
         return Ok(bootstrap.wildcard_type);
     }
 
-    if contains_type_parameter(store, check_type, &HashSet::new())? {
+    let mut resolved_check_parameters = HashSet::new();
+    for (parameter, argument) in mapped_parameters.iter().zip(type_arguments) {
+        if !contains_type_parameter(store, *argument, &HashSet::new())? {
+            resolved_check_parameters.insert(*parameter);
+        }
+    }
+    if contains_type_parameter(store, check_type, &resolved_check_parameters)? {
         return deferred_conditional(
             store,
             root,
@@ -1827,16 +1833,34 @@ fn contains_type_parameter(
                 let signature_record = store
                     .signature(*signature)
                     .ok_or(ConditionalTypeError::InvalidSignature(*signature))?;
+                let mut signature_excluded = excluded.clone();
+                signature_excluded.extend(signature_record.type_parameters().iter().copied());
+                for parameter in signature_record.type_parameters() {
+                    let Some(TypeData::TypeParameter(parameter)) =
+                        store.type_payload(*parameter).map(TypeRecord::data)
+                    else {
+                        return Err(ConditionalTypeError::InvalidSignature(*signature));
+                    };
+                    if let Some(constraint) = parameter.constraint
+                        && visit(store, constraint, &signature_excluded, visiting)?
+                    {
+                        result = true;
+                        break;
+                    }
+                }
+                if result {
+                    break;
+                }
                 let return_type = signature_record
                     .resolved_return_type()
                     .ok_or(ConditionalTypeError::InvalidSignature(*signature))?;
-                if visit(store, return_type, excluded, visiting)? {
+                if visit(store, return_type, &signature_excluded, visiting)? {
                     result = true;
                     break;
                 }
                 if let Some(parameters) = store.callable_signature_parameter_types(*signature) {
                     for parameter in parameters {
-                        if visit(store, *parameter, excluded, visiting)? {
+                        if visit(store, *parameter, &signature_excluded, visiting)? {
                             result = true;
                             break;
                         }
@@ -2203,7 +2227,12 @@ fn infer_from_structured_types(
             let source_index = sources.len().saturating_sub(targets.len()) + index;
             let source_signature = sources[source_index.min(sources.len() - 1)];
             let (source_parameters, source_minimum, source_return) =
-                inference_signature_parts(store, source_signature)?;
+                base_inference_signature_parts(
+                    store,
+                    source_signature,
+                    context.global_types,
+                    session,
+                )?;
             let (target_parameters, _, target_return) =
                 inference_signature_parts(store, target_signature)?;
             if source_minimum > target_parameters.len() {
@@ -2306,6 +2335,95 @@ fn inference_signature_parts(
         .resolved_return_type()
         .ok_or(ConditionalTypeError::InvalidSignature(signature))?;
     Ok((parameters, minimum, return_type))
+}
+
+fn base_inference_signature_parts(
+    store: &mut CanonicalTypeMapperStore,
+    signature: SignatureId,
+    global_types: Option<&CanonicalGlobalTypes>,
+    session: &mut InstantiationSession,
+) -> Result<(Vec<TypeId>, usize, TypeId), ConditionalTypeError> {
+    let (parameters, minimum, return_type) = inference_signature_parts(store, signature)?;
+    let local_parameters = store
+        .signature(signature)
+        .ok_or(ConditionalTypeError::InvalidSignature(signature))?
+        .type_parameters()
+        .to_vec();
+    if local_parameters.is_empty() {
+        return Ok((parameters, minimum, return_type));
+    }
+
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(ConditionalTypeError::MissingBootstrap)?;
+    let (unknown, any, no_constraint, circular_constraint) = (
+        bootstrap.unknown_type,
+        bootstrap.any_type,
+        bootstrap.no_constraint_type,
+        bootstrap.circular_constraint_type,
+    );
+    let mut constraints = Vec::with_capacity(local_parameters.len());
+    for parameter in &local_parameters {
+        let Some(TypeData::TypeParameter(data)) =
+            store.type_payload(*parameter).map(TypeRecord::data)
+        else {
+            return Err(ConditionalTypeError::InvalidSignature(signature));
+        };
+        let constraint = data.constraint.unwrap_or(unknown);
+        constraints.push(
+            if constraint == no_constraint || constraint == circular_constraint {
+                unknown
+            } else {
+                constraint
+            },
+        );
+    }
+
+    for _ in 1..local_parameters.len() {
+        let previous = constraints.clone();
+        for constraint in &mut constraints {
+            *constraint = map_type(
+                store,
+                *constraint,
+                &local_parameters,
+                &previous,
+                global_types,
+                session,
+            )?;
+        }
+    }
+    let erased = vec![any; local_parameters.len()];
+    for constraint in &mut constraints {
+        *constraint = map_type(
+            store,
+            *constraint,
+            &local_parameters,
+            &erased,
+            global_types,
+            session,
+        )?;
+    }
+
+    let mut base_parameters = Vec::with_capacity(parameters.len());
+    for parameter in parameters {
+        base_parameters.push(map_type(
+            store,
+            parameter,
+            &local_parameters,
+            &constraints,
+            global_types,
+            session,
+        )?);
+    }
+    let base_return = map_type(
+        store,
+        return_type,
+        &local_parameters,
+        &constraints,
+        global_types,
+        session,
+    )?;
+    Ok((base_parameters, minimum, base_return))
 }
 
 fn template_inference_candidate(
@@ -4073,6 +4191,105 @@ mod tests {
                 "construct={construct}"
             );
         }
+    }
+
+    #[test]
+    fn conditional_inference_uses_bound_generic_signature_constraints() {
+        let mut fixture =
+            Fixture::new("type H<X> = (<O extends X>() => O) extends (() => infer R) ? R : never;");
+        let node = fixture.conditional();
+        let outer = fixture.type_parameter("X");
+        let local = fixture.type_parameter("O");
+        let inferred = fixture.type_parameter("R");
+        assert!(
+            fixture
+                .store
+                .set_type_parameter_resolution(local, Some(outer), None, None, None)
+        );
+
+        let source = fixture
+            .store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, None)
+            .unwrap();
+        let signature = fixture
+            .store
+            .alloc_signature(
+                SignatureFlags::NONE,
+                None,
+                vec![local],
+                None,
+                Vec::new(),
+                Some(local),
+                None,
+                0,
+            )
+            .unwrap();
+        assert!(fixture.store.set_structured_type_members(
+            source,
+            None,
+            None,
+            Some(vec![signature]),
+            None,
+            None,
+        ));
+        let target = callable_object(&mut fixture.store, inferred, false);
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let (string, number, never) = (
+            bootstrap.string_type,
+            bootstrap.number_type,
+            bootstrap.never_type,
+        );
+        assert_eq!(
+            contains_type_parameter(&fixture.store, source, &HashSet::new()),
+            Ok(true),
+        );
+        assert_eq!(
+            contains_type_parameter(&fixture.store, source, &HashSet::from([outer])),
+            Ok(false),
+        );
+
+        let branch_types = branches(inferred, never);
+        let conditional = get_type_from_conditional_type(
+            &mut fixture.store,
+            ConditionalTypeRequest {
+                node,
+                check_type: source,
+                extends_type: target,
+                branches: branch_types,
+                infer_type_parameters: &[inferred],
+                outer_type_parameters: &[outer],
+                alias: None,
+            },
+            None,
+        )
+        .unwrap();
+        for argument in [string, number] {
+            assert_eq!(
+                get_conditional_type_instantiation(
+                    &mut fixture.store,
+                    ConditionalTypeInstantiation {
+                        conditional_type: conditional,
+                        type_arguments: &[argument],
+                        branches: branch_types,
+                        alias: None,
+                        for_constraint: false,
+                    },
+                    None,
+                    None,
+                ),
+                Ok(argument),
+            );
+        }
+
+        let original = fixture.store.signature(signature).unwrap();
+        assert_eq!(original.type_parameters(), &[local]);
+        assert_eq!(original.resolved_return_type(), Some(local));
+        let Some(TypeData::TypeParameter(parameter)) =
+            fixture.store.type_payload(local).map(TypeRecord::data)
+        else {
+            panic!("a signature-local generic parameter must remain intact")
+        };
+        assert_eq!(parameter.constraint, Some(outer));
     }
 
     #[test]

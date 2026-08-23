@@ -1315,6 +1315,11 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         }
         self.plan_type_node_in_context(check_type, None, false)?;
         self.plan_type_node_in_context(extends_type, None, false)?;
+        if self.conditional_operand_contains_infer(extends_type, &mut HashSet::new())? {
+            for operand in [check_type, extends_type] {
+                self.plan_intersection_callable_returns(operand, &mut HashSet::new())?;
+            }
+        }
         match self.planned_conditional_branch_demand(check_type, extends_type)? {
             Some(ConditionalBranchDemand::Neither) => {}
             Some(ConditionalBranchDemand::True) => {
@@ -1365,6 +1370,43 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             },
         );
         Ok(())
+    }
+
+    fn conditional_operand_contains_infer(
+        &self,
+        node: NodeRef,
+        visited: &mut HashSet<NodeRef>,
+    ) -> Result<bool, DeclaredTypeError> {
+        if !visited.insert(node) {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTypeReference(node),
+            ));
+        }
+        let record = preflight_node(self.store, self.host, node)?;
+        if record.kind == SyntaxKind::InferType {
+            visited.remove(&node);
+            return Ok(true);
+        }
+        if record.kind == SyntaxKind::ConditionalType {
+            visited.remove(&node);
+            return Ok(false);
+        }
+
+        let mut children = Vec::new();
+        record.for_each_child(|child| children.push(NodeRef::new(node.arena, node.file, child)));
+        for child in children {
+            if preflight_node(self.store, self.host, child)?.parent != Some(node.node) {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(node),
+                ));
+            }
+            if self.conditional_operand_contains_infer(child, visited)? {
+                visited.remove(&node);
+                return Ok(true);
+            }
+        }
+        visited.remove(&node);
+        Ok(false)
     }
 
     fn planned_conditional_branch_demand(
@@ -1441,7 +1483,23 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node))
             })?;
         preflight_type_parameter_symbol(self.store, self.host, symbol, &mut HashSet::new())?;
-        self.plan.infer_parameters.insert(node, symbol);
+        if self.store.type_node_links(node).is_some_and(|links| {
+            links.outer_type_parameters.is_some()
+                || links.resolved_type.is_some_and(|type_| {
+                    cached_ordinary_type_parameter_owner(self.store, type_) != Some(symbol)
+                })
+        }) {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTypeReference(node),
+            ));
+        }
+        if let Some(previous) = self.plan.infer_parameters.insert(node, symbol)
+            && previous != symbol
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTypeReference(node),
+            ));
+        }
         Ok(())
     }
 
@@ -7900,6 +7958,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .and_then(|count| count.checked_add(plan.keyofs.len()))
             .and_then(|count| count.checked_add(plan.references.len()))
             .and_then(|count| count.checked_add(plan.type_queries.len()))
+            .and_then(|count| count.checked_add(plan.infer_parameters.len()))
             .and_then(|count| count.checked_add(plan.literals.len()))
             .and_then(|count| count.checked_add(plan.unions.len()))
             .and_then(|count| count.checked_add(plan.intersections.len()))
@@ -7927,6 +7986,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .chain(plan.keyofs.keys())
             .chain(plan.references.keys())
             .chain(plan.type_queries.keys())
+            .chain(plan.infer_parameters.keys())
             .chain(plan.literals.keys())
             .chain(plan.unions.keys())
             .chain(plan.intersections.keys())
@@ -8662,7 +8722,32 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 let symbol = plan.infer_parameters.get(&node).copied().ok_or_else(|| {
                     type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node))
                 })?;
-                Ok(execute_type_parameter(self.store, symbol))
+                let resolved = execute_type_parameter(self.store, symbol);
+                if plan
+                    .functions
+                    .values()
+                    .any(|function| function.return_type == node)
+                {
+                    let mut links = self
+                        .store
+                        .type_node_links(node)
+                        .cloned()
+                        .unwrap_or_default();
+                    if links.outer_type_parameters.is_some()
+                        || links.resolved_type.is_some_and(|cached| cached != resolved)
+                    {
+                        return Err(type_node_unavailable(
+                            TypeNodeUnavailable::InvalidTypeReference(node),
+                        ));
+                    }
+                    links.resolved_type = Some(resolved);
+                    if !self.store.set_type_node_links(node, links) {
+                        return Err(type_node_unavailable(
+                            TypeNodeUnavailable::InvalidTypeReference(node),
+                        ));
+                    }
+                }
+                Ok(resolved)
             }
             kind => Err(type_node_unavailable(
                 TypeNodeUnavailable::UnsupportedSyntax { node, kind },
@@ -8752,6 +8837,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .iter()
             .map(|symbol| execute_type_parameter(self.store, *symbol))
             .collect::<Vec<_>>();
+        if !infer_type_parameters.is_empty() {
+            self.resolve_conditional_callable_returns([check_type, extends_type], plan, prepared)?;
+        }
         let outer_type_parameters = conditional
             .outer_parameters
             .iter()
@@ -8784,6 +8872,50 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 kind: SyntaxKind::ConditionalType,
             })
         })
+    }
+
+    fn resolve_conditional_callable_returns(
+        &mut self,
+        operands: [TypeId; 2],
+        plan: &TypeQueryPlan,
+        prepared: &mut PreparedTypeQueryTypes,
+    ) -> Result<(), DeclaredTypeError> {
+        self.flush_pending_function_parameters(plan, prepared)?;
+        for operand in operands {
+            let signatures = self
+                .store
+                .type_payload(operand)
+                .and_then(|record| record.data().structured())
+                .and_then(|structured| structured.signatures.as_ref())
+                .cloned()
+                .unwrap_or_default();
+            for signature in signatures {
+                if self
+                    .store
+                    .signature(signature)
+                    .and_then(Signature::resolved_return_type)
+                    .is_some()
+                {
+                    continue;
+                }
+                let declaration = self
+                    .store
+                    .signature(signature)
+                    .and_then(Signature::declaration)
+                    .ok_or_else(|| {
+                        type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(
+                            signature,
+                        ))
+                    })?;
+                let function = plan.functions.get(&declaration).cloned().ok_or_else(|| {
+                    type_node_unavailable(TypeNodeUnavailable::InvalidFunctionSignature(signature))
+                })?;
+                let return_type = self.execute_type_node(function.return_type, plan, prepared)?;
+                functions::publish_lazy_return_type(self.store, &function, signature, return_type)
+                    .map_err(function_type_error)?;
+            }
+        }
+        Ok(())
     }
 
     fn conditional_branch_demand(
@@ -14072,6 +14204,139 @@ mod tests {
             let unselected = NodeRef::new(conditional.arena, conditional.file, unselected);
             assert!(fixture.store.type_node_links(unselected).is_none());
         }
+    }
+
+    #[test]
+    fn conditional_callable_inference_preserves_outer_signature_identity_and_warm_caches() {
+        let mut fixture = fixture(concat!(
+            "type Extract<Value> = ",
+            "(<Inner extends Value>() => Inner) extends (() => infer Result) ",
+            "? Result : never; ",
+            "type Text = Extract<string>;",
+        ));
+        let extract = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Extract");
+        let text = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Text");
+        let functions = fixture
+            .parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionType).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(functions.len(), 2);
+        let generic = functions
+            .iter()
+            .copied()
+            .find(|node| {
+                matches!(
+                    &fixture.parsed.arena.get(node.node).unwrap().data,
+                    NodeData::FunctionTypeNode(function) if function.type_parameters.is_some()
+                )
+            })
+            .unwrap();
+        let inferred = functions
+            .iter()
+            .copied()
+            .find(|node| *node != generic)
+            .unwrap();
+        let inferred_return = function_return_node(&fixture, inferred);
+        let expected = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                text,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(expected),
+        );
+
+        let outer = fixture
+            .store
+            .type_alias_links(extract)
+            .unwrap()
+            .type_parameters
+            .as_ref()
+            .unwrap()[0];
+        let generic_signature = function_signature(&fixture.store, generic);
+        let [inner] = fixture
+            .store
+            .signature(generic_signature)
+            .unwrap()
+            .type_parameters()
+        else {
+            panic!("the source callable must retain its generic signature parameter")
+        };
+        let inner = *inner;
+        let TypeData::TypeParameter(parameter) = fixture.store.type_payload(inner).unwrap().data()
+        else {
+            panic!("the generic signature parameter must retain its type identity")
+        };
+        assert_eq!(parameter.constraint, Some(outer));
+        assert_eq!(
+            fixture
+                .store
+                .signature(generic_signature)
+                .and_then(Signature::resolved_return_type),
+            Some(inner),
+        );
+
+        let inferred_signature = function_signature(&fixture.store, inferred);
+        let inferred_type = fixture
+            .store
+            .signature(inferred_signature)
+            .and_then(Signature::resolved_return_type)
+            .unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .type_node_links(inferred_return)
+                .and_then(|links| links.resolved_type),
+            Some(inferred_type),
+        );
+        let declared = fixture
+            .store
+            .type_alias_links(extract)
+            .unwrap()
+            .declared_type
+            .unwrap();
+        let TypeData::Conditional(conditional) =
+            fixture.store.type_payload(declared).unwrap().data()
+        else {
+            panic!("the generic alias must retain its conditional root")
+        };
+        let root = fixture.store.conditional_root(conditional.root).unwrap();
+        assert_eq!(root.infer_type_parameters(), Some(&[inferred_type][..]));
+        assert_eq!(root.outer_type_parameters(), Some(&[outer][..]));
+
+        let warm = (
+            function_store_state(&fixture.store),
+            fixture.store.conditional_root_len(),
+        );
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                text,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(expected),
+        );
+        assert_eq!(
+            (
+                function_store_state(&fixture.store),
+                fixture.store.conditional_root_len(),
+            ),
+            warm,
+        );
+        assert!(diagnostics.is_empty());
     }
 
     #[test]

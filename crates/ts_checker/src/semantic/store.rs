@@ -267,13 +267,14 @@ pub(super) struct PreparedSourceOverloadPublication {
 /// Immutable syntax-plan edge for the admitted direct-interface heritage slice.
 ///
 /// `resolved_base_types` remains the pinned semantic cache, while this separate
-/// provenance lets store-only consumers prove that the cached edge still names
-/// the exact base selected by source planning.
+/// provenance lets store-only consumers prove that one or two cached edges
+/// still name the exact nongeneric bases selected by source planning.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct DirectInterfaceHeritageProvenance {
     pub(super) owner_symbol: SemanticSymbolId,
     pub(super) base_symbol: SemanticSymbolId,
     pub(super) base_type: TypeId,
+    pub(super) second_base: Option<(SemanticSymbolId, TypeId)>,
 }
 
 /// Immutable source-plan edge for one direct local class base.
@@ -4721,12 +4722,12 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             .copied()
     }
 
-    /// Publishes one source-planned direct-base edge exactly once.
+    /// Publishes one or two source-planned direct-base edges exactly once.
     ///
     /// Callers reserve the map slot before beginning their semantic transaction.
-    /// Both declared-type links are authoritative by the time heritage members
-    /// resolve, so accepting only those identities prevents a coherent but
-    /// source-wrong `resolved_base_types` cache from reaching structural relation.
+    /// Every declared-type link is authoritative by the time heritage members
+    /// resolve. A second base must be a distinct, resolved, nongeneric
+    /// property-only interface.
     pub(super) fn publish_direct_interface_heritage_provenance(
         &mut self,
         type_: TypeId,
@@ -4750,7 +4751,57 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             && self
                 .declared_type_links(provenance.base_symbol)
                 .is_some_and(|links| links.declared_type == Some(provenance.base_type));
-        if provenance.owner_symbol == provenance.base_symbol || !owner_is_exact || !base_is_exact {
+        let second_base_is_exact = provenance
+            .second_base
+            .is_none_or(|(base_symbol, base_type)| {
+                base_symbol != provenance.owner_symbol
+                    && base_symbol != provenance.base_symbol
+                    && base_type != type_
+                    && base_type != provenance.base_type
+                    && self.get_merged_symbol(base_symbol) == Some(base_symbol)
+                    && self
+                        .declared_type_links(base_symbol)
+                        .is_some_and(|links| links.declared_type == Some(base_type))
+                    && self.type_payload(base_type).is_some_and(|record| {
+                        let TypeData::Interface(interface) = record.data() else {
+                            return false;
+                        };
+                        let structured = &interface.reference.object.structured;
+                        record.flags() == TypeFlags::OBJECT
+                            && record.object_flags()
+                                == super::types::ObjectFlags::INTERFACE
+                                    | super::types::ObjectFlags::MEMBERS_RESOLVED
+                            && record.symbol() == Some(base_symbol)
+                            && record.alias().is_none()
+                            && self.symbol(base_symbol).is_some_and(|symbol| {
+                                symbol.flags() == SymbolFlags::INTERFACE
+                                    && symbol.members() == interface.declared_members
+                            })
+                            && interface.all_type_parameters.is_none()
+                            && interface.outer_type_parameter_count == 0
+                            && interface.this_type.is_none()
+                            && interface.reference.object.target.is_none()
+                            && interface.reference.object.mapper.is_none()
+                            && interface.reference.object.instantiations
+                                == TypeCacheState::Unallocated
+                            && interface.reference.node.is_none()
+                            && interface.reference.resolved_type_arguments.is_none()
+                            && interface.base_types_resolved
+                            && interface.declared_members_resolved
+                            && interface.resolved_base_constructor_type.is_none()
+                            && interface.declared_call_signatures.is_none()
+                            && interface.declared_construct_signatures.is_none()
+                            && interface.declared_index_infos.is_none()
+                            && structured.signatures.is_none()
+                            && structured.call_signature_count == 0
+                            && structured.index_infos.is_none()
+                    })
+            });
+        if provenance.owner_symbol == provenance.base_symbol
+            || !owner_is_exact
+            || !base_is_exact
+            || !second_base_is_exact
+        {
             return false;
         }
         let std::collections::hash_map::Entry::Vacant(entry) =
@@ -7008,6 +7059,110 @@ mod tests {
             },
         ));
         assert!(store.union_cache_needs_validation);
+    }
+
+    #[test]
+    fn direct_interface_heritage_authenticates_optional_second_base_atomically() {
+        fn interface(
+            store: &mut CanonicalTypeMapperStore,
+            name: &str,
+            resolve_members: bool,
+        ) -> (crate::semantic::SemanticSymbolId, crate::semantic::TypeId) {
+            let symbol = store
+                .alloc_symbol(SymbolData::new(
+                    SymbolFlags::INTERFACE,
+                    EscapedName::source(name),
+                ))
+                .unwrap();
+            let type_ = store
+                .alloc_interface_type(ObjectFlags::INTERFACE, Some(symbol))
+                .unwrap();
+            assert!(store.set_declared_type_links(
+                symbol,
+                DeclaredTypeLinks {
+                    declared_type: Some(type_),
+                    ..DeclaredTypeLinks::default()
+                },
+            ));
+            if resolve_members {
+                assert!(store.set_interface_base_resolution(type_, true, None, None));
+                assert!(store.set_interface_declared_members(type_, true, None, None, None, None,));
+                assert!(store.set_structured_type_members(type_, None, None, None, None, None,));
+            }
+            (symbol, type_)
+        }
+
+        let mut store = CanonicalTypeMapperStore::new();
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        let (owner_symbol, owner_type) = interface(&mut store, "Derived", false);
+        let (single_owner, single_type) = interface(&mut store, "Single", false);
+        let (base_symbol, base_type) = interface(&mut store, "First", true);
+        let (second_symbol, second_type) = interface(&mut store, "Second", true);
+        let (unresolved_symbol, unresolved_type) = interface(&mut store, "Unresolved", false);
+        let mut foreign = CanonicalTypeMapperStore::new();
+        foreign
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        let foreign_base = interface(&mut foreign, "Foreign", true);
+        let before = (
+            store.direct_interface_heritage_provenance.len(),
+            store.type_len(),
+            store.relation_state_snapshot(),
+        );
+
+        for second_base in [
+            (base_symbol, base_type),
+            (second_symbol, base_type),
+            (owner_symbol, owner_type),
+            (unresolved_symbol, unresolved_type),
+            foreign_base,
+        ] {
+            assert!(!store.publish_direct_interface_heritage_provenance(
+                owner_type,
+                super::DirectInterfaceHeritageProvenance {
+                    owner_symbol,
+                    base_symbol,
+                    base_type,
+                    second_base: Some(second_base),
+                },
+            ));
+            assert_eq!(
+                (
+                    store.direct_interface_heritage_provenance.len(),
+                    store.type_len(),
+                    store.relation_state_snapshot(),
+                ),
+                before,
+            );
+        }
+
+        let paired = super::DirectInterfaceHeritageProvenance {
+            owner_symbol,
+            base_symbol,
+            base_type,
+            second_base: Some((second_symbol, second_type)),
+        };
+        assert!(store.try_reserve_direct_interface_heritage_provenance(2));
+        assert!(store.publish_direct_interface_heritage_provenance(owner_type, paired));
+        assert_eq!(
+            store.direct_interface_heritage_provenance(owner_type),
+            Some(paired)
+        );
+        assert!(!store.publish_direct_interface_heritage_provenance(owner_type, paired));
+
+        let single = super::DirectInterfaceHeritageProvenance {
+            owner_symbol: single_owner,
+            base_symbol,
+            base_type,
+            second_base: None,
+        };
+        assert!(store.publish_direct_interface_heritage_provenance(single_type, single));
+        assert_eq!(
+            store.direct_interface_heritage_provenance(single_type),
+            Some(single)
+        );
     }
 
     #[test]

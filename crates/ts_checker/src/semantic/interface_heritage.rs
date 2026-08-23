@@ -1,8 +1,9 @@
 //! Exact syntax and symbol plan for the first interface-heritage slice.
 //!
-//! This module admits direct identifier bases on nongeneric interfaces. It
-//! resolves every base before publication so the member resolver never has to
-//! guess at an alias, qualified name, or generic instantiation boundary.
+//! This module admits one or two direct identifier bases on nongeneric
+//! interfaces. It resolves every base before publication so the member
+//! resolver never has to guess at an alias, qualified name, or generic
+//! instantiation boundary.
 
 use std::collections::HashSet;
 
@@ -63,7 +64,7 @@ pub(super) fn plan_direct_interface_heritage(
     {
         return Err(DirectInterfaceHeritageError::Invalid);
     }
-    if clause_data.types.nodes.len() != 1 {
+    if clause_data.types.nodes.len() > 2 {
         return Err(DirectInterfaceHeritageError::Unsupported {
             node: clause,
             kind: SyntaxKind::HeritageClause,

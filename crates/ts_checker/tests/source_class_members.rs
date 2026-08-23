@@ -232,6 +232,85 @@ fn source_check_materializes_class_members_and_accepts_unmarked_static_fields() 
 }
 
 #[test]
+fn paired_class_accessors_share_the_getter_type_and_infer_setter_parameter() {
+    let parsed =
+        parse_source_file("class Model { get value(): number { return 1; } set value(next) {} }");
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(90);
+    let mut context = checker_context(&parsed, file);
+    let owner = class_symbol(&parsed, file, &context, "Model");
+
+    context.check_source_file(file).unwrap();
+    assert!(
+        context.diagnostics().is_empty(),
+        "{:?}",
+        context.diagnostics()
+    );
+
+    let members = context.get_nongeneric_class_members(owner).unwrap();
+    let [accessor] = members.instance_properties() else {
+        panic!("getter and setter must share one class member")
+    };
+    let accessor = *accessor;
+    let symbol = context.store().symbol(accessor).unwrap();
+    assert_eq!(
+        symbol.flags(),
+        SymbolFlags::GET_ACCESSOR | SymbolFlags::SET_ACCESSOR
+    );
+    assert_eq!(symbol.declarations().unwrap().len(), 2);
+    let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+    assert_eq!(
+        context
+            .store()
+            .value_symbol_links(accessor)
+            .and_then(|links| links.resolved_type),
+        Some(number),
+    );
+
+    let setter_parameter = parsed
+        .arena
+        .iter()
+        .find_map(|(node, record)| {
+            let NodeData::ParameterDeclaration(parameter) = &record.data else {
+                return None;
+            };
+            let NodeData::Identifier(name) = &parsed.arena.get(parameter.name)?.data else {
+                return None;
+            };
+            (name.text == "next").then_some(NodeRef::new(parsed.arena.id(), file, node))
+        })
+        .unwrap();
+    let setter_symbol = context
+        .file(file)
+        .unwrap()
+        .1
+        .symbol(setter_parameter)
+        .unwrap();
+    assert_eq!(
+        context
+            .store()
+            .value_symbol_links(setter_symbol)
+            .and_then(|links| links.resolved_type),
+        Some(number),
+    );
+
+    let warm = (
+        context.store().type_len(),
+        context.store().signature_len(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
+}
+
+#[test]
 fn supported_classes_execute_at_their_lexical_statement_positions() {
     let parsed = parse_source_file(concat!(
         "class First { value?: string; }\n",

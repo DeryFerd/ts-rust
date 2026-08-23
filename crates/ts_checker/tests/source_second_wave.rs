@@ -197,6 +197,88 @@ fn object_literals_preserve_shorthand_and_computed_literal_properties() {
 }
 
 #[test]
+fn object_property_arrows_publish_callable_values_without_changing_siblings() {
+    let parsed = parse_source_file(concat!(
+        "const handlers = { ",
+        "run: (value: any) => value.id, ",
+        "label: 'ready' ",
+        "};",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(8_220);
+    let mut context = context(&parsed, file, CanonicalSourceLanguage::TypeScript);
+
+    context.check_source_file(file).unwrap();
+    assert!(
+        context.diagnostics().is_empty(),
+        "{:?}",
+        context.diagnostics()
+    );
+
+    let arrow = parsed
+        .arena
+        .iter()
+        .find_map(|(node, record)| {
+            (record.kind == SyntaxKind::ArrowFunction).then_some(NodeRef::new(
+                parsed.arena.id(),
+                file,
+                node,
+            ))
+        })
+        .unwrap();
+    let arrow_type = context
+        .store()
+        .type_node_links(arrow)
+        .and_then(|links| links.resolved_type)
+        .unwrap();
+    assert_eq!(
+        context.type_to_string(arrow_type).unwrap(),
+        "(value: any) => any"
+    );
+
+    let warm = (
+        context.store().type_len(),
+        context.store().signature_len(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
+}
+
+#[test]
+fn contextual_arrays_accept_nested_object_type_assertions() {
+    let parsed = parse_source_file(concat!(
+        "interface Array<T> {}\n",
+        "interface ReadonlyArray<T> {}\n",
+        "const value: { id: number }[] = [<{ id: number }>({})];\n",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(8_221);
+    let mut context = context(&parsed, file, CanonicalSourceLanguage::TypeScript);
+
+    context.check_source_file(file).unwrap();
+    assert!(
+        context.diagnostics().is_empty(),
+        "{:?}",
+        context.diagnostics()
+    );
+
+    let warm = (context.store().type_len(), context.diagnostics().clone());
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (context.store().type_len(), context.diagnostics().clone()),
+        warm
+    );
+}
+
+#[test]
 fn numeric_and_quoted_object_keys_keep_distinct_assignment_diagnostics() {
     let parsed = parse_source_file(concat!(
         "const numeric: number = { 0: 1 }; ",

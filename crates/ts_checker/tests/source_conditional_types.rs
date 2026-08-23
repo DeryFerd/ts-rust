@@ -369,3 +369,44 @@ fn conditional_template_inference_preserves_unicode_code_points() {
         warm,
     );
 }
+
+#[test]
+fn conditional_signature_inference_uses_its_outer_generic_constraint() {
+    let parsed = parse_source_file(concat!(
+        "type Extract<Value> = ",
+        "(<Inner extends Value>() => Inner) extends (() => infer Result) ",
+        "? Result : never;\n",
+        "type Text = Extract<string>;\n",
+        "const value: Text = 'ready';\n",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(6);
+    let mut context = context(&parsed, file);
+
+    context.check_source_file(file).unwrap();
+    assert!(
+        context.diagnostics().is_empty(),
+        "{:?}",
+        context.diagnostics()
+    );
+    let text = alias_symbol(&parsed, file, &context, "Text");
+    assert_eq!(
+        context.type_to_string(alias_type(&context, text)).unwrap(),
+        "string"
+    );
+
+    let warm = (
+        context.store().type_len(),
+        context.store().signature_len(),
+        context.store().mapper_len(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().mapper_len(),
+        ),
+        warm,
+    );
+}

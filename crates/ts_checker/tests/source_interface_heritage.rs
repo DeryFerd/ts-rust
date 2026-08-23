@@ -517,15 +517,6 @@ fn compatible_interface_overrides_replace_inherited_properties() {
 fn unsupported_interface_heritage_shapes_fail_before_semantic_publication() {
     let cases = [
         (
-            "multiple-bases",
-            concat!(
-                "interface Left { left: number }\n",
-                "interface Right { right: number }\n",
-                "interface Both extends Left, Right { own: number }\n",
-                "const value: Both = { left: 1, right: 2, own: 3 };\n",
-            ),
-        ),
-        (
             "cycle",
             concat!(
                 "interface Left extends Right { left: number }\n",
@@ -642,4 +633,70 @@ fn unsupported_interface_heritage_shapes_fail_before_semantic_publication() {
         );
         assert_eq!(context.check_source_file(file), Err(first), "{name}");
     }
+}
+
+#[test]
+fn compatible_interface_bases_merge_properties_in_declaration_order() {
+    let parsed = parse_source_file(concat!(
+        "interface First { data: any; which: number; metaKey: any }\n",
+        "interface Second { data: any }\n",
+        "interface Combined extends First, Second {}\n",
+        "const value: Combined = { data: 1, which: 2, metaKey: 3 };\n",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(40);
+    let mut context = checker_context(&parsed, file, "/project/multiple-bases.ts");
+    let first = interface_symbol(&parsed, file, &context, "First");
+    let second = interface_symbol(&parsed, file, &context, "Second");
+    let combined = interface_symbol(&parsed, file, &context, "Combined");
+
+    context.check_source_file(file).unwrap();
+    assert!(
+        context.diagnostics().is_empty(),
+        "{:?}",
+        context.diagnostics()
+    );
+
+    let first_type = declared_type(&context, first);
+    let second_type = declared_type(&context, second);
+    let combined_type = declared_type(&context, combined);
+    let TypeData::Interface(interface) =
+        context.store().type_payload(combined_type).unwrap().data()
+    else {
+        panic!("Combined must retain its interface payload")
+    };
+    assert_eq!(
+        interface.resolved_base_types.as_deref(),
+        Some(&[first_type, second_type][..]),
+    );
+    assert_eq!(
+        interface_property_names(&context, combined_type),
+        (
+            Vec::new(),
+            vec!["data".to_owned(), "which".to_owned(), "metaKey".to_owned()],
+        ),
+    );
+    assert_eq!(
+        context.is_type_assignable_to(combined_type, first_type),
+        Ok(true)
+    );
+    assert_eq!(
+        context.is_type_assignable_to(combined_type, second_type),
+        Ok(true)
+    );
+
+    let warm = (
+        context.store().type_len(),
+        context.store().symbol_len(),
+        context.store().relation_state_snapshot(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().relation_state_snapshot(),
+        ),
+        warm,
+    );
 }

@@ -5105,6 +5105,34 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     }
                     break;
                 }
+                NodeData::PropertyAssignment(property)
+                    if record.kind == SyntaxKind::PropertyAssignment
+                        && property.initializer == argument.node =>
+                {
+                    let object = record.parent.map(|node| self.reference(node)).ok_or(
+                        SourceCheckError::Unsupported(UnsupportedSourceSyntax::Arrow(declaration)),
+                    )?;
+                    let object_plan = super::object_members::plan_object_literal(
+                        store, host, object,
+                    )
+                    .map_err(|_| {
+                        SourceCheckError::Unsupported(UnsupportedSourceSyntax::Arrow(declaration))
+                    })?;
+                    if !object_plan.properties.iter().any(|planned| {
+                        planned.declaration == parent
+                            && planned.type_node == argument
+                            && self
+                                .bound
+                                .symbol(parent)
+                                .and_then(|symbol| store.get_merged_symbol(symbol))
+                                == Some(planned.symbol)
+                    }) {
+                        return Err(SourceCheckError::Unsupported(
+                            UnsupportedSourceSyntax::Arrow(declaration),
+                        ));
+                    }
+                    break;
+                }
                 _ => {
                     return Err(SourceCheckError::Unsupported(
                         UnsupportedSourceSyntax::Arrow(declaration),
@@ -7187,6 +7215,15 @@ fn expression_type(
         expression,
         prepared,
         &mut property_diagnostics,
+        &mut |_, nested, _| {
+            Err(SourceCheckError::Unsupported(
+                if matches!(&nested.kind, PlannedExpressionKind::Arrow(_)) {
+                    UnsupportedSourceSyntax::Arrow(nested.node)
+                } else {
+                    UnsupportedSourceSyntax::NestedAssertion(nested.node)
+                },
+            ))
+        },
     )?
     .result)
 }
@@ -7255,14 +7292,22 @@ fn prepare_source_property_diagnostic_sink(
     Ok(diagnostics)
 }
 
-fn execute_expression_types(
+fn execute_expression_types<F>(
     store: &mut CanonicalTypeMapperStore,
     global_types: Option<&CanonicalGlobalTypes>,
     current_flow_types: &HashMap<SemanticSymbolId, TypeId>,
     expression: &PlannedExpression,
     prepared: &PreparedExpression,
     property_diagnostics: &mut Vec<SourcePropertyDiagnostic>,
-) -> Result<CheckedExpressionTypes, SourceCheckError> {
+    check_nested_expression: &mut F,
+) -> Result<CheckedExpressionTypes, SourceCheckError>
+where
+    F: FnMut(
+        &mut CanonicalTypeMapperStore,
+        &PlannedExpression,
+        Option<TypeId>,
+    ) -> Result<CheckedExpressionTypes, SourceCheckError>,
+{
     let types = match (&expression.kind, prepared) {
         (PlannedExpressionKind::Null, PreparedExpression::Literal(LiteralTreatment::Identity)) => {
             store
@@ -7394,6 +7439,7 @@ fn execute_expression_types(
             inner,
             prepared,
             property_diagnostics,
+            check_nested_expression,
         ),
         (PlannedExpressionKind::Array(elements), PreparedExpression::Array(prepared_elements)) => {
             debug_assert_eq!(elements.len(), prepared_elements.len());
@@ -7414,6 +7460,7 @@ fn execute_expression_types(
                     element,
                     prepared,
                     property_diagnostics,
+                    check_nested_expression,
                 )?;
                 element_types.push(checked.result);
                 checked_elements.push(checked);
@@ -7464,6 +7511,7 @@ fn execute_expression_types(
                     property,
                     prepared,
                     property_diagnostics,
+                    check_nested_expression,
                 )?;
                 property_types.push(checked.result);
                 checked_properties.push(checked);
@@ -7489,6 +7537,7 @@ fn execute_expression_types(
                 &property.receiver,
                 prepared_receiver,
                 property_diagnostics,
+                check_nested_expression,
             )?;
             let checked =
                 check_direct_source_property(store, global_types, property, receiver.result)
@@ -7501,6 +7550,11 @@ fn execute_expression_types(
             }
             Ok(CheckedExpressionTypes::leaf(checked.type_, checked.type_))
         }
+        (PlannedExpressionKind::Arrow(_), PreparedExpression::Arrow(contextual_type))
+        | (
+            PlannedExpressionKind::Assertion { .. },
+            PreparedExpression::Assertion(contextual_type),
+        ) => check_nested_expression(store, expression, *contextual_type),
         _ => unreachable!("a prepared expression must retain its planned expression shape"),
     }?;
     publish_expression_type(store, expression.node, types.raw)?;
@@ -8725,14 +8779,37 @@ fn check_expression_type(
             let mut resolved_members = HashSet::new();
             let mut resolved_properties = HashSet::new();
             let checked = loop {
-                match execute_expression_types(
-                    store,
-                    Some(global_types),
-                    current_flow_types,
-                    expression,
-                    &prepared,
-                    &mut property_diagnostics,
-                ) {
+                let execution = {
+                    let mut check_nested_expression =
+                        |store: &mut CanonicalTypeMapperStore,
+                         nested: &PlannedExpression,
+                         nested_context: Option<TypeId>| {
+                            check_expression_type(
+                                store,
+                                host,
+                                global_types,
+                                source,
+                                options,
+                                session,
+                                diagnostics,
+                                current_flow_types,
+                                preflighted_type_import_value_uses,
+                                nested,
+                                nested_context,
+                                deferred,
+                            )
+                        };
+                    execute_expression_types(
+                        store,
+                        Some(global_types),
+                        current_flow_types,
+                        expression,
+                        &prepared,
+                        &mut property_diagnostics,
+                        &mut check_nested_expression,
+                    )
+                };
+                match execution {
                     Ok(checked) => break checked,
                     Err(SourceCheckError::RelationUnavailable(error)) => {
                         let candidates = current_flow_types.values().copied().collect::<Vec<_>>();
@@ -23069,6 +23146,177 @@ mod tests {
         mark_source_unchecked(&mut context, file);
         context.check_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn object_property_arrows_publish_distinct_callables_and_widen_other_properties() {
+        let source = parsed(concat!(
+            "const captured = 1; ",
+            "var resolve = { ",
+            "id: /*! @ngInject */ (details: any) => details.id, ",
+            "label: 'hello', ",
+            "wrapped: ((details: any) => details.id), ",
+            "other: (details: any) => details.id, ",
+            "}; const retained = captured;",
+        ));
+        let file = FileId::new(8_414);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let object = variable_initializer(&source, file, "resolve");
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let any = bootstrap.any_type;
+        assert_eq!(
+            object_property_type(&context, object, "label"),
+            bootstrap.string_type
+        );
+        assert_eq!(
+            variable_value_type(&context, &source, file, "retained"),
+            variable_value_type(&context, &source, file, "captured")
+        );
+
+        let (_, bound) = context.file(file).unwrap();
+        let mut callables = HashSet::new();
+        for name in ["id", "wrapped", "other"] {
+            let mut arrow = object_property_initializer(&source, file, object, name);
+            while let NodeData::ParenthesizedExpression(parenthesized) =
+                &source.arena.get(arrow.node).unwrap().data
+            {
+                arrow = NodeRef::new(source.arena.id(), file, parenthesized.expression);
+            }
+            let owner = bound.symbol(arrow).unwrap();
+            let callable = context
+                .store()
+                .source_callable_type_for_owner(owner)
+                .unwrap();
+            assert!(callables.insert(callable));
+            assert_eq!(resolved_node_type(&context, arrow), callable);
+            assert_eq!(object_property_type(&context, object, name), callable);
+            let signature = context
+                .store()
+                .source_callable_provenance(callable)
+                .unwrap()
+                .signature;
+            assert_eq!(
+                context
+                    .store()
+                    .signature(signature)
+                    .unwrap()
+                    .resolved_return_type(),
+                Some(any)
+            );
+        }
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        mark_source_unchecked(&mut context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn malformed_object_cache_rejects_property_arrows_before_publication() {
+        let source = parsed("var resolve = { id: (details: any) => details.id };");
+        let file = FileId::new(8_415);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let object = variable_initializer(&source, file, "resolve");
+        let variable = variable_symbol(&context, &source, file, "resolve");
+        let arrow = object_property_initializer(&source, file, object, "id");
+        let owner = context.file(file).unwrap().1.symbol(arrow).unwrap();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert!(context.store_mut_for_test().set_type_node_links(
+            object,
+            TypeNodeLinks {
+                resolved_type: Some(number),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        let before = observable_state(&context, file);
+
+        assert!(matches!(
+            context.check_source_file(file),
+            Err(SourceCheckError::ObjectLiteral(
+                SourceObjectLiteralError::InvalidCache { node, .. }
+            )) if node == object
+        ));
+        assert_eq!(observable_state(&context, file), before);
+        assert!(context.store().value_symbol_links(variable).is_none());
+        assert!(
+            context
+                .store()
+                .source_callable_type_for_owner(owner)
+                .is_none()
+        );
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn contextual_array_assertions_retain_deferred_comparisons_and_replay_warm() {
+        let library = parsed("interface Array<T> {}");
+        let library_file = FileId::new(8_416);
+        let cases = [
+            ("var foo: { id: number }[] = [<{ id: number }>({})];", None),
+            (
+                "var foo: { id: number }[] = [<{ id: number }>('bad')];",
+                Some(2352),
+            ),
+        ];
+
+        for (index, (text, expected_diagnostic)) in cases.into_iter().enumerate() {
+            let source = parsed(text);
+            let file = FileId::new(8_417 + u32::try_from(index).unwrap());
+            let mut context = context(
+                &[(library_file, &library), (file, &source)],
+                CanonicalCheckerOptions::default(),
+            );
+
+            context.check_source_file(file).unwrap();
+
+            let array = variable_initializer(&source, file, "foo");
+            let elements = array_elements(&source, file, array);
+            let [assertion] = elements.as_slice() else {
+                panic!("expected one asserted array element")
+            };
+            let NodeData::TypeAssertion(assertion_data) =
+                &source.arena.get(assertion.node).unwrap().data
+            else {
+                panic!("expected an asserted array element")
+            };
+            let operand = NodeRef::new(source.arena.id(), file, assertion_data.expression);
+            assert_eq!(
+                context.store().assertion_links(*assertion),
+                Some(&AssertionLinks {
+                    expr_type: Some(resolved_node_type(&context, operand)),
+                })
+            );
+            let source_ref = context.source_file(file).unwrap();
+            assert_eq!(
+                context
+                    .store()
+                    .source_file_links(source_ref)
+                    .unwrap()
+                    .deferred_nodes
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                [*assertion]
+            );
+            assert_eq!(
+                context
+                    .diagnostics()
+                    .as_slice()
+                    .iter()
+                    .map(|diagnostic| diagnostic.diagnostic.code())
+                    .collect::<Vec<_>>(),
+                expected_diagnostic.into_iter().collect::<Vec<_>>()
+            );
+
+            let warm = observable_state(&context, file);
+            mark_source_unchecked(&mut context, file);
+            context.check_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
     }
 
     #[test]

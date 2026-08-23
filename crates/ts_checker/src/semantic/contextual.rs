@@ -44,6 +44,8 @@ pub(super) enum PreparedExpression {
     Array(Vec<PreparedExpression>),
     Object(Vec<PreparedExpression>),
     Property(Box<PreparedExpression>),
+    Arrow(Option<TypeId>),
+    Assertion(Option<TypeId>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -331,11 +333,7 @@ fn prepare_expression(
                 location,
             )?))
         }
-        PlannedExpressionKind::Assertion { .. } => {
-            return Err(SourceCheckError::Unsupported(
-                UnsupportedSourceSyntax::NestedAssertion(expression.node),
-            ));
-        }
+        PlannedExpressionKind::Assertion { .. } => PreparedExpression::Assertion(contextual_type),
         PlannedExpressionKind::Array(elements) => {
             let element_context = match (global_types, contextual_type) {
                 (Some(global_types), Some(contextual_type)) => {
@@ -429,11 +427,7 @@ fn prepare_expression(
                 UnsupportedSourceSyntax::Call(expression.node),
             ));
         }
-        PlannedExpressionKind::Arrow(_) => {
-            return Err(SourceCheckError::Unsupported(
-                UnsupportedSourceSyntax::Arrow(expression.node),
-            ));
-        }
+        PlannedExpressionKind::Arrow(_) => PreparedExpression::Arrow(contextual_type),
         PlannedExpressionKind::New(_) => {
             return Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::New(
                 expression.node,
