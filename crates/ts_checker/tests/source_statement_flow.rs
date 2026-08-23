@@ -888,3 +888,65 @@ fn final_if_accepts_direct_and_mixed_return_branches() {
         counts,
     );
 }
+
+#[test]
+fn assignments_to_type_only_namespaces_report_ts2708_and_keep_expression_types() {
+    let source = "namespace A {}\nA = undefined;\n";
+    let parsed = parse_source_file(source);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(2_160);
+    let mut context = context(&parsed, file);
+
+    context.check_source_file(file).unwrap();
+
+    let [diagnostic] = context.diagnostics().as_slice() else {
+        panic!("expected one namespace assignment diagnostic")
+    };
+    assert_eq!(diagnostic.diagnostic.code(), 2708);
+    assert_eq!(
+        diagnostic.diagnostic.render().unwrap(),
+        "Cannot use namespace 'A' as a value.",
+    );
+    assert_eq!(node_text(source, &parsed, diagnostic.node.unwrap()), "A",);
+
+    let assignment = node_of_kind(&parsed, file, SyntaxKind::BinaryExpression);
+    let NodeData::BinaryExpression(binary) = &parsed.arena.get(assignment.node).unwrap().data
+    else {
+        panic!("expected namespace assignment")
+    };
+    let left = NodeRef::new(parsed.arena.id(), file, binary.left);
+    let right = NodeRef::new(parsed.arena.id(), file, binary.right);
+    assert_eq!(
+        context
+            .type_to_string(resolved_type(&context, left))
+            .unwrap(),
+        "any",
+    );
+    assert_eq!(
+        context
+            .type_to_string(resolved_type(&context, assignment))
+            .unwrap(),
+        "undefined",
+    );
+    assert_eq!(
+        context
+            .type_to_string(resolved_type(&context, right))
+            .unwrap(),
+        "undefined",
+    );
+
+    let warm = (
+        context.store().type_len(),
+        context.store().symbol_len(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
+}

@@ -965,6 +965,14 @@ struct PlannedCommonJsAssignment {
 }
 
 #[derive(Clone, Debug)]
+struct PlannedNamespaceAssignment {
+    expression: NodeRef,
+    left: NodeRef,
+    target_symbol: SemanticSymbolId,
+    right: PlannedExpression,
+}
+
+#[derive(Clone, Debug)]
 struct PlannedTopLevelIf {
     syntax: SourceControlIfSyntax,
     condition: PlannedExpression,
@@ -1011,6 +1019,7 @@ enum PlannedStatement {
     Variables(Vec<PlannedVariable>),
     Assignment(PlannedAssignment),
     CommonJsAssignment(PlannedCommonJsAssignment),
+    NamespaceAssignment(PlannedNamespaceAssignment),
     ControlIf(Box<PlannedTopLevelIf>),
     ControlLoop(Box<PlannedTopLevelLoop>),
     Break(NodeRef),
@@ -1874,6 +1883,12 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         statements.push(PlannedStatement::ExpressionValue(expression));
                         continue;
                     }
+                    if let Some(assignment) =
+                        self.plan_top_level_namespace_assignment(expression, &statements)?
+                    {
+                        statements.push(PlannedStatement::NamespaceAssignment(assignment));
+                        continue;
+                    }
                     let Some((store, host)) = self.semantic else {
                         return Err(self.unsupported(
                             statement,
@@ -2635,6 +2650,80 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             return Err(SourceCheckError::Element(expression));
         }
         Ok(Some(planned))
+    }
+
+    fn plan_top_level_namespace_assignment(
+        &mut self,
+        expression: NodeRef,
+        statements: &[PlannedStatement],
+    ) -> Result<Option<PlannedNamespaceAssignment>, SourceCheckError> {
+        let record = self.node(expression)?;
+        let NodeData::BinaryExpression(binary) = &record.data else {
+            return Ok(None);
+        };
+        let left = self.reference(binary.left);
+        let right = self.reference(binary.right);
+        let operator = self.reference(binary.operator_token);
+        let operator_record = self.node(operator)?;
+        if operator_record.kind != SyntaxKind::EqualsToken {
+            return Ok(None);
+        }
+        let left_record = self.node(left)?;
+        let NodeData::Identifier(identifier) = &left_record.data else {
+            return Ok(None);
+        };
+        let Some((store, _)) = self.semantic else {
+            return Ok(None);
+        };
+        let Some(target_symbol) = statements.iter().rev().find_map(|statement| {
+            let PlannedStatement::Namespace(namespace) = statement else {
+                return None;
+            };
+            let target = store.symbol(namespace.symbol)?;
+            (target.flags() == SymbolFlags::NAMESPACE_MODULE
+                && target.name().as_utf8() == Some(identifier.text.as_str())
+                && store.get_merged_symbol(namespace.symbol) == Some(namespace.symbol))
+            .then_some(namespace.symbol)
+        }) else {
+            return Ok(None);
+        };
+        let right_record = self.node(right)?;
+        if record.kind != SyntaxKind::BinaryExpression
+            || record.flags.0 != 0
+            || binary.symbol.is_some()
+            || binary.type_.is_some()
+            || binary.facts != 0
+            || binary.modifiers.is_some()
+            || operator_record.parent != Some(expression.node)
+            || operator_record.flags.0 != 0
+            || !matches!(operator_record.data, NodeData::Token(_))
+            || left_record.kind != SyntaxKind::Identifier
+            || left_record.parent != Some(expression.node)
+            || left_record.flags.0 != 0
+            || identifier.flow_node.is_some()
+            || right_record.parent != Some(expression.node)
+            || right_record.kind != SyntaxKind::Identifier
+        {
+            return Ok(None);
+        }
+        let bootstrap = store
+            .intrinsic_bootstrap()
+            .ok_or(SourceCheckError::LiteralCache(
+                SourceLiteralCacheError::BootstrapUninitialized,
+            ))?;
+        preflight_source_expression_cache(store, left, bootstrap.error_type)?;
+        preflight_source_expression_cache(store, expression, bootstrap.undefined_type)?;
+
+        let right = self.plan_expression(right)?;
+        if !matches!(right.kind, PlannedExpressionKind::GlobalUndefined) {
+            return Ok(None);
+        }
+        Ok(Some(PlannedNamespaceAssignment {
+            expression,
+            left,
+            target_symbol,
+            right,
+        }))
     }
 
     fn is_direct_top_level_variable_initializer(
@@ -14091,6 +14180,61 @@ pub(super) fn check_source_file(
                 preflight_source_expression_cache(store, assignment.expression, value.result)?;
                 publish_expression_type(store, assignment.left, value.result)?;
                 publish_expression_type(store, assignment.expression, value.result)?;
+            }
+            PlannedStatement::NamespaceAssignment(assignment) => {
+                if store
+                    .symbol(assignment.target_symbol)
+                    .is_none_or(|symbol| symbol.flags() != SymbolFlags::NAMESPACE_MODULE)
+                {
+                    return Err(SourceCheckError::Assignment(
+                        AssignmentInvariant::InvalidSymbolShape(assignment.target_symbol),
+                    ));
+                }
+                let value = check_expression_type(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    &current_flow_types,
+                    &preflighted_type_import_value_uses,
+                    &assignment.right,
+                    None,
+                    &mut deferred,
+                )?;
+                let error_type = store
+                    .intrinsic_bootstrap()
+                    .map(|bootstrap| bootstrap.error_type)
+                    .ok_or(SourceCheckError::LiteralCache(
+                        SourceLiteralCacheError::BootstrapUninitialized,
+                    ))?;
+                let node = host
+                    .node(assignment.left)
+                    .ok_or(SourceCheckError::Provenance(
+                        SourceCheckProvenanceError::MissingNode(assignment.left),
+                    ))?;
+                let NodeData::Identifier(identifier) = &node.data else {
+                    return Err(SourceCheckError::Assignment(
+                        AssignmentInvariant::InvalidIdentifierShape(assignment.left),
+                    ));
+                };
+                publish_expression_type(store, assignment.left, error_type)?;
+                publish_expression_type(store, assignment.expression, value.result)?;
+                merge_retry_diagnostic(
+                    diagnostics,
+                    CanonicalCheckerDiagnostic {
+                        node: Some(assignment.left),
+                        range_override: None,
+                        diagnostic: Diagnostic::with_arguments(
+                            message_by_code(2708)
+                                .ok_or(SourceCheckError::MissingDiagnostic(2708))?,
+                            [identifier.text.clone()],
+                        ),
+                        related_information: Vec::new(),
+                    },
+                );
             }
             PlannedStatement::ControlIf(control) => {
                 let checked = check_expression_type(
