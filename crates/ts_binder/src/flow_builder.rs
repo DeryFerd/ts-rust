@@ -137,12 +137,26 @@ impl<'a, 'hooks> FlowBuilder<'a, 'hooks> {
             return;
         }
         self.hooks.enter_node(node_id);
+        let saved_in_assignment_pattern = self.in_assignment_pattern;
+        self.in_assignment_pattern = saved_in_assignment_pattern
+            && !self.current_is_unreachable()
+            && (self.is_destructuring_assignment(node_id)
+                || matches!(
+                    self.node_kind(node_id),
+                    Some(
+                        SyntaxKind::ObjectLiteralExpression
+                            | SyntaxKind::ArrayLiteralExpression
+                            | SyntaxKind::PropertyAssignment
+                            | SyntaxKind::SpreadElement
+                    )
+                ));
         self.bind_node_worker(node_id);
         for child in self.children_in_pinned_order(node_id) {
             if !self.visited[child.index()] {
                 self.bind_node(child);
             }
         }
+        self.in_assignment_pattern = saved_in_assignment_pattern;
         self.hooks.exit_node(node_id);
     }
 
@@ -2676,6 +2690,51 @@ mod tests {
         assert_eq!(
             assigned_identifiers(&parsed.arena, graph),
             ["fallback", "nested", "source", "nested", "trailing"]
+        );
+    }
+
+    #[test]
+    fn nested_destructuring_in_default_expressions_starts_a_new_assignment_pattern() {
+        for source in [
+            "([target = ([inner = (left = 1)] = (right = 2)), trailing] = source);",
+            "({ target = ([inner = (left = 1)] = (right = 2)), trailing } = source);",
+        ] {
+            let parsed = parse_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+
+            let file = FileId::new(145);
+            let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+            let graph = result
+                .flow_graph(&parsed.arena, parsed.source_file)
+                .expect("program-bound source has a flow graph");
+
+            assert!(graph.is_complete(), "{:?}", graph.unsupported());
+            assert_eq!(
+                assigned_identifiers(&parsed.arena, graph),
+                ["left", "right", "inner", "target", "trailing"],
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_function_containers_do_not_inherit_assignment_pattern_state() {
+        let parsed = parse_source_file(concat!(
+            "([target = (() => ([inner = (left = 1)] = (right = 2))), ",
+            "trailing] = source);",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+
+        let file = FileId::new(146);
+        let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+        let graph = result
+            .flow_graph(&parsed.arena, parsed.source_file)
+            .expect("program-bound source has a flow graph");
+
+        assert!(graph.is_complete(), "{:?}", graph.unsupported());
+        assert_eq!(
+            assigned_identifiers(&parsed.arena, graph),
+            ["left", "right", "inner", "target", "trailing"]
         );
     }
 
