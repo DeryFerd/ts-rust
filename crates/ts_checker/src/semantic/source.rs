@@ -146,13 +146,14 @@ use super::{
         plan_direct_source_property_syntax, prepare_source_property_diagnostic,
     },
     source_statements::{
-        SourceControlIfSyntax, SourceFallthroughBranchSyntax, SourceFunctionStatementsError,
+        SourceControlIfSyntax, SourceControlLoopKind, SourceControlLoopSyntax,
+        SourceFallthroughBranchSyntax, SourceFunctionStatementsError,
         SourceFunctionStatementsInvariant, SourceFunctionStatementsSyntax,
         SourceJoinedFunctionStatementsError, SourceJoinedFunctionStatementsInvariant,
         SourceJoinedFunctionStatementsSyntax, SourceLinearFunctionStatementsSyntax,
         SourceLocalDeclarationSyntax, SourceReturnBranchSyntax, SourceTypeofConditionSyntax,
-        plan_source_control_if_syntax, plan_source_function_statements_syntax,
-        plan_source_joined_function_statements_syntax,
+        plan_source_control_if_syntax, plan_source_control_loop_syntax,
+        plan_source_function_statements_syntax, plan_source_joined_function_statements_syntax,
         plan_source_linear_function_statements_syntax, source_control_branch_is_empty,
     },
     type_nodes::{
@@ -932,6 +933,13 @@ struct PlannedTopLevelIf {
     condition: PlannedExpression,
 }
 
+#[derive(Clone, Debug)]
+struct PlannedTopLevelLoop {
+    syntax: SourceControlLoopSyntax,
+    condition: PlannedExpression,
+    invalid_break: Option<NodeRef>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DeferredAssertion {
     node: NodeRef,
@@ -958,6 +966,7 @@ enum PlannedStatement {
     Variables(Vec<PlannedVariable>),
     Assignment(PlannedAssignment),
     ControlIf(Box<PlannedTopLevelIf>),
+    ControlLoop(Box<PlannedTopLevelLoop>),
     Break(NodeRef),
     ExpressionValue(PlannedExpression),
     ExpressionJsx {
@@ -1369,6 +1378,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         syntax,
                         condition,
                     })));
+                }
+                SyntaxKind::WhileStatement | SyntaxKind::LabeledStatement => {
+                    statements.push(PlannedStatement::ControlLoop(Box::new(
+                        self.plan_top_level_while(statement)?,
+                    )));
                 }
                 SyntaxKind::BreakStatement => {
                     let node = self.node(statement)?;
@@ -1862,6 +1876,149 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             strings: self.strings,
             numbers: self.numbers,
             bigints: self.bigints,
+        })
+    }
+
+    fn plan_top_level_while(
+        &mut self,
+        statement: NodeRef,
+    ) -> Result<PlannedTopLevelLoop, SourceCheckError> {
+        let mut labels = Vec::new();
+        let mut current = statement;
+        let mut parent = self.source.node_ref();
+
+        while self.node(current)?.kind == SyntaxKind::LabeledStatement {
+            let record = self.node(current)?;
+            let NodeData::LabeledStatement(labeled) = &record.data else {
+                return Err(self.unsupported(
+                    current,
+                    SyntaxKind::LabeledStatement,
+                    SourceSyntaxRole::Statement,
+                ));
+            };
+            if record.flags.0 != 0
+                || record.parent != Some(parent.node)
+                || labeled.flow_node.is_some()
+            {
+                return Err(self.unsupported(
+                    current,
+                    SyntaxKind::LabeledStatement,
+                    SourceSyntaxRole::Statement,
+                ));
+            }
+            let label = self.reference(labeled.label);
+            let label_record = self.node(label)?;
+            let NodeData::Identifier(identifier) = &label_record.data else {
+                return Err(self.unsupported(
+                    label,
+                    label_record.kind,
+                    SourceSyntaxRole::Statement,
+                ));
+            };
+            if label_record.kind != SyntaxKind::Identifier
+                || label_record.flags.0 != 0
+                || label_record.parent != Some(current.node)
+                || identifier.flow_node.is_some()
+                || identifier.text.is_empty()
+                || labels.contains(&identifier.text)
+            {
+                return Err(self.unsupported(
+                    label,
+                    label_record.kind,
+                    SourceSyntaxRole::Statement,
+                ));
+            }
+            labels.push(identifier.text.clone());
+            let next = self.reference(labeled.statement);
+            parent = current;
+            current = next;
+        }
+
+        let syntax = plan_source_control_loop_syntax(self.arena, self.bound, current, parent)
+            .map_err(|error| match error {
+                SourceFunctionStatementsError::Unsupported(_) => self.unsupported(
+                    current,
+                    self.node(current)
+                        .map_or(SyntaxKind::Unknown, |node| node.kind),
+                    SourceSyntaxRole::Statement,
+                ),
+                SourceFunctionStatementsError::Variable(error) => Self::variable_plan_error(error),
+                SourceFunctionStatementsError::Invariant(_) => {
+                    SourceCheckError::Function(SourceFunctionInvariant::Callable(current))
+                }
+            })?;
+        if syntax.kind != SourceControlLoopKind::While {
+            return Err(self.unsupported(
+                current,
+                self.node(current)?.kind,
+                SourceSyntaxRole::Statement,
+            ));
+        }
+
+        let body = self.node(syntax.body)?;
+        let (break_node, break_parent) = match &body.data {
+            NodeData::BreakStatement(_) => (syntax.body, current),
+            NodeData::Block(block)
+                if body.kind == SyntaxKind::Block
+                    && body.flags.0 == 0
+                    && body.parent == Some(current.node)
+                    && block.flow_node.is_none()
+                    && block.next_container.is_none()
+                    && block.facts == 0
+                    && !block.statements.has_trailing_comma
+                    && block.statements.nodes.len() == 1 =>
+            {
+                (self.reference(block.statements.nodes[0]), syntax.body)
+            }
+            _ => {
+                return Err(self.unsupported(syntax.body, body.kind, SourceSyntaxRole::Statement));
+            }
+        };
+        let record = self.node(break_node)?;
+        let NodeData::BreakStatement(break_statement) = &record.data else {
+            return Err(self.unsupported(break_node, record.kind, SourceSyntaxRole::Statement));
+        };
+        if record.kind != SyntaxKind::BreakStatement
+            || record.flags.0 != 0
+            || record.parent != Some(break_parent.node)
+            || break_statement.flow_node.is_some()
+        {
+            return Err(self.unsupported(break_node, record.kind, SourceSyntaxRole::Statement));
+        }
+        let invalid_break = if let Some(label) = break_statement.label {
+            let label = self.reference(label);
+            let label_record = self.node(label)?;
+            let NodeData::Identifier(identifier) = &label_record.data else {
+                return Err(self.unsupported(
+                    label,
+                    label_record.kind,
+                    SourceSyntaxRole::Statement,
+                ));
+            };
+            if label_record.kind != SyntaxKind::Identifier
+                || label_record.flags.0 != 0
+                || label_record.parent != Some(break_node.node)
+                || identifier.flow_node.is_some()
+                || identifier.text.is_empty()
+            {
+                return Err(self.unsupported(
+                    label,
+                    label_record.kind,
+                    SourceSyntaxRole::Statement,
+                ));
+            }
+            (!labels.contains(&identifier.text)).then_some(break_node)
+        } else {
+            None
+        };
+        let condition = self.plan_expression(syntax.condition.ok_or(
+            SourceCheckError::Function(SourceFunctionInvariant::Callable(current)),
+        )?)?;
+
+        Ok(PlannedTopLevelLoop {
+            syntax,
+            condition,
+            invalid_break,
         })
     }
 
@@ -12634,6 +12791,53 @@ pub(super) fn check_source_file(
                 )?;
                 for diagnostic in control.syntax.nested_export_diagnostics {
                     merge_retry_diagnostic(diagnostics, diagnostic);
+                }
+            }
+            PlannedStatement::ControlLoop(control) => {
+                let checked = check_expression_type(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    &current_flow_types,
+                    &preflighted_type_import_value_uses,
+                    &control.condition,
+                    None,
+                    &mut deferred,
+                )?;
+                if !source_truthiness_condition_type_is_supported(
+                    store,
+                    checked.result,
+                    control.condition.node,
+                    &mut HashSet::new(),
+                )? {
+                    let kind = host
+                        .node(control.condition.node)
+                        .ok_or(SourceCheckError::Provenance(
+                            SourceCheckProvenanceError::MissingNode(control.condition.node),
+                        ))?
+                        .kind;
+                    return Err(SourceCheckError::Unsupported(
+                        UnsupportedSourceSyntax::Syntax {
+                            node: control.condition.node,
+                            kind,
+                            role: SourceSyntaxRole::Statement,
+                        },
+                    ));
+                }
+                emit_truthiness_operand_diagnostics(
+                    store,
+                    host,
+                    diagnostics,
+                    &control.condition,
+                    checked.result,
+                    control.syntax.statement,
+                )?;
+                if let Some(statement) = control.invalid_break {
+                    issue_node_diagnostic(diagnostics, statement, 1116)?;
                 }
             }
             PlannedStatement::Break(statement) => {

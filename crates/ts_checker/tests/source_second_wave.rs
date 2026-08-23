@@ -73,6 +73,52 @@ fn top_level_empty_statements_are_semantic_noops() {
 }
 
 #[test]
+fn top_level_while_breaks_validate_enclosing_labels_and_replay_warm() {
+    for (index, (source, expected)) in [
+        ("while (true) break;", &[][..]),
+        ("while (true) { break; }", &[][..]),
+        ("target: while (true) { break target; }", &[][..]),
+        ("while (true) { break target; }", &[1116][..]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let parsed = parse_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(8_210 + u32::try_from(index).unwrap());
+        let mut context = context(&parsed, file, CanonicalSourceLanguage::TypeScript);
+
+        context.check_source_file(file).unwrap();
+
+        assert_eq!(
+            context
+                .diagnostics()
+                .as_slice()
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            expected,
+            "source: {source}",
+        );
+        let warm = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.diagnostics().clone(),
+        );
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.diagnostics().clone(),
+            ),
+            warm,
+            "source: {source}",
+        );
+    }
+}
+
+#[test]
 fn object_assertions_allow_structurally_overlapping_extra_properties() {
     let parsed = parse_source_file("var value = <{ id: number; }> { id: 4, name: 'extra' };");
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
