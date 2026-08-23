@@ -904,18 +904,26 @@ impl<'a, 'hooks> FlowBuilder<'a, 'hooks> {
             self.mark_unsupported(node_id, UnsupportedFlowKind::DestructuringAssignment);
             return;
         };
-        if is_logical_operator(operator) {
-            self.bind_logical_expression(node_id);
-            return;
-        }
         if operator.is_assignment_operator()
             && matches!(
                 self.node_kind(left),
                 Some(SyntaxKind::ArrayLiteralExpression | SyntaxKind::ObjectLiteralExpression)
             )
         {
-            self.mark_unsupported(node_id, UnsupportedFlowKind::DestructuringAssignment);
-            self.bind_children_without_flow(node_id);
+            if operator != SyntaxKind::EqualsToken {
+                self.mark_unsupported(node_id, UnsupportedFlowKind::DestructuringAssignment);
+                self.bind_children_without_flow(node_id);
+                return;
+            }
+
+            let saved_in_assignment_pattern = self.in_assignment_pattern;
+            self.bind_destructuring_assignment_children(node_id);
+            debug_assert_eq!(self.in_assignment_pattern, saved_in_assignment_pattern);
+            self.bind_assignment_target_flow(left);
+            return;
+        }
+        if is_logical_operator(operator) {
+            self.bind_logical_expression(node_id);
             return;
         }
 
@@ -1378,9 +1386,53 @@ impl<'a, 'hooks> FlowBuilder<'a, 'hooks> {
     }
 
     fn bind_assignment_target_flow(&mut self, node_id: NodeId) {
-        if self.is_narrowable_reference(node_id) {
-            self.create_flow_mutation(FlowFlags::ASSIGNMENT, node_id);
+        match self.ast.get(node_id).map(|node| &node.data) {
+            Some(NodeData::ArrayLiteralExpression(data)) => {
+                let elements = data.elements.nodes.clone();
+                for element in elements {
+                    if let Some(NodeData::SpreadElement(spread)) =
+                        self.ast.get(element).map(|node| &node.data)
+                    {
+                        self.bind_assignment_target_flow(spread.expression);
+                    } else {
+                        self.bind_destructuring_target_flow(element);
+                    }
+                }
+            }
+            Some(NodeData::ObjectLiteralExpression(data)) => {
+                let properties = data.properties.nodes.clone();
+                for property in properties {
+                    match self.ast.get(property).map(|node| &node.data) {
+                        Some(NodeData::PropertyAssignment(data)) => {
+                            self.bind_destructuring_target_flow(data.initializer);
+                        }
+                        Some(NodeData::ShorthandPropertyAssignment(data)) => {
+                            self.bind_assignment_target_flow(data.name);
+                        }
+                        Some(NodeData::SpreadAssignment(data)) => {
+                            self.bind_assignment_target_flow(data.expression);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ if self.is_narrowable_reference(node_id) => {
+                self.create_flow_mutation(FlowFlags::ASSIGNMENT, node_id);
+            }
+            _ => {}
         }
+    }
+
+    fn bind_destructuring_target_flow(&mut self, node_id: NodeId) {
+        let target = match self.ast.get(node_id).map(|node| &node.data) {
+            Some(NodeData::BinaryExpression(data))
+                if self.node_kind(data.operator_token) == Some(SyntaxKind::EqualsToken) =>
+            {
+                data.left
+            }
+            _ => node_id,
+        };
+        self.bind_assignment_target_flow(target);
     }
 
     fn bind_function_container(&mut self, node_id: NodeId, function: FunctionContainer) {
@@ -2374,8 +2426,22 @@ impl<'a, 'hooks> FlowBuilder<'a, 'hooks> {
                 NodeData::ForInOrOfStatement(data) => {
                     return data.initializer == node_id;
                 }
+                NodeData::PropertyAssignment(data) => {
+                    if data.name == node_id {
+                        return false;
+                    }
+                    node_id = parent;
+                }
+                NodeData::ShorthandPropertyAssignment(data) => {
+                    if data.name != node_id {
+                        return false;
+                    }
+                    node_id = parent;
+                }
                 NodeData::ParenthesizedExpression(_)
                 | NodeData::ArrayLiteralExpression(_)
+                | NodeData::ObjectLiteralExpression(_)
+                | NodeData::SpreadAssignment(_)
                 | NodeData::SpreadElement(_)
                 | NodeData::NonNullExpression(_) => node_id = parent,
                 _ => return false,
@@ -2515,4 +2581,199 @@ fn is_optional_chain(kind: SyntaxKind, flags: NodeFlags) -> bool {
                 | SyntaxKind::CallExpression
                 | SyntaxKind::NonNullExpression
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use ts_ast::{FileId, FlowFlags, FlowNodePayload, NodeArena, NodeData, NodeRef, SyntaxKind};
+    use ts_parser::parse_source_file;
+
+    use crate::{BoundFlowGraph, UnsupportedFlowKind, bind_source_file_in_file};
+
+    fn assigned_identifiers<'arena>(
+        arena: &'arena NodeArena,
+        graph: &BoundFlowGraph,
+    ) -> Vec<&'arena str> {
+        graph
+            .nodes()
+            .iter()
+            .filter(|flow| flow.flags.contains(FlowFlags::ASSIGNMENT))
+            .filter_map(|flow| {
+                let Some(FlowNodePayload::Ast(node)) = flow.payload.as_ref() else {
+                    return None;
+                };
+                let Some(NodeData::Identifier(identifier)) =
+                    arena.get(node.node).map(|node| &node.data)
+                else {
+                    return None;
+                };
+                Some(identifier.text.as_str())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn direct_destructuring_assigns_nested_defaults_and_rest_targets_in_order() {
+        let parsed = parse_source_file(concat!(
+            "({ first: [first = fallback, nested, ...arrayRest], ",
+            "shorthand, ...objectRest } = source); after;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+
+        let file = FileId::new(140);
+        let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+        let graph = result
+            .flow_graph(&parsed.arena, parsed.source_file)
+            .expect("program-bound source has a flow graph");
+
+        assert!(graph.is_complete(), "{:?}", graph.unsupported());
+        assert_eq!(
+            assigned_identifiers(&parsed.arena, graph),
+            ["first", "nested", "arrayRest", "shorthand", "objectRest"]
+        );
+    }
+
+    #[test]
+    fn destructuring_defaults_bind_effects_before_assignment_targets() {
+        let parsed = parse_source_file(concat!(
+            "({ item: assigned = (fallback = 1), ",
+            "shorthand = (secondFallback = 2) } = (source = input));",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+
+        let file = FileId::new(141);
+        let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+        let graph = result
+            .flow_graph(&parsed.arena, parsed.source_file)
+            .expect("program-bound source has a flow graph");
+
+        assert!(graph.is_complete(), "{:?}", graph.unsupported());
+        assert_eq!(
+            assigned_identifiers(&parsed.arena, graph),
+            [
+                "fallback",
+                "secondFallback",
+                "source",
+                "assigned",
+                "shorthand"
+            ]
+        );
+    }
+
+    #[test]
+    fn nested_destructuring_defaults_preserve_assignment_pattern_order() {
+        let parsed =
+            parse_source_file("([[nested] = (fallback = input), trailing] = (source = value));");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+
+        let file = FileId::new(142);
+        let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+        let graph = result
+            .flow_graph(&parsed.arena, parsed.source_file)
+            .expect("program-bound source has a flow graph");
+
+        assert!(graph.is_complete(), "{:?}", graph.unsupported());
+        assert_eq!(
+            assigned_identifiers(&parsed.arena, graph),
+            ["fallback", "nested", "source", "nested", "trailing"]
+        );
+    }
+
+    #[test]
+    fn object_destructuring_assigns_private_properties_without_assigning_keys() {
+        let parsed = parse_source_file(concat!(
+            "class Example { #state = { value: 0 }; ",
+            "update(source: { value: { value: number } }) { ",
+            "({ value: this.#state } = source); } }",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+
+        let file = FileId::new(143);
+        let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+        let graph = result
+            .flow_graph(&parsed.arena, parsed.source_file)
+            .expect("program-bound source has a flow graph");
+
+        assert!(graph.is_complete(), "{:?}", graph.unsupported());
+        let (property_name, target) = parsed
+            .arena
+            .iter()
+            .find_map(|(_, node)| {
+                let NodeData::PropertyAssignment(property) = &node.data else {
+                    return None;
+                };
+                let Some(NodeData::PropertyAccessExpression(access)) = parsed
+                    .arena
+                    .get(property.initializer)
+                    .map(|node| &node.data)
+                else {
+                    return None;
+                };
+                (parsed.arena.get(access.name)?.kind == SyntaxKind::PrivateIdentifier)
+                    .then_some((property.name, property.initializer))
+            })
+            .expect("destructuring pattern has a private-property assignment");
+        let target = NodeRef::new(parsed.arena.id(), file, target);
+        let property_name = NodeRef::new(parsed.arena.id(), file, property_name);
+
+        assert!(graph.nodes().iter().any(|flow| {
+            flow.flags.contains(FlowFlags::ASSIGNMENT)
+                && flow.payload == Some(FlowNodePayload::Ast(target))
+        }));
+        assert!(!graph.nodes().iter().any(|flow| {
+            flow.flags.contains(FlowFlags::ASSIGNMENT)
+                && flow.payload == Some(FlowNodePayload::Ast(property_name))
+        }));
+    }
+
+    #[test]
+    fn compound_destructuring_assignment_remains_unsupported() {
+        for operator in [
+            SyntaxKind::PlusEqualsToken,
+            SyntaxKind::AmpersandAmpersandEqualsToken,
+            SyntaxKind::BarBarEqualsToken,
+            SyntaxKind::QuestionQuestionEqualsToken,
+        ] {
+            let mut parsed = parse_source_file("([value] = source); after;");
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let operator_node = parsed
+                .arena
+                .iter()
+                .find_map(|(_, node)| match &node.data {
+                    NodeData::BinaryExpression(binary)
+                        if parsed.arena.get(binary.left).is_some_and(|left| {
+                            left.kind == SyntaxKind::ArrayLiteralExpression
+                        }) =>
+                    {
+                        Some(binary.operator_token)
+                    }
+                    _ => None,
+                })
+                .expect("the fixture contains one array destructuring assignment");
+            parsed.arena.get_mut(operator_node).unwrap().kind = operator;
+
+            let file = FileId::new(144);
+            let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+            let graph = result
+                .flow_graph(&parsed.arena, parsed.source_file)
+                .expect("program-bound source has a flow graph");
+
+            assert!(!graph.is_complete(), "operator: {operator:?}");
+            assert_eq!(graph.unsupported().len(), 1, "operator: {operator:?}");
+            assert_eq!(
+                graph.unsupported()[0].kind,
+                UnsupportedFlowKind::DestructuringAssignment,
+                "operator: {operator:?}"
+            );
+            assert_eq!(
+                parsed
+                    .arena
+                    .get(graph.unsupported()[0].node.node)
+                    .unwrap()
+                    .kind,
+                SyntaxKind::BinaryExpression,
+                "operator: {operator:?}"
+            );
+        }
+    }
 }
