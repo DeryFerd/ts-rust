@@ -6832,6 +6832,110 @@ mod tests {
     }
 
     #[test]
+    fn declaration_default_assignment_imports_const_enum_through_cold_alias_chain() {
+        let mut fixture = fixture_with_declaration_files(
+            &[
+                r#"
+                    import Selected from "./bridge";
+                    const result = Selected.First;
+                "#,
+                r#"
+                    import { Values } from "./enum";
+                    export default Values;
+                "#,
+                "export const enum Values { First, Second }",
+            ],
+            &[
+                Route {
+                    source: 0,
+                    specifier: 0,
+                    target: Some(1),
+                },
+                Route {
+                    source: 1,
+                    specifier: 0,
+                    target: Some(2),
+                },
+            ],
+            &[1, 2],
+        );
+        let import = fixture.plan_import(0, 0);
+        let bridge_import = fixture.plan_import(1, 0);
+        let default_alias = direct_export(&fixture, 1, "default");
+        let target = direct_export(&fixture, 2, "Values");
+
+        let resolved = resolve_all(&mut fixture, &import.bindings).unwrap();
+        assert_eq!(resolved[0].immediate_target_symbol, default_alias);
+        assert_eq!(resolved[0].target_symbol, target);
+        assert_eq!(
+            fixture
+                .store
+                .alias_symbol_links(default_alias)
+                .map(|links| links.alias_target),
+            Some(AliasTargetState::Resolved(target)),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .alias_symbol_links(bridge_import.bindings[0].alias_symbol)
+                .map(|links| links.alias_target),
+            Some(AliasTargetState::Resolved(target)),
+        );
+        assert!(fixture.store.value_symbol_links(target).is_none());
+
+        let source = &fixture.files[0];
+        let node = source
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::Identifier(identifier) = &record.data else {
+                    return None;
+                };
+                if identifier.text != "Selected" {
+                    return None;
+                }
+                let parent = record
+                    .parent
+                    .and_then(|parent| source.parsed.arena.get(parent))?;
+                matches!(
+                    &parent.data,
+                    NodeData::PropertyAccessExpression(access) if access.expression == node
+                )
+                .then_some(NodeRef::new(
+                    source.parsed.arena.id(),
+                    source.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let bound = fixture.bound.get(&source.file).unwrap();
+        let read = plan_source_import_identifier_read(
+            &source.parsed.arena,
+            bound,
+            &fixture.store,
+            &import.bindings[0],
+            node,
+            "Selected",
+            import.bindings[0].alias_symbol,
+        )
+        .unwrap();
+        let prepared = prepare_one(&mut fixture, &resolved[0], &read).unwrap();
+        assert!(matches!(
+            &prepared.target,
+            PreparedSourceImportTarget::ConstEnum { .. }
+        ));
+        publish_for_test(&mut fixture.store, std::slice::from_ref(&prepared));
+
+        let warm = store_state(&fixture.store);
+        assert_eq!(
+            prepare_one(&mut fixture, &resolved[0], &read).unwrap(),
+            prepared,
+        );
+        assert_eq!(store_state(&fixture.store), warm);
+    }
+
+    #[test]
     fn value_import_attributes_accept_identifier_and_quoted_string_entries() {
         let mut fixture = fixture(
             &[

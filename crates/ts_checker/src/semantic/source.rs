@@ -1106,6 +1106,7 @@ enum PlannedStatement {
     LocalNamedExport,
     NamedReexport,
     DefaultAlias(Box<PlannedDefaultAliasExport>),
+    DefaultObject(Box<PlannedDefaultObjectExport>),
     InvalidModuleSpecifier(NodeRef),
     AmbientVariables(Vec<(NodeRef, u32)>),
     AmbientOverload,
@@ -1141,6 +1142,13 @@ struct PlannedDefaultAliasExport {
     declaration: NodeRef,
     alias_symbol: SemanticSymbolId,
     target_symbol: SemanticSymbolId,
+}
+
+#[derive(Clone, Debug)]
+struct PlannedDefaultObjectExport {
+    declaration: NodeRef,
+    owner_symbol: SemanticSymbolId,
+    expression: PlannedExpression,
 }
 
 #[derive(Debug)]
@@ -1903,6 +1911,26 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     if expression_node.kind == SyntaxKind::Identifier {
                         let export = self.plan_default_alias_export(statement, expression)?;
                         statements.push(PlannedStatement::DefaultAlias(Box::new(export)));
+                        continue;
+                    }
+                    if expression_node.kind == SyntaxKind::ObjectLiteralExpression {
+                        let owner_symbol =
+                            self.plan_default_object_export(statement, expression)?;
+                        let expression = self.plan_expression(expression)?;
+                        if !matches!(expression.kind, PlannedExpressionKind::Object { .. }) {
+                            return Err(self.unsupported(
+                                expression.node,
+                                SyntaxKind::ObjectLiteralExpression,
+                                SourceSyntaxRole::Statement,
+                            ));
+                        }
+                        statements.push(PlannedStatement::DefaultObject(Box::new(
+                            PlannedDefaultObjectExport {
+                                declaration: statement,
+                                owner_symbol,
+                                expression,
+                            },
+                        )));
                         continue;
                     }
                     let Some(element) = self.jsx_initializer_element(expression)? else {
@@ -5738,6 +5766,18 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             ));
         };
         let target_record = self.node(*target_declaration)?;
+        let declaration_start = self.node(declaration)?.range.start;
+        let imported_enum_alias = target.flags() == SymbolFlags::ALIAS
+            && self
+                .value_import_bindings
+                .get(&target_symbol)
+                .is_some_and(|binding| {
+                    binding.local_text == identifier.text
+                        && binding.imported_text == identifier.text
+                        && binding.declaration == *target_declaration
+                        && target_record.kind == SyntaxKind::ImportSpecifier
+                        && target_record.range.end <= declaration_start
+                });
         let supported_target = target.flags() == SymbolFlags::INTERFACE
             && target_record.kind == SyntaxKind::InterfaceDeclaration
             || self.prior_enums.contains(&target_symbol)
@@ -5745,10 +5785,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     target.flags(),
                     SymbolFlags::CONST_ENUM | SymbolFlags::REGULAR_ENUM
                 )
-                && target_record.kind == SyntaxKind::EnumDeclaration;
+                && target_record.kind == SyntaxKind::EnumDeclaration
+            || imported_enum_alias;
         if !supported_target
-            || target_record.parent != Some(self.source.node_ref().node)
-            || target_record.range.end > self.node(declaration)?.range.start
+            || !imported_enum_alias && target_record.parent != Some(self.source.node_ref().node)
+            || target_record.range.end > declaration_start
             || target.flags() == SymbolFlags::INTERFACE
                 && (target.value_declaration().is_some()
                     || store
@@ -5794,10 +5835,15 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     .immediate_target
                     .is_some_and(|target| target != target_symbol)
                     || links.type_only_declaration.is_some()
-                    || links
-                        .alias_target
-                        .symbol()
-                        .is_some_and(|target| target != target_symbol)
+                    || links.alias_target.symbol().is_some_and(|resolved| {
+                        if imported_enum_alias {
+                            store
+                                .symbol(resolved)
+                                .is_none_or(|target| target.flags() != SymbolFlags::CONST_ENUM)
+                        } else {
+                            resolved != target_symbol
+                        }
+                    })
             })
             || target.flags() == SymbolFlags::INTERFACE
                 && store
@@ -5812,6 +5858,70 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             alias_symbol,
             target_symbol,
         })
+    }
+
+    fn plan_default_object_export(
+        &self,
+        declaration: NodeRef,
+        expression: NodeRef,
+    ) -> Result<SemanticSymbolId, SourceCheckError> {
+        let Some((store, _)) = self.semantic else {
+            return Err(self.unsupported(
+                expression,
+                SyntaxKind::ObjectLiteralExpression,
+                SourceSyntaxRole::Statement,
+            ));
+        };
+        let owner = self
+            .bound
+            .symbol(declaration)
+            .ok_or(SourceCheckError::Import(declaration))?;
+        let module = self
+            .bound
+            .symbol(self.source.node_ref())
+            .ok_or(SourceCheckError::Import(declaration))?;
+        let symbol = store
+            .symbol(owner)
+            .ok_or(SourceCheckError::Import(declaration))?;
+        if store
+            .symbol(module)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| store.symbol_table(exports))
+            .and_then(|exports| exports.get_source("default"))
+            != Some(owner)
+            || symbol.flags() != SymbolFlags::PROPERTY
+            || symbol.check_flags() != CheckFlags::NONE
+            || symbol.declarations() != Some(&[declaration])
+            || symbol.value_declaration() != Some(declaration)
+            || symbol.members().is_some()
+            || symbol.exports().is_some()
+            || symbol.parent() != Some(module)
+            || symbol.export_symbol().is_some()
+            || symbol.name().as_bytes() != b"default"
+            || store.get_merged_symbol(owner) != Some(owner)
+            || store.value_symbol_links(owner).is_some_and(|links| {
+                links
+                    != &(ValueSymbolLinks {
+                        resolved_type: links.resolved_type,
+                        ..ValueSymbolLinks::default()
+                    })
+                    || links
+                        .resolved_type
+                        .is_some_and(|type_| store.type_payload(type_).is_none())
+            })
+            || store
+                .type_node_links(expression)
+                .and_then(|links| links.resolved_type)
+                .zip(
+                    store
+                        .value_symbol_links(owner)
+                        .and_then(|links| links.resolved_type),
+                )
+                .is_some_and(|(expression, owner)| expression != owner)
+        {
+            return Err(SourceCheckError::Import(declaration));
+        }
+        Ok(owner)
     }
 
     fn preplan_ambient_variable_statement(
@@ -16128,15 +16238,26 @@ pub(super) fn check_source_file(
                     &SourceImportError::Alias(error),
                 )
             })?;
+        let Some(final_target) = resolved.target.symbol() else {
+            return Err(SourceCheckError::Import(export.declaration));
+        };
+        let imported_enum_alias = store
+            .symbol(export.target_symbol)
+            .is_some_and(|target| target.flags() == SymbolFlags::ALIAS);
         if immediate != Some(export.target_symbol)
-            || resolved.target != super::AliasTargetState::Resolved(export.target_symbol)
+            || if imported_enum_alias {
+                !store
+                    .symbol(final_target)
+                    .is_some_and(|target| target.flags() == SymbolFlags::CONST_ENUM)
+            } else {
+                final_target != export.target_symbol
+            }
             || !resolved.events.is_empty()
             || store
                 .alias_symbol_links(export.alias_symbol)
                 .is_none_or(|links| {
                     links.immediate_target != Some(export.target_symbol)
-                        || links.alias_target
-                            != super::AliasTargetState::Resolved(export.target_symbol)
+                        || links.alias_target != super::AliasTargetState::Resolved(final_target)
                         || links.type_only_declaration.is_some()
                 })
         {
@@ -17494,6 +17615,36 @@ pub(super) fn check_source_file(
             | PlannedStatement::NamedReexport
             | PlannedStatement::DefaultAlias(_)
             | PlannedStatement::AmbientOverload => {}
+            PlannedStatement::DefaultObject(export) => {
+                let object = check_expression_type(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    &current_flow_types,
+                    &preflighted_type_import_value_uses,
+                    &export.expression,
+                    None,
+                    &mut deferred,
+                )?;
+                if store
+                    .type_node_links(export.expression.node)
+                    .and_then(|links| links.resolved_type)
+                    != Some(object.result)
+                {
+                    return Err(SourceCheckError::Import(export.declaration));
+                }
+                stage_value_type(
+                    store,
+                    &mut staged_value_types,
+                    &mut value_order,
+                    export.owner_symbol,
+                    object.result,
+                )?;
+            }
             PlannedStatement::AmbientVariables(initializers) => {
                 for (initializer, code) in initializers {
                     issue_node_diagnostic(diagnostics, initializer, code)?;
@@ -25268,6 +25419,171 @@ mod tests {
         let warm = observable_state(&context, consumer_file);
         context.recheck_source_file(consumer_file).unwrap();
         assert_eq!(observable_state(&context, consumer_file), warm);
+    }
+
+    #[test]
+    fn default_exported_import_aliases_preserve_their_const_enum_identity() {
+        let consumer = parsed(concat!(
+            "import selected from './selected'; ",
+            "import forwarded from './forwarded'; ",
+            "const first = selected.Foo; ",
+            "const second = forwarded.Foo;",
+        ));
+        let selected = parsed(concat!(
+            "import { MyConstEnum } from './base'; ",
+            "export default MyConstEnum;",
+        ));
+        let forwarded = parsed("export { MyConstEnum as default } from './base';");
+        let base = parsed("export const enum MyConstEnum { Foo = 1 }");
+        let consumer_file = FileId::new(8_343);
+        let selected_file = FileId::new(8_344);
+        let forwarded_file = FileId::new(8_345);
+        let base_file = FileId::new(8_346);
+        let files = [
+            (consumer_file, &consumer),
+            (selected_file, &selected),
+            (forwarded_file, &forwarded),
+            (base_file, &base),
+        ];
+        let mut context = external_context_with_import_routes(
+            &files,
+            &[
+                SourceImportRoute {
+                    source: 0,
+                    specifier: 0,
+                    target: 1,
+                },
+                SourceImportRoute {
+                    source: 0,
+                    specifier: 1,
+                    target: 2,
+                },
+                SourceImportRoute {
+                    source: 1,
+                    specifier: 0,
+                    target: 3,
+                },
+                SourceImportRoute {
+                    source: 2,
+                    specifier: 0,
+                    target: 3,
+                },
+            ],
+        );
+
+        context.check_source_file(consumer_file).unwrap();
+        context.check_source_file(selected_file).unwrap();
+        context.check_source_file(forwarded_file).unwrap();
+        context.check_source_file(base_file).unwrap();
+        assert!(context.diagnostics().is_empty());
+
+        let imported =
+            source_import_alias_symbol(&context, &selected, selected_file, "MyConstEnum");
+        let export = selected
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ExportAssignment).then_some(NodeRef::new(
+                    selected.arena.id(),
+                    selected_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let (_, selected_bound) = context.file(selected_file).unwrap();
+        let default = selected_bound.symbol(export).unwrap();
+        let enumeration = base
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::EnumDeclaration).then_some(NodeRef::new(
+                    base.arena.id(),
+                    base_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let (_, base_bound) = context.file(base_file).unwrap();
+        let enumeration = base_bound.symbol(enumeration).unwrap();
+        assert_eq!(
+            context
+                .store()
+                .alias_symbol_links(default)
+                .map(|links| (links.immediate_target, links.alias_target)),
+            Some((Some(imported), AliasTargetState::Resolved(enumeration))),
+        );
+        assert_eq!(
+            variable_value_type(&context, &consumer, consumer_file, "first"),
+            variable_value_type(&context, &consumer, consumer_file, "second"),
+        );
+
+        let warm = observable_state(&context, consumer_file);
+        context.recheck_source_file(consumer_file).unwrap();
+        assert_eq!(observable_state(&context, consumer_file), warm);
+    }
+
+    #[test]
+    fn default_object_exports_publish_the_binder_owned_property_value() {
+        let target = parsed(r#"export default { a: "a", b: "b", 1: "1" };"#);
+        let importer = parsed(concat!(
+            r#"import selected from "./target" "#,
+            r#"with { a: /* first */ "a", "b": /* second */ "b" }; "#,
+            "const value = selected.a;",
+        ));
+        let target_file = FileId::new(8_347);
+        let importer_file = FileId::new(8_348);
+        let files = [(target_file, &target), (importer_file, &importer)];
+        let mut context = external_context_with_import_routes(
+            &files,
+            &[SourceImportRoute {
+                source: 1,
+                specifier: 0,
+                target: 0,
+            }],
+        );
+        let export = target
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ExportAssignment).then_some(NodeRef::new(
+                    target.arena.id(),
+                    target_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let NodeData::ExportAssignment(assignment) = &target.arena.get(export.node).unwrap().data
+        else {
+            panic!("expected a default object export")
+        };
+        let object = NodeRef::new(target.arena.id(), target_file, assignment.expression);
+        let (_, bound) = context.file(target_file).unwrap();
+        let owner = bound.symbol(export).unwrap();
+
+        context.check_source_file(target_file).unwrap();
+        context.check_source_file(importer_file).unwrap();
+
+        assert_eq!(
+            context.store().symbol(owner).unwrap().flags(),
+            SymbolFlags::PROPERTY
+        );
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(owner)
+                .and_then(|links| links.resolved_type),
+            Some(resolved_node_type(&context, object)),
+        );
+        assert_eq!(
+            variable_value_type(&context, &importer, importer_file, "value"),
+            context.store().intrinsic_bootstrap().unwrap().string_type,
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, importer_file);
+        context.recheck_source_file(target_file).unwrap();
+        context.recheck_source_file(importer_file).unwrap();
+        assert_eq!(observable_state(&context, importer_file), warm);
     }
 
     #[test]
