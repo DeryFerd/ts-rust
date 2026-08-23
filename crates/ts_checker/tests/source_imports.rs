@@ -671,6 +671,64 @@ fn imported_values_feed_property_and_call_expression_verticals() {
 }
 
 #[test]
+fn checked_inferred_function_imports_keep_return_types_and_warm_identity() {
+    let importer = parse_source_file(concat!(
+        "import { hello } from './target'; ",
+        "const accepted: string = hello(); ",
+        "const rejected: number = hello();",
+    ));
+    let target = parse_source_file("export function hello() { return 'world'; }");
+    let importer_file = FileId::new(26);
+    let target_file = FileId::new(27);
+    let (mut context, binding) = make_context(&importer, &target, importer_file, target_file);
+    let alias = context
+        .file(importer_file)
+        .unwrap()
+        .1
+        .symbol(binding)
+        .unwrap();
+
+    context.check_source_file(target_file).unwrap();
+    context.check_source_file(importer_file).unwrap();
+
+    let [diagnostic] = context.diagnostics().as_slice() else {
+        panic!("expected one inferred-return assignment diagnostic")
+    };
+    assert_eq!(diagnostic.diagnostic.code(), 2322);
+    assert_eq!(
+        diagnostic.diagnostic.render().unwrap(),
+        "Type 'string' is not assignable to type 'number'.",
+    );
+    assert_eq!(
+        context
+            .type_to_string(
+                context
+                    .store()
+                    .value_symbol_links(alias)
+                    .and_then(|links| links.resolved_type)
+                    .unwrap(),
+            )
+            .unwrap(),
+        "() => string",
+    );
+
+    let warm = (
+        context.store().type_len(),
+        context.store().signature_len(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(importer_file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
+}
+
+#[test]
 fn unused_imports_resolve_without_eager_value_typing_or_partial_source_publication() {
     let importer = parse_source_file("import { value } from './target';");
     let target = parse_source_file("export const value = 1;");

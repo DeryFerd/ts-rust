@@ -163,3 +163,89 @@ fn duplicate_type_parameter_names_fall_back_without_publication() {
         assert!(context.diagnostics().is_empty());
     }
 }
+
+#[test]
+fn empty_generic_functions_infer_void_and_validate_explicit_type_argument_counts() {
+    let parsed = parse_source_file(concat!(
+        "function callback<First, Second>() {}\n",
+        "callback<number>();\n",
+        "callback<number, string>();\n",
+        "callback<number, string, boolean>();\n",
+    ));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(3);
+    let mut binder = CanonicalBinder::new();
+    binder
+        .bind_source_file_with_facts(
+            &parsed.arena,
+            parsed.source_file,
+            file,
+            CanonicalSourceFileFacts::new(
+                EscapedName::source("\"/project/empty-generic.ts\""),
+                CanonicalSourceLanguage::TypeScript,
+                false,
+                CanonicalModuleState::Script,
+            ),
+        )
+        .unwrap();
+    binder
+        .bind_typescript_declaration_slice(&parsed.arena, file)
+        .unwrap();
+    let mut context = CanonicalCheckerContext::new(
+        binder.finish(),
+        [(file, &parsed.arena)].into_iter().collect(),
+        CanonicalCheckerOptions::default(),
+    )
+    .unwrap();
+
+    context.check_source_file(file).unwrap();
+
+    assert_eq!(
+        context
+            .diagnostics()
+            .as_slice()
+            .iter()
+            .map(|diagnostic| diagnostic.diagnostic.code())
+            .collect::<Vec<_>>(),
+        [2558, 2558],
+    );
+    let declaration = parsed
+        .arena
+        .iter()
+        .find_map(|(node, record)| {
+            matches!(&record.data, NodeData::FunctionDeclaration(_)).then_some(NodeRef::new(
+                parsed.arena.id(),
+                file,
+                node,
+            ))
+        })
+        .unwrap();
+    let signature = context
+        .store()
+        .signature_links(declaration)
+        .and_then(|links| links.resolved_signature.signature())
+        .unwrap();
+    assert_eq!(
+        context
+            .store()
+            .signature(signature)
+            .unwrap()
+            .resolved_return_type(),
+        Some(context.store().intrinsic_bootstrap().unwrap().void_type),
+    );
+
+    let warm = (
+        context.store().type_len(),
+        context.store().signature_len(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
+}

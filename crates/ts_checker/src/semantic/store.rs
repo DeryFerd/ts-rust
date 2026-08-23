@@ -335,7 +335,7 @@ pub(super) struct PreparedSourceGenericCallablePublication<'a> {
     pub(super) parameters: Vec<SemanticSymbolId>,
     pub(super) flags: SignatureFlags,
     pub(super) min_argument_count: i32,
-    pub(super) return_annotation: NodeRef,
+    pub(super) return_annotation: Option<NodeRef>,
     pub(super) return_null_literal_identity: bool,
     pub(super) generic_return_type_parameter: Option<TypeId>,
     pub(super) array_targets: Option<CanonicalArrayTargets>,
@@ -4893,8 +4893,8 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
     }
 
     /// Publishes the type, signature, generic metadata, provenance reverse
-    /// maps, owner barrier, return annotation, and signature link as one
-    /// prevalidated transaction.
+    /// maps, owner barrier, optional return annotation, and signature link as
+    /// one prevalidated transaction.
     ///
     /// No semantic identity or cache is mutated until every dependency and
     /// capacity has been checked. After the first allocation, all remaining
@@ -4969,8 +4969,23 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                     .value_symbol_links(*parameter)
                     .is_none_or(|links| links == &ValueSymbolLinks::default())
         });
-        let return_annotation_valid = self
-            .source_return_annotation_belongs_to(prepared.declaration, prepared.return_annotation);
+        let return_annotation_valid = match prepared.return_annotation {
+            Some(annotation) => {
+                !prepared.syntax.inferred_empty_body_is_exact()
+                    && self.source_return_annotation_belongs_to(prepared.declaration, annotation)
+            }
+            None => {
+                prepared.syntax.inferred_empty_body_is_exact()
+                    && prepared.parameters.is_empty()
+                    && prepared.min_argument_count == 0
+                    && !prepared.return_null_literal_identity
+                    && prepared.generic_return_type_parameter.is_none()
+                    && self
+                        .intrinsic_bootstrap
+                        .as_ref()
+                        .is_some_and(|bootstrap| self.types.get(bootstrap.void_type).is_some())
+            }
+        };
         let minimum_argument_count_valid = usize::try_from(prepared.min_argument_count)
             .is_ok_and(|minimum| minimum <= prepared.parameters.len());
         let owner_links_cold = self
@@ -5041,7 +5056,9 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         if !self.try_reserve_types(1)
             || !self.try_reserve_signatures(1)
             || !self.try_reserve_source_callable_provenance(1)
-            || !self.try_reserve_function_signature_return_annotations(1)
+            || !self.try_reserve_function_signature_return_annotations(usize::from(
+                prepared.return_annotation.is_some(),
+            ))
             || !self.links.signature.try_reserve(1)
             || !self.links.value_symbol.try_reserve(value_link_reservations)
         {
@@ -5090,7 +5107,11 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             owner_parent: prepared.owner_parent,
             export_local: prepared.export_local,
             signature,
-            return_provenance: SourceCallableReturnProvenance::Annotated,
+            return_provenance: if prepared.return_annotation.is_some() {
+                SourceCallableReturnProvenance::Annotated
+            } else {
+                SourceCallableReturnProvenance::Inferred
+            },
             array_targets: prepared.array_targets,
             generic_return_type_parameter: prepared.generic_return_type_parameter,
             contextual_target: None,
@@ -5116,17 +5137,16 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
                 .insert(signature, type_)
                 .is_none()
         );
-        assert!(
-            self.function_signature_return_annotations
-                .insert(
-                    signature,
-                    (
-                        prepared.return_annotation,
-                        prepared.return_null_literal_identity,
-                    ),
-                )
-                .is_none()
-        );
+        if let Some(annotation) = prepared.return_annotation {
+            assert!(
+                self.function_signature_return_annotations
+                    .insert(
+                        signature,
+                        (annotation, prepared.return_null_literal_identity),
+                    )
+                    .is_none()
+            );
+        }
         assert!(self.set_value_symbol_links(
             prepared.owner_symbol,
             ValueSymbolLinks {
@@ -5148,10 +5168,19 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
     fn source_generic_return_type_parameter_is_exact(
         &self,
         syntax: &SourceCallableTypeParameterSyntaxProof,
-        annotation: NodeRef,
+        annotation: Option<NodeRef>,
         return_type_parameter: Option<TypeId>,
         resolved: &[ResolvedSourceCallableTypeParameter],
     ) -> bool {
+        let Some(annotation) = annotation else {
+            return syntax.inferred_empty_body_is_exact()
+                && !syntax.generic_fixed_return_is_exact()
+                && syntax.generic_return_type_parameter_declaration().is_none()
+                && return_type_parameter.is_none();
+        };
+        if syntax.inferred_empty_body_is_exact() {
+            return false;
+        }
         match (
             syntax.generic_return_type_parameter_declaration(),
             return_type_parameter,
@@ -5739,7 +5768,11 @@ mod tests {
         FileId, IdentifierData, Node, NodeArena, NodeData, NodeFlags, NodeId, NodeRef,
         QualifiedNameData, SyntaxKind,
     };
-    use ts_binder::{EscapedName, SymbolData, SymbolFlags, SymbolStore};
+    use ts_binder::{
+        CanonicalBinder, CanonicalModuleState, CanonicalNameResolverOptions,
+        CanonicalSourceFileFacts, CanonicalSourceLanguage, EscapedName, SymbolData, SymbolFlags,
+        SymbolStore,
+    };
     use ts_core::TextRange;
     use ts_parser::{parse_isolated_entity_name, parse_source_file};
 
@@ -5747,17 +5780,20 @@ mod tests {
     use crate::semantic::{
         AccessibleChainCacheKey, AliasSymbolLinks, AliasTargetState, ArrayLiteralLinks,
         AssertionLinks, CacheHashKey, CanonicalTypeMapperStore, ContainingSymbolLinks,
-        DeclaredTypeLinks, DecoratorSignatureState, DeferredSymbolLinks, EffectsSignatureState,
-        EntityNameNode, EnumMemberLinks, EvaluatorResult, EvaluatorValue, ExhaustiveState,
-        ExportTypeLinks, ExtendedContainersState, ExternalEmitHelpers, IntrinsicBootstrapOptions,
-        JsxElementLinks, JsxFlags, LateBoundLinks, MappedSymbolLinks, MarkedAssignmentSymbolLinks,
-        MembersAndExportsLinks, ModuleSymbolLinks, NodeCheckFlags, NodeLinks,
-        OptionalSymbolSequence, OrderedNodeSet, RelationComparisonResult, RelationKind,
+        DeclaredTypeHost, DeclaredTypeLinks, DecoratorSignatureState, DeferredSymbolLinks,
+        EffectsSignatureState, EntityNameNode, EnumMemberLinks, EvaluatorResult, EvaluatorValue,
+        ExhaustiveState, ExportTypeLinks, ExtendedContainersState, ExternalEmitHelpers,
+        IntrinsicBootstrapOptions, JsxElementLinks, JsxFlags, LateBoundLinks, MappedSymbolLinks,
+        MarkedAssignmentSymbolLinks, MembersAndExportsLinks, ModuleSymbolLinks, NodeCheckFlags,
+        NodeLinks, OptionalSymbolSequence, OrderedNodeSet, RelationComparisonResult, RelationKind,
         ResolvedSignatureState, ReverseMappedSymbolLinks, SignatureLinks, SourceFileLinks,
         SpreadLinks, SwitchStatementLinks, SymbolNodeLinks, SymbolReferenceLinks, TypeAliasLinks,
         TypeNodeLinks, TypeRecord, TypeResolutionTarget, TypeSystemPropertyName, ValueSymbolLinks,
         VarianceFlags, VarianceLinks,
+        declared::execute_type_parameter,
+        production::GlobalMergeCompletion,
         signatures::{ElementFlags, SignatureFlags, TypePredicateKind},
+        source_callables::plan_source_callable,
         types::{ObjectFlags, TypeFlags},
     };
     use ts_jsnum::{Number, PseudoBigInt};
@@ -7059,6 +7095,146 @@ mod tests {
             },
         ));
         assert!(store.union_cache_needs_validation);
+    }
+
+    #[test]
+    fn inferred_generic_void_publication_requires_exact_empty_body_proof() {
+        let parsed = parse_source_file("function empty<T>() {}");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(90_005);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/inferred-generic.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let (symbols, mut files) = binder.finish().try_into_parts().unwrap();
+        let bound = files.remove(&file).unwrap();
+        let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
+        assert!(
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .is_some()
+        );
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        let declaration = node_ref_of_kind(&parsed.arena, file, SyntaxKind::FunctionDeclaration);
+        let owner = bound.symbol(declaration).unwrap();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let plan = plan_source_callable(&store, &host, declaration, owner, None).unwrap();
+        assert!(plan.type_parameter_syntax.inferred_empty_body_is_exact());
+        let parameter = plan.type_parameters[0];
+        let type_parameter = execute_type_parameter(&mut store, parameter.symbol);
+        let (no_constraint, void) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.no_constraint_type, bootstrap.void_type)
+        };
+        let resolved = super::ResolvedSourceCallableTypeParameter {
+            provenance: super::SourceCallableTypeParameterProvenance {
+                declaration: parameter.declaration,
+                symbol: parameter.symbol,
+                type_parameter,
+                constraint: None,
+                default_type: None,
+            },
+            constraint: no_constraint,
+            default_type: no_constraint,
+        };
+        let request = |annotation, parameters, minimum, null_literal, return_parameter| {
+            super::PreparedSourceGenericCallablePublication {
+                syntax: &plan.type_parameter_syntax,
+                family: plan.family,
+                declaration,
+                owner_symbol: owner,
+                owner_parent: plan.owner_parent,
+                export_local: plan.export_local,
+                type_parameters: vec![resolved],
+                parameters,
+                flags: plan.flags,
+                min_argument_count: minimum,
+                return_annotation: annotation,
+                return_null_literal_identity: null_literal,
+                generic_return_type_parameter: return_parameter,
+                array_targets: plan.array_targets,
+            }
+        };
+        let before = (
+            store.type_len(),
+            store.signature_len(),
+            store.source_callable_provenance_lengths(),
+            store.function_signature_return_annotations.len(),
+            store.checker_link_allocated_lengths(),
+        );
+
+        for invalid in [
+            request(None, vec![owner], 0, false, None),
+            request(None, Vec::new(), 1, false, None),
+            request(None, Vec::new(), 0, true, None),
+            request(None, Vec::new(), 0, false, Some(type_parameter)),
+            request(Some(plan.body), Vec::new(), 0, false, None),
+        ] {
+            assert_eq!(store.publish_source_generic_callable(invalid), None);
+            assert_eq!(
+                (
+                    store.type_len(),
+                    store.signature_len(),
+                    store.source_callable_provenance_lengths(),
+                    store.function_signature_return_annotations.len(),
+                    store.checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+        }
+
+        let (type_, signature) = store
+            .publish_source_generic_callable(request(None, Vec::new(), 0, false, None))
+            .unwrap();
+        assert_eq!(
+            store
+                .source_callable_provenance(type_)
+                .unwrap()
+                .return_provenance,
+            super::SourceCallableReturnProvenance::Inferred,
+        );
+        assert_eq!(store.function_signature_return_annotation(signature), None);
+        assert_eq!(
+            store.signature(signature).unwrap().type_parameters(),
+            [type_parameter]
+        );
+        assert_eq!(
+            store.signature(signature).unwrap().resolved_return_type(),
+            None
+        );
+        assert!(store.set_structured_type_members(
+            type_,
+            None,
+            None,
+            Some(vec![signature]),
+            None,
+            None,
+        ));
+        assert!(store.set_callable_signature_parameter_types_batch(vec![(signature, Vec::new())]));
+        assert!(store.set_signature_resolved_return_type(signature, Some(void)));
+        assert_eq!(
+            store.signature(signature).unwrap().resolved_return_type(),
+            Some(void)
+        );
     }
 
     #[test]
