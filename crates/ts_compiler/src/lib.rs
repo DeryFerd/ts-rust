@@ -1319,6 +1319,7 @@ pub struct Program {
     file_index: BTreeMap<String, usize>,
     root_file_names: BTreeSet<String>,
     resolved_modules: BTreeMap<(String, String), String>,
+    module_resolution_diagnostics: Vec<ProgramDiagnostic>,
     package_export_specifiers: BTreeMap<String, String>,
     diagnostics: Vec<ProgramDiagnostic>,
     current_directory: String,
@@ -1640,6 +1641,27 @@ impl Program {
                     }
                 };
                 if let Some(resolved) = result.resolved {
+                    if self.checker == ProgramChecker::Canonical
+                        && !self.options.no_check
+                        && resolved.resolved_using_ts_extension
+                        && !self
+                            .options
+                            .allows_importing_typescript_extensions_from(&containing_file)
+                        && !ts_path::is_declaration_file(&specifier)
+                        && module_specifier_is_emittable(
+                            &self.source_files[file_index].parse,
+                            range,
+                        )
+                        && let Some(extension) = imported_typescript_extension(&specifier)
+                    {
+                        self.module_resolution_diagnostics.push(
+                            typescript_extension_import_diagnostic(
+                                &containing_file,
+                                range,
+                                extension,
+                            ),
+                        );
+                    }
                     if let Some(package_json) = resolved.package_json.as_deref() {
                         self.register_package_export_specifiers(file_system, package_json);
                     }
@@ -3933,6 +3955,18 @@ impl Program {
             );
         }
 
+        diagnostics.extend(
+            self.module_resolution_diagnostics
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic
+                        .file_name
+                        .as_deref()
+                        .and_then(|file_name| self.source_file(file_name))
+                        .is_some_and(|source| checked_sources.contains(&source.id))
+                })
+                .cloned(),
+        );
         self.apply_comment_directives(&mut diagnostics, &checked_sources);
 
         let mut canonical_queries = CanonicalProgramQueries { context };
@@ -7604,6 +7638,69 @@ fn module_specifiers(parse: &ParseResult) -> Vec<(String, TextRange, bool, bool)
     specifiers
 }
 
+fn module_specifier_is_emittable(parse: &ParseResult, range: TextRange) -> bool {
+    let matches_range = |specifier| {
+        parse
+            .arena
+            .get(specifier)
+            .is_some_and(|node| node.range == range)
+    };
+
+    parse.arena.iter().any(|(_, node)| match &node.data {
+        NodeData::ImportDeclaration(import) => {
+            matches_range(import.module_specifier)
+                && import
+                    .import_clause
+                    .and_then(|clause| parse.arena.get(clause))
+                    .is_some_and(|clause| {
+                        matches!(
+                            &clause.data,
+                            NodeData::ImportClause(clause)
+                                if clause.phase_modifier != Some(SyntaxKind::TypeKeyword)
+                        )
+                    })
+        }
+        NodeData::ImportEqualsDeclaration(import) => {
+            !import.is_type_only
+                && parse
+                    .arena
+                    .get(import.module_reference)
+                    .is_some_and(|reference| {
+                        matches!(
+                            &reference.data,
+                            NodeData::ExternalModuleReference(reference)
+                                if matches_range(reference.expression)
+                        )
+                    })
+        }
+        NodeData::ExportDeclaration(export) => {
+            !export.is_type_only && export.module_specifier.is_some_and(matches_range)
+        }
+        NodeData::CallExpression(call) => {
+            call.arguments
+                .nodes
+                .first()
+                .is_some_and(|argument| matches_range(*argument))
+                && parse.arena.get(call.expression).is_some_and(|node| {
+                    matches!(&node.data, NodeData::Identifier(identifier) if identifier.text == "import")
+                })
+        }
+        _ => false,
+    })
+}
+
+fn imported_typescript_extension(specifier: &str) -> Option<&'static str> {
+    ts_path::extension_from_path(specifier)
+        .filter(|extension| extension.is_typescript())
+        .map(FileExtension::as_str)
+        .or_else(|| {
+            ts_path::SUPPORTED_TS_EXTENSIONS
+                .into_iter()
+                .find(|extension| specifier.contains(extension.as_str()))
+                .map(FileExtension::as_str)
+        })
+}
+
 fn jsdoc_import_specifiers(source: &str) -> Vec<(String, TextRange, bool, bool)> {
     let mut specifiers = Vec::new();
     let mut search_start = 0;
@@ -8051,6 +8148,24 @@ fn module_not_found_diagnostic(
         message: message
             .format(&[specifier.to_owned()])
             .expect("TS2307 has one formatting argument"),
+        related_information: Vec::new(),
+    }
+}
+
+fn typescript_extension_import_diagnostic(
+    file_name: &str,
+    range: TextRange,
+    extension: &str,
+) -> ProgramDiagnostic {
+    let message = message_by_code(5097).expect("TS5097 must be in the generated catalog");
+    ProgramDiagnostic {
+        file_name: Some(file_name.to_owned()),
+        range: Some(range),
+        code: Some(message.code()),
+        category: message.category(),
+        message: message
+            .format(&[extension.to_owned()])
+            .expect("TS5097 has one formatting argument"),
         related_information: Vec::new(),
     }
 }

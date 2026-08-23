@@ -2,6 +2,217 @@ use ts_compiler::Program;
 use ts_options::{CompilerOptions, ModuleKind, ModuleResolutionKind};
 use ts_vfs::{FileSystem, MemoryFileSystem};
 
+fn wildcard_package_import_filesystem(importer: &str, target: &str) -> MemoryFileSystem {
+    let filesystem = MemoryFileSystem::new(true);
+    filesystem
+        .write_file(
+            "/project/package.json",
+            r##"{"type":"module","imports":{"#/*.omg":"./src/*","#generated/*":"./src/*.ts"}}"##,
+        )
+        .unwrap();
+    filesystem
+        .write_file("/project/src/foo.ts", target)
+        .unwrap();
+    filesystem
+        .write_file("/project/src/index.ts", importer)
+        .unwrap();
+    filesystem
+}
+
+fn nodenext_package_import_options() -> CompilerOptions {
+    CompilerOptions {
+        lib: Some(vec!["es5".to_owned()]),
+        module: ModuleKind::NodeNext,
+        module_specified: true,
+        module_resolution: ModuleResolutionKind::NodeNext,
+        no_emit: true,
+        ..CompilerOptions::default()
+    }
+}
+
+#[test]
+fn canonical_wildcard_package_import_reports_captured_typescript_extension() {
+    let importer = "import { hello } from \"#/foo.ts.omg\";\n\nhello();\n";
+    let filesystem = wildcard_package_import_filesystem(
+        importer,
+        "export function hello() { return \"world\"; }\n",
+    );
+
+    let program = Program::try_new_with_canonical_checker(
+        &filesystem,
+        "/project",
+        &["src/foo.ts".to_owned(), "src/index.ts".to_owned()],
+        nodenext_package_import_options(),
+    )
+    .unwrap();
+
+    let [diagnostic] = program.diagnostics() else {
+        panic!(
+            "expected one TS5097 diagnostic: {:?}",
+            program.diagnostics()
+        );
+    };
+    assert_eq!(
+        diagnostic.file_name.as_deref(),
+        Some("/project/src/index.ts")
+    );
+    assert_eq!(diagnostic.code, Some(5097));
+    assert_eq!(
+        diagnostic.message,
+        "An import path can only end with a '.ts' extension when 'allowImportingTsExtensions' is enabled."
+    );
+    let range = diagnostic.range.expect("module specifier range");
+    let start = importer.find("\"#/foo.ts.omg\"").unwrap();
+    assert_eq!(range.start.get(), u32::try_from(start).unwrap());
+    assert_eq!(
+        range.end.get(),
+        u32::try_from(start + "\"#/foo.ts.omg\"".len()).unwrap()
+    );
+}
+
+#[test]
+fn canonical_typescript_extension_imports_preserve_supported_exemptions() {
+    const TARGET: &str = concat!(
+        "export const value: number = 1;\n",
+        "export interface Shape { value: number; }\n",
+    );
+    for (name, importer, allow_extensions, rewrite_extensions, no_check) in [
+        (
+            "type-only import",
+            "import type { Shape } from \"#/foo.ts.omg\";\nconst result: Shape = { value: 1 };\n",
+            false,
+            false,
+            false,
+        ),
+        (
+            "side-effect import",
+            "import \"#/foo.ts.omg\";\n",
+            false,
+            false,
+            false,
+        ),
+        (
+            "configured target extension",
+            "import { value } from \"#generated/foo\";\nconst result: number = value;\n",
+            false,
+            false,
+            false,
+        ),
+        (
+            "allowed TypeScript extension",
+            "import { value } from \"#/foo.ts.omg\";\nconst result: number = value;\n",
+            true,
+            false,
+            false,
+        ),
+        (
+            "rewritten TypeScript extension",
+            "import { value } from \"#/foo.ts.omg\";\nconst result: number = value;\n",
+            false,
+            true,
+            false,
+        ),
+        (
+            "noCheck",
+            "import { value } from \"#/foo.ts.omg\";\nconst result: number = value;\n",
+            false,
+            false,
+            true,
+        ),
+        (
+            "source no-check directive",
+            "// @ts-nocheck\nimport { value } from \"#/foo.ts.omg\";\nconst result: number = value;\n",
+            false,
+            false,
+            false,
+        ),
+    ] {
+        let filesystem = wildcard_package_import_filesystem(importer, TARGET);
+        let mut options = nodenext_package_import_options();
+        options.allow_importing_ts_extensions = allow_extensions;
+        options.rewrite_relative_import_extensions = rewrite_extensions;
+        options.no_check = no_check;
+
+        let program = Program::try_new_with_canonical_checker(
+            &filesystem,
+            "/project",
+            &["src/foo.ts".to_owned(), "src/index.ts".to_owned()],
+            options,
+        )
+        .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+
+        assert!(
+            program.diagnostics().is_empty(),
+            "{name}: {:?}",
+            program.diagnostics()
+        );
+    }
+}
+
+#[test]
+fn canonical_declaration_sources_may_import_typescript_extensions() {
+    let filesystem =
+        wildcard_package_import_filesystem("export {};\n", "export const value: number = 1;\n");
+    filesystem
+        .write_file(
+            "/project/src/index.d.ts",
+            "import { value } from \"#/foo.ts.omg\";\nexport declare const exposed: number;\n",
+        )
+        .unwrap();
+    let mut options = nodenext_package_import_options();
+    options.skip_lib_check = true;
+
+    let program = Program::try_new_with_canonical_checker(
+        &filesystem,
+        "/project",
+        &["src/foo.ts".to_owned(), "src/index.d.ts".to_owned()],
+        options,
+    )
+    .unwrap();
+
+    assert!(
+        program.diagnostics().is_empty(),
+        "{:?}",
+        program.diagnostics()
+    );
+}
+
+#[test]
+fn canonical_typescript_extension_diagnostics_follow_comment_directives() {
+    const TARGET: &str = "export const value: number = 1;\n";
+
+    for (directive, allow_extensions, expected_codes) in [
+        ("// @ts-ignore", false, [].as_slice()),
+        ("// @ts-expect-error", false, [].as_slice()),
+        ("// @ts-expect-error", true, [2578].as_slice()),
+    ] {
+        let importer = format!(
+            "{directive}\nimport {{ value }} from \"#/foo.ts.omg\";\nconst result: number = value;\n"
+        );
+        let filesystem = wildcard_package_import_filesystem(&importer, TARGET);
+        let mut options = nodenext_package_import_options();
+        options.allow_importing_ts_extensions = allow_extensions;
+
+        let program = Program::try_new_with_canonical_checker(
+            &filesystem,
+            "/project",
+            &["src/foo.ts".to_owned(), "src/index.ts".to_owned()],
+            options,
+        )
+        .unwrap();
+
+        assert_eq!(
+            program
+                .diagnostics()
+                .iter()
+                .filter_map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            expected_codes,
+            "directive={directive}, allow_extensions={allow_extensions}"
+        );
+    }
+}
+
 #[test]
 fn canonical_program_checks_importer_first_array_values_through_bundler_manifest() {
     let fs = MemoryFileSystem::new(true);
