@@ -5,10 +5,11 @@
 //! supports canonical `any`, direct `Array<T>`/`ReadonlyArray<T>` references,
 //! validated fixed tuple elements,
 //! required own and shared union properties selected by string or number
-//! literals, primitive string indexing, resolved anonymous string/number index
-//! signatures, finite unions of valid literal keys, optional properties, and
-//! optional chains. Writes, generic indexed access types, and apparent/global
-//! property lookup stay typed boundaries.
+//! literals, authenticated enum members and numeric reverse indices, primitive
+//! string indexing, resolved anonymous string/number index signatures, finite
+//! unions of valid literal keys, optional properties, and optional chains.
+//! Writes, generic indexed access types, and apparent/global property lookup
+//! stay typed boundaries.
 
 use std::collections::HashSet;
 
@@ -506,6 +507,10 @@ fn resolve_element_index(
 ) -> Result<ElementResolution, SourceElementError> {
     Ok(if receiver_type == error {
         ElementResolution::success(error, None)
+    } else if let Some(enumeration) =
+        resolve_enum_element(store, plan, receiver_type, index, error, string)?
+    {
+        enumeration
     } else if matches!(index.shape, IndexShape::Invalid) {
         ElementResolution::diagnostic(error, ElementDiagnostic::InvalidIndexType)
     } else if receiver_type == any {
@@ -625,6 +630,12 @@ fn classify_index(
     } else if flags.intersects(TypeFlags::FRESHABLE) {
         store.validate_union_constituent(index_type)?;
     }
+    if flags == TypeFlags::ENUM {
+        return Ok(ClassifiedIndex {
+            shape: IndexShape::Number,
+            property_name: None,
+        });
+    }
     if flags == TypeFlags::STRING {
         return Ok(ClassifiedIndex {
             shape: IndexShape::String,
@@ -714,6 +725,7 @@ fn is_string_receiver(
 enum ElementDiagnostic {
     NumberIndexRequired,
     InvalidIndexType,
+    InvalidConstEnumIndex,
     MissingLiteralProperty,
     MissingConstEnumProperty,
     MissingBroadIndex,
@@ -810,11 +822,6 @@ fn resolve_object_element(
     }
 
     if let Some(name) = index.property_name.as_deref() {
-        if let Some(resolution) =
-            resolve_enum_element(store, plan, receiver_type, name, error_type)?
-        {
-            return Ok(resolution);
-        }
         if store
             .type_payload(receiver_type)
             .is_some_and(|record| record.flags().intersects(TypeFlags::UNION))
@@ -912,18 +919,86 @@ fn resolve_enum_element(
     store: &CanonicalTypeMapperStore,
     plan: &SourceElementPlan,
     receiver_type: TypeId,
-    name: &str,
+    index: &ClassifiedIndex,
     error_type: TypeId,
+    string_type: TypeId,
 ) -> Result<Option<ElementResolution>, SourceElementError> {
-    if !matches!(
+    let Some(owner) = validated_enum_element_owner(store, plan, receiver_type)? else {
+        return Ok(None);
+    };
+    let owner_record = store
+        .symbol(owner)
+        .ok_or(SourceElementError::InvalidCache(plan.node))?;
+    let literal_index = matches!(
         store.source_node_kind(plan.index.node),
         Some(SyntaxKind::StringLiteral | SyntaxKind::NoSubstitutionTemplateLiteral)
-    ) {
+    );
+    if owner_record.flags() == SymbolFlags::CONST_ENUM && !literal_index {
+        return Ok(Some(ElementResolution::diagnostic(
+            error_type,
+            ElementDiagnostic::InvalidConstEnumIndex,
+        )));
+    }
+    if matches!(index.shape, IndexShape::Invalid | IndexShape::Any) {
         return Ok(None);
     }
+    let member = match (owner_record.exports(), index.property_name.as_deref()) {
+        (Some(exports), Some(name)) => store
+            .symbol_table(exports)
+            .ok_or(SourceElementError::InvalidCache(plan.node))?
+            .get_source(name),
+        _ => None,
+    };
+    if let Some(member) = member {
+        let name = index
+            .property_name
+            .as_deref()
+            .ok_or(SourceElementError::InvalidCache(plan.node))?;
+        let (resolved, type_) = enums::enum_value_member_type(store, receiver_type, name)
+            .ok_or(SourceElementError::InvalidCache(plan.node))?;
+        if resolved != member
+            || store.value_symbol_links(member)
+                != Some(&ValueSymbolLinks {
+                    resolved_type: Some(type_),
+                    ..ValueSymbolLinks::default()
+                })
+        {
+            return Err(SourceElementError::InvalidCache(plan.node));
+        }
+        return Ok(Some(ElementResolution::success(type_, Some(member))));
+    }
+    if owner_record.flags() == SymbolFlags::REGULAR_ENUM
+        && matches!(
+            index.shape,
+            IndexShape::Number | IndexShape::Literal { numeric_name: true }
+        )
+        && enum_has_numeric_index(store, plan, receiver_type, owner)?
+    {
+        return Ok(Some(ElementResolution::success(string_type, None)));
+    }
+    Ok(Some(ElementResolution::diagnostic(
+        error_type,
+        if owner_record.flags() == SymbolFlags::CONST_ENUM {
+            ElementDiagnostic::MissingConstEnumProperty
+        } else if index.property_name.is_some() {
+            ElementDiagnostic::MissingLiteralProperty
+        } else {
+            ElementDiagnostic::MissingBroadIndex
+        },
+    )))
+}
+
+fn validated_enum_element_owner(
+    store: &CanonicalTypeMapperStore,
+    plan: &SourceElementPlan,
+    receiver_type: TypeId,
+) -> Result<Option<SemanticSymbolId>, SourceElementError> {
     let receiver = store
         .type_payload(receiver_type)
         .ok_or(SourceElementError::InvalidCache(plan.node))?;
+    if receiver.flags() != TypeFlags::OBJECT {
+        return Ok(None);
+    }
     let Some(owner) = receiver.symbol() else {
         return Ok(None);
     };
@@ -972,41 +1047,64 @@ fn resolve_enum_element(
     {
         return Err(SourceElementError::InvalidCache(plan.node));
     }
-
-    let member = match owner_record.exports() {
-        Some(exports) => {
-            let exports = store
-                .symbol_table(exports)
-                .ok_or(SourceElementError::InvalidCache(plan.node))?;
-            if exports.is_empty() {
-                return Err(SourceElementError::InvalidCache(plan.node));
-            }
-            exports.get_source(name)
-        }
-        None => None,
-    };
-    let Some(member) = member else {
-        return Ok(Some(ElementResolution::diagnostic(
-            error_type,
-            if owner_record.flags() == SymbolFlags::CONST_ENUM {
-                ElementDiagnostic::MissingConstEnumProperty
-            } else {
-                ElementDiagnostic::MissingLiteralProperty
-            },
-        )));
-    };
-    let (resolved, type_) = enums::enum_value_member_type(store, receiver_type, name)
-        .ok_or(SourceElementError::InvalidCache(plan.node))?;
-    if resolved != member
-        || store.value_symbol_links(member)
-            != Some(&ValueSymbolLinks {
-                resolved_type: Some(type_),
-                ..ValueSymbolLinks::default()
-            })
+    if let Some(exports) = owner_record.exports()
+        && store
+            .symbol_table(exports)
+            .ok_or(SourceElementError::InvalidCache(plan.node))?
+            .is_empty()
     {
         return Err(SourceElementError::InvalidCache(plan.node));
     }
-    Ok(Some(ElementResolution::success(type_, Some(member))))
+    Ok(Some(owner))
+}
+
+fn enum_has_numeric_index(
+    store: &CanonicalTypeMapperStore,
+    plan: &SourceElementPlan,
+    receiver_type: TypeId,
+    owner: SemanticSymbolId,
+) -> Result<bool, SourceElementError> {
+    let owner_record = store
+        .symbol(owner)
+        .ok_or(SourceElementError::InvalidCache(plan.node))?;
+    let declared = store
+        .declared_type_links(owner)
+        .and_then(|links| links.declared_type)
+        .ok_or(SourceElementError::InvalidCache(plan.node))?;
+    if store.type_payload(declared).is_some_and(|declared| {
+        declared.flags() == TypeFlags::ENUM && declared.symbol() == Some(owner)
+    }) {
+        return Ok(true);
+    }
+    let Some(exports) = owner_record.exports() else {
+        return Ok(false);
+    };
+    let exports = store
+        .symbol_table(exports)
+        .ok_or(SourceElementError::InvalidCache(plan.node))?;
+    for (name, member) in exports.iter() {
+        let name = name
+            .as_utf8()
+            .ok_or(SourceElementError::InvalidCache(plan.node))?;
+        let (resolved, type_) = enums::enum_value_member_type(store, receiver_type, name)
+            .ok_or(SourceElementError::InvalidCache(plan.node))?;
+        if resolved != member
+            || store.value_symbol_links(member)
+                != Some(&ValueSymbolLinks {
+                    resolved_type: Some(type_),
+                    ..ValueSymbolLinks::default()
+                })
+        {
+            return Err(SourceElementError::InvalidCache(plan.node));
+        }
+        if store
+            .type_payload(type_)
+            .is_some_and(|record| record.flags().intersects(TypeFlags::NUMBER_LIKE))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn optional_element_read_type(
@@ -1290,6 +1388,7 @@ fn prepare_element_diagnostic(
         && !matches!(
             kind,
             ElementDiagnostic::InvalidIndexType
+                | ElementDiagnostic::InvalidConstEnumIndex
                 | ElementDiagnostic::MissingConstEnumProperty
                 | ElementDiagnostic::NegativeTupleIndex
                 | ElementDiagnostic::TupleIndexOutOfBounds { .. }
@@ -1318,6 +1417,14 @@ fn prepare_element_diagnostic(
                     options,
                     index_type,
                 )?],
+            ),
+            related_information: Vec::new(),
+        },
+        ElementDiagnostic::InvalidConstEnumIndex => CanonicalCheckerDiagnostic {
+            node: Some(plan.index.node),
+            range_override: None,
+            diagnostic: Diagnostic::new(
+                message_by_code(2476).ok_or(SourceElementError::MissingDiagnostic(2476))?,
             ),
             related_information: Vec::new(),
         },
@@ -1632,6 +1739,22 @@ mod tests {
         owner: SemanticSymbolId,
         name: &str,
     ) -> SourceElementPlan {
+        enum_index_plan(
+            parsed,
+            file,
+            store,
+            owner,
+            PlannedExpressionKind::String(name.to_owned()),
+        )
+    }
+
+    fn enum_index_plan(
+        parsed: &ParseResult,
+        file: FileId,
+        store: &CanonicalTypeMapperStore,
+        owner: SemanticSymbolId,
+        index: PlannedExpressionKind,
+    ) -> SourceElementPlan {
         let access = element_access(parsed, file);
         let syntax = plan_direct_source_element_syntax(&parsed.arena, store, access).unwrap();
         finish_direct_source_element_plan(
@@ -1644,10 +1767,7 @@ mod tests {
                     kind: PlannedIdentifierReadKind::DeclaredValue,
                 }),
             ),
-            PlannedExpression::new(
-                syntax.index(),
-                PlannedExpressionKind::String(name.to_owned()),
-            ),
+            PlannedExpression::new(syntax.index(), index),
         )
         .unwrap()
     }
@@ -1990,6 +2110,276 @@ mod tests {
             );
             assert!(store.symbol_node_links(plan.node).is_none());
         }
+    }
+
+    #[test]
+    fn dynamic_const_enum_indices_report_ts2476_on_the_complete_index() {
+        #[derive(Clone, Copy)]
+        enum Index {
+            Number,
+            KnownString,
+            BroadString,
+        }
+
+        for (offset, source, index_kind) in [
+            (
+                0,
+                "const enum Status { Ready = 1 } const result = Status[0];",
+                Index::Number,
+            ),
+            (
+                1,
+                "const enum Status { Ready = 1 } const key = 'Ready'; const result = Status[key];",
+                Index::KnownString,
+            ),
+            (
+                2,
+                "const enum Status { Ready = 1 } let key: string = 'Ready'; const result = Status[key];",
+                Index::BroadString,
+            ),
+        ] {
+            let parsed = parse_fixture(source);
+            let file = FileId::new(630 + offset);
+            let (mut store, bound, enumeration) = published_enum(&parsed, file);
+            let (expression, index) = match index_kind {
+                Index::Number => {
+                    let value = ts_jsnum::Number::new(0.0);
+                    (
+                        PlannedExpressionKind::Number {
+                            value,
+                            unary_operand: None,
+                        },
+                        store.regular_number_literal_type(value).unwrap(),
+                    )
+                }
+                Index::KnownString | Index::BroadString => {
+                    let key = bound
+                        .locals(bound.source_file())
+                        .and_then(|locals| store.symbol_table(locals))
+                        .and_then(|locals| locals.get_source("key"))
+                        .unwrap();
+                    let type_ = if matches!(index_kind, Index::KnownString) {
+                        store.regular_string_literal_type("Ready".into()).unwrap()
+                    } else {
+                        store.intrinsic_bootstrap().unwrap().string_type
+                    };
+                    (
+                        PlannedExpressionKind::Identifier(PlannedIdentifierRead {
+                            resolved_symbol: key,
+                            value_symbol: key,
+                            kind: PlannedIdentifierReadKind::Variable,
+                        }),
+                        type_,
+                    )
+                }
+            };
+            let plan = enum_index_plan(&parsed, file, &store, enumeration.symbol, expression);
+            let host = DeclaredTypeHost::new([(&parsed.arena, &bound)]).unwrap();
+            let targets =
+                CanonicalArrayTargets::for_single_target_validation(enumeration.value_type);
+
+            for _ in 0..2 {
+                let checked = check_direct_source_element_with_array_targets(
+                    &mut store,
+                    &host,
+                    targets,
+                    CanonicalCheckerOptions::default(),
+                    &plan,
+                    enumeration.value_type,
+                    index,
+                )
+                .unwrap();
+                assert_eq!(
+                    checked.type_,
+                    store.intrinsic_bootstrap().unwrap().error_type,
+                );
+                let diagnostic = checked.diagnostic.unwrap();
+                assert_eq!(diagnostic.node, Some(plan.index.node));
+                assert_eq!(diagnostic.diagnostic.code(), 2476);
+                assert_eq!(
+                    diagnostic.diagnostic.render().unwrap(),
+                    "A const enum member can only be accessed using a string literal.",
+                );
+            }
+            assert!(store.symbol_node_links(plan.node).is_none());
+        }
+    }
+
+    #[test]
+    fn regular_numeric_enum_reverse_indices_return_string_cold_and_warm() {
+        #[derive(Clone, Copy)]
+        enum Index {
+            Number,
+            NumericMember,
+            ComputedMember,
+        }
+
+        for (offset, source, index_kind) in [
+            (
+                0,
+                "enum Status { Ready = 1, Done = 2 } const result = Status[0];",
+                Index::Number,
+            ),
+            (
+                1,
+                "enum Status { Ready = 1, Done = 2 } const value = Status.Ready; const result = Status[value];",
+                Index::NumericMember,
+            ),
+            (
+                2,
+                "declare function compute(): number; enum Status { Ready = compute() } const value = Status.Ready; const result = Status[value];",
+                Index::ComputedMember,
+            ),
+        ] {
+            let parsed = parse_fixture(source);
+            let file = FileId::new(633 + offset);
+            let (mut store, bound, enumeration) = published_enum(&parsed, file);
+            let (expression, index) = match index_kind {
+                Index::Number => {
+                    let value = ts_jsnum::Number::new(0.0);
+                    (
+                        PlannedExpressionKind::Number {
+                            value,
+                            unary_operand: None,
+                        },
+                        store.regular_number_literal_type(value).unwrap(),
+                    )
+                }
+                Index::NumericMember | Index::ComputedMember => {
+                    let value = bound
+                        .locals(bound.source_file())
+                        .and_then(|locals| store.symbol_table(locals))
+                        .and_then(|locals| locals.get_source("value"))
+                        .unwrap();
+                    (
+                        PlannedExpressionKind::Identifier(PlannedIdentifierRead {
+                            resolved_symbol: value,
+                            value_symbol: value,
+                            kind: PlannedIdentifierReadKind::Variable,
+                        }),
+                        enumeration.members[0].fresh_type,
+                    )
+                }
+            };
+            let plan = enum_index_plan(&parsed, file, &store, enumeration.symbol, expression);
+            let host = DeclaredTypeHost::new([(&parsed.arena, &bound)]).unwrap();
+            let string = store.intrinsic_bootstrap().unwrap().string_type;
+            let targets =
+                CanonicalArrayTargets::for_single_target_validation(enumeration.value_type);
+
+            for _ in 0..2 {
+                assert_eq!(
+                    check_direct_source_element_with_array_targets(
+                        &mut store,
+                        &host,
+                        targets,
+                        CanonicalCheckerOptions::default(),
+                        &plan,
+                        enumeration.value_type,
+                        index,
+                    ),
+                    Ok(CheckedSourceElement {
+                        type_: string,
+                        diagnostic: None,
+                    }),
+                );
+            }
+            assert_eq!(
+                store
+                    .type_node_links(plan.node)
+                    .and_then(|links| links.resolved_type),
+                Some(string),
+            );
+            assert!(store.symbol_node_links(plan.node).is_none());
+        }
+    }
+
+    #[test]
+    fn regular_enum_variable_string_keys_preserve_the_fresh_member_identity() {
+        let parsed = parse_fixture(
+            "enum Status { Ready = 1 } const key = 'Ready'; const result = Status[key];",
+        );
+        let file = FileId::new(636);
+        let (mut store, bound, enumeration) = published_enum(&parsed, file);
+        let key = bound
+            .locals(bound.source_file())
+            .and_then(|locals| store.symbol_table(locals))
+            .and_then(|locals| locals.get_source("key"))
+            .unwrap();
+        let regular = store.regular_string_literal_type("Ready".into()).unwrap();
+        let index = store.fresh_type_of_literal_type(regular).unwrap();
+        let plan = enum_index_plan(
+            &parsed,
+            file,
+            &store,
+            enumeration.symbol,
+            PlannedExpressionKind::Identifier(PlannedIdentifierRead {
+                resolved_symbol: key,
+                value_symbol: key,
+                kind: PlannedIdentifierReadKind::Variable,
+            }),
+        );
+        let host = DeclaredTypeHost::new([(&parsed.arena, &bound)]).unwrap();
+        let member = &enumeration.members[0];
+
+        assert_eq!(
+            check_direct_source_element_with_array_targets(
+                &mut store,
+                &host,
+                CanonicalArrayTargets::for_single_target_validation(enumeration.value_type),
+                CanonicalCheckerOptions::default(),
+                &plan,
+                enumeration.value_type,
+                index,
+            ),
+            Ok(CheckedSourceElement {
+                type_: member.fresh_type,
+                diagnostic: None,
+            }),
+        );
+        assert_eq!(
+            store
+                .symbol_node_links(plan.node)
+                .and_then(|links| links.resolved_symbol),
+            Some(member.symbol),
+        );
+    }
+
+    #[test]
+    fn string_only_regular_enums_do_not_gain_numeric_reverse_indices() {
+        let parsed = parse_fixture("enum Status { Ready = 'ready' } const result = Status[0];");
+        let file = FileId::new(637);
+        let (mut store, bound, enumeration) = published_enum(&parsed, file);
+        let value = ts_jsnum::Number::new(0.0);
+        let index = store.regular_number_literal_type(value).unwrap();
+        let plan = enum_index_plan(
+            &parsed,
+            file,
+            &store,
+            enumeration.symbol,
+            PlannedExpressionKind::Number {
+                value,
+                unary_operand: None,
+            },
+        );
+        let host = DeclaredTypeHost::new([(&parsed.arena, &bound)]).unwrap();
+        let checked = check_direct_source_element_with_array_targets(
+            &mut store,
+            &host,
+            CanonicalArrayTargets::for_single_target_validation(enumeration.value_type),
+            strict_options(),
+            &plan,
+            enumeration.value_type,
+            index,
+        )
+        .unwrap();
+
+        assert_eq!(
+            checked.type_,
+            store.intrinsic_bootstrap().unwrap().error_type,
+        );
+        assert_eq!(checked.diagnostic.unwrap().diagnostic.code(), 7053);
+        assert!(store.symbol_node_links(plan.node).is_none());
     }
 
     #[test]

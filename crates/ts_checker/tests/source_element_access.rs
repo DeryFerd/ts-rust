@@ -1,4 +1,4 @@
-use ts_ast::{FileId, NodeData, NodeRef};
+use ts_ast::{FileId, NodeData, NodeRef, SyntaxKind};
 use ts_binder::{
     CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
     EscapedName,
@@ -373,5 +373,63 @@ fn const_enum_element_access_preserves_member_identity_and_missing_diagnostics()
     assert_eq!(
         (context.store().type_len(), context.diagnostics().clone()),
         warm
+    );
+}
+
+#[test]
+fn numeric_enum_reverse_lookup_preserves_const_enum_dynamic_index_errors() {
+    let source = concat!(
+        "enum Size { Small, Large }\n",
+        "const selected = Size.Large;\n",
+        "const label = Size[selected];\n",
+        "const enum Fixed { Ready }\n",
+        "const rejected = Fixed[1];\n",
+        "label + '';\n",
+    );
+    let library = parse_source_file(LIBRARY);
+    let parsed = parse_source_file(source);
+    assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(27);
+    let mut context = context(&library, FileId::new(26), &parsed, file);
+
+    context.check_source_file(file).unwrap();
+
+    let label = variable_initializer(&parsed, file, "label");
+    assert_eq!(
+        context
+            .type_to_string(resolved_type(&context, label))
+            .unwrap(),
+        "string",
+    );
+    let [diagnostic] = context.diagnostics().as_slice() else {
+        panic!("expected one dynamic const-enum access diagnostic")
+    };
+    assert_eq!(diagnostic.diagnostic.code(), 2476);
+    assert_eq!(node_text(source, &parsed, diagnostic.node.unwrap()), "1");
+
+    let concatenation = parsed
+        .arena
+        .iter()
+        .find_map(|(node, record)| {
+            (record.kind == SyntaxKind::BinaryExpression).then_some(NodeRef::new(
+                parsed.arena.id(),
+                file,
+                node,
+            ))
+        })
+        .unwrap();
+    assert_eq!(
+        context
+            .type_to_string(resolved_type(&context, concatenation))
+            .unwrap(),
+        "string",
+    );
+
+    let warm = (context.store().type_len(), context.diagnostics().clone());
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (context.store().type_len(), context.diagnostics().clone()),
+        warm,
     );
 }
