@@ -18,6 +18,7 @@
 //! Definite annotated fields admit one authenticated ambient-function decorator.
 //! One direct getter/setter pair can expose an annotated numeric property.
 //! A constructor may retain one authenticated decorated string parameter.
+//! Mutable instance fields can infer `number` from a direct numeric literal.
 //! Nonempty executable bodies, general heritage, and non-primitive annotations
 //! remain later class stages.
 
@@ -113,14 +114,14 @@ struct ClassIndexSignaturePlan {
     value_type_node: NodeRef,
 }
 
-/// One source property whose annotation can be executed by the root query
-/// adapter without rediscovering its binder ownership or class side.
+/// One source property with an annotation or a direct numeric initializer.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct ClassPropertyPlan {
     declaration: NodeRef,
     symbol: SemanticSymbolId,
     name_node: NodeRef,
     type_node: NodeRef,
+    initializer_text: Option<String>,
     name: String,
     side: ClassPropertySide,
     optional: bool,
@@ -2025,11 +2026,15 @@ fn plan_property(
             kind: record.kind,
         }));
     };
-    if property.initializer.is_some() {
-        return Err(unsupported(ClassUnsupported::PropertyInitializer(member)));
-    }
-    let Some(type_node) = property.type_ else {
-        return Err(unsupported(ClassUnsupported::MissingPropertyType(member)));
+    let type_node = match (property.type_, property.initializer) {
+        (Some(type_node), None) => type_node,
+        (None, Some(initializer)) => initializer,
+        (Some(_), Some(_)) => {
+            return Err(unsupported(ClassUnsupported::PropertyInitializer(member)));
+        }
+        (None, None) => {
+            return Err(unsupported(ClassUnsupported::MissingPropertyType(member)));
+        }
     };
     if property.symbol.is_some()
         || property.facts != 0
@@ -2064,6 +2069,33 @@ fn plan_property(
     {
         return Err(invariant(ClassInvariant::InvalidProperty(member)));
     }
+    let initializer_text = if property.initializer.is_some() {
+        let NodeData::NumericLiteral(literal) = &type_record.data else {
+            return Err(unsupported(ClassUnsupported::PropertyInitializer(member)));
+        };
+        let spelling_matches = host
+            .source(type_node)
+            .and_then(|(arena, _)| arena.source_text())
+            .is_none_or(|source| {
+                source.get(
+                    type_record.range.start.get() as usize..type_record.range.end.get() as usize,
+                ) == Some(literal.text.as_str())
+            });
+        if side != ClassPropertySide::Instance
+            || readonly
+            || property.postfix_token.is_some()
+            || type_record.kind != SyntaxKind::NumericLiteral
+            || type_record.flags.0 != 0
+            || literal.token_flags.0 != 0
+            || ts_jsnum::from_string(&literal.text).is_nan()
+            || !spelling_matches
+        {
+            return Err(unsupported(ClassUnsupported::PropertyInitializer(member)));
+        }
+        Some(literal.text.clone())
+    } else {
+        None
+    };
 
     let (optional, definite) = match property.postfix_token {
         None => (false, false),
@@ -2143,6 +2175,7 @@ fn plan_property(
         symbol,
         name_node: name,
         type_node,
+        initializer_text,
         name: identifier.text.clone(),
         side,
         optional,
@@ -2936,6 +2969,69 @@ fn expected_property_check_flags(property: &ClassPropertyPlan) -> CheckFlags {
     }
 }
 
+fn property_initializer_number(property: &ClassPropertyPlan) -> Option<Number> {
+    property
+        .initializer_text
+        .as_ref()
+        .map(|literal| ts_jsnum::from_string(literal))
+}
+
+fn property_initializer_fresh_literal_type(
+    store: &CanonicalTypeMapperStore,
+    property: &ClassPropertyPlan,
+) -> Result<Option<TypeId>, ClassError> {
+    let Some(number) = property_initializer_number(property) else {
+        return Ok(None);
+    };
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or_else(|| invariant(ClassInvariant::BootstrapUnavailable(property.type_node)))?;
+    let Some(regular) = bootstrap.cached_number_literal_type(number) else {
+        return Ok(None);
+    };
+    store
+        .fresh_type_of_literal_type(regular)
+        .map(Some)
+        .map_err(|_| invariant(ClassInvariant::InvalidPropertyTypeCache(property.type_node)))
+}
+
+fn planned_property_type(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    property: &ClassPropertyPlan,
+) -> Result<TypeId, ClassError> {
+    let record = preflight_node(store, host, property.type_node)?;
+    if record.flags.0 != 0 || record.parent != Some(property.declaration.node) {
+        return Err(unsupported(ClassUnsupported::PropertyType {
+            node: property.type_node,
+            kind: record.kind,
+        }));
+    }
+    if let Some(expected) = &property.initializer_text {
+        let NodeData::NumericLiteral(literal) = &record.data else {
+            return Err(unsupported(ClassUnsupported::PropertyInitializer(
+                property.declaration,
+            )));
+        };
+        if record.kind != SyntaxKind::NumericLiteral || &literal.text != expected {
+            return Err(unsupported(ClassUnsupported::PropertyInitializer(
+                property.declaration,
+            )));
+        }
+        return store
+            .intrinsic_bootstrap()
+            .map(|bootstrap| bootstrap.number_type)
+            .ok_or_else(|| invariant(ClassInvariant::BootstrapUnavailable(property.type_node)));
+    }
+    if !matches!(record.data, NodeData::KeywordTypeNode(_)) {
+        return Err(unsupported(ClassUnsupported::PropertyType {
+            node: property.type_node,
+            kind: record.kind,
+        }));
+    }
+    primitive_keyword_type(store, property.type_node, record.kind)
+}
+
 fn method_return_type(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -3217,7 +3313,11 @@ fn uninitialized_instance_properties(
         .map_err(|_| invariant(ClassInvariant::Capacity(class.declaration)))?;
 
     for (property, property_type) in class.properties.iter().zip(property_types) {
-        if property.side != ClassPropertySide::Instance || property.optional || property.definite {
+        if property.side != ClassPropertySide::Instance
+            || property.optional
+            || property.definite
+            || property.initializer_text.is_some()
+        {
             continue;
         }
         let record = store
@@ -3256,15 +3356,22 @@ fn validate_property_cache_state(
     property: &ClassPropertyPlan,
     property_type: TypeId,
 ) -> Result<(), ClassError> {
+    let expected_type_node = if property.initializer_text.is_some() {
+        property_initializer_fresh_literal_type(store, property)?
+    } else {
+        Some(property_type)
+    };
     match store.type_node_links(property.type_node) {
         None => {}
         Some(links) if links == &TypeNodeLinks::default() => {}
         Some(links)
-            if links
-                == &(TypeNodeLinks {
-                    resolved_type: Some(property_type),
-                    ..TypeNodeLinks::default()
-                }) => {}
+            if expected_type_node.is_some_and(|expected| {
+                links
+                    == &(TypeNodeLinks {
+                        resolved_type: Some(expected),
+                        ..TypeNodeLinks::default()
+                    })
+            }) => {}
         Some(_) => {
             return Err(invariant(ClassInvariant::InvalidPropertyTypeCache(
                 property.type_node,
@@ -3306,6 +3413,27 @@ fn validate_property_cache_state(
         }
     }
     Ok(())
+}
+
+fn exact_property_type_links(
+    store: &CanonicalTypeMapperStore,
+    property: &ClassPropertyPlan,
+    property_type: TypeId,
+) -> bool {
+    let expected = if property.initializer_text.is_some() {
+        property_initializer_fresh_literal_type(store, property)
+            .ok()
+            .flatten()
+    } else {
+        Some(property_type)
+    };
+    expected.is_some_and(|expected| {
+        store.type_node_links(property.type_node)
+            == Some(&TypeNodeLinks {
+                resolved_type: Some(expected),
+                ..TypeNodeLinks::default()
+            })
+    })
 }
 
 fn validate_index_type_cache(
@@ -3360,10 +3488,8 @@ fn plan_accessor_type(
 
 /// Preflights the first exact class-member cut.
 ///
-/// Every property must have one direct primitive keyword annotation. This
-/// keeps the class transaction dependency-closed without executing several
-/// independent type-node queries whose later failure could expose an earlier
-/// property publication.
+/// Properties have a direct primitive annotation or a numeric initializer.
+/// Planning the full class first prevents partial property publication.
 fn plan_class_members(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -3374,17 +3500,7 @@ fn plan_class_members(
         .try_reserve_exact(class.properties.len())
         .map_err(|_| invariant(ClassInvariant::Capacity(class.declaration)))?;
     for property in &class.properties {
-        let record = preflight_node(store, host, property.type_node)?;
-        if record.flags.0 != 0
-            || !matches!(record.data, NodeData::KeywordTypeNode(_))
-            || record.parent != Some(property.declaration.node)
-        {
-            return Err(unsupported(ClassUnsupported::PropertyType {
-                node: property.type_node,
-                kind: record.kind,
-            }));
-        }
-        let property_type = primitive_keyword_type(store, property.type_node, record.kind)?;
+        let property_type = planned_property_type(store, host, property)?;
         validate_property_cache_state(store, property, property_type)?;
         property_types.push(property_type);
     }
@@ -3757,15 +3873,7 @@ fn completed_class_members(
         .iter()
         .zip(&plan.property_types)
         .any(|(property, property_type)| {
-            store
-                .type_node_links(property.type_node)
-                .is_none_or(|links| {
-                    links
-                        != &(TypeNodeLinks {
-                            resolved_type: Some(*property_type),
-                            ..TypeNodeLinks::default()
-                        })
-                })
+            !exact_property_type_links(store, property, *property_type)
                 || store.symbol(property.symbol).is_none_or(|symbol| {
                     symbol.check_flags() != expected_property_check_flags(property)
                 })
@@ -4095,15 +4203,7 @@ fn completed_derived_class_members(
         .iter()
         .zip(&plan.property_types)
         .any(|(property, property_type)| {
-            store
-                .type_node_links(property.type_node)
-                .is_none_or(|links| {
-                    links
-                        != &(TypeNodeLinks {
-                            resolved_type: Some(*property_type),
-                            ..TypeNodeLinks::default()
-                        })
-                })
+            !exact_property_type_links(store, property, *property_type)
                 || store.symbol(property.symbol).is_none_or(|symbol| {
                     symbol.check_flags() != expected_property_check_flags(property)
                 })
@@ -4193,14 +4293,7 @@ fn cached_primitive_member_plan(
 ) -> Option<ClassMemberPlan> {
     let mut property_types = Vec::with_capacity(class.properties.len());
     for property in &class.properties {
-        let record = preflight_node(store, host, property.type_node).ok()?;
-        if record.flags.0 != 0
-            || !matches!(record.data, NodeData::KeywordTypeNode(_))
-            || record.parent != Some(property.declaration.node)
-        {
-            return None;
-        }
-        let property_type = primitive_keyword_type(store, property.type_node, record.kind).ok()?;
+        let property_type = planned_property_type(store, host, property).ok()?;
         validate_property_cache_state(store, property, property_type).ok()?;
         property_types.push(property_type);
     }
@@ -4650,6 +4743,99 @@ fn publish_class_accessor(store: &mut CanonicalTypeMapperStore, plan: &ClassMemb
     }
 }
 
+fn prepare_class_literal_types(
+    store: &mut CanonicalTypeMapperStore,
+    plan: &ClassMemberPlan,
+    base: Option<&ClassMemberPlan>,
+) -> Result<(), ClassError> {
+    let capacity = plan
+        .class
+        .properties
+        .len()
+        .checked_add(base.map_or(0, |base| base.class.properties.len()))
+        .and_then(|count| count.checked_add(usize::from(plan.class.accessor.is_some())))
+        .and_then(|count| {
+            count.checked_add(usize::from(
+                base.is_some_and(|base| base.class.accessor.is_some()),
+            ))
+        })
+        .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
+    let mut numbers = Vec::new();
+    numbers
+        .try_reserve_exact(capacity)
+        .map_err(|_| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
+    for class in std::iter::once(plan).chain(base) {
+        numbers.extend(
+            class
+                .class
+                .properties
+                .iter()
+                .filter_map(property_initializer_number),
+        );
+        if let Some(accessor) = class.class.accessor.as_ref() {
+            numbers.push(accessor_literal_number(accessor));
+        }
+    }
+    if numbers.is_empty() {
+        return Ok(());
+    }
+    store
+        .prepare_regular_literal_types(&[], &numbers, &[])
+        .map_err(|error| {
+            if error == LiteralTypeCacheError::Capacity {
+                invariant(ClassInvariant::Capacity(plan.class.declaration))
+            } else {
+                let node = plan
+                    .class
+                    .properties
+                    .iter()
+                    .chain(base.into_iter().flat_map(|base| &base.class.properties))
+                    .find(|property| property.initializer_text.is_some())
+                    .map(|property| property.type_node)
+                    .or_else(|| {
+                        plan.class
+                            .accessor
+                            .as_ref()
+                            .map(|accessor| accessor.return_expression)
+                    })
+                    .unwrap_or(plan.class.declaration);
+                invariant(ClassInvariant::InvalidPropertyTypeCache(node))
+            }
+        })
+}
+
+fn publish_class_property(
+    store: &mut CanonicalTypeMapperStore,
+    property: &ClassPropertyPlan,
+    property_type: TypeId,
+) {
+    let node_type = if let Some(number) = property_initializer_number(property) {
+        let regular = store
+            .regular_number_literal_type(number)
+            .expect("the class transaction prepared its numeric field literal");
+        store
+            .fresh_type_of_literal_type(regular)
+            .expect("the prepared numeric field literal retains its fresh type")
+    } else {
+        property_type
+    };
+    assert!(store.set_type_node_links(
+        property.type_node,
+        TypeNodeLinks {
+            resolved_type: Some(node_type),
+            ..TypeNodeLinks::default()
+        },
+    ));
+    assert!(store.set_source_property_readonly(property.symbol, property.readonly));
+    assert!(store.set_value_symbol_links(
+        property.symbol,
+        ValueSymbolLinks {
+            resolved_type: Some(property_type),
+            ..ValueSymbolLinks::default()
+        },
+    ));
+}
+
 /// Installs the exact primitive-property member graph and default constructor
 /// for a previously preflighted class.
 ///
@@ -4670,6 +4856,15 @@ pub(super) fn execute_nongeneric_class_members(
     let additional_types = usize::from(cold_value)
         .checked_add(usize::from(cold_instance) * 2)
         .and_then(|count| count.checked_add(plan.class.methods.len()))
+        .and_then(|count| {
+            plan.class
+                .properties
+                .iter()
+                .filter(|property| property.initializer_text.is_some())
+                .count()
+                .checked_mul(2)
+                .and_then(|literals| count.checked_add(literals))
+        })
         .and_then(|count| count.checked_add(usize::from(plan.class.accessor.is_some()) * 2))
         .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
 
@@ -4846,18 +5041,7 @@ pub(super) fn execute_nongeneric_class_members(
         .checked_add(1)
         .and_then(|count| count.checked_add(usize::from(plan.class.accessor.is_some())))
         .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
-    if let Some(accessor) = plan.class.accessor.as_ref() {
-        store
-            .prepare_regular_literal_types(&[], &[accessor_literal_number(accessor)], &[])
-            .map_err(|error| match error {
-                LiteralTypeCacheError::Capacity => {
-                    invariant(ClassInvariant::Capacity(plan.class.declaration))
-                }
-                _ => invariant(ClassInvariant::InvalidPropertyTypeCache(
-                    accessor.return_expression,
-                )),
-            })?;
-    }
+    prepare_class_literal_types(store, plan, None)?;
     if !store.try_reserve_types(additional_types)
         || !store.try_reserve_signatures(signature_count)
         || !store.try_reserve_index_infos(usize::from(plan.class.index.is_some()))
@@ -4935,21 +5119,7 @@ pub(super) fn execute_nongeneric_class_members(
     }
 
     for (property, property_type) in plan.class.properties.iter().zip(&plan.property_types) {
-        assert!(store.set_type_node_links(
-            property.type_node,
-            TypeNodeLinks {
-                resolved_type: Some(*property_type),
-                ..TypeNodeLinks::default()
-            },
-        ));
-        assert!(store.set_source_property_readonly(property.symbol, property.readonly,));
-        assert!(store.set_value_symbol_links(
-            property.symbol,
-            ValueSymbolLinks {
-                resolved_type: Some(*property_type),
-                ..ValueSymbolLinks::default()
-            },
-        ));
+        publish_class_property(store, property, *property_type);
     }
     if let Some(index) = plan.class.index {
         let (key_type, value_type) = plan
@@ -5220,10 +5390,21 @@ fn execute_direct_derived_class_members(
         .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
     let type_count = method_count
         .checked_add(6)
+        .and_then(|count| {
+            plan.class
+                .properties
+                .iter()
+                .chain(&base_plan.class.properties)
+                .filter(|property| property.initializer_text.is_some())
+                .count()
+                .checked_mul(2)
+                .and_then(|literals| count.checked_add(literals))
+        })
         .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
     let signature_count = method_count
         .checked_add(2)
         .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
+    prepare_class_literal_types(store, plan, Some(base_plan))?;
     if !store.try_reserve_types(type_count)
         || !store.try_reserve_signatures(signature_count)
         || !store.try_reserve_checker_symbol_allocations(
@@ -5301,21 +5482,7 @@ fn execute_direct_derived_class_members(
         },
     ));
     for (property, property_type) in plan.class.properties.iter().zip(&plan.property_types) {
-        assert!(store.set_type_node_links(
-            property.type_node,
-            TypeNodeLinks {
-                resolved_type: Some(*property_type),
-                ..TypeNodeLinks::default()
-            },
-        ));
-        assert!(store.set_source_property_readonly(property.symbol, property.readonly,));
-        assert!(store.set_value_symbol_links(
-            property.symbol,
-            ValueSymbolLinks {
-                resolved_type: Some(*property_type),
-                ..ValueSymbolLinks::default()
-            },
-        ));
+        publish_class_property(store, property, *property_type);
     }
     publish_class_methods(store, plan, method_signature_lists);
     assert!(store.set_interface_declared_members(
@@ -5479,6 +5646,61 @@ fn exact_stored_property(
         bootstrap.non_primitive_type,
     ]
     .contains(&property_type);
+    let source_type_valid = store
+        .source_primitive_type_annotation(*declaration)
+        .map_or_else(
+            || {
+                let Some(initializer_index) = declaration
+                    .node
+                    .index()
+                    .checked_sub(1)
+                    .and_then(|index| u32::try_from(index).ok())
+                else {
+                    return false;
+                };
+                let initializer = NodeRef::new(
+                    declaration.arena,
+                    declaration.file,
+                    ts_ast::NodeId::new(initializer_index),
+                );
+                let Some(fresh) = store
+                    .type_node_links(initializer)
+                    .and_then(|links| links.resolved_type)
+                else {
+                    return false;
+                };
+                let Some(literal_record) = store.type_payload(fresh) else {
+                    return false;
+                };
+                let TypeData::Literal(literal) = literal_record.data() else {
+                    return false;
+                };
+                let super::type_records::LiteralValue::Number(number) = &literal.value else {
+                    return false;
+                };
+                flags == SymbolFlags::PROPERTY
+                    && check_flags == CheckFlags::NONE
+                    && property_type == bootstrap.number_type
+                    && store.source_node_kind(initializer) == Some(SyntaxKind::NumericLiteral)
+                    && store.source_node_parent(initializer)
+                        == Some(SourceNodeParent::Parent(*declaration))
+                    && store.type_node_links(initializer)
+                        == Some(&TypeNodeLinks {
+                            resolved_type: Some(fresh),
+                            ..TypeNodeLinks::default()
+                        })
+                    && literal_record.flags() == TypeFlags::NUMBER_LITERAL
+                    && bootstrap.cached_number_literal_type(*number) == Some(literal.regular_type)
+                    && store.fresh_type_of_literal_type(literal.regular_type) == Ok(fresh)
+                    && store
+                        .symbol(owner)
+                        .and_then(Symbol::members)
+                        .and_then(|members| store.symbol_table(members))
+                        .and_then(|members| members.get(record.name()))
+                        == Some(property)
+            },
+            |annotation| store.source_type_node_result_is_exact(annotation, property_type, &[]),
+        );
     ((flags == SymbolFlags::PROPERTY || flags == (SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL))
         && matches!(check_flags, CheckFlags::NONE | CheckFlags::READONLY)
         && record.value_declaration() == Some(*declaration)
@@ -5490,11 +5712,7 @@ fn exact_stored_property(
         && store.source_node_kind(*declaration) == Some(SyntaxKind::PropertyDeclaration)
         && store.source_node_parent(*declaration)
             == Some(SourceNodeParent::Parent(owner_declaration))
-        && store
-            .source_primitive_type_annotation(*declaration)
-            .is_some_and(|annotation| {
-                store.source_type_node_result_is_exact(annotation, property_type, &[])
-            })
+        && source_type_valid
         && links
             == &(ValueSymbolLinks {
                 resolved_type: Some(property_type),
@@ -8133,7 +8351,7 @@ mod tests {
             ("class Generic<T> {}", "Generic"),
             ("class Base {} class Derived extends Base {}", "Derived"),
             ("class Method { method(): void { return; } }", "Method"),
-            ("class Initialized { value = 1; }", "Initialized"),
+            ("class Initialized { value = () => 1; }", "Initialized"),
             ("class Reserved { static prototype: number; }", "Reserved"),
             (
                 "class StaticDefinite { static value!: number; }",

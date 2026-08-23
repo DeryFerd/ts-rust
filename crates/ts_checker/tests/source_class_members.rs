@@ -460,6 +460,81 @@ fn strict_property_options_report_later_unsafe_field_without_rejecting_classes()
 }
 
 #[test]
+fn numeric_class_field_initializers_infer_number_and_avoid_ts2564() {
+    let parsed = parse_source_file("class Model { value = 1; }");
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(98);
+    let mut context = checker_context_with_options(
+        &parsed,
+        file,
+        CanonicalModuleState::Script,
+        strict_property_options(),
+    );
+    let owner = class_symbol(&parsed, file, &context, "Model");
+    let initializer = parsed
+        .arena
+        .iter()
+        .find_map(|(_, record)| {
+            let NodeData::PropertyDeclaration(property) = &record.data else {
+                return None;
+            };
+            property
+                .initializer
+                .map(|node| NodeRef::new(parsed.arena.id(), file, node))
+        })
+        .unwrap();
+
+    context.check_source_file(file).unwrap();
+
+    assert!(context.diagnostics().is_empty());
+    let members = context.get_nongeneric_class_members(owner).unwrap();
+    let [property] = members.instance_properties() else {
+        panic!("expected one initialized numeric field")
+    };
+    assert_eq!(
+        context
+            .type_to_string(
+                context
+                    .store()
+                    .value_symbol_links(*property)
+                    .and_then(|links| links.resolved_type)
+                    .unwrap(),
+            )
+            .unwrap(),
+        "number",
+    );
+    assert_eq!(
+        context
+            .type_to_string(
+                context
+                    .store()
+                    .type_node_links(initializer)
+                    .and_then(|links| links.resolved_type)
+                    .unwrap(),
+            )
+            .unwrap(),
+        "1",
+    );
+
+    let warm = (
+        context.store().type_len(),
+        context.store().symbol_len(),
+        context.store().signature_len(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().signature_len(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
+}
+
+#[test]
 fn later_unannotated_variable_keeps_classes_and_field_diagnostics_cold_across_retries() {
     let parsed = parse_source_file(concat!(
         "class Loose { bare: string; optional?: number; static count: number; }\n",
