@@ -20,8 +20,8 @@
 //!   dependency-closed union cache ownership stays here; the expression-union
 //!   prefix additionally admits recursively canonical unions and fresh,
 //!   property-only object literals for exact array-literal subtype reduction,
-//!   plus resolved nongeneric declared property objects as canonical array
-//!   elements.
+//!   their authenticated regular and widened counterparts, plus resolved
+//!   nongeneric declared property objects as canonical array elements.
 
 use std::{
     cmp::Ordering,
@@ -41,6 +41,7 @@ use super::{
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
     callables::CallableFamily,
     declared::cached_ordinary_type_parameter_owner,
+    derived_types::DerivedObjectLiteralValidation,
     functions::{self, PendingFunctionTypeProof},
     ids::{IndexInfoId, SignatureId, TypeAliasId, TypeId, TypePredicateId},
     links::ValueSymbolLinks,
@@ -2026,6 +2027,60 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         })
     }
 
+    fn validate_supported_derived_property_object(
+        &self,
+        type_: TypeId,
+        record: &TypeRecord,
+        object: &ObjectTypeData,
+        array_validation: UnionArrayValidation<'_>,
+        visiting: &mut HashSet<TypeId>,
+        allowed_pending: &HashSet<TypeId>,
+    ) -> Result<bool, LiteralTypeCacheError> {
+        let derived = match array_validation {
+            UnionArrayValidation::None => self.validate_derived_object_literal_for_relation(type_),
+            UnionArrayValidation::GlobalTypes(global_types) => {
+                self.validate_derived_object_literal_with_global_types(type_, global_types)
+            }
+            UnionArrayValidation::Targets(targets) => {
+                self.validate_derived_object_literal_with_array_targets(type_, targets)
+            }
+        };
+        match derived {
+            DerivedObjectLiteralValidation::NotDerived => Ok(false),
+            DerivedObjectLiteralValidation::Invalid => {
+                Err(LiteralTypeCacheError::InvalidCachedUnion(type_))
+            }
+            DerivedObjectLiteralValidation::Valid { owner, .. } => {
+                if record.symbol() != Some(owner) {
+                    return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
+                }
+                if !visiting.insert(type_) {
+                    return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
+                }
+                let result = object
+                    .structured
+                    .properties
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .try_for_each(|property| {
+                        let property_type = self
+                            .value_symbol_links(*property)
+                            .and_then(|links| links.resolved_type)
+                            .ok_or(LiteralTypeCacheError::InvalidCachedUnion(type_))?;
+                        self.validate_union_constituent_worker(
+                            property_type,
+                            array_validation,
+                            visiting,
+                            allowed_pending,
+                        )
+                    });
+                visiting.remove(&type_);
+                result.map(|()| true)
+            }
+        }
+    }
+
     fn valid_supported_property_object_tail(object: &ObjectTypeData) -> bool {
         object.target.is_none()
             && object.mapper.is_none()
@@ -2465,15 +2520,27 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                                     allowed_pending,
                                 )
                             }
-                            object_members::DeclaredPropertyTypeGraphValidation::Opaque => self
-                                .validate_supported_fresh_property_object(
+                            object_members::DeclaredPropertyTypeGraphValidation::Opaque => {
+                                if self.validate_supported_derived_property_object(
                                     type_,
                                     record,
                                     object,
                                     array_validation,
                                     visiting,
                                     allowed_pending,
-                                ),
+                                )? {
+                                    Ok(())
+                                } else {
+                                    self.validate_supported_fresh_property_object(
+                                        type_,
+                                        record,
+                                        object,
+                                        array_validation,
+                                        visiting,
+                                        allowed_pending,
+                                    )
+                                }
+                            }
                             object_members::DeclaredPropertyTypeGraphValidation::Malformed => {
                                 Err(LiteralTypeCacheError::InvalidCachedUnion(type_))
                             }
@@ -6281,6 +6348,87 @@ mod tests {
                     .union_of_union_cache_len(),
             ),
             warm
+        );
+    }
+
+    #[test]
+    fn derived_object_union_constituents_require_valid_cache_provenance() {
+        let parsed = parse_source_file("const value: any = { missing: undefined };");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(145);
+        let mut context = checker_context(file, &parsed);
+        context.check_source_file(file).unwrap();
+        let fresh = checked_expression_type(&context, variable_initializer(&parsed, file, "value"));
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let store = context.store_mut_for_test();
+        let regular = store.get_regular_type_of_object_literal(fresh).unwrap();
+        let widened = store.get_widened_type(regular).unwrap();
+        assert_ne!(fresh, regular);
+        assert_ne!(regular, widened);
+
+        assert_eq!(store.validate_union_constituent(regular), Ok(()));
+        assert_eq!(store.validate_union_constituent(widened), Ok(()));
+        let regular_union = store
+            .expression_union_type(&[number, regular], UnionReduction::None)
+            .unwrap();
+        let widened_union = store
+            .expression_union_type(&[number, widened], UnionReduction::None)
+            .unwrap();
+        assert_eq!(union_types(store, regular_union), &[number, regular]);
+        assert_eq!(union_types(store, widened_union), &[number, widened]);
+
+        let warm = (
+            store.type_len(),
+            store.intrinsic_bootstrap().unwrap().union_cache_len(),
+        );
+        assert_eq!(
+            store.expression_union_type(&[widened, number], UnionReduction::None),
+            Ok(widened_union),
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.intrinsic_bootstrap().unwrap().union_cache_len(),
+            ),
+            warm,
+        );
+
+        let property = record(store, widened)
+            .data()
+            .structured()
+            .and_then(|structured| structured.properties.as_deref())
+            .and_then(|properties| properties.first())
+            .copied()
+            .unwrap();
+        let original_links = store.value_symbol_links(property).unwrap().clone();
+        let mut poisoned_links = original_links.clone();
+        poisoned_links.resolved_type = Some(number);
+        assert!(store.set_value_symbol_links(property, poisoned_links));
+        assert_eq!(
+            store.validate_union_constituent(widened),
+            Err(LiteralTypeCacheError::InvalidCachedUnion(widened)),
+        );
+        assert!(store.set_value_symbol_links(property, original_links));
+        assert_eq!(store.validate_union_constituent(widened), Ok(()));
+
+        let (owner, members, properties) = {
+            let regular_record = record(store, regular);
+            let TypeData::Object(object) = regular_record.data() else {
+                panic!("a regular object literal must retain its object payload")
+            };
+            (
+                regular_record.symbol().unwrap(),
+                object.structured.members,
+                object.structured.properties.clone(),
+            )
+        };
+        let forged = store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(owner))
+            .unwrap();
+        assert!(store.set_structured_type_members(forged, members, properties, None, None, None,));
+        assert_eq!(
+            store.validate_union_constituent(forged),
+            Err(LiteralTypeCacheError::UnsupportedUnionConstituent(forged)),
         );
     }
 

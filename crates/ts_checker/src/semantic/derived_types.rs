@@ -36,6 +36,8 @@ use super::{
 pub(super) struct DerivedTypeCaches {
     regular_object_literals: HashMap<TypeId, TypeId>,
     widened_types: HashMap<TypeId, TypeId>,
+    contextual_widened_types: HashMap<(TypeId, TypeId), TypeId>,
+    undefined_properties: HashMap<EscapedName, SemanticSymbolId>,
     pub(super) array_literal_types: HashMap<TypeId, TypeId>,
 }
 
@@ -61,6 +63,16 @@ impl DerivedTypeCaches {
 
     fn try_reserve_widened(&mut self, additional: usize) -> bool {
         self.widened_types.try_reserve(additional).is_ok()
+    }
+
+    fn try_reserve_contextual_widened(&mut self, additional: usize) -> bool {
+        self.contextual_widened_types
+            .try_reserve(additional)
+            .is_ok()
+    }
+
+    fn try_reserve_undefined_properties(&mut self, additional: usize) -> bool {
+        self.undefined_properties.try_reserve(additional).is_ok()
     }
 
     pub(super) fn try_reserve_array_literals(&mut self, additional: usize) -> bool {
@@ -186,6 +198,7 @@ struct RegularObjectPlan {
 enum WidenTransform {
     Identity(TypeId),
     Cached(TypeId),
+    ContextualCached { union: TypeId, source: TypeId },
 }
 
 #[derive(Debug)]
@@ -205,6 +218,13 @@ enum WidenPlan {
         source: TypeId,
         shape: ObjectShape,
         properties: Vec<WidenPropertyPlan>,
+    },
+    ContextualObject {
+        union: TypeId,
+        source: TypeId,
+        shape: ObjectShape,
+        properties: Vec<WidenPropertyPlan>,
+        undefined_properties: Vec<PropertyShape>,
     },
     Array {
         source: TypeId,
@@ -330,7 +350,16 @@ impl SemanticStore<TypeRecord, TypeMapper> {
 
         let object_count = plans
             .iter()
-            .filter(|plan| matches!(plan, WidenPlan::Object { .. }))
+            .filter(|plan| {
+                matches!(
+                    plan,
+                    WidenPlan::Object { .. } | WidenPlan::ContextualObject { .. }
+                )
+            })
+            .count();
+        let contextual_count = plans
+            .iter()
+            .filter(|plan| matches!(plan, WidenPlan::ContextualObject { .. }))
             .count();
         let array_count = plans
             .iter()
@@ -340,6 +369,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             .iter()
             .filter(|plan| matches!(plan, WidenPlan::Union { .. }))
             .count();
+        let mut undefined_names = HashSet::new();
         let clone_count = plans.iter().try_fold(0usize, |count, plan| match plan {
             WidenPlan::Existing { .. } | WidenPlan::Array { .. } | WidenPlan::Union { .. } => {
                 Some(count)
@@ -350,8 +380,26 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     .filter(|property| matches!(property.transform, WidenTransform::Cached(_)))
                     .count(),
             ),
+            WidenPlan::ContextualObject {
+                properties,
+                undefined_properties,
+                ..
+            } => {
+                for property in undefined_properties {
+                    if !self
+                        .derived_types
+                        .undefined_properties
+                        .contains_key(&property.name)
+                    {
+                        undefined_names.insert(property.name.clone());
+                    }
+                }
+                count.checked_add(properties.len())
+            }
         });
-        let Some(clone_count) = clone_count else {
+        let Some(clone_count) =
+            clone_count.and_then(|count| count.checked_add(undefined_names.len()))
+        else {
             return Err(DerivedTypeError::Capacity(type_));
         };
         let Some(type_count) = object_count.checked_add(array_count).and_then(|count| {
@@ -362,6 +410,12 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             return Err(DerivedTypeError::Capacity(type_));
         };
         if !self.derived_types.try_reserve_widened(plans.len())
+            || !self
+                .derived_types
+                .try_reserve_contextual_widened(contextual_count)
+            || !self
+                .derived_types
+                .try_reserve_undefined_properties(undefined_names.len())
             || !self.try_reserve_types(type_count)
             || !self.try_reserve_checker_symbol_allocations(clone_count, object_count)
         {
@@ -463,6 +517,18 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         self.validate_derived_object_literal(type_, Some(array_targets))
     }
 
+    /// Authenticates a donor-owned optional property on a contextual object.
+    pub(super) fn validate_contextual_widened_object_property(
+        &self,
+        receiver: TypeId,
+        property: SemanticSymbolId,
+    ) -> bool {
+        let Some((union, source)) = self.contextual_widened_source(receiver) else {
+            return false;
+        };
+        self.contextual_optional_property_is_valid(union, source, receiver, property)
+    }
+
     fn validate_derived_object_literal(
         &self,
         type_: TypeId,
@@ -487,18 +553,28 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 return DerivedObjectLiteralValidation::Invalid;
             }
         }
+        let contextual_source = self.contextual_widened_source(type_);
+        if self
+            .derived_types
+            .contextual_widened_types
+            .values()
+            .filter(|cached| **cached == type_)
+            .count()
+            > 1
+        {
+            return DerivedObjectLiteralValidation::Invalid;
+        }
 
-        let (source, valid) = match (regular_source, widened_source) {
-            (None, None) => return DerivedObjectLiteralValidation::NotDerived,
-            (Some(_), Some(_)) => return DerivedObjectLiteralValidation::Invalid,
-            (Some(source), None) => {
+        let (source, valid) = match (regular_source, widened_source, contextual_source) {
+            (None, None, None) => return DerivedObjectLiteralValidation::NotDerived,
+            (Some(source), None, None) => {
                 let mut visiting = HashSet::new();
                 (
                     source,
                     self.regular_cache_entry_is_valid(source, type_, &mut visiting),
                 )
             }
-            (None, Some(source)) => {
+            (None, Some(source), None) => {
                 let mut visiting = HashSet::new();
                 let mut regular_visiting = HashSet::new();
                 (
@@ -512,6 +588,11 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     ),
                 )
             }
+            (None, None, Some((union, source))) => (
+                source,
+                self.contextual_object_cache_entry_is_valid(union, source, type_, array_targets),
+            ),
+            _ => return DerivedObjectLiteralValidation::Invalid,
         };
         if !valid {
             return DerivedObjectLiteralValidation::Invalid;
@@ -628,16 +709,14 @@ impl SemanticStore<TypeRecord, TypeMapper> {
 
         if let TypeData::Union(union) = record.data() {
             let members = union.union.types.clone();
-            if members.iter().any(|member| {
+            let has_object_literals = members.iter().any(|member| {
                 self.type_payload(*member).is_some_and(|record| {
                     record.object_flags().contains(ObjectFlags::OBJECT_LITERAL)
                         && record
                             .object_flags()
                             .intersects(ObjectFlags::REQUIRES_WIDENING)
                 })
-            }) {
-                return Err(DerivedTypeError::UnsupportedWideningType(source));
-            }
+            });
             let validation = match global_types {
                 Some(global_types) => {
                     self.validate_union_constituent_with_global_types(global_types, source)
@@ -645,6 +724,16 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 None => self.validate_union_constituent(source),
             };
             validation.map_err(|error| widening_union_error(source, error))?;
+            if has_object_literals {
+                return self.plan_contextual_widened_union(
+                    source,
+                    &members,
+                    global_types,
+                    plans,
+                    visiting,
+                    planned,
+                );
+            }
             if !visiting.insert(source) {
                 return Err(DerivedTypeError::RecursiveWideningType(source));
             }
@@ -719,6 +808,165 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             properties,
         });
         Ok(WidenTransform::Cached(source))
+    }
+
+    fn plan_contextual_widened_union(
+        &self,
+        union: TypeId,
+        members: &[TypeId],
+        global_types: Option<&CanonicalGlobalTypes>,
+        plans: &mut Vec<WidenPlan>,
+        visiting: &mut HashSet<TypeId>,
+        planned: &mut HashSet<TypeId>,
+    ) -> Result<WidenTransform, DerivedTypeError> {
+        if !visiting.insert(union) {
+            return Err(DerivedTypeError::RecursiveWideningType(union));
+        }
+
+        let mut object_shapes = Vec::with_capacity(members.len());
+        let mut context_properties = Vec::<PropertyShape>::new();
+        let mut context_names = HashMap::<EscapedName, usize>::new();
+        for member in members {
+            let record = self
+                .type_payload(*member)
+                .ok_or(DerivedTypeError::Type(*member))?;
+            if record.flags().intersects(TypeFlags::NULLABLE) {
+                continue;
+            }
+            if !record.object_flags().contains(ObjectFlags::OBJECT_LITERAL) {
+                return Err(DerivedTypeError::UnsupportedWideningType(*member));
+            }
+
+            let mut regular_visiting = HashSet::new();
+            let shape = self
+                .validated_widening_object_shape(*member, &mut regular_visiting)
+                .ok_or(DerivedTypeError::MalformedObjectLiteral(*member))?;
+            for property in &shape.properties {
+                let property_record = self
+                    .type_payload(property.type_)
+                    .ok_or(DerivedTypeError::Type(property.type_))?;
+                if property_record.flags().intersects(TypeFlags::OBJECT)
+                    || property_record
+                        .object_flags()
+                        .intersects(ObjectFlags::REQUIRES_WIDENING)
+                        && !property_record
+                            .flags()
+                            .intersects(TypeFlags::ANY | TypeFlags::NULLABLE)
+                {
+                    return Err(DerivedTypeError::UnsupportedWideningType(property.type_));
+                }
+                if let Some(index) = context_names.get(&property.name).copied() {
+                    context_properties[index] = property.clone();
+                } else {
+                    context_names.insert(property.name.clone(), context_properties.len());
+                    context_properties.push(property.clone());
+                }
+            }
+            object_shapes.push((*member, shape));
+        }
+
+        let mut constituents = Vec::with_capacity(members.len());
+        for member in members {
+            let record = self
+                .type_payload(*member)
+                .ok_or(DerivedTypeError::Type(*member))?;
+            if record.flags().intersects(TypeFlags::NULLABLE) {
+                constituents.push(WidenTransform::Identity(*member));
+                continue;
+            }
+
+            let (_, shape) = object_shapes
+                .iter()
+                .find(|(source, _)| source == member)
+                .expect("each contextual object was authenticated");
+            if let Some(cached) = self
+                .derived_types
+                .contextual_widened_types
+                .get(&(union, *member))
+                .copied()
+            {
+                if !self.contextual_object_cache_entry_is_valid(
+                    union,
+                    *member,
+                    cached,
+                    global_types.map(CanonicalArrayTargets::from_global_types),
+                ) {
+                    return Err(DerivedTypeError::InvalidWidenedTypeCache {
+                        source: *member,
+                        cached,
+                    });
+                }
+                constituents.push(WidenTransform::ContextualCached {
+                    union,
+                    source: *member,
+                });
+                continue;
+            }
+
+            let mut properties = Vec::with_capacity(shape.properties.len());
+            for property in &shape.properties {
+                let property_record = self
+                    .type_payload(property.type_)
+                    .ok_or(DerivedTypeError::Type(property.type_))?;
+                let transformed = if property_record
+                    .object_flags()
+                    .intersects(ObjectFlags::REQUIRES_WIDENING)
+                {
+                    self.intrinsic_bootstrap()
+                        .ok_or(DerivedTypeError::BootstrapUninitialized)?
+                        .any_type
+                } else {
+                    property.type_
+                };
+                properties.push(WidenPropertyPlan {
+                    source: property.symbol,
+                    name: property.name.clone(),
+                    transform: WidenTransform::Identity(transformed),
+                });
+            }
+
+            let undefined_properties = context_properties
+                .iter()
+                .filter(|property| {
+                    !shape
+                        .properties
+                        .iter()
+                        .any(|source| source.name == property.name)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            for property in &undefined_properties {
+                if let Some(cached) = self
+                    .derived_types
+                    .undefined_properties
+                    .get(&property.name)
+                    .copied()
+                    && !self.valid_cached_undefined_property(&property.name, cached)
+                {
+                    return Err(DerivedTypeError::MalformedObjectLiteral(*member));
+                }
+            }
+
+            plans.push(WidenPlan::ContextualObject {
+                union,
+                source: *member,
+                shape: shape.clone(),
+                properties,
+                undefined_properties,
+            });
+            constituents.push(WidenTransform::ContextualCached {
+                union,
+                source: *member,
+            });
+        }
+
+        debug_assert!(visiting.remove(&union));
+        planned.insert(union);
+        plans.push(WidenPlan::Union {
+            source: union,
+            constituents,
+        });
+        Ok(WidenTransform::Cached(union))
     }
 
     fn publish_regular_object(&mut self, plan: RegularObjectPlan) {
@@ -805,6 +1053,11 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                             .widened_types
                             .get(&source)
                             .expect("widened child types are published before their parent"),
+                        WidenTransform::ContextualCached { union, source } => *self
+                            .derived_types
+                            .contextual_widened_types
+                            .get(&(union, source))
+                            .expect("contextual child objects are published before their parent"),
                     };
                     let original = self
                         .value_symbol_links(property.source)
@@ -844,6 +1097,95 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     self.mark_relation_inputs_dirty();
                 }
             }
+            WidenPlan::ContextualObject {
+                union,
+                source,
+                shape,
+                properties: property_plans,
+                undefined_properties,
+            } => {
+                let members = self.alloc_symbol_table();
+                let mut properties =
+                    Vec::with_capacity(property_plans.len() + undefined_properties.len());
+                for property in property_plans {
+                    let transformed = match property.transform {
+                        WidenTransform::Identity(type_) => type_,
+                        WidenTransform::Cached(source) => *self
+                            .derived_types
+                            .widened_types
+                            .get(&source)
+                            .expect("widened child types are published before their parent"),
+                        WidenTransform::ContextualCached { union, source } => *self
+                            .derived_types
+                            .contextual_widened_types
+                            .get(&(union, source))
+                            .expect("contextual child objects are published before their parent"),
+                    };
+                    let original = self
+                        .value_symbol_links(property.source)
+                        .and_then(|links| links.resolved_type)
+                        .expect("the contextual plan authenticated its source property");
+                    let property_symbol = if transformed == original {
+                        property.source
+                    } else {
+                        self.clone_symbol_with_type(property.source, transformed)
+                    };
+                    assert_eq!(
+                        self.insert_symbol(members, property.name, property_symbol),
+                        Some(None)
+                    );
+                    properties.push(property_symbol);
+                }
+
+                for property in undefined_properties {
+                    let property_symbol = self
+                        .derived_types
+                        .undefined_properties
+                        .get(&property.name)
+                        .copied()
+                        .unwrap_or_else(|| {
+                            let symbol = self.clone_undefined_property(property.symbol);
+                            assert_eq!(
+                                self.derived_types
+                                    .undefined_properties
+                                    .insert(property.name.clone(), symbol),
+                                None
+                            );
+                            symbol
+                        });
+                    assert_eq!(
+                        self.insert_symbol(members, property.name, property_symbol),
+                        Some(None)
+                    );
+                    properties.push(property_symbol);
+                }
+
+                let retained = shape.object_flags
+                    & (ObjectFlags::JS_LITERAL | ObjectFlags::NON_INFERRABLE_TYPE);
+                let widened = self
+                    .alloc_plain_object_type(ObjectFlags::ANONYMOUS | retained, Some(shape.symbol))
+                    .expect("the contextual object plan authenticated its owner and flags");
+                assert!(self.set_structured_type_members(
+                    widened,
+                    Some(members),
+                    (!properties.is_empty()).then_some(properties),
+                    None,
+                    None,
+                    None,
+                ));
+                assert_eq!(
+                    self.derived_types
+                        .contextual_widened_types
+                        .insert((union, source), widened),
+                    None
+                );
+                if self.relation_derived_cache_source_is_observable(union)
+                    || self.relation_derived_cache_source_is_observable(source)
+                    || self.relation_derived_cache_target_is_observable(widened)
+                {
+                    self.mark_relation_inputs_dirty();
+                }
+            }
             WidenPlan::Array {
                 source,
                 element,
@@ -856,6 +1198,11 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         .widened_types
                         .get(&source)
                         .expect("widened array elements are published before their parent"),
+                    WidenTransform::ContextualCached { union, source } => *self
+                        .derived_types
+                        .contextual_widened_types
+                        .get(&(union, source))
+                        .expect("contextual array elements are published before their parent"),
                 };
                 let widened = self
                     .create_canonical_array_type(
@@ -887,15 +1234,26 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                             .widened_types
                             .get(&source)
                             .expect("widened union members are published before their parent"),
+                        WidenTransform::ContextualCached { union, source } => *self
+                            .derived_types
+                            .contextual_widened_types
+                            .get(&(union, source))
+                            .expect("contextual union members are published before their parent"),
                     })
                     .collect::<Vec<_>>();
-                let widened = if let Some(global_types) = global_types {
-                    self.expression_union_type_with_global_types(
-                        global_types,
-                        &members,
-                        super::bootstrap::UnionReduction::Literal,
+                let reduction = if members.iter().any(|member| {
+                    matches!(
+                        self.type_payload(*member).map(TypeRecord::data),
+                        Some(TypeData::Object(object)) if object.structured.properties.is_none()
                     )
-                    .expect("preflighted widened union members remain canonical")
+                }) {
+                    super::bootstrap::UnionReduction::Subtype
+                } else {
+                    super::bootstrap::UnionReduction::Literal
+                };
+                let widened = if let Some(global_types) = global_types {
+                    self.expression_union_type_with_global_types(global_types, &members, reduction)
+                        .expect("preflighted widened union members remain canonical")
                 } else {
                     let mut prepared = self
                         .prepare_type_query_types(&[], &[], &[], 1, 0)
@@ -948,6 +1306,229 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             },
         ));
         clone
+    }
+
+    fn clone_undefined_property(&mut self, source: SemanticSymbolId) -> SemanticSymbolId {
+        let undefined = self
+            .intrinsic_bootstrap()
+            .expect("contextual widening requires intrinsic bootstrap")
+            .undefined_or_missing_type;
+        let (data, name_type) = {
+            let source_record = self
+                .symbol(source)
+                .expect("the contextual plan authenticated its donor property");
+            let mut data = SymbolData::new(
+                source_record.flags() | SymbolFlags::OPTIONAL,
+                source_record.name().to_owned(),
+            );
+            data.check_flags = source_record.check_flags() & CheckFlags::READONLY;
+            data.declarations = source_record.declarations().map(<[NodeRef]>::to_vec);
+            data.value_declaration = source_record.value_declaration();
+            data.parent = source_record.parent();
+            let name_type = self
+                .value_symbol_links(source)
+                .and_then(|links| links.name_type);
+            (data, name_type)
+        };
+        let clone = self
+            .alloc_symbol(data)
+            .expect("the contextual plan authenticated optional clone provenance");
+        assert!(self.set_value_symbol_links(
+            clone,
+            ValueSymbolLinks {
+                resolved_type: Some(undefined),
+                target: Some(source),
+                name_type,
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        clone
+    }
+
+    fn contextual_widened_source(&self, target: TypeId) -> Option<(TypeId, TypeId)> {
+        let mut found = None;
+        for (&source, &cached) in &self.derived_types.contextual_widened_types {
+            if cached == target && found.replace(source).is_some() {
+                return None;
+            }
+        }
+        found
+    }
+
+    fn valid_cached_undefined_property(
+        &self,
+        name: &EscapedName,
+        property: SemanticSymbolId,
+    ) -> bool {
+        let Some(bootstrap) = self.intrinsic_bootstrap() else {
+            return false;
+        };
+        if self.derived_types.undefined_properties.get(name) != Some(&property)
+            || self.get_merged_symbol(property) != Some(property)
+        {
+            return false;
+        }
+        let Some(record) = self.symbol(property) else {
+            return false;
+        };
+        let Some(links) = self.value_symbol_links(property) else {
+            return false;
+        };
+        let Some(donor) = links.target else {
+            return false;
+        };
+        let Some(donor_record) = self.symbol(donor) else {
+            return false;
+        };
+        let Some(donor_links) = self.value_symbol_links(donor) else {
+            return false;
+        };
+        let expected_links = ValueSymbolLinks {
+            resolved_type: Some(bootstrap.undefined_or_missing_type),
+            target: Some(donor),
+            name_type: donor_links.name_type,
+            ..ValueSymbolLinks::default()
+        };
+        if record.flags()
+            != (SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT | SymbolFlags::OPTIONAL)
+            || donor_record.flags() != (SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT)
+            || record.check_flags() != donor_record.check_flags() & CheckFlags::READONLY
+            || record.name() != name.as_ref()
+            || record.name() != donor_record.name()
+            || record.declarations() != donor_record.declarations()
+            || record.value_declaration() != donor_record.value_declaration()
+            || record.parent() != donor_record.parent()
+            || record.parent().is_none()
+            || record.members().is_some()
+            || record.exports().is_some()
+            || record.export_symbol().is_some()
+            || links != &expected_links
+            || self.get_merged_symbol(donor) != Some(donor)
+        {
+            return false;
+        }
+
+        self.derived_types
+            .contextual_widened_types
+            .keys()
+            .any(|(union, _)| {
+                let Some(TypeData::Union(members)) =
+                    self.type_payload(*union).map(TypeRecord::data)
+                else {
+                    return false;
+                };
+                members.union.types.iter().any(|member| {
+                    let mut regular_visiting = HashSet::new();
+                    self.validated_widening_object_shape(*member, &mut regular_visiting)
+                        .is_some_and(|shape| {
+                            shape
+                                .properties
+                                .iter()
+                                .any(|candidate| candidate.symbol == donor)
+                        })
+                })
+            })
+    }
+
+    fn contextual_optional_property_is_valid(
+        &self,
+        union: TypeId,
+        source: TypeId,
+        receiver: TypeId,
+        property: SemanticSymbolId,
+    ) -> bool {
+        if self
+            .derived_types
+            .contextual_widened_types
+            .get(&(union, source))
+            != Some(&receiver)
+        {
+            return false;
+        }
+        let Some(record) = self.type_payload(receiver) else {
+            return false;
+        };
+        let Some(owner) = record.symbol() else {
+            return false;
+        };
+        let TypeData::Object(object) = record.data() else {
+            return false;
+        };
+        let Some(property_record) = self.symbol(property) else {
+            return false;
+        };
+        let Some(members) = object.structured.members else {
+            return false;
+        };
+        if property_record.parent() == Some(owner)
+            || self
+                .symbol_table(members)
+                .and_then(|table| table.get(property_record.name()))
+                != Some(property)
+            || object
+                .structured
+                .properties
+                .as_deref()
+                .is_none_or(|properties| !properties.contains(&property))
+        {
+            return false;
+        }
+
+        let name = property_record.name().to_owned();
+        if !self.valid_cached_undefined_property(&name, property) {
+            return false;
+        }
+        let mut regular_visiting = HashSet::new();
+        let Some(shape) = self.validated_widening_object_shape(source, &mut regular_visiting)
+        else {
+            return false;
+        };
+        if shape.symbol != owner
+            || shape
+                .properties
+                .iter()
+                .any(|candidate| candidate.name == name)
+        {
+            return false;
+        }
+        self.contextual_sibling_properties(union)
+            .is_some_and(|properties| properties.iter().any(|candidate| candidate.name == name))
+    }
+
+    fn contextual_sibling_properties(&self, union: TypeId) -> Option<Vec<PropertyShape>> {
+        let TypeData::Union(data) = self.type_payload(union)?.data() else {
+            return None;
+        };
+        let mut properties = Vec::<PropertyShape>::new();
+        let mut names = HashMap::<EscapedName, usize>::new();
+        for member in &data.union.types {
+            let record = self.type_payload(*member)?;
+            if record.flags().intersects(TypeFlags::NULLABLE) {
+                continue;
+            }
+            let mut regular_visiting = HashSet::new();
+            let shape = self.validated_widening_object_shape(*member, &mut regular_visiting)?;
+            for property in shape.properties {
+                let record = self.type_payload(property.type_)?;
+                if record.flags().intersects(TypeFlags::OBJECT)
+                    || record
+                        .object_flags()
+                        .intersects(ObjectFlags::REQUIRES_WIDENING)
+                        && !record
+                            .flags()
+                            .intersects(TypeFlags::ANY | TypeFlags::NULLABLE)
+                {
+                    return None;
+                }
+                if let Some(index) = names.get(&property.name).copied() {
+                    properties[index] = property;
+                } else {
+                    names.insert(property.name.clone(), properties.len());
+                    properties.push(property);
+                }
+            }
+        }
+        Some(properties)
     }
 
     fn is_fresh_object_literal(&self, type_: TypeId) -> bool {
@@ -1149,8 +1730,9 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             let property_record = self.symbol(*property)?;
             let property_type = self.value_symbol_links(*property)?.resolved_type?;
             self.type_payload(property_type)?;
-            if property_record.parent() != Some(symbol)
-                || table.get(property_record.name()) != Some(*property)
+            if table.get(property_record.name()) != Some(*property)
+                || property_record.parent() != Some(symbol)
+                    && !self.validate_contextual_widened_object_property(type_, *property)
             {
                 return None;
             }
@@ -1382,17 +1964,33 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                         .object_flags()
                         .intersects(ObjectFlags::REQUIRES_WIDENING)
                 {
-                    let cached = *self.derived_types.widened_types.get(constituent)?;
-                    if !self.widened_cache_entry_is_valid(
-                        *constituent,
-                        cached,
-                        visiting,
-                        regular_visiting,
-                        array_targets,
-                    ) {
-                        return None;
+                    if record.object_flags().contains(ObjectFlags::OBJECT_LITERAL) {
+                        let cached = *self
+                            .derived_types
+                            .contextual_widened_types
+                            .get(&(source, *constituent))?;
+                        if !self.contextual_object_cache_entry_is_valid(
+                            source,
+                            *constituent,
+                            cached,
+                            array_targets,
+                        ) {
+                            return None;
+                        }
+                        cached
+                    } else {
+                        let cached = *self.derived_types.widened_types.get(constituent)?;
+                        if !self.widened_cache_entry_is_valid(
+                            *constituent,
+                            cached,
+                            visiting,
+                            regular_visiting,
+                            array_targets,
+                        ) {
+                            return None;
+                        }
+                        cached
                     }
-                    cached
                 } else {
                     *constituent
                 };
@@ -1422,6 +2020,115 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         .is_some();
         debug_assert!(visiting.remove(&source));
         valid
+    }
+
+    fn contextual_object_cache_entry_is_valid(
+        &self,
+        union: TypeId,
+        source: TypeId,
+        target: TypeId,
+        array_targets: Option<CanonicalArrayTargets>,
+    ) -> bool {
+        self.observe_relation_derived_cache_source_read(union);
+        self.observe_relation_derived_cache_source_read(source);
+        if self
+            .derived_types
+            .contextual_widened_types
+            .get(&(union, source))
+            != Some(&target)
+        {
+            return false;
+        }
+        let source_valid = match array_targets {
+            Some(targets) => self.validate_union_constituent_with_array_targets(targets, union),
+            None => self.validate_union_constituent(union),
+        };
+        if source_valid.is_err() {
+            return false;
+        }
+        let Some(TypeData::Union(union_data)) = self.type_payload(union).map(TypeRecord::data)
+        else {
+            return false;
+        };
+        if !union_data.union.types.contains(&source) {
+            return false;
+        }
+
+        let mut regular_visiting = HashSet::new();
+        let Some(source_shape) =
+            self.validated_widening_object_shape(source, &mut regular_visiting)
+        else {
+            return false;
+        };
+        let Some(target_shape) = self.resolved_object_shape(target) else {
+            return false;
+        };
+        let Some(context_properties) = self.contextual_sibling_properties(union) else {
+            return false;
+        };
+        let missing_properties = context_properties
+            .iter()
+            .filter(|property| {
+                !source_shape
+                    .properties
+                    .iter()
+                    .any(|source| source.name == property.name)
+            })
+            .collect::<Vec<_>>();
+        let retained = source_shape.object_flags
+            & (ObjectFlags::JS_LITERAL | ObjectFlags::NON_INFERRABLE_TYPE);
+        if source == target
+            || target_shape.flags != TypeFlags::OBJECT
+            || target_shape.object_flags
+                != ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED | retained
+            || target_shape.symbol != source_shape.symbol
+            || target_shape.members == source_shape.members
+            || target_shape.properties.len()
+                != source_shape.properties.len() + missing_properties.len()
+        {
+            return false;
+        }
+
+        for (source_property, target_property) in
+            source_shape.properties.iter().zip(&target_shape.properties)
+        {
+            let Some(property_record) = self.type_payload(source_property.type_) else {
+                return false;
+            };
+            let expected_type = if property_record
+                .object_flags()
+                .intersects(ObjectFlags::REQUIRES_WIDENING)
+            {
+                let Some(bootstrap) = self.intrinsic_bootstrap() else {
+                    return false;
+                };
+                bootstrap.any_type
+            } else {
+                source_property.type_
+            };
+            if target_property.name != source_property.name
+                || target_property.type_ != expected_type
+                || if expected_type == source_property.type_ {
+                    target_property.symbol != source_property.symbol
+                } else {
+                    !self.valid_symbol_clone(
+                        source_property.symbol,
+                        target_property.symbol,
+                        expected_type,
+                    )
+                }
+            {
+                return false;
+            }
+        }
+
+        target_shape.properties[source_shape.properties.len()..]
+            .iter()
+            .zip(missing_properties)
+            .all(|(property, donor)| {
+                property.name == donor.name
+                    && self.validate_contextual_widened_object_property(target, property.symbol)
+            })
     }
 
     fn widened_object_cache_entry_is_valid(
@@ -2144,6 +2851,238 @@ mod tests {
     }
 
     #[test]
+    fn contextual_object_unions_preserve_optional_identity_and_option_sentinels() {
+        for (strict_null_checks, exact_optional_property_types) in
+            [(false, false), (true, false), (true, true)]
+        {
+            let library = parsed("interface Array<T> {}");
+            let source = parsed("var value: any = [{ first: 1 }, { second: 2 }, { third: 3 }];");
+            let library_file = FileId::new(80);
+            let file = FileId::new(81);
+            let files = [(library_file, &library), (file, &source)];
+            let mut context = CanonicalCheckerContext::new(
+                completed_bindings(&files),
+                files
+                    .iter()
+                    .map(|(file, parsed)| (*file, &parsed.arena))
+                    .collect(),
+                CanonicalCheckerOptions {
+                    intrinsic: crate::semantic::IntrinsicBootstrapOptions {
+                        strict_null_checks,
+                        exact_optional_property_types,
+                    },
+                    ..CanonicalCheckerOptions::default()
+                },
+            )
+            .unwrap();
+            context.check_source_file(file).unwrap();
+
+            let value =
+                resolved_expression_type(&context, variable_initializer(&source, file, "value"));
+            let global_types = context.global_types().clone();
+            let source_union = context
+                .store()
+                .canonical_array_element_type(&global_types, value)
+                .unwrap()
+                .unwrap();
+            let source_members = match context.store().type_payload(source_union).unwrap().data() {
+                TypeData::Union(union) => union.union.types.clone(),
+                _ => panic!("three object literals must produce an expression union"),
+            };
+
+            let widened = context
+                .store_mut_for_test()
+                .get_widened_type_with_global_types(value, &global_types)
+                .unwrap();
+            let widened_union = context
+                .store()
+                .canonical_array_element_type(&global_types, widened)
+                .unwrap()
+                .unwrap();
+            let members = match context.store().type_payload(widened_union).unwrap().data() {
+                TypeData::Union(union) => union.union.types.clone(),
+                _ => panic!("widened object literals must remain a canonical union"),
+            };
+            assert_eq!(members.len(), 3);
+            let expected_undefined = context
+                .store()
+                .intrinsic_bootstrap()
+                .unwrap()
+                .undefined_or_missing_type;
+            let mut optional_symbols = HashMap::<EscapedName, SemanticSymbolId>::new();
+            for member in members {
+                let shape = context.store().resolved_object_shape(member).unwrap();
+                assert_eq!(shape.properties.len(), 3);
+                assert!(
+                    context
+                        .store()
+                        .symbol(shape.properties[0].symbol)
+                        .is_some_and(|record| !record.flags().contains(SymbolFlags::OPTIONAL))
+                );
+                for property in &shape.properties[1..] {
+                    let record = context.store().symbol(property.symbol).unwrap();
+                    let links = context.store().value_symbol_links(property.symbol).unwrap();
+                    let donor = context.store().symbol(links.target.unwrap()).unwrap();
+                    assert!(record.flags().contains(SymbolFlags::OPTIONAL));
+                    assert_eq!(property.type_, expected_undefined);
+                    assert_eq!(record.parent(), donor.parent());
+                    assert_ne!(record.parent(), Some(shape.symbol));
+                    assert!(
+                        context
+                            .store()
+                            .validate_contextual_widened_object_property(member, property.symbol)
+                    );
+                    match optional_symbols.get(&property.name) {
+                        Some(previous) => assert_eq!(*previous, property.symbol),
+                        None => {
+                            optional_symbols.insert(property.name.clone(), property.symbol);
+                        }
+                    }
+                }
+            }
+            assert_eq!(optional_symbols.len(), 3);
+            assert!(source_members.iter().all(|source| {
+                !context
+                    .store()
+                    .derived_types
+                    .widened_types
+                    .contains_key(source)
+            }));
+
+            let warm = (
+                observable_state(context.store()),
+                context.store().derived_types.contextual_widened_types.len(),
+                context.store().derived_types.undefined_properties.len(),
+            );
+            assert_eq!(
+                context
+                    .store_mut_for_test()
+                    .get_widened_type_with_global_types(value, &global_types),
+                Ok(widened),
+            );
+            assert_eq!(
+                (
+                    observable_state(context.store()),
+                    context.store().derived_types.contextual_widened_types.len(),
+                    context.store().derived_types.undefined_properties.len(),
+                ),
+                warm,
+            );
+
+            let name = EscapedName::source("first");
+            let optional = optional_symbols[&name];
+            let donor = context
+                .store()
+                .value_symbol_links(optional)
+                .and_then(|links| links.target)
+                .unwrap();
+            assert_eq!(
+                context
+                    .store_mut_for_test()
+                    .derived_types
+                    .undefined_properties
+                    .insert(name.clone(), donor),
+                Some(optional),
+            );
+            assert_eq!(
+                context
+                    .store_mut_for_test()
+                    .get_widened_type_with_global_types(value, &global_types),
+                Err(DerivedTypeError::InvalidWidenedTypeCache {
+                    source: value,
+                    cached: widened,
+                }),
+            );
+            assert_eq!(
+                context
+                    .store_mut_for_test()
+                    .derived_types
+                    .undefined_properties
+                    .insert(name, optional),
+                Some(donor),
+            );
+            assert_eq!(
+                context
+                    .store_mut_for_test()
+                    .get_widened_type_with_global_types(value, &global_types),
+                Ok(widened),
+            );
+
+            let ordinary = context
+                .store_mut_for_test()
+                .get_widened_type_with_global_types(source_members[0], &global_types)
+                .unwrap();
+            assert_eq!(
+                context
+                    .store()
+                    .resolved_object_shape(ordinary)
+                    .unwrap()
+                    .properties
+                    .len(),
+                1,
+            );
+        }
+    }
+
+    #[test]
+    fn contextual_object_unions_reject_nested_objects_before_publication() {
+        let library = parsed("interface Array<T> {}");
+        let source = parsed("var value: any = [{ nested: { id: 1 } }, {}];");
+        let library_file = FileId::new(82);
+        let file = FileId::new(83);
+        let mut context = checker_context(&[(library_file, &library), (file, &source)]);
+        context.check_source_file(file).unwrap();
+
+        let value =
+            resolved_expression_type(&context, variable_initializer(&source, file, "value"));
+        let global_types = context.global_types().clone();
+        let union = context
+            .store()
+            .canonical_array_element_type(&global_types, value)
+            .unwrap()
+            .unwrap();
+        let nested = match context.store().type_payload(union).unwrap().data() {
+            TypeData::Union(union) => union
+                .union
+                .types
+                .iter()
+                .find_map(|member| {
+                    context
+                        .store()
+                        .fresh_object_shape(*member)
+                        .and_then(|shape| {
+                            shape
+                                .properties
+                                .into_iter()
+                                .find(|property| property.name.as_utf8() == Some("nested"))
+                        })
+                        .map(|property| property.type_)
+                })
+                .unwrap(),
+            _ => panic!("nested and empty object literals must form an expression union"),
+        };
+        let before = (
+            observable_state(context.store()),
+            context.store().derived_types.contextual_widened_types.len(),
+            context.store().derived_types.undefined_properties.len(),
+        );
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .get_widened_type_with_global_types(value, &global_types),
+            Err(DerivedTypeError::UnsupportedWideningType(nested)),
+        );
+        assert_eq!(
+            (
+                observable_state(context.store()),
+                context.store().derived_types.contextual_widened_types.len(),
+                context.store().derived_types.undefined_properties.len(),
+            ),
+            before,
+        );
+    }
+
+    #[test]
     fn canonical_array_widening_is_recursive_cached_and_fail_closed() {
         let library = parsed("interface Array<T> {}");
         let source = parsed(concat!(
@@ -2313,14 +3252,65 @@ mod tests {
                 .object_flags()
                 .intersects(ObjectFlags::REQUIRES_WIDENING)
         );
-        let union_boundary_state = observable_state(context.store());
+        let source_constituents = match context.store().type_payload(union_element).unwrap().data()
+        {
+            TypeData::Union(data) => data.union.types.clone(),
+            _ => unreachable!("the array element was authenticated as a union"),
+        };
+        let widened_union = context
+            .store_mut_for_test()
+            .get_widened_type_with_global_types(union, &global_types)
+            .unwrap();
+        let widened_union_element = context
+            .store()
+            .canonical_array_element_type(&global_types, widened_union)
+            .unwrap()
+            .unwrap();
+        let TypeData::Union(widened_constituents) = context
+            .store()
+            .type_payload(widened_union_element)
+            .unwrap()
+            .data()
+        else {
+            panic!("flat object literals must remain a canonical widened union");
+        };
+        assert_eq!(widened_constituents.union.types.len(), 2);
+        for constituent in &widened_constituents.union.types {
+            let shape = context.store().resolved_object_shape(*constituent).unwrap();
+            assert_eq!(shape.properties.len(), 2);
+            let optional = shape
+                .properties
+                .iter()
+                .find(|property| {
+                    context
+                        .store()
+                        .symbol(property.symbol)
+                        .unwrap()
+                        .flags()
+                        .contains(SymbolFlags::OPTIONAL)
+                })
+                .unwrap();
+            assert!(
+                context
+                    .store()
+                    .validate_contextual_widened_object_property(*constituent, optional.symbol)
+            );
+        }
+        assert!(source_constituents.iter().all(|source| {
+            !context
+                .store()
+                .derived_types
+                .widened_types
+                .contains_key(source)
+        }));
+        let warm_union = observable_state(context.store());
         assert_eq!(
             context
                 .store_mut_for_test()
                 .get_widened_type_with_global_types(union, &global_types),
-            Err(DerivedTypeError::UnsupportedWideningType(union_element)),
+            Ok(widened_union),
         );
-        assert_eq!(observable_state(context.store()), union_boundary_state);
+        assert_eq!(observable_state(context.store()), warm_union);
 
         let recursive = {
             let store = context.store_mut_for_test();

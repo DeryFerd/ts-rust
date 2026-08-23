@@ -3619,11 +3619,12 @@ fn append_structural_property(
         result.push('?');
     }
     result.push_str(": ");
-    result.push_str(&display_type_worker(
+    result.push_str(&display_property_type(
         store,
         host,
         global_types,
         *property_type,
+        *optional,
         flags,
         state,
         visiting,
@@ -3633,6 +3634,89 @@ fn append_structural_property(
     }
     result.push_str("; ");
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn display_property_type(
+    store: &CanonicalTypeMapperStore,
+    host: Option<&DeclaredTypeHost<'_>>,
+    global_types: Option<&CanonicalGlobalTypes>,
+    property_type: TypeId,
+    optional: bool,
+    flags: CanonicalTypeFormatFlags,
+    state: &mut DisplayState,
+    visiting: &mut HashSet<TypeId>,
+) -> Result<String, TypeDisplayUnavailable> {
+    if optional
+        && let Some(bootstrap) = store.intrinsic_bootstrap()
+        && bootstrap.options.exact_optional_property_types
+    {
+        if property_type == bootstrap.missing_type {
+            return display_type_worker(
+                store,
+                host,
+                global_types,
+                bootstrap.never_type,
+                flags,
+                state,
+                visiting,
+            );
+        }
+
+        if let Some(TypeData::Union(union)) =
+            store.type_payload(property_type).map(TypeRecord::data)
+            && union.union.types.contains(&bootstrap.missing_type)
+        {
+            ensure_acyclic_union_graph(store, property_type)?;
+            validate_display_union(store, global_types, property_type)?;
+            let constituents = union
+                .union
+                .types
+                .iter()
+                .copied()
+                .filter(|constituent| *constituent != bootstrap.missing_type)
+                .collect::<Vec<_>>();
+            if constituents.is_empty() {
+                return display_type_worker(
+                    store,
+                    host,
+                    global_types,
+                    bootstrap.never_type,
+                    flags,
+                    state,
+                    visiting,
+                );
+            }
+            if !visiting.insert(property_type) {
+                return Err(TypeDisplayUnavailable::CyclicType(property_type));
+            }
+            let result =
+                format_union_types(store, property_type, &constituents).and_then(|types| {
+                    display_union_list(
+                        store,
+                        host,
+                        global_types,
+                        property_type,
+                        &types,
+                        flags,
+                        state,
+                        visiting,
+                    )
+                });
+            visiting.remove(&property_type);
+            return result;
+        }
+    }
+
+    display_type_worker(
+        store,
+        host,
+        global_types,
+        property_type,
+        flags,
+        state,
+        visiting,
+    )
 }
 
 fn validate_structured_member_table(
@@ -3731,8 +3815,11 @@ fn validated_property(
                 && record.check_flags().bits() & !CheckFlags::READONLY.bits() == 0
         }
         StructuralObjectProof::ObjectLiteral => {
-            record.flags() == (SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT)
-                && record.check_flags() == CheckFlags::NONE
+            record.check_flags() == CheckFlags::NONE
+                && (record.flags() == (SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT)
+                    || record.flags()
+                        == (SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT | SymbolFlags::OPTIONAL)
+                        && store.validate_contextual_widened_object_property(type_id, property))
         }
         StructuralObjectProof::ConstObjectLiteral => {
             record.flags() == (SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT)
@@ -6836,6 +6923,49 @@ mod tests {
             .unwrap(),
             full,
         );
+    }
+
+    #[test]
+    fn exact_optional_property_display_removes_only_the_missing_sentinel() {
+        let mut store = CanonicalTypeMapperStore::default();
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                exact_optional_property_types: true,
+            })
+            .unwrap();
+        let (missing, undefined, string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.missing_type,
+                bootstrap.undefined_type,
+                bootstrap.string_type,
+                bootstrap.number_type,
+            )
+        };
+        let missing_union = canonical_union(&mut store, &[missing, string, number]);
+        let explicit_undefined = canonical_union(&mut store, &[undefined, string]);
+        let properties = [
+            ("absent", missing, true),
+            ("mixed", missing_union, true),
+            ("explicit", explicit_undefined, true),
+            ("required", missing, false),
+        ]
+        .into_iter()
+        .map(|(name, type_, optional)| {
+            alloc_typed_property(&mut store, name, type_, optional, false)
+        })
+        .collect();
+        let object = alloc_structural_object(&mut store, properties);
+        let before = (store.type_len(), store.symbol_len());
+        let expected = concat!(
+            "{ absent?: never; mixed?: string | number; ",
+            "explicit?: string | undefined; required: undefined; }",
+        );
+
+        assert_eq!(type_to_string(&store, object).unwrap(), expected);
+        assert_eq!(type_to_string(&store, object).unwrap(), expected);
+        assert_eq!((store.type_len(), store.symbol_len()), before);
     }
 
     #[test]

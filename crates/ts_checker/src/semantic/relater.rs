@@ -384,7 +384,10 @@ enum ObjectPropertyOrigin {
     GenericReference(TypeId),
     Intersection(TypeId),
     FreshObjectLiteral(SemanticSymbolId),
-    DerivedObjectLiteral(SemanticSymbolId),
+    DerivedObjectLiteral {
+        owner: SemanticSymbolId,
+        receiver: TypeId,
+    },
 }
 
 impl ObjectPropertyOrigin {
@@ -3309,11 +3312,18 @@ impl<'store> RelaterSession<'store> {
                     Err(RelationUnavailable::UnsupportedProperty(symbol))
                 };
             }
-            ObjectPropertyOrigin::DerivedObjectLiteral(owner) => {
+            ObjectPropertyOrigin::DerivedObjectLiteral { owner, receiver } => {
                 // The object-wide warm-cache validator established the full
-                // clone/reuse chain before this marker was constructed.
-                return if record.parent() == Some(owner)
-                    && self.store.get_merged_symbol(symbol) == Some(symbol)
+                // clone/reuse chain before this marker was constructed. A
+                // contextual widened union can also borrow an authenticated
+                // optional property from a sibling object's owner.
+                return if self.store.get_merged_symbol(symbol) == Some(symbol)
+                    && (record.parent() == Some(owner)
+                        || record.parent().is_some()
+                            && record.flags().contains(SymbolFlags::OPTIONAL)
+                            && self
+                                .store
+                                .validate_contextual_widened_object_property(receiver, symbol))
                 {
                     Ok(record)
                 } else {
@@ -3419,7 +3429,7 @@ impl<'store> RelaterSession<'store> {
                     SymbolFlags::INTERFACE | SymbolFlags::TYPE_LITERAL
                 }
                 ObjectPropertyOrigin::FreshObjectLiteral(_)
-                | ObjectPropertyOrigin::DerivedObjectLiteral(_)
+                | ObjectPropertyOrigin::DerivedObjectLiteral { .. }
                 | ObjectPropertyOrigin::Intersection(_) => {
                     unreachable!("literal property origins return before declared validation")
                 }
@@ -4233,7 +4243,10 @@ impl<'store> RelaterSession<'store> {
             .ok_or(RelationUnavailable::Type(type_id))?;
         let mut property_origin = match self.validate_derived_object_literal(type_id) {
             DerivedObjectLiteralValidation::Valid { owner, .. } => {
-                ObjectPropertyOrigin::DerivedObjectLiteral(owner)
+                ObjectPropertyOrigin::DerivedObjectLiteral {
+                    owner,
+                    receiver: type_id,
+                }
             }
             DerivedObjectLiteralValidation::Invalid => {
                 return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
