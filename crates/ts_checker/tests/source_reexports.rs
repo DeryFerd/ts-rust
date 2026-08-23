@@ -289,6 +289,78 @@ fn repeated_namespace_imports_reuse_one_module_identity() {
 }
 
 #[test]
+fn local_enum_exports_follow_the_original_symbol_across_files() {
+    let base = parse_source_file("const enum State { Ready }; export { State };");
+    let barrel = parse_source_file("import { State } from './base'; export { State };");
+    let base_file = FileId::new(92);
+    let barrel_file = FileId::new(93);
+    let sources = [
+        Source {
+            parsed: &base,
+            file: base_file,
+            path: "\"/project/base.ts\"",
+        },
+        Source {
+            parsed: &barrel,
+            file: barrel_file,
+            path: "\"/project/barrel.ts\"",
+        },
+    ];
+    let mut context = make_context(
+        &sources,
+        &[Route {
+            source: 1,
+            specifier: 0,
+            target: 0,
+        }],
+    );
+    let base_export = bound_symbol(&context, named_reexport_binding(&base, base_file, "State"));
+    let import = bound_symbol(
+        &context,
+        named_import_binding(&barrel, barrel_file, "State"),
+    );
+    let barrel_export = bound_symbol(
+        &context,
+        named_reexport_binding(&barrel, barrel_file, "State"),
+    );
+
+    context.check_source_file(base_file).unwrap();
+    context.check_source_file(barrel_file).unwrap();
+
+    assert!(context.diagnostics().is_empty());
+    assert!(source_is_checked(&context, base_file));
+    assert!(source_is_checked(&context, barrel_file));
+    let target = match context
+        .store()
+        .alias_symbol_links(base_export)
+        .unwrap()
+        .alias_target
+    {
+        AliasTargetState::Resolved(target) => target,
+        other => panic!("expected an enum export alias, got {other:?}"),
+    };
+    assert_alias_chain(&context, base_export, target, target, None);
+    assert_alias_chain(&context, import, base_export, target, None);
+    assert_alias_chain(&context, barrel_export, import, target, None);
+
+    let warm = (
+        context.store().type_len(),
+        context.store().symbol_len(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(base_file).unwrap();
+    context.recheck_source_file(barrel_file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
+}
+
+#[test]
 #[allow(clippy::too_many_lines)]
 fn two_hop_renamed_value_and_function_reexports_are_exact_and_warm_stable() {
     let consumer = parse_source_file(concat!(

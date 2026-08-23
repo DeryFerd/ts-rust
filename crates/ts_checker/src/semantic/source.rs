@@ -36,7 +36,8 @@ use std::collections::{HashMap, HashSet};
 
 use ts_ast::{FileId, ModifierList, Node, NodeArena, NodeData, NodeId, NodeRef, SyntaxKind};
 use ts_binder::{
-    BoundFile, CanonicalNameResolver, CanonicalResolutionLocation, SemanticSymbolId, SymbolFlags,
+    BoundFile, CanonicalNameResolver, CanonicalResolutionLocation, CheckFlags, SemanticSymbolId,
+    SymbolFlags,
 };
 use ts_core::TextRange;
 use ts_diagnostics::{Diagnostic, message_by_code};
@@ -118,7 +119,8 @@ use super::{
     source_imports::{
         PlannedSourceImportRead, PreparedSourceImportPublication, PreparedSourceImportValue,
         ResolvedSourceImportBinding, ResolvedSourceTypeImportBinding, SourceImportBindingPlan,
-        SourceImportError, SourceImportPlan, SourceImportUnsupported, SourceNamedReexportPlan,
+        SourceImportError, SourceImportPlan, SourceImportUnsupported,
+        SourceNamedReexportBindingPlan, SourceNamedReexportPlan,
         plan_source_import_identifier_read, plan_source_type_import_reference,
         plan_top_level_import_equals, plan_top_level_named_reexport,
         plan_top_level_named_type_import, plan_top_level_named_value_import,
@@ -1009,6 +1011,7 @@ enum PlannedStatement {
     Class(ClassMemberQueryPlan),
     Enum(SourceEnumPlan),
     ExternalModuleMarker,
+    LocalNamedExport,
     NamedReexport,
     InvalidModuleSpecifier(NodeRef),
     AmbientVariables(Vec<NodeRef>),
@@ -1033,10 +1036,18 @@ enum PlannedStatement {
 }
 
 #[derive(Debug)]
+struct PlannedLocalNamedExport {
+    clause: NodeRef,
+    local_symbol: SemanticSymbolId,
+    binding: SourceNamedReexportBindingPlan,
+}
+
+#[derive(Debug)]
 struct SourceCheckPlan {
     statements: Vec<PlannedStatement>,
     value_imports: Vec<SourceImportPlan>,
     type_imports: Vec<SourceImportPlan>,
+    local_named_exports: Vec<PlannedLocalNamedExport>,
     named_reexports: Vec<SourceNamedReexportPlan>,
     import_reads: Vec<PlannedSourceImportRead>,
     type_import_references: Vec<PlannedSourceTypeImportReference>,
@@ -1370,6 +1381,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
 
         let mut statements = Vec::with_capacity(source_statements.len());
+        let mut local_named_exports = Vec::new();
         let mut named_reexports = Vec::new();
         let mut ambient_variables = Vec::new();
         let mut functions = Vec::with_capacity(preplanned_functions.len());
@@ -1710,8 +1722,10 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                                 .map_err(|error| Self::import_plan_error(statement, &error))?;
                         named_reexports.push(reexport);
                         statements.push(PlannedStatement::NamedReexport);
+                    } else if let Some(export) = self.plan_external_module_marker(statement)? {
+                        local_named_exports.push(export);
+                        statements.push(PlannedStatement::LocalNamedExport);
                     } else {
-                        self.plan_external_module_marker(statement)?;
                         statements.push(PlannedStatement::ExternalModuleMarker);
                     }
                 }
@@ -2001,6 +2015,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             statements,
             value_imports,
             type_imports,
+            local_named_exports,
             named_reexports,
             import_reads: self.import_reads,
             type_import_references: self.type_import_references,
@@ -4298,7 +4313,10 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
     }
 
-    fn plan_external_module_marker(&self, statement: NodeRef) -> Result<(), SourceCheckError> {
+    fn plan_external_module_marker(
+        &self,
+        statement: NodeRef,
+    ) -> Result<Option<PlannedLocalNamedExport>, SourceCheckError> {
         let statement_node = self.node(statement)?;
         let NodeData::ExportDeclaration(export) = &statement_node.data else {
             return Err(SourceCheckError::Provenance(
@@ -4342,13 +4360,153 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             || clause_node.flags.0 != 0
             || clause_node.parent != Some(statement.node)
             || exports.elements.range != clause_node.range
-            || !exports.elements.nodes.is_empty()
             || exports.elements.has_trailing_comma
             || exports.facts != 0
         {
             return Err(self.unsupported(clause, clause_node.kind, SourceSyntaxRole::ExportClause));
         }
-        Ok(())
+        if exports.elements.nodes.is_empty() {
+            return Ok(None);
+        }
+
+        let &[binding_node] = exports.elements.nodes.as_slice() else {
+            return Err(self.unsupported(clause, clause_node.kind, SourceSyntaxRole::ExportClause));
+        };
+        let binding = self.reference(binding_node);
+        let binding_record = self.node(binding)?;
+        let NodeData::ExportSpecifier(specifier) = &binding_record.data else {
+            return Err(self.unsupported(clause, clause_node.kind, SourceSyntaxRole::ExportClause));
+        };
+        if binding_record.kind != SyntaxKind::ExportSpecifier
+            || binding_record.flags.0 != 0
+            || binding_record.parent != Some(clause.node)
+            || binding_record.range.start < clause_node.range.start
+            || binding_record.range.end > clause_node.range.end
+            || specifier.property_name.is_some()
+            || specifier.is_type_only
+            || specifier.local_symbol.is_some()
+            || specifier.symbol.is_some()
+            || specifier.facts != 0
+        {
+            return Err(self.unsupported(clause, clause_node.kind, SourceSyntaxRole::ExportClause));
+        }
+
+        let name = self.reference(specifier.name);
+        let name_record = self.node(name)?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Err(self.unsupported(clause, clause_node.kind, SourceSyntaxRole::ExportClause));
+        };
+        if name_record.kind != SyntaxKind::Identifier
+            || name_record.flags.0 != 0
+            || name_record.parent != Some(binding.node)
+            || name_record.range.start < binding_record.range.start
+            || name_record.range.end > binding_record.range.end
+            || identifier.flow_node.is_some()
+            || identifier.text.is_empty()
+        {
+            return Err(self.unsupported(clause, clause_node.kind, SourceSyntaxRole::ExportClause));
+        }
+
+        let Some((store, _)) = self.semantic else {
+            return Err(self.unsupported(clause, clause_node.kind, SourceSyntaxRole::ExportClause));
+        };
+        if !store.contains_node_ref(clause)
+            || !store.contains_node_ref(binding)
+            || !store.contains_node_ref(name)
+        {
+            return Err(SourceCheckError::Import(binding));
+        }
+        let Some(local_symbol) = self
+            .bound
+            .locals(self.source.node_ref())
+            .and_then(|locals| store.symbol_table(locals))
+            .and_then(|locals| locals.get_source(&identifier.text))
+        else {
+            return Err(self.unsupported(clause, clause_node.kind, SourceSyntaxRole::ExportClause));
+        };
+        let local_symbol = store
+            .get_merged_symbol(local_symbol)
+            .ok_or(SourceCheckError::Import(binding))?;
+        let local_record = store
+            .symbol(local_symbol)
+            .ok_or(SourceCheckError::Import(binding))?;
+        let is_prior_enum = self.prior_enums.contains(&local_symbol)
+            && matches!(
+                local_record.flags(),
+                SymbolFlags::CONST_ENUM | SymbolFlags::REGULAR_ENUM
+            );
+        let is_prior_named_value_import = self
+            .value_import_bindings
+            .get(&local_symbol)
+            .is_some_and(|import| {
+                local_record.flags() == SymbolFlags::ALIAS
+                    && import.local_text == identifier.text
+                    && import.imported_text == identifier.text
+                    && self.node(import.declaration).is_ok_and(|declaration| {
+                        declaration.kind == SyntaxKind::ImportSpecifier
+                            && declaration.range.end <= statement_node.range.start
+                    })
+            });
+        if !is_prior_enum && !is_prior_named_value_import {
+            return Err(self.unsupported(clause, clause_node.kind, SourceSyntaxRole::ExportClause));
+        }
+
+        let alias = self
+            .bound
+            .symbol(binding)
+            .ok_or(SourceCheckError::Import(binding))?;
+        let module = self
+            .bound
+            .symbol(self.source.node_ref())
+            .ok_or(SourceCheckError::Import(binding))?;
+        let module_record = store
+            .symbol(module)
+            .ok_or(SourceCheckError::Import(binding))?;
+        let alias_record = store
+            .symbol(alias)
+            .ok_or(SourceCheckError::Import(binding))?;
+        if module_record
+            .exports()
+            .and_then(|exports| store.symbol_table(exports))
+            .and_then(|exports| exports.get_source(&identifier.text))
+            != Some(alias)
+            || alias_record.flags() != SymbolFlags::ALIAS
+            || alias_record.check_flags() != CheckFlags::NONE
+            || alias_record.declarations() != Some(&[binding])
+            || alias_record.value_declaration().is_some()
+            || alias_record.members().is_some()
+            || alias_record.exports().is_some()
+            || alias_record.parent() != Some(module)
+            || alias_record.export_symbol().is_some()
+            || alias_record.name().as_bytes() != identifier.text.as_bytes()
+            || store.get_merged_symbol(alias) != Some(alias)
+            || store.alias_symbol_links(alias).is_some_and(|links| {
+                links
+                    .immediate_target
+                    .is_some_and(|target| target != local_symbol)
+                    || links.type_only_declaration.is_some()
+                    || links
+                        .alias_target
+                        .symbol()
+                        .is_some_and(|target| store.symbol(target).is_none())
+            })
+        {
+            return Err(SourceCheckError::Import(binding));
+        }
+
+        Ok(Some(PlannedLocalNamedExport {
+            clause,
+            local_symbol,
+            binding: SourceNamedReexportBindingPlan {
+                declaration: binding,
+                imported_name: name,
+                exported_name: name,
+                imported_text: identifier.text.clone(),
+                exported_text: identifier.text.clone(),
+                alias_symbol: alias,
+                syntactic_type_only: false,
+            },
+        }))
     }
 
     fn preplan_ambient_variable_statement(
@@ -12505,6 +12663,7 @@ pub(super) fn check_source_file(
         statements,
         value_imports,
         type_imports,
+        local_named_exports,
         named_reexports,
         import_reads,
         type_import_references,
@@ -12572,10 +12731,41 @@ pub(super) fn check_source_file(
             }
         }
     }
+    for export in &local_named_exports {
+        if !reexport_aliases.insert(export.binding.alias_symbol) {
+            return Err(SourceCheckError::Import(export.binding.declaration));
+        }
+    }
     for reexport in &named_reexports {
         for binding in &reexport.bindings {
             resolve_source_named_reexport_binding(store, alias_host, binding)
                 .map_err(|error| SourcePlanner::import_plan_error(binding.declaration, &error))?;
+        }
+    }
+    for export in &local_named_exports {
+        let resolved = resolve_source_named_reexport_binding(store, alias_host, &export.binding)
+            .map_err(|error| {
+                SourcePlanner::import_plan_error(export.binding.declaration, &error)
+            })?;
+        if resolved.immediate_target_symbol != export.local_symbol
+            || !store.symbol(resolved.target_symbol).is_some_and(|target| {
+                matches!(
+                    target.flags(),
+                    SymbolFlags::CONST_ENUM | SymbolFlags::REGULAR_ENUM
+                )
+            })
+            || (store
+                .symbol(export.local_symbol)
+                .is_some_and(|local| local.flags() != SymbolFlags::ALIAS)
+                && resolved.target_symbol != export.local_symbol)
+        {
+            return Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Syntax {
+                    node: export.clause,
+                    kind: SyntaxKind::NamedExports,
+                    role: SourceSyntaxRole::ExportClause,
+                },
+            ));
         }
     }
 
@@ -13395,6 +13585,7 @@ pub(super) fn check_source_file(
                 }
             }
             PlannedStatement::ExternalModuleMarker
+            | PlannedStatement::LocalNamedExport
             | PlannedStatement::NamedReexport
             | PlannedStatement::AmbientOverload => {}
             PlannedStatement::AmbientVariables(initializers) => {
