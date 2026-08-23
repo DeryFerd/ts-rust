@@ -1,4 +1,4 @@
-//! Exact semantic kernel for one ordinary, direct call expression.
+//! Exact semantic kernel for direct calls and authenticated tagged templates.
 //!
 //! This is the dependency-closed fixed-signature branch of pinned
 //! typescript-go `checkCallExpression`, `resolveCallExpression`, `resolveCall`,
@@ -8,6 +8,8 @@
 //! signatures, selects the first applicable fixed-arity candidate, and
 //! projects its resolved return type. It never substitutes `any` for an
 //! unsupported or malformed call.
+
+use ts_binder::SymbolFlags;
 
 use super::{
     CanonicalGlobalTypes, CanonicalTypeMapperStore, RelationUnavailable, SignatureId, TypeId,
@@ -24,7 +26,7 @@ pub(super) enum DirectCallForm {
     Call,
     #[allow(dead_code)] // Retained as an explicit typed rejection seam.
     New,
-    #[allow(dead_code)] // Retained as an explicit typed rejection seam.
+    #[allow(dead_code)] // Source syntax integration is staged separately.
     TaggedTemplate,
 }
 
@@ -207,6 +209,7 @@ pub(super) fn resolve_direct_call(
         return Err(DirectCallInvariant::InvalidCalleeType(request.callee).into());
     }
     validate_argument_types(store, request.arguments)?;
+    validate_tagged_template_argument(store, request)?;
 
     let projection = match validate_stored_callable_set(store, request.callee) {
         StoredCallableSetValidation::NotCallable => {
@@ -302,7 +305,11 @@ fn choose_applicable_overload(
 }
 
 fn validate_direct_call_form(request: DirectCallRequest<'_>) -> Result<(), DirectCallError> {
-    if request.form != DirectCallForm::Call {
+    if !matches!(
+        request.form,
+        DirectCallForm::Call | DirectCallForm::TaggedTemplate
+    ) || request.form == DirectCallForm::TaggedTemplate && request.arguments.is_empty()
+    {
         return Err(DirectCallUnsupported::Form(request.form).into());
     }
     if request.optional_chain {
@@ -316,6 +323,41 @@ fn validate_direct_call_form(request: DirectCallRequest<'_>) -> Result<(), Direc
     }
     if request.has_spread_argument {
         return Err(DirectCallUnsupported::SpreadArgument.into());
+    }
+    Ok(())
+}
+
+fn validate_tagged_template_argument(
+    store: &CanonicalTypeMapperStore,
+    request: DirectCallRequest<'_>,
+) -> Result<(), DirectCallError> {
+    if request.form != DirectCallForm::TaggedTemplate {
+        return Ok(());
+    }
+
+    let expected = store
+        .intrinsic_bootstrap()
+        .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+        .and_then(|globals| globals.get_source("TemplateStringsArray"))
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .filter(|symbol| {
+            store
+                .symbol(*symbol)
+                .is_some_and(|record| record.flags().contains(SymbolFlags::INTERFACE))
+        })
+        .and_then(|symbol| {
+            let type_ = store.declared_type_links(symbol)?.declared_type?;
+            let record = store.type_payload(type_)?;
+            (matches!(record.data(), TypeData::Interface(_))
+                && record
+                    .symbol()
+                    .and_then(|owner| store.get_merged_symbol(owner))
+                    == Some(symbol))
+            .then_some(type_)
+        });
+
+    if expected.is_none() || request.arguments.first().copied() != expected {
+        return Err(DirectCallUnsupported::Form(DirectCallForm::TaggedTemplate).into());
     }
     Ok(())
 }
@@ -391,6 +433,12 @@ fn project_validated_direct_call(
             maximum: maximum_argument_count,
         }
         .into());
+    }
+    if request.form == DirectCallForm::TaggedTemplate
+        && (callable.min_argument_count == 0
+            || callable.parameters.first() != request.arguments.first())
+    {
+        return Err(DirectCallUnsupported::Form(DirectCallForm::TaggedTemplate).into());
     }
     for (index, parameter) in callable.parameters.iter().copied().enumerate() {
         if store.type_payload(parameter).is_none() {
@@ -593,7 +641,8 @@ mod tests {
 
     use super::*;
     use crate::semantic::{
-        IntrinsicBootstrapOptions, SemanticStore, TypeRecord, mapper::TypeMapper,
+        DeclaredTypeLinks, IntrinsicBootstrapOptions, SemanticStore, TypeRecord,
+        mapper::TypeMapper, types::ObjectFlags,
     };
 
     fn initialized_store() -> CanonicalTypeMapperStore {
@@ -611,6 +660,31 @@ mod tests {
                 EscapedName::source(name),
             ))
             .unwrap()
+    }
+
+    fn template_strings_array(store: &mut CanonicalTypeMapperStore) -> TypeId {
+        let symbol = store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::INTERFACE,
+                EscapedName::source("TemplateStringsArray"),
+            ))
+            .unwrap();
+        let type_ = store
+            .alloc_interface_type(ObjectFlags::INTERFACE, Some(symbol))
+            .unwrap();
+        let globals = store.intrinsic_bootstrap().unwrap().globals;
+        assert_eq!(
+            store.insert_symbol(globals, EscapedName::source("TemplateStringsArray"), symbol),
+            Some(None)
+        );
+        assert!(store.set_declared_type_links(
+            symbol,
+            DeclaredTypeLinks {
+                declared_type: Some(type_),
+                ..DeclaredTypeLinks::default()
+            },
+        ));
+        type_
     }
 
     fn callable(
@@ -680,13 +754,6 @@ mod tests {
             ),
             (
                 DirectCallRequest {
-                    form: DirectCallForm::TaggedTemplate,
-                    ..request(callee, &[])
-                },
-                DirectCallUnsupported::Form(DirectCallForm::TaggedTemplate),
-            ),
-            (
-                DirectCallRequest {
                     optional_chain: true,
                     ..request(callee, &[])
                 },
@@ -712,6 +779,146 @@ mod tests {
                 Err(DirectCallError::Unsupported(expected))
             );
         }
+    }
+
+    #[test]
+    fn tagged_templates_authenticate_the_global_first_argument_and_signature() {
+        let mut store = initialized_store();
+        let template = template_strings_array(&mut store);
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let number = bootstrap.number_type;
+        let string = bootstrap.string_type;
+        let callable = callable(
+            &mut store,
+            SignatureFlags::NONE,
+            &[template, number],
+            1,
+            Some(string),
+        );
+        let arguments = [template, number];
+        let tagged = DirectCallRequest {
+            form: DirectCallForm::TaggedTemplate,
+            ..request(callable.owner, &arguments)
+        };
+
+        assert_eq!(validate_direct_call_form(tagged), Ok(()));
+        assert_eq!(validate_tagged_template_argument(&store, tagged), Ok(()));
+
+        let resolution = project_validated_direct_call(&store, None, tagged, &callable).unwrap();
+        assert_eq!(
+            resolution.applicability,
+            DirectCallApplicability::Applicable
+        );
+        assert_eq!(resolution.projection.signature, callable.signature);
+        assert_eq!(resolution.projection.return_type, string);
+        assert_eq!(
+            resolution.projection.argument_targets,
+            vec![
+                DirectCallArgumentTarget {
+                    index: 0,
+                    argument_type: template,
+                    parameter_type: template,
+                },
+                DirectCallArgumentTarget {
+                    index: 1,
+                    argument_type: number,
+                    parameter_type: number,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn tagged_templates_reject_missing_or_forged_template_arguments() {
+        let mut store = initialized_store();
+        let callee = store.intrinsic_bootstrap().unwrap().any_function_type;
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let unsupported = DirectCallError::Unsupported(DirectCallUnsupported::Form(
+            DirectCallForm::TaggedTemplate,
+        ));
+        let missing = DirectCallRequest {
+            form: DirectCallForm::TaggedTemplate,
+            ..request(callee, &[])
+        };
+        assert_eq!(validate_direct_call_form(missing), Err(unsupported));
+
+        let arguments = [number];
+        let forged = DirectCallRequest {
+            form: DirectCallForm::TaggedTemplate,
+            ..request(callee, &arguments)
+        };
+        assert_eq!(
+            validate_tagged_template_argument(&store, forged),
+            Err(unsupported)
+        );
+
+        let template = template_strings_array(&mut store);
+        assert_eq!(
+            validate_tagged_template_argument(&store, forged),
+            Err(unsupported)
+        );
+
+        let wrong_signature =
+            callable(&mut store, SignatureFlags::NONE, &[number], 1, Some(number));
+        let arguments = [template];
+        let tagged = DirectCallRequest {
+            form: DirectCallForm::TaggedTemplate,
+            ..request(wrong_signature.owner, &arguments)
+        };
+        assert_eq!(validate_tagged_template_argument(&store, tagged), Ok(()));
+        assert_eq!(
+            project_validated_direct_call(&store, None, tagged, &wrong_signature),
+            Err(unsupported)
+        );
+
+        let optional_template = callable(
+            &mut store,
+            SignatureFlags::NONE,
+            &[template],
+            0,
+            Some(number),
+        );
+        assert_eq!(
+            project_validated_direct_call(&store, None, tagged, &optional_template),
+            Err(unsupported)
+        );
+    }
+
+    #[test]
+    fn tagged_templates_keep_substitution_argument_diagnostics() {
+        let mut store = initialized_store();
+        let template = template_strings_array(&mut store);
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let number = bootstrap.number_type;
+        let string = bootstrap.string_type;
+        let callable = callable(
+            &mut store,
+            SignatureFlags::NONE,
+            &[template, number],
+            2,
+            Some(string),
+        );
+        let arguments = [template, string];
+        let tagged = DirectCallRequest {
+            form: DirectCallForm::TaggedTemplate,
+            ..request(callable.owner, &arguments)
+        };
+        let resolution = project_validated_direct_call(&store, None, tagged, &callable).unwrap();
+        let applicability =
+            check_argument_applicability(&resolution.projection, |source, target| {
+                Ok(source == target)
+            })
+            .unwrap();
+
+        assert_eq!(
+            applicability,
+            DirectCallApplicability::ArgumentNotAssignable {
+                index: 1,
+                argument_type: string,
+                parameter_type: number,
+            }
+        );
+        assert_eq!(resolution.projection.return_type, string);
     }
 
     #[test]
