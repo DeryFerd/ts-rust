@@ -433,3 +433,54 @@ fn numeric_enum_reverse_lookup_preserves_const_enum_dynamic_index_errors() {
         warm,
     );
 }
+
+#[test]
+fn enum_indices_distinguish_numeric_strings_any_and_const_enum_access() {
+    let source = concat!(
+        "enum Numeric { Ready = 1 }\n",
+        "const reverse = Numeric[\"1\"];\n",
+        "const invalid = Numeric[\"01\"];\n",
+        "enum Text { Ready = 'ready' }\n",
+        "let key: any;\n",
+        "const missing = Text[key];\n",
+        "const enum Fixed { Ready = 1 }\n",
+        "const rejected = Fixed[key];\n",
+    );
+    let library = parse_source_file(LIBRARY);
+    let parsed = parse_source_file(source);
+    assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(29);
+    let mut context = context(&library, FileId::new(28), &parsed, file);
+
+    context.check_source_file(file).unwrap();
+
+    assert_eq!(
+        context
+            .type_to_string(resolved_type(
+                &context,
+                variable_initializer(&parsed, file, "reverse"),
+            ))
+            .unwrap(),
+        "string",
+    );
+    assert_eq!(
+        context
+            .diagnostics()
+            .as_slice()
+            .iter()
+            .map(|diagnostic| (
+                diagnostic.diagnostic.code(),
+                node_text(source, &parsed, diagnostic.node.unwrap()),
+            ))
+            .collect::<Vec<_>>(),
+        [(7015, "\"01\""), (7053, "Text[key]"), (2476, "key")],
+    );
+
+    let warm = (context.store().type_len(), context.diagnostics().clone());
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (context.store().type_len(), context.diagnostics().clone()),
+        warm,
+    );
+}
