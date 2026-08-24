@@ -2157,7 +2157,8 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
             .is_some_and(|facts| facts.is_javascript_file() && facts.is_common_js_module());
         let allow_mixed_module_modes = matches!(
             supported,
-            SupportedAliasDeclaration::ExternalImportEquals { .. }
+            SupportedAliasDeclaration::NamespaceImport { .. }
+                | SupportedAliasDeclaration::ExternalImportEquals { .. }
                 | SupportedAliasDeclaration::NamedModuleMember {
                     type_only: true,
                     ..
@@ -5149,6 +5150,102 @@ mod tests {
                 file: target_file,
             }
         );
+    }
+
+    #[test]
+    fn namespace_imports_preserve_module_identity_across_authenticated_module_modes() {
+        for (index, usage_mode, target_mode, declaration_file) in [
+            (
+                0,
+                CanonicalModuleResolutionMode::Esm,
+                CanonicalModuleResolutionMode::CommonJs,
+                false,
+            ),
+            (
+                1,
+                CanonicalModuleResolutionMode::CommonJs,
+                CanonicalModuleResolutionMode::Esm,
+                false,
+            ),
+            (
+                2,
+                CanonicalModuleResolutionMode::Esm,
+                CanonicalModuleResolutionMode::CommonJs,
+                true,
+            ),
+            (
+                3,
+                CanonicalModuleResolutionMode::CommonJs,
+                CanonicalModuleResolutionMode::Esm,
+                true,
+            ),
+        ] {
+            let importer = parsed(r#"import * as values from "./target";"#);
+            let target = if declaration_file {
+                parsed("export declare const value: number;")
+            } else {
+                parsed("export const value: number = 1;")
+            };
+            let importer_file = FileId::new(5_220 + index * 2);
+            let target_file = FileId::new(5_221 + index * 2);
+            let files = [
+                (importer_file, &importer, CanonicalModuleState::External),
+                (target_file, &target, CanonicalModuleState::External),
+            ];
+            let specifier = module_specifiers(&importer)[0];
+            let declaration_files = if declaration_file {
+                vec![target_file]
+            } else {
+                Vec::new()
+            };
+            let (mut store, bound_files, manifest) = fixture_with_declaration_files(
+                &files,
+                CanonicalModuleResolutionManifestInput::new([
+                    CanonicalModuleResolutionEntry::resolved(
+                        node_ref(&importer, importer_file, specifier),
+                        CanonicalResolvedModuleInput::new(target_file, usage_mode, target_mode),
+                    ),
+                ]),
+                &declaration_files,
+            );
+            let mut host =
+                ProductionAliasTargetHost::new(&store, sources(&files, &bound_files), &manifest)
+                    .unwrap();
+            let declaration = alias_declaration_named(&importer, importer_file, "values");
+            let namespace = alias(&bound_files, declaration);
+            let module = source_module(&bound_files, target_file);
+            let symbols = (store.symbol_len(), store.symbol_store().symbol_table_len());
+
+            let resolved = CanonicalAliasResolver::new(&mut store, &mut host)
+                .resolve_alias(namespace)
+                .unwrap();
+
+            assert_eq!(resolved.target, AliasTargetState::Resolved(module));
+            assert!(resolved.events.is_empty());
+            assert_eq!(
+                store.alias_symbol_links(namespace),
+                Some(&AliasSymbolLinks {
+                    immediate_target: Some(module),
+                    alias_target: AliasTargetState::Resolved(module),
+                    ..AliasSymbolLinks::default()
+                }),
+            );
+            assert_eq!(
+                (store.symbol_len(), store.symbol_store().symbol_table_len()),
+                symbols,
+            );
+            assert_eq!(
+                CanonicalAliasResolver::new(&mut store, &mut host)
+                    .resolve_alias(namespace)
+                    .unwrap()
+                    .target,
+                AliasTargetState::Resolved(module),
+            );
+            assert_eq!(
+                (store.symbol_len(), store.symbol_store().symbol_table_len()),
+                symbols,
+            );
+        }
     }
 
     #[test]

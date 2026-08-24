@@ -31664,6 +31664,105 @@ mod tests {
     }
 
     #[test]
+    fn namespace_imports_cross_authenticated_module_modes_without_changing_exports() {
+        for (index, usage_mode, target_mode) in [
+            (
+                0,
+                CanonicalModuleResolutionMode::Esm,
+                CanonicalModuleResolutionMode::CommonJs,
+            ),
+            (
+                1,
+                CanonicalModuleResolutionMode::CommonJs,
+                CanonicalModuleResolutionMode::Esm,
+            ),
+        ] {
+            let source = parsed(concat!(
+                "import * as values from './target'; ",
+                "const result = values.value;",
+            ));
+            let target = parsed("export declare const value: number;");
+            let source_file = FileId::new(8_370 + index * 2);
+            let target_file = FileId::new(8_371 + index * 2);
+            let files = [(source_file, &source, false), (target_file, &target, true)];
+            let mut binder = CanonicalBinder::new();
+            for (file, parsed, declaration_file) in files {
+                binder
+                    .bind_source_file_with_facts(
+                        &parsed.arena,
+                        parsed.source_file,
+                        file,
+                        CanonicalSourceFileFacts::new(
+                            EscapedName::source(format!("\"/project/{}.ts\"", file.index())),
+                            CanonicalSourceLanguage::TypeScript,
+                            declaration_file,
+                            CanonicalModuleState::External,
+                        ),
+                    )
+                    .unwrap();
+                binder
+                    .bind_typescript_declaration_slice(&parsed.arena, file)
+                    .unwrap();
+            }
+            let specifiers = source_module_specifiers(&source);
+            let [specifier] = specifiers.as_slice() else {
+                panic!("the namespace import must retain one exact module specifier")
+            };
+            let manifest = CanonicalModuleResolutionManifestInput::new([
+                CanonicalModuleResolutionEntry::resolved(
+                    NodeRef::new(source.arena.id(), source_file, *specifier),
+                    CanonicalResolvedModuleInput::new(target_file, usage_mode, target_mode),
+                ),
+            ]);
+            let mut context = CanonicalCheckerContext::new_with_module_resolutions(
+                binder.finish(),
+                vec![(source_file, &source.arena), (target_file, &target.arena)],
+                CanonicalCheckerOptions::default(),
+                manifest,
+            )
+            .unwrap();
+
+            context.check_source_file(source_file).unwrap();
+
+            let (_, target_bound) = context.file(target_file).unwrap();
+            let target_module = target_bound.symbol(target_bound.source_file()).unwrap();
+            let binding = source
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::NamespaceImport).then_some(NodeRef::new(
+                        source.arena.id(),
+                        source_file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let (_, source_bound) = context.file(source_file).unwrap();
+            let alias = source_bound.symbol(binding).unwrap();
+            assert_eq!(
+                context
+                    .store()
+                    .alias_symbol_links(alias)
+                    .map(|links| (links.immediate_target, links.alias_target)),
+                Some((
+                    Some(target_module),
+                    AliasTargetState::Resolved(target_module)
+                )),
+            );
+            assert_eq!(
+                variable_value_type(&context, &source, source_file, "result"),
+                context.store().intrinsic_bootstrap().unwrap().number_type,
+            );
+            assert!(context.diagnostics().is_empty());
+            let warm = observable_state(&context, source_file);
+
+            context.recheck_source_file(source_file).unwrap();
+
+            assert_eq!(observable_state(&context, source_file), warm);
+        }
+    }
+
+    #[test]
     fn imported_callable_default_interface_returns_materialize_before_their_source() {
         let consumer = parsed(concat!(
             "import { styled } from './factory'; ",
