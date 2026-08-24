@@ -170,6 +170,15 @@ pub(super) struct GlobalArrayCallAugmentationPlan {
     pub any_array_type: TypeId,
 }
 
+/// One source-owned property added to the initialized global `Array<T>`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct GlobalArrayPropertyAugmentationPlan {
+    pub declaration: NodeRef,
+    pub symbol: SemanticSymbolId,
+    pub target: TypeId,
+    pub property: PlannedProperty,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GlobalArrayConcatOverloadKind {
     Arrays,
@@ -1579,6 +1588,15 @@ pub(super) fn plan_global_array_call_augmentation(
     {
         return Ok(None);
     }
+    if interface.members.nodes.len() == 1
+        && store.source_node_kind(NodeRef::new(
+            declaration.arena,
+            declaration.file,
+            interface.members.nodes[0],
+        )) != Some(SyntaxKind::CallSignature)
+    {
+        return Ok(None);
+    }
 
     let owner = store.symbol(canonical).ok_or_else(invalid)?;
     let allowed_flags =
@@ -1839,6 +1857,258 @@ pub(super) fn plan_global_array_call_augmentation(
         signature,
         return_type,
         any_array_type,
+    }))
+}
+
+/// Authenticates a source property augmentation without resolving library members.
+#[allow(clippy::too_many_lines)] // Declaration, merged parameter, and property form one proof.
+pub(super) fn plan_global_array_property_augmentation(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    symbol: SemanticSymbolId,
+) -> Result<Option<GlobalArrayPropertyAugmentationPlan>, PropertyObjectError> {
+    let canonical = store
+        .get_merged_symbol(symbol)
+        .ok_or(PropertyObjectError::InvalidInterfaceSymbol(symbol))?;
+    let invalid = || PropertyObjectError::InvalidInterface {
+        declaration,
+        symbol: canonical,
+    };
+    let record = preflight_node(store, host, declaration).map_err(|_| invalid())?;
+    let NodeData::InterfaceDeclaration(interface) = &record.data else {
+        return Err(invalid());
+    };
+    let name = NodeRef::new(declaration.arena, declaration.file, interface.name);
+    let name_record = preflight_node(store, host, name).map_err(|_| invalid())?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(invalid());
+    };
+    if identifier.text != "Array" {
+        return Ok(None);
+    }
+    let bootstrap = store.intrinsic_bootstrap().ok_or_else(invalid)?;
+    let global = store
+        .symbol_table(bootstrap.globals)
+        .and_then(|globals| globals.get_source("Array"))
+        .and_then(|owner| store.get_merged_symbol(owner));
+    if global != Some(canonical) {
+        return Ok(None);
+    }
+    let bound = host.bound_file(declaration).ok_or_else(invalid)?;
+    let facts = bound.source_facts().ok_or_else(invalid)?;
+    if facts.is_default_library()
+        || facts.is_declaration_file()
+        || facts.is_javascript_file()
+        || facts.is_external_or_common_js_module()
+    {
+        return Ok(None);
+    }
+    let [member] = interface.members.nodes.as_slice() else {
+        return Ok(None);
+    };
+    let member = NodeRef::new(declaration.arena, declaration.file, *member);
+    let member_record = preflight_node(store, host, member).map_err(|_| invalid())?;
+    let (property_name, annotation, optional, modifiers) = match &member_record.data {
+        NodeData::PropertyDeclaration(property)
+            if member_record.kind == SyntaxKind::PropertyDeclaration
+                && property.initializer.is_none() =>
+        {
+            (
+                property.name,
+                property.type_.ok_or_else(invalid)?,
+                property.postfix_token,
+                property.modifiers.as_ref(),
+            )
+        }
+        NodeData::PropertySignatureDeclaration(property)
+            if member_record.kind == SyntaxKind::PropertySignature =>
+        {
+            (
+                property.name,
+                property.type_,
+                property.postfix_token,
+                property.modifiers.as_ref(),
+            )
+        }
+        _ => return Ok(None),
+    };
+
+    let owner = store.symbol(canonical).ok_or_else(invalid)?;
+    let allowed_flags =
+        SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::TRANSIENT;
+    let declarations = owner.declarations().ok_or_else(invalid)?;
+    let has_library_owner = declarations.iter().any(|candidate| {
+        candidate.file != declaration.file
+            && host
+                .bound_file(*candidate)
+                .and_then(ts_binder::BoundFile::source_facts)
+                .is_some_and(ts_binder::CanonicalSourceFileFacts::is_default_library)
+    });
+    if !has_library_owner {
+        return Ok(None);
+    }
+    let parameters = interface.type_parameters.as_ref().ok_or_else(invalid)?;
+    let [parameter] = parameters.nodes.as_slice() else {
+        return Err(invalid());
+    };
+    let members = owner.members().ok_or_else(invalid)?;
+    let table = store.symbol_table(members).ok_or_else(invalid)?;
+    if record.kind != SyntaxKind::InterfaceDeclaration
+        || record.flags.0 != 0
+        || !host.symbol_matches(store, declaration, canonical)
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.parent != Some(declaration.node)
+        || interface.flow_node.is_some()
+        || interface.local_symbol.is_some()
+        || interface.symbol.is_some()
+        || interface.modifiers.is_some()
+        || interface.heritage_clauses.is_some()
+        || interface.members.has_trailing_comma
+        || parameters.has_trailing_comma
+        || owner.flags() & SymbolFlags::TYPE != SymbolFlags::INTERFACE
+        || owner.flags().without(allowed_flags) != SymbolFlags::NONE
+        || owner.check_flags() != CheckFlags::NONE
+        || owner.name().as_utf8() != Some("Array")
+        || owner.parent().is_some()
+        || owner.exports().is_some()
+        || owner.export_symbol().is_some()
+        || !declarations.contains(&declaration)
+    {
+        return Err(invalid());
+    }
+
+    let target = store
+        .declared_type_links(canonical)
+        .and_then(|links| links.declared_type)
+        .ok_or_else(invalid)?;
+    let target_record = store.type_payload(target).ok_or_else(invalid)?;
+    let TypeData::Interface(target_interface) = target_record.data() else {
+        return Err(invalid());
+    };
+    let reference = validate_direct_generic_reference(store, target).map_err(|_| invalid())?;
+    let [parameter_type] = reference.type_arguments.as_slice() else {
+        return Err(invalid());
+    };
+    let parameter_symbol =
+        cached_ordinary_type_parameter_owner(store, *parameter_type).ok_or_else(invalid)?;
+    let parameter = NodeRef::new(declaration.arena, declaration.file, *parameter);
+    let parameter_record = preflight_node(store, host, parameter).map_err(|_| invalid())?;
+    let NodeData::TypeParameterDeclaration(parameter_data) = &parameter_record.data else {
+        return Err(invalid());
+    };
+    let parameter_name = NodeRef::new(parameter.arena, parameter.file, parameter_data.name);
+    let parameter_name_record =
+        preflight_node(store, host, parameter_name).map_err(|_| invalid())?;
+    let NodeData::Identifier(parameter_identifier) = &parameter_name_record.data else {
+        return Err(invalid());
+    };
+    if reference.target != target
+        || target_record.flags() != TypeFlags::OBJECT
+        || !target_record
+            .object_flags()
+            .contains(ObjectFlags::INTERFACE | ObjectFlags::REFERENCE)
+        || target_record.symbol() != Some(canonical)
+        || target_record.alias().is_some()
+        || target_interface.outer_type_parameter_count != 0
+        || target_interface.declared_members_resolved
+        || target_interface.reference.object.structured != StructuredTypeData::default()
+        || parameter_record.kind != SyntaxKind::TypeParameter
+        || parameter_record.parent != Some(declaration.node)
+        || parameter_data.constraint.is_some()
+        || parameter_data.default_type.is_some()
+        || parameter_data.expression.is_some()
+        || parameter_data.symbol.is_some()
+        || parameter_data.modifiers.is_some()
+        || parameter_name_record.kind != SyntaxKind::Identifier
+        || parameter_name_record.parent != Some(parameter.node)
+        || parameter_identifier.text != "T"
+        || bound
+            .symbol(parameter)
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            != Some(parameter_symbol)
+        || table
+            .get_source("T")
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            != Some(parameter_symbol)
+    {
+        return Err(invalid());
+    }
+
+    let name_node = NodeRef::new(member.arena, member.file, property_name);
+    let property_name_record = preflight_node(store, host, name_node).map_err(|_| invalid())?;
+    let NodeData::Identifier(property_identifier) = &property_name_record.data else {
+        return Err(invalid());
+    };
+    let annotation = NodeRef::new(member.arena, member.file, annotation);
+    let annotation_record = preflight_node(store, host, annotation).map_err(|_| invalid())?;
+    let property_symbol = bound
+        .symbol(member)
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .ok_or_else(invalid)?;
+    let property_record = store.symbol(property_symbol).ok_or_else(invalid)?;
+    let optional = optional.is_some();
+    let expected_flags = SymbolFlags::PROPERTY
+        | if optional {
+            SymbolFlags::OPTIONAL
+        } else {
+            SymbolFlags::NONE
+        };
+    let readonly =
+        preflight_readonly_modifier(store, host, member, modifiers).ok_or_else(invalid)?;
+    if member_record.flags.0 != 0
+        || member_record.parent != Some(declaration.node)
+        || property_name_record.kind != SyntaxKind::Identifier
+        || property_name_record.parent != Some(member.node)
+        || property_identifier.flow_node.is_some()
+        || property_identifier.text.is_empty()
+        || annotation_record.parent != Some(member.node)
+        || property_record.flags() != expected_flags
+        || property_record.check_flags() != CheckFlags::NONE
+            && property_record.check_flags() != source_property_check_flags(readonly)
+        || property_record.name().as_utf8() != Some(property_identifier.text.as_str())
+        || property_record.declarations() != Some(&[member])
+        || property_record.value_declaration() != Some(member)
+        || property_record.members().is_some()
+        || property_record.exports().is_some()
+        || property_record.export_symbol().is_some()
+        || property_record
+            .parent()
+            .and_then(|parent| store.get_merged_symbol(parent))
+            != Some(canonical)
+        || table
+            .get_source(&property_identifier.text)
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            != Some(property_symbol)
+        || store
+            .value_symbol_links(property_symbol)
+            .is_some_and(|links| {
+                links
+                    != &(ValueSymbolLinks {
+                        resolved_type: links.resolved_type,
+                        ..ValueSymbolLinks::default()
+                    })
+                    || links
+                        .resolved_type
+                        .is_some_and(|type_| store.type_payload(type_).is_none())
+            })
+    {
+        return Err(invalid());
+    }
+
+    Ok(Some(GlobalArrayPropertyAugmentationPlan {
+        declaration,
+        symbol: canonical,
+        target,
+        property: PlannedProperty {
+            declaration: member,
+            symbol: property_symbol,
+            name_node,
+            type_node: annotation,
+            optional,
+            readonly,
+            name: property_identifier.text.clone(),
+        },
     }))
 }
 
@@ -8502,6 +8772,77 @@ mod generic_publication_tests {
             store.symbol_store().symbol_table_len(),
             store.checker_link_allocated_lengths(),
         )
+    }
+
+    #[test]
+    fn global_array_property_augmentation_preserves_the_lazy_library_target() {
+        let fixture = global_array_augmentation_fixture(
+            "interface Array<T> { split: (parts: number) => T[][]; }",
+            3_729,
+        );
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&fixture.library.arena, &fixture.library_bound),
+                (&fixture.source.arena, &fixture.source_bound),
+            ],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.symbol_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        let plan = plan_global_array_property_augmentation(
+            &fixture.store,
+            &host,
+            fixture.declaration,
+            fixture.symbol,
+        )
+        .unwrap()
+        .expect("the source property must augment the initialized Array target");
+
+        assert_eq!(plan.target, fixture.global_types.array_type);
+        assert_eq!(plan.property.name, "split");
+        assert_eq!(
+            fixture.store.source_node_kind(plan.property.type_node),
+            Some(SyntaxKind::FunctionType),
+        );
+        assert!(
+            fixture
+                .store
+                .value_symbol_links(plan.property.symbol)
+                .is_none()
+        );
+        let TypeData::Interface(target) = fixture.store.type_payload(plan.target).unwrap().data()
+        else {
+            panic!("Array must retain its generic interface target")
+        };
+        assert!(!target.declared_members_resolved);
+        assert_eq!(
+            target.reference.object.structured,
+            StructuredTypeData::default()
+        );
+        assert_eq!(
+            plan_global_array_call_augmentation(
+                &fixture.store,
+                &host,
+                fixture.declaration,
+                fixture.symbol,
+            ),
+            Ok(None),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.symbol_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            before,
+        );
     }
 
     #[test]

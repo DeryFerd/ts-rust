@@ -91,7 +91,8 @@ use super::{
     },
     object_members::{
         DeclaredPropertyObjectValidation, GlobalArrayCallAugmentationPlan,
-        plan_global_array_call_augmentation, validate_resolved_declared_property_object,
+        GlobalArrayPropertyAugmentationPlan, plan_global_array_call_augmentation,
+        plan_global_array_property_augmentation, validate_resolved_declared_property_object,
     },
     primitive_operators::{
         PrimitiveBigIntExponentiationTarget, PrimitiveBinaryError, PrimitiveBinaryRecovery,
@@ -206,9 +207,9 @@ use super::{
         PlannedIdentifierRead as PlannedVariableRead, PlannedObjectBindingElement,
         VariableBindingKind, VariablePlanError, plan_declared_value_identifier_read,
         plan_identifier_read, plan_recovered_anonymous_module_identifier_read,
-        plan_recovered_anonymous_module_variable, plan_top_level_array_binding_element,
-        plan_top_level_computed_binding_element, plan_top_level_object_binding_elements,
-        plan_top_level_variable,
+        plan_recovered_anonymous_module_variable, plan_redeclared_top_level_variable,
+        plan_top_level_array_binding_element, plan_top_level_computed_binding_element,
+        plan_top_level_object_binding_elements, plan_top_level_variable,
     },
 };
 
@@ -807,6 +808,13 @@ struct PlannedArrayVariable {
     initializer: PlannedExpression,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PlannedVariableRedeclaration {
+    declaration: NodeRef,
+    symbol: SemanticSymbolId,
+    type_node: NodeRef,
+}
+
 #[derive(Clone, Debug)]
 struct PlannedObjectVariable {
     elements: Vec<PlannedObjectBindingElement>,
@@ -1209,6 +1217,7 @@ enum PlannedStatement {
     FunctionTypeGrammar(PlannedFunctionTypeGrammar),
     GenericInterface(super::object_members::PropertyObjectPlan),
     GlobalArrayCallAugmentation(GlobalArrayCallAugmentationPlan),
+    GlobalArrayPropertyAugmentation(GlobalArrayPropertyAugmentationPlan),
     Namespace(Box<SourceNamespacePlan>),
     Class(ClassMemberQueryPlan),
     ExportedJsxArrowClass(Box<PlannedExportedJsxArrowClass>),
@@ -1232,6 +1241,7 @@ enum PlannedStatement {
     Variables(Vec<PlannedVariable>),
     LexicalBlock(Box<PlannedTopLevelLexicalBlock>),
     RecoveredAnonymousVariables(Vec<PlannedVariable>),
+    VariableRedeclaration(PlannedVariableRedeclaration),
     ComputedVariable(Box<PlannedComputedVariable>),
     ArrayVariable(Box<PlannedArrayVariable>),
     ObjectVariable(Box<PlannedObjectVariable>),
@@ -1309,6 +1319,7 @@ enum PlannedVariableStatement {
     Arrow(Box<SourceArrowPlan>),
     ContextualArrow(Box<SourceContextualArrowPlan>),
     Variables(Vec<PlannedVariable>),
+    Redeclaration(PlannedVariableRedeclaration),
     Computed(Box<PlannedComputedVariable>),
     Array(Box<PlannedArrayVariable>),
     Object(Box<PlannedObjectVariable>),
@@ -2023,6 +2034,16 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                                 ));
                                 continue;
                             }
+                            if let Some(augmentation) = plan_global_array_property_augmentation(
+                                store, host, statement, symbol,
+                            )
+                            .map_err(|error| self.interface_plan_error(statement, error))?
+                            {
+                                statements.push(PlannedStatement::GlobalArrayPropertyAugmentation(
+                                    augmentation,
+                                ));
+                                continue;
+                            }
                             let plan =
                                 super::object_members::plan_generic_interface(store, host, symbol)
                                     .map_err(|error| self.interface_plan_error(statement, error))?;
@@ -2566,6 +2587,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         }
                         PlannedVariableStatement::Variables(variables) => {
                             statements.push(PlannedStatement::Variables(variables));
+                        }
+                        PlannedVariableStatement::Redeclaration(variable) => {
+                            statements.push(PlannedStatement::VariableRedeclaration(variable));
                         }
                         PlannedVariableStatement::Computed(variable) => {
                             statements.push(PlannedStatement::ComputedVariable(variable));
@@ -8988,6 +9012,54 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             let declaration = self.reference(*declaration);
             let record = self.node(declaration)?;
             if let NodeData::VariableDeclaration(variable) = &record.data {
+                if binding == VariableBindingKind::Var
+                    && !exported
+                    && variable.initializer.is_none()
+                    && let Some(type_node) = variable.type_
+                    && let Some(symbol) = self.bound.symbol(declaration)
+                    && self.prior_variables.contains(&symbol)
+                {
+                    let name = self.reference(variable.name);
+                    let type_node = self.reference(type_node);
+                    let name_record = self.node(name)?;
+                    let NodeData::Identifier(identifier) = &name_record.data else {
+                        return Err(self.unsupported(
+                            name,
+                            name_record.kind,
+                            SourceSyntaxRole::VariableName,
+                        ));
+                    };
+                    let name_text = identifier.text.clone();
+                    let Some((store, _)) = self.semantic else {
+                        return Err(self.unsupported(
+                            declaration,
+                            record.kind,
+                            SourceSyntaxRole::VariableDeclaration,
+                        ));
+                    };
+                    let resolved = plan_redeclared_top_level_variable(
+                        self.bound,
+                        store,
+                        declaration,
+                        name,
+                        &name_text,
+                    )
+                    .map_err(Self::variable_plan_error)?;
+                    if resolved != symbol || self.node(type_node)?.parent != Some(declaration.node)
+                    {
+                        return Err(SourceCheckError::Variable(
+                            VariableInvariant::InvalidSymbolShape(symbol),
+                        ));
+                    }
+                    self.plan_type_import_annotation_root(type_node)?;
+                    return Ok(PlannedVariableStatement::Redeclaration(
+                        PlannedVariableRedeclaration {
+                            declaration,
+                            symbol,
+                            type_node,
+                        },
+                    ));
+                }
                 match self.node(self.reference(variable.name))?.kind {
                     SyntaxKind::ObjectBindingPattern => {
                         let pattern = self.node(self.reference(variable.name))?;
@@ -9552,7 +9624,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 &name_text,
             )
         } else {
-            plan_top_level_variable(
+            match plan_top_level_variable(
                 self.bound,
                 store,
                 declaration,
@@ -9560,7 +9632,21 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 &name_text,
                 binding,
                 exported,
-            )
+            ) {
+                Ok(symbol) => Ok(symbol),
+                Err(VariablePlanError::Unsupported(
+                    VariableUnsupported::NonUniqueDeclaration { .. },
+                )) if binding == VariableBindingKind::Var && !exported => {
+                    plan_redeclared_top_level_variable(
+                        self.bound,
+                        store,
+                        declaration,
+                        name,
+                        &name_text,
+                    )
+                }
+                Err(error) => Err(error),
+            }
         }
         .map_err(Self::variable_plan_error)?;
 
@@ -21446,6 +21532,30 @@ pub(super) fn check_source_file(
                 )?
                 .preflight_type_from_type_node(augmentation.return_type)?;
             }
+            PlannedStatement::GlobalArrayPropertyAugmentation(augmentation) => {
+                session.reset_query();
+                CanonicalTypeQuery::new_with_global_types_and_session(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    &mut type_import_preflight_diagnostics,
+                )?
+                .preflight_type_from_type_node(augmentation.property.type_node)?;
+            }
+            PlannedStatement::VariableRedeclaration(variable) => {
+                session.reset_query();
+                CanonicalTypeQuery::new_with_global_types_and_session(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    &mut type_import_preflight_diagnostics,
+                )?
+                .preflight_type_from_type_node(variable.type_node)?;
+            }
             PlannedStatement::Namespace(namespace) => {
                 preflight_source_namespace_annotations(
                     store,
@@ -22510,6 +22620,76 @@ pub(super) fn check_source_file(
                     ));
                 }
             }
+            PlannedStatement::GlobalArrayPropertyAugmentation(augmentation) => {
+                if augmentation.target != global_types.array_type
+                    || plan_global_array_property_augmentation(
+                        store,
+                        host,
+                        augmentation.declaration,
+                        augmentation.symbol,
+                    )
+                    .map_err(|_| SourceCheckError::Property(augmentation.property.declaration))?
+                        != Some(augmentation.clone())
+                {
+                    return Err(SourceCheckError::Property(
+                        augmentation.property.declaration,
+                    ));
+                }
+                let mut statement_diagnostics = CanonicalCheckerDiagnostics::default();
+                let property_type = CanonicalTypeQuery::new_with_global_types_and_session(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    &mut statement_diagnostics,
+                )?
+                .get_type_from_type_node(augmentation.property.type_node)?;
+                if let Some(signature) = store
+                    .signature_links(augmentation.property.type_node)
+                    .and_then(|links| links.resolved_signature.signature())
+                {
+                    session.reset_query();
+                    CanonicalTypeQuery::new_with_global_types_and_session(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        session,
+                        &mut statement_diagnostics,
+                    )?
+                    .get_return_type_of_signature(signature)?;
+                }
+                merge_retry_diagnostics(diagnostics, statement_diagnostics);
+                let expected = ValueSymbolLinks {
+                    resolved_type: Some(property_type),
+                    ..ValueSymbolLinks::default()
+                };
+                match store.value_symbol_links(augmentation.property.symbol) {
+                    Some(links) if links == &expected => {}
+                    None
+                    | Some(ValueSymbolLinks {
+                        resolved_type: None,
+                        ..
+                    }) => {
+                        if !store.set_source_property_readonly(
+                            augmentation.property.symbol,
+                            augmentation.property.readonly,
+                        ) || !store
+                            .set_value_symbol_links(augmentation.property.symbol, expected)
+                        {
+                            return Err(SourceCheckError::Property(
+                                augmentation.property.declaration,
+                            ));
+                        }
+                    }
+                    Some(_) => {
+                        return Err(SourceCheckError::Property(
+                            augmentation.property.declaration,
+                        ));
+                    }
+                }
+            }
             PlannedStatement::GenericInterface(interface) => {
                 let mut statement_diagnostics = CanonicalCheckerDiagnostics::default();
                 let target = CanonicalTypeQuery::new_with_global_types_and_session(
@@ -23550,6 +23730,34 @@ pub(super) fn check_source_file(
                             ));
                         }
                     }
+                }
+            }
+            PlannedStatement::VariableRedeclaration(variable) => {
+                let expected = top_level_declared_types
+                    .get(&variable.symbol)
+                    .copied()
+                    .ok_or(SourceCheckError::Variable(
+                        VariableInvariant::MissingStagedValueType(variable.symbol),
+                    ))?;
+                let mut annotation_diagnostics = CanonicalCheckerDiagnostics::default();
+                let actual = CanonicalTypeQuery::new_with_global_types_and_session(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    &mut annotation_diagnostics,
+                )?
+                .get_type_from_type_node(variable.type_node)?;
+                merge_retry_diagnostics(diagnostics, annotation_diagnostics);
+                if expected != actual {
+                    return Err(SourceCheckError::Unsupported(
+                        UnsupportedSourceSyntax::Syntax {
+                            node: variable.declaration,
+                            kind: SyntaxKind::VariableDeclaration,
+                            role: SourceSyntaxRole::VariableDeclaration,
+                        },
+                    ));
                 }
             }
             PlannedStatement::Variables(variables) => {
@@ -38547,6 +38755,77 @@ mod tests {
         let warm = observable_state(&context, consumer_file);
         context.recheck_source_file(consumer_file).unwrap();
         assert_eq!(observable_state(&context, consumer_file), warm);
+    }
+
+    #[test]
+    fn global_array_property_augmentation_specializes_function_values_and_var_redeclarations() {
+        let library = parsed(concat!(
+            "interface IArguments {} ",
+            "interface Array<T> { [index: number]: T; } declare var Array: any; ",
+            "interface Object {} interface Function {} ",
+            "interface String {} interface Number {} interface Boolean {} ",
+            "interface RegExp {} interface ReadonlyArray<T> {} interface ThisType<T> {}",
+        ));
+        let source = parsed(concat!(
+            "interface Array<T> { split: (parts: number) => T[][]; } ",
+            "var input = ['']; ",
+            "var result = input.split(4); ",
+            "var result: string[][];",
+        ));
+        let library_file = FileId::new(8_900);
+        let source_file = FileId::new(8_901);
+        let mut context = context_with_default_library_files(
+            &[(library_file, &library), (source_file, &source)],
+            &[library_file],
+            CanonicalCheckerOptions::default(),
+        );
+
+        context.check_source_file(source_file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
+        let result = variable_value_type(&context, &source, source_file, "result");
+        assert_eq!(context.type_to_string(result).unwrap(), "string[][]");
+        let property = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::PropertyAccessExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    source_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let callable = resolved_node_type(&context, property);
+        let [signature] = context
+            .store()
+            .type_payload(callable)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.signatures.as_deref())
+            .unwrap()
+        else {
+            panic!("the augmented property must retain one specialized callable signature")
+        };
+        assert_eq!(
+            context
+                .store()
+                .signature(*signature)
+                .and_then(super::super::signatures::Signature::resolved_return_type),
+            Some(result),
+        );
+        let TypeData::Interface(target) = context
+            .store()
+            .type_payload(context.global_types().array_type)
+            .unwrap()
+            .data()
+        else {
+            panic!("Array must retain its initialized generic interface target")
+        };
+        assert!(!target.declared_members_resolved);
+
+        let warm = observable_state(&context, source_file);
+        context.recheck_source_file(source_file).unwrap();
+        assert_eq!(observable_state(&context, source_file), warm);
     }
 
     #[test]

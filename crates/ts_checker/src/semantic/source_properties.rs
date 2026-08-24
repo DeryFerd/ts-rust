@@ -927,7 +927,7 @@ fn resolve_published_canonical_array_property(
     if is_method {
         validate_published_canonical_array_method(store, plan.node, symbol, declarations, type_)?;
     }
-    let requires_instantiation = is_method
+    let requires_method_instantiation = is_method
         && store
             .type_payload(type_)
             .and_then(|record| record.data().structured())
@@ -940,14 +940,29 @@ fn resolve_published_canonical_array_property(
                         == Some(target)
                 })
             });
-    let type_ = if requires_instantiation {
-        super::instantiated_members::instantiate_published_generic_interface_method(
-            store,
-            global_types,
-            receiver_type,
-            symbol,
+    let instantiation = if requires_method_instantiation {
+        Some(
+            super::instantiated_members::instantiate_published_generic_interface_method(
+                store,
+                global_types,
+                receiver_type,
+                symbol,
+            ),
         )
-        .map_err(|error| match error {
+    } else if is_property && store.type_has_function_type_provenance(type_) {
+        Some(
+            super::instantiated_members::instantiate_published_generic_array_property_callable(
+                store,
+                global_types,
+                receiver_type,
+                symbol,
+            ),
+        )
+    } else {
+        None
+    };
+    let type_ = if let Some(instantiation) = instantiation {
+        instantiation.map_err(|error| match error {
             super::instantiated_members::GenericInterfaceMemberError::Capacity(_) => {
                 SourcePropertyError::Capacity(plan.node)
             }

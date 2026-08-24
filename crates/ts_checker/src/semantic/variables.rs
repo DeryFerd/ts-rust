@@ -246,6 +246,26 @@ pub(super) fn plan_top_level_variable(
     )
 }
 
+/// Proves a same-file, function-scoped variable with compatible redeclarations.
+pub(super) fn plan_redeclared_top_level_variable(
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    name: NodeRef,
+    name_text: &str,
+) -> Result<SemanticSymbolId, VariablePlanError> {
+    plan_variable_declaration(
+        bound,
+        store,
+        declaration,
+        name,
+        name_text,
+        VariableBindingKind::Var,
+        false,
+        true,
+    )
+}
+
 /// Proves one recovered anonymous-module `var`, including its shared binder symbol.
 pub(super) fn plan_recovered_anonymous_module_variable(
     bound: &BoundFile,
@@ -2290,6 +2310,16 @@ mod tests {
         for &(declaration, name) in &declarations {
             assert_eq!(
                 plan_recovered_anonymous_module_variable(
+                    &fixture.bound,
+                    &fixture.store,
+                    declaration,
+                    name,
+                    "shared",
+                ),
+                Ok(symbol),
+            );
+            assert_eq!(
+                plan_redeclared_top_level_variable(
                     &fixture.bound,
                     &fixture.store,
                     declaration,

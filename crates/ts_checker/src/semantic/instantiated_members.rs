@@ -22,6 +22,7 @@ use super::{
     CanonicalGlobalTypes, CanonicalTypeMapperStore, IndexInfoId, SignatureId, TypeId, TypeMapperId,
     array_types::CanonicalArrayTargets,
     declared::{cached_ordinary_type_parameter_owner, type_list_key},
+    functions::{StoredFunctionTypeValidation, validate_stored_function_type},
     instantiate::{
         InstantiationError, InstantiationLimits, InstantiationSession,
         instantiable_member_type_contains_variables, instantiate_type_with_session,
@@ -267,6 +268,22 @@ struct PublishedInterfaceMethodPlan {
     mapper_sources: Vec<TypeId>,
     mapper_targets: Vec<TypeId>,
     signatures: Vec<PublishedInterfaceMethodSignature>,
+}
+
+#[derive(Clone, Debug)]
+struct PublishedArrayPropertyCallablePlan {
+    source: TypeId,
+    signature: SignatureId,
+    parameter_types: Vec<TypeId>,
+    return_type: TypeId,
+    mapper_sources: Vec<TypeId>,
+    mapper_targets: Vec<TypeId>,
+}
+
+pub(super) enum InstantiatedArrayPropertyCallableValidation {
+    NotCallable,
+    Valid(Vec<TypeId>),
+    Malformed,
 }
 
 impl CanonicalTypeMapperStore {
@@ -644,6 +661,437 @@ pub(super) fn instantiate_published_generic_interface_method(
         ));
     }
     Ok(callable)
+}
+
+/// Specializes a published function-valued global Array property for one receiver.
+pub(super) fn instantiate_published_generic_array_property_callable(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    receiver: TypeId,
+    property: SemanticSymbolId,
+) -> Result<TypeId, GenericInterfaceMemberError> {
+    let targets = CanonicalArrayTargets::from_global_types(global_types);
+    let plan = plan_published_array_property_callable(store, targets, receiver, property)?;
+    let mut session = InstantiationSession::new(InstantiationLimits::default());
+    let resolved_parameters = plan
+        .parameter_types
+        .iter()
+        .copied()
+        .map(|type_| {
+            instantiate_type_with_vector_and_session(
+                store,
+                type_,
+                &plan.mapper_sources,
+                &plan.mapper_targets,
+                Some(targets),
+                &mut session,
+            )
+            .map_err(|error| property_instantiation_error(type_, &error))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let resolved_return = instantiate_type_with_vector_and_session(
+        store,
+        plan.return_type,
+        &plan.mapper_sources,
+        &plan.mapper_targets,
+        Some(targets),
+        &mut session,
+    )
+    .map_err(|error| property_instantiation_error(plan.return_type, &error))?;
+    if resolved_parameters == plan.parameter_types && resolved_return == plan.return_type {
+        return Ok(plan.source);
+    }
+    for (type_, record) in store.types() {
+        let TypeData::Object(object) = record.data() else {
+            continue;
+        };
+        let Some(mapper) = object.mapper else {
+            continue;
+        };
+        if record.symbol() == Some(property)
+            && object.target == Some(plan.source)
+            && store.type_mapper_has_exact_endpoints(
+                mapper,
+                &plan.mapper_sources,
+                &plan.mapper_targets,
+            ) == Some(true)
+        {
+            return match validate_instantiated_array_property_callable(store, type_) {
+                InstantiatedArrayPropertyCallableValidation::Valid(_) => Ok(type_),
+                InstantiatedArrayPropertyCallableValidation::NotCallable
+                | InstantiatedArrayPropertyCallableValidation::Malformed => {
+                    Err(GenericInterfaceMemberError::InvalidCachedMembers(receiver))
+                }
+            };
+        }
+    }
+
+    if !store.try_reserve_mappers(1)
+        || !store.try_reserve_types(1)
+        || !store.try_reserve_signatures(1)
+    {
+        return Err(GenericInterfaceMemberError::Capacity(receiver));
+    }
+    let mapper = store
+        .new_type_mapper(plan.mapper_sources.clone(), plan.mapper_targets.clone())
+        .ok_or(GenericInterfaceMemberError::Capacity(receiver))?;
+    let signature = store
+        .instantiate_signature(plan.signature, mapper)
+        .map_err(|error| match error {
+            SignatureInstantiationError::Capacity(_) => {
+                GenericInterfaceMemberError::Capacity(receiver)
+            }
+            _ => GenericInterfaceMemberError::InvalidMember(property),
+        })?;
+    let parameters = store
+        .signature(signature)
+        .ok_or(GenericInterfaceMemberError::InvalidCachedMembers(receiver))?
+        .parameters()
+        .to_vec();
+    for (&parameter, &type_) in parameters.iter().zip(&resolved_parameters) {
+        let links = store.value_symbol_links(parameter).cloned().ok_or(
+            GenericInterfaceMemberError::InvalidCachedProperty(parameter),
+        )?;
+        if links.resolved_type.is_some_and(|cached| cached != type_)
+            || links.resolved_type.is_none()
+                && !store.set_value_symbol_links(
+                    parameter,
+                    ValueSymbolLinks {
+                        resolved_type: Some(type_),
+                        ..links
+                    },
+                )
+        {
+            return Err(GenericInterfaceMemberError::InvalidCachedProperty(
+                parameter,
+            ));
+        }
+    }
+    if !store.set_signature_resolved_return_type(signature, Some(resolved_return)) {
+        return Err(GenericInterfaceMemberError::InvalidCachedMembers(receiver));
+    }
+    let callable = store
+        .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(property))
+        .ok_or(GenericInterfaceMemberError::Capacity(receiver))?;
+    if !store.set_object_target_and_mapper(callable, Some(plan.source), Some(mapper))
+        || !store.set_structured_type_members(
+            callable,
+            None,
+            None,
+            Some(vec![signature]),
+            None,
+            None,
+        )
+    {
+        return Err(GenericInterfaceMemberError::InvalidCachedMembers(receiver));
+    }
+    Ok(callable)
+}
+
+fn plan_published_array_property_callable(
+    store: &CanonicalTypeMapperStore,
+    targets: CanonicalArrayTargets,
+    receiver: TypeId,
+    property: SemanticSymbolId,
+) -> Result<PublishedArrayPropertyCallablePlan, GenericInterfaceMemberError> {
+    let array = store
+        .canonical_array_reference_with_targets(targets, receiver)
+        .map_err(|_| GenericInterfaceMemberError::InvalidTarget(receiver))?
+        .ok_or(GenericInterfaceMemberError::InvalidTarget(receiver))?;
+    let receiver = array.base_type;
+    let reference = validate_direct_generic_reference(store, receiver)?;
+    let expected_target = if array.readonly {
+        targets.readonly_array_type()
+    } else {
+        targets.array_type()
+    };
+    if reference.target != expected_target {
+        return Err(GenericInterfaceMemberError::InvalidTarget(receiver));
+    }
+    let target_record = store
+        .type_payload(reference.target)
+        .ok_or(GenericInterfaceMemberError::InvalidTarget(reference.target))?;
+    let TypeData::Interface(interface) = target_record.data() else {
+        return Err(GenericInterfaceMemberError::InvalidTarget(reference.target));
+    };
+    let owner = target_record
+        .symbol()
+        .ok_or(GenericInterfaceMemberError::InvalidTarget(reference.target))?;
+    let member = store
+        .symbol(property)
+        .ok_or(GenericInterfaceMemberError::InvalidMember(property))?;
+    let links = store
+        .value_symbol_links(property)
+        .ok_or(GenericInterfaceMemberError::InvalidMember(property))?;
+    let source = links
+        .resolved_type
+        .ok_or(GenericInterfaceMemberError::InvalidMember(property))?;
+    if !member.flags().contains(SymbolFlags::PROPERTY)
+        || member
+            .parent()
+            .and_then(|parent| store.get_merged_symbol(parent))
+            != Some(owner)
+        || store
+            .symbol(owner)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get(member.name()))
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            != Some(property)
+        || links
+            != &(ValueSymbolLinks {
+                resolved_type: Some(source),
+                ..ValueSymbolLinks::default()
+            })
+        || !matches!(
+            validate_stored_function_type(store, source),
+            StoredFunctionTypeValidation::Valid(_)
+        )
+    {
+        return Err(GenericInterfaceMemberError::InvalidMember(property));
+    }
+    let source_record = store
+        .type_payload(source)
+        .ok_or(GenericInterfaceMemberError::InvalidMember(property))?;
+    let TypeData::Object(callable) = source_record.data() else {
+        return Err(GenericInterfaceMemberError::InvalidMember(property));
+    };
+    let [signature] = callable
+        .structured
+        .signatures
+        .as_deref()
+        .unwrap_or_default()
+    else {
+        return Err(GenericInterfaceMemberError::InvalidMember(property));
+    };
+    let signature_record = store
+        .signature(*signature)
+        .ok_or(GenericInterfaceMemberError::InvalidMember(property))?;
+    let parameter_types = store
+        .callable_signature_parameter_types(*signature)
+        .ok_or(GenericInterfaceMemberError::InvalidMember(property))?
+        .to_vec();
+    let return_type = signature_record
+        .resolved_return_type()
+        .ok_or(GenericInterfaceMemberError::InvalidMember(property))?;
+    let parameters = interface
+        .reference
+        .resolved_type_arguments
+        .as_deref()
+        .ok_or(GenericInterfaceMemberError::InvalidTarget(reference.target))?;
+    let this_type = interface
+        .this_type
+        .ok_or(GenericInterfaceMemberError::InvalidTarget(reference.target))?;
+    if parameters.len() != reference.type_arguments.len()
+        || !signature_record.type_parameters().is_empty()
+        || signature_record.parameters().len() != parameter_types.len()
+    {
+        return Err(GenericInterfaceMemberError::InvalidMember(property));
+    }
+    Ok(PublishedArrayPropertyCallablePlan {
+        source,
+        signature: *signature,
+        parameter_types,
+        return_type,
+        mapper_sources: parameters
+            .iter()
+            .copied()
+            .chain(std::iter::once(this_type))
+            .collect(),
+        mapper_targets: reference
+            .type_arguments
+            .iter()
+            .copied()
+            .chain(std::iter::once(receiver))
+            .collect(),
+    })
+}
+
+/// Validates a receiver-specialized function-valued Array property.
+#[allow(clippy::too_many_lines)] // One proof covers the source signature and mapped proxies.
+pub(super) fn validate_instantiated_array_property_callable(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> InstantiatedArrayPropertyCallableValidation {
+    let not_callable = InstantiatedArrayPropertyCallableValidation::NotCallable;
+    let malformed = || InstantiatedArrayPropertyCallableValidation::Malformed;
+    let Some(record) = store.type_payload(type_) else {
+        return not_callable;
+    };
+    let TypeData::Object(object) = record.data() else {
+        return not_callable;
+    };
+    let (Some(source), Some(mapper), Some(property)) =
+        (object.target, object.mapper, record.symbol())
+    else {
+        return not_callable;
+    };
+    let Some(property_record) = store.symbol(property) else {
+        return malformed();
+    };
+    if !property_record.flags().contains(SymbolFlags::PROPERTY)
+        || !store.type_has_function_type_provenance(source)
+    {
+        return not_callable;
+    }
+    let Some(owner) = property_record
+        .parent()
+        .and_then(|parent| store.get_merged_symbol(parent))
+    else {
+        return malformed();
+    };
+    let Some(owner_record) = store.symbol(owner) else {
+        return malformed();
+    };
+    let Some(target) = store
+        .declared_type_links(owner)
+        .and_then(|links| links.declared_type)
+    else {
+        return malformed();
+    };
+    let Some(TypeData::Interface(interface)) =
+        store.type_payload(target).map(|record| record.data())
+    else {
+        return malformed();
+    };
+    let Some(parameters) = interface.reference.resolved_type_arguments.as_deref() else {
+        return malformed();
+    };
+    let Some(this_type) = interface.this_type else {
+        return malformed();
+    };
+    let Some(receiver) = store.map_type(mapper, this_type) else {
+        return malformed();
+    };
+    let Ok(reference) = validate_direct_generic_reference(store, receiver) else {
+        return malformed();
+    };
+    let mapper_sources = parameters
+        .iter()
+        .copied()
+        .chain(std::iter::once(this_type))
+        .collect::<Vec<_>>();
+    let mapper_targets = reference
+        .type_arguments
+        .iter()
+        .copied()
+        .chain(std::iter::once(receiver))
+        .collect::<Vec<_>>();
+    let Some([signature]) = object.structured.signatures.as_deref() else {
+        return malformed();
+    };
+    let Some(instantiated) = store.signature(*signature) else {
+        return malformed();
+    };
+    let Some(original_id) = instantiated.target() else {
+        return malformed();
+    };
+    let Some(original) = store.signature(original_id) else {
+        return malformed();
+    };
+    let Some(source_record) = store.type_payload(source) else {
+        return malformed();
+    };
+    let Some(source_structured) = source_record.data().structured() else {
+        return malformed();
+    };
+    let Some(original_types) = store.callable_signature_parameter_types(original_id) else {
+        return malformed();
+    };
+    let Some(return_type) = instantiated.resolved_return_type() else {
+        return malformed();
+    };
+    let Some(original_return) = original.resolved_return_type() else {
+        return malformed();
+    };
+    let targets = CanonicalArrayTargets::for_single_target_validation(target);
+    let global_owner = store
+        .intrinsic_bootstrap()
+        .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+        .and_then(|globals| globals.get(owner_record.name()))
+        .and_then(|owner| store.get_merged_symbol(owner));
+    if !matches!(
+        owner_record.name().as_utf8(),
+        Some("Array" | "ReadonlyArray")
+    ) || global_owner != Some(owner)
+        || reference.target != target
+        || parameters.len() != reference.type_arguments.len()
+        || store.type_mapper_has_exact_endpoints(mapper, &mapper_sources, &mapper_targets)
+            != Some(true)
+        || record.flags() != TypeFlags::OBJECT
+        || record.object_flags() != ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
+        || record.alias().is_some()
+        || object.structured.members.is_some()
+        || object.structured.properties.is_some()
+        || object.structured.call_signature_count != 1
+        || object.structured.index_infos.is_some()
+        || source_structured.signatures.as_deref() != Some(&[original_id])
+        || store.value_symbol_links(property)
+            != Some(&ValueSymbolLinks {
+                resolved_type: Some(source),
+                ..ValueSymbolLinks::default()
+            })
+        || instantiated.mapper() != Some(mapper)
+        || instantiated.declaration() != original.declaration()
+        || instantiated.parameters().len() != original.parameters().len()
+        || original.parameters().len() != original_types.len()
+        || !cached_instantiated_property_type_matches(
+            store,
+            original_return,
+            return_type,
+            mapper,
+            Some(targets),
+        )
+    {
+        return malformed();
+    }
+    let mut edges = Vec::with_capacity(original_types.len() + 1);
+    for ((parameter, original_parameter), template) in instantiated
+        .parameters()
+        .iter()
+        .zip(original.parameters())
+        .zip(original_types)
+    {
+        let Some(links) = store.value_symbol_links(*parameter) else {
+            return malformed();
+        };
+        let Some(type_) = links.resolved_type else {
+            return malformed();
+        };
+        let valid_links = if parameter == original_parameter {
+            links
+                == &(ValueSymbolLinks {
+                    resolved_type: Some(type_),
+                    ..ValueSymbolLinks::default()
+                })
+                && type_ == *template
+        } else {
+            links
+                == &(ValueSymbolLinks {
+                    resolved_type: Some(type_),
+                    target: Some(*original_parameter),
+                    mapper: Some(mapper),
+                    name_type: store
+                        .value_symbol_links(*original_parameter)
+                        .and_then(|links| links.name_type),
+                    ..ValueSymbolLinks::default()
+                })
+        };
+        if !valid_links
+            || !cached_instantiated_property_type_matches(
+                store,
+                *template,
+                type_,
+                mapper,
+                Some(targets),
+            )
+        {
+            return malformed();
+        }
+        edges.push(type_);
+    }
+    edges.push(return_type);
+    InstantiatedArrayPropertyCallableValidation::Valid(edges)
 }
 
 fn plan_published_interface_method(

@@ -125,6 +125,32 @@ pub(super) fn validate_stored_callable_set(
         }
     }
     let family = CallableFamily::DeclaredCallSignatures;
+    match super::instantiated_members::validate_instantiated_array_property_callable(store, type_) {
+        super::instantiated_members::InstantiatedArrayPropertyCallableValidation::NotCallable => {}
+        super::instantiated_members::InstantiatedArrayPropertyCallableValidation::Malformed => {
+            return StoredCallableSetValidation::Malformed { family };
+        }
+        super::instantiated_members::InstantiatedArrayPropertyCallableValidation::Valid(edges) => {
+            let Some(projection) =
+                validate_stored_callable_set_projection_with(store, type_, false, |signature| {
+                    store
+                        .signature(signature)?
+                        .parameters()
+                        .iter()
+                        .map(|parameter| store.value_symbol_links(*parameter)?.resolved_type)
+                        .collect()
+                })
+            else {
+                return StoredCallableSetValidation::Malformed { family };
+            };
+            return StoredCallableSetValidation::Valid {
+                family,
+                projection,
+                edges,
+            };
+        }
+    }
+    let family = CallableFamily::DeclaredCallSignatures;
     match validate_stored_declared_call_set(store, type_) {
         StoredDeclaredCallSetValidation::NotDeclaredCallSet => {}
         StoredDeclaredCallSetValidation::Malformed => {
