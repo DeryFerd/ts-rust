@@ -3,8 +3,8 @@
 //! This module deliberately supports only unmodified type aliases and simple
 //! interfaces, top-level nongeneric classes with primitive annotated fields
 //! and at most one exact direct preceding local nongeneric base,
-//! exact zero-argument construction of one preceding admitted no-base local
-//! class,
+//! exact construction of preceding admitted classes and declared constructors
+//! inside top-level values, assignments, property receivers, and statements,
 //! top-level literal enums, empty external-module markers, exact
 //! named ESM reexports,
 //! leading direct named ESM value imports, clause-level type-only named ESM
@@ -2778,6 +2778,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         SyntaxKind::Identifier
                             | SyntaxKind::StringLiteral
                             | SyntaxKind::PropertyAccessExpression
+                            | SyntaxKind::NewExpression
                     ) {
                         let expression = self.plan_expression(expression)?;
                         statements.push(PlannedStatement::ExpressionValue(expression));
@@ -4891,38 +4892,71 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             && statement_record.parent == Some(self.source.node_ref().node))
     }
 
-    fn is_direct_top_level_assignment_right(
+    /// Proves that constructor evaluation remains inside an admitted top-level expression.
+    fn is_top_level_constructor_expression(
         &self,
         expression: NodeRef,
     ) -> Result<bool, SourceCheckError> {
-        let Some(assignment) = self
-            .node(expression)?
-            .parent
-            .map(|node| self.reference(node))
-        else {
-            return Ok(false);
-        };
-        let assignment_record = self.node(assignment)?;
-        let NodeData::BinaryExpression(binary) = &assignment_record.data else {
-            return Ok(false);
-        };
-        let operator = self.reference(binary.operator_token);
-        if assignment_record.kind != SyntaxKind::BinaryExpression
-            || binary.right != expression.node
-            || self.node(operator)?.kind != SyntaxKind::EqualsToken
-        {
-            return Ok(false);
+        let mut current = expression;
+        let mut visited = HashSet::new();
+        loop {
+            if !visited.insert(current) {
+                return Ok(false);
+            }
+            let Some(parent) = self.node(current)?.parent.map(|node| self.reference(node)) else {
+                return Ok(false);
+            };
+            let record = self.node(parent)?;
+            match (&record.data, record.kind) {
+                (
+                    NodeData::ParenthesizedExpression(parenthesized),
+                    SyntaxKind::ParenthesizedExpression,
+                ) if parenthesized.expression == current.node => current = parent,
+                (NodeData::TypeAssertion(assertion), SyntaxKind::TypeAssertionExpression)
+                    if assertion.expression == current.node =>
+                {
+                    current = parent;
+                }
+                (NodeData::AsExpression(assertion), SyntaxKind::AsExpression)
+                    if assertion.expression == current.node =>
+                {
+                    current = parent;
+                }
+                (
+                    NodeData::PropertyAccessExpression(property),
+                    SyntaxKind::PropertyAccessExpression,
+                ) if property.expression == current.node => {
+                    current = parent;
+                }
+                (
+                    NodeData::ElementAccessExpression(element),
+                    SyntaxKind::ElementAccessExpression,
+                ) if element.expression == current.node => {
+                    current = parent;
+                }
+                (NodeData::CallExpression(call), SyntaxKind::CallExpression)
+                    if call.expression == current.node
+                        || call.arguments.nodes.contains(&current.node) =>
+                {
+                    current = parent;
+                }
+                (NodeData::BinaryExpression(binary), SyntaxKind::BinaryExpression)
+                    if binary.left == current.node || binary.right == current.node =>
+                {
+                    current = parent;
+                }
+                (NodeData::VariableDeclaration(variable), SyntaxKind::VariableDeclaration)
+                    if variable.initializer == Some(current.node) =>
+                {
+                    return self.is_direct_top_level_variable_initializer(current);
+                }
+                (NodeData::ExpressionStatement(statement), SyntaxKind::ExpressionStatement) => {
+                    return Ok(statement.expression == current.node
+                        && record.parent == Some(self.source.node_ref().node));
+                }
+                _ => return Ok(false),
+            }
         }
-        let Some(statement) = assignment_record.parent.map(|node| self.reference(node)) else {
-            return Ok(false);
-        };
-        let statement_record = self.node(statement)?;
-        let NodeData::ExpressionStatement(statement_data) = &statement_record.data else {
-            return Ok(false);
-        };
-        Ok(statement_record.kind == SyntaxKind::ExpressionStatement
-            && statement_record.parent == Some(self.source.node_ref().node)
-            && statement_data.expression == assignment.node)
     }
 
     fn is_recovered_missing_arrow_body(
@@ -12070,36 +12104,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 ))
             }
             SyntaxKind::NewExpression => {
-                let mut initializer = expression;
-                while let Some(parent) = self
-                    .node(initializer)?
-                    .parent
-                    .map(|node| self.reference(node))
-                {
-                    let parent_record = self.node(parent)?;
-                    let wraps_initializer = match (&parent_record.data, parent_record.kind) {
-                        (
-                            NodeData::TypeAssertion(assertion),
-                            SyntaxKind::TypeAssertionExpression,
-                        ) => assertion.expression == initializer.node,
-                        (NodeData::AsExpression(assertion), SyntaxKind::AsExpression) => {
-                            assertion.expression == initializer.node
-                        }
-                        (
-                            NodeData::ParenthesizedExpression(parenthesized),
-                            SyntaxKind::ParenthesizedExpression,
-                        ) => parenthesized.expression == initializer.node,
-                        _ => false,
-                    };
-                    if !wraps_initializer {
-                        break;
-                    }
-                    initializer = parent;
-                }
-                let direct_initializer =
-                    self.is_direct_top_level_variable_initializer(initializer)?;
-                let assignment_right = self.is_direct_top_level_assignment_right(initializer)?;
-                if !direct_initializer && !assignment_right {
+                if !self.is_top_level_constructor_expression(expression)? {
                     return Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::New(
                         expression,
                     )));
@@ -12118,11 +12123,6 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     expression,
                 )
                 .map_err(|error| Self::new_plan_error(expression, error))?;
-                if assignment_right && !construction.is_global_array_constructor() {
-                    return Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::New(
-                        expression,
-                    )));
-                }
                 self.default_news.push(construction.clone());
                 Ok(PlannedExpression::new(
                     expression,
@@ -16578,11 +16578,6 @@ fn check_expression_type(
             contextual_type,
         ),
         PlannedExpressionKind::New(construction) => {
-            if contextual_type.is_some() && !construction.is_global_array_constructor() {
-                return Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::New(
-                    construction.node(),
-                )));
-            }
             preflight_direct_default_new(store, host, construction)
                 .map_err(|error| SourcePlanner::new_plan_error(construction.node(), error))?;
             let checked = check_direct_default_new(store, host, construction)
@@ -16605,6 +16600,29 @@ fn check_expression_type(
                     != Some(checked.instance_type)
             {
                 return Err(SourceCheckError::Call(construction.node()));
+            }
+            let (arena, bound) = host.source(construction.node()).ok_or({
+                SourceCheckError::Provenance(SourceCheckProvenanceError::MissingNode(
+                    construction.node(),
+                ))
+            })?;
+            if let Some((code, name)) = construction
+                .constructor_accessibility_diagnostic(arena, bound, store)
+                .map_err(|error| SourcePlanner::new_plan_error(construction.node(), error))?
+            {
+                merge_retry_diagnostic(
+                    diagnostics,
+                    CanonicalCheckerDiagnostic {
+                        node: Some(construction.node()),
+                        range_override: None,
+                        diagnostic: Diagnostic::with_arguments(
+                            message_by_code(code)
+                                .ok_or(SourceCheckError::MissingDiagnostic(code))?,
+                            [name],
+                        ),
+                        related_information: Vec::new(),
+                    },
+                );
             }
             Ok(CheckedExpressionTypes::leaf(
                 checked.instance_type,

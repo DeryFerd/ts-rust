@@ -31,6 +31,7 @@ use super::{
         preflight_nongeneric_class_member_query,
     },
     declared::execute_type_parameter,
+    jsdoc::leading_jsdoc_comment,
     object_members::{PropertyObjectPlan, plan_interface, plan_type_literal},
     signatures::SignatureFlags,
     store::CachedSignatureLookup,
@@ -236,12 +237,98 @@ impl SourceDefaultNewPlan {
         self.resolved_symbol
     }
 
-    pub(super) const fn is_global_array_constructor(&self) -> bool {
-        matches!(self.target, SourceNewTarget::GlobalArray(_))
-    }
-
     fn arguments(&self) -> impl Iterator<Item = &SourceNewArgument> {
         self.argument.iter().chain(&self.additional_arguments)
+    }
+
+    /// Returns the exact access diagnostic for an authenticated class constructor.
+    pub(super) fn constructor_accessibility_diagnostic(
+        &self,
+        arena: &NodeArena,
+        bound: &BoundFile,
+        store: &CanonicalTypeMapperStore,
+    ) -> Result<Option<(u32, String)>, SourceNewError> {
+        let SourceNewTarget::Class(class) = &self.target else {
+            return Ok(None);
+        };
+        let code = match class.constructor_visibility() {
+            ClassConstructorVisibility::Private => Some(2673),
+            ClassConstructorVisibility::Protected => Some(2674),
+            ClassConstructorVisibility::Public => {
+                if !bound
+                    .source_facts()
+                    .is_some_and(ts_binder::CanonicalSourceFileFacts::is_javascript_file)
+                {
+                    return Ok(None);
+                }
+                let Some(constructor) = class.constructor_declaration() else {
+                    return Ok(None);
+                };
+                let comment = leading_jsdoc_comment(arena, constructor)
+                    .map_err(|_| invariant(SourceNewInvariant::InvalidClassPlan(constructor)))?;
+                let Some(comment) = comment else {
+                    return Ok(None);
+                };
+                let source = arena
+                    .source_text()
+                    .ok_or_else(|| invariant(SourceNewInvariant::InvalidClassPlan(constructor)))?;
+                let range = comment.range();
+                let start = usize::try_from(range.start.get())
+                    .map_err(|_| invariant(SourceNewInvariant::InvalidClassPlan(constructor)))?;
+                let end = usize::try_from(range.end.get())
+                    .map_err(|_| invariant(SourceNewInvariant::InvalidClassPlan(constructor)))?;
+                let comment = source
+                    .get(start..end)
+                    .ok_or_else(|| invariant(SourceNewInvariant::InvalidClassPlan(constructor)))?;
+                let parsed = ts_parser::parse_jsdoc_comment(comment);
+                if !parsed.diagnostics.is_empty() {
+                    return Err(invariant(SourceNewInvariant::InvalidClassPlan(constructor)));
+                }
+                let root = parsed
+                    .arena
+                    .get(parsed.jsdoc)
+                    .ok_or_else(|| invariant(SourceNewInvariant::InvalidClassPlan(constructor)))?;
+                let NodeData::JsDoc(jsdoc) = &root.data else {
+                    return Err(invariant(SourceNewInvariant::InvalidClassPlan(constructor)));
+                };
+                let Some(tags) = jsdoc.tags.as_ref() else {
+                    return Ok(None);
+                };
+                let mut accessibility = None;
+                for tag in &tags.nodes {
+                    let record = parsed.arena.get(*tag).ok_or_else(|| {
+                        invariant(SourceNewInvariant::InvalidClassPlan(constructor))
+                    })?;
+                    let NodeData::JsDocUnknownTag(tag) = &record.data else {
+                        return Err(invariant(SourceNewInvariant::InvalidClassPlan(constructor)));
+                    };
+                    let name = parsed.arena.get(tag.tag_name).ok_or_else(|| {
+                        invariant(SourceNewInvariant::InvalidClassPlan(constructor))
+                    })?;
+                    let NodeData::Identifier(identifier) = &name.data else {
+                        return Err(invariant(SourceNewInvariant::InvalidClassPlan(constructor)));
+                    };
+                    let code = match identifier.text.as_str() {
+                        "private" => 2673,
+                        "protected" => 2674,
+                        _ => continue,
+                    };
+                    if accessibility.replace(code).is_some() {
+                        return Err(invariant(SourceNewInvariant::InvalidClassPlan(constructor)));
+                    }
+                }
+                accessibility
+            }
+        };
+        let Some(code) = code else {
+            return Ok(None);
+        };
+        let name = store
+            .symbol(self.resolved_symbol)
+            .and_then(|symbol| symbol.name().as_utf8())
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| invariant(SourceNewInvariant::InvalidSymbol(self.resolved_symbol)))?;
+        Ok(Some((code, name.to_owned())))
     }
 }
 
@@ -508,12 +595,6 @@ pub(super) fn plan_direct_default_new(
             return Err(invariant(SourceNewInvariant::InvalidClassPlan(
                 class.declaration(),
             )));
-        }
-        if class.constructor_visibility() != ClassConstructorVisibility::Public {
-            return Err(unsupported(SourceNewUnsupported::ConstructorClass {
-                node: constructor,
-                symbol,
-            }));
         }
         preflight_nongeneric_class_member_query(store, host, &class)?;
         let parameter = constructor_parameter(store, host, &class)?;
@@ -2843,7 +2924,7 @@ mod tests {
         CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
         EscapedName,
     };
-    use ts_parser::{ParseResult, parse_source_file};
+    use ts_parser::{ParseResult, parse_javascript_source_file, parse_source_file};
 
     use super::*;
     use crate::semantic::{
@@ -2868,6 +2949,32 @@ mod tests {
             .unwrap();
         binder
             .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            [(file, &parsed.arena)].into_iter().collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap()
+    }
+
+    fn javascript_context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/class-default-new.js\""),
+                    CanonicalSourceLanguage::JavaScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_javascript_declaration_slice(&parsed.arena, file)
             .unwrap();
         CanonicalCheckerContext::new(
             binder.finish(),
@@ -4140,6 +4247,197 @@ mod tests {
             );
             assert!(context.store().declared_type_links(owner).is_none());
             assert!(context.store().value_symbol_links(owner).is_none());
+        }
+    }
+
+    #[test]
+    fn constructor_expressions_publish_real_signatures_in_top_level_expression_positions() {
+        for (index, source) in [
+            "class Model {} new Model();",
+            "class Model {} let current: Model; current = new Model();",
+            "class Model {} const current: Model = new Model();",
+            "class Model { value!: number; } const value = new Model().value;",
+            "class Model { run(): void {} } new Model().run();",
+            concat!(
+                "declare const factory: { new(): string }; ",
+                "let value: string = ''; value = new factory();",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let parsed = parse_source_file(source);
+            assert!(
+                parsed.diagnostics.is_empty(),
+                "{source}: {:?}",
+                parsed.diagnostics
+            );
+            let file = FileId::new(1_820 + u32::try_from(index).unwrap());
+            let mut context = context(&parsed, file);
+
+            context.check_source_file(file).unwrap();
+
+            let constructions = parsed
+                .arena
+                .iter()
+                .filter_map(|(node, record)| {
+                    (record.kind == SyntaxKind::NewExpression).then_some(NodeRef::new(
+                        parsed.arena.id(),
+                        file,
+                        node,
+                    ))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(constructions.len(), 1, "{source}");
+            let construction = constructions[0];
+            let signature = context
+                .store()
+                .signature_links(construction)
+                .and_then(|links| links.resolved_signature.signature())
+                .unwrap();
+            assert!(
+                context
+                    .store()
+                    .signature(signature)
+                    .is_some_and(|signature| signature.flags().contains(SignatureFlags::CONSTRUCT)),
+                "{source}",
+            );
+            assert!(
+                context
+                    .store()
+                    .type_node_links(construction)
+                    .and_then(|links| links.resolved_type)
+                    .is_some(),
+                "{source}",
+            );
+            assert!(context.diagnostics().is_empty(), "{source}");
+            let warm = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.diagnostics().clone(),
+            );
+
+            context.recheck_source_file(file).unwrap();
+
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    context.diagnostics().clone(),
+                ),
+                warm,
+                "{source}",
+            );
+        }
+    }
+
+    #[test]
+    fn constructor_assignment_results_retain_exact_target_diagnostics() {
+        let parsed = parse_source_file(concat!(
+            "declare const factory: { new(): string }; ",
+            "let value: number = 0; ",
+            "value = new factory();",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(1_826);
+        let mut context = context(&parsed, file);
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("the incompatible constructor assignment must produce one diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2322);
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "Type 'string' is not assignable to type 'number'.",
+        );
+    }
+
+    #[test]
+    fn inaccessible_class_constructor_calls_report_exact_source_diagnostics() {
+        for (index, source, javascript, expected_code, name) in [
+            (
+                "class Secret { private constructor() {} } new Secret();",
+                false,
+                2673,
+                "Secret",
+            ),
+            (
+                "class Base { protected constructor() {} } new Base();",
+                false,
+                2674,
+                "Base",
+            ),
+            (
+                "class Secret { /** @private */ constructor() {} } new Secret();",
+                true,
+                2673,
+                "Secret",
+            ),
+            (
+                "class Base { /** @protected */ constructor() {} } new Base();",
+                true,
+                2674,
+                "Base",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let parsed = if javascript {
+                parse_javascript_source_file(source)
+            } else {
+                parse_source_file(source)
+            };
+            assert!(
+                parsed.diagnostics.is_empty(),
+                "{source}: {:?}",
+                parsed.diagnostics
+            );
+            let file = FileId::new(1_827 + u32::try_from(index).unwrap());
+            let mut context = if javascript {
+                javascript_context(&parsed, file)
+            } else {
+                context(&parsed, file)
+            };
+
+            context.check_source_file(file).unwrap();
+
+            let [diagnostic] = context.diagnostics().as_slice() else {
+                panic!("{source} must produce one constructor accessibility diagnostic")
+            };
+            assert_eq!(diagnostic.diagnostic.code(), expected_code, "{source}");
+            assert_eq!(
+                diagnostic.diagnostic.arguments,
+                vec![name.to_owned()],
+                "{source}",
+            );
+            let node = diagnostic.node.unwrap();
+            assert_eq!(
+                parsed.arena.get(node.node).unwrap().kind,
+                SyntaxKind::NewExpression,
+                "{source}",
+            );
+            let warm = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.diagnostics().clone(),
+            );
+
+            context.recheck_source_file(file).unwrap();
+
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.diagnostics().clone(),
+                ),
+                warm,
+                "{source}",
+            );
         }
     }
 
