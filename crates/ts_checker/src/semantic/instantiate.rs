@@ -14,18 +14,23 @@ use super::{
     TypeAliasId, TypeId, TypeMapperId,
     array_types::{ArrayTypeError, CanonicalArrayTargets},
     bootstrap::LiteralTypeCacheError,
-    declared::type_list_key,
+    declared::{cached_ordinary_type_parameter_owner, type_list_key},
     intersection_types::{DeferredIntersectionTypeProjection, IntersectionTypeError},
     mapper::{CanonicalTypeMapperStore, TypeMapperApplication},
+    object_members::{
+        DeclaredPropertyObjectValidation, validate_resolved_declared_property_object,
+    },
     reference_types::{
         DirectGenericReference, DirectGenericReferenceError, create_direct_generic_reference,
         validate_direct_generic_reference,
     },
+    store::SourceNodeParent,
     template_types::TemplateTypeError,
     type_records::{TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
 };
-use ts_binder::{SemanticSymbolId, SymbolFlags};
+use ts_ast::SyntaxKind;
+use ts_binder::{CheckFlags, SemanticSymbolId, SymbolFlags};
 
 /// Pinned checker limits for one instantiation query.
 ///
@@ -604,6 +609,20 @@ fn could_contain_installed_type_variables_worker(
         .ok_or(InstantiationError::InvalidType(type_))?;
     let result = match record.data() {
         TypeData::Intrinsic(_) | TypeData::Literal(_) | TypeData::UniqueEsSymbol(_) => Ok(false),
+        TypeData::Object(_)
+            if store
+                .intrinsic_bootstrap()
+                .is_some_and(|bootstrap| type_ == bootstrap.empty_type_literal_type) =>
+        {
+            if matches!(
+                validate_resolved_declared_property_object(store, type_),
+                DeclaredPropertyObjectValidation::Valid(_)
+            ) {
+                Ok(false)
+            } else {
+                Err(InstantiationError::UnsupportedType(type_))
+            }
+        }
         TypeData::TemplateLiteral(template) => {
             if template.types.is_empty() || template.texts.len() != template.types.len() + 1 {
                 Err(TemplateTypeError::InvalidTemplate(type_).into())
@@ -1641,12 +1660,196 @@ fn instantiate_intersection(
         return Ok(source);
     }
 
+    if let Some(reduced) = reduce_default_library_non_nullable_intersection(
+        store,
+        source,
+        projection,
+        &constituents,
+        &alias_arguments,
+        array_targets,
+    )? {
+        return Ok(reduced);
+    }
+
     let alias = projection
         .alias_symbol
         .map(|symbol| (symbol, alias_arguments.as_slice()));
     store
         .canonical_deferred_intersection_type(&constituents, alias)
         .map_err(|error| deferred_intersection_error(source, error))
+}
+
+fn authenticated_default_library_non_nullable_empty_object(
+    store: &CanonicalTypeMapperStore,
+    projection: &DeferredIntersectionTypeProjection,
+) -> Option<TypeId> {
+    let bootstrap = store.intrinsic_bootstrap()?;
+    let alias = projection.alias_symbol?;
+    let [parameter, empty_object] = projection.types.as_slice() else {
+        return None;
+    };
+    let [argument] = projection.alias_arguments.as_slice() else {
+        return None;
+    };
+    if argument != parameter
+        || *empty_object != bootstrap.empty_type_literal_type
+        || !matches!(
+            validate_resolved_declared_property_object(store, *empty_object),
+            DeclaredPropertyObjectValidation::Valid(_)
+        )
+        || store
+            .symbol_table(bootstrap.globals)
+            .and_then(|globals| globals.get_source("NonNullable"))
+            .and_then(|global| store.get_merged_symbol(global))
+            != Some(alias)
+    {
+        return None;
+    }
+
+    let owner = store.symbol(alias)?;
+    let [declaration] = owner.declarations()? else {
+        return None;
+    };
+    let SourceNodeParent::Parent(source_file) = store.source_node_parent(*declaration)? else {
+        return None;
+    };
+    if owner.flags() != SymbolFlags::TYPE_ALIAS
+        || owner.check_flags() != CheckFlags::NONE
+        || owner.name().as_utf8() != Some("NonNullable")
+        || owner.parent().is_some()
+        || owner.value_declaration().is_some()
+        || owner.members().is_some()
+        || owner.exports().is_some()
+        || owner.export_symbol().is_some()
+        || store.get_merged_symbol(alias) != Some(alias)
+        || store.source_node_kind(*declaration) != Some(SyntaxKind::TypeAliasDeclaration)
+        || store.source_node_kind(source_file) != Some(SyntaxKind::SourceFile)
+    {
+        return None;
+    }
+
+    let links = store.type_alias_links(alias)?;
+    let [declared_parameter] = links.type_parameters.as_deref()? else {
+        return None;
+    };
+    let declared_type = links.declared_type?;
+    if links
+        .instantiations
+        .as_ref()?
+        .get(&type_list_key(&[*declared_parameter]))
+        != Some(&declared_type)
+    {
+        return None;
+    }
+
+    let declared_owner = cached_ordinary_type_parameter_owner(store, *declared_parameter)?;
+    let declared_symbol = store.symbol(declared_owner)?;
+    let [parameter_declaration] = declared_symbol.declarations()? else {
+        return None;
+    };
+    if declared_symbol.flags() != SymbolFlags::TYPE_PARAMETER
+        || declared_symbol.check_flags() != CheckFlags::NONE
+        || declared_symbol.name().as_utf8() != Some("T")
+        || declared_symbol.parent().is_some()
+        || declared_symbol.value_declaration().is_some()
+        || declared_symbol.members().is_some()
+        || declared_symbol.exports().is_some()
+        || declared_symbol.export_symbol().is_some()
+        || store.get_merged_symbol(declared_owner) != Some(declared_owner)
+        || store.source_node_kind(*parameter_declaration) != Some(SyntaxKind::TypeParameter)
+        || store.source_node_parent(*parameter_declaration)
+            != Some(SourceNodeParent::Parent(*declaration))
+        || cached_ordinary_type_parameter_owner(store, *parameter).is_none()
+    {
+        return None;
+    }
+
+    let declared = store
+        .validate_deferred_intersection_type(declared_type)
+        .ok()?;
+    (declared.alias_symbol == Some(alias)
+        && declared.alias_arguments == [*declared_parameter]
+        && declared.types == [*declared_parameter, *empty_object])
+    .then_some(*empty_object)
+}
+
+fn reduce_default_library_non_nullable_intersection(
+    store: &CanonicalTypeMapperStore,
+    source: TypeId,
+    projection: &DeferredIntersectionTypeProjection,
+    constituents: &[TypeId],
+    alias_arguments: &[TypeId],
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<Option<TypeId>, InstantiationError> {
+    let Some(empty_object) =
+        authenticated_default_library_non_nullable_empty_object(store, projection)
+    else {
+        return Ok(None);
+    };
+    let [argument, mapped_empty_object] = constituents else {
+        return Err(InstantiationError::UnsupportedType(source));
+    };
+    let [mapped_argument] = alias_arguments else {
+        return Err(InstantiationError::UnsupportedType(source));
+    };
+    if argument != mapped_argument || *mapped_empty_object != empty_object {
+        return Err(InstantiationError::UnsupportedType(source));
+    }
+
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(InstantiationError::UnsupportedType(source))?;
+    let record = store
+        .type_payload(*argument)
+        .ok_or(InstantiationError::InvalidType(*argument))?;
+    if matches!(record.data(), TypeData::TypeParameter(_)) {
+        return Ok(None);
+    }
+    if record.flags().intersects(TypeFlags::NULLABLE) {
+        return Ok(Some(bootstrap.never_type));
+    }
+    if record.flags().intersects(TypeFlags::UNKNOWN) {
+        return Ok(Some(empty_object));
+    }
+    if record
+        .flags()
+        .intersects(TypeFlags::ANY | TypeFlags::NEVER | TypeFlags::DEFINITELY_NON_NULLABLE)
+    {
+        return Ok(Some(*argument));
+    }
+
+    let TypeData::Union(union) = record.data() else {
+        return Err(InstantiationError::UnsupportedType(source));
+    };
+    match array_targets {
+        Some(targets) => {
+            store.validate_cached_union_result_with_array_targets(targets, *argument, None)
+        }
+        None => store.validate_cached_union_result(*argument, None),
+    }
+    .map_err(InstantiationError::Union)?;
+
+    let mut survivor = None;
+    for constituent in &union.union.types {
+        let constituent_record = store
+            .type_payload(*constituent)
+            .ok_or(InstantiationError::InvalidType(*constituent))?;
+        if constituent_record.flags().intersects(TypeFlags::NULLABLE) {
+            continue;
+        }
+        if !constituent_record
+            .flags()
+            .intersects(TypeFlags::DEFINITELY_NON_NULLABLE)
+            || survivor.replace(*constituent).is_some()
+        {
+            return Err(if record.alias().is_some() {
+                InstantiationError::UnsupportedAliasedUnion(*argument)
+            } else {
+                InstantiationError::UnsupportedType(source)
+            });
+        }
+    }
+    Ok(Some(survivor.unwrap_or(bootstrap.never_type)))
 }
 
 fn deferred_intersection_error(source: TypeId, error: IntersectionTypeError) -> InstantiationError {
@@ -2307,6 +2510,30 @@ mod tests {
             Ok(source),
         );
         assert_eq!(deferred_intersection_store_state(&fixture.store), before);
+    }
+
+    #[test]
+    fn canonical_empty_type_literal_identity_rejects_incomplete_object_or_symbol_state() {
+        for poison_symbol in [false, true] {
+            let mut store = initialized_store();
+            let (empty_object, string) = {
+                let bootstrap = store.intrinsic_bootstrap().unwrap();
+                (bootstrap.empty_type_literal_type, bootstrap.string_type)
+            };
+            assert_eq!(
+                could_contain_installed_type_variables(&store, empty_object, None),
+                Ok(false),
+            );
+            if poison_symbol {
+                assert!(store.set_type_symbol(empty_object, None));
+            } else {
+                assert!(store.set_resolved_base_constraint(empty_object, Some(string)));
+            }
+            assert_eq!(
+                could_contain_installed_type_variables(&store, empty_object, None),
+                Err(InstantiationError::UnsupportedType(empty_object)),
+            );
+        }
     }
 
     #[test]

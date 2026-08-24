@@ -356,6 +356,14 @@ struct ReactDetailedHtmlPropsPlan {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DefaultLibraryNonNullablePlan {
+    parameter: SemanticSymbolId,
+    intersection: NodeRef,
+    parameter_reference: NodeRef,
+    empty_object: NodeRef,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PlannedTypeParameter {
     declaration: NodeRef,
     symbol: SemanticSymbolId,
@@ -411,6 +419,7 @@ struct TypeQueryPlan {
     keyofs: BTreeMap<NodeRef, NodeRef>,
     aliases: BTreeMap<SemanticSymbolId, TypeAliasPlan>,
     react_detailed_html_props_aliases: BTreeMap<SemanticSymbolId, ReactDetailedHtmlPropsPlan>,
+    default_library_non_nullable_aliases: BTreeMap<SemanticSymbolId, DefaultLibraryNonNullablePlan>,
     recursive_mapped_aliases: BTreeMap<SemanticSymbolId, NodeRef>,
     references: BTreeMap<NodeRef, PlannedTypeReference>,
     recovered_missing_references: BTreeMap<NodeRef, NodeRef>,
@@ -3478,7 +3487,15 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 .copied()
                 .filter(|planned| planned.intersection == node)
         });
+        let non_nullable_alias = alias_symbol.and_then(|alias| {
+            self.plan
+                .default_library_non_nullable_aliases
+                .get(&alias)
+                .copied()
+                .filter(|planned| planned.intersection == node)
+        });
         if react_alias.is_none()
+            && non_nullable_alias.is_none()
             && alias_symbol.is_some_and(|alias| {
                 self.plan
                     .aliases
@@ -3546,6 +3563,17 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     TypeNodeUnavailable::UnsupportedIntersectionConstituent(node),
                 ));
             }
+        } else if let Some(non_nullable_alias) = non_nullable_alias {
+            if types.as_slice()
+                != [
+                    non_nullable_alias.parameter_reference,
+                    non_nullable_alias.empty_object,
+                ]
+            {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::UnsupportedIntersectionConstituent(node),
+                ));
+            }
         } else {
             let mut validating = HashSet::new();
             for constituent in &types {
@@ -3557,7 +3585,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 TypeNodeUnavailable::ImportAliasCapabilityUnsupported(node),
             ));
         }
-        let derived_alias = if react_alias.is_some() {
+        let derived_alias = if react_alias.is_some() || non_nullable_alias.is_some() {
             alias_symbol
         } else {
             self.direct_union_alias(node)?
@@ -4214,8 +4242,13 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                                         .contains(ObjectFlags::MEMBERS_RESOLVED)
                                 });
                         if deferred {
-                            let Some(react_alias) =
-                                self.authenticated_react_detailed_html_props_alias(symbol)
+                            let non_nullable_alias =
+                                self.authenticated_default_library_non_nullable_alias(symbol);
+                            let authenticated_intersection = self
+                                .authenticated_react_detailed_html_props_alias(symbol)
+                                .map(|alias| alias.intersection)
+                                .or_else(|| non_nullable_alias.map(|alias| alias.intersection));
+                            let Some(authenticated_intersection) = authenticated_intersection
                             else {
                                 return Err(type_node_unavailable(
                                     TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
@@ -4234,13 +4267,45 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                                         TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
                                     )
                                 })?;
-                            if react_alias.intersection != intersection
+                            if authenticated_intersection != intersection
                                 || projection.alias_symbol != Some(symbol)
                                 || projection.alias_arguments != expected_arguments
                             {
                                 return Err(type_node_unavailable(
                                     TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
                                 ));
+                            }
+                            if let Some(non_nullable_alias) = non_nullable_alias {
+                                let [parameter] = expected_arguments else {
+                                    return Err(type_node_unavailable(
+                                        TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
+                                    ));
+                                };
+                                let empty_object = self
+                                    .store
+                                    .intrinsic_bootstrap()
+                                    .map(|bootstrap| bootstrap.empty_type_literal_type)
+                                    .ok_or(DeclaredTypeError::Unavailable(
+                                        DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
+                                    ))?;
+                                if projection.types != [*parameter, empty_object]
+                                    || cached_ordinary_type_parameter_owner(self.store, *parameter)
+                                        != Some(non_nullable_alias.parameter)
+                                    || self
+                                        .store
+                                        .type_node_links(non_nullable_alias.parameter_reference)
+                                        .and_then(|links| links.resolved_type)
+                                        != Some(*parameter)
+                                    || self
+                                        .store
+                                        .type_node_links(non_nullable_alias.empty_object)
+                                        .and_then(|links| links.resolved_type)
+                                        != Some(empty_object)
+                                {
+                                    return Err(type_node_unavailable(
+                                        TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
+                                    ));
+                                }
                             }
                         } else {
                             self.store
@@ -4658,6 +4723,29 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                                 .is_some_and(|instantiation| *instantiation == declared_type)
                         };
                         if is_cached_instantiation {
+                            if let Some(non_nullable_alias) =
+                                self.authenticated_default_library_non_nullable_alias(canonical)
+                            {
+                                let type_arguments = self
+                                    .type_reference_argument_nodes(reference)?
+                                    .into_iter()
+                                    .map(|argument| {
+                                        self.cached_type_node_identity(root_symbol, argument)
+                                    })
+                                    .collect::<Result<Vec<_>, _>>()?;
+                                let [argument] = type_arguments.as_slice() else {
+                                    return Err(type_node_unavailable(
+                                        TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
+                                    ));
+                                };
+                                self.validate_cached_non_nullable_instantiation(
+                                    root_symbol,
+                                    canonical,
+                                    non_nullable_alias,
+                                    *argument,
+                                    declared_type,
+                                )?;
+                            }
                             if matches!(
                                 self.store
                                     .type_payload(target_cached.declared_type)
@@ -4743,6 +4831,78 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     symbol = canonical;
                 }
             }
+        }
+    }
+
+    fn validate_cached_non_nullable_instantiation(
+        &self,
+        root_symbol: SemanticSymbolId,
+        alias: SemanticSymbolId,
+        proof: DefaultLibraryNonNullablePlan,
+        argument: TypeId,
+        actual: TypeId,
+    ) -> Result<(), DeclaredTypeError> {
+        let invalid =
+            || type_node_unavailable(TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol));
+        let bootstrap = self.store.intrinsic_bootstrap().ok_or({
+            DeclaredTypeError::Unavailable(
+                DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
+            )
+        })?;
+        let empty_object = bootstrap.empty_type_literal_type;
+        if self
+            .store
+            .type_node_links(proof.empty_object)
+            .and_then(|links| links.resolved_type)
+            != Some(empty_object)
+        {
+            return Err(invalid());
+        }
+        let record = self.store.type_payload(argument).ok_or_else(invalid)?;
+        if matches!(record.data(), TypeData::TypeParameter(_)) {
+            let projection = self
+                .store
+                .validate_deferred_intersection_type(actual)
+                .map_err(|_| invalid())?;
+            return if projection.alias_symbol == Some(alias)
+                && projection.alias_arguments == [argument]
+                && projection.types == [argument, empty_object]
+            {
+                Ok(())
+            } else {
+                Err(invalid())
+            };
+        }
+
+        let expected = if record.flags().intersects(TypeFlags::NULLABLE) {
+            bootstrap.never_type
+        } else if record.flags().intersects(TypeFlags::UNKNOWN) {
+            empty_object
+        } else if record
+            .flags()
+            .intersects(TypeFlags::ANY | TypeFlags::NEVER | TypeFlags::DEFINITELY_NON_NULLABLE)
+        {
+            argument
+        } else if let TypeData::Union(union) = record.data() {
+            self.validate_cached_union_result(argument, None)
+                .map_err(|_| invalid())?;
+            let mut survivors = union.union.types.iter().filter(|type_| {
+                self.store
+                    .type_payload(**type_)
+                    .is_some_and(|record| !record.flags().intersects(TypeFlags::NULLABLE))
+            });
+            let first = survivors.next().copied().unwrap_or(bootstrap.never_type);
+            if survivors.next().is_some() {
+                return Err(invalid());
+            }
+            first
+        } else {
+            return Err(invalid());
+        };
+        if actual == expected {
+            Ok(())
+        } else {
+            Err(invalid())
         }
     }
 
@@ -5768,7 +5928,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             && !cached_type.is_some_and(|cached| is_instantiated_mapped_type(self.store, cached))
             && !qualified
             && !source_parameter_constraint
-            && !matches!(name_text, "Array" | "ReadonlyArray")
+            && !matches!(name_text, "Array" | "ReadonlyArray" | "NonNullable")
         {
             return Ok(());
         }
@@ -6481,6 +6641,164 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             .and_then(|globals| globals.get_source(name))
             .and_then(|global| self.store.get_merged_symbol(global))
             == Some(symbol)
+    }
+
+    fn authenticated_default_library_non_nullable_alias(
+        &self,
+        alias: SemanticSymbolId,
+    ) -> Option<DefaultLibraryNonNullablePlan> {
+        if !self.global_symbol_has_name(alias, "NonNullable") {
+            return None;
+        }
+        let owner = self.store.symbol(alias)?;
+        let [declaration] = owner.declarations()? else {
+            return None;
+        };
+        let declaration = *declaration;
+        let bound = self.host.bound_file(declaration)?;
+        let facts = bound.source_facts()?;
+        let declaration_record = preflight_node(self.store, self.host, declaration).ok()?;
+        let NodeData::TypeAliasDeclaration(data) = &declaration_record.data else {
+            return None;
+        };
+        let name = NodeRef::new(declaration.arena, declaration.file, data.name);
+        let name_record = preflight_node(self.store, self.host, name).ok()?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return None;
+        };
+        if owner.flags() != SymbolFlags::TYPE_ALIAS
+            || owner.check_flags() != CheckFlags::NONE
+            || owner.parent().is_some()
+            || owner.value_declaration().is_some()
+            || owner.members().is_some()
+            || owner.exports().is_some()
+            || owner.export_symbol().is_some()
+            || owner.name().as_utf8() != Some("NonNullable")
+            || self.store.get_merged_symbol(alias) != Some(alias)
+            || !facts.is_default_library()
+            || !facts.is_declaration_file()
+            || facts.is_javascript_file()
+            || facts.is_external_module()
+            || facts.is_common_js_module()
+            || declaration_record.kind != SyntaxKind::TypeAliasDeclaration
+            || declaration_record.flags.0 != 0
+            || declaration_record.parent != Some(bound.source_file().node)
+            || !self.host.symbol_matches(self.store, declaration, alias)
+            || bound
+                .symbol(declaration)
+                .and_then(|symbol| self.store.get_merged_symbol(symbol))
+                != Some(alias)
+            || data.flow_node.is_some()
+            || data.local_symbol.is_some()
+            || data.next_container.is_some()
+            || data.symbol.is_some()
+            || data.modifiers.is_some()
+            || name_record.kind != SyntaxKind::Identifier
+            || name_record.flags.0 != 0
+            || name_record.parent != Some(declaration.node)
+            || identifier.text != "NonNullable"
+            || identifier.flow_node.is_some()
+        {
+            return None;
+        }
+
+        let parameters = data.type_parameters.as_ref()?;
+        let [parameter_id] = parameters.nodes.as_slice() else {
+            return None;
+        };
+        let parameter = NodeRef::new(declaration.arena, declaration.file, *parameter_id);
+        let parameter_record = preflight_node(self.store, self.host, parameter).ok()?;
+        let NodeData::TypeParameterDeclaration(parameter_data) = &parameter_record.data else {
+            return None;
+        };
+        let parameter_name = NodeRef::new(parameter.arena, parameter.file, parameter_data.name);
+        let parameter_name_record = preflight_node(self.store, self.host, parameter_name).ok()?;
+        let NodeData::Identifier(parameter_identifier) = &parameter_name_record.data else {
+            return None;
+        };
+        let parameter_symbol = bound
+            .symbol(parameter)
+            .and_then(|symbol| self.store.get_merged_symbol(symbol))?;
+        let parameter_owner = self.store.symbol(parameter_symbol)?;
+        let locals = bound
+            .locals(declaration)
+            .and_then(|locals| self.store.symbol_table(locals))?;
+        if parameters.has_trailing_comma
+            || parameter_record.kind != SyntaxKind::TypeParameter
+            || parameter_record.flags.0 != 0
+            || parameter_record.parent != Some(declaration.node)
+            || parameter_data.constraint.is_some()
+            || parameter_data.default_type.is_some()
+            || parameter_data.expression.is_some()
+            || parameter_data.symbol.is_some()
+            || parameter_data.modifiers.is_some()
+            || parameter_owner.flags() != SymbolFlags::TYPE_PARAMETER
+            || parameter_owner.check_flags() != CheckFlags::NONE
+            || parameter_owner.name().as_utf8() != Some("T")
+            || parameter_owner.declarations() != Some(&[parameter])
+            || parameter_owner.parent().is_some()
+            || parameter_owner.value_declaration().is_some()
+            || parameter_owner.members().is_some()
+            || parameter_owner.exports().is_some()
+            || parameter_owner.export_symbol().is_some()
+            || locals.len() != 1
+            || locals.get_source("T") != Some(parameter_symbol)
+            || !self
+                .host
+                .symbol_matches(self.store, parameter, parameter_symbol)
+            || parameter_name_record.kind != SyntaxKind::Identifier
+            || parameter_name_record.flags.0 != 0
+            || parameter_name_record.parent != Some(parameter.node)
+            || parameter_identifier.text != "T"
+            || parameter_identifier.flow_node.is_some()
+        {
+            return None;
+        }
+
+        let intersection = NodeRef::new(declaration.arena, declaration.file, data.type_);
+        let intersection_record = preflight_node(self.store, self.host, intersection).ok()?;
+        let NodeData::IntersectionTypeNode(body) = &intersection_record.data else {
+            return None;
+        };
+        let [reference_id, empty_id] = body.types.nodes.as_slice() else {
+            return None;
+        };
+        let parameter_reference =
+            NodeRef::new(intersection.arena, intersection.file, *reference_id);
+        let empty_object = NodeRef::new(intersection.arena, intersection.file, *empty_id);
+        let empty_record = preflight_node(self.store, self.host, empty_object).ok()?;
+        let NodeData::TypeLiteralNode(empty) = &empty_record.data else {
+            return None;
+        };
+        if intersection_record.kind != SyntaxKind::IntersectionType
+            || intersection_record.flags.0 != 0
+            || intersection_record.parent != Some(declaration.node)
+            || body.types.has_trailing_comma
+            || body.types.range != intersection_record.range
+            || !self.react_detailed_html_props_parameter_reference(
+                parameter_reference,
+                intersection,
+                "T",
+                parameter_symbol,
+            )
+            || empty_record.kind != SyntaxKind::TypeLiteral
+            || empty_record.flags.0 != 0
+            || empty_record.parent != Some(intersection.node)
+            || !empty.members.nodes.is_empty()
+            || empty.members.has_trailing_comma
+            || empty.members.range != empty_record.range
+            || empty.symbol.is_some()
+            || object_members::plan_type_literal(self.store, self.host, empty_object, None).is_err()
+        {
+            return None;
+        }
+
+        Some(DefaultLibraryNonNullablePlan {
+            parameter: parameter_symbol,
+            intersection,
+            parameter_reference,
+            empty_object,
+        })
     }
 
     fn react_detailed_html_props_identifier(
@@ -9415,6 +9733,27 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             self.plan
                 .react_detailed_html_props_aliases
                 .insert(symbol, react_alias);
+        }
+        if let Some(non_nullable_alias) =
+            self.authenticated_default_library_non_nullable_alias(symbol)
+        {
+            self.plan
+                .default_library_non_nullable_aliases
+                .insert(symbol, non_nullable_alias);
+        }
+        if let Some(cached) = cached
+            && let Some(alias) = self
+                .store
+                .type_payload(cached.declared_type)
+                .and_then(TypeRecord::alias)
+                .and_then(|identity| self.store.type_alias(identity))
+                .and_then(super::type_records::TypeAlias::symbol)
+            && let Some(non_nullable_alias) =
+                self.authenticated_default_library_non_nullable_alias(alias)
+        {
+            self.plan
+                .default_library_non_nullable_aliases
+                .insert(alias, non_nullable_alias);
         }
         if let Some(constraint) =
             self.recursive_mapped_alias_constraint(symbol, type_node, &planned_parameters)?
@@ -13525,10 +13864,14 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             }
         }
         let resolved_type = if let Some(alias) = intersection.alias_symbol
-            && plan
+            && (plan
                 .react_detailed_html_props_aliases
                 .get(&alias)
                 .is_some_and(|react_alias| react_alias.intersection == node)
+                || plan
+                    .default_library_non_nullable_aliases
+                    .get(&alias)
+                    .is_some_and(|non_nullable_alias| non_nullable_alias.intersection == node))
         {
             let metadata = plan.aliases.get(&alias).ok_or_else(|| {
                 type_node_unavailable(TypeNodeUnavailable::MissingGenericAliasMetadata(alias))
@@ -13818,6 +14161,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     || reference.global_array_target.is_some()
                     || reference.direct_generic
                     || plan.interfaces.contains_key(&reference.symbol)
+                    || plan
+                        .default_library_non_nullable_aliases
+                        .contains_key(&reference.symbol)
                     || is_instantiated_mapped_type(self.store, resolved_type)
             })
         {
@@ -14430,7 +14776,21 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     declared_type,
                 })
             })?
-        } else if plan.react_detailed_html_props_aliases.contains_key(&symbol) {
+        } else if plan.react_detailed_html_props_aliases.contains_key(&symbol)
+            || plan
+                .default_library_non_nullable_aliases
+                .contains_key(&symbol)
+            || self
+                .store
+                .type_payload(declared_type)
+                .and_then(TypeRecord::alias)
+                .and_then(|identity| self.store.type_alias(identity))
+                .and_then(super::type_records::TypeAlias::symbol)
+                .is_some_and(|alias| {
+                    plan.default_library_non_nullable_aliases
+                        .contains_key(&alias)
+                })
+        {
             self.instantiate_dependent_alias_type(
                 symbol,
                 declared_type,
@@ -18609,6 +18969,322 @@ mod tests {
             Some(&declared)
         );
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn default_library_non_nullable_alias_preserves_deferred_parameter_identity() {
+        let mut fixture = default_library_fixture(concat!(
+            "type NonNullable<T> = T & {}; ",
+            "type Forward<Value> = NonNullable<Value>;",
+        ));
+        let non_nullable = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "NonNullable");
+        let forward = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Forward");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let declared = query_declared(
+            &mut fixture,
+            non_nullable,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let parameter = fixture
+            .store
+            .type_alias_links(non_nullable)
+            .and_then(|links| links.type_parameters.as_deref())
+            .and_then(|parameters| parameters.first())
+            .copied()
+            .unwrap();
+        let projection = fixture
+            .store
+            .validate_deferred_intersection_type(declared)
+            .unwrap();
+        let empty_object = fixture
+            .store
+            .intrinsic_bootstrap()
+            .unwrap()
+            .empty_type_literal_type;
+        assert_eq!(projection.alias_symbol, Some(non_nullable));
+        assert_eq!(projection.alias_arguments, [parameter]);
+        assert_eq!(projection.types, [parameter, empty_object]);
+
+        let forwarded = query_declared(
+            &mut fixture,
+            forward,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let forward_parameter = fixture
+            .store
+            .type_alias_links(forward)
+            .and_then(|links| links.type_parameters.as_deref())
+            .and_then(|parameters| parameters.first())
+            .copied()
+            .unwrap();
+        let forwarded_projection = fixture
+            .store
+            .validate_deferred_intersection_type(forwarded)
+            .unwrap();
+        assert_eq!(forwarded_projection.alias_symbol, Some(non_nullable));
+        assert_eq!(forwarded_projection.alias_arguments, [forward_parameter]);
+        assert_eq!(
+            forwarded_projection.types,
+            [forward_parameter, empty_object]
+        );
+        assert_ne!(declared, forwarded);
+
+        let warm = store_state(&fixture.store);
+        for (alias, expected) in [(non_nullable, declared), (forward, forwarded)] {
+            assert_eq!(
+                query_declared(
+                    &mut fixture,
+                    alias,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                ),
+                Ok(expected),
+            );
+        }
+        assert_eq!(store_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn non_nullable_intersections_require_the_exact_default_library_declaration() {
+        for (mut fixture, name) in [
+            (fixture("type NonNullable<T> = T & {};"), "NonNullable"),
+            (
+                default_library_fixture("type NonNullable<T> = {} & T;"),
+                "NonNullable",
+            ),
+            (
+                default_library_fixture("type NonNullable<T, U> = T & {};"),
+                "NonNullable",
+            ),
+            (
+                default_library_fixture("type NonNullable<U> = U & {};"),
+                "NonNullable",
+            ),
+            (
+                default_library_fixture("type NonNullable<T extends unknown> = T & {};"),
+                "NonNullable",
+            ),
+            (
+                default_library_fixture("type NonNullable<T = unknown> = T & {};"),
+                "NonNullable",
+            ),
+            (
+                default_library_fixture("type NonNullable<T> = T & { value: string };"),
+                "NonNullable",
+            ),
+            (
+                default_library_fixture("namespace Fake { export type NonNullable<T> = T & {}; }"),
+                "NonNullable",
+            ),
+            (
+                default_library_fixture("type NotNullable<T> = T & {};"),
+                "NotNullable",
+            ),
+        ] {
+            let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, name);
+            let before = store_state(&fixture.store);
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+            assert!(matches!(
+                query_declared(
+                    &mut fixture,
+                    alias,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                ),
+                Err(DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::UnsupportedIntersectionConstituent(_)
+                ))
+            ));
+            assert_eq!(store_state(&fixture.store), before);
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn warmed_non_nullable_alias_rejects_changed_parameter_and_empty_object_identities() {
+        let mut fixture = default_library_fixture("type NonNullable<T> = T & {};");
+        let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "NonNullable");
+        let intersection = alias_parts(&fixture, "NonNullable").2;
+        let NodeData::IntersectionTypeNode(data) =
+            &fixture.parsed.arena.get(intersection.node).unwrap().data
+        else {
+            panic!("NonNullable must have an intersection body")
+        };
+        let empty = NodeRef::new(intersection.arena, intersection.file, data.types.nodes[1]);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let declared = query_declared(
+            &mut fixture,
+            alias,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let parameter = fixture
+            .store
+            .type_alias_links(alias)
+            .and_then(|links| links.type_parameters.as_deref())
+            .and_then(|parameters| parameters.first())
+            .and_then(|parameter| cached_ordinary_type_parameter_owner(&fixture.store, *parameter))
+            .unwrap();
+        let original_relationships = {
+            let owner = fixture.store.symbol(parameter).unwrap();
+            (
+                owner.members(),
+                owner.exports(),
+                owner.parent(),
+                owner.export_symbol(),
+            )
+        };
+        assert!(fixture.store.set_symbol_relationships(
+            parameter,
+            original_relationships.0,
+            original_relationships.1,
+            Some(alias),
+            original_relationships.3,
+        ));
+        let changed = union_state(&fixture.store);
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidCachedTypeAlias(alias),
+            )),
+        );
+        assert_eq!(union_state(&fixture.store), changed);
+        assert!(fixture.store.set_symbol_relationships(
+            parameter,
+            original_relationships.0,
+            original_relationships.1,
+            original_relationships.2,
+            original_relationships.3,
+        ));
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(declared),
+        );
+
+        let original_links = fixture.store.type_node_links(empty).cloned().unwrap();
+        let mut changed_links = original_links.clone();
+        changed_links.resolved_type = Some(
+            fixture
+                .store
+                .intrinsic_bootstrap()
+                .unwrap()
+                .empty_object_type,
+        );
+        assert!(fixture.store.set_type_node_links(empty, changed_links));
+        let changed = union_state(&fixture.store);
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidCachedTypeAlias(alias),
+            )),
+        );
+        assert_eq!(union_state(&fixture.store), changed);
+        assert!(fixture.store.set_type_node_links(empty, original_links));
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(declared),
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn default_library_non_nullable_reduces_concrete_arguments_and_forwarded_aliases() {
+        for strict_null_checks in [false, true] {
+            let mut fixture = fixture_with_source_facts(
+                concat!(
+                    "type NonNullable<T> = T & {}; ",
+                    "type Text = NonNullable<string>; ",
+                    "type Null = NonNullable<null>; ",
+                    "type Missing = NonNullable<undefined>; ",
+                    "type Never = NonNullable<never>; ",
+                    "type Unknown = NonNullable<unknown>; ",
+                    "type Any = NonNullable<any>; ",
+                    "type Optional = NonNullable<string | null | undefined>; ",
+                    "type Forward<Value> = NonNullable<Value>; ",
+                    "type ForwardText = Forward<string>;",
+                ),
+                CanonicalModuleState::Script,
+                IntrinsicBootstrapOptions {
+                    strict_null_checks,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                true,
+                |_| {},
+            );
+            let expected = {
+                let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+                [
+                    ("Text", bootstrap.string_type),
+                    ("Null", bootstrap.never_type),
+                    ("Missing", bootstrap.never_type),
+                    ("Never", bootstrap.never_type),
+                    ("Unknown", bootstrap.empty_type_literal_type),
+                    ("Any", bootstrap.any_type),
+                    ("Optional", bootstrap.string_type),
+                    ("ForwardText", bootstrap.string_type),
+                ]
+            };
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+            for (name, type_) in expected {
+                let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, name);
+                assert_eq!(
+                    query_declared(
+                        &mut fixture,
+                        alias,
+                        CanonicalTypeQueryOptions::default(),
+                        &mut diagnostics,
+                    ),
+                    Ok(type_),
+                    "{name}, strict_null_checks={strict_null_checks}",
+                );
+            }
+
+            let warm = store_state(&fixture.store);
+            for (name, type_) in expected {
+                let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, name);
+                assert_eq!(
+                    query_declared(
+                        &mut fixture,
+                        alias,
+                        CanonicalTypeQueryOptions::default(),
+                        &mut diagnostics,
+                    ),
+                    Ok(type_),
+                    "warm {name}, strict_null_checks={strict_null_checks}",
+                );
+            }
+            assert_eq!(store_state(&fixture.store), warm);
+            assert!(diagnostics.is_empty());
+        }
     }
 
     #[test]
