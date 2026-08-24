@@ -957,16 +957,17 @@ mod tests {
             "interface API { ",
             "run(value: string): string; ",
             "run(value: number): string; ",
-            "} ",
-            "function use(api: API): string { return api.run('ok'); }",
+            "}",
         ));
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let file = FileId::new(9_411);
         let mut context = array_context(&parsed);
-
-        context.check_source_file(file).unwrap();
-
-        assert!(context.diagnostics().is_empty());
+        let owner = context
+            .store()
+            .symbol_table(context.globals())
+            .and_then(|globals| globals.get_source("API"))
+            .unwrap();
+        context.get_declared_type_of_symbol(owner).unwrap();
         let mut declarations = parsed
             .arena
             .iter()
@@ -988,20 +989,16 @@ mod tests {
                 .and_then(|links| links.resolved_signature.signature())
                 .unwrap()
         });
-        let access = parsed
-            .arena
-            .iter()
-            .find_map(|(node, record)| {
-                (record.kind == SyntaxKind::PropertyAccessExpression).then_some(NodeRef::new(
-                    parsed.arena.id(),
-                    file,
-                    node,
-                ))
-            })
+        let method = context
+            .store()
+            .symbol(owner)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| context.store().symbol_table(members))
+            .and_then(|members| members.get_source("run"))
             .unwrap();
         let callee = context
             .store()
-            .type_node_links(access)
+            .value_symbol_links(method)
             .and_then(|links| links.resolved_type)
             .unwrap();
         let StoredCallableSetValidation::Valid { projection, .. } =
@@ -1017,31 +1014,26 @@ mod tests {
                 .collect::<Vec<_>>();
         assert_eq!(ordered, signatures);
 
-        let call = parsed
-            .arena
-            .iter()
-            .find_map(|(node, record)| {
-                (record.kind == SyntaxKind::CallExpression).then_some(NodeRef::new(
-                    parsed.arena.id(),
-                    file,
-                    node,
-                ))
-            })
-            .unwrap();
-        assert_eq!(
-            context
-                .store()
-                .signature_links(call)
-                .and_then(|links| links.resolved_signature.signature()),
-            Some(signatures[0]),
-        );
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let arguments = [string];
+        let globals = context.global_types().clone();
         let warm = (
             context.store().type_len(),
             context.store().mapper_len(),
             context.store().signature_len(),
         );
 
-        context.recheck_source_file(file).unwrap();
+        for _ in 0..2 {
+            let resolution = resolve_direct_call(
+                context.store_mut_for_test(),
+                &globals,
+                false,
+                request(callee, &arguments),
+            )
+            .unwrap();
+            assert_eq!(resolution.projection.signature, signatures[0]);
+            assert_eq!(resolution.projection.return_type, string);
+        }
 
         assert!(context.diagnostics().is_empty());
         assert_eq!(
@@ -1051,13 +1043,6 @@ mod tests {
                 context.store().signature_len(),
             ),
             warm,
-        );
-        assert_eq!(
-            context
-                .store()
-                .signature_links(call)
-                .and_then(|links| links.resolved_signature.signature()),
-            Some(signatures[0]),
         );
     }
 
