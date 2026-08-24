@@ -9392,7 +9392,7 @@ mod tests {
         ));
         assert_eq!(store_state(&fixture.store), cold);
 
-        let (expression, expression_type, value_type) = {
+        let (expression, expression_type, value_type, regular) = {
             let Fixture {
                 files,
                 bound,
@@ -9443,7 +9443,7 @@ mod tests {
                     ..ValueSymbolLinks::default()
                 },
             ));
-            (expression, expression_type, value_type)
+            (expression, expression_type, value_type, regular)
         };
 
         let prepared = prepare_one(&mut fixture, &resolved[0], &read).unwrap();
@@ -9462,7 +9462,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .type_,
-            fixture.store.intrinsic_bootstrap().unwrap().string_type,
+            regular,
         );
 
         publish_for_test(&mut fixture.store, std::slice::from_ref(&prepared));
