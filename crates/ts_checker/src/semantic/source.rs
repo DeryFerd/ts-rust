@@ -1088,6 +1088,12 @@ struct PlannedTopLevelLoop {
     invalid_break: Option<NodeRef>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PlannedCatchObjectRest {
+    name: NodeRef,
+    symbol: SemanticSymbolId,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SourceModuleSpecifierGrammar {
     Valid,
@@ -1138,6 +1144,7 @@ enum PlannedStatement {
     NamespaceAssignment(PlannedNamespaceAssignment),
     ControlIf(Box<PlannedTopLevelIf>),
     ControlLoop(Box<PlannedTopLevelLoop>),
+    CatchObjectRest(PlannedCatchObjectRest),
     Break(NodeRef),
     ExpressionValue(PlannedExpression),
     ExpressionJsx {
@@ -1558,6 +1565,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             SourceSyntaxRole::Statement,
                         ));
                     }
+                }
+                SyntaxKind::TryStatement => {
+                    statements.push(PlannedStatement::CatchObjectRest(
+                        self.plan_catch_object_rest(statement)?,
+                    ));
                 }
                 SyntaxKind::IfStatement => {
                     let syntax = plan_source_control_if_syntax(
@@ -2481,6 +2493,193 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             numbers: self.numbers,
             bigints: self.bigints,
         })
+    }
+
+    /// Authenticates the exact empty `try {} catch ({ ...rest }) {}` grammar.
+    fn plan_catch_object_rest(
+        &self,
+        statement: NodeRef,
+    ) -> Result<PlannedCatchObjectRest, SourceCheckError> {
+        let unsupported = || {
+            self.unsupported(
+                statement,
+                SyntaxKind::TryStatement,
+                SourceSyntaxRole::Statement,
+            )
+        };
+        let record = self.node(statement)?;
+        let NodeData::TryStatement(try_statement) = &record.data else {
+            return Err(unsupported());
+        };
+        if record.kind != SyntaxKind::TryStatement
+            || record.flags.0 != 0
+            || record.parent != Some(self.source.node_ref().node)
+            || try_statement.finally_block.is_some()
+            || try_statement.flow_node.is_some()
+            || try_statement.facts != 0
+            || self.bound.container(statement) != Some(self.source.node_ref())
+        {
+            return Err(unsupported());
+        }
+
+        let catch = try_statement
+            .catch_clause
+            .map(|node| self.reference(node))
+            .ok_or_else(unsupported)?;
+        let catch_record = self.node(catch)?;
+        let NodeData::CatchClause(catch_clause) = &catch_record.data else {
+            return Err(unsupported());
+        };
+        if catch_record.kind != SyntaxKind::CatchClause
+            || catch_record.flags.0 != 0
+            || catch_record.parent != Some(statement.node)
+            || catch_clause.next_container.is_some()
+            || catch_clause.facts != 0
+        {
+            return Err(unsupported());
+        }
+
+        for (block, parent) in [
+            (self.reference(try_statement.try_block), statement),
+            (self.reference(catch_clause.block), catch),
+        ] {
+            let block_record = self.node(block)?;
+            let NodeData::Block(data) = &block_record.data else {
+                return Err(unsupported());
+            };
+            if block_record.kind != SyntaxKind::Block
+                || block_record.flags.0 != 0
+                || block_record.parent != Some(parent.node)
+                || data.flow_node.is_some()
+                || data.next_container.is_some()
+                || !data.statements.nodes.is_empty()
+                || data.statements.has_trailing_comma
+                || data.facts != 0
+            {
+                return Err(unsupported());
+            }
+        }
+
+        let declaration = catch_clause
+            .variable_declaration
+            .map(|node| self.reference(node))
+            .ok_or_else(unsupported)?;
+        let declaration_record = self.node(declaration)?;
+        let NodeData::VariableDeclaration(variable) = &declaration_record.data else {
+            return Err(unsupported());
+        };
+        if declaration_record.kind != SyntaxKind::VariableDeclaration
+            || declaration_record.flags.0 != 0
+            || declaration_record.parent != Some(catch.node)
+            || variable.exclamation_token.is_some()
+            || variable.initializer.is_some()
+            || variable.local_symbol.is_some()
+            || variable.symbol.is_some()
+            || variable.type_.is_some()
+            || variable.facts != 0
+            || self.bound.symbol(declaration).is_some()
+        {
+            return Err(unsupported());
+        }
+
+        let pattern = self.reference(variable.name);
+        let pattern_record = self.node(pattern)?;
+        let NodeData::BindingPattern(binding_pattern) = &pattern_record.data else {
+            return Err(unsupported());
+        };
+        let [element] = binding_pattern.elements.nodes.as_slice() else {
+            return Err(unsupported());
+        };
+        if pattern_record.kind != SyntaxKind::ObjectBindingPattern
+            || pattern_record.flags.0 != 0
+            || pattern_record.parent != Some(declaration.node)
+            || binding_pattern.elements.range != pattern_record.range
+            || binding_pattern.elements.has_trailing_comma
+            || binding_pattern.facts != 0
+        {
+            return Err(unsupported());
+        }
+
+        let element = self.reference(*element);
+        let element_record = self.node(element)?;
+        let NodeData::BindingElement(binding) = &element_record.data else {
+            return Err(unsupported());
+        };
+        let spread = binding
+            .dot_dot_dot_token
+            .map(|node| self.reference(node))
+            .ok_or_else(unsupported)?;
+        let name = binding
+            .name
+            .map(|node| self.reference(node))
+            .ok_or_else(unsupported)?;
+        let spread_record = self.node(spread)?;
+        let name_record = self.node(name)?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Err(unsupported());
+        };
+        if element_record.kind != SyntaxKind::BindingElement
+            || element_record.flags.0 != 0
+            || element_record.parent != Some(pattern.node)
+            || binding.flow_node.is_some()
+            || binding.initializer.is_some()
+            || binding.local_symbol.is_some()
+            || binding.property_name.is_some()
+            || binding.symbol.is_some()
+            || binding.facts != 0
+            || spread_record.kind != SyntaxKind::DotDotDotToken
+            || spread_record.flags.0 != 0
+            || spread_record.parent != Some(element.node)
+            || spread_record.range.start != element_record.range.start
+            || spread_record.range.end > name_record.range.start
+            || !self.source_spelling_matches(spread, "...")
+            || name_record.kind != SyntaxKind::Identifier
+            || name_record.flags.0 != 0
+            || name_record.parent != Some(element.node)
+            || name_record.range.end != element_record.range.end
+            || identifier.flow_node.is_some()
+            || identifier.text.is_empty()
+        {
+            return Err(unsupported());
+        }
+
+        let Some((store, _)) = self.semantic else {
+            return Err(unsupported());
+        };
+        let symbol = self.bound.symbol(element).ok_or_else(unsupported)?;
+        let owner = store.symbol(symbol).ok_or_else(unsupported)?;
+        let locals = self
+            .bound
+            .locals(catch)
+            .and_then(|locals| store.symbol_table(locals))
+            .ok_or_else(unsupported)?;
+        if store.get_merged_symbol(symbol) != Some(symbol)
+            || owner.flags() != SymbolFlags::BLOCK_SCOPED_VARIABLE
+            || owner.check_flags() != CheckFlags::NONE
+            || owner.name().as_utf8() != Some(identifier.text.as_str())
+            || owner.declarations() != Some(&[element])
+            || owner.value_declaration() != Some(element)
+            || owner.members().is_some()
+            || owner.exports().is_some()
+            || owner.parent().is_some()
+            || owner.export_symbol().is_some()
+            || locals.len() != 1
+            || locals.get_source(&identifier.text) != Some(symbol)
+            || self.bound.block_scope_container(element) != Some(catch)
+            || self.bound.container(element) != Some(self.source.node_ref())
+        {
+            return Err(unsupported());
+        }
+        if store
+            .value_symbol_links(symbol)
+            .is_some_and(|links| links != &ValueSymbolLinks::default())
+        {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidValueLinks(symbol),
+            ));
+        }
+
+        Ok(PlannedCatchObjectRest { name, symbol })
     }
 
     fn plan_top_level_while(
@@ -20197,6 +20396,17 @@ pub(super) fn check_source_file(
                     },
                 );
             }
+            PlannedStatement::CatchObjectRest(catch) => {
+                if store
+                    .value_symbol_links(catch.symbol)
+                    .is_some_and(|links| links != &ValueSymbolLinks::default())
+                {
+                    return Err(SourceCheckError::Variable(
+                        VariableInvariant::InvalidValueLinks(catch.symbol),
+                    ));
+                }
+                issue_node_diagnostic(diagnostics, catch.name, 2700)?;
+            }
             PlannedStatement::ControlIf(control) => {
                 let checked = check_expression_type(
                     store,
@@ -21388,6 +21598,125 @@ mod tests {
                 .source_callable_type_for_owner(owner)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn catch_object_rest_reports_ts2700_on_its_bound_name_and_replays_warm() {
+        let source = parsed(concat!(
+            "try {\n",
+            "  // try block\n",
+            "} catch ({ ...rest }) {\n",
+            "  // catch block\n",
+            "}\n",
+        ));
+        let file = FileId::new(8_380);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let binding = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::BindingElement).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let (_, bound) = context.file(file).unwrap();
+        let symbol = bound.symbol(binding).unwrap();
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected one object-rest catch diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2700);
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "Rest types may only be created from object types."
+        );
+        let name = diagnostic
+            .node
+            .expect("TS2700 retains the rest binding name");
+        assert_eq!(
+            source.arena.get(name.node).unwrap().kind,
+            SyntaxKind::Identifier
+        );
+        assert_eq!(node_text(&source, name), "rest");
+        assert!(context.store().value_symbol_links(symbol).is_none());
+        assert!(context.store().type_node_links(name).is_none());
+        assert!(is_type_checked(&context, file));
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn catch_object_rest_rejects_other_try_shapes_and_poisoned_bindings() {
+        for (index, text) in [
+            "try {} catch (rest) {}",
+            "try {} catch ({ value }) {}",
+            "try { const value = 1; } catch ({ ...rest }) {}",
+            "try {} catch ({ ...rest }) { rest; }",
+            "try {} catch ({ ...rest }) {} finally {}",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parsed(text);
+            let file = FileId::new(8_381 + u32::try_from(index).unwrap());
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            let cold = observable_state(&context, file);
+
+            assert!(matches!(
+                context.check_source_file(file),
+                Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Syntax {
+                        kind: SyntaxKind::TryStatement,
+                        role: SourceSyntaxRole::Statement,
+                        ..
+                    }
+                ))
+            ));
+            assert_eq!(observable_state(&context, file), cold);
+            assert!(context.diagnostics().is_empty());
+        }
+
+        let source = parsed("try {} catch ({ ...rest }) {}");
+        let file = FileId::new(8_386);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let binding = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::BindingElement).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let (_, bound) = context.file(file).unwrap();
+        let symbol = bound.symbol(binding).unwrap();
+        let any = context.store().intrinsic_bootstrap().unwrap().any_type;
+        assert!(context.store_mut_for_test().set_value_symbol_links(
+            symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(any),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        let poisoned = observable_state(&context, file);
+
+        assert_eq!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidValueLinks(symbol)
+            ))
+        );
+        assert_eq!(observable_state(&context, file), poisoned);
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]
