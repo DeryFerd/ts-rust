@@ -3933,6 +3933,7 @@ impl Program {
                 .check_source_file_with_jsx_runtime(file, runtime)
                 .map_err(|error| CanonicalProgramCheckError::SourceCheck { file_name, error })?;
             self.add_missing_jsx_option_diagnostics(source, &mut diagnostics);
+            self.add_erasable_import_assignment_diagnostics(source, &mut diagnostics);
             checked_sources.push(file);
         }
 
@@ -4011,6 +4012,72 @@ impl Program {
                     related_information: Vec::new(),
                 }),
         );
+    }
+
+    fn add_erasable_import_assignment_diagnostics(
+        &self,
+        source: &SourceFile,
+        diagnostics: &mut Vec<ProgramDiagnostic>,
+    ) {
+        if !self.options.erasable_syntax_only
+            || is_javascript_file_name(&source.file_name)
+            || ts_path::is_declaration_file(&source.file_name)
+        {
+            return;
+        }
+
+        let Some(NodeData::SourceFile(file)) = source
+            .parse
+            .arena
+            .get(source.parse.source_file)
+            .map(|node| &node.data)
+        else {
+            return;
+        };
+        let emits_ecmascript_modules = matches!(
+            self.options.module,
+            ModuleKind::Es2015 | ModuleKind::Es2020 | ModuleKind::Es2022 | ModuleKind::EsNext
+        ) || self.options.module == ModuleKind::None
+            && !self.options.module_specified
+            && self.options.target >= ScriptTarget::Es2015;
+
+        for statement in &file.statements.nodes {
+            let Some(node) = source.parse.arena.get(*statement) else {
+                continue;
+            };
+            let NodeData::ImportEqualsDeclaration(import) = &node.data else {
+                continue;
+            };
+            if import.is_type_only {
+                continue;
+            }
+            let external_module_reference = source
+                .parse
+                .arena
+                .get(import.module_reference)
+                .is_some_and(|reference| {
+                    matches!(reference.data, NodeData::ExternalModuleReference(_))
+                });
+
+            for code in [
+                (emits_ecmascript_modules && external_module_reference).then_some(1202),
+                Some(1294),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let message = message_by_code(code)
+                    .expect("import-assignment diagnostics must be in the generated catalog");
+                diagnostics.push(ProgramDiagnostic {
+                    file_name: Some(source.file_name.clone()),
+                    range: Some(node.range),
+                    code: Some(message.code()),
+                    category: message.category(),
+                    message: message.text().to_owned(),
+                    related_information: Vec::new(),
+                });
+            }
+        }
     }
 
     fn apply_comment_directives(
@@ -10184,6 +10251,44 @@ mod tests {
         assert!(facts.is_declaration_file());
         assert!(!facts.is_default_library());
         assert!(!facts.is_external_or_common_js_module());
+    }
+
+    #[test]
+    fn canonical_program_checks_erasable_import_assignments_only_in_typescript() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/target.js", "module.exports = { value: 1 };\n")
+            .unwrap();
+        fs.write_file(
+            "/project/input.ts",
+            "import target = require('./target.js');\n",
+        )
+        .unwrap();
+
+        let program = Program::try_new_with_canonical_checker(
+            &fs,
+            "/project",
+            &["target.js".to_owned(), "input.ts".to_owned()],
+            CompilerOptions {
+                allow_js: true,
+                check_js: true,
+                erasable_syntax_only: true,
+                lib: Some(vec!["es5".to_owned()]),
+                module: ModuleKind::EsNext,
+                module_specified: true,
+                no_emit: true,
+                ..CompilerOptions::default()
+            },
+        )
+        .unwrap();
+
+        let diagnostics = program.diagnostics();
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].code, Some(1202));
+        assert_eq!(diagnostics[1].code, Some(1294));
+        for diagnostic in diagnostics {
+            assert_eq!(diagnostic.file_name.as_deref(), Some("/project/input.ts"));
+            assert_eq!(diagnostic.range.unwrap().start.get(), 0);
+        }
     }
 
     #[test]

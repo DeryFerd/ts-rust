@@ -5386,6 +5386,7 @@ const RUST_APPLIED_COMPILER_OPTION_NAMES: &[&str] = &[
     "emitBOM",
     "emitDeclarationOnly",
     "emitDecoratorMetadata",
+    "erasableSyntaxOnly",
     "esModuleInterop",
     "exactOptionalPropertyTypes",
     "experimentalDecorators",
@@ -8057,6 +8058,25 @@ mod tests {
         assert!(options.strict_function_types);
         assert!(options.strict_function_types_specified);
         assert!(!options.no_error_truncation);
+    }
+
+    #[test]
+    fn applies_erasable_syntax_only_option_variants() {
+        let case = Case::parse(
+            "erasableSyntax.ts",
+            concat!("// @erasableSyntaxOnly: *\n", "const value = 1;\n"),
+        )
+        .unwrap();
+        let variants = expand_option_matrix(&case);
+
+        assert_eq!(variants.len(), 2);
+        for (variant, expected) in variants.iter().zip([true, false]) {
+            assert!(variant.unsupported_details.is_empty());
+            assert_eq!(
+                fixture_compiler_options(&case, variant).erasable_syntax_only,
+                expected
+            );
+        }
     }
 
     #[test]
