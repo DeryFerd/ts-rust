@@ -5225,7 +5225,6 @@ mod tests {
             assert_eq!(
                 store.alias_symbol_links(namespace),
                 Some(&AliasSymbolLinks {
-                    immediate_target: Some(module),
                     alias_target: AliasTargetState::Resolved(module),
                     ..AliasSymbolLinks::default()
                 }),
@@ -5240,6 +5239,12 @@ mod tests {
                     .unwrap()
                     .target,
                 AliasTargetState::Resolved(module),
+            );
+            assert_eq!(
+                store
+                    .alias_symbol_links(namespace)
+                    .and_then(|links| links.immediate_target),
+                None,
             );
             assert_eq!(
                 (store.symbol_len(), store.symbol_store().symbol_table_len()),
