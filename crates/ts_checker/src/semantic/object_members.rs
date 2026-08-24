@@ -4,7 +4,8 @@
 //! does not recurse through property annotations: [`super::type_nodes`] plans
 //! and executes property, index, and signature annotations so one query
 //! retains a single dependency graph and resolution stack. Declared signature
-//! sets are limited to pure nongeneric, fixed-arity call or construct members.
+//! sets are limited to pure nongeneric call or construct members. Construct
+//! signatures can also retain trailing optional `any` parameters.
 //! Named interface and type-literal methods retain their own binder symbols,
 //! required annotated parameters, and an optional authenticated `any[]` rest
 //! parameter.
@@ -98,13 +99,14 @@ pub(super) struct PlannedIndexSignature {
     pub readonly: bool,
 }
 
-/// One required identifier parameter in an admitted declared call signature.
+/// One annotated identifier parameter in an admitted declared signature.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct PlannedCallParameter {
     pub symbol: SemanticSymbolId,
     pub type_node: NodeRef,
     identity_node: NodeRef,
     null_literal_identity: bool,
+    optional: bool,
 }
 
 /// One named, nongeneric interface or type-literal method in declaration order.
@@ -120,7 +122,7 @@ pub(super) struct PlannedInterfaceMethod {
     pub flags: SignatureFlags,
 }
 
-/// One nongeneric, fixed-arity call or construct signature in source order.
+/// One nongeneric call or construct signature in source order.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct PlannedCallSignature {
     pub declaration: NodeRef,
@@ -151,6 +153,13 @@ impl PlannedCallSignature {
         } else {
             InternalSymbolName::Call
         }
+    }
+
+    pub(super) fn min_argument_count(&self) -> usize {
+        self.parameters
+            .iter()
+            .position(|parameter| parameter.optional)
+            .unwrap_or(self.parameters.len())
     }
 }
 
@@ -590,7 +599,9 @@ pub(super) fn validate_stored_declared_call_set(
         else {
             return StoredDeclaredCallSetValidation::Malformed;
         };
-        let minimum = usize::try_from(signature_record.min_argument_count()).ok();
+        let Ok(minimum) = usize::try_from(signature_record.min_argument_count()) else {
+            return StoredDeclaredCallSetValidation::Malformed;
+        };
         let provider = if index < own_signature_count {
             type_
         } else {
@@ -632,7 +643,8 @@ pub(super) fn validate_stored_declared_call_set(
                 & !(SignatureFlags::HAS_LITERAL_TYPES | SignatureFlags::CONSTRUCT).bits()
                 != 0
             || signature_record.resolved_min_argument_count() != -1
-            || minimum != Some(signature_record.parameters().len())
+            || minimum > signature_record.parameters().len()
+            || !constructs && minimum != signature_record.parameters().len()
             || !signature_record.type_parameters().is_empty()
             || signature_record.this_parameter().is_some()
             || signature_record.resolved_type_predicate().is_some()
@@ -652,11 +664,12 @@ pub(super) fn validate_stored_declared_call_set(
             return StoredDeclaredCallSetValidation::Malformed;
         }
         let mut seen_parameters = HashSet::with_capacity(parameter_types.len());
-        for (parameter, type_) in signature_record
+        for (parameter_index, (parameter, type_)) in signature_record
             .parameters()
             .iter()
             .copied()
             .zip(parameter_types)
+            .enumerate()
         {
             let Some(parameter_record) = store.symbol(parameter) else {
                 return StoredDeclaredCallSetValidation::Malformed;
@@ -681,6 +694,8 @@ pub(super) fn validate_stored_declared_call_set(
                         resolved_type: Some(*type_),
                         ..ValueSymbolLinks::default()
                     })
+                || declared_signature_parameter_is_optional(store, *parameter_declaration, *type_)
+                    .is_none_or(|optional| optional != (constructs && parameter_index >= minimum))
             {
                 return StoredDeclaredCallSetValidation::Malformed;
             }
@@ -689,6 +704,29 @@ pub(super) fn validate_stored_declared_call_set(
         edges.push(return_type);
     }
     StoredDeclaredCallSetValidation::Valid(edges)
+}
+
+fn declared_signature_parameter_is_optional(
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    type_: TypeId,
+) -> Option<bool> {
+    let annotation = store.source_direct_type_annotation(declaration)?;
+    let question_index = annotation.node.index().checked_sub(1)?;
+    let question = NodeRef::new(
+        declaration.arena,
+        declaration.file,
+        ts_ast::NodeId::new(u32::try_from(question_index).ok()?),
+    );
+    let optional = store.source_node_kind(question) == Some(SyntaxKind::QuestionToken)
+        && store.source_node_parent(question) == Some(SourceNodeParent::Parent(declaration));
+    if optional {
+        let any = store.intrinsic_bootstrap()?.any_type;
+        if store.source_node_kind(annotation) != Some(SyntaxKind::AnyKeyword) || type_ != any {
+            return None;
+        }
+    }
+    Some(optional)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4729,6 +4767,7 @@ fn plan_interface_method_parameter(
             type_node,
             identity_node: type_node,
             null_literal_identity: false,
+            optional: false,
         },
         rest.is_some(),
     ))
@@ -4848,6 +4887,7 @@ fn plan_call_signature(
     } else {
         SignatureFlags::NONE
     };
+    let mut optional_seen = false;
     for parameter_id in &parameter_nodes.nodes {
         let parameter = NodeRef::new(declaration.arena, declaration.file, *parameter_id);
         let parameter_record = preflight_node(store, host, parameter).map_err(|_| unsupported())?;
@@ -4862,7 +4902,6 @@ fn plan_call_signature(
             || parameter_record.range.end > parameter_nodes.range.end
             || data.dot_dot_dot_token.is_some()
             || data.initializer.is_some()
-            || data.question_token.is_some()
             || data.symbol.is_some()
             || data.facts != 0
             || data.modifiers.is_some()
@@ -4895,6 +4934,29 @@ fn plan_call_signature(
         {
             return Err(unsupported());
         }
+        let optional = if let Some(token) = data.question_token {
+            let token = NodeRef::new(parameter.arena, parameter.file, token);
+            let token_record = preflight_node(store, host, token).map_err(|_| unsupported())?;
+            if !is_construct
+                || token_record.kind != SyntaxKind::QuestionToken
+                || !matches!(token_record.data, NodeData::Token(_))
+                || token_record.flags.0 != 0
+                || token_record.parent != Some(parameter.node)
+                || token_record.range.start < name_record.range.end
+                || token_record.range.end > type_record.range.start
+                || type_record.kind != SyntaxKind::AnyKeyword
+                || !matches!(type_record.data, NodeData::KeywordTypeNode(_))
+            {
+                return Err(unsupported());
+            }
+            true
+        } else {
+            false
+        };
+        if optional_seen && !optional {
+            return Err(unsupported());
+        }
+        optional_seen |= optional;
         if type_record.kind == SyntaxKind::LiteralType {
             flags |= SignatureFlags::HAS_LITERAL_TYPES;
         }
@@ -4928,6 +4990,7 @@ fn plan_call_signature(
             type_node,
             identity_node,
             null_literal_identity: is_null_literal_type(store, host, identity_node)?,
+            optional,
         });
     }
     if locals.is_some_and(|locals| locals.len() != parameters.len()) {
@@ -6973,7 +7036,7 @@ fn validate_resolved_call_signature(
         .collect::<Vec<_>>();
     let parameter_types = store.callable_signature_parameter_types(signature)?;
     let return_type = record.resolved_return_type()?;
-    let minimum = i32::try_from(planned.parameters.len()).ok()?;
+    let minimum = i32::try_from(planned.min_argument_count()).ok()?;
     if record.flags() != planned.flags
         || record.min_argument_count() != minimum
         || record.resolved_min_argument_count() != -1
@@ -7003,11 +7066,14 @@ fn validate_resolved_call_signature(
         return None;
     }
     for (parameter, type_) in planned.parameters.iter().zip(parameter_types) {
+        let declaration = store.symbol(parameter.symbol)?.value_declaration()?;
         if cached_annotation_identity(
             store,
             parameter.identity_node,
             parameter.null_literal_identity,
         ) != Some(*type_)
+            || declared_signature_parameter_is_optional(store, declaration, *type_)
+                != Some(parameter.optional)
             || store.value_symbol_links(parameter.symbol)
                 != Some(&ValueSymbolLinks {
                     resolved_type: Some(*type_),
@@ -7680,6 +7746,13 @@ pub(super) fn publish_declared_members(
                     parameter.identity_node,
                     parameter.null_literal_identity,
                 ) != Some(*type_)
+                    || store
+                        .symbol(parameter.symbol)
+                        .and_then(ts_binder::semantic::Symbol::value_declaration)
+                        .and_then(|declaration| {
+                            declared_signature_parameter_is_optional(store, declaration, *type_)
+                        })
+                        != Some(parameter.optional)
             })
         {
             return Err(invalid_cache(plan, type_));
@@ -7722,8 +7795,8 @@ pub(super) fn publish_declared_members(
                         .collect(),
                     Some(resolved.return_type),
                     None,
-                    i32::try_from(planned.parameters.len())
-                        .expect("the call-signature plan validated its fixed arity"),
+                    i32::try_from(planned.min_argument_count())
+                        .expect("the call-signature plan validated its minimum arity"),
                 )
                 .expect("the declared-call plan and reservation validated every identity")
         })
@@ -9745,6 +9818,174 @@ mod generic_publication_tests {
             warm,
         );
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn optional_interface_construct_parameters_preserve_source_arity_and_warm_identity() {
+        let mut fixture =
+            interface_fixture("interface Constructor { new(value?: any): string; }", 3_781);
+        let host = host(&fixture.parsed, &fixture.bound);
+        let plan = plan_interface(&fixture.store, &host, fixture.symbol).unwrap();
+        let [planned] = plan.call_signatures.as_slice() else {
+            panic!("the constructor interface must retain its binder-owned signature")
+        };
+        let [parameter] = planned.parameters.as_slice() else {
+            panic!("the constructor signature must retain its optional parameter")
+        };
+        assert!(planned.is_construct());
+        assert!(parameter.optional);
+        assert_eq!(planned.min_argument_count(), 0);
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let type_ = CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalCheckerOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_declared_type_of_symbol(fixture.symbol)
+        .unwrap();
+        let TypeData::Interface(interface) = fixture.store.type_payload(type_).unwrap().data()
+        else {
+            panic!("the constructor interface must retain its declared identity")
+        };
+        let [signature] = interface.declared_construct_signatures.as_deref().unwrap() else {
+            panic!("the interface must publish one real construct signature")
+        };
+        let signature = *signature;
+        let record = fixture.store.signature(signature).unwrap();
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        assert_eq!(record.declaration(), Some(planned.declaration));
+        assert_eq!(record.parameters(), [parameter.symbol].as_slice());
+        assert_eq!(record.min_argument_count(), 0);
+        assert_eq!(record.resolved_return_type(), Some(bootstrap.string_type));
+        assert_eq!(
+            fixture.store.callable_signature_parameter_types(signature),
+            Some([bootstrap.any_type].as_slice()),
+        );
+        assert_eq!(
+            validate_stored_declared_call_set(&fixture.store, type_),
+            StoredDeclaredCallSetValidation::Valid(vec![bootstrap.any_type, bootstrap.string_type]),
+        );
+
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalCheckerOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_declared_type_of_symbol(fixture.symbol),
+            Ok(type_),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn unsupported_optional_signature_parameters_do_not_publish_checker_state() {
+        for (source, expected_kind, file) in [
+            (
+                "interface Constructor { new(value?: string): number; }",
+                SyntaxKind::ConstructSignature,
+                3_782,
+            ),
+            (
+                "interface Callable { (value?: any): string; }",
+                SyntaxKind::CallSignature,
+                3_783,
+            ),
+            (
+                concat!(
+                    "interface Constructor { ",
+                    "new(value?: any): string; ",
+                    "<T>(value?: T): value is T; ",
+                    "}",
+                ),
+                SyntaxKind::CallSignature,
+                3_791,
+            ),
+        ] {
+            let fixture = interface_fixture(source, file);
+            let host = host(&fixture.parsed, &fixture.bound);
+            let before = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            assert!(matches!(
+                plan_interface(&fixture.store, &host, fixture.symbol),
+                Err(PropertyObjectError::UnsupportedMember { kind, .. }) if kind == expected_kind
+            ));
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+        }
+    }
+
+    #[test]
+    fn forged_optional_constructor_parameter_plans_fail_before_publication() {
+        let mut fixture =
+            interface_fixture("interface Constructor { new(value?: any): string; }", 3_790);
+        let host = host(&fixture.parsed, &fixture.bound);
+        let mut plan = plan_interface(&fixture.store, &host, fixture.symbol).unwrap();
+        let flags = fixture.store.symbol(fixture.symbol).unwrap().flags();
+        let type_ = get_declared_class_interface_or_type_parameter(
+            &mut fixture.store,
+            &host,
+            fixture.symbol,
+            flags,
+        )
+        .unwrap()
+        .unwrap();
+        let state = interface_state(&fixture.store, &plan, type_).unwrap();
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let resolved = [ResolvedCallSignatureTypes {
+            parameter_types: vec![bootstrap.any_type],
+            return_type: bootstrap.string_type,
+        }];
+        plan.call_signatures[0].parameters[0].optional = false;
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        assert_eq!(
+            publish_declared_members(&mut fixture.store, &plan, state, &[], &[], &resolved),
+            Err(PropertyObjectError::InvalidCachedInterface {
+                symbol: fixture.symbol,
+                type_,
+            }),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            before,
+        );
     }
 
     #[test]

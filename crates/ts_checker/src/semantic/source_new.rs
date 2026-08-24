@@ -159,6 +159,8 @@ struct SourceDeclaredConstructorPlan {
     annotation: NodeRef,
     declaration: NodeRef,
     parameter: Option<SourceNewParameter>,
+    signature_parameter: Option<SourceNewParameter>,
+    min_argument_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -830,10 +832,14 @@ fn plan_declared_constructor(
     }
 
     for signature in object.call_signatures {
-        if signature.parameters.len() != usize::from(argument.is_some()) {
+        let supplied_arguments = usize::from(argument.is_some());
+        if signature.parameters.len() > 1
+            || supplied_arguments < signature.min_argument_count()
+            || supplied_arguments > signature.parameters.len()
+        {
             continue;
         }
-        let parameter = signature
+        let signature_parameter = signature
             .parameters
             .first()
             .map(|parameter| {
@@ -846,9 +852,10 @@ fn plan_declared_constructor(
             })
             .transpose()?
             .flatten();
-        if argument.is_some() != parameter.is_some() {
+        if signature.parameters.len() != usize::from(signature_parameter.is_some()) {
             return Err(reject());
         }
+        let parameter = argument.and(signature_parameter);
         if argument
             .zip(parameter)
             .is_some_and(|(argument, parameter)| {
@@ -861,6 +868,8 @@ fn plan_declared_constructor(
             annotation,
             declaration: signature.declaration,
             parameter,
+            signature_parameter,
+            min_argument_count: signature.min_argument_count(),
         });
     }
 
@@ -1547,10 +1556,10 @@ fn resolved_declared_constructor(
         || record.flags().bits() & !allowed_flags.bits() != 0
         || record.parameters()
             != declared
-                .parameter
+                .signature_parameter
                 .map(|parameter| parameter.symbol)
                 .as_slice()
-        || record.min_argument_count() != i32::from(declared.parameter.is_some())
+        || usize::try_from(record.min_argument_count()).ok() != Some(declared.min_argument_count)
         || record.resolved_min_argument_count() != -1
         || !record.type_parameters().is_empty()
         || record.this_parameter().is_some()
@@ -1560,7 +1569,7 @@ fn resolved_declared_constructor(
         || store.callable_signature_parameter_types(signature)
             != Some(
                 declared
-                    .parameter
+                    .signature_parameter
                     .map(|parameter| parameter.type_)
                     .as_slice(),
             )
@@ -2752,6 +2761,119 @@ mod tests {
                 "{source}: {:?}",
                 context.diagnostics()
             );
+            let warm = (
+                store.type_len(),
+                store.signature_len(),
+                store.checker_link_allocated_lengths(),
+            );
+
+            context.recheck_source_file(file).unwrap();
+
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                warm,
+                "{source}",
+            );
+        }
+    }
+
+    #[test]
+    fn optional_declared_constructor_parameters_preserve_zero_minimum_and_warm_identity() {
+        for (source, has_argument) in [
+            (
+                concat!(
+                    "interface Factory { new(value?: any): string; } ",
+                    "declare const factory: Factory; ",
+                    "const result = new factory();",
+                ),
+                false,
+            ),
+            (
+                concat!(
+                    "interface Factory { new(value?: any): string; } ",
+                    "declare const factory: Factory; ",
+                    "const result = new factory(1);",
+                ),
+                true,
+            ),
+            (
+                concat!(
+                    "declare const factory: { new(value?: any): string }; ",
+                    "const result = new factory();",
+                ),
+                false,
+            ),
+        ] {
+            let parsed = parse_source_file(source);
+            assert!(
+                parsed.diagnostics.is_empty(),
+                "{source}: {:?}",
+                parsed.diagnostics
+            );
+            let file = FileId::new(1_835);
+            let mut context = context(&parsed, file);
+            let (annotation, owner) = ambient_constructor(&parsed, file, &context, "factory");
+            let (construction, constructor) = variable_new(&parsed, file, "result");
+
+            context.check_source_file(file).unwrap();
+
+            let store = context.store();
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            let value = store
+                .type_node_links(annotation)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            let signature = store
+                .signature_links(construction)
+                .and_then(|links| links.resolved_signature.signature())
+                .unwrap();
+            let record = store.signature(signature).unwrap();
+            assert!(record.flags().contains(SignatureFlags::CONSTRUCT));
+            assert_eq!(record.parameters().len(), 1);
+            assert_eq!(record.min_argument_count(), 0);
+            assert_eq!(record.resolved_return_type(), Some(bootstrap.string_type));
+            assert_eq!(
+                store.callable_signature_parameter_types(signature),
+                Some([bootstrap.any_type].as_slice()),
+            );
+            assert_eq!(
+                store
+                    .symbol_node_links(constructor)
+                    .and_then(|links| links.resolved_symbol),
+                Some(owner),
+            );
+            assert_eq!(
+                store
+                    .type_node_links(construction)
+                    .and_then(|links| links.resolved_type),
+                Some(bootstrap.string_type),
+            );
+            assert!(matches!(
+                validate_stored_callable_set(store, value),
+                StoredCallableSetValidation::Valid {
+                    family: CallableFamily::DeclaredCallSignatures,
+                    projection,
+                    ..
+                } if projection.construct_signatures.as_ref() == [signature].as_slice()
+            ));
+            assert!(context.diagnostics().is_empty(), "{source}");
+            if has_argument {
+                let NodeData::NewExpression(expression) =
+                    &parsed.arena.get(construction.node).unwrap().data
+                else {
+                    panic!("the constructor fixture must retain its new expression")
+                };
+                let argument = NodeRef::new(
+                    construction.arena,
+                    construction.file,
+                    expression.arguments.as_ref().unwrap().nodes[0],
+                );
+                assert!(store.type_node_links(argument).is_some());
+            }
             let warm = (
                 store.type_len(),
                 store.signature_len(),
