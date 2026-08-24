@@ -68,6 +68,7 @@ use super::{
         LiteralTreatment, PreparedExpression, prepare_expression_context_with_global_types,
         prepare_expression_without_context_with_global_types,
     },
+    diagnostics::missing_name_diagnostic_code,
     formatter::{
         CanonicalTypeFormatFlags,
         get_type_names_for_assignability_error_with_host_global_types_and_flags,
@@ -190,7 +191,9 @@ use super::{
     variables::{
         PlannedComputedBindingElement, PlannedIdentifierRead as PlannedVariableRead,
         VariableBindingKind, VariablePlanError, plan_declared_value_identifier_read,
-        plan_identifier_read, plan_top_level_computed_binding_element, plan_top_level_variable,
+        plan_identifier_read, plan_recovered_anonymous_module_identifier_read,
+        plan_recovered_anonymous_module_variable, plan_top_level_computed_binding_element,
+        plan_top_level_variable,
     },
 };
 
@@ -1157,6 +1160,7 @@ enum PlannedStatement {
     Arrow(usize),
     ContextualArrow(usize),
     Variables(Vec<PlannedVariable>),
+    RecoveredAnonymousVariables(Vec<PlannedVariable>),
     ComputedVariable(Box<PlannedComputedVariable>),
     Assignment(PlannedAssignment),
     CommonJsAssignment(PlannedCommonJsAssignment),
@@ -1265,6 +1269,7 @@ struct SourcePlanner<'arena, 'semantic, 'sources> {
     assignable_ambient_variables: HashSet<SemanticSymbolId>,
     assignable_uninitialized_variables: HashSet<SemanticSymbolId>,
     assignable_mutable_variables: HashSet<SemanticSymbolId>,
+    recovered_anonymous_variables: HashSet<SemanticSymbolId>,
     planned_ambient_namespaces: HashSet<SemanticSymbolId>,
     planned_classes: HashSet<SemanticSymbolId>,
     prior_enums: HashSet<SemanticSymbolId>,
@@ -1305,6 +1310,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             assignable_ambient_variables: HashSet::new(),
             assignable_uninitialized_variables: HashSet::new(),
             assignable_mutable_variables: HashSet::new(),
+            recovered_anonymous_variables: HashSet::new(),
             planned_ambient_namespaces: HashSet::new(),
             planned_classes: HashSet::new(),
             prior_enums: HashSet::new(),
@@ -1349,6 +1355,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             assignable_ambient_variables: HashSet::new(),
             assignable_uninitialized_variables: HashSet::new(),
             assignable_mutable_variables: HashSet::new(),
+            recovered_anonymous_variables: HashSet::new(),
             planned_ambient_namespaces: HashSet::new(),
             planned_classes: HashSet::new(),
             prior_enums: HashSet::new(),
@@ -1686,6 +1693,13 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         self.planned_ambient_namespaces.insert(namespace.symbol);
                     }
                     statements.push(PlannedStatement::Namespace(Box::new(namespace)));
+                }
+                SyntaxKind::Block => {
+                    self.plan_recovered_anonymous_module_block(
+                        statement,
+                        self.source.node_ref(),
+                        &mut statements,
+                    )?;
                 }
                 SyntaxKind::TypeAliasDeclaration => {
                     let node = self.node(statement)?;
@@ -2519,6 +2533,400 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             strings: self.strings,
             numbers: self.numbers,
             bigints: self.bigints,
+        })
+    }
+
+    fn plan_recovered_anonymous_module_block(
+        &mut self,
+        block: NodeRef,
+        parent: NodeRef,
+        statements: &mut Vec<PlannedStatement>,
+    ) -> Result<(), SourceCheckError> {
+        let record = self.node(block)?;
+        let NodeData::Block(data) = &record.data else {
+            return Err(self.unsupported(block, record.kind, SourceSyntaxRole::Statement));
+        };
+        if record.kind != SyntaxKind::Block
+            || record.flags.0 != 0
+            || record.parent != Some(parent.node)
+            || data.flow_node.is_some()
+            || data.next_container.is_some()
+            || data.statements.has_trailing_comma
+            || data.facts != 0
+            || self.bound.container(block) != Some(self.source.node_ref())
+        {
+            return Err(self.unsupported(block, record.kind, SourceSyntaxRole::Statement));
+        }
+        let children = data.statements.nodes.clone();
+        let block_start = record.range.start;
+
+        let parent_record = self.node(parent)?;
+        let siblings = match &parent_record.data {
+            NodeData::SourceFile(source) if parent == self.source.node_ref() => {
+                &source.statements.nodes
+            }
+            NodeData::Block(block) if parent_record.kind == SyntaxKind::Block => {
+                &block.statements.nodes
+            }
+            _ => {
+                return Err(self.unsupported(
+                    block,
+                    SyntaxKind::Block,
+                    SourceSyntaxRole::Statement,
+                ));
+            }
+        };
+        let Some(index) = siblings
+            .iter()
+            .position(|statement| *statement == block.node)
+        else {
+            return Err(self.unsupported(block, SyntaxKind::Block, SourceSyntaxRole::Statement));
+        };
+        let Some(previous) = index.checked_sub(1).and_then(|index| siblings.get(index)) else {
+            return Err(self.unsupported(block, SyntaxKind::Block, SourceSyntaxRole::Statement));
+        };
+        let previous = self.reference(*previous);
+        let previous_record = self.node(previous)?;
+        let NodeData::ExpressionStatement(expression_statement) = &previous_record.data else {
+            return Err(self.unsupported(block, SyntaxKind::Block, SourceSyntaxRole::Statement));
+        };
+        let identifier = self.reference(expression_statement.expression);
+        let identifier_record = self.node(identifier)?;
+        let NodeData::Identifier(name) = &identifier_record.data else {
+            return Err(self.unsupported(block, SyntaxKind::Block, SourceSyntaxRole::Statement));
+        };
+        if previous_record.kind != SyntaxKind::ExpressionStatement
+            || previous_record.flags.0 != 0
+            || previous_record.parent != Some(parent.node)
+            || expression_statement.flow_node.is_some()
+            || identifier_record.kind != SyntaxKind::Identifier
+            || identifier_record.flags.0 != 0
+            || identifier_record.parent != Some(previous.node)
+            || name.flow_node.is_some()
+            || name.text != "module"
+            || identifier_record.range.end > block_start
+            || !self.source_spelling_matches(identifier, "module")
+        {
+            return Err(self.unsupported(block, SyntaxKind::Block, SourceSyntaxRole::Statement));
+        }
+        if let Some(source) = self.arena.source_text() {
+            let start = usize::try_from(identifier_record.range.end.get()).map_err(|_| {
+                self.unsupported(block, SyntaxKind::Block, SourceSyntaxRole::Statement)
+            })?;
+            let end = usize::try_from(block_start.get()).map_err(|_| {
+                self.unsupported(block, SyntaxKind::Block, SourceSyntaxRole::Statement)
+            })?;
+            if source
+                .get(start..end)
+                .is_none_or(|between| !between.chars().all(char::is_whitespace))
+                || source.as_bytes().get(end) != Some(&b'{')
+            {
+                return Err(self.unsupported(
+                    block,
+                    SyntaxKind::Block,
+                    SourceSyntaxRole::Statement,
+                ));
+            }
+        }
+        if !matches!(
+            statements.last(),
+            Some(PlannedStatement::ExpressionValue(expression))
+                if expression.node == identifier
+                    && matches!(
+                        &expression.kind,
+                        PlannedExpressionKind::Identifier(read)
+                            if read.kind == PlannedIdentifierReadKind::Unresolved
+                    )
+        ) {
+            return Err(self.unsupported(block, SyntaxKind::Block, SourceSyntaxRole::Statement));
+        }
+
+        for (index, statement) in children.iter().copied().enumerate() {
+            let statement = self.reference(statement);
+            match self.node(statement)?.kind {
+                SyntaxKind::VariableStatement => {
+                    let variables =
+                        self.plan_recovered_anonymous_module_variables(statement, block)?;
+                    statements.push(PlannedStatement::RecoveredAnonymousVariables(variables));
+                }
+                SyntaxKind::ExpressionStatement => {
+                    let Some(next) = children.get(index + 1) else {
+                        return Err(self.unsupported(
+                            statement,
+                            SyntaxKind::ExpressionStatement,
+                            SourceSyntaxRole::Statement,
+                        ));
+                    };
+                    if self.node(self.reference(*next))?.kind != SyntaxKind::Block {
+                        return Err(self.unsupported(
+                            statement,
+                            SyntaxKind::ExpressionStatement,
+                            SourceSyntaxRole::Statement,
+                        ));
+                    }
+                    let expression =
+                        self.plan_recovered_anonymous_module_identifier(statement, block)?;
+                    statements.push(PlannedStatement::ExpressionValue(expression));
+                }
+                SyntaxKind::Block => {
+                    self.plan_recovered_anonymous_module_block(statement, block, statements)?;
+                }
+                kind => {
+                    return Err(self.unsupported(statement, kind, SourceSyntaxRole::Statement));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn plan_recovered_anonymous_module_identifier(
+        &mut self,
+        statement: NodeRef,
+        parent: NodeRef,
+    ) -> Result<PlannedExpression, SourceCheckError> {
+        let record = self.node(statement)?;
+        let kind = record.kind;
+        let NodeData::ExpressionStatement(data) = &record.data else {
+            return Err(self.unsupported(statement, record.kind, SourceSyntaxRole::Statement));
+        };
+        let identifier = self.reference(data.expression);
+        let identifier_record = self.node(identifier)?;
+        let NodeData::Identifier(name) = &identifier_record.data else {
+            return Err(self.unsupported(statement, record.kind, SourceSyntaxRole::Statement));
+        };
+        if record.kind != SyntaxKind::ExpressionStatement
+            || record.flags.0 != 0
+            || record.parent != Some(parent.node)
+            || data.flow_node.is_some()
+            || identifier_record.kind != SyntaxKind::Identifier
+            || identifier_record.flags.0 != 0
+            || identifier_record.parent != Some(statement.node)
+            || name.flow_node.is_some()
+            || name.text != "module"
+            || !self.source_spelling_matches(identifier, "module")
+        {
+            return Err(self.unsupported(statement, record.kind, SourceSyntaxRole::Statement));
+        }
+
+        let expression = self.plan_expression(identifier)?;
+        if !matches!(
+            &expression.kind,
+            PlannedExpressionKind::Identifier(read)
+                if read.kind == PlannedIdentifierReadKind::Unresolved
+        ) {
+            return Err(self.unsupported(statement, kind, SourceSyntaxRole::Statement));
+        }
+        Ok(expression)
+    }
+
+    fn plan_recovered_anonymous_module_variables(
+        &mut self,
+        statement: NodeRef,
+        parent: NodeRef,
+    ) -> Result<Vec<PlannedVariable>, SourceCheckError> {
+        let record = self.node(statement)?;
+        let NodeData::VariableStatement(data) = &record.data else {
+            return Err(self.unsupported(statement, record.kind, SourceSyntaxRole::Statement));
+        };
+        if record.kind != SyntaxKind::VariableStatement
+            || record.flags.0 != 0
+            || record.parent != Some(parent.node)
+            || data.flow_node.is_some()
+            || data.facts != 0
+        {
+            return Err(self.unsupported(statement, record.kind, SourceSyntaxRole::Statement));
+        }
+        self.validate_variable_modifiers(
+            statement,
+            record.range,
+            data.declaration_list,
+            data.modifiers.as_ref(),
+        )?;
+
+        let list = self.reference(data.declaration_list);
+        let list_record = self.node(list)?;
+        let NodeData::VariableDeclarationList(declarations) = &list_record.data else {
+            return Err(self.unsupported(
+                list,
+                list_record.kind,
+                SourceSyntaxRole::VariableDeclarationList,
+            ));
+        };
+        if list_record.kind != SyntaxKind::VariableDeclarationList
+            || list_record.flags.0 != 0
+            || list_record.parent != Some(statement.node)
+            || declarations.declarations.range != list_record.range
+            || declarations.declarations.has_trailing_comma
+            || declarations.declarations.nodes.is_empty()
+            || declarations.facts != 0
+        {
+            return Err(self.unsupported(
+                list,
+                list_record.kind,
+                SourceSyntaxRole::VariableDeclarationList,
+            ));
+        }
+        let declarations = declarations.declarations.nodes.clone();
+
+        let mut variables = Vec::with_capacity(declarations.len());
+        for declaration in declarations {
+            variables.push(self.plan_recovered_anonymous_variable_declaration(
+                list,
+                self.reference(declaration),
+            )?);
+        }
+        Ok(variables)
+    }
+
+    fn plan_recovered_anonymous_variable_declaration(
+        &mut self,
+        list: NodeRef,
+        declaration: NodeRef,
+    ) -> Result<PlannedVariable, SourceCheckError> {
+        let record = self.node(declaration)?;
+        let NodeData::VariableDeclaration(variable) = &record.data else {
+            return Err(self.unsupported(
+                declaration,
+                record.kind,
+                SourceSyntaxRole::VariableDeclaration,
+            ));
+        };
+        let Some(initializer) = variable.initializer.map(|node| self.reference(node)) else {
+            return Err(self.unsupported(
+                declaration,
+                record.kind,
+                SourceSyntaxRole::VariableDeclaration,
+            ));
+        };
+        if record.kind != SyntaxKind::VariableDeclaration
+            || record.flags.0 != 0
+            || record.parent != Some(list.node)
+            || variable.exclamation_token.is_some()
+            || variable.local_symbol.is_some()
+            || variable.symbol.is_some()
+            || variable.type_.is_some()
+            || variable.facts != 0
+        {
+            return Err(self.unsupported(
+                declaration,
+                record.kind,
+                SourceSyntaxRole::VariableDeclaration,
+            ));
+        }
+        let name = self.reference(variable.name);
+        let name_record = self.node(name)?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Err(self.unsupported(name, name_record.kind, SourceSyntaxRole::VariableName));
+        };
+        if name_record.kind != SyntaxKind::Identifier
+            || name_record.flags.0 != 0
+            || name_record.parent != Some(declaration.node)
+            || identifier.flow_node.is_some()
+            || identifier.text.is_empty()
+        {
+            return Err(self.unsupported(name, name_record.kind, SourceSyntaxRole::VariableName));
+        }
+        let name_text = identifier.text.clone();
+        let initializer_record = self.node(initializer)?;
+        if initializer_record.flags.0 != 0
+            || initializer_record.parent != Some(declaration.node)
+            || !matches!(
+                initializer_record.kind,
+                SyntaxKind::NumericLiteral | SyntaxKind::Identifier
+            )
+        {
+            return Err(self.unsupported(
+                initializer,
+                initializer_record.kind,
+                SourceSyntaxRole::VariableInitializer,
+            ));
+        }
+
+        let Some((store, host)) = self.semantic else {
+            return Err(self.unsupported(
+                declaration,
+                record.kind,
+                SourceSyntaxRole::VariableDeclaration,
+            ));
+        };
+        let symbol = plan_recovered_anonymous_module_variable(
+            self.bound,
+            store,
+            declaration,
+            name,
+            &name_text,
+        )
+        .map_err(Self::variable_plan_error)?;
+        let initializer = if initializer_record.kind == SyntaxKind::Identifier {
+            let NodeData::Identifier(identifier) = &initializer_record.data else {
+                return Err(self.unsupported(
+                    initializer,
+                    initializer_record.kind,
+                    SourceSyntaxRole::VariableInitializer,
+                ));
+            };
+            let read = plan_recovered_anonymous_module_identifier_read(
+                self.arena,
+                self.bound,
+                store,
+                host,
+                &self.prior_variables,
+                &self.readable_variables,
+                initializer,
+                &identifier.text,
+            )
+            .map_err(Self::variable_plan_error)?;
+            self.identifier_reads
+                .push((initializer, read.resolved_symbol));
+            PlannedExpression::new(
+                initializer,
+                PlannedExpressionKind::Identifier(PlannedIdentifierRead::variable(read)),
+            )
+        } else {
+            self.plan_expression(initializer)?
+        };
+        if !matches!(
+            &initializer.kind,
+            PlannedExpressionKind::Number { .. }
+                | PlannedExpressionKind::Identifier(PlannedIdentifierRead {
+                    kind: PlannedIdentifierReadKind::Variable,
+                    ..
+                })
+        ) {
+            return Err(self.unsupported(
+                initializer.node,
+                self.node(initializer.node)?.kind,
+                SourceSyntaxRole::VariableInitializer,
+            ));
+        }
+
+        let repeated = !self.recovered_anonymous_variables.insert(symbol);
+        if repeated {
+            if !self.prior_variables.contains(&symbol)
+                || !self.readable_variables.contains(&symbol)
+                || !self.assignable_mutable_variables.contains(&symbol)
+            {
+                return Err(SourceCheckError::Variable(
+                    VariableInvariant::InvalidSymbolShape(symbol),
+                ));
+            }
+        } else if !self.prior_variables.insert(symbol)
+            || !self.readable_variables.insert(symbol)
+            || !self.assignable_mutable_variables.insert(symbol)
+        {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidSymbolShape(symbol),
+            ));
+        }
+
+        Ok(PlannedVariable {
+            declaration,
+            name,
+            symbol,
+            binding: VariableBindingKind::Var,
+            type_node: None,
+            jsdoc_type: None,
+            initializer: PlannedVariableInitializer::Expression(initializer),
         })
     }
 
@@ -12574,6 +12982,7 @@ fn check_type_import_value_use(
 fn check_unresolved_identifier(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
+    options: CanonicalCheckerOptions,
     diagnostics: &mut CanonicalCheckerDiagnostics,
     expression: &PlannedExpression,
     read: PlannedIdentifierRead,
@@ -12626,13 +13035,14 @@ fn check_unresolved_identifier(
     {
         return Ok(CheckedExpressionTypes::leaf(error_type, error_type));
     }
+    let code = missing_name_diagnostic_code(&name, options.uses_wildcard_types);
     merge_retry_diagnostic(
         diagnostics,
         CanonicalCheckerDiagnostic {
             node: Some(expression.node),
             range_override: None,
             diagnostic: Diagnostic::with_arguments(
-                message_by_code(2304).ok_or(SourceCheckError::MissingDiagnostic(2304))?,
+                message_by_code(code).ok_or(SourceCheckError::MissingDiagnostic(code))?,
                 [name],
             ),
             related_information: Vec::new(),
@@ -12855,7 +13265,7 @@ fn check_expression_type(
         PlannedExpressionKind::Identifier(read)
             if read.kind == PlannedIdentifierReadKind::Unresolved =>
         {
-            check_unresolved_identifier(store, host, diagnostics, expression, *read)
+            check_unresolved_identifier(store, host, options, diagnostics, expression, *read)
         }
         PlannedExpressionKind::Identifier(read)
             if read.kind == PlannedIdentifierReadKind::Import
@@ -20555,6 +20965,105 @@ pub(super) fn check_source_file(
                     ));
                 }
             }
+            PlannedStatement::RecoveredAnonymousVariables(variables) => {
+                for variable in variables {
+                    let PlannedVariableInitializer::Expression(initializer) = &variable.initializer
+                    else {
+                        return Err(SourceCheckError::Variable(
+                            VariableInvariant::InvalidSymbolShape(variable.symbol),
+                        ));
+                    };
+                    if variable.binding != VariableBindingKind::Var
+                        || variable.type_node.is_some()
+                        || variable.jsdoc_type.is_some()
+                    {
+                        return Err(SourceCheckError::Variable(
+                            VariableInvariant::InvalidSymbolShape(variable.symbol),
+                        ));
+                    }
+
+                    let checked = check_expression_type(
+                        store,
+                        host,
+                        global_types,
+                        source,
+                        options,
+                        session,
+                        diagnostics,
+                        &current_flow_types,
+                        &preflighted_type_import_value_uses,
+                        initializer,
+                        None,
+                        &mut deferred,
+                    )?;
+                    let declared_type = inferred_variable_type(
+                        store,
+                        global_types,
+                        variable.binding,
+                        checked.result,
+                    )?;
+                    let current_flow_type = current_flow_type_after_assignment(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        session,
+                        diagnostics,
+                        CheckedAssignment {
+                            declared_type,
+                            assigned_type: checked.result,
+                        },
+                    )?;
+
+                    if let Some(previous) = top_level_declared_types.get(&variable.symbol).copied()
+                    {
+                        if previous != declared_type {
+                            return Err(SourceCheckError::Variable(
+                                VariableInvariant::CachedValueTypeMismatch {
+                                    symbol: variable.symbol,
+                                    cached: previous,
+                                    expected: declared_type,
+                                },
+                            ));
+                        }
+                        if staged_value_types.get(&variable.symbol) != Some(&declared_type)
+                            || !mutable_variables.contains(&variable.symbol)
+                            || current_flow_types
+                                .insert(variable.symbol, current_flow_type)
+                                .is_none()
+                        {
+                            return Err(SourceCheckError::Variable(
+                                VariableInvariant::MissingCurrentFlowType(variable.symbol),
+                            ));
+                        }
+                    } else {
+                        stage_value_type(
+                            store,
+                            &mut staged_value_types,
+                            &mut value_order,
+                            variable.symbol,
+                            declared_type,
+                        )?;
+                        if top_level_declared_types
+                            .insert(variable.symbol, declared_type)
+                            .is_some()
+                        {
+                            return Err(SourceCheckError::Variable(
+                                VariableInvariant::DuplicateStagedValueType(variable.symbol),
+                            ));
+                        }
+                        if !mutable_variables.insert(variable.symbol)
+                            || current_flow_types
+                                .insert(variable.symbol, current_flow_type)
+                                .is_some()
+                        {
+                            return Err(SourceCheckError::Variable(
+                                VariableInvariant::DuplicateCurrentFlowType(variable.symbol),
+                            ));
+                        }
+                    }
+                }
+            }
             PlannedStatement::Variables(variables) => {
                 for variable in variables {
                     let (declared_type, current_flow_type) = match (
@@ -24060,6 +24569,130 @@ mod tests {
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn recovered_anonymous_modules_check_nested_blocks_and_node_global_names() {
+        const SOURCE: &str = concat!(
+            "module {\n",
+            "  export var foo = 1;\n",
+            "  module {\n",
+            "    export var bar = 1;\n",
+            "  }\n",
+            "  var bar = 2;\n",
+            "  module {\n",
+            "    var x = bar;\n",
+            "  }\n",
+            "}"
+        );
+        let source = parse_source_file(SOURCE);
+        assert_eq!(
+            source
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            vec![Some(1437), Some(1437), Some(1437)],
+        );
+        let file = FileId::new(8_391);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 3);
+        for diagnostic in diagnostics {
+            assert_eq!(diagnostic.diagnostic.code(), 2591);
+            assert_eq!(diagnostic.diagnostic.arguments, ["module"]);
+            assert_eq!(node_text(&source, diagnostic.node.unwrap()), "module");
+            assert_eq!(
+                diagnostic.diagnostic.render().unwrap(),
+                concat!(
+                    "Cannot find name 'module'. Do you need to install type definitions ",
+                    "for node? Try `npm i --save-dev @types/node` and then add 'node' ",
+                    "to the types field in your tsconfig.",
+                ),
+            );
+        }
+        let mut ordered_diagnostics = diagnostics
+            .iter()
+            .map(|diagnostic| {
+                (
+                    source
+                        .arena
+                        .get(diagnostic.node.unwrap().node)
+                        .unwrap()
+                        .range
+                        .start
+                        .get(),
+                    diagnostic.diagnostic.code(),
+                )
+            })
+            .chain(source.diagnostics.iter().map(|diagnostic| {
+                (
+                    diagnostic.range.start.get(),
+                    diagnostic.code.expect("anonymous-module parser diagnostic"),
+                )
+            }))
+            .collect::<Vec<_>>();
+        ordered_diagnostics.sort_unstable_by_key(|(position, _)| *position);
+        assert_eq!(
+            ordered_diagnostics
+                .iter()
+                .map(|(_, code)| *code)
+                .collect::<Vec<_>>(),
+            [2591, 1437, 2591, 1437, 2591, 1437],
+        );
+
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        for name in ["foo", "bar", "x"] {
+            assert_eq!(variable_value_type(&context, &source, file, name), number);
+        }
+        let reads = identifier_expressions(&source, file, "bar");
+        let [read] = reads.as_slice() else {
+            panic!("expected one read of the shared bar symbol")
+        };
+        assert_eq!(resolved_node_type(&context, *read), number);
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(*read)
+                .and_then(|links| links.resolved_symbol),
+            Some(variable_symbol(&context, &source, file, "bar")),
+        );
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn recovered_anonymous_modules_reject_unpaired_blocks_and_unsupported_variables() {
+        for (index, text) in [
+            "{ var value = 1; }",
+            "module; { var value = 1; }",
+            "module { let value = 1; }",
+            "module { var value = missing; }",
+            "module { module; }",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parse_source_file(text);
+            let file = FileId::new(8_450 + u32::try_from(index).unwrap());
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            let cold = observable_state(&context, file);
+
+            assert!(
+                matches!(
+                    context.check_source_file(file),
+                    Err(SourceCheckError::Unsupported(_))
+                ),
+                "{text}",
+            );
+            assert_eq!(observable_state(&context, file), cold);
+            assert!(context.diagnostics().is_empty());
+        }
     }
 
     #[test]

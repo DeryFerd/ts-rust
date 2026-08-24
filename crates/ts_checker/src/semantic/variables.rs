@@ -214,6 +214,49 @@ pub(super) fn plan_top_level_variable(
     binding: VariableBindingKind,
     exported: bool,
 ) -> Result<SemanticSymbolId, VariablePlanError> {
+    plan_variable_declaration(
+        bound,
+        store,
+        declaration,
+        name,
+        name_text,
+        binding,
+        exported,
+        false,
+    )
+}
+
+/// Proves one recovered anonymous-module `var`, including its shared binder symbol.
+pub(super) fn plan_recovered_anonymous_module_variable(
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    name: NodeRef,
+    name_text: &str,
+) -> Result<SemanticSymbolId, VariablePlanError> {
+    plan_variable_declaration(
+        bound,
+        store,
+        declaration,
+        name,
+        name_text,
+        VariableBindingKind::Var,
+        false,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_variable_declaration(
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    name: NodeRef,
+    name_text: &str,
+    binding: VariableBindingKind,
+    exported: bool,
+    allow_recovered_redeclarations: bool,
+) -> Result<SemanticSymbolId, VariablePlanError> {
     let raw = bound
         .symbol(declaration)
         .ok_or(VariableInvariant::MissingDeclarationSymbol(declaration))?;
@@ -230,12 +273,14 @@ pub(super) fn plan_top_level_variable(
         ));
     }
     validate_variable_target(
+        bound,
         store,
         declaration,
         name,
         name_text,
         merged,
         binding.symbol_flags(),
+        allow_recovered_redeclarations,
     )?;
 
     let local = bound.local_symbol(declaration);
@@ -490,6 +535,56 @@ pub(super) fn plan_identifier_read(
     node: NodeRef,
     name: &str,
 ) -> Result<PlannedIdentifierRead, VariablePlanError> {
+    plan_identifier_read_worker(
+        arena,
+        bound,
+        store,
+        host,
+        prior_variables,
+        readable_variables,
+        node,
+        name,
+        false,
+    )
+}
+
+/// Resolves an authenticated recovered anonymous-module `var` redeclaration.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn plan_recovered_anonymous_module_identifier_read(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    prior_variables: &HashSet<SemanticSymbolId>,
+    readable_variables: &HashSet<SemanticSymbolId>,
+    node: NodeRef,
+    name: &str,
+) -> Result<PlannedIdentifierRead, VariablePlanError> {
+    plan_identifier_read_worker(
+        arena,
+        bound,
+        store,
+        host,
+        prior_variables,
+        readable_variables,
+        node,
+        name,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_identifier_read_worker(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    prior_variables: &HashSet<SemanticSymbolId>,
+    readable_variables: &HashSet<SemanticSymbolId>,
+    node: NodeRef,
+    name: &str,
+    allow_recovered_redeclarations: bool,
+) -> Result<PlannedIdentifierRead, VariablePlanError> {
     let mut callback_host = host
         .name_resolver_host(store)
         .map_err(VariablePlanError::DeclaredType)?;
@@ -542,8 +637,16 @@ pub(super) fn plan_identifier_read(
     let declarations = record
         .declarations()
         .ok_or(VariableInvariant::MissingDeclarations(routed.target))?;
-    let declaration =
-        single_variable_declaration(store, node, routed.target, flags, declarations, true)?;
+    let declaration = single_variable_declaration(
+        bound,
+        store,
+        node,
+        routed.target,
+        flags,
+        declarations,
+        true,
+        allow_recovered_redeclarations,
+    )?;
     if declaration.file != node.file || declaration.arena != node.arena {
         return Err(VariablePlanError::Unsupported(
             VariableUnsupported::CrossFileDeclaration { node, declaration },
@@ -792,13 +895,16 @@ fn route_value_symbol(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_variable_target(
+    bound: &BoundFile,
     store: &CanonicalTypeMapperStore,
     declaration: NodeRef,
     name: NodeRef,
     name_text: &str,
     symbol: SemanticSymbolId,
     expected_flags: SymbolFlags,
+    allow_recovered_redeclarations: bool,
 ) -> Result<(), VariablePlanError> {
     let record = store
         .symbol(symbol)
@@ -823,20 +929,26 @@ fn validate_variable_target(
         .declarations()
         .ok_or(VariableInvariant::MissingDeclarations(symbol))?;
     let actual = single_variable_declaration(
+        bound,
         store,
         declaration,
         symbol,
         record.flags(),
         declarations,
         false,
+        allow_recovered_redeclarations,
     )?;
-    if actual != declaration {
+    if actual != declaration
+        && (!allow_recovered_redeclarations
+            || expected_flags != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+            || !declarations.contains(&declaration))
+    {
         return Err(VariableInvariant::InvalidSymbolShape(symbol).into());
     }
-    if record.value_declaration() != Some(declaration) {
+    if record.value_declaration() != Some(actual) {
         return Err(VariableInvariant::ValueDeclarationMismatch {
             symbol,
-            declaration,
+            declaration: actual,
             value_declaration: record.value_declaration(),
         }
         .into());
@@ -862,13 +974,44 @@ fn variable_binding_flags(flags: SymbolFlags) -> Option<SymbolFlags> {
     (flags.without(allowed) == SymbolFlags::NONE).then_some(binding)
 }
 
+fn is_nonambient_variable_declaration(
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+) -> bool {
+    if bound
+        .source_facts()
+        .is_some_and(ts_binder::CanonicalSourceFileFacts::is_declaration_file)
+    {
+        return false;
+    }
+    let Some(SourceNodeParent::Parent(list)) = store.source_node_parent(declaration) else {
+        return false;
+    };
+    let Some(SourceNodeParent::Parent(statement)) = store.source_node_parent(list) else {
+        return false;
+    };
+    if store.source_node_kind(list) != Some(SyntaxKind::VariableDeclarationList)
+        || store.source_node_kind(statement) != Some(SyntaxKind::VariableStatement)
+    {
+        return false;
+    }
+    !bound.traversal_order().any(|node| {
+        store.source_node_kind(node) == Some(SyntaxKind::DeclareKeyword)
+            && store.source_node_parent(node) == Some(SourceNodeParent::Parent(statement))
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn single_variable_declaration(
+    bound: &BoundFile,
     store: &CanonicalTypeMapperStore,
     node: NodeRef,
     symbol: SemanticSymbolId,
     flags: SymbolFlags,
     declarations: &[NodeRef],
     allow_parameter: bool,
+    allow_recovered_redeclarations: bool,
 ) -> Result<NodeRef, VariablePlanError> {
     let mut variable = None;
     for declaration in declarations.iter().copied() {
@@ -878,6 +1021,19 @@ fn single_variable_declaration(
             {
                 variable = Some(declaration);
             }
+            Some(SyntaxKind::VariableDeclaration)
+                if allow_recovered_redeclarations
+                    && flags == SymbolFlags::FUNCTION_SCOPED_VARIABLE
+                    && variable.is_some_and(|first| {
+                        declaration.file == first.file
+                            && declaration.arena == first.arena
+                            && is_nonambient_variable_declaration(bound, store, first)
+                            && is_nonambient_variable_declaration(bound, store, declaration)
+                            && bound.symbol(declaration) == Some(symbol)
+                            && bound.local_symbol(declaration).is_none()
+                            && bound.container(declaration) == bound.container(first)
+                            && bound.container(declaration) == Some(bound.source_file())
+                    }) => {}
             Some(SyntaxKind::Parameter)
                 if allow_parameter
                     && variable.is_none()
@@ -1367,6 +1523,126 @@ mod tests {
             .unwrap();
             assert_eq!(planned.value_symbol, symbol);
         }
+    }
+
+    #[test]
+    fn repeated_function_scoped_variables_share_one_symbol_and_value_declaration() {
+        let mut fixture = binding_fixture(
+            "var shared = 1; { var shared = 2; } var observed = shared;",
+            930,
+        );
+        let declarations = fixture
+            .parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let NodeData::VariableDeclaration(declaration) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(identifier) =
+                    &fixture.parsed.arena.get(declaration.name)?.data
+                else {
+                    return None;
+                };
+                (identifier.text == "shared").then_some((
+                    NodeRef::new(fixture.parsed.arena.id(), fixture.file, node),
+                    NodeRef::new(fixture.parsed.arena.id(), fixture.file, declaration.name),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let [(first, _), (second, _)] = declarations.as_slice() else {
+            panic!("expected two declarations of the same function-scoped variable")
+        };
+        let symbol = fixture.bound.symbol(*first).unwrap();
+
+        assert_eq!(fixture.bound.symbol(*second), Some(symbol));
+        assert_eq!(
+            fixture.store.symbol(symbol).unwrap().value_declaration(),
+            Some(*first),
+        );
+        for &(declaration, name) in &declarations {
+            assert_eq!(
+                plan_recovered_anonymous_module_variable(
+                    &fixture.bound,
+                    &fixture.store,
+                    declaration,
+                    name,
+                    "shared",
+                ),
+                Ok(symbol),
+            );
+        }
+
+        let read = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::Identifier(identifier) = &record.data else {
+                    return None;
+                };
+                (identifier.text == "shared"
+                    && !declarations.iter().any(|(_, name)| name.node == node))
+                .then_some(NodeRef::new(fixture.parsed.arena.id(), fixture.file, node))
+            })
+            .unwrap();
+        let globals = fixture.store.intrinsic_bootstrap().unwrap().globals;
+        assert_eq!(
+            fixture.store.merge_global_symbol(globals, symbol),
+            Ok(symbol)
+        );
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&fixture.parsed.arena, &fixture.bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan_recovered_anonymous_module_identifier_read(
+                &fixture.parsed.arena,
+                &fixture.bound,
+                &fixture.store,
+                &host,
+                &HashSet::from([symbol]),
+                &HashSet::from([symbol]),
+                read,
+                "shared",
+            ),
+            Ok(PlannedIdentifierRead {
+                resolved_symbol: symbol,
+                value_symbol: symbol,
+            }),
+        );
+
+        assert!(matches!(
+            plan_top_level_variable(
+                &fixture.bound,
+                &fixture.store,
+                *first,
+                declarations[0].1,
+                "shared",
+                VariableBindingKind::Var,
+                false,
+            ),
+            Err(VariablePlanError::Unsupported(
+                VariableUnsupported::NonUniqueDeclaration { .. }
+            )),
+        ));
+        assert!(matches!(
+            plan_identifier_read(
+                &fixture.parsed.arena,
+                &fixture.bound,
+                &fixture.store,
+                &host,
+                &HashSet::from([symbol]),
+                &HashSet::from([symbol]),
+                read,
+                "shared",
+            ),
+            Err(VariablePlanError::Unsupported(
+                VariableUnsupported::NonUniqueDeclaration { .. }
+            )),
+        ));
     }
 
     #[test]
