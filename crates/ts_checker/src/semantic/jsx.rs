@@ -1,11 +1,11 @@
 //! Canonical checking for basic JSX elements.
 //!
 //! This module follows the pinned JSX checker for global `JSX` namespaces,
-//! named or indexed intrinsic tags, and fixed function components. It writes
-//! only to the existing semantic graph. Inline object-literal spreads reuse
-//! canonical object publication. Other spreads, generic components, dotted
-//! component names, contextual child expressions, and factory imports remain
-//! explicit source-capability boundaries.
+//! named or indexed intrinsic tags, and fixed or inferred function components.
+//! It writes only to the existing semantic graph. Inline object-literal and
+//! identifier spreads reuse canonical object publication. Other spreads,
+//! dotted component names, contextual child expressions, and factory imports
+//! remain explicit source-capability boundaries.
 
 use std::collections::HashSet;
 
@@ -20,22 +20,26 @@ use ts_jsnum::Number;
 
 use super::{
     CanonicalCheckerDiagnostic, CanonicalCheckerDiagnosticRange, CanonicalCheckerDiagnostics,
-    CanonicalCheckerOptions, CanonicalCheckerRelatedInformation, CanonicalTypeMapperStore,
-    DeclaredTypeHost, DeclaredTypeLinks, JsxElementLinks, JsxFlags, ResolvedSignatureState,
-    SignatureId, SignatureLinks, SourceCheckError, SourceCheckProvenanceError,
-    SourceLiteralCacheError, SourceSyntaxRole, SymbolNodeLinks, TypeId, TypeNodeLinks,
-    UnsupportedSourceSyntax, ValueSymbolLinks,
+    CanonicalCheckerOptions, CanonicalCheckerRelatedInformation, CanonicalGlobalTypes,
+    CanonicalTypeMapperStore, DeclaredTypeHost, DeclaredTypeLinks, JsxElementLinks, JsxFlags,
+    ResolvedSignatureState, SignatureId, SignatureLinks, SourceCheckError,
+    SourceCheckProvenanceError, SourceLiteralCacheError, SourceSyntaxRole, SymbolNodeLinks, TypeId,
+    TypeNodeLinks, UnsupportedSourceSyntax, ValueSymbolLinks,
+    array_types::CanonicalArrayTargets,
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
     formatter::{
         CanonicalTypeFormatFlags, get_type_names_for_assignability_error,
         type_to_string_with_host_and_flags,
     },
     indexed_access_types::template_pattern_index_matches_name,
+    instantiate::{InstantiationLimits, InstantiationSession},
+    instantiated_members::{demand_instantiated_property_type, resolve_members_with_array_targets},
     mapped_types::MappedTypeModifiers,
     production::{CanonicalJsxRuntime, CanonicalJsxRuntimeEvidence},
     reference_types::validate_direct_generic_reference,
     signatures::SignatureFlags,
     source::merge_retry_diagnostic,
+    source_calls::resolve_jsx_generic_component_signature,
     spelling::get_spelling_suggestion,
     type_nodes::CanonicalTypeQuery,
     types::{ObjectFlags, TypeFlags},
@@ -87,6 +91,7 @@ struct JsxAttributePlan {
 enum JsxAttributesPlan {
     Properties(Vec<JsxAttributePlan>),
     ObjectSpread(Box<JsxObjectSpreadPlan>),
+    SourceSpread(Box<JsxSourceSpreadPlan>),
 }
 
 #[derive(Clone, Debug)]
@@ -94,6 +99,12 @@ struct JsxObjectSpreadPlan {
     node: NodeRef,
     object: super::object_members::PropertyObjectPlan,
     properties: Vec<JsxAttributePlan>,
+}
+
+#[derive(Clone, Debug)]
+struct JsxSourceSpreadPlan {
+    node: NodeRef,
+    value: JsxScalarPlan,
 }
 
 #[derive(Clone, Debug)]
@@ -276,6 +287,28 @@ impl CanonicalTypeMapperStore {
         options: CanonicalCheckerOptions,
         diagnostics: &mut CanonicalCheckerDiagnostics,
     ) -> Result<TypeId, SourceCheckError> {
+        self.check_jsx_element_inner(host, None, expression, options, diagnostics)
+    }
+
+    pub(super) fn check_jsx_element_with_global_types(
+        &mut self,
+        host: &DeclaredTypeHost<'_>,
+        global_types: &CanonicalGlobalTypes,
+        expression: NodeRef,
+        options: CanonicalCheckerOptions,
+        diagnostics: &mut CanonicalCheckerDiagnostics,
+    ) -> Result<TypeId, SourceCheckError> {
+        self.check_jsx_element_inner(host, Some(global_types), expression, options, diagnostics)
+    }
+
+    fn check_jsx_element_inner(
+        &mut self,
+        host: &DeclaredTypeHost<'_>,
+        global_types: Option<&CanonicalGlobalTypes>,
+        expression: NodeRef,
+        options: CanonicalCheckerOptions,
+        diagnostics: &mut CanonicalCheckerDiagnostics,
+    ) -> Result<TypeId, SourceCheckError> {
         let (arena, bound) = host.source(expression).ok_or(SourceCheckError::Provenance(
             SourceCheckProvenanceError::MissingNode(expression),
         ))?;
@@ -289,7 +322,7 @@ impl CanonicalTypeMapperStore {
         let namespace = resolve_jsx_namespace(self, host, options, diagnostics, &plan)?;
         execute_jsx_element(
             self,
-            (arena, bound, host),
+            (arena, bound, host, global_types),
             &namespace,
             &plan,
             options,
@@ -842,9 +875,16 @@ fn plan_jsx_attributes(
     if let [attribute] = attributes.properties.nodes.as_slice() {
         let node = child_ref(attributes_node, *attribute);
         let record = jsx_node(arena, bound, store, node)?;
-        if matches!(&record.data, NodeData::JsxSpreadAttribute(_)) {
-            return plan_jsx_object_spread(arena, bound, store, attributes_node, node)
-                .map(|spread| JsxAttributesPlan::ObjectSpread(Box::new(spread)));
+        if let NodeData::JsxSpreadAttribute(spread) = &record.data {
+            let expression = child_ref(node, spread.expression);
+            let expression_record = jsx_node(arena, bound, store, expression)?;
+            return if expression_record.kind == SyntaxKind::Identifier {
+                plan_jsx_source_spread(arena, bound, store, attributes_node, node)
+                    .map(|spread| JsxAttributesPlan::SourceSpread(Box::new(spread)))
+            } else {
+                plan_jsx_object_spread(arena, bound, store, attributes_node, node)
+                    .map(|spread| JsxAttributesPlan::ObjectSpread(Box::new(spread)))
+            };
         }
     }
 
@@ -1045,6 +1085,36 @@ fn plan_jsx_object_spread(
         object,
         properties,
     })
+}
+
+fn plan_jsx_source_spread(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    attributes: NodeRef,
+    node: NodeRef,
+) -> Result<JsxSourceSpreadPlan, SourceCheckError> {
+    let record = jsx_node(arena, bound, store, node)?;
+    let NodeData::JsxSpreadAttribute(spread) = &record.data else {
+        return Err(unsupported(node, record.kind));
+    };
+    if record.kind != SyntaxKind::JsxSpreadAttribute
+        || record.parent != Some(attributes.node)
+        || record.flags.0 != 0
+    {
+        return Err(unsupported(node, record.kind));
+    }
+    let value = plan_scalar(
+        arena,
+        bound,
+        store,
+        node,
+        child_ref(node, spread.expression),
+    )?;
+    if !matches!(&value, JsxScalarPlan::Identifier { .. }) {
+        return Err(unsupported(node, SyntaxKind::JsxSpreadAttribute));
+    }
+    Ok(JsxSourceSpreadPlan { node, value })
 }
 
 fn plan_jsx_children(
@@ -1749,13 +1819,23 @@ fn collect_jsx_plan_intrinsic_names(plan: &JsxElementPlan, names: &mut HashSet<S
             {
                 names.insert(closing.tag.name.clone());
             }
-            let properties = match attributes {
-                JsxAttributesPlan::Properties(properties) => properties.as_slice(),
-                JsxAttributesPlan::ObjectSpread(spread) => spread.properties.as_slice(),
-            };
-            for property in properties {
-                if let JsxAttributeValue::Expression { value, .. } = &property.value {
-                    collect_jsx_scalar_intrinsic_names(value, names);
+            match attributes {
+                JsxAttributesPlan::Properties(properties) => {
+                    for property in properties {
+                        if let JsxAttributeValue::Expression { value, .. } = &property.value {
+                            collect_jsx_scalar_intrinsic_names(value, names);
+                        }
+                    }
+                }
+                JsxAttributesPlan::ObjectSpread(spread) => {
+                    for property in &spread.properties {
+                        if let JsxAttributeValue::Expression { value, .. } = &property.value {
+                            collect_jsx_scalar_intrinsic_names(value, names);
+                        }
+                    }
+                }
+                JsxAttributesPlan::SourceSpread(spread) => {
+                    collect_jsx_scalar_intrinsic_names(&spread.value, names);
                 }
             }
         }
@@ -2775,13 +2855,18 @@ fn invalid_namespace_symbol(symbol: SemanticSymbolId) -> SourceCheckError {
 #[allow(clippy::too_many_lines)] // Preserve opening, closing, attribute, and child ordering.
 fn execute_jsx_element(
     store: &mut CanonicalTypeMapperStore,
-    source: (&NodeArena, &BoundFile, &DeclaredTypeHost<'_>),
+    source: (
+        &NodeArena,
+        &BoundFile,
+        &DeclaredTypeHost<'_>,
+        Option<&CanonicalGlobalTypes>,
+    ),
     namespace: &JsxNamespace,
     plan: &JsxElementPlan,
     options: CanonicalCheckerOptions,
     diagnostics: &mut CanonicalCheckerDiagnostics,
 ) -> Result<TypeId, SourceCheckError> {
-    let (arena, bound, host) = source;
+    let (arena, bound, host, _) = source;
     let mut children_checked = false;
     if plan.expression != plan.opening {
         publish_jsx_links(
@@ -2872,10 +2957,11 @@ fn execute_jsx_element(
                 }
                 let (attributes_type, signature) = resolve_component_tag(
                     store,
-                    (arena, bound),
+                    source,
                     namespace,
                     plan.opening,
                     tag,
+                    attributes,
                     options,
                     diagnostics,
                 )?;
@@ -2950,6 +3036,24 @@ fn execute_jsx_element(
                         diagnostics,
                     )?;
                     publish_type_links(store, *attributes_node, actual)?;
+                    (checked, actual)
+                }
+                JsxAttributesPlan::SourceSpread(spread) => {
+                    let checked = check_jsx_source_spread(
+                        store,
+                        source,
+                        namespace,
+                        spread,
+                        options,
+                        diagnostics,
+                    )?;
+                    let actual = publish_attribute_object(
+                        store,
+                        bound,
+                        *attributes_node,
+                        &checked,
+                        children,
+                    )?;
                     (checked, actual)
                 }
             };
@@ -3040,7 +3144,12 @@ fn check_jsx_element_type_constraint(
 
 fn check_jsx_implicit_children(
     store: &mut CanonicalTypeMapperStore,
-    source: (&NodeArena, &BoundFile, &DeclaredTypeHost<'_>),
+    source: (
+        &NodeArena,
+        &BoundFile,
+        &DeclaredTypeHost<'_>,
+        Option<&CanonicalGlobalTypes>,
+    ),
     namespace: &JsxNamespace,
     plan: &JsxElementPlan,
     attributes: &JsxAttributesPlan,
@@ -3079,7 +3188,7 @@ fn check_jsx_implicit_children(
             }
             return Ok(None);
         }
-        JsxAttributesPlan::Properties(_) => {}
+        JsxAttributesPlan::Properties(_) | JsxAttributesPlan::SourceSpread(_) => {}
     }
 
     let mut first_node = None;
@@ -3619,16 +3728,23 @@ fn intrinsic_signature(
         .ok_or(SourceCheckError::Call(opening))
 }
 
+#[allow(clippy::too_many_arguments)] // Generic JSX needs its authenticated attribute source.
 fn resolve_component_tag(
     store: &mut CanonicalTypeMapperStore,
-    source: (&NodeArena, &BoundFile),
+    source: (
+        &NodeArena,
+        &BoundFile,
+        &DeclaredTypeHost<'_>,
+        Option<&CanonicalGlobalTypes>,
+    ),
     namespace: &JsxNamespace,
     opening: NodeRef,
     tag: &JsxTagPlan,
+    attributes: &JsxAttributesPlan,
     options: CanonicalCheckerOptions,
     diagnostics: &mut CanonicalCheckerDiagnostics,
 ) -> Result<(TypeId, SignatureId), SourceCheckError> {
-    let (arena, bound) = source;
+    let (arena, bound, host, global_types) = source;
     let Some(symbol) = resolve_source_value_symbol(store, bound, &tag.name) else {
         add_missing_component_diagnostic(store, bound, tag.node, &tag.name, diagnostics)?;
         let unknown_signature = store
@@ -3679,18 +3795,54 @@ fn resolve_component_tag(
     let signature = store
         .signature(callable.signature)
         .ok_or(SourceCheckError::Call(opening))?;
-    if !signature.type_parameters().is_empty()
-        || signature.this_parameter().is_some()
+    if signature.this_parameter().is_some()
         || signature.has_rest_parameter()
         || callable.min_argument_count > 1
         || callable.parameters.len() > 1
     {
         return Err(unsupported(opening, SyntaxKind::JsxOpeningElement));
     }
+    if !signature.type_parameters().is_empty() {
+        let Some(global_types) = global_types else {
+            return Err(unsupported(opening, SyntaxKind::JsxOpeningElement));
+        };
+        let JsxAttributesPlan::SourceSpread(spread) = attributes else {
+            return Err(unsupported(opening, SyntaxKind::JsxOpeningElement));
+        };
+        let argument = execute_scalar(
+            store,
+            source,
+            namespace,
+            &spread.value,
+            options,
+            diagnostics,
+        )?;
+        let signature = resolve_jsx_generic_component_signature(
+            store,
+            host,
+            global_types,
+            options,
+            diagnostics,
+            opening,
+            component,
+            argument,
+        )?;
+        let [parameter] = store
+            .signature(signature)
+            .ok_or(SourceCheckError::Call(opening))?
+            .parameters()
+        else {
+            return Err(SourceCheckError::Call(opening));
+        };
+        let attributes_type = store
+            .value_symbol_links(*parameter)
+            .and_then(|links| links.resolved_type)
+            .ok_or(SourceCheckError::Call(opening))?;
+        resolve_jsx_spread_members(store, attributes_type, Some(global_types), opening)?;
+        return Ok((attributes_type, signature));
+    }
     if callable.return_type.is_none() {
-        let host =
-            DeclaredTypeHost::new([(arena, bound)]).map_err(super::DeclaredTypeError::from)?;
-        CanonicalTypeQuery::new(store, &host, options, diagnostics)?
+        CanonicalTypeQuery::new(store, host, options, diagnostics)?
             .get_return_type_of_signature(callable.signature)?;
     }
     let attributes_type = callable.parameters.first().copied().unwrap_or_else(|| {
@@ -3931,14 +4083,19 @@ fn resolve_scoped_jsx_value_symbol(
 
 fn check_jsx_attributes(
     store: &mut CanonicalTypeMapperStore,
-    source: (&NodeArena, &BoundFile, &DeclaredTypeHost<'_>),
+    source: (
+        &NodeArena,
+        &BoundFile,
+        &DeclaredTypeHost<'_>,
+        Option<&CanonicalGlobalTypes>,
+    ),
     namespace: &JsxNamespace,
     expected_attributes: TypeId,
     attributes: &[JsxAttributePlan],
     options: CanonicalCheckerOptions,
     diagnostics: &mut CanonicalCheckerDiagnostics,
 ) -> Result<Vec<CheckedJsxAttribute>, SourceCheckError> {
-    let (arena, _, _) = source;
+    let (arena, _, _, _) = source;
     let mut checked = Vec::with_capacity(attributes.len());
     let mut names = HashSet::with_capacity(attributes.len());
     for attribute in attributes {
@@ -4003,7 +4160,12 @@ fn check_jsx_attributes(
 
 fn check_jsx_object_spread(
     store: &mut CanonicalTypeMapperStore,
-    source: (&NodeArena, &BoundFile, &DeclaredTypeHost<'_>),
+    source: (
+        &NodeArena,
+        &BoundFile,
+        &DeclaredTypeHost<'_>,
+        Option<&CanonicalGlobalTypes>,
+    ),
     namespace: &JsxNamespace,
     expected_attributes: TypeId,
     spread: &JsxObjectSpreadPlan,
@@ -4040,6 +4202,100 @@ fn check_jsx_object_spread(
     }
 
     Ok((checked, object))
+}
+
+fn check_jsx_source_spread(
+    store: &mut CanonicalTypeMapperStore,
+    source: (
+        &NodeArena,
+        &BoundFile,
+        &DeclaredTypeHost<'_>,
+        Option<&CanonicalGlobalTypes>,
+    ),
+    namespace: &JsxNamespace,
+    spread: &JsxSourceSpreadPlan,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+) -> Result<Vec<CheckedJsxAttribute>, SourceCheckError> {
+    let JsxScalarPlan::Identifier { node, .. } = &spread.value else {
+        return Err(unsupported(spread.node, SyntaxKind::JsxSpreadAttribute));
+    };
+    let type_ = execute_scalar(
+        store,
+        source,
+        namespace,
+        &spread.value,
+        options,
+        diagnostics,
+    )?;
+    resolve_jsx_spread_members(store, type_, source.3, spread.node)?
+        .into_iter()
+        .map(|(symbol, type_)| {
+            let record = store
+                .symbol(symbol)
+                .ok_or(SourceCheckError::Property(spread.node))?;
+            let name = record
+                .name()
+                .as_utf8()
+                .filter(|name| !name.is_empty())
+                .ok_or(SourceCheckError::Property(spread.node))?;
+            if !record.flags().contains(SymbolFlags::PROPERTY) {
+                return Err(SourceCheckError::Property(spread.node));
+            }
+            Ok(CheckedJsxAttribute {
+                plan: JsxAttributePlan {
+                    node: spread.node,
+                    name_node: *node,
+                    name: name.to_owned(),
+                    symbol,
+                    value: JsxAttributeValue::ImplicitTrue,
+                },
+                type_,
+            })
+        })
+        .collect()
+}
+
+fn resolve_jsx_spread_members(
+    store: &mut CanonicalTypeMapperStore,
+    type_: TypeId,
+    global_types: Option<&CanonicalGlobalTypes>,
+    location: NodeRef,
+) -> Result<Vec<(SemanticSymbolId, TypeId)>, SourceCheckError> {
+    if validate_direct_generic_reference(store, type_).is_ok() {
+        let array_targets = global_types.map(CanonicalArrayTargets::from_global_types);
+        let members = resolve_members_with_array_targets(store, type_, array_targets)
+            .map_err(|_| SourceCheckError::Property(location))?;
+        let properties = members.properties().to_vec();
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        return properties
+            .into_iter()
+            .map(|symbol| {
+                demand_instantiated_property_type(store, type_, symbol, array_targets, &mut session)
+                    .map(|type_| (symbol, type_))
+                    .map_err(|_| SourceCheckError::Property(location))
+            })
+            .collect();
+    }
+
+    let properties = store
+        .type_payload(type_)
+        .and_then(|record| record.data().structured())
+        .ok_or_else(|| unsupported(location, SyntaxKind::JsxSpreadAttribute))?
+        .properties
+        .clone()
+        .unwrap_or_default();
+    properties
+        .into_iter()
+        .map(|symbol| {
+            store
+                .value_symbol_links(symbol)
+                .and_then(|links| links.resolved_type)
+                .filter(|type_| store.type_payload(*type_).is_some())
+                .map(|type_| (symbol, type_))
+                .ok_or(SourceCheckError::Property(location))
+        })
+        .collect()
 }
 
 fn widened_jsx_attribute_type(
@@ -4108,13 +4364,18 @@ fn publish_attribute_value_links(
 
 fn execute_scalar(
     store: &mut CanonicalTypeMapperStore,
-    source: (&NodeArena, &BoundFile, &DeclaredTypeHost<'_>),
+    source: (
+        &NodeArena,
+        &BoundFile,
+        &DeclaredTypeHost<'_>,
+        Option<&CanonicalGlobalTypes>,
+    ),
     namespace: &JsxNamespace,
     scalar: &JsxScalarPlan,
     options: CanonicalCheckerOptions,
     diagnostics: &mut CanonicalCheckerDiagnostics,
 ) -> Result<TypeId, SourceCheckError> {
-    let (arena, bound, host) = source;
+    let (arena, bound, host, _) = source;
     let (node, type_) = match scalar {
         JsxScalarPlan::String { node, value } => {
             let regular = store.regular_string_literal_type(value.clone())?;
@@ -4189,11 +4450,16 @@ fn execute_scalar(
                     else {
                         return None;
                     };
-                    let initializer = child_ref(declaration, variable.initializer?);
-                    store
-                        .type_node_links(initializer)
-                        .and_then(|links| links.resolved_type)
-                        .filter(|type_| store.type_payload(*type_).is_some())
+                    variable
+                        .type_
+                        .into_iter()
+                        .chain(variable.initializer)
+                        .find_map(|node| {
+                            store
+                                .type_node_links(child_ref(declaration, node))
+                                .and_then(|links| links.resolved_type)
+                                .filter(|type_| store.type_payload(*type_).is_some())
+                        })
                 })
                 .ok_or(SourceCheckError::Property(*node))?;
             publish_symbol_links(store, *node, symbol)?;
@@ -9442,6 +9708,229 @@ mod runtime_tests {
                 context.store().signature_len(),
                 context.store().checker_link_allocated_lengths(),
                 context.diagnostics().as_slice().to_vec(),
+            ),
+            cold,
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep spread ownership, child diagnostics, and warm state together.
+    fn identifier_spread_attributes_merge_legacy_children_and_replay_warm() {
+        let source = concat!(
+            "declare namespace JSX {\n",
+            "  interface Element {}\n",
+            "  interface ElementChildrenAttribute { children: any; }\n",
+            "  interface IntrinsicElements { div: { locale: string; children: string }; }\n",
+            "}\n",
+            "interface BaseProps { locale: string; }\n",
+            "declare const props: BaseProps;\n",
+            "const valid = <div {...props}>ready</div>;\n",
+            "const invalid = <div {...props}>{123}</div>;\n",
+        );
+        let parsed = parse_jsx_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(8_180);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/jsx-spread-children.tsx\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = crate::semantic::CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("only the numeric spread child must fail")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2322);
+        let range = parsed
+            .arena
+            .get(diagnostic.node.unwrap().node)
+            .unwrap()
+            .range;
+        assert_eq!(
+            source.get(range.start.get() as usize..range.end.get() as usize),
+            Some("{123}"),
+        );
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let mut spreads = 0;
+        for (node, record) in parsed.arena.iter() {
+            if record.kind != SyntaxKind::JsxAttributes {
+                continue;
+            }
+            let node = NodeRef::new(parsed.arena.id(), file, node);
+            let type_ = context
+                .store()
+                .type_node_links(node)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            let members = context
+                .store()
+                .type_payload(type_)
+                .and_then(|record| record.data().structured())
+                .and_then(|structured| structured.members)
+                .and_then(|members| context.store().symbol_table(members))
+                .unwrap();
+            let locale = members.get_source("locale").unwrap();
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(locale)
+                    .and_then(|links| links.resolved_type),
+                Some(string),
+            );
+            assert!(members.get_source("children").is_some());
+            spreads += 1;
+        }
+        assert_eq!(spreads, 2);
+
+        let cold = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().signature_len(),
+            context.store().checker_link_allocated_lengths(),
+            context.diagnostics().as_slice().to_vec(),
+        );
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.diagnostics().as_slice().to_vec(),
+            ),
+            cold,
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Preserve generic source inference and shared signature identity.
+    fn generic_jsx_components_infer_identifier_spread_types_and_replay_warm() {
+        let source = concat!(
+            "declare namespace JSX { interface Element {} }\n",
+            "interface Props<T> { value: T; }\n",
+            "declare function Widget<T>(props: Props<T>): any;\n",
+            "declare const numberProps: Props<number>;\n",
+            "const first = <Widget {...numberProps} />;\n",
+            "const second = <Widget {...numberProps} />;\n",
+        );
+        let parsed = parse_jsx_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(8_181);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/generic-jsx-spread.tsx\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = crate::semantic::CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+
+        context.check_source_file(file).unwrap();
+
+        assert!(
+            context.diagnostics().is_empty(),
+            "{:?}",
+            context.diagnostics()
+        );
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let mut signatures = Vec::new();
+        for (node, record) in parsed.arena.iter() {
+            if record.kind != SyntaxKind::JsxSelfClosingElement {
+                continue;
+            }
+            let opening = NodeRef::new(parsed.arena.id(), file, node);
+            let signature = context
+                .store()
+                .signature_links(opening)
+                .and_then(|links| links.resolved_signature.signature())
+                .unwrap();
+            assert!(
+                context
+                    .store()
+                    .signature(signature)
+                    .unwrap()
+                    .type_parameters()
+                    .is_empty()
+            );
+            signatures.push(signature);
+            let NodeData::JsxSelfClosingElement(element) = &record.data else {
+                unreachable!("the filtered node is a self-closing JSX element")
+            };
+            let attributes = child_ref(opening, element.attributes);
+            let type_ = context
+                .store()
+                .type_node_links(attributes)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            let value = context
+                .store()
+                .type_payload(type_)
+                .and_then(|record| record.data().structured())
+                .and_then(|structured| structured.members)
+                .and_then(|members| context.store().symbol_table(members))
+                .and_then(|members| members.get_source("value"))
+                .unwrap();
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(value)
+                    .and_then(|links| links.resolved_type),
+                Some(number),
+            );
+        }
+        assert_eq!(signatures.len(), 2);
+        assert_eq!(signatures[0], signatures[1]);
+
+        let cold = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().mapper_len(),
+            context.store().signature_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        context.recheck_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().mapper_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
             ),
             cold,
         );

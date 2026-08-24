@@ -41,7 +41,7 @@ use super::{
         source_declared_inference_candidate_is_exported,
     },
     inference::{NakedTypeCandidateError, NakedTypeInferenceError},
-    instantiate::InstantiationSession,
+    instantiate::{InstantiationLimits, InstantiationSession},
     object_diagnostics::{
         callable_assignability_details, exact_optional_property_mismatch_details,
         excess_object_argument_diagnostic, missing_mapped_index_signature_details,
@@ -1810,6 +1810,95 @@ fn resolve_source_call_once(
             | IdentityGenericCallError::Instantiation(_),
         ) => Err(SourceCallResolutionError::Unsupported),
         Err(IdentityGenericCallError::Invariant(_)) => Err(SourceCallResolutionError::Invariant),
+    }
+}
+
+/// Reuses ordinary source-call inference for a JSX component's spread props.
+#[allow(clippy::too_many_arguments)] // JSX retains its opening-node signature and source context.
+pub(super) fn resolve_jsx_generic_component_signature(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    opening: NodeRef,
+    component: TypeId,
+    attributes: TypeId,
+) -> Result<SignatureId, SourceCheckError> {
+    let existing = store
+        .signature_links(opening)
+        .and_then(|links| links.resolved_signature.signature());
+    let mut session = InstantiationSession::new(InstantiationLimits::default());
+    let mut retried_signatures = HashSet::new();
+    let arguments = [attributes];
+    let resolution = loop {
+        match resolve_source_call_once(
+            store,
+            host,
+            global_types,
+            options,
+            existing,
+            &mut session,
+            SourceCallResolutionRequest {
+                form: DirectCallForm::Call,
+                callee_type: component,
+                argument_types: &arguments,
+                explicit_type_arguments: None,
+            },
+        ) {
+            Ok(resolution) => break resolution,
+            Err(SourceCallResolutionError::Retry(signature))
+                if retried_signatures.insert(signature) =>
+            {
+                resolve_signature_return(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    &mut session,
+                    diagnostics,
+                    signature,
+                )?;
+            }
+            Err(SourceCallResolutionError::Relation(error)) => return Err(error.into()),
+            Err(
+                SourceCallResolutionError::Retry(_)
+                | SourceCallResolutionError::Unsupported
+                | SourceCallResolutionError::Invariant,
+            ) => {
+                return Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Syntax {
+                        node: opening,
+                        kind: SyntaxKind::JsxOpeningElement,
+                        role: super::SourceSyntaxRole::VariableInitializer,
+                    },
+                ));
+            }
+        }
+    };
+
+    match resolution {
+        ResolvedSourceCall::Legacy(resolution)
+        | ResolvedSourceCall::NongenericTypeArguments(resolution) => Ok(resolution.signature),
+        ResolvedSourceCall::Identity(resolution) => {
+            demand_identity_generic_call_return_with_session(store, &resolution, &mut session)
+                .map_err(|_| SourceCheckError::Call(opening))?;
+            Ok(resolution.projection.signature)
+        }
+        ResolvedSourceCall::Vector(resolution) => {
+            if !matches!(
+                resolution.applicability(),
+                GenericCallVectorApplicability::Applicable
+                    | GenericCallVectorApplicability::ArgumentNotAssignable { .. }
+            ) {
+                return Err(SourceCheckError::Call(opening));
+            }
+            let materialized = materialize_generic_call_vector_source(store, &resolution, existing)
+                .map_err(|_| SourceCheckError::Call(opening))?;
+            demand_generic_call_vector_return_with_session(store, &resolution, &mut session)
+                .map_err(|_| SourceCheckError::Call(opening))?;
+            Ok(materialized.call_signature)
+        }
     }
 }
 

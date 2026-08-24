@@ -22808,8 +22808,13 @@ pub(super) fn check_source_file(
             PlannedFunctionBody::Return { expression, .. } => (Some(expression), body_flow_types),
             PlannedFunctionBody::ReturnJsx { expression, .. } => {
                 let mut jsx_diagnostics = CanonicalCheckerDiagnostics::default();
-                let result =
-                    store.check_jsx_element(host, *expression, options, &mut jsx_diagnostics);
+                let result = store.check_jsx_element_with_global_types(
+                    host,
+                    global_types,
+                    *expression,
+                    options,
+                    &mut jsx_diagnostics,
+                );
                 merge_retry_diagnostics(&mut function_diagnostics, jsx_diagnostics);
                 let inferred = store.get_widened_type_with_global_types(result?, global_types)?;
                 let inferred = if function.callable.is_async {
@@ -23427,8 +23432,9 @@ pub(super) fn check_source_file(
                     &type_import_capabilities,
                 )?;
                 let mut jsx_diagnostics = CanonicalCheckerDiagnostics::default();
-                let result = store.check_jsx_element(
+                let result = store.check_jsx_element_with_global_types(
                     host,
+                    global_types,
                     class.class.element,
                     options,
                     &mut jsx_diagnostics,
@@ -23886,8 +23892,9 @@ pub(super) fn check_source_file(
                         expression,
                     } => {
                         let mut jsx_diagnostics = CanonicalCheckerDiagnostics::default();
-                        let result = store.check_jsx_element(
+                        let result = store.check_jsx_element_with_global_types(
                             host,
+                            global_types,
                             *expression,
                             options,
                             &mut jsx_diagnostics,
@@ -24115,8 +24122,9 @@ pub(super) fn check_source_file(
                             ..
                         } => {
                             let mut jsx_diagnostics = CanonicalCheckerDiagnostics::default();
-                            let result = store.check_jsx_element(
+                            let result = store.check_jsx_element_with_global_types(
                                 host,
+                                global_types,
                                 *element,
                                 options,
                                 &mut jsx_diagnostics,
@@ -24583,8 +24591,9 @@ pub(super) fn check_source_file(
                             type_node,
                         ) => {
                             let mut jsx_diagnostics = CanonicalCheckerDiagnostics::default();
-                            let jsx_type = store.check_jsx_element(
+                            let jsx_type = store.check_jsx_element_with_global_types(
                                 host,
+                                global_types,
                                 *element,
                                 options,
                                 &mut jsx_diagnostics,
@@ -25764,7 +25773,13 @@ pub(super) fn check_source_file(
                 element,
             } => {
                 let mut jsx_diagnostics = CanonicalCheckerDiagnostics::default();
-                let result = store.check_jsx_element(host, element, options, &mut jsx_diagnostics);
+                let result = store.check_jsx_element_with_global_types(
+                    host,
+                    global_types,
+                    element,
+                    options,
+                    &mut jsx_diagnostics,
+                );
                 merge_retry_diagnostics(diagnostics, jsx_diagnostics);
                 let type_ = result?;
                 publish_parenthesized_jsx_expression_types(
@@ -25871,7 +25886,13 @@ pub(super) fn check_source_file(
                 element,
             } => {
                 let mut jsx_diagnostics = CanonicalCheckerDiagnostics::default();
-                let result = store.check_jsx_element(host, *element, options, &mut jsx_diagnostics);
+                let result = store.check_jsx_element_with_global_types(
+                    host,
+                    global_types,
+                    *element,
+                    options,
+                    &mut jsx_diagnostics,
+                );
                 merge_retry_diagnostics(diagnostics, jsx_diagnostics);
                 let source_type = result?;
                 publish_parenthesized_jsx_expression_types(
