@@ -1195,7 +1195,14 @@ fn plan_jsx_source_spread(
         node,
         child_ref(node, spread.expression),
     )?;
-    if !matches!(&value, JsxScalarPlan::Identifier { .. }) {
+    let JsxScalarPlan::Identifier {
+        node: identifier,
+        name,
+    } = &value
+    else {
+        return Err(unsupported(node, SyntaxKind::JsxSpreadAttribute));
+    };
+    if resolve_scoped_jsx_value_symbol(store, arena, bound, *identifier, name).is_none() {
         return Err(unsupported(node, SyntaxKind::JsxSpreadAttribute));
     }
     Ok(JsxSourceSpreadPlan { node, value })
