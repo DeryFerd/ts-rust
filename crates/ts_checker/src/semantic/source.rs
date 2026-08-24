@@ -536,6 +536,7 @@ impl From<ArrayTypeError> for SourceCheckError {
 pub(super) struct PlannedExpression {
     pub(super) node: NodeRef,
     pub(super) kind: PlannedExpressionKind,
+    array_spreads: Vec<(usize, NodeRef)>,
     object_spreads: Vec<PlannedExpression>,
     used_before_assignment: bool,
 }
@@ -545,6 +546,7 @@ impl PlannedExpression {
         Self {
             node,
             kind,
+            array_spreads: Vec::new(),
             object_spreads: Vec::new(),
             used_before_assignment: false,
         }
@@ -561,6 +563,12 @@ impl PlannedExpression {
             expression = inner;
         }
         expression
+    }
+
+    pub(super) fn array_spread_node(&self, index: usize) -> Option<NodeRef> {
+        self.array_spreads
+            .iter()
+            .find_map(|(position, node)| (*position == index).then_some(*node))
     }
 }
 
@@ -12046,23 +12054,44 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             array.elements.nodes.clone()
         };
         let mut planned = Vec::with_capacity(elements.len());
+        let mut spreads = Vec::new();
         for element in elements {
             let element = self.reference(element);
             let record = self.node(element)?;
             if record.parent != Some(expression.node)
-                || matches!(
-                    record.kind,
-                    SyntaxKind::SpreadElement | SyntaxKind::OmittedExpression
-                )
+                || record.kind == SyntaxKind::OmittedExpression
             {
                 return Err(self.unsupported(element, record.kind, SourceSyntaxRole::ArrayElement));
             }
-            planned.push(self.plan_expression(element)?);
+            if record.kind == SyntaxKind::SpreadElement {
+                let NodeData::SpreadElement(spread) = &record.data else {
+                    return Err(self.unsupported(
+                        element,
+                        record.kind,
+                        SourceSyntaxRole::ArrayElement,
+                    ));
+                };
+                let operand = self.reference(spread.expression);
+                let operand_record = self.node(operand)?;
+                if record.flags.0 != 0
+                    || operand_record.parent != Some(element.node)
+                    || operand_record.kind != SyntaxKind::Identifier
+                {
+                    return Err(self.unsupported(
+                        element,
+                        SyntaxKind::SpreadElement,
+                        SourceSyntaxRole::ArrayElement,
+                    ));
+                }
+                spreads.push((planned.len(), element));
+                planned.push(self.plan_expression(operand)?);
+            } else {
+                planned.push(self.plan_expression(element)?);
+            }
         }
-        Ok(PlannedExpression::new(
-            expression,
-            PlannedExpressionKind::Array(planned),
-        ))
+        let mut planned = PlannedExpression::new(expression, PlannedExpressionKind::Array(planned));
+        planned.array_spreads = spreads;
+        Ok(planned)
     }
 
     fn plan_object_literal(
@@ -13899,7 +13928,8 @@ where
             ))?;
             let mut checked_elements = Vec::with_capacity(elements.len());
             let mut element_types = Vec::with_capacity(elements.len());
-            for (element, prepared) in elements.iter().zip(prepared_elements) {
+            let mut element_infos = Vec::with_capacity(elements.len());
+            for (index, (element, prepared)) in elements.iter().zip(prepared_elements).enumerate() {
                 let checked = execute_expression_types(
                     store,
                     Some(global_types),
@@ -13910,7 +13940,51 @@ where
                     property_diagnostics,
                     check_nested_expression,
                 )?;
-                element_types.push(checked.result);
+                if let Some(spread) = expression.array_spread_node(index) {
+                    if let Some(array) =
+                        store.canonical_array_reference(global_types, checked.result)?
+                    {
+                        let info = store
+                            .create_tuple_element_info(ElementFlags::REST, None)
+                            .ok_or(RelationUnavailable::InvalidStructuredMembers(
+                                checked.result,
+                            ))?;
+                        element_types.push(array.element_type);
+                        element_infos.push(info);
+                    } else if let Some(tuple) =
+                        store.canonical_tuple_shape(checked.result).map_err(|_| {
+                            RelationUnavailable::InvalidStructuredMembers(checked.result)
+                        })?
+                    {
+                        if tuple.combined_flags().intersects(ElementFlags::VARIABLE) {
+                            return Err(SourceCheckError::Unsupported(
+                                UnsupportedSourceSyntax::Syntax {
+                                    node: spread,
+                                    kind: SyntaxKind::SpreadElement,
+                                    role: SourceSyntaxRole::ArrayElement,
+                                },
+                            ));
+                        }
+                        element_types.extend_from_slice(tuple.element_types());
+                        element_infos.extend_from_slice(tuple.element_infos());
+                    } else {
+                        return Err(SourceCheckError::Unsupported(
+                            UnsupportedSourceSyntax::Syntax {
+                                node: spread,
+                                kind: SyntaxKind::SpreadElement,
+                                role: SourceSyntaxRole::ArrayElement,
+                            },
+                        ));
+                    }
+                } else {
+                    let info = store
+                        .create_tuple_element_info(ElementFlags::REQUIRED, None)
+                        .ok_or(RelationUnavailable::InvalidStructuredMembers(
+                            checked.result,
+                        ))?;
+                    element_types.push(checked.result);
+                    element_infos.push(info);
+                }
                 checked_elements.push(checked);
             }
             let base = if let Some(contextual_tuple) = tuple_contexts.get(&expression.node) {
@@ -13925,16 +13999,10 @@ where
                         RelationUnavailable::UnsupportedStructuredType(*contextual_tuple).into(),
                     );
                 }
-                let required = store
-                    .create_tuple_element_info(ElementFlags::REQUIRED, None)
-                    .ok_or(RelationUnavailable::InvalidStructuredMembers(
-                        *contextual_tuple,
-                    ))?;
-                let infos = vec![required; element_types.len()];
                 store
                     .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(
                         &element_types,
-                        &infos,
+                        &element_infos,
                         false,
                     ))
                     .map_err(|error| source_contextual_tuple_error(*contextual_tuple, error))?
@@ -31936,11 +32004,114 @@ mod tests {
     }
 
     #[test]
-    fn spread_and_omitted_array_elements_remain_atomic_typed_boundaries() {
+    fn direct_array_identifier_spreads_preserve_literal_cache_identity() {
+        let library = parsed("interface Array<T> {}");
+        let source = parsed(concat!(
+            "const values: number[] = [1, 2]; ",
+            "const copy: number[] = [.../* comment */values, 3];",
+        ));
+        let library_file = FileId::new(9_734);
+        let file = FileId::new(9_735);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions::default(),
+        );
+        let values = variable_initializer(&source, file, "values");
+        let copy = variable_initializer(&source, file, "copy");
+        let elements = array_elements(&source, file, copy);
+        let [spread, final_element] = elements.as_slice() else {
+            panic!("the copied array must retain its spread and numeric element")
+        };
+        let (spread, final_element) = (*spread, *final_element);
+        let NodeData::SpreadElement(data) = &source.arena.get(spread.node).unwrap().data else {
+            panic!("the copied array must retain its spread syntax")
+        };
+        let operand = NodeRef::new(source.arena.id(), file, data.expression);
+
+        context.check_source_file(file).unwrap();
+
+        let values_type = resolved_node_type(&context, values);
+        let copy_type = resolved_node_type(&context, copy);
+        assert_eq!(copy_type, values_type);
+        assert_eq!(context.type_to_string(copy_type).unwrap(), "number[]");
+        assert!(
+            context
+                .store()
+                .type_payload(copy_type)
+                .unwrap()
+                .object_flags()
+                .contains(ObjectFlags::ARRAY_LITERAL),
+        );
+        assert_eq!(
+            context
+                .type_to_string(resolved_node_type(&context, operand))
+                .unwrap(),
+            "number[]",
+        );
+        assert_eq!(
+            context
+                .type_to_string(resolved_node_type(&context, final_element))
+                .unwrap(),
+            "3",
+        );
+        assert!(context.store().type_node_links(spread).is_none());
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn contextual_fixed_tuple_identifier_spreads_reuse_canonical_tuple_literals() {
+        let library = parsed("interface Array<T> {}");
+        let source = parsed(concat!(
+            "const pair: [number, string] = [1, \"value\"]; ",
+            "const copy: [number, string] = [...pair];",
+        ));
+        let library_file = FileId::new(9_736);
+        let file = FileId::new(9_737);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions::default(),
+        );
+        let pair = variable_initializer(&source, file, "pair");
+        let copy = variable_initializer(&source, file, "copy");
+
+        context.check_source_file(file).unwrap();
+
+        let pair_type = resolved_node_type(&context, pair);
+        let copy_type = resolved_node_type(&context, copy);
+        assert_eq!(copy_type, pair_type);
+        assert_eq!(
+            context.type_to_string(copy_type).unwrap(),
+            "[number, string]",
+        );
+        let shape = context
+            .store()
+            .canonical_tuple_shape(copy_type)
+            .unwrap()
+            .unwrap();
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        assert_eq!(
+            shape.element_types(),
+            &[bootstrap.number_type, bootstrap.string_type],
+        );
+        assert!(!shape.is_readonly());
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn unsupported_spread_operands_and_omitted_elements_remain_atomic_boundaries() {
         let library = parsed("interface Array<T> {}");
         let library_file = FileId::new(122);
         for (index, text) in [
             "var value: number[] = [...[1]];",
+            "var value: number[] = [...1];",
             "var value: number[] = [, 1];",
         ]
         .into_iter()

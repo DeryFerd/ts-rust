@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use ts_ast::NodeRef;
+use ts_ast::{NodeRef, SyntaxKind};
 use ts_binder::{EscapedName, SemanticSymbolId, SymbolFlags};
 
 use super::{
@@ -22,7 +22,10 @@ use super::{
     mapped_types::{FiniteRecordMappedProjection, MappedTypeError, MappedTypeModifiers},
     object_members::PlannedProperty,
     relater::ResolvedDeclaredPropertyObject,
-    source::{PlannedExpression, PlannedExpressionKind, SourceCheckError, UnsupportedSourceSyntax},
+    source::{
+        PlannedExpression, PlannedExpressionKind, SourceCheckError, SourceSyntaxRole,
+        UnsupportedSourceSyntax,
+    },
     type_records::{LiteralValue, TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
 };
@@ -497,6 +500,58 @@ fn prepare_expression(
             }
             let mut prepared = Vec::with_capacity(elements.len());
             for (index, element) in elements.iter().enumerate() {
+                if let Some(spread) = expression.array_spread_node(index) {
+                    let PlannedExpressionKind::Identifier(read) = &element.kind else {
+                        return Err(SourceCheckError::Unsupported(
+                            UnsupportedSourceSyntax::Syntax {
+                                node: spread,
+                                kind: SyntaxKind::SpreadElement,
+                                role: SourceSyntaxRole::ArrayElement,
+                            },
+                        ));
+                    };
+                    let source_type = *state.current_flow_types.get(&read.value_symbol).ok_or(
+                        SourceCheckError::Variable(VariableInvariant::MissingCurrentFlowType(
+                            read.value_symbol,
+                        )),
+                    )?;
+                    let array = global_types
+                        .map(|global_types| {
+                            store.canonical_array_element_type(global_types, source_type)
+                        })
+                        .transpose()?
+                        .flatten();
+                    let tuple = store
+                        .canonical_tuple_shape(source_type)
+                        .map_err(|_| RelationUnavailable::InvalidStructuredMembers(source_type))?;
+                    if array.is_none() && tuple.is_none()
+                        || tuple.as_ref().is_some_and(|shape| {
+                            shape
+                                .combined_flags()
+                                .intersects(super::signatures::ElementFlags::VARIABLE)
+                        })
+                        || tuple_context.is_some()
+                            && (array.is_some() || index != elements.len() - 1)
+                    {
+                        return Err(SourceCheckError::Unsupported(
+                            UnsupportedSourceSyntax::Syntax {
+                                node: spread,
+                                kind: SyntaxKind::SpreadElement,
+                                role: SourceSyntaxRole::ArrayElement,
+                            },
+                        ));
+                    }
+                    prepared.push(prepare_expression(
+                        store,
+                        host,
+                        global_types,
+                        state,
+                        element,
+                        None,
+                        ExpressionLocation::Cached,
+                    )?);
+                    continue;
+                }
                 let positional_context = tuple_context.as_ref().and_then(|(types, has_rest)| {
                     types
                         .get(index)
