@@ -893,11 +893,20 @@ fn alias_owner_of_method_type(
     let result = match store.type_payload(type_)?.data() {
         TypeData::TypeParameter(_) => {
             let parameter = cached_ordinary_type_parameter_owner(store, type_)?;
-            let alias = store.get_parent_of_symbol(parameter)?;
+            let [declaration] = store.symbol(parameter)?.declarations()? else {
+                return None;
+            };
+            let SourceNodeParent::Parent(alias_declaration) =
+                store.source_node_parent(*declaration)?
+            else {
+                return None;
+            };
+            let alias = store.cached_type_alias_symbol_for_declaration(alias_declaration)?;
             store
-                .symbol(alias)?
-                .flags()
-                .contains(SymbolFlags::TYPE_ALIAS)
+                .type_alias_links(alias)?
+                .type_parameters
+                .as_deref()?
+                .contains(&type_)
                 .then_some(alias)
         }
         TypeData::Union(union) => union

@@ -3103,6 +3103,30 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             .flatten()
     }
 
+    /// Finds the authenticated cached alias that owns one source declaration.
+    pub(super) fn cached_type_alias_symbol_for_declaration(
+        &self,
+        declaration: NodeRef,
+    ) -> Option<SemanticSymbolId> {
+        if !matches!(
+            self.source_node_kind(declaration),
+            Some(SyntaxKind::TypeAliasDeclaration | SyntaxKind::JsTypeAliasDeclaration)
+        ) {
+            return None;
+        }
+        self.links
+            .type_alias
+            .find_key(|symbol| {
+                self.get_merged_symbol(*symbol) == Some(*symbol)
+                    && self.symbol(*symbol).is_some_and(|alias| {
+                        alias.flags() == SymbolFlags::TYPE_ALIAS
+                            && alias.check_flags() == CheckFlags::NONE
+                            && alias.declarations() == Some(&[declaration][..])
+                    })
+            })
+            .copied()
+    }
+
     pub fn ensure_type_alias_links(&mut self, symbol: SemanticSymbolId) -> bool {
         if !self.symbols.contains_symbol(symbol) {
             return false;

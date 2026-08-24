@@ -3281,6 +3281,100 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             && literal.call_signatures.is_empty())
     }
 
+    fn is_authenticated_bivariant_alias_type_parameter(
+        &self,
+        node: NodeRef,
+        symbol: SemanticSymbolId,
+    ) -> Result<bool, DeclaredTypeError> {
+        let Some(parameter) = self.store.symbol(symbol) else {
+            return Ok(false);
+        };
+        let Some([declaration]) = parameter.declarations() else {
+            return Ok(false);
+        };
+        let declaration = *declaration;
+        let declaration_record = preflight_node(self.store, self.host, declaration)?;
+        let Some(alias_node) = declaration_record
+            .parent
+            .map(|parent| NodeRef::new(declaration.arena, declaration.file, parent))
+        else {
+            return Ok(false);
+        };
+        let alias_record = preflight_node(self.store, self.host, alias_node)?;
+        let NodeData::TypeAliasDeclaration(alias_declaration) = &alias_record.data else {
+            return Ok(false);
+        };
+        let alias_symbol = self
+            .host
+            .bound_file(alias_node)
+            .and_then(|bound| bound.symbol(alias_node))
+            .and_then(|alias| self.store.get_merged_symbol(alias));
+        let Some(alias_symbol) = alias_symbol else {
+            return Ok(false);
+        };
+        let Some(plan) = self.plan.aliases.get(&alias_symbol) else {
+            return Ok(false);
+        };
+        if declaration_record.kind != SyntaxKind::TypeParameter
+            || declaration_record.parent != Some(alias_node.node)
+            || alias_record.kind != SyntaxKind::TypeAliasDeclaration
+            || parameter.flags() != SymbolFlags::TYPE_PARAMETER
+            || parameter.check_flags() != CheckFlags::NONE
+            || !plan
+                .type_parameters
+                .iter()
+                .any(|planned| planned.symbol == symbol && planned.declaration == declaration)
+        {
+            return Ok(false);
+        }
+
+        let mut current = node;
+        let mut visited = HashSet::new();
+        let mut reached_alias = false;
+        while visited.insert(current) {
+            let Some(parent) = preflight_node(self.store, self.host, current)?.parent else {
+                return Ok(false);
+            };
+            let parent = NodeRef::new(current.arena, current.file, parent);
+            if parent == alias_node {
+                reached_alias = true;
+                break;
+            }
+            current = parent;
+        }
+        if !reached_alias {
+            return Ok(false);
+        }
+
+        let body = NodeRef::new(alias_node.arena, alias_node.file, alias_declaration.type_);
+        if plan.type_node != body {
+            return Ok(false);
+        }
+        let body_record = preflight_node(self.store, self.host, body)?;
+        if body_record.parent != Some(alias_node.node) {
+            return Ok(false);
+        }
+        if body_record.kind == SyntaxKind::IndexedAccessType {
+            return self.is_authenticated_bivariant_method_indexed_access(body);
+        }
+        let NodeData::UnionTypeNode(union) = &body_record.data else {
+            return Ok(false);
+        };
+        if body_record.kind != SyntaxKind::UnionType {
+            return Ok(false);
+        }
+        for constituent in &union.types.nodes {
+            let constituent = NodeRef::new(body.arena, body.file, *constituent);
+            if preflight_node(self.store, self.host, constituent)?.parent != Some(body.node) {
+                return Ok(false);
+            }
+            if self.is_authenticated_bivariant_method_indexed_access(constituent)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     fn try_plan_generic_mapped_indexed_alias(
         &mut self,
         node: NodeRef,
@@ -6597,6 +6691,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             && global_array_target.is_none()
             && !flags.contains(SymbolFlags::TYPE_ALIAS)
             && !flags.intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE)
+            && (!flags.contains(SymbolFlags::TYPE_PARAMETER)
+                || !self.is_authenticated_bivariant_alias_type_parameter(node, symbol)?)
         {
             return Err(type_node_unavailable(
                 TypeNodeUnavailable::UnsupportedUnionConstituent(node),
@@ -28816,6 +28912,20 @@ mod tests {
             .type_alias_links(handler_alias)
             .and_then(|links| links.type_parameters.as_ref())
             .unwrap()[0];
+        let original_parameter_symbol =
+            cached_ordinary_type_parameter_owner(&fixture.store, original_parameter).unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .get_parent_of_symbol(original_parameter_symbol),
+            None
+        );
+        assert_eq!(
+            fixture
+                .store
+                .cached_type_alias_symbol_for_declaration(alias_parts(&fixture, "Handler").0),
+            Some(handler_alias),
+        );
         let StoredCallableSetValidation::Valid { projection, .. } =
             validate_stored_callable_set(&fixture.store, original_handler)
         else {
