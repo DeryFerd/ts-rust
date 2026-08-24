@@ -12841,16 +12841,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             PlannedExpressionKind::String(_)
             | PlannedExpressionKind::Number { .. }
             | PlannedExpressionKind::BigInt { .. }
-            | PlannedExpressionKind::Boolean(_) => true,
-            PlannedExpressionKind::Object { properties, .. } => properties.iter().all(|property| {
-                matches!(
-                    &property.unparenthesized().kind,
-                    PlannedExpressionKind::String(_)
-                        | PlannedExpressionKind::Number { .. }
-                        | PlannedExpressionKind::BigInt { .. }
-                        | PlannedExpressionKind::Boolean(_)
-                )
-            }),
+            | PlannedExpressionKind::Boolean(_)
+            | PlannedExpressionKind::Object { .. } => true,
             _ => false,
         };
         if const_assertion && !supported_const_operand {
@@ -13046,9 +13038,6 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             operand = inner;
         }
         let record = self.node(operand)?;
-        if record.kind == SyntaxKind::ObjectLiteralExpression {
-            return Err(self.unsupported(operand, record.kind, SourceSyntaxRole::ObjectLiteral));
-        }
         if record.kind == SyntaxKind::BinaryExpression {
             let NodeData::BinaryExpression(binary) = &record.data else {
                 return Err(self.unsupported(
@@ -14703,6 +14692,15 @@ fn prepare_const_object_property(
             | PlannedExpressionKind::Boolean(_),
             PreparedExpression::Literal(_),
         ) => Ok(PreparedExpression::Literal(LiteralTreatment::Regular)),
+        (PlannedExpressionKind::Identifier(_), PreparedExpression::Identifier(_)) => {
+            Ok(PreparedExpression::Identifier(LiteralTreatment::Identity))
+        }
+        (PlannedExpressionKind::Object { .. }, PreparedExpression::Object(_))
+        | (PlannedExpressionKind::Property(_), PreparedExpression::Property(_))
+        | (
+            PlannedExpressionKind::Null | PlannedExpressionKind::GlobalUndefined,
+            PreparedExpression::Literal(_),
+        ) => Ok(prepared.clone()),
         (
             PlannedExpressionKind::Parenthesized(inner),
             PreparedExpression::Parenthesized(prepared),
@@ -15022,7 +15020,7 @@ where
                     .readonly
                     .then(|| prepare_const_object_property(property, prepared))
                     .transpose()?;
-                let checked = execute_expression_types(
+                let mut checked = execute_expression_types(
                     store,
                     global_types,
                     current_flow_types,
@@ -15032,6 +15030,12 @@ where
                     property_diagnostics,
                     check_nested_expression,
                 )?;
+                if property_plan.readonly
+                    && let Some(TypeData::Literal(literal)) =
+                        store.type_payload(checked.result).map(TypeRecord::data)
+                {
+                    checked.result = literal.regular_type;
+                }
                 property_types.push(checked.result);
                 checked_properties.push(checked);
             }
@@ -16591,6 +16595,16 @@ fn check_expression_type(
                             &operand.unparenthesized().kind,
                             PlannedExpressionKind::Object { .. }
                         ) =>
+                    {
+                        operand_types.result
+                    }
+                    TypeData::Intrinsic(_)
+                        if matches!(
+                            &operand.unparenthesized().kind,
+                            PlannedExpressionKind::Object { .. }
+                        ) && store.intrinsic_bootstrap().is_some_and(|bootstrap| {
+                            operand_types.result == bootstrap.any_type
+                        }) =>
                     {
                         operand_types.result
                     }
@@ -35726,21 +35740,211 @@ mod tests {
     }
 
     #[test]
-    fn nonscalar_const_assertions_remain_an_atomic_typed_boundary() {
+    fn nested_const_assertions_preserve_recursive_readonly_literal_properties() {
         let source = parsed(r"var value = { item: { nested: 1 } } as const;");
         let file = FileId::new(116);
         let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
-        let before = observable_state(&context, file);
 
-        assert!(matches!(
-            context.check_source_file(file),
-            Err(SourceCheckError::Unsupported(
-                UnsupportedSourceSyntax::ConstAssertion(_)
-            ))
-        ));
-        assert_eq!(observable_state(&context, file), before);
+        context.check_source_file(file).unwrap();
+
+        let assertion = variable_initializer(&source, file, "value");
+        let NodeData::AsExpression(assertion_data) =
+            &source.arena.get(assertion.node).unwrap().data
+        else {
+            panic!("expected a nested const assertion")
+        };
+        let outer = NodeRef::new(source.arena.id(), file, assertion_data.expression);
+        let inner = object_property_initializer(&source, file, outer, "item");
+        let value = variable_value_type(&context, &source, file, "value");
+        assert_eq!(resolved_node_type(&context, assertion), value);
+        assert_eq!(resolved_node_type(&context, outer), value);
+        assert_eq!(
+            context
+                .type_to_string(object_property_type(&context, inner, "nested"))
+                .unwrap(),
+            "1",
+        );
+        assert_eq!(
+            context.type_to_string(value).unwrap(),
+            "{ readonly item: { readonly nested: 1; }; }",
+        );
+        for object in [outer, inner] {
+            let object_type = resolved_node_type(&context, object);
+            let TypeData::Object(record) =
+                context.store().type_payload(object_type).unwrap().data()
+            else {
+                panic!("nested const assertions must retain object types")
+            };
+            assert!(
+                record
+                    .structured
+                    .properties
+                    .as_deref()
+                    .unwrap()
+                    .iter()
+                    .all(|property| {
+                        context
+                            .store()
+                            .symbol(*property)
+                            .unwrap()
+                            .check_flags()
+                            .contains(CheckFlags::READONLY)
+                    })
+            );
+        }
         assert!(context.diagnostics().is_empty());
-        assert!(!is_type_checked(&context, file));
+        assert!(is_type_checked(&context, file));
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn exported_nested_enum_const_objects_survive_readonly_concrete_spreads() {
+        let source = parsed(concat!(
+            "export enum E { A = 'a', B = 'b' } ",
+            "export const A = { item: { a: E.A } } as const; ",
+            "export const B = { ...A } as const;",
+        ));
+        let file = FileId::new(8_531);
+        let mut context = context_with_module_state(
+            &[(file, &source)],
+            CanonicalModuleState::External,
+            CanonicalCheckerOptions::default(),
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let asserted_object = |name| {
+            let assertion = variable_initializer(&source, file, name);
+            let NodeData::AsExpression(assertion) = &source.arena.get(assertion.node).unwrap().data
+            else {
+                panic!("{name} must retain its const assertion")
+            };
+            NodeRef::new(source.arena.id(), file, assertion.expression)
+        };
+        let original = asserted_object("A");
+        let nested = object_property_initializer(&source, file, original, "item");
+        let spread = asserted_object("B");
+        let original_type = variable_value_type(&context, &source, file, "A");
+        let spread_type = variable_value_type(&context, &source, file, "B");
+        assert_eq!(resolved_node_type(&context, original), original_type);
+        assert_eq!(resolved_node_type(&context, spread), spread_type);
+        assert_eq!(
+            object_property_type(&context, spread, "item"),
+            object_property_type(&context, original, "item"),
+        );
+        assert_eq!(
+            context
+                .type_to_string(object_property_type(&context, nested, "a"))
+                .unwrap(),
+            "E.A",
+        );
+        assert_eq!(
+            context.type_to_string(original_type).unwrap(),
+            "{ readonly item: { readonly a: E.A; }; }",
+        );
+        assert_eq!(
+            context.type_to_string(spread_type).unwrap(),
+            "{ readonly item: { readonly a: E.A; }; }",
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn concrete_object_spreads_merge_donors_direct_properties_and_inline_literals() {
+        let source = parsed(concat!(
+            "const first = { shared: 'left', first: 1 }; ",
+            "const second = { shared: true, second: 2 }; ",
+            "const merged = { ...first, ...second, last: 4 }; ",
+            "const overwritten = { ...first, shared: 3 }; ",
+            "const inline = { ...{ fresh: 1 }, marker: 2 };",
+        ));
+        let file = FileId::new(8_532);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let merged = variable_initializer(&source, file, "merged");
+        let overwritten = variable_initializer(&source, file, "overwritten");
+        let inline = variable_initializer(&source, file, "inline");
+        assert_eq!(
+            context
+                .type_to_string(object_property_type(&context, merged, "shared"))
+                .unwrap(),
+            "boolean",
+        );
+        assert_eq!(
+            context
+                .type_to_string(object_property_type(&context, overwritten, "shared"))
+                .unwrap(),
+            "number",
+        );
+        assert_eq!(
+            context
+                .type_to_string(object_property_type(&context, inline, "fresh"))
+                .unwrap(),
+            "number",
+        );
+        assert_eq!(
+            context
+                .type_to_string(variable_value_type(&context, &source, file, "merged"))
+                .unwrap(),
+            "{ shared: boolean; first: number; second: number; last: number; }",
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn readonly_spread_status_follows_the_receiver_and_const_spreads_absorb_any() {
+        let source = parsed(concat!(
+            "const frozen = { value: 1 } as const; ",
+            "const mutable = { ...frozen }; ",
+            "const input: any = 1; ",
+            "const absorbed = { ...frozen, ...input } as const;",
+        ));
+        let file = FileId::new(8_533);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let mutable = variable_initializer(&source, file, "mutable");
+        let mutable_type = resolved_node_type(&context, mutable);
+        let TypeData::Object(record) = context.store().type_payload(mutable_type).unwrap().data()
+        else {
+            panic!("the mutable spread must retain an object type")
+        };
+        let [property] = record.structured.properties.as_deref().unwrap() else {
+            panic!("the mutable spread must retain its one source property")
+        };
+        assert_eq!(
+            context.store().symbol(*property).unwrap().check_flags(),
+            CheckFlags::NONE,
+        );
+        assert_eq!(
+            context
+                .type_to_string(object_property_type(&context, mutable, "value"))
+                .unwrap(),
+            "1",
+        );
+        assert_eq!(
+            variable_value_type(&context, &source, file, "absorbed"),
+            context.store().intrinsic_bootstrap().unwrap().any_type,
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
     }
 
     #[test]
@@ -38876,10 +39080,6 @@ mod tests {
     #[test]
     fn unsupported_object_forms_fail_before_writes() {
         let cases = [
-            (
-                "const value: any = { ...{ property: 1 } };",
-                SourceSyntaxRole::ObjectLiteral,
-            ),
             (
                 "const value: any = { method(): string { return ''; } };",
                 SourceSyntaxRole::ObjectProperty,

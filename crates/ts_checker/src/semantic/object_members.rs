@@ -77,6 +77,13 @@ pub(super) struct PlannedObjectSpread {
     pub property_index: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ResolvedObjectProperty {
+    name: String,
+    type_: TypeId,
+    readonly: bool,
+}
+
 const fn source_property_check_flags(readonly: bool) -> CheckFlags {
     if readonly {
         CheckFlags::READONLY
@@ -226,6 +233,7 @@ pub(super) struct LazyMergedGenericInterfacePlan {
 pub(super) struct PropertyObjectPlan {
     pub kind: PropertyObjectKind,
     pub node: NodeRef,
+    pub const_context: bool,
     pub declarations: Vec<NodeRef>,
     pub symbol: SemanticSymbolId,
     pub members: Option<SymbolTableId>,
@@ -884,7 +892,8 @@ pub(super) fn plan_object_literal(
         None,
         TypeLiteralMemberPolicy::General,
     )?;
-    if object_literal_has_const_assertion(store, host, node)? {
+    plan.const_context = object_literal_has_const_assertion(store, host, node)?;
+    if plan.const_context {
         for property in &mut plan.properties {
             property.readonly = true;
         }
@@ -1001,6 +1010,23 @@ fn object_literal_has_const_assertion(
                 SyntaxKind::ParenthesizedExpression,
             ) if parenthesized.expression == operand.node => {
                 operand = parent;
+                continue;
+            }
+            (NodeData::PropertyAssignment(property), SyntaxKind::PropertyAssignment)
+                if property.initializer == operand.node =>
+            {
+                let owner = record.parent.ok_or_else(invalid)?;
+                let owner = NodeRef::new(parent.arena, parent.file, owner);
+                let owner_record = preflight_node(store, host, owner).map_err(|_| invalid())?;
+                let NodeData::ObjectLiteralExpression(object) = &owner_record.data else {
+                    return Err(invalid());
+                };
+                if owner_record.kind != SyntaxKind::ObjectLiteralExpression
+                    || !object.properties.nodes.contains(&parent.node)
+                {
+                    return Err(invalid());
+                }
+                operand = owner;
                 continue;
             }
             (NodeData::AsExpression(assertion), SyntaxKind::AsExpression)
@@ -3898,6 +3924,7 @@ fn plan_members(
     let provisional = PropertyObjectPlan {
         kind,
         node,
+        const_context: false,
         declarations: std::iter::once(node)
             .chain(
                 additional_members
@@ -5379,6 +5406,13 @@ pub(super) fn object_literal_state(
             .intrinsic_bootstrap()
             .is_some_and(|bootstrap| type_ == bootstrap.any_type)
         && unresolved_property_links(store, plan)
+    {
+        return Ok(Some(PropertyObjectState::Resolved(type_)));
+    }
+    if store
+        .type_payload(type_)
+        .is_some_and(|record| record.symbol().is_none())
+        && synthetic_object_literal_matches_plan(store, plan, type_)
     {
         return Ok(Some(PropertyObjectState::Resolved(type_)));
     }
@@ -7064,8 +7098,111 @@ fn valid_object_literal_property_type(
 ) -> bool {
     store.type_payload(type_).is_some_and(|record| {
         !property.readonly
-            || matches!(record.data(), TypeData::Literal(literal) if literal.regular_type == type_)
+            || !matches!(record.data(), TypeData::Literal(literal) if literal.regular_type != type_)
     })
+}
+
+fn validated_synthetic_object_properties(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Option<Vec<ResolvedObjectProperty>> {
+    let record = store.type_payload(type_)?;
+    let TypeData::Object(object) = record.data() else {
+        return None;
+    };
+    if record.flags() != TypeFlags::OBJECT
+        || record.object_flags() != ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
+        || record.symbol().is_some()
+        || record.alias().is_some()
+        || !valid_object_tail(object)
+        || object.structured.constrained != ConstrainedTypeData::default()
+        || object.structured.signatures.is_some()
+        || object.structured.call_signature_count != 0
+        || object.structured.index_infos.is_some()
+        || object
+            .structured
+            .object_type_without_abstract_construct_signatures
+            .is_some()
+    {
+        return None;
+    }
+    let members = object.structured.members?;
+    let table = store.symbol_table(members)?;
+    let properties = object.structured.properties.as_deref().unwrap_or_default();
+    if table.len() != properties.len()
+        || object.structured.properties.is_some() == properties.is_empty()
+    {
+        return None;
+    }
+
+    let mut seen = HashSet::with_capacity(properties.len());
+    let mut resolved = Vec::with_capacity(properties.len());
+    for symbol in properties {
+        if !seen.insert(*symbol) {
+            return None;
+        }
+        let property = store.symbol(*symbol)?;
+        let links = store.value_symbol_links(*symbol)?;
+        let type_ = links.resolved_type?;
+        let name = property.name().as_utf8()?;
+        if property.flags() != SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT
+            || property.check_flags().bits() & !CheckFlags::READONLY.bits() != 0
+            || property.name().is_reserved_member_name()
+            || property.name().is_private_identifier()
+            || property.name().is_late_bound()
+            || property.declarations().is_some()
+            || property.value_declaration().is_some()
+            || property.parent().is_some()
+            || property.members().is_some()
+            || property.exports().is_some()
+            || property.export_symbol().is_some()
+            || store.get_merged_symbol(*symbol) != Some(*symbol)
+            || store.type_payload(type_).is_none()
+            || table.get(property.name()) != Some(*symbol)
+            || links
+                != &(ValueSymbolLinks {
+                    resolved_type: Some(type_),
+                    ..ValueSymbolLinks::default()
+                })
+        {
+            return None;
+        }
+        resolved.push(ResolvedObjectProperty {
+            name: name.to_owned(),
+            type_,
+            readonly: property.check_flags().contains(CheckFlags::READONLY),
+        });
+    }
+    Some(resolved)
+}
+
+fn synthetic_object_literal_matches_plan(
+    store: &CanonicalTypeMapperStore,
+    plan: &PropertyObjectPlan,
+    type_: TypeId,
+) -> bool {
+    if !unresolved_property_links(store, plan) {
+        return false;
+    }
+    let Some(properties) = validated_synthetic_object_properties(store, type_) else {
+        return false;
+    };
+    if !plan.spreads.is_empty() {
+        return properties
+            .iter()
+            .all(|property| property.readonly == plan.const_context);
+    }
+    plan.const_context
+        && properties.len() == plan.properties.len()
+        && plan
+            .properties
+            .iter()
+            .zip(properties)
+            .all(|(planned, actual)| {
+                planned.name == actual.name
+                    && planned.readonly == actual.readonly
+                    && valid_object_literal_property_type(store, planned, actual.type_)
+            })
 }
 
 fn unresolved_property_links(store: &CanonicalTypeMapperStore, plan: &PropertyObjectPlan) -> bool {
@@ -7707,6 +7844,25 @@ pub(super) fn validate_resolved_property_types(
             .and_then(|links| links.resolved_type)
             .and_then(|type_| store.type_payload(type_))
             .and_then(|record| match record.data() {
+                TypeData::Object(_) if record.symbol().is_none() => {
+                    validated_synthetic_object_properties(store, record.id()).and_then(
+                        |properties| {
+                            (properties.len() == plan.properties.len()
+                                && properties.iter().zip(&plan.properties).all(
+                                    |(actual, planned)| {
+                                        actual.name == planned.name
+                                            && actual.readonly == planned.readonly
+                                    },
+                                ))
+                            .then(|| {
+                                properties
+                                    .into_iter()
+                                    .map(|property| property.type_)
+                                    .collect()
+                            })
+                        },
+                    )
+                }
                 TypeData::Object(object) => object_literal_property_types(store, object, plan),
                 _ => None,
             })
@@ -8499,6 +8655,149 @@ fn valid_generic_structured_members(
         })
 }
 
+fn valid_object_literal_owner(store: &CanonicalTypeMapperStore, plan: &PropertyObjectPlan) -> bool {
+    let Some(owner) = store.symbol(plan.symbol) else {
+        return false;
+    };
+    store.get_merged_symbol(plan.symbol) == Some(plan.symbol)
+        && owner.flags() == SymbolFlags::OBJECT_LITERAL
+        && owner.check_flags() == CheckFlags::NONE
+        && owner.name() == InternalSymbolName::Object.as_ref()
+        && owner.declarations() == Some(&[plan.node])
+        && owner.value_declaration() == Some(plan.node)
+        && owner.members() == plan.members
+        && owner.parent().is_none()
+        && owner.exports().is_none()
+        && owner.export_symbol().is_none()
+}
+
+fn valid_bound_object_literal_property(
+    store: &CanonicalTypeMapperStore,
+    plan: &PropertyObjectPlan,
+    property: &PlannedProperty,
+) -> bool {
+    let Some(bound) = store.symbol(property.symbol) else {
+        return false;
+    };
+    store.get_merged_symbol(property.symbol) == Some(property.symbol)
+        && bound.flags() == SymbolFlags::PROPERTY
+        && bound.check_flags() == CheckFlags::NONE
+        && bound.name().as_utf8() == Some(property.name.as_str())
+        && bound.declarations() == Some(&[property.declaration])
+        && bound.value_declaration() == Some(property.declaration)
+        && bound.members().is_none()
+        && bound.exports().is_none()
+        && bound.parent() == Some(plan.symbol)
+        && bound.export_symbol().is_none()
+        && store.source_node_parent(property.declaration)
+            == Some(SourceNodeParent::Parent(plan.node))
+        && store.source_node_parent(property.name_node)
+            == Some(SourceNodeParent::Parent(property.declaration))
+        && store.source_node_parent(property.type_node)
+            == Some(SourceNodeParent::Parent(property.declaration))
+        && plan
+            .members
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get_source(&property.name))
+            == Some(property.symbol)
+}
+
+fn inherited_const_object_literal(store: &CanonicalTypeMapperStore, node: NodeRef) -> bool {
+    let mut current = node;
+    while let Some(SourceNodeParent::Parent(parent)) = store.source_node_parent(current) {
+        match store.source_node_kind(parent) {
+            Some(SyntaxKind::ParenthesizedExpression) => current = parent,
+            Some(SyntaxKind::PropertyAssignment) => return true,
+            _ => return false,
+        }
+    }
+    false
+}
+
+fn uses_synthetic_const_object(
+    store: &CanonicalTypeMapperStore,
+    plan: &PropertyObjectPlan,
+    property_types: &[TypeId],
+) -> bool {
+    plan.const_context
+        && (inherited_const_object_literal(store, plan.node)
+            || property_types.iter().any(|type_| {
+                !matches!(
+                    store.type_payload(*type_).map(TypeRecord::data),
+                    Some(TypeData::Literal(_))
+                )
+            }))
+}
+
+fn publish_synthetic_object_literal(
+    store: &mut CanonicalTypeMapperStore,
+    plan: &PropertyObjectPlan,
+    properties: &[ResolvedObjectProperty],
+) -> Result<TypeId, PropertyObjectError> {
+    if properties.iter().any(|property| {
+        let name = EscapedName::source(&property.name);
+        name.as_ref().is_reserved_member_name()
+            || name.as_ref().is_private_identifier()
+            || name.as_ref().is_late_bound()
+            || store.type_payload(property.type_).is_none()
+    }) {
+        return Err(PropertyObjectError::InvalidObjectLiteral(plan.node));
+    }
+    let prepared_members = PreparedSymbolTable::new(properties.len())
+        .ok_or(PropertyObjectError::Capacity(plan.node))?;
+    let mut symbols = Vec::new();
+    symbols
+        .try_reserve_exact(properties.len())
+        .map_err(|_| PropertyObjectError::Capacity(plan.node))?;
+    if !store.try_reserve_types(1)
+        || !store.try_reserve_checker_symbol_allocations(properties.len(), 1)
+        || !store.try_reserve_value_symbol_links(properties.len())
+        || !store
+            .try_reserve_type_node_links(usize::from(store.type_node_links(plan.node).is_none()))
+    {
+        return Err(PropertyObjectError::Capacity(plan.node));
+    }
+
+    let members = store.alloc_prepared_symbol_table(prepared_members);
+    for property in properties {
+        let symbol = store.alloc_transient_symbol(
+            SymbolFlags::PROPERTY,
+            EscapedName::source(&property.name),
+            source_property_check_flags(property.readonly),
+        );
+        assert!(store.set_value_symbol_links(
+            symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(property.type_),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        assert_eq!(
+            store.insert_symbol(members, EscapedName::source(&property.name), symbol),
+            Some(None)
+        );
+        symbols.push(symbol);
+    }
+    let type_ = store
+        .alloc_plain_object_type(ObjectFlags::ANONYMOUS, None)
+        .expect("the synthetic object has no source-owned symbol");
+    assert!(store.set_structured_type_members(
+        type_,
+        Some(members),
+        (!symbols.is_empty()).then_some(symbols),
+        None,
+        None,
+        None,
+    ));
+    let mut links = store
+        .type_node_links(plan.node)
+        .cloned()
+        .unwrap_or_default();
+    links.resolved_type = Some(type_);
+    assert!(store.set_type_node_links(plan.node, links));
+    Ok(type_)
+}
+
 pub(super) fn publish_object_literal(
     store: &mut CanonicalTypeMapperStore,
     plan: &PropertyObjectPlan,
@@ -8530,20 +8829,7 @@ pub(super) fn publish_object_literal(
     {
         return Err(PropertyObjectError::InvalidObjectLiteral(plan.node));
     }
-    let owner = store
-        .symbol(plan.symbol)
-        .ok_or(PropertyObjectError::InvalidObjectLiteral(plan.node))?;
-    if store.get_merged_symbol(plan.symbol) != Some(plan.symbol)
-        || owner.flags() != SymbolFlags::OBJECT_LITERAL
-        || owner.check_flags() != CheckFlags::NONE
-        || owner.name() != InternalSymbolName::Object.as_ref()
-        || owner.declarations() != Some(&[plan.node])
-        || owner.value_declaration() != Some(plan.node)
-        || owner.members() != plan.members
-        || owner.parent().is_some()
-        || owner.exports().is_some()
-        || owner.export_symbol().is_some()
-    {
+    if !valid_object_literal_owner(store, plan) {
         return Err(PropertyObjectError::InvalidObjectLiteral(plan.node));
     }
     let object_flags = expected_object_literal_flags(store, property_types)
@@ -8553,28 +8839,7 @@ pub(super) fn publish_object_literal(
         .iter()
         .map(|property| {
             let bound = store.symbol(property.symbol)?;
-            if store.get_merged_symbol(property.symbol) != Some(property.symbol)
-                || bound.flags() != SymbolFlags::PROPERTY
-                || bound.check_flags() != CheckFlags::NONE
-                || bound.name().as_utf8() != Some(property.name.as_str())
-                || bound.declarations() != Some(&[property.declaration])
-                || bound.value_declaration() != Some(property.declaration)
-                || bound.members().is_some()
-                || bound.exports().is_some()
-                || bound.parent() != Some(plan.symbol)
-                || bound.export_symbol().is_some()
-                || store.source_node_parent(property.declaration)
-                    != Some(SourceNodeParent::Parent(plan.node))
-                || store.source_node_parent(property.name_node)
-                    != Some(SourceNodeParent::Parent(property.declaration))
-                || store.source_node_parent(property.type_node)
-                    != Some(SourceNodeParent::Parent(property.declaration))
-                || plan
-                    .members
-                    .and_then(|members| store.symbol_table(members))
-                    .and_then(|members| members.get_source(&property.name))
-                    != Some(property.symbol)
-            {
+            if !valid_bound_object_literal_property(store, plan, property) {
                 return None;
             }
             let mut data = SymbolData::new(
@@ -8589,6 +8854,19 @@ pub(super) fn publish_object_literal(
         })
         .collect::<Option<Vec<_>>>()
         .ok_or(PropertyObjectError::InvalidObjectLiteral(plan.node))?;
+    if uses_synthetic_const_object(store, plan, property_types) {
+        let properties = plan
+            .properties
+            .iter()
+            .zip(property_types)
+            .map(|(property, type_)| ResolvedObjectProperty {
+                name: property.name.clone(),
+                type_: *type_,
+                readonly: property.readonly,
+            })
+            .collect::<Vec<_>>();
+        return publish_synthetic_object_literal(store, plan, &properties);
+    }
     let prepared_members = PreparedSymbolTable::new(plan.properties.len())
         .ok_or(PropertyObjectError::Capacity(plan.node))?;
     let mut cloned_properties = Vec::new();
@@ -8714,12 +8992,263 @@ fn publish_javascript_expando_object_literal(
     Ok(type_)
 }
 
-/// Publishes a spread literal only when every operand is the canonical `any`.
-///
-/// Object spread absorbs `any` upstream. Direct properties keep their original
-/// binder symbols and are still checked by the source caller before this cache
-/// is published. Concrete donor objects remain closed until their member
-/// ownership and overwrite diagnostics are implemented together.
+enum SpreadDonorValidation {
+    Valid(Vec<ResolvedObjectProperty>),
+    Unsupported,
+    Malformed,
+}
+
+fn projected_spread_donor_properties(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Option<Vec<ResolvedObjectProperty>> {
+    let record = store.type_payload(type_)?;
+    let structured = record.data().structured()?;
+    let properties = structured.properties.as_deref().unwrap_or_default();
+    if structured.properties.is_some() == properties.is_empty() {
+        return None;
+    }
+    let table = match structured.members {
+        Some(members) => Some(store.symbol_table(members)?),
+        None if properties.is_empty() => None,
+        None => return None,
+    };
+    if table.is_some_and(|table| table.len() != properties.len()) {
+        return None;
+    }
+    let mut seen = HashSet::with_capacity(properties.len());
+    let mut result = Vec::with_capacity(properties.len());
+    for symbol in properties {
+        if !seen.insert(*symbol) {
+            return None;
+        }
+        let property = store.symbol(*symbol)?;
+        let name = property.name().as_utf8()?;
+        let type_ = store.value_symbol_links(*symbol)?.resolved_type?;
+        if !property.flags().contains(SymbolFlags::PROPERTY)
+            || property.flags().contains(SymbolFlags::OPTIONAL)
+            || property.check_flags().bits() & !CheckFlags::READONLY.bits() != 0
+            || property.name().is_reserved_member_name()
+            || property.name().is_private_identifier()
+            || property.name().is_late_bound()
+            || store.get_merged_symbol(*symbol) != Some(*symbol)
+            || store.type_payload(type_).is_none()
+            || table.and_then(|table| table.get(property.name())) != Some(*symbol)
+        {
+            return None;
+        }
+        result.push(ResolvedObjectProperty {
+            name: name.to_owned(),
+            type_,
+            readonly: property.check_flags().contains(CheckFlags::READONLY),
+        });
+    }
+    Some(result)
+}
+
+fn validated_source_object_spread_donor(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Option<Vec<ResolvedObjectProperty>> {
+    let record = store.type_payload(type_)?;
+    let TypeData::Object(object) = record.data() else {
+        return None;
+    };
+    let owner = record.symbol()?;
+    let owner_record = store.symbol(owner)?;
+    let [declaration] = owner_record.declarations()? else {
+        return None;
+    };
+    if record.flags() != TypeFlags::OBJECT
+        || record.alias().is_some()
+        || !valid_object_tail(object)
+        || object.structured.constrained != ConstrainedTypeData::default()
+        || object.structured.signatures.is_some()
+        || object.structured.call_signature_count != 0
+        || object.structured.index_infos.is_some()
+        || object
+            .structured
+            .object_type_without_abstract_construct_signatures
+            .is_some()
+        || owner_record.flags() != SymbolFlags::OBJECT_LITERAL
+        || owner_record.check_flags() != CheckFlags::NONE
+        || owner_record.name() != InternalSymbolName::Object.as_ref()
+        || owner_record.value_declaration() != Some(*declaration)
+        || owner_record.parent().is_some()
+        || owner_record.exports().is_some()
+        || owner_record.export_symbol().is_some()
+        || store.get_merged_symbol(owner) != Some(owner)
+        || store.source_node_kind(*declaration) != Some(SyntaxKind::ObjectLiteralExpression)
+        || store
+            .type_node_links(*declaration)
+            .and_then(|links| links.resolved_type)
+            != Some(type_)
+    {
+        return None;
+    }
+    let members = object.structured.members?;
+    if Some(members) == owner_record.members() {
+        return None;
+    }
+    let table = store.symbol_table(members)?;
+    let properties = object.structured.properties.as_deref().unwrap_or_default();
+    if table.len() != properties.len()
+        || object.structured.properties.is_some() == properties.is_empty()
+        || owner_record.members().is_some() == properties.is_empty()
+    {
+        return None;
+    }
+    let raw_table = match owner_record.members() {
+        Some(members) => Some(store.symbol_table(members)?),
+        None => None,
+    };
+    if raw_table.is_some_and(|table| table.len() != properties.len()) {
+        return None;
+    }
+    let mut seen = HashSet::with_capacity(properties.len());
+    let mut seen_raw = HashSet::with_capacity(properties.len());
+    let mut result = Vec::with_capacity(properties.len());
+    for symbol in properties {
+        if !seen.insert(*symbol) {
+            return None;
+        }
+        let property = store.symbol(*symbol)?;
+        let links = store.value_symbol_links(*symbol)?;
+        let property_type = links.resolved_type?;
+        let raw = links.target?;
+        let raw_record = store.symbol(raw)?;
+        let name = property.name().as_utf8()?;
+        if !seen_raw.insert(raw)
+            || property.flags() != SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT
+            || property.check_flags().bits() & !CheckFlags::READONLY.bits() != 0
+            || property.name().is_reserved_member_name()
+            || property.name().is_private_identifier()
+            || property.name().is_late_bound()
+            || property.parent() != Some(owner)
+            || property.members().is_some()
+            || property.exports().is_some()
+            || property.export_symbol().is_some()
+            || store.get_merged_symbol(*symbol) != Some(*symbol)
+            || raw_record.flags() != SymbolFlags::PROPERTY
+            || raw_record.check_flags() != CheckFlags::NONE
+            || raw_record.name() != property.name()
+            || raw_record.declarations() != property.declarations()
+            || raw_record.value_declaration() != property.value_declaration()
+            || raw_record.parent() != Some(owner)
+            || raw_record.members().is_some()
+            || raw_record.exports().is_some()
+            || raw_record.export_symbol().is_some()
+            || store.get_merged_symbol(raw) != Some(raw)
+            || store
+                .value_symbol_links(raw)
+                .is_some_and(|links| links != &ValueSymbolLinks::default())
+            || store.type_payload(property_type).is_none()
+            || table.get(property.name()) != Some(*symbol)
+            || raw_table.and_then(|table| table.get(raw_record.name())) != Some(raw)
+            || links
+                != &(ValueSymbolLinks {
+                    resolved_type: Some(property_type),
+                    target: Some(raw),
+                    ..ValueSymbolLinks::default()
+                })
+        {
+            return None;
+        }
+        let [property_declaration] = property.declarations()? else {
+            return None;
+        };
+        if property.value_declaration() != Some(*property_declaration)
+            || !matches!(
+                store.source_node_kind(*property_declaration),
+                Some(SyntaxKind::PropertyAssignment | SyntaxKind::ShorthandPropertyAssignment)
+            )
+            || store.source_node_parent(*property_declaration)
+                != Some(SourceNodeParent::Parent(*declaration))
+            || property.check_flags().contains(CheckFlags::READONLY)
+                && !matches!(
+                    store.type_payload(property_type).map(TypeRecord::data),
+                    Some(TypeData::Literal(literal)) if literal.regular_type == property_type
+                )
+        {
+            return None;
+        }
+        result.push(ResolvedObjectProperty {
+            name: name.to_owned(),
+            type_: property_type,
+            readonly: property.check_flags().contains(CheckFlags::READONLY),
+        });
+    }
+    let property_types = result
+        .iter()
+        .map(|property| property.type_)
+        .collect::<Vec<_>>();
+    (record.object_flags()
+        == expected_object_literal_flags(store, &property_types)? | ObjectFlags::MEMBERS_RESOLVED)
+        .then_some(result)
+}
+
+fn validate_spread_donor(store: &CanonicalTypeMapperStore, type_: TypeId) -> SpreadDonorValidation {
+    let Some(record) = store.type_payload(type_) else {
+        return SpreadDonorValidation::Malformed;
+    };
+    if record.flags() != TypeFlags::OBJECT {
+        return SpreadDonorValidation::Unsupported;
+    }
+    match validate_resolved_declared_property_object(store, type_) {
+        DeclaredPropertyObjectValidation::Valid(_) => {
+            return projected_spread_donor_properties(store, type_).map_or(
+                SpreadDonorValidation::Malformed,
+                SpreadDonorValidation::Valid,
+            );
+        }
+        DeclaredPropertyObjectValidation::Malformed => return SpreadDonorValidation::Malformed,
+        DeclaredPropertyObjectValidation::NotDeclared => {}
+    }
+    match store.validate_derived_object_literal_for_relation(type_) {
+        super::derived_types::DerivedObjectLiteralValidation::Valid { .. } => {
+            return projected_spread_donor_properties(store, type_).map_or(
+                SpreadDonorValidation::Malformed,
+                SpreadDonorValidation::Valid,
+            );
+        }
+        super::derived_types::DerivedObjectLiteralValidation::Invalid => {
+            return SpreadDonorValidation::Malformed;
+        }
+        super::derived_types::DerivedObjectLiteralValidation::NotDerived => {}
+    }
+    if record.symbol().is_none() {
+        return validated_synthetic_object_properties(store, type_).map_or(
+            SpreadDonorValidation::Malformed,
+            SpreadDonorValidation::Valid,
+        );
+    }
+    if record
+        .symbol()
+        .and_then(|symbol| store.symbol(symbol))
+        .is_some_and(|symbol| symbol.flags() == SymbolFlags::OBJECT_LITERAL)
+    {
+        return validated_source_object_spread_donor(store, type_).map_or(
+            SpreadDonorValidation::Malformed,
+            SpreadDonorValidation::Valid,
+        );
+    }
+    SpreadDonorValidation::Unsupported
+}
+
+fn merge_spread_property(
+    properties: &mut Vec<ResolvedObjectProperty>,
+    positions: &mut HashMap<String, usize>,
+    property: ResolvedObjectProperty,
+) {
+    if let Some(index) = positions.get(&property.name).copied() {
+        properties[index] = property;
+    } else {
+        positions.insert(property.name.clone(), properties.len());
+        properties.push(property);
+    }
+}
+
+/// Publishes authenticated concrete spreads, with canonical `any` absorption.
 pub(super) fn publish_object_literal_with_spreads(
     store: &mut CanonicalTypeMapperStore,
     plan: &PropertyObjectPlan,
@@ -8730,9 +9259,16 @@ pub(super) fn publish_object_literal_with_spreads(
         || plan.spreads.is_empty()
         || plan.spreads.len() != spread_types.len()
         || plan.properties.len() != property_types.len()
-        || property_types
+        || plan
+            .properties
             .iter()
-            .any(|type_| store.type_payload(*type_).is_none())
+            .zip(property_types)
+            .any(|(property, type_)| {
+                property.readonly != plan.const_context
+                    || !valid_bound_object_literal_property(store, plan, property)
+                    || !valid_object_literal_property_type(store, property, *type_)
+            })
+        || !valid_object_literal_owner(store, plan)
         || !unresolved_property_links(store, plan)
     {
         return Err(PropertyObjectError::InvalidObjectLiteral(plan.node));
@@ -8741,29 +9277,121 @@ pub(super) fn publish_object_literal_with_spreads(
         .intrinsic_bootstrap()
         .ok_or(PropertyObjectError::InvalidObjectLiteral(plan.node))?
         .any_type;
-    if spread_types.iter().any(|type_| *type_ != any) {
-        return Err(PropertyObjectError::UnsupportedMember {
-            node: plan.spreads[0].declaration,
-            kind: SyntaxKind::SpreadAssignment,
-        });
+    let mut donors = Vec::with_capacity(spread_types.len());
+    let mut absorbs_any = false;
+    for (spread, type_) in plan.spreads.iter().zip(spread_types) {
+        if *type_ == any {
+            donors.push(None);
+            absorbs_any = true;
+            continue;
+        }
+        match validate_spread_donor(store, *type_) {
+            SpreadDonorValidation::Valid(properties) => donors.push(Some(properties)),
+            SpreadDonorValidation::Unsupported => {
+                return Err(PropertyObjectError::UnsupportedMember {
+                    node: spread.declaration,
+                    kind: SyntaxKind::SpreadAssignment,
+                });
+            }
+            SpreadDonorValidation::Malformed => {
+                return Err(PropertyObjectError::InvalidObjectLiteral(plan.node));
+            }
+        }
     }
     if let Some(state) = object_literal_state(store, plan)? {
-        return if state.type_id() == any {
-            Ok(any)
+        if absorbs_any {
+            return if state.type_id() == any {
+                Ok(any)
+            } else {
+                Err(invalid_cache(plan, state.type_id()))
+            };
+        }
+        if state.type_id() == any {
+            return Err(invalid_cache(plan, any));
+        }
+    }
+
+    if absorbs_any {
+        if !store
+            .try_reserve_type_node_links(usize::from(store.type_node_links(plan.node).is_none()))
+        {
+            return Err(PropertyObjectError::Capacity(plan.node));
+        }
+        let mut links = store
+            .type_node_links(plan.node)
+            .cloned()
+            .unwrap_or_default();
+        links.resolved_type = Some(any);
+        assert!(store.set_type_node_links(plan.node, links));
+        return Ok(any);
+    }
+
+    let mut merged = Vec::new();
+    let mut positions = HashMap::new();
+    let mut spread_index = 0;
+    for (index, (property, type_)) in plan.properties.iter().zip(property_types).enumerate() {
+        while plan
+            .spreads
+            .get(spread_index)
+            .is_some_and(|spread| spread.property_index == index)
+        {
+            let donor = donors[spread_index]
+                .as_ref()
+                .expect("canonical any was handled before concrete spread publication");
+            for property in donor {
+                merge_spread_property(
+                    &mut merged,
+                    &mut positions,
+                    ResolvedObjectProperty {
+                        name: property.name.clone(),
+                        type_: property.type_,
+                        readonly: plan.const_context,
+                    },
+                );
+            }
+            spread_index += 1;
+        }
+        merge_spread_property(
+            &mut merged,
+            &mut positions,
+            ResolvedObjectProperty {
+                name: property.name.clone(),
+                type_: *type_,
+                readonly: property.readonly,
+            },
+        );
+    }
+    while let Some(spread) = plan.spreads.get(spread_index) {
+        if spread.property_index != plan.properties.len() {
+            return Err(PropertyObjectError::InvalidObjectLiteral(plan.node));
+        }
+        let donor = donors[spread_index]
+            .as_ref()
+            .expect("canonical any was handled before concrete spread publication");
+        for property in donor {
+            merge_spread_property(
+                &mut merged,
+                &mut positions,
+                ResolvedObjectProperty {
+                    name: property.name.clone(),
+                    type_: property.type_,
+                    readonly: plan.const_context,
+                },
+            );
+        }
+        spread_index += 1;
+    }
+
+    if let Some(state) = object_literal_state(store, plan)? {
+        return if validated_synthetic_object_properties(store, state.type_id())
+            .is_some_and(|actual| actual == merged)
+        {
+            Ok(state.type_id())
         } else {
             Err(invalid_cache(plan, state.type_id()))
         };
     }
-    if !store.try_reserve_type_node_links(usize::from(store.type_node_links(plan.node).is_none())) {
-        return Err(PropertyObjectError::Capacity(plan.node));
-    }
-    let mut links = store
-        .type_node_links(plan.node)
-        .cloned()
-        .unwrap_or_default();
-    links.resolved_type = Some(any);
-    assert!(store.set_type_node_links(plan.node, links));
-    Ok(any)
+    publish_synthetic_object_literal(store, plan, &merged)
 }
 
 #[cfg(test)]
@@ -9028,6 +9656,40 @@ mod generic_publication_tests {
             },
             object,
         )
+    }
+
+    fn object_initializer(fixture: &Fixture, expected: &str) -> NodeRef {
+        let initializer = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::VariableDeclaration(variable) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(name) = &fixture.parsed.arena.get(variable.name)?.data
+                else {
+                    return None;
+                };
+                (name.text == expected)
+                    .then_some(variable.initializer)
+                    .flatten()
+            })
+            .unwrap_or_else(|| panic!("missing object initializer {expected}"));
+        let mut node = NodeRef::new(fixture.parsed.arena.id(), fixture.file, initializer);
+        loop {
+            let record = fixture.parsed.arena.get(node.node).unwrap();
+            node = match &record.data {
+                NodeData::AsExpression(assertion) => {
+                    NodeRef::new(node.arena, node.file, assertion.expression)
+                }
+                NodeData::ParenthesizedExpression(parenthesized) => {
+                    NodeRef::new(node.arena, node.file, parenthesized.expression)
+                }
+                NodeData::ObjectLiteralExpression(_) => return node,
+                _ => panic!("initializer {expected} does not contain an object literal"),
+            };
+        }
     }
 
     fn host<'a>(parsed: &'a ParseResult, bound: &'a BoundFile) -> DeclaredTypeHost<'a> {
@@ -9510,7 +10172,218 @@ mod generic_publication_tests {
     }
 
     #[test]
-    fn concrete_object_spreads_fail_before_publishing_partial_caches() {
+    fn concrete_object_spreads_merge_in_source_order_and_replay_exactly() {
+        let (mut fixture, _) = object_fixture(concat!(
+            "const first = { shared: 'left', first: 1 }; ",
+            "const second = { shared: true, second: 2 }; ",
+            "const value = { start: 0, ...first, shared: 3, ...second, last: 4 } as const;",
+        ));
+        let host = host(&fixture.parsed, &fixture.bound);
+        let first = object_initializer(&fixture, "first");
+        let second = object_initializer(&fixture, "second");
+        let receiver = object_initializer(&fixture, "value");
+        let first_plan = plan_object_literal(&fixture.store, &host, first).unwrap();
+        let second_plan = plan_object_literal(&fixture.store, &host, second).unwrap();
+        let receiver_plan = plan_object_literal(&fixture.store, &host, receiver).unwrap();
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let string = bootstrap.string_type;
+        let number = bootstrap.number_type;
+        let boolean = bootstrap.boolean_type;
+        let zero = fixture
+            .store
+            .regular_number_literal_type(ts_jsnum::Number::new(0.0))
+            .unwrap();
+        let three = fixture
+            .store
+            .regular_number_literal_type(ts_jsnum::Number::new(3.0))
+            .unwrap();
+        let four = fixture
+            .store
+            .regular_number_literal_type(ts_jsnum::Number::new(4.0))
+            .unwrap();
+        let nine = fixture
+            .store
+            .regular_number_literal_type(ts_jsnum::Number::new(9.0))
+            .unwrap();
+        let first_type =
+            publish_object_literal(&mut fixture.store, &first_plan, &[string, number]).unwrap();
+        let second_type =
+            publish_object_literal(&mut fixture.store, &second_plan, &[boolean, number]).unwrap();
+
+        let result = publish_object_literal_with_spreads(
+            &mut fixture.store,
+            &receiver_plan,
+            &[zero, three, four],
+            &[first_type, second_type],
+        )
+        .unwrap();
+        assert_eq!(
+            validated_synthetic_object_properties(&fixture.store, result),
+            Some(vec![
+                ResolvedObjectProperty {
+                    name: "start".to_owned(),
+                    type_: zero,
+                    readonly: true,
+                },
+                ResolvedObjectProperty {
+                    name: "shared".to_owned(),
+                    type_: boolean,
+                    readonly: true,
+                },
+                ResolvedObjectProperty {
+                    name: "first".to_owned(),
+                    type_: number,
+                    readonly: true,
+                },
+                ResolvedObjectProperty {
+                    name: "second".to_owned(),
+                    type_: number,
+                    readonly: true,
+                },
+                ResolvedObjectProperty {
+                    name: "last".to_owned(),
+                    type_: four,
+                    readonly: true,
+                },
+            ]),
+        );
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.symbol_len(),
+            fixture.store.symbol_store().symbol_table_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            publish_object_literal_with_spreads(
+                &mut fixture.store,
+                &receiver_plan,
+                &[zero, three, four],
+                &[first_type, second_type],
+            ),
+            Ok(result),
+        );
+        assert_eq!(
+            publish_object_literal_with_spreads(
+                &mut fixture.store,
+                &receiver_plan,
+                &[zero, three, nine],
+                &[first_type, second_type],
+            ),
+            Err(PropertyObjectError::InvalidCachedTypeLiteral {
+                node: receiver,
+                type_: result,
+            }),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.symbol_store().symbol_table_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn concrete_donors_and_any_still_absorb_without_allocating_receiver_members() {
+        let (mut fixture, _) = object_fixture(concat!(
+            "declare const unknown: any; ",
+            "const donor = { value: 1 }; ",
+            "const result = { ...donor, ...unknown };",
+        ));
+        let host = host(&fixture.parsed, &fixture.bound);
+        let donor = object_initializer(&fixture, "donor");
+        let receiver = object_initializer(&fixture, "result");
+        let donor_plan = plan_object_literal(&fixture.store, &host, donor).unwrap();
+        let receiver_plan = plan_object_literal(&fixture.store, &host, receiver).unwrap();
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let any = bootstrap.any_type;
+        let number = bootstrap.number_type;
+        let donor_type =
+            publish_object_literal(&mut fixture.store, &donor_plan, &[number]).unwrap();
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.symbol_len(),
+            fixture.store.symbol_store().symbol_table_len(),
+        );
+
+        assert_eq!(
+            publish_object_literal_with_spreads(
+                &mut fixture.store,
+                &receiver_plan,
+                &[],
+                &[donor_type, any],
+            ),
+            Ok(any),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.symbol_store().symbol_table_len(),
+            ),
+            before,
+        );
+    }
+
+    #[test]
+    fn malformed_concrete_spread_donors_fail_before_receiver_publication() {
+        let (mut fixture, _) = object_fixture(concat!(
+            "const donor = { value: 1 }; ",
+            "const result = { ...donor };",
+        ));
+        let host = host(&fixture.parsed, &fixture.bound);
+        let donor = object_initializer(&fixture, "donor");
+        let receiver = object_initializer(&fixture, "result");
+        let donor_plan = plan_object_literal(&fixture.store, &host, donor).unwrap();
+        let receiver_plan = plan_object_literal(&fixture.store, &host, receiver).unwrap();
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        let donor_type =
+            publish_object_literal(&mut fixture.store, &donor_plan, &[number]).unwrap();
+        let property = fixture
+            .store
+            .type_payload(donor_type)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.properties.as_deref())
+            .and_then(|properties| properties.first())
+            .copied()
+            .unwrap();
+        assert!(fixture.store.set_symbol_flags(
+            property,
+            SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT,
+            CheckFlags::READONLY,
+        ));
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.symbol_len(),
+            fixture.store.symbol_store().symbol_table_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        assert_eq!(
+            publish_object_literal_with_spreads(
+                &mut fixture.store,
+                &receiver_plan,
+                &[],
+                &[donor_type],
+            ),
+            Err(PropertyObjectError::InvalidObjectLiteral(receiver)),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.symbol_store().symbol_table_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+        assert!(fixture.store.type_node_links(receiver).is_none());
+    }
+
+    #[test]
+    fn unsupported_spread_donors_fail_before_publishing_partial_caches() {
         let (mut fixture, object) = object_fixture(concat!(
             "declare const source: any; ",
             "const value = { ...source };",
@@ -9590,6 +10463,84 @@ mod generic_publication_tests {
         assert_eq!(
             publish_object_literal(&mut fixture.store, &plan, &property_types),
             Ok(type_)
+        );
+    }
+
+    #[test]
+    fn nested_const_objects_inherit_readonly_context_and_replay_synthetic_members() {
+        let (mut fixture, _) =
+            object_fixture("const value = ({ item: ({ nested: 1 }) }) as const;");
+        let host = host(&fixture.parsed, &fixture.bound);
+        let outer = object_initializer(&fixture, "value");
+        let outer_plan = plan_object_literal(&fixture.store, &host, outer).unwrap();
+        let parenthesized = outer_plan.properties[0].type_node;
+        let NodeData::ParenthesizedExpression(parenthesized) =
+            &fixture.parsed.arena.get(parenthesized.node).unwrap().data
+        else {
+            panic!("the nested object must retain its parenthesized initializer")
+        };
+        let inner = NodeRef::new(outer.arena, outer.file, parenthesized.expression);
+        let inner_plan = plan_object_literal(&fixture.store, &host, inner).unwrap();
+        assert!(outer_plan.const_context);
+        assert!(inner_plan.const_context);
+        assert!(
+            outer_plan
+                .properties
+                .iter()
+                .all(|property| property.readonly)
+        );
+        assert!(
+            inner_plan
+                .properties
+                .iter()
+                .all(|property| property.readonly)
+        );
+        let one = fixture
+            .store
+            .regular_number_literal_type(ts_jsnum::Number::new(1.0))
+            .unwrap();
+
+        let inner_type = publish_object_literal(&mut fixture.store, &inner_plan, &[one]).unwrap();
+        let outer_type =
+            publish_object_literal(&mut fixture.store, &outer_plan, &[inner_type]).unwrap();
+        assert_eq!(
+            validated_synthetic_object_properties(&fixture.store, inner_type),
+            Some(vec![ResolvedObjectProperty {
+                name: "nested".to_owned(),
+                type_: one,
+                readonly: true,
+            }]),
+        );
+        assert_eq!(
+            validated_synthetic_object_properties(&fixture.store, outer_type),
+            Some(vec![ResolvedObjectProperty {
+                name: "item".to_owned(),
+                type_: inner_type,
+                readonly: true,
+            }]),
+        );
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.symbol_len(),
+            fixture.store.symbol_store().symbol_table_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            publish_object_literal(&mut fixture.store, &inner_plan, &[one]),
+            Ok(inner_type),
+        );
+        assert_eq!(
+            publish_object_literal(&mut fixture.store, &outer_plan, &[inner_type]),
+            Ok(outer_type),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.symbol_store().symbol_table_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm,
         );
     }
 
