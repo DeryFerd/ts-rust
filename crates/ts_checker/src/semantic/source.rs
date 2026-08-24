@@ -9501,7 +9501,12 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     && (!declaration_file_export
                         || binding != VariableBindingKind::Const
                         || type_id.is_some()
-                        || initializer_node.kind != SyntaxKind::NumericLiteral))
+                        || !matches!(
+                            initializer_node.kind,
+                            SyntaxKind::NumericLiteral
+                                | SyntaxKind::TrueKeyword
+                                | SyntaxKind::FalseKeyword
+                        )))
             {
                 return Err(self.unsupported(
                     initializer,
@@ -36406,6 +36411,175 @@ mod tests {
 
             assert_eq!(observable_state(&context, source_file), warm);
         }
+    }
+
+    #[test]
+    fn declaration_namespace_imports_preserve_implicit_boolean_const_exports() {
+        for (index, check_target_first) in [false, true].into_iter().enumerate() {
+            let source = parsed(concat!(
+                "import * as values from './target'; ",
+                "const enabled = values.enabled; ",
+                "const label = values.label;",
+            ));
+            let target = parsed("export const enabled = true; export const label: string;");
+            let file_index = 8_480 + u32::try_from(index).unwrap() * 2;
+            let source_file = FileId::new(file_index);
+            let target_file = FileId::new(file_index + 1);
+            let files = [(source_file, &source, false), (target_file, &target, true)];
+            let mut binder = CanonicalBinder::new();
+            for (file, parsed, declaration_file) in files {
+                binder
+                    .bind_source_file_with_facts(
+                        &parsed.arena,
+                        parsed.source_file,
+                        file,
+                        CanonicalSourceFileFacts::new(
+                            EscapedName::source(format!("\"/project/{}.ts\"", file.index())),
+                            CanonicalSourceLanguage::TypeScript,
+                            declaration_file,
+                            CanonicalModuleState::External,
+                        ),
+                    )
+                    .unwrap();
+                binder
+                    .bind_typescript_declaration_slice(&parsed.arena, file)
+                    .unwrap();
+            }
+            let specifiers = source_module_specifiers(&source);
+            let [specifier] = specifiers.as_slice() else {
+                panic!("the source must retain one namespace import specifier")
+            };
+            let manifest = CanonicalModuleResolutionManifestInput::new([
+                CanonicalModuleResolutionEntry::resolved(
+                    NodeRef::new(source.arena.id(), source_file, *specifier),
+                    CanonicalResolvedModuleInput::new(
+                        target_file,
+                        CanonicalModuleResolutionMode::Esm,
+                        CanonicalModuleResolutionMode::CommonJs,
+                    ),
+                ),
+            ]);
+            let mut context = CanonicalCheckerContext::new_with_module_resolutions(
+                binder.finish(),
+                vec![(source_file, &source.arena), (target_file, &target.arena)],
+                CanonicalCheckerOptions::default(),
+                manifest,
+            )
+            .unwrap();
+
+            if check_target_first {
+                context.check_source_file(target_file).unwrap();
+            }
+            context.check_source_file(source_file).unwrap();
+            context.check_source_file(target_file).unwrap();
+
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            assert_eq!(
+                variable_value_type(&context, &source, source_file, "enabled"),
+                bootstrap.true_type,
+            );
+            assert_eq!(
+                variable_value_type(&context, &source, source_file, "label"),
+                bootstrap.string_type,
+            );
+            assert!(context.diagnostics().is_empty());
+
+            let warm = observable_state(&context, source_file);
+            context.recheck_source_file(source_file).unwrap();
+            assert_eq!(observable_state(&context, source_file), warm);
+        }
+    }
+
+    #[test]
+    fn merged_ambient_namespace_imports_preserve_callable_exports_and_array_members() {
+        let library = parsed("interface Array<T> {}");
+        let declaration = parsed(concat!(
+            "declare function foo(): void; ",
+            "declare namespace foo { export const items: string[]; } ",
+            "export = foo;",
+        ));
+        let source = parsed("import * as foo from './foo'; const items = foo.items;");
+        let library_file = FileId::new(8_484);
+        let declaration_file = FileId::new(8_485);
+        let source_file = FileId::new(8_486);
+        let files = [
+            (library_file, &library, false, CanonicalModuleState::Script),
+            (
+                declaration_file,
+                &declaration,
+                true,
+                CanonicalModuleState::External,
+            ),
+            (source_file, &source, false, CanonicalModuleState::External),
+        ];
+        let mut binder = CanonicalBinder::new();
+        for (file, parsed, declaration_file, state) in files {
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(format!("\"/project/{}.ts\"", file.index())),
+                        CanonicalSourceLanguage::TypeScript,
+                        declaration_file,
+                        state,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let specifiers = source_module_specifiers(&source);
+        let [specifier] = specifiers.as_slice() else {
+            panic!("the source must retain one namespace import specifier")
+        };
+        let manifest = CanonicalModuleResolutionManifestInput::new([
+            CanonicalModuleResolutionEntry::resolved(
+                NodeRef::new(source.arena.id(), source_file, *specifier),
+                CanonicalResolvedModuleInput::new(
+                    declaration_file,
+                    CanonicalModuleResolutionMode::Esm,
+                    CanonicalModuleResolutionMode::Esm,
+                ),
+            ),
+        ]);
+        let mut context = CanonicalCheckerContext::new_with_module_resolutions(
+            binder.finish(),
+            vec![
+                (library_file, &library.arena),
+                (declaration_file, &declaration.arena),
+                (source_file, &source.arena),
+            ],
+            CanonicalCheckerOptions::default(),
+            manifest,
+        )
+        .unwrap();
+
+        context.check_source_file(source_file).unwrap();
+
+        let imported = variable_value_type(&context, &source, source_file, "items");
+        assert_eq!(context.type_to_string(imported).unwrap(), "string[]");
+        let function = function_declaration(&declaration, declaration_file, "foo");
+        let (_, bound) = context.file(declaration_file).unwrap();
+        let original = bound.symbol(function).unwrap();
+        let callable = context
+            .store()
+            .source_callable_type_for_owner(original)
+            .unwrap();
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(original)
+                .and_then(|links| links.resolved_type),
+            Some(callable),
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, source_file);
+        context.recheck_source_file(source_file).unwrap();
+        assert_eq!(observable_state(&context, source_file), warm);
     }
 
     #[test]

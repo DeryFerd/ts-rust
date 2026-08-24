@@ -1473,7 +1473,9 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
             Self::alias_expression_target(store, source, assignment_declaration, export.expression)
                 .map_err(|_| malformed())?;
         let original_record = store.symbol(original).ok_or_else(malformed)?;
-        if original_record.flags() != SymbolFlags::FUNCTION | SymbolFlags::NAMESPACE_MODULE {
+        if original_record.flags() != SymbolFlags::FUNCTION | SymbolFlags::NAMESPACE_MODULE
+            && original_record.flags() != SymbolFlags::FUNCTION | SymbolFlags::VALUE_MODULE
+        {
             return Ok(None);
         }
         let Some([function, namespace]) = original_record.declarations() else {
@@ -1490,7 +1492,6 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
         };
         if source_file.statements.nodes.as_slice()
             != [function.node, namespace.node, assignment_declaration.node]
-            || original_record.exports().is_some()
         {
             return Ok(None);
         }
@@ -1575,7 +1576,6 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
             || function_data.type_parameters.is_some()
             || return_type.kind != SyntaxKind::VoidKeyword
             || namespace_data.keyword != SyntaxKind::NamespaceKeyword
-            || !block_data.statements.nodes.is_empty()
             || !exact_declare(function, function_data.modifiers.as_ref())
             || !exact_declare(namespace, namespace_data.modifiers.as_ref())
         {
@@ -1636,7 +1636,6 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
             || block.parent != Some(namespace.node)
             || block.flags.0 != 0
             || block_data.flow_node.is_some()
-            || !block_data.statements.nodes.is_empty()
             || block_data.statements.has_trailing_comma
             || block_data.facts != 0
             || store.alias_symbol_links(assignment).is_some_and(|links| {
@@ -1652,6 +1651,106 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
             })
         {
             return Err(malformed());
+        }
+
+        let original_exports = original_record
+            .exports()
+            .map(|exports| store.symbol_table(exports).ok_or_else(malformed))
+            .transpose()?;
+        let mut exported_members = Vec::new();
+        match block_data.statements.nodes.as_slice() {
+            [] if original_exports.is_none()
+                && original_record.flags()
+                    == SymbolFlags::FUNCTION | SymbolFlags::NAMESPACE_MODULE => {}
+            [statement]
+                if original_record.flags() == SymbolFlags::FUNCTION | SymbolFlags::VALUE_MODULE =>
+            {
+                let exports = original_exports.ok_or_else(malformed)?;
+                if exports.len() != 1 {
+                    return Ok(None);
+                }
+                let statement_node = source.arena.get(*statement).ok_or_else(malformed)?;
+                let NodeData::VariableStatement(statement_data) = &statement_node.data else {
+                    return Ok(None);
+                };
+                let list = source
+                    .arena
+                    .get(statement_data.declaration_list)
+                    .ok_or_else(malformed)?;
+                let NodeData::VariableDeclarationList(list_data) = &list.data else {
+                    return Err(malformed());
+                };
+                let [member] = list_data.declarations.nodes.as_slice() else {
+                    return Ok(None);
+                };
+                let member_node = source.arena.get(*member).ok_or_else(malformed)?;
+                let NodeData::VariableDeclaration(member_data) = &member_node.data else {
+                    return Err(malformed());
+                };
+                let member_name = source.arena.get(member_data.name).ok_or_else(malformed)?;
+                let NodeData::Identifier(identifier) = &member_name.data else {
+                    return Ok(None);
+                };
+                let annotation = member_data
+                    .type_
+                    .and_then(|node| source.arena.get(node))
+                    .ok_or_else(malformed)?;
+                let modifiers = statement_data.modifiers.as_ref().ok_or_else(malformed)?;
+                let [modifier] = modifiers.list.nodes.as_slice() else {
+                    return Ok(None);
+                };
+                let modifier = source.arena.get(*modifier).ok_or_else(malformed)?;
+                let member_ref = NodeRef::new(namespace.arena, namespace.file, *member);
+                let member_symbol = source.bound.symbol(member_ref).ok_or_else(malformed)?;
+                let member_record = store.symbol(member_symbol).ok_or_else(malformed)?;
+                if statement_node.kind != SyntaxKind::VariableStatement
+                    || statement_node.parent != namespace_data.body
+                    || statement_node.flags.0 != 0
+                    || statement_data.flow_node.is_some()
+                    || statement_data.facts != 0
+                    || modifiers.flags.0 != 0
+                    || modifiers.list.has_trailing_comma
+                    || modifier.kind != SyntaxKind::ExportKeyword
+                    || modifier.flags.0 != 0
+                    || modifier.parent != Some(*statement)
+                    || !matches!(modifier.data, NodeData::Token(_))
+                    || list.kind != SyntaxKind::VariableDeclarationList
+                    || list.parent != Some(*statement)
+                    || list.flags.0 != 1 << 1
+                    || list_data.facts != 0
+                    || member_node.kind != SyntaxKind::VariableDeclaration
+                    || member_node.parent != Some(statement_data.declaration_list)
+                    || member_node.flags.0 != 0
+                    || member_data.exclamation_token.is_some()
+                    || member_data.initializer.is_some()
+                    || member_data.local_symbol.is_some()
+                    || member_data.symbol.is_some()
+                    || member_data.facts != 0
+                    || member_name.kind != SyntaxKind::Identifier
+                    || member_name.parent != Some(*member)
+                    || member_name.flags.0 != 0
+                    || identifier.flow_node.is_some()
+                    || identifier.text.is_empty()
+                    || annotation.parent != Some(*member)
+                    || annotation.flags.0 != 0
+                    || member_record.flags() != SymbolFlags::BLOCK_SCOPED_VARIABLE
+                    || member_record.check_flags() != CheckFlags::NONE
+                    || member_record.declarations() != Some(&[member_ref])
+                    || member_record.value_declaration() != Some(member_ref)
+                    || member_record.members().is_some()
+                    || member_record.exports().is_some()
+                    || member_record.parent() != Some(original)
+                    || member_record.export_symbol().is_some()
+                    || member_record.name().as_utf8() != Some(identifier.text.as_str())
+                    || store.get_merged_symbol(member_symbol) != Some(member_symbol)
+                    || exports.get_source(&identifier.text) != Some(member_symbol)
+                {
+                    return Err(malformed());
+                }
+                exported_members
+                    .push((EscapedName::source(identifier.text.clone()), member_symbol));
+            }
+            _ => return Ok(None),
         }
 
         let importer = self.checked_source(store, declaration)?;
@@ -1736,7 +1835,7 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
             let Some(default) = exports.get(InternalSymbolName::Default.as_ref()) else {
                 return Err(malformed());
             };
-            if exports.len() != 1
+            if exports.len() != 1 + exported_members.len()
                 || cached_record.flags() != original_record.flags()
                 || cached_record.check_flags() != CheckFlags::NONE
                 || cached_record.name() != original_record.name()
@@ -1767,6 +1866,9 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
                         alias_target: AliasTargetState::Resolved(original),
                         ..AliasSymbolLinks::default()
                     })
+                || exported_members
+                    .iter()
+                    .any(|(name, symbol)| exports.get(name.as_ref()) != Some(*symbol))
             {
                 return Err(malformed());
             }
@@ -1809,6 +1911,11 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
         ) != Some(None)
         {
             return Err(malformed());
+        }
+        for (name, symbol) in exported_members {
+            if store.insert_symbol(exports, name, symbol) != Some(None) {
+                return Err(malformed());
+            }
         }
         let synthetic = store
             .alloc_symbol(SymbolData {
@@ -4200,6 +4307,154 @@ mod tests {
             (store.symbol_len(), store.symbol_store().symbol_table_len()),
             allocations
         );
+    }
+
+    #[test]
+    fn declaration_namespace_import_preserves_merged_ambient_const_exports() {
+        let importer = parsed(r#"import * as foo from "./foo";"#);
+        let declaration = parsed(concat!(
+            "declare function foo(): void; ",
+            "declare namespace foo { export const items: string[]; } ",
+            "export = foo;",
+        ));
+        let importer_file = FileId::new(5_204);
+        let declaration_file = FileId::new(5_205);
+        let files = [
+            (importer_file, &importer, CanonicalModuleState::External),
+            (
+                declaration_file,
+                &declaration,
+                CanonicalModuleState::External,
+            ),
+        ];
+        let specifier = module_specifiers(&importer)[0];
+        let (mut store, bound_files, manifest) = fixture_with_declaration_files(
+            &files,
+            CanonicalModuleResolutionManifestInput::new([
+                CanonicalModuleResolutionEntry::resolved(
+                    node_ref(&importer, importer_file, specifier),
+                    esm(declaration_file),
+                ),
+            ]),
+            &[declaration_file],
+        );
+        let binding = alias_declaration_named(&importer, importer_file, "foo");
+        let import_alias = alias(&bound_files, binding);
+        let target_bound = bound_files.get(&declaration_file).unwrap();
+        let original = store
+            .symbol_table(target_bound.locals(target_bound.source_file()).unwrap())
+            .unwrap()
+            .get_source("foo")
+            .unwrap();
+        let original_exports = store.symbol(original).unwrap().exports().unwrap();
+        let items = store
+            .symbol_table(original_exports)
+            .unwrap()
+            .get_source("items")
+            .unwrap();
+        let mut host =
+            ProductionAliasTargetHost::new(&store, sources(&files, &bound_files), &manifest)
+                .unwrap();
+
+        let synthetic = CanonicalAliasResolver::new(&mut store, &mut host)
+            .resolve_alias(import_alias)
+            .unwrap()
+            .target
+            .symbol()
+            .unwrap();
+
+        assert_ne!(synthetic, original);
+        let exports = store
+            .symbol(synthetic)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| store.symbol_table(exports))
+            .unwrap();
+        assert_eq!(exports.len(), 2);
+        assert!(exports.get(InternalSymbolName::Default.as_ref()).is_some());
+        assert_eq!(exports.get_source("items"), Some(items));
+        assert_eq!(
+            store
+                .symbol(original)
+                .and_then(ts_binder::semantic::Symbol::exports),
+            Some(original_exports),
+        );
+
+        let allocations = (store.symbol_len(), store.symbol_store().symbol_table_len());
+        assert_eq!(
+            CanonicalAliasResolver::new(&mut store, &mut host)
+                .resolve_alias(import_alias)
+                .unwrap()
+                .target,
+            AliasTargetState::Resolved(synthetic),
+        );
+        assert_eq!(
+            (store.symbol_len(), store.symbol_store().symbol_table_len()),
+            allocations,
+        );
+    }
+
+    #[test]
+    fn declaration_namespace_import_rejects_forged_merged_const_ownership() {
+        let importer = parsed(r#"import * as foo from "./foo";"#);
+        let declaration = parsed(concat!(
+            "declare function foo(): void; ",
+            "declare namespace foo { export const items: string[]; } ",
+            "export = foo;",
+        ));
+        let importer_file = FileId::new(5_206);
+        let declaration_file = FileId::new(5_207);
+        let files = [
+            (importer_file, &importer, CanonicalModuleState::External),
+            (
+                declaration_file,
+                &declaration,
+                CanonicalModuleState::External,
+            ),
+        ];
+        let specifier = module_specifiers(&importer)[0];
+        let (mut store, bound_files, manifest) = fixture_with_declaration_files(
+            &files,
+            CanonicalModuleResolutionManifestInput::new([
+                CanonicalModuleResolutionEntry::resolved(
+                    node_ref(&importer, importer_file, specifier),
+                    esm(declaration_file),
+                ),
+            ]),
+            &[declaration_file],
+        );
+        let binding = alias_declaration_named(&importer, importer_file, "foo");
+        let import_alias = alias(&bound_files, binding);
+        let target_bound = bound_files.get(&declaration_file).unwrap();
+        let module = target_bound.symbol(target_bound.source_file()).unwrap();
+        let original = store
+            .symbol_table(target_bound.locals(target_bound.source_file()).unwrap())
+            .unwrap()
+            .get_source("foo")
+            .unwrap();
+        let items = store
+            .symbol(original)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| store.symbol_table(exports))
+            .and_then(|exports| exports.get_source("items"))
+            .unwrap();
+        assert!(store.set_symbol_relationships(items, None, None, Some(module), None));
+        let symbols = store.symbol_len();
+        let mut host =
+            ProductionAliasTargetHost::new(&store, sources(&files, &bound_files), &manifest)
+                .unwrap();
+
+        assert_eq!(
+            unavailable_reason(
+                CanonicalAliasResolver::new(&mut store, &mut host)
+                    .resolve_alias(import_alias)
+                    .unwrap_err(),
+            ),
+            CanonicalAliasTargetUnavailable::MalformedModuleSymbol {
+                declaration: binding,
+                module,
+            },
+        );
+        assert_eq!(store.symbol_len(), symbols);
     }
 
     #[test]

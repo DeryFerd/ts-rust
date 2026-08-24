@@ -9,10 +9,10 @@
 //! JavaScript `JSDoc` typedef targets retain their exact parser-owned reparsed
 //! flag. Comment-only typedef imports authenticate promoted `CommonJS` type
 //! exports through their exact module-specifier nodes. Value preparation
-//! supports initialized annotated `const` declarations,
-//! authenticated `CommonJS` variables and named assignments, exact
-//! `export declare const` declarations in retained declaration files, and
-//! annotated `FunctionDeclaration`s, and already-published inferred object
+//! supports initialized annotated `const` declarations, authenticated
+//! `CommonJS` variables and named assignments, explicit and implicit ambient
+//! `export const` declarations in retained declaration files, annotated
+//! `FunctionDeclaration`s, and already-published inferred object
 //! constants with authenticated fresh-to-widened provenance. Declaration-file
 //! bodies are never source checked by this leaf; only the final imported
 //! annotation is queried.
@@ -222,6 +222,10 @@ enum PreparedSourceImportTarget {
         initializer: NodeRef,
         literal: String,
     },
+    DeclarationBooleanConst {
+        initializer: NodeRef,
+        value: bool,
+    },
     AnnotatedFunction {
         signature: SignatureId,
     },
@@ -272,6 +276,11 @@ enum PlannedSourceImportValueTarget {
         declaration: NodeRef,
         initializer: NodeRef,
         literal: String,
+    },
+    DeclarationBooleanConst {
+        declaration: NodeRef,
+        initializer: NodeRef,
+        value: bool,
     },
     AnnotatedFunction(Box<SourceCallablePlan>),
     ConstEnum {
@@ -2607,6 +2616,7 @@ pub(super) fn prepare_source_import_value(
     let target_declaration = match &planned_target {
         PlannedSourceImportValueTarget::AnnotatedConst { declaration, .. }
         | PlannedSourceImportValueTarget::DeclarationNumericConst { declaration, .. }
+        | PlannedSourceImportValueTarget::DeclarationBooleanConst { declaration, .. }
         | PlannedSourceImportValueTarget::ConstEnum { declaration }
         | PlannedSourceImportValueTarget::ExportedObject { declaration, .. }
         | PlannedSourceImportValueTarget::PublishedObjectConst { declaration, .. }
@@ -2653,6 +2663,15 @@ pub(super) fn prepare_source_import_value(
                     initializer,
                     literal,
                 },
+            )
+        }
+        PlannedSourceImportValueTarget::DeclarationBooleanConst {
+            initializer, value, ..
+        } => {
+            let type_ = declaration_boolean_literal_type(store, target, value)?;
+            (
+                type_,
+                PreparedSourceImportTarget::DeclarationBooleanConst { initializer, value },
             )
         }
         PlannedSourceImportValueTarget::AnnotatedFunction(callable) => {
@@ -4113,6 +4132,15 @@ fn authenticate_synthetic_import_namespace_identity(
         .exports()
         .and_then(|exports| store.symbol_table(exports))
         .ok_or_else(invalid)?;
+    let original_exports = owner
+        .exports()
+        .map(|exports| store.symbol_table(exports).ok_or_else(invalid))
+        .transpose()?;
+    let expected_flags = if original_exports.is_some() {
+        SymbolFlags::FUNCTION | SymbolFlags::VALUE_MODULE
+    } else {
+        SymbolFlags::FUNCTION | SymbolFlags::NAMESPACE_MODULE
+    };
     let default = exports
         .get(InternalSymbolName::Default.as_ref())
         .ok_or_else(invalid)?;
@@ -4135,7 +4163,7 @@ fn authenticate_synthetic_import_namespace_identity(
         return Err(invalid());
     };
 
-    if record.flags() != SymbolFlags::FUNCTION | SymbolFlags::NAMESPACE_MODULE
+    if record.flags() != expected_flags
         || record.check_flags() != CheckFlags::NONE
         || record.name() != owner.name()
         || record.declarations() != owner.declarations()
@@ -4144,15 +4172,26 @@ fn authenticate_synthetic_import_namespace_identity(
         || record.parent() != owner.parent()
         || record.export_symbol().is_some()
         || store.get_merged_symbol(synthetic) != Some(synthetic)
-        || owner.flags() != SymbolFlags::FUNCTION | SymbolFlags::NAMESPACE_MODULE
+        || owner.flags() != expected_flags
         || owner.check_flags() != CheckFlags::NONE
         || owner.value_declaration() != Some(function)
         || owner.members().is_some()
-        || owner.exports().is_some()
         || owner.parent().is_some()
         || owner.export_symbol().is_some()
         || store.get_merged_symbol(original) != Some(original)
-        || exports.len() != 1
+        || exports.len() != 1 + original_exports.map_or(0, ts_binder::semantic::SymbolTable::len)
+        || original_exports.is_some_and(|original_exports| {
+            original_exports.is_empty()
+                || original_exports.iter().any(|(name, symbol)| {
+                    name == InternalSymbolName::Default.as_ref()
+                        || exports.get(name) != Some(symbol)
+                        || store.symbol(symbol).is_none_or(|member| {
+                            member.flags() != SymbolFlags::BLOCK_SCOPED_VARIABLE
+                                || member.parent() != Some(original)
+                                || store.get_merged_symbol(symbol) != Some(symbol)
+                        })
+                })
+        })
         || default_record.flags() != SymbolFlags::ALIAS
         || default_record.check_flags() != CheckFlags::NONE
         || default_record.name() != InternalSymbolName::Default.as_ref()
@@ -4435,7 +4474,6 @@ fn plan_synthetic_import_namespace(
         || block.parent != Some(authenticated.namespace.node)
         || block.flags.0 != 0
         || block_data.flow_node.is_some()
-        || !block_data.statements.nodes.is_empty()
         || block_data.statements.has_trailing_comma
         || block_data.facts != 0
         || assignment.kind != SyntaxKind::ExportAssignment
@@ -4550,14 +4588,120 @@ fn plan_synthetic_import_namespace(
         return Err(invalid());
     }
 
+    let mut members = vec![PlannedSourceImportModuleMember {
+        name: EscapedName::internal(InternalSymbolName::Default),
+        symbol: authenticated.default,
+        value_symbol: authenticated.original,
+        target: PlannedSourceImportValueTarget::AnnotatedFunction(Box::new(callable)),
+    }];
+    if let [statement] = block_data.statements.nodes.as_slice() {
+        let statement = NodeRef::new(namespace_body.arena, namespace_body.file, *statement);
+        let statement_record = checked_node(arena, bound, store, statement)?;
+        let NodeData::VariableStatement(statement_data) = &statement_record.data else {
+            return Err(invalid());
+        };
+        let list = NodeRef::new(
+            statement.arena,
+            statement.file,
+            statement_data.declaration_list,
+        );
+        let list_record = checked_node(arena, bound, store, list)?;
+        let NodeData::VariableDeclarationList(list_data) = &list_record.data else {
+            return Err(invalid());
+        };
+        let [declaration] = list_data.declarations.nodes.as_slice() else {
+            return Err(invalid());
+        };
+        let declaration = NodeRef::new(list.arena, list.file, *declaration);
+        let declaration_record = checked_node(arena, bound, store, declaration)?;
+        let NodeData::VariableDeclaration(variable) = &declaration_record.data else {
+            return Err(invalid());
+        };
+        let name = NodeRef::new(declaration.arena, declaration.file, variable.name);
+        let name_text = exact_identifier(
+            arena,
+            bound,
+            store,
+            name,
+            declaration,
+            SourceImportUnsupported::TargetDeclaration(name),
+        )?;
+        let annotation = variable
+            .type_
+            .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+            .ok_or_else(invalid)?;
+        let annotation_record = checked_node(arena, bound, store, annotation)?;
+        let symbol = bound.symbol(declaration).ok_or_else(invalid)?;
+        let member = store.symbol(symbol).ok_or_else(invalid)?;
+        let original_exports = store
+            .symbol(authenticated.original)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| store.symbol_table(exports))
+            .ok_or_else(invalid)?;
+        let synthetic_exports = store
+            .symbol(synthetic)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| store.symbol_table(exports))
+            .ok_or_else(invalid)?;
+        if statement_record.kind != SyntaxKind::VariableStatement
+            || statement_record.parent != Some(namespace_body.node)
+            || statement_record.flags.0 != 0
+            || statement_data.flow_node.is_some()
+            || statement_data.facts != 0
+            || !has_exact_export_modifier(
+                arena,
+                bound,
+                store,
+                statement,
+                statement_data.modifiers.as_ref(),
+            )?
+            || list_record.kind != SyntaxKind::VariableDeclarationList
+            || list_record.parent != Some(statement.node)
+            || list_record.flags.0 != NODE_FLAG_CONST
+            || list_data.facts != 0
+            || declaration_record.kind != SyntaxKind::VariableDeclaration
+            || declaration_record.parent != Some(list.node)
+            || declaration_record.flags.0 != 0
+            || variable.exclamation_token.is_some()
+            || variable.initializer.is_some()
+            || variable.local_symbol.is_some()
+            || variable.symbol.is_some()
+            || variable.facts != 0
+            || annotation_record.parent != Some(declaration.node)
+            || annotation_record.flags.0 != 0
+            || member.flags() != SymbolFlags::BLOCK_SCOPED_VARIABLE
+            || member.check_flags() != CheckFlags::NONE
+            || member.declarations() != Some(&[declaration])
+            || member.value_declaration() != Some(declaration)
+            || member.members().is_some()
+            || member.exports().is_some()
+            || member.parent() != Some(authenticated.original)
+            || member.export_symbol().is_some()
+            || member.name().as_utf8() != Some(name_text.as_str())
+            || store.get_merged_symbol(symbol) != Some(symbol)
+            || original_exports.len() != 1
+            || original_exports.get_source(&name_text) != Some(symbol)
+            || synthetic_exports.get_source(&name_text) != Some(symbol)
+        {
+            return Err(invalid());
+        }
+        preflight_import_target_value_links(store, symbol)?;
+        members.push(PlannedSourceImportModuleMember {
+            name: EscapedName::source(name_text),
+            symbol,
+            value_symbol: symbol,
+            target: PlannedSourceImportValueTarget::AnnotatedConst {
+                declaration,
+                type_node: annotation,
+            },
+        });
+    } else if !block_data.statements.nodes.is_empty() {
+        return Err(invalid());
+    }
+
     Ok(PlannedSourceImportValueTarget::ModuleNamespace {
         declaration: authenticated.function,
-        members: vec![PlannedSourceImportModuleMember {
-            name: EscapedName::internal(InternalSymbolName::Default),
-            symbol: authenticated.default,
-            value_symbol: authenticated.original,
-            target: PlannedSourceImportValueTarget::AnnotatedFunction(Box::new(callable)),
-        }],
+        members,
     })
 }
 
@@ -4834,6 +4978,10 @@ fn materialize_imported_module_namespace(
                 declaration_numeric_literal_type(store, member.value_symbol, &literal)?,
                 None,
             ),
+            PlannedSourceImportValueTarget::DeclarationBooleanConst { value, .. } => (
+                declaration_boolean_literal_type(store, member.value_symbol, value)?,
+                None,
+            ),
             PlannedSourceImportValueTarget::JavaScriptAnnotatedConst {
                 declaration,
                 annotation,
@@ -4984,6 +5132,7 @@ fn preflight_imported_module_namespace_members(
                 .preflight_type_of_source_callable(callable.declaration, callable.owner_symbol)?;
             }
             PlannedSourceImportValueTarget::DeclarationNumericConst { .. }
+            | PlannedSourceImportValueTarget::DeclarationBooleanConst { .. }
             | PlannedSourceImportValueTarget::JavaScriptAnnotatedConst { .. }
             | PlannedSourceImportValueTarget::CommonJsNamedExport { .. }
             | PlannedSourceImportValueTarget::ExportedObject { .. }
@@ -5821,7 +5970,13 @@ fn plan_direct_typescript_const_target(
             statement_data.modifiers.as_ref(),
         )?
     } else if facts.is_declaration_file() {
-        has_exact_export_declare_modifiers(
+        has_exact_export_modifier(
+            arena,
+            bound,
+            store,
+            statement,
+            statement_data.modifiers.as_ref(),
+        )? || has_exact_export_declare_modifiers(
             arena,
             bound,
             store,
@@ -5886,29 +6041,50 @@ fn plan_direct_typescript_const_target(
                 .expect("inferred declaration literal has an initializer"),
         );
         let initializer_record = checked_node(arena, bound, store, initializer)?;
-        let NodeData::NumericLiteral(literal) = &initializer_record.data else {
-            return Err(unsupported(SourceImportUnsupported::TargetDeclaration(
-                initializer,
-            )));
-        };
-        if initializer_record.kind != SyntaxKind::NumericLiteral
-            || initializer_record.parent != Some(declaration.node)
-            || initializer_record.flags.0 != 0
-            || literal.token_flags.0 != 0
-            || literal.text.is_empty()
-            || !literal.text.bytes().all(|byte| byte.is_ascii_digit())
-            || !source_spelling_matches(arena, initializer_record, &literal.text)
-            || !ts_jsnum::from_string(&literal.text).value().is_finite()
-        {
+        if initializer_record.parent != Some(declaration.node) || initializer_record.flags.0 != 0 {
             return Err(unsupported(SourceImportUnsupported::TargetDeclaration(
                 initializer,
             )));
         }
-        return Ok(PlannedSourceImportValueTarget::DeclarationNumericConst {
-            declaration,
-            initializer,
-            literal: literal.text.clone(),
-        });
+        return match &initializer_record.data {
+            NodeData::NumericLiteral(literal)
+                if initializer_record.kind == SyntaxKind::NumericLiteral
+                    && literal.token_flags.0 == 0
+                    && !literal.text.is_empty()
+                    && literal.text.bytes().all(|byte| byte.is_ascii_digit())
+                    && source_spelling_matches(arena, initializer_record, &literal.text)
+                    && ts_jsnum::from_string(&literal.text).value().is_finite() =>
+            {
+                Ok(PlannedSourceImportValueTarget::DeclarationNumericConst {
+                    declaration,
+                    initializer,
+                    literal: literal.text.clone(),
+                })
+            }
+            NodeData::KeywordExpression(_)
+                if matches!(
+                    initializer_record.kind,
+                    SyntaxKind::TrueKeyword | SyntaxKind::FalseKeyword
+                ) && source_spelling_matches(
+                    arena,
+                    initializer_record,
+                    if initializer_record.kind == SyntaxKind::TrueKeyword {
+                        "true"
+                    } else {
+                        "false"
+                    },
+                ) =>
+            {
+                Ok(PlannedSourceImportValueTarget::DeclarationBooleanConst {
+                    declaration,
+                    initializer,
+                    value: initializer_record.kind == SyntaxKind::TrueKeyword,
+                })
+            }
+            _ => Err(unsupported(SourceImportUnsupported::TargetDeclaration(
+                initializer,
+            ))),
+        };
     }
     if !facts.is_declaration_file() && variable.type_.is_none() {
         let expression = variable
@@ -6052,6 +6228,26 @@ fn declaration_numeric_literal_type(
     let regular = store
         .regular_number_literal_type(ts_jsnum::from_string(literal))
         .map_err(|_| invariant(SourceImportInvariant::InvalidTargetLinks(target)))?;
+    store
+        .fresh_type_of_literal_type(regular)
+        .map_err(|_| invariant(SourceImportInvariant::InvalidTargetLinks(target)))
+}
+
+fn declaration_boolean_literal_type(
+    store: &CanonicalTypeMapperStore,
+    target: SemanticSymbolId,
+    value: bool,
+) -> Result<TypeId, SourceImportError> {
+    let regular = store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| {
+            if value {
+                bootstrap.regular_true_type
+            } else {
+                bootstrap.regular_false_type
+            }
+        })
+        .ok_or_else(|| invariant(SourceImportInvariant::InvalidTargetLinks(target)))?;
     store
         .fresh_type_of_literal_type(regular)
         .map_err(|_| invariant(SourceImportInvariant::InvalidTargetLinks(target)))
@@ -6256,6 +6452,21 @@ fn validate_prepared_import_value(
                 && store.source_node_parent(*initializer)
                     == Some(SourceNodeParent::Parent(prepared.target_declaration))
                 && cached_type == Some(prepared.type_)
+        }
+        PreparedSourceImportTarget::DeclarationBooleanConst { initializer, value } => {
+            let expected_kind = if *value {
+                SyntaxKind::TrueKeyword
+            } else {
+                SyntaxKind::FalseKeyword
+            };
+            store.symbol(prepared.target_symbol).is_some_and(|target| {
+                target.flags() == SymbolFlags::BLOCK_SCOPED_VARIABLE
+                    && target.value_declaration() == Some(prepared.target_declaration)
+            }) && store.source_node_kind(*initializer) == Some(expected_kind)
+                && store.source_node_parent(*initializer)
+                    == Some(SourceNodeParent::Parent(prepared.target_declaration))
+                && declaration_boolean_literal_type(store, prepared.target_symbol, *value)
+                    == Ok(prepared.type_)
         }
         PreparedSourceImportTarget::AnnotatedFunction { signature } => {
             store.symbol(prepared.target_symbol).is_some_and(|target| {
@@ -8171,6 +8382,91 @@ mod tests {
     }
 
     #[test]
+    fn combined_default_and_namespace_imports_preserve_both_binding_identities() {
+        let mut fixture = fixture(
+            &[
+                concat!(
+                    "import selected, * as namespace from './target'; ",
+                    "const direct = selected; ",
+                    "const grouped = namespace;",
+                ),
+                "export const value: number = 1; export { value as default };",
+            ],
+            &[Route {
+                source: 0,
+                specifier: 0,
+                target: Some(1),
+            }],
+        );
+        let plan = fixture.plan_import(0, 0);
+        let [selected, namespace] = plan.bindings.as_slice() else {
+            panic!("the combined import must retain both exact bindings")
+        };
+        assert_eq!(selected.imported_text, "default");
+        assert_eq!(namespace.imported_text, "*");
+        let source = &fixture.files[0];
+        let bound = fixture.bound.get(&source.file).unwrap();
+        let selected_read = plan_source_import_identifier_read(
+            &source.parsed.arena,
+            bound,
+            &fixture.store,
+            selected,
+            identifier_initializer(&fixture, 0, "selected"),
+            "selected",
+            selected.alias_symbol,
+        )
+        .unwrap();
+        let namespace_read = plan_source_import_identifier_read(
+            &source.parsed.arena,
+            bound,
+            &fixture.store,
+            namespace,
+            identifier_initializer(&fixture, 0, "namespace"),
+            "namespace",
+            namespace.alias_symbol,
+        )
+        .unwrap();
+        let resolved = resolve_all(&mut fixture, &plan.bindings).unwrap();
+        let target_bound = fixture.bound.get(&fixture.files[1].file).unwrap();
+        let module = target_bound.symbol(target_bound.source_file()).unwrap();
+        assert_eq!(
+            resolved[0].target_symbol,
+            direct_export(&fixture, 1, "value")
+        );
+        assert_eq!(resolved[1].target_symbol, module);
+        resolve_namespace_exports(&mut fixture, &resolved[1]).unwrap();
+
+        let selected_value = prepare_one(&mut fixture, &resolved[0], &selected_read).unwrap();
+        let namespace_value = prepare_one(&mut fixture, &resolved[1], &namespace_read).unwrap();
+        assert_eq!(
+            selected_value.type_,
+            fixture.store.intrinsic_bootstrap().unwrap().number_type,
+        );
+        let PreparedSourceImportTarget::ModuleNamespace { properties } = &namespace_value.target
+        else {
+            panic!("the combined import must preserve its namespace value")
+        };
+        assert!(properties.iter().any(|property| {
+            property.name.as_ref() == InternalSymbolName::Default.as_ref()
+                && property.type_ == selected_value.type_
+        }));
+
+        let prepared = [selected_value, namespace_value];
+        publish_for_test(&mut fixture.store, &prepared);
+        let warm = store_state(&fixture.store);
+        assert_eq!(resolve_all(&mut fixture, &plan.bindings).unwrap(), resolved);
+        assert_eq!(
+            prepare_one(&mut fixture, &resolved[0], &selected_read).unwrap(),
+            prepared[0],
+        );
+        assert_eq!(
+            prepare_one(&mut fixture, &resolved[1], &namespace_read).unwrap(),
+            prepared[1],
+        );
+        assert_eq!(store_state(&fixture.store), warm);
+    }
+
+    #[test]
     fn external_and_local_import_equals_preserve_exact_module_aliases() {
         let mut fixture = fixture(
             &[
@@ -8503,6 +8799,181 @@ mod tests {
                 .and_then(|links| links.resolved_type),
             Some(callable)
         );
+    }
+
+    #[test]
+    fn namespace_import_preserves_merged_ambient_callable_const_members() {
+        let mut fixture = fixture_with_module_states_and_wrapper_flags(
+            &[
+                r#"import * as foo from "./foo"; const imported = foo;"#,
+                concat!(
+                    "declare function foo(): void; ",
+                    "declare namespace foo { export const items: string[]; } ",
+                    "export = foo;",
+                ),
+                "interface Array<T> {}",
+            ],
+            &[Route {
+                source: 0,
+                specifier: 0,
+                target: Some(1),
+            }],
+            &[
+                CanonicalModuleState::External,
+                CanonicalModuleState::External,
+                CanonicalModuleState::Script,
+            ],
+            None,
+            &[1],
+        );
+        let plan = fixture.plan_import(0, 0);
+        let node = identifier_initializer(&fixture, 0, "foo");
+        let bound = fixture.bound.get(&fixture.files[0].file).unwrap();
+        let read = plan_source_import_identifier_read(
+            &fixture.files[0].parsed.arena,
+            bound,
+            &fixture.store,
+            &plan.bindings[0],
+            node,
+            "foo",
+            plan.bindings[0].alias_symbol,
+        )
+        .unwrap();
+        let resolved = resolve_all(&mut fixture, &plan.bindings).unwrap();
+        let target_bound = fixture.bound.get(&fixture.files[1].file).unwrap();
+        let original = fixture
+            .store
+            .symbol_table(target_bound.locals(target_bound.source_file()).unwrap())
+            .unwrap()
+            .get_source("foo")
+            .unwrap();
+        let items = fixture
+            .store
+            .symbol(original)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| fixture.store.symbol_table(exports))
+            .and_then(|exports| exports.get_source("items"))
+            .unwrap();
+        assert_ne!(resolved[0].target_symbol, original);
+        resolve_namespace_exports(&mut fixture, &resolved[0]).unwrap();
+
+        let prepared = prepare_one(&mut fixture, &resolved[0], &read).unwrap();
+
+        let PreparedSourceImportTarget::ModuleNamespace { properties } = &prepared.target else {
+            panic!("expected one authenticated synthetic namespace")
+        };
+        assert_eq!(properties.len(), 2);
+        let callable_property = properties
+            .iter()
+            .find(|property| property.name.as_ref() == InternalSymbolName::Default.as_ref())
+            .unwrap();
+        let items_property = properties
+            .iter()
+            .find(|property| property.name.as_utf8() == Some("items"))
+            .unwrap();
+        assert_eq!(callable_property.value_symbol, original);
+        assert_eq!(items_property.target_symbol, items);
+        assert_eq!(items_property.value_symbol, items);
+        assert_eq!(display_type(&fixture, items_property.type_), "string[]");
+        let callable = fixture
+            .store
+            .source_callable_type_for_owner(original)
+            .unwrap();
+        assert_eq!(callable_property.type_, callable);
+        assert_eq!(
+            fixture
+                .store
+                .value_symbol_links(original)
+                .and_then(|links| links.resolved_type),
+            Some(callable),
+        );
+        assert!(fixture.store.value_symbol_links(items).is_none());
+
+        publish_for_test(&mut fixture.store, std::slice::from_ref(&prepared));
+        let warm = store_state(&fixture.store);
+        assert_eq!(
+            prepare_one(&mut fixture, &resolved[0], &read).unwrap(),
+            prepared,
+        );
+        assert_eq!(store_state(&fixture.store), warm);
+        assert_eq!(
+            fixture
+                .store
+                .value_symbol_links(original)
+                .and_then(|links| links.resolved_type),
+            Some(callable),
+        );
+    }
+
+    #[test]
+    fn synthetic_namespace_import_rejects_forged_ambient_member_ownership() {
+        let mut fixture = fixture_with_declaration_files(
+            &[
+                r#"import * as foo from "./foo"; const imported = foo;"#,
+                concat!(
+                    "declare function foo(): void; ",
+                    "declare namespace foo { export const items: number; } ",
+                    "export = foo;",
+                ),
+            ],
+            &[Route {
+                source: 0,
+                specifier: 0,
+                target: Some(1),
+            }],
+            &[1],
+        );
+        let plan = fixture.plan_import(0, 0);
+        let node = identifier_initializer(&fixture, 0, "foo");
+        let bound = fixture.bound.get(&fixture.files[0].file).unwrap();
+        let read = plan_source_import_identifier_read(
+            &fixture.files[0].parsed.arena,
+            bound,
+            &fixture.store,
+            &plan.bindings[0],
+            node,
+            "foo",
+            plan.bindings[0].alias_symbol,
+        )
+        .unwrap();
+        let resolved = resolve_all(&mut fixture, &plan.bindings).unwrap();
+        let synthetic = resolved[0].target_symbol;
+        let target_bound = fixture.bound.get(&fixture.files[1].file).unwrap();
+        let module = target_bound.symbol(target_bound.source_file()).unwrap();
+        let original = fixture
+            .store
+            .symbol_table(target_bound.locals(target_bound.source_file()).unwrap())
+            .unwrap()
+            .get_source("foo")
+            .unwrap();
+        let items = fixture
+            .store
+            .symbol(original)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| fixture.store.symbol_table(exports))
+            .and_then(|exports| exports.get_source("items"))
+            .unwrap();
+        assert!(
+            fixture
+                .store
+                .set_symbol_relationships(items, None, None, Some(module), None)
+        );
+        let before = store_state(&fixture.store);
+
+        assert_eq!(
+            resolve_namespace_exports(&mut fixture, &resolved[0]),
+            Err(SourceImportError::Invariant(
+                SourceImportInvariant::InvalidTargetLinks(synthetic),
+            )),
+        );
+        assert_eq!(
+            prepare_one(&mut fixture, &resolved[0], &read),
+            Err(SourceImportError::Invariant(
+                SourceImportInvariant::InvalidTargetLinks(synthetic),
+            )),
+        );
+        assert_eq!(store_state(&fixture.store), before);
+        assert!(fixture.store.value_symbol_links(synthetic).is_none());
     }
 
     #[test]
@@ -13010,9 +13481,229 @@ mod tests {
     }
 
     #[test]
+    fn implicit_ambient_const_imports_preserve_annotation_identity() {
+        let mut fixture = fixture_with_declaration_files(
+            &[
+                "import { value } from './target'; const copied = value;",
+                "export const value: number;",
+            ],
+            &[Route {
+                source: 0,
+                specifier: 0,
+                target: Some(1),
+            }],
+            &[1],
+        );
+        let plan = fixture.plan_import(0, 0);
+        let node = identifier_initializer(&fixture, 0, "value");
+        let bound = fixture.bound.get(&fixture.files[0].file).unwrap();
+        let read = plan_source_import_identifier_read(
+            &fixture.files[0].parsed.arena,
+            bound,
+            &fixture.store,
+            &plan.bindings[0],
+            node,
+            "value",
+            plan.bindings[0].alias_symbol,
+        )
+        .unwrap();
+        let resolved = resolve_all(&mut fixture, &plan.bindings).unwrap();
+
+        let prepared = prepare_one(&mut fixture, &resolved[0], &read).unwrap();
+
+        assert!(matches!(
+            &prepared.target,
+            PreparedSourceImportTarget::AnnotatedConst { .. }
+        ));
+        assert_eq!(
+            prepared.type_,
+            fixture.store.intrinsic_bootstrap().unwrap().number_type,
+        );
+        publish_for_test(&mut fixture.store, std::slice::from_ref(&prepared));
+        let warm = store_state(&fixture.store);
+        assert_eq!(
+            prepare_one(&mut fixture, &resolved[0], &read).unwrap(),
+            prepared,
+        );
+        assert_eq!(store_state(&fixture.store), warm);
+    }
+
+    #[test]
+    fn declaration_boolean_const_imports_preserve_exact_literals_cold_and_warm() {
+        for (spelling, expected_value) in [("true", true), ("false", false)] {
+            let mut fixture = fixture_with_declaration_files(
+                &[
+                    "import { value } from './target'; const copied = value;",
+                    &format!("export const value = {spelling};"),
+                ],
+                &[Route {
+                    source: 0,
+                    specifier: 0,
+                    target: Some(1),
+                }],
+                &[1],
+            );
+            let plan = fixture.plan_import(0, 0);
+            let node = identifier_initializer(&fixture, 0, "value");
+            let bound = fixture.bound.get(&fixture.files[0].file).unwrap();
+            let read = plan_source_import_identifier_read(
+                &fixture.files[0].parsed.arena,
+                bound,
+                &fixture.store,
+                &plan.bindings[0],
+                node,
+                "value",
+                plan.bindings[0].alias_symbol,
+            )
+            .unwrap();
+            let resolved = resolve_all(&mut fixture, &plan.bindings).unwrap();
+
+            let prepared = prepare_one(&mut fixture, &resolved[0], &read).unwrap();
+
+            assert!(matches!(
+                &prepared.target,
+                PreparedSourceImportTarget::DeclarationBooleanConst { value, .. }
+                    if *value == expected_value
+            ));
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            assert_eq!(
+                prepared.type_,
+                if expected_value {
+                    bootstrap.true_type
+                } else {
+                    bootstrap.false_type
+                },
+            );
+            assert_eq!(display_type(&fixture, prepared.type_), spelling);
+            assert!(
+                fixture
+                    .store
+                    .value_symbol_links(resolved[0].target_symbol)
+                    .is_none()
+            );
+
+            publish_for_test(&mut fixture.store, std::slice::from_ref(&prepared));
+            let warm = store_state(&fixture.store);
+            assert_eq!(
+                prepare_one(&mut fixture, &resolved[0], &read).unwrap(),
+                prepared,
+            );
+            assert_eq!(store_state(&fixture.store), warm);
+        }
+    }
+
+    #[test]
+    fn declaration_namespaces_include_implicit_and_boolean_const_exports() {
+        let mut fixture = fixture_with_declaration_files(
+            &[
+                "import * as values from './target'; const copied = values;",
+                "export const label: string; export const enabled = true;",
+            ],
+            &[Route {
+                source: 0,
+                specifier: 0,
+                target: Some(1),
+            }],
+            &[1],
+        );
+        let plan = fixture.plan_import(0, 0);
+        let node = identifier_initializer(&fixture, 0, "values");
+        let bound = fixture.bound.get(&fixture.files[0].file).unwrap();
+        let read = plan_source_import_identifier_read(
+            &fixture.files[0].parsed.arena,
+            bound,
+            &fixture.store,
+            &plan.bindings[0],
+            node,
+            "values",
+            plan.bindings[0].alias_symbol,
+        )
+        .unwrap();
+        let resolved = resolve_all(&mut fixture, &plan.bindings).unwrap();
+
+        let prepared = prepare_one(&mut fixture, &resolved[0], &read).unwrap();
+
+        let PreparedSourceImportTarget::ModuleNamespace { properties } = &prepared.target else {
+            panic!("expected an imported declaration namespace")
+        };
+        assert_eq!(properties.len(), 2);
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let label = properties
+            .iter()
+            .find(|property| property.name.as_utf8() == Some("label"))
+            .unwrap();
+        let enabled = properties
+            .iter()
+            .find(|property| property.name.as_utf8() == Some("enabled"))
+            .unwrap();
+        assert_eq!(label.type_, bootstrap.string_type);
+        assert_eq!(enabled.type_, bootstrap.true_type);
+
+        publish_for_test(&mut fixture.store, std::slice::from_ref(&prepared));
+        let warm = store_state(&fixture.store);
+        assert_eq!(
+            prepare_one(&mut fixture, &resolved[0], &read).unwrap(),
+            prepared,
+        );
+        assert_eq!(store_state(&fixture.store), warm);
+    }
+
+    #[test]
+    fn declaration_boolean_const_import_rejects_poisoned_target_values() {
+        let mut fixture = fixture_with_declaration_files(
+            &[
+                "import { value } from './target'; const copied = value;",
+                "export const value = true;",
+            ],
+            &[Route {
+                source: 0,
+                specifier: 0,
+                target: Some(1),
+            }],
+            &[1],
+        );
+        let plan = fixture.plan_import(0, 0);
+        let node = identifier_initializer(&fixture, 0, "value");
+        let bound = fixture.bound.get(&fixture.files[0].file).unwrap();
+        let read = plan_source_import_identifier_read(
+            &fixture.files[0].parsed.arena,
+            bound,
+            &fixture.store,
+            &plan.bindings[0],
+            node,
+            "value",
+            plan.bindings[0].alias_symbol,
+        )
+        .unwrap();
+        let resolved = resolve_all(&mut fixture, &plan.bindings).unwrap();
+        let wrong = fixture.store.intrinsic_bootstrap().unwrap().false_type;
+        assert!(fixture.store.set_value_symbol_links(
+            resolved[0].target_symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(wrong),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        let before = store_state(&fixture.store);
+
+        assert!(matches!(
+            prepare_one(&mut fixture, &resolved[0], &read),
+            Err(SourceImportError::Invariant(
+                SourceImportInvariant::CachedTypeMismatch { symbol, .. }
+            )) if symbol == resolved[0].target_symbol
+        ));
+        assert_eq!(store_state(&fixture.store), before);
+        assert!(
+            fixture
+                .store
+                .value_symbol_links(plan.bindings[0].alias_symbol)
+                .is_none()
+        );
+    }
+
+    #[test]
     fn declaration_numeric_const_import_rejects_unsupported_initializer_shapes() {
         for target in [
-            "export const value: number;",
             "export declare const value: number = 1;",
             "export declare const value;",
             "export const value = \"one\";",
