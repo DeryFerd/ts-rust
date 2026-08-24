@@ -173,6 +173,18 @@ impl SourceCallableFamily {
             Self::ArrowFunction => SyntaxKind::ArrowFunction,
         }
     }
+
+    /// Anonymous function expressions share the existing anonymous callable brand.
+    pub(super) const fn matches_syntax_kind(self, kind: SyntaxKind) -> bool {
+        matches!(
+            (self, kind),
+            (Self::FunctionDeclaration, SyntaxKind::FunctionDeclaration)
+                | (
+                    Self::ArrowFunction,
+                    SyntaxKind::ArrowFunction | SyntaxKind::FunctionExpression
+                )
+        )
+    }
 }
 
 /// Immutable owner tuple distinguishing source values from `FunctionType` nodes.
@@ -1245,8 +1257,9 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             || !contextual_pair
             || !exact_type_parameters
             || !array_targets_valid
-            || self.source_node_kind(provenance.declaration)
-                != Some(provenance.family.syntax_kind())
+            || self
+                .source_node_kind(provenance.declaration)
+                .is_none_or(|kind| !provenance.family.matches_syntax_kind(kind))
             || !self.symbols.contains_symbol(provenance.owner_symbol)
             || provenance
                 .owner_parent
@@ -2345,7 +2358,9 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             .and_then(|type_| self.source_callable_provenance(type_))
             .is_some_and(|provenance| {
                 provenance.declaration == node
-                    && self.source_node_kind(node) == Some(provenance.family.syntax_kind())
+                    && self
+                        .source_node_kind(node)
+                        .is_some_and(|kind| provenance.family.matches_syntax_kind(kind))
             })
     }
 

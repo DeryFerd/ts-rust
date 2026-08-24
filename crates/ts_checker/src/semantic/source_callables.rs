@@ -1,10 +1,11 @@
 //! Exact source callable values owned by source function symbols.
 //!
 //! This provider deliberately stops before statement/expression dispatch and
-//! function-body semantics. It proves one retained `FunctionDeclaration` or
-//! `ArrowFunction` and its binder-owned FUNCTION symbol, publishes the callable
-//! shell/signature/parameter types, including implicit `any` on ordinary
-//! function declarations, and validates the resulting store shape.
+//! function-body semantics. It proves one retained `FunctionDeclaration`,
+//! anonymous `FunctionExpression`, or `ArrowFunction` and its binder-owned
+//! FUNCTION symbol, publishes the callable shell/signature/parameter types,
+//! including implicit `any` on ordinary function declarations, and validates
+//! the resulting store shape.
 //! Source values never borrow `FunctionType` `TypeNode` or `__call` provenance.
 
 use std::collections::HashSet;
@@ -1786,6 +1787,33 @@ fn plan_source_callable_with_owner_shape(
                     || function.end_flow_node.is_some(),
             }
         }
+        NodeData::FunctionExpression(function) if record.kind == SyntaxKind::FunctionExpression => {
+            if let Some(name) = function.name {
+                let name = NodeRef::new(declaration.arena, declaration.file, name);
+                preflight_child(store, host, declaration, name)?;
+                return Err(SourceCallableError::Unsupported(
+                    SourceCallableUnsupported::OverloadDeclaration(name),
+                ));
+            }
+            SourceSyntaxView {
+                family: SourceCallableFamily::ArrowFunction,
+                parameters: &function.parameters,
+                modifiers: function.modifiers.as_ref(),
+                type_parameters: function.type_parameters.as_ref(),
+                return_type: function.type_,
+                body: Some(function.body),
+                asterisk_token: function.asterisk_token,
+                name: None,
+                equals_greater_than_token: None,
+                invalid_parser_cache: function.full_signature.is_some()
+                    || function.next_container.is_some()
+                    || function.symbol.is_some()
+                    || function.flow_node.is_some()
+                    || function.end_flow_node.is_some()
+                    || function.return_flow_node.is_some()
+                    || function.facts != 0,
+            }
+        }
         _ => {
             return Err(invariant(SourceCallableInvariant::InvalidSyntax(
                 declaration,
@@ -3304,6 +3332,11 @@ fn prove_source_type_parameter_syntax(
         }
         NodeData::ArrowFunction(function)
             if declaration_record.kind == SyntaxKind::ArrowFunction =>
+        {
+            function.type_parameters.as_ref()
+        }
+        NodeData::FunctionExpression(function)
+            if declaration_record.kind == SyntaxKind::FunctionExpression =>
         {
             function.type_parameters.as_ref()
         }
@@ -5482,7 +5515,9 @@ fn valid_source_callable_plan_owner(
     let Some(owner) = store.symbol(plan.owner_symbol) else {
         return false;
     };
-    if store.source_node_kind(plan.declaration) != Some(plan.family.syntax_kind())
+    if store
+        .source_node_kind(plan.declaration)
+        .is_none_or(|kind| !plan.family.matches_syntax_kind(kind))
         || store.get_merged_symbol(plan.owner_symbol) != Some(plan.owner_symbol)
         || owner.check_flags() != CheckFlags::NONE
         || owner.members().is_some()
@@ -6832,6 +6867,56 @@ pub(super) fn finalize_source_callable_structure(
         }
     }
     Ok(())
+}
+
+/// Publishes an authenticated zero-parameter anonymous function expression.
+pub(super) fn materialize_anonymous_source_function_expression(
+    store: &mut CanonicalTypeMapperStore,
+    plan: &SourceCallablePlan,
+) -> Result<(TypeId, SignatureId), SourceCallableError> {
+    if plan.family != SourceCallableFamily::ArrowFunction
+        || store.source_node_kind(plan.declaration) != Some(SyntaxKind::FunctionExpression)
+        || !plan.parameters.is_empty()
+        || !plan.type_parameters.is_empty()
+        || !plan.return_type.is_inferred()
+        || plan.body_mode != SourceCallableBodyMode::Present
+        || plan.is_async
+        || plan.flags != SignatureFlags::NONE
+        || plan.min_argument_count != 0
+        || plan.owner_parent.is_some()
+        || plan.export_local.is_some()
+        || store
+            .symbol(plan.owner_symbol)
+            .is_none_or(|owner| owner.exports().is_some())
+    {
+        return Err(invariant(SourceCallableInvariant::InvalidOwnerSymbol(
+            plan.declaration,
+        )));
+    }
+
+    match source_callable_state(store, plan, true)? {
+        SourceCallableState::AwaitingInferredReturn { type_, signature }
+        | SourceCallableState::Resolved { type_, signature } => Ok((type_, signature)),
+        SourceCallableState::Cold => {
+            let (type_count, optional_unions) = reserve_source_callable_capacities(store, &[plan])?;
+            if type_count != 1 || optional_unions != 0 || !store.try_reserve_types(type_count) {
+                return Err(invariant(SourceCallableInvariant::Capacity(
+                    plan.declaration,
+                )));
+            }
+            let Ok(pending) = begin_source_callable(store, plan, &[])? else {
+                return Err(invariant(SourceCallableInvariant::Publication(
+                    plan.declaration,
+                )));
+            };
+            finalize_source_callable_structure(store, plan, pending)?;
+            Ok((pending.type_, pending.signature))
+        }
+        SourceCallableState::ActiveBarrier { .. }
+        | SourceCallableState::ActiveParameters { .. } => Err(invariant(
+            SourceCallableInvariant::InvalidTypeCache(plan.declaration),
+        )),
+    }
 }
 
 /// Publishes the canonical `any` return of a bodyless declaration signature.
@@ -8590,7 +8675,9 @@ pub(super) fn stored_source_callable_family(
 const fn source_family_for_kind(kind: Option<SyntaxKind>) -> Option<SourceCallableFamily> {
     match kind {
         Some(SyntaxKind::FunctionDeclaration) => Some(SourceCallableFamily::FunctionDeclaration),
-        Some(SyntaxKind::ArrowFunction) => Some(SourceCallableFamily::ArrowFunction),
+        Some(SyntaxKind::ArrowFunction | SyntaxKind::FunctionExpression) => {
+            Some(SourceCallableFamily::ArrowFunction)
+        }
         _ => None,
     }
 }
@@ -9482,6 +9569,149 @@ mod tests {
             callable_parameter_types: store.callable_signature_parameter_types_len(),
             checker_links: store.checker_link_allocated_lengths(),
         }
+    }
+
+    #[test]
+    fn anonymous_function_expressions_preserve_binder_ownership_and_warm_signatures() {
+        for (index, javascript) in [false, true].into_iter().enumerate() {
+            let file = FileId::new(1_900 + u32::try_from(index).unwrap());
+            let mut fixture = if javascript {
+                QueryFixture::javascript("const value = function () {};", file)
+            } else {
+                QueryFixture::new("const value = function () {};", file)
+            };
+            let declaration = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::FunctionExpression).then_some(NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let owner = fixture.bound.symbol(declaration).unwrap();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            let before = publication_state(&fixture.store);
+
+            let plan =
+                plan_source_callable(&fixture.store, &host, declaration, owner, None).unwrap();
+            assert_eq!(plan.family, SourceCallableFamily::ArrowFunction);
+            assert_eq!(plan.declaration, declaration);
+            assert_eq!(plan.owner_symbol, owner);
+            assert_eq!(publication_state(&fixture.store), before);
+
+            let (callable, signature) =
+                materialize_anonymous_source_function_expression(&mut fixture.store, &plan)
+                    .unwrap();
+            let void = fixture.store.intrinsic_bootstrap().unwrap().void_type;
+            assert_eq!(
+                publish_inferred_source_callable_return(&mut fixture.store, &plan, signature, void,),
+                Ok(void),
+            );
+            assert_eq!(
+                fixture.store.source_callable_type_for_owner(owner),
+                Some(callable),
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .source_callable_type_for_declaration(declaration),
+                Some(callable),
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .source_callable_provenance(callable)
+                    .map(|provenance| provenance.signature),
+                Some(signature),
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .signature(signature)
+                    .unwrap()
+                    .resolved_return_type(),
+                Some(void),
+            );
+            assert!(matches!(
+                validate_stored_source_callable(&fixture.store, callable),
+                StoredSourceCallableValidation::Valid(_)
+            ));
+
+            let warm = publication_state(&fixture.store);
+            assert_eq!(
+                materialize_anonymous_source_function_expression(&mut fixture.store, &plan),
+                Ok((callable, signature)),
+            );
+            assert_eq!(publication_state(&fixture.store), warm);
+        }
+    }
+
+    #[test]
+    fn anonymous_function_expression_plans_reject_names_and_corrupt_owners() {
+        let named = QueryFixture::new("const value = function inner() {};", FileId::new(1_902));
+        let declaration = named
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionExpression).then_some(NodeRef::new(
+                    named.parsed.arena.id(),
+                    named.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let owner = named.bound.symbol(declaration).unwrap();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&named.parsed.arena, &named.bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        assert!(matches!(
+            plan_source_callable(&named.store, &host, declaration, owner, None),
+            Err(SourceCallableError::Unsupported(
+                SourceCallableUnsupported::OverloadDeclaration(_)
+            ))
+        ));
+
+        let mut invalid = QueryFixture::new("const value = function () {};", FileId::new(1_903));
+        let declaration = invalid
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionExpression).then_some(NodeRef::new(
+                    invalid.parsed.arena.id(),
+                    invalid.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let owner = invalid.bound.symbol(declaration).unwrap();
+        assert!(invalid.store.set_symbol_flags(
+            owner,
+            SymbolFlags::FUNCTION | SymbolFlags::ASSIGNMENT,
+            CheckFlags::NONE,
+        ));
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&invalid.parsed.arena, &invalid.bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        assert_eq!(
+            plan_source_callable(&invalid.store, &host, declaration, owner, None),
+            Err(SourceCallableError::Invariant(
+                SourceCallableInvariant::InvalidOwnerSymbol(declaration),
+            )),
+        );
     }
 
     #[test]
