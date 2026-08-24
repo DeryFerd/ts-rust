@@ -1010,7 +1010,7 @@ pub(super) fn source_typeof_narrowing_type_is_supported(
     Ok(true)
 }
 
-fn narrow_by_typeof(
+pub(super) fn narrow_by_typeof(
     store: &mut CanonicalTypeMapperStore,
     globals: &CanonicalGlobalTypes,
     type_: TypeId,

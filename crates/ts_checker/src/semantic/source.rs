@@ -122,9 +122,9 @@ use super::{
     },
     source_flow::{
         SourceFlowAssignment, SourceFlowCondition, SourceFlowError, SourceFlowFrame,
-        SourceFlowParameterAssignment, SourceFlowPlan, SourceTruthinessCondition,
-        SourceTypeofComparison, SourceTypeofCondition, SourceTypeofTag,
-        source_typeof_narrowing_type_is_supported,
+        SourceFlowInvariant, SourceFlowParameterAssignment, SourceFlowPlan,
+        SourceTruthinessCondition, SourceTypeofComparison, SourceTypeofCondition, SourceTypeofTag,
+        narrow_by_typeof, source_typeof_narrowing_type_is_supported,
     },
     source_functions::{
         PlannedFunctionRead, SourceFunctionInvariant, SourceFunctionPlanError,
@@ -173,11 +173,13 @@ use super::{
         SourceLinearFunctionStatementSyntax, SourceLinearFunctionStatementsSyntax,
         SourceLocalDeclarationSyntax, SourceReturnBranchSyntax,
         SourceSwitchFunctionStatementsSyntax, SourceTypeofConditionSyntax,
+        SourceTypeofSwitchFunctionStatementsSyntax,
         plan_source_conditional_enum_function_statements_syntax, plan_source_control_if_syntax,
         plan_source_control_loop_syntax, plan_source_function_statements_syntax,
         plan_source_joined_function_statements_syntax,
         plan_source_linear_function_statements_syntax,
-        plan_source_switch_function_statements_syntax, source_control_branch_is_empty,
+        plan_source_switch_function_statements_syntax,
+        plan_source_typeof_switch_function_statements_syntax, source_control_branch_is_empty,
     },
     type_nodes::{
         CanonicalTypeQuery, CanonicalTypeReferenceAliasTarget, normalize_bigint_literal,
@@ -884,6 +886,7 @@ enum PlannedFunctionBody {
     },
     Linear(Box<PlannedLinearFunctionStatements>),
     Switch(Box<PlannedSwitchFunctionStatements>),
+    TypeofSwitch(Box<PlannedTypeofSwitchFunctionStatements>),
     ConditionalEnum(Box<PlannedConditionalEnumFunctionStatements>),
     Statements(Box<PlannedFunctionStatements>),
     JoinedStatements(Box<PlannedJoinedFunctionStatements>),
@@ -923,6 +926,22 @@ struct PlannedSwitchFunctionStatements {
     cases: Vec<PlannedExpression>,
     returns: Vec<PlannedSwitchReturn>,
     exhaustive_constraint: Option<NodeRef>,
+}
+
+#[derive(Clone, Debug)]
+struct PlannedTypeofSwitchFunctionStatements {
+    discriminant: NodeRef,
+    identifier: PlannedExpression,
+    symbol: SemanticSymbolId,
+    cases: Vec<PlannedExpression>,
+    expressions: Vec<PlannedTypeofSwitchExpression>,
+}
+
+#[derive(Clone, Debug)]
+struct PlannedTypeofSwitchExpression {
+    statement: NodeRef,
+    expression: PlannedExpression,
+    tag: SourceTypeofTag,
 }
 
 #[derive(Clone, Debug)]
@@ -5392,6 +5411,16 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             Err(SourceFunctionStatementsError::Unsupported(_)) => {}
             Err(error) => return Err(Self::function_statements_plan_error(callable, error)),
         }
+        match plan_source_typeof_switch_function_statements_syntax(
+            self.arena, self.bound, store, callable,
+        ) {
+            Ok(syntax) => {
+                let planned = self.finish_typeof_switch_function_statements(callable, syntax)?;
+                return Ok(PlannedFunctionBody::TypeofSwitch(Box::new(planned)));
+            }
+            Err(SourceFunctionStatementsError::Unsupported(_)) => {}
+            Err(error) => return Err(Self::function_statements_plan_error(callable, error)),
+        }
         match plan_source_conditional_enum_function_statements_syntax(
             self.arena, self.bound, store, callable,
         ) {
@@ -5704,6 +5733,86 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             cases,
             returns,
             exhaustive_constraint,
+        })
+    }
+
+    fn finish_typeof_switch_function_statements(
+        &mut self,
+        callable: &SourceCallablePlan,
+        syntax: SourceTypeofSwitchFunctionStatementsSyntax,
+    ) -> Result<PlannedTypeofSwitchFunctionStatements, SourceCheckError> {
+        let [parameter] = callable.parameters.as_slice() else {
+            return Err(Self::unsupported_function_body(callable));
+        };
+        if syntax.body != callable.body || !callable.return_type.is_inferred() {
+            return Err(Self::unsupported_function_body(callable));
+        }
+
+        let identifier = self.plan_expression(syntax.identifier)?;
+        if !matches!(
+            &identifier.kind,
+            PlannedExpressionKind::Identifier(read)
+                if read.kind == PlannedIdentifierReadKind::Variable
+                    && read.value_symbol == parameter.symbol
+        ) {
+            return Err(Self::unsupported_function_body(callable));
+        }
+        let Some((store, _)) = self.semantic else {
+            return Err(Self::unsupported_function_body(callable));
+        };
+        let typeof_type = store
+            .intrinsic_bootstrap()
+            .ok_or(SourceCheckError::LiteralCache(
+                SourceLiteralCacheError::BootstrapUninitialized,
+            ))?
+            .typeof_type;
+        preflight_source_expression_cache(store, syntax.switch.expression, typeof_type)?;
+
+        let mut cases = Vec::with_capacity(syntax.switch.clauses.len());
+        for clause in &syntax.switch.clauses {
+            let case = clause
+                .expression
+                .ok_or_else(|| Self::unsupported_function_body(callable))?;
+            let case = self.plan_expression(case)?;
+            if !matches!(&case.kind, PlannedExpressionKind::String(_)) {
+                return Err(Self::unsupported_function_body(callable));
+            }
+            cases.push(case);
+        }
+
+        let mut expressions = Vec::with_capacity(syntax.expressions.len());
+        for value in syntax.expressions {
+            let expression = self.plan_expression(value.expression)?;
+            let PlannedExpressionKind::Call(call) = &expression.kind else {
+                return Err(Self::unsupported_function_body(callable));
+            };
+            let PlannedExpressionKind::Property(property) = &call.callee.kind else {
+                return Err(Self::unsupported_function_body(callable));
+            };
+            if !matches!(
+                &property.receiver.kind,
+                PlannedExpressionKind::Identifier(read)
+                    if read.kind == PlannedIdentifierReadKind::Variable
+                        && read.value_symbol == parameter.symbol
+            ) || !matches!(
+                call.arguments.as_slice(),
+                [argument] if matches!(&argument.kind, PlannedExpressionKind::Number { .. })
+            ) {
+                return Err(Self::unsupported_function_body(callable));
+            }
+            expressions.push(PlannedTypeofSwitchExpression {
+                statement: value.statement,
+                expression,
+                tag: value.tag,
+            });
+        }
+
+        Ok(PlannedTypeofSwitchFunctionStatements {
+            discriminant: syntax.switch.expression,
+            identifier,
+            symbol: parameter.symbol,
+            cases,
+            expressions,
         })
     }
 
@@ -11365,6 +11474,38 @@ fn preflight_inferred_function_return_dependencies(
                     )
                 })
             }
+            PlannedFunctionBody::TypeofSwitch(statements) => {
+                expression_is_closed(
+                    &statements.identifier,
+                    &function.callable.parameters,
+                    &locals,
+                    functions,
+                ) && statements.cases.iter().all(|case| {
+                    expression_is_closed(case, &function.callable.parameters, &locals, functions)
+                }) && statements.expressions.iter().all(|value| {
+                    matches!(
+                        &value.expression.kind,
+                        PlannedExpressionKind::Call(call)
+                            if matches!(
+                                &call.callee.kind,
+                                PlannedExpressionKind::Property(property)
+                                    if expression_is_closed(
+                                        &property.receiver,
+                                        &function.callable.parameters,
+                                        &locals,
+                                        functions,
+                                    )
+                            ) && call.arguments.iter().all(|argument| {
+                                expression_is_closed(
+                                    argument,
+                                    &function.callable.parameters,
+                                    &locals,
+                                    functions,
+                                )
+                            })
+                    )
+                })
+            }
             PlannedFunctionBody::ConditionalEnum(statements) => expression_is_closed(
                 &statements.condition,
                 &function.callable.parameters,
@@ -15327,6 +15468,489 @@ fn check_planned_switch_function_statements(
     Ok(return_types)
 }
 
+#[allow(clippy::too_many_arguments)] // Keeps switch narrowing inside the source transaction.
+fn check_planned_typeof_switch_function_statements(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source: SourceFileRef,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    flow_types: &HashMap<SemanticSymbolId, TypeId>,
+    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    deferred: &mut Vec<DeferredAssertion>,
+    callable: &SourceCallablePlan,
+    statements: &PlannedTypeofSwitchFunctionStatements,
+) -> Result<(), SourceCheckError> {
+    let current = flow_types
+        .get(&statements.symbol)
+        .copied()
+        .ok_or(SourceCheckError::Variable(
+            VariableInvariant::MissingCurrentFlowType(statements.symbol),
+        ))?;
+    let identifier = check_expression_type(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        session,
+        diagnostics,
+        flow_types,
+        preflighted_type_import_value_uses,
+        &statements.identifier,
+        None,
+        deferred,
+    )?;
+    if identifier.raw != current {
+        return Err(SourceCheckError::Function(
+            SourceFunctionInvariant::Callable(callable.declaration),
+        ));
+    }
+    let typeof_type = store
+        .intrinsic_bootstrap()
+        .ok_or(SourceCheckError::LiteralCache(
+            SourceLiteralCacheError::BootstrapUninitialized,
+        ))?
+        .typeof_type;
+    publish_expression_type(store, statements.discriminant, typeof_type)?;
+
+    let mut checked_cases = Vec::with_capacity(statements.cases.len());
+    for case in &statements.cases {
+        checked_cases.push(check_expression_type(
+            store,
+            host,
+            global_types,
+            source,
+            options,
+            session,
+            diagnostics,
+            flow_types,
+            preflighted_type_import_value_uses,
+            case,
+            None,
+            deferred,
+        )?);
+    }
+
+    for (case, checked) in statements.cases.iter().zip(checked_cases) {
+        if !store.are_types_comparable_with_global_types(
+            checked.result,
+            typeof_type,
+            global_types,
+        )? {
+            let mut flags = CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT;
+            if options.no_error_truncation {
+                flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
+            }
+            let display = get_type_names_for_assignability_error_with_host_global_types_and_flags(
+                store,
+                host,
+                global_types,
+                checked.result,
+                typeof_type,
+                flags,
+            )?;
+            merge_retry_diagnostic(
+                diagnostics,
+                CanonicalCheckerDiagnostic {
+                    node: Some(case.node),
+                    range_override: None,
+                    diagnostic: Diagnostic::with_arguments(
+                        message_by_code(2678).ok_or(SourceCheckError::MissingDiagnostic(2678))?,
+                        [display.source, display.target],
+                    ),
+                    related_information: Vec::new(),
+                },
+            );
+        }
+    }
+
+    for value in &statements.expressions {
+        let supported =
+            source_typeof_narrowing_type_is_supported(store, global_types, current, value.tag)
+                .map_err(|error| {
+                    SourcePlanner::source_flow_plan_error(
+                        callable,
+                        SourceFlowError::Invariant(SourceFlowInvariant::TypeofNarrowing(error)),
+                    )
+                })?;
+        if !supported {
+            return Err(SourcePlanner::unsupported_function_body(callable));
+        }
+        let narrowed =
+            narrow_by_typeof(store, global_types, current, value.tag, true).map_err(|error| {
+                SourcePlanner::source_flow_plan_error(
+                    callable,
+                    SourceFlowError::Invariant(SourceFlowInvariant::TypeofNarrowing(error)),
+                )
+            })?;
+        let mut narrowed_flow = flow_types.clone();
+        narrowed_flow.insert(statements.symbol, narrowed);
+        check_typeof_switch_string_method_call(
+            store,
+            host,
+            global_types,
+            source,
+            options,
+            session,
+            diagnostics,
+            &narrowed_flow,
+            preflighted_type_import_value_uses,
+            deferred,
+            callable,
+            statements.symbol,
+            value,
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)] // Proves the actual String.charAt declaration and call.
+fn check_typeof_switch_string_method_call(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source: SourceFileRef,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    flow_types: &HashMap<SemanticSymbolId, TypeId>,
+    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    deferred: &mut Vec<DeferredAssertion>,
+    callable: &SourceCallablePlan,
+    parameter_symbol: SemanticSymbolId,
+    value: &PlannedTypeofSwitchExpression,
+) -> Result<(), SourceCheckError> {
+    let unsupported = || SourcePlanner::unsupported_function_body(callable);
+    let PlannedExpressionKind::Call(call) = &value.expression.kind else {
+        return Err(unsupported());
+    };
+    let PlannedExpressionKind::Property(property) = &call.callee.kind else {
+        return Err(unsupported());
+    };
+    let PlannedExpressionKind::Identifier(receiver) = &property.receiver.kind else {
+        return Err(unsupported());
+    };
+    let [argument] = call.arguments.as_slice() else {
+        return Err(unsupported());
+    };
+    if value.tag != SourceTypeofTag::String
+        || receiver.kind != PlannedIdentifierReadKind::Variable
+        || receiver.value_symbol != parameter_symbol
+        || host
+            .node(value.statement)
+            .is_none_or(|record| record.kind != SyntaxKind::ExpressionStatement)
+    {
+        return Err(unsupported());
+    }
+    let property_record = host.node(property.node).ok_or_else(unsupported)?;
+    let NodeData::PropertyAccessExpression(access) = &property_record.data else {
+        return Err(unsupported());
+    };
+    let property_name = NodeRef::new(property.node.arena, property.node.file, access.name);
+    let name_record = host.node(property_name).ok_or_else(unsupported)?;
+    let NodeData::Identifier(name) = &name_record.data else {
+        return Err(unsupported());
+    };
+    if property_record.kind != SyntaxKind::PropertyAccessExpression
+        || access.expression != property.receiver.node.node
+        || access.question_dot_token.is_some()
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.parent != Some(property.node.node)
+        || name.text != "charAt"
+    {
+        return Err(unsupported());
+    }
+
+    let string_wrapper = store
+        .type_payload(global_types.string_type)
+        .ok_or_else(unsupported)?;
+    let owner = string_wrapper
+        .symbol()
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .ok_or_else(unsupported)?;
+    let owner_record = store.symbol(owner).ok_or_else(unsupported)?;
+    let method = owner_record
+        .members()
+        .and_then(|members| store.symbol_table(members))
+        .and_then(|members| members.get_source("charAt"))
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .ok_or_else(unsupported)?;
+    let method_record = store.symbol(method).ok_or_else(unsupported)?;
+    let Some([declaration]) = method_record.declarations() else {
+        return Err(unsupported());
+    };
+    let declaration = *declaration;
+    if !owner_record.flags().contains(SymbolFlags::INTERFACE)
+        || owner_record.name().as_utf8() != Some("String")
+        || method_record.flags() != SymbolFlags::METHOD
+        || method_record.check_flags() != CheckFlags::NONE
+        || method_record.name().as_utf8() != Some("charAt")
+        || method_record.value_declaration() != Some(declaration)
+        || method_record
+            .parent()
+            .and_then(|parent| store.get_merged_symbol(parent))
+            != Some(owner)
+        || !host.symbol_matches(store, declaration, method)
+    {
+        return Err(unsupported());
+    }
+
+    let declaration_record = host.node(declaration).ok_or_else(unsupported)?;
+    let NodeData::MethodSignatureDeclaration(method_data) = &declaration_record.data else {
+        return Err(unsupported());
+    };
+    let [method_parameter] = method_data.parameters.nodes.as_slice() else {
+        return Err(unsupported());
+    };
+    if declaration_record.kind != SyntaxKind::MethodSignature
+        || declaration_record.flags.0 != 0
+        || method_data.full_signature.is_some()
+        || method_data.next_container.is_some()
+        || method_data.postfix_token.is_some()
+        || method_data.symbol.is_some()
+        || method_data.type_parameters.is_some()
+        || method_data.modifiers.is_some()
+        || method_data.parameters.has_trailing_comma
+    {
+        return Err(unsupported());
+    }
+    let method_parameter = NodeRef::new(declaration.arena, declaration.file, *method_parameter);
+    let parameter_record = host.node(method_parameter).ok_or_else(unsupported)?;
+    let NodeData::ParameterDeclaration(parameter) = &parameter_record.data else {
+        return Err(unsupported());
+    };
+    let parameter_name = NodeRef::new(
+        method_parameter.arena,
+        method_parameter.file,
+        parameter.name,
+    );
+    let parameter_name_record = host.node(parameter_name).ok_or_else(unsupported)?;
+    let NodeData::Identifier(parameter_identifier) = &parameter_name_record.data else {
+        return Err(unsupported());
+    };
+    let method_parameter_symbol = host
+        .bound_file(method_parameter)
+        .and_then(|bound| bound.symbol(method_parameter))
+        .ok_or_else(unsupported)?;
+    let method_parameter_owner = store
+        .symbol(method_parameter_symbol)
+        .ok_or_else(unsupported)?;
+    let parameter_annotation = parameter
+        .type_
+        .map(|node| NodeRef::new(method_parameter.arena, method_parameter.file, node))
+        .ok_or_else(unsupported)?;
+    let return_annotation = method_data
+        .type_
+        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+        .ok_or_else(unsupported)?;
+    if parameter_record.kind != SyntaxKind::Parameter
+        || parameter_record.flags.0 != 0
+        || parameter_record.parent != Some(declaration.node)
+        || parameter.dot_dot_dot_token.is_some()
+        || parameter.initializer.is_some()
+        || parameter.question_token.is_some()
+        || parameter.symbol.is_some()
+        || parameter.modifiers.is_some()
+        || parameter.facts != 0
+        || parameter_name_record.kind != SyntaxKind::Identifier
+        || parameter_name_record.parent != Some(method_parameter.node)
+        || parameter_identifier.text != "pos"
+        || store.get_merged_symbol(method_parameter_symbol) != Some(method_parameter_symbol)
+        || method_parameter_owner.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+        || method_parameter_owner.check_flags() != CheckFlags::NONE
+        || method_parameter_owner.name().as_utf8() != Some("pos")
+        || method_parameter_owner.declarations() != Some(&[method_parameter])
+        || method_parameter_owner.value_declaration() != Some(method_parameter)
+        || method_parameter_owner.members().is_some()
+        || method_parameter_owner.exports().is_some()
+        || method_parameter_owner.parent().is_some()
+        || method_parameter_owner.export_symbol().is_some()
+        || host
+            .node(parameter_annotation)
+            .is_none_or(|record| record.kind != SyntaxKind::NumberKeyword)
+        || host
+            .node(return_annotation)
+            .is_none_or(|record| record.kind != SyntaxKind::StringKeyword)
+    {
+        return Err(unsupported());
+    }
+
+    let receiver_type = check_expression_type(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        session,
+        diagnostics,
+        flow_types,
+        preflighted_type_import_value_uses,
+        &property.receiver,
+        None,
+        deferred,
+    )?;
+    let (expected_receiver, expected_parameter, expected_return) = store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| {
+            (
+                bootstrap.string_type,
+                bootstrap.number_type,
+                bootstrap.string_type,
+            )
+        })
+        .ok_or(SourceCheckError::LiteralCache(
+            SourceLiteralCacheError::BootstrapUninitialized,
+        ))?;
+    if receiver_type.result != expected_receiver {
+        return Err(unsupported());
+    }
+
+    session.reset_query();
+    let mut method_diagnostics = CanonicalCheckerDiagnostics::default();
+    let parameter_type = CanonicalTypeQuery::new_with_global_types_and_session(
+        store,
+        host,
+        global_types,
+        options,
+        session,
+        &mut method_diagnostics,
+    )?
+    .get_type_from_type_node(parameter_annotation)?;
+    merge_retry_diagnostics(diagnostics, method_diagnostics);
+    session.reset_query();
+    let mut method_diagnostics = CanonicalCheckerDiagnostics::default();
+    let return_type = CanonicalTypeQuery::new_with_global_types_and_session(
+        store,
+        host,
+        global_types,
+        options,
+        session,
+        &mut method_diagnostics,
+    )?
+    .get_type_from_type_node(return_annotation)?;
+    merge_retry_diagnostics(diagnostics, method_diagnostics);
+    if parameter_type != expected_parameter || return_type != expected_return {
+        return Err(unsupported());
+    }
+
+    let argument = check_expression_type(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        session,
+        diagnostics,
+        flow_types,
+        preflighted_type_import_value_uses,
+        argument,
+        Some(parameter_type),
+        deferred,
+    )?;
+    if !source_type_is_assignable_to(
+        store,
+        host,
+        global_types,
+        options,
+        session,
+        diagnostics,
+        argument.result,
+        parameter_type,
+    )? {
+        return Err(unsupported());
+    }
+    publish_typeof_switch_string_method_call(
+        store,
+        value.expression.node,
+        declaration,
+        method_parameter_symbol,
+        return_type,
+    )
+}
+
+/// Publishes the call and its exact binder-owned `String.charAt` signature together.
+fn publish_typeof_switch_string_method_call(
+    store: &mut CanonicalTypeMapperStore,
+    node: NodeRef,
+    declaration: NodeRef,
+    parameter: SemanticSymbolId,
+    return_type: TypeId,
+) -> Result<(), SourceCheckError> {
+    let expected_type = TypeNodeLinks {
+        resolved_type: Some(return_type),
+        ..TypeNodeLinks::default()
+    };
+    let type_links = store.type_node_links(node).cloned();
+    let signature_links = store.signature_links(node).cloned();
+
+    if let (Some(type_links), Some(signature_links)) = (&type_links, &signature_links)
+        && type_links == &expected_type
+        && let super::links::ResolvedSignatureState::Resolved(signature) =
+            signature_links.resolved_signature
+    {
+        let expected_links = super::links::SignatureLinks {
+            resolved_signature: super::links::ResolvedSignatureState::Resolved(signature),
+            ..super::links::SignatureLinks::default()
+        };
+        let Some(record) = store.signature(signature) else {
+            return Err(SourceCheckError::Call(node));
+        };
+        return if signature_links == &expected_links
+            && record.flags() == super::signatures::SignatureFlags::NONE
+            && record.declaration() == Some(declaration)
+            && record.type_parameters().is_empty()
+            && record.this_parameter().is_none()
+            && record.parameters() == [parameter]
+            && record.min_argument_count() == 1
+            && record.resolved_min_argument_count() == -1
+            && record.resolved_return_type() == Some(return_type)
+            && record.resolved_type_predicate().is_none()
+            && record.target().is_none()
+            && record.mapper().is_none()
+            && record.isolated_signature_type().is_none()
+            && record.composite().is_none()
+        {
+            Ok(())
+        } else {
+            Err(SourceCheckError::Call(node))
+        };
+    }
+
+    if type_links.is_some_and(|links| links != TypeNodeLinks::default())
+        || signature_links.is_some_and(|links| links != super::links::SignatureLinks::default())
+        || !store.try_reserve_signatures(1)
+        || !store.try_reserve_signature_links(usize::from(store.signature_links(node).is_none()))
+        || !store.try_reserve_type_node_links(usize::from(store.type_node_links(node).is_none()))
+    {
+        return Err(SourceCheckError::Call(node));
+    }
+    let signature = store
+        .alloc_signature(
+            super::signatures::SignatureFlags::NONE,
+            Some(declaration),
+            Vec::new(),
+            None,
+            vec![parameter],
+            Some(return_type),
+            None,
+            1,
+        )
+        .ok_or(SourceCheckError::Call(node))?;
+    let expected_signature = super::links::SignatureLinks {
+        resolved_signature: super::links::ResolvedSignatureState::Resolved(signature),
+        ..super::links::SignatureLinks::default()
+    };
+    if !store.set_signature_links(node, expected_signature)
+        || !store.set_type_node_links(node, expected_type)
+    {
+        return Err(SourceCheckError::Call(node));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)] // Reuses the existing source flow and publication transaction.
 fn check_planned_linear_function_statements(
     bound: &BoundFile,
@@ -18835,6 +19459,37 @@ pub(super) fn check_source_file(
                 inferred_function_diagnostics[index] = Some(function_diagnostics);
                 continue;
             }
+            PlannedFunctionBody::TypeofSwitch(statements) => {
+                check_planned_typeof_switch_function_statements(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    &mut function_diagnostics,
+                    &body_flow_types,
+                    &preflighted_type_import_value_uses,
+                    &mut deferred,
+                    &function.callable,
+                    statements,
+                )?;
+                let void = store
+                    .intrinsic_bootstrap()
+                    .ok_or(SourceCheckError::LiteralCache(
+                        SourceLiteralCacheError::BootstrapUninitialized,
+                    ))?
+                    .void_type;
+                publish_inferred_source_callable_return(
+                    store,
+                    &function.callable,
+                    materialized.signature,
+                    void,
+                )
+                .map_err(SourcePlanner::callable_plan_error)?;
+                inferred_function_diagnostics[index] = Some(function_diagnostics);
+                continue;
+            }
             PlannedFunctionBody::ConditionalEnum(statements) => {
                 check_expression_type(
                     store,
@@ -19505,7 +20160,9 @@ pub(super) fn check_source_file(
                     &function.parameter_initializers,
                 )?;
                 match &function.body {
-                    PlannedFunctionBody::Ambient | PlannedFunctionBody::ConditionalEnum(_) => {
+                    PlannedFunctionBody::Ambient
+                    | PlannedFunctionBody::TypeofSwitch(_)
+                    | PlannedFunctionBody::ConditionalEnum(_) => {
                         return Err(SourceCheckError::Function(
                             SourceFunctionInvariant::Callable(function.callable.declaration),
                         ));
@@ -31063,6 +31720,190 @@ mod tests {
         ));
         assert_eq!(observable_state(&blocked_context, blocked_file), before);
         assert!(blocked_context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn typeof_switch_reports_empty_case_and_checks_the_narrowed_string_method() {
+        let library = parsed("interface String { charAt(pos: number): string; }");
+        let library_file = FileId::new(8_510);
+        let source = parsed(concat!(
+            "function choose(value: string | number) {\n",
+            "  switch (typeof value) {\n",
+            "    case \"\":\n",
+            "    case \"string\":\n",
+            "      value.charAt(0);\n",
+            "      break;\n",
+            "  }\n",
+            "}\n",
+        ));
+        let file = FileId::new(8_511);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions::default(),
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected one incompatible typeof case diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2678);
+        assert_eq!(node_text(&source, diagnostic.node.unwrap()), "\"\"");
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            concat!(
+                "Type '\"\"' is not comparable to type '",
+                "\"bigint\" | \"boolean\" | \"function\" | \"number\" | ",
+                "\"object\" | \"string\" | \"symbol\" | \"undefined\"'.",
+            ),
+        );
+
+        let typeof_expression = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::TypeOfExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let call = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::CallExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let NodeData::CallExpression(call_data) = &source.arena.get(call.node).unwrap().data else {
+            panic!("expected one narrowed string method call")
+        };
+        let NodeData::PropertyAccessExpression(property) =
+            &source.arena.get(call_data.expression).unwrap().data
+        else {
+            panic!("expected a direct string method access")
+        };
+        let receiver = NodeRef::new(source.arena.id(), file, property.expression);
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        assert_eq!(
+            resolved_node_type(&context, typeof_expression),
+            bootstrap.typeof_type
+        );
+        assert_eq!(
+            resolved_node_type(&context, receiver),
+            bootstrap.string_type
+        );
+        assert_eq!(resolved_node_type(&context, call), bootstrap.string_type);
+        let call_signature = context
+            .store()
+            .signature_links(call)
+            .and_then(|links| links.resolved_signature.signature())
+            .expect("the narrowed method call retains its resolved signature");
+        let method_declaration = library
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::MethodSignature).then_some(NodeRef::new(
+                    library.arena.id(),
+                    library_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let NodeData::MethodSignatureDeclaration(method) =
+            &library.arena.get(method_declaration.node).unwrap().data
+        else {
+            panic!("expected the canonical String.charAt declaration")
+        };
+        let method_parameter =
+            NodeRef::new(library.arena.id(), library_file, method.parameters.nodes[0]);
+        let (_, library_bound) = context.file(library_file).unwrap();
+        let method_parameter = library_bound.symbol(method_parameter).unwrap();
+        let call_signature_record = context.store().signature(call_signature).unwrap();
+        assert_eq!(
+            call_signature_record.declaration(),
+            Some(method_declaration)
+        );
+        assert_eq!(call_signature_record.parameters(), [method_parameter]);
+        assert_eq!(call_signature_record.min_argument_count(), 1);
+        assert_eq!(
+            call_signature_record.resolved_return_type(),
+            Some(bootstrap.string_type),
+        );
+        let owner = function_symbol(&context, &source, file, "choose");
+        let callable = context
+            .store()
+            .source_callable_type_for_owner(owner)
+            .unwrap();
+        let signature = context
+            .store()
+            .source_callable_provenance(callable)
+            .unwrap()
+            .signature;
+        assert_eq!(
+            context
+                .store()
+                .signature(signature)
+                .unwrap()
+                .resolved_return_type(),
+            Some(bootstrap.void_type),
+        );
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+        assert_eq!(
+            context
+                .store()
+                .signature_links(call)
+                .and_then(|links| links.resolved_signature.signature()),
+            Some(call_signature),
+        );
+    }
+
+    #[test]
+    fn typeof_switch_rejects_unknown_execution_tags_and_missing_breaks() {
+        let library = parsed("interface String { charAt(pos: number): string; }");
+        let library_file = FileId::new(8_512);
+        for (index, text) in [
+            concat!(
+                "function choose(value: string | number) { ",
+                "switch (typeof value) { case 'other': value.charAt(0); break; } }",
+            ),
+            concat!(
+                "function choose(value: string | number) { ",
+                "switch (typeof value) { case 'string': value.charAt(0); } }",
+            ),
+            concat!(
+                "function choose(value: string | number) { ",
+                "switch (typeof value) { case 'string': value.toLowerCase(); break; } }",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parsed(text);
+            let file = FileId::new(8_513 + u32::try_from(index).unwrap());
+            let mut context = context(
+                &[(library_file, &library), (file, &source)],
+                CanonicalCheckerOptions::default(),
+            );
+            let cold = observable_state(&context, file);
+
+            assert!(matches!(
+                context.check_source_file(file),
+                Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Function(SourceFunctionUnsupported::FunctionBody(_))
+                ))
+            ));
+            assert_eq!(observable_state(&context, file), cold);
+            assert!(context.diagnostics().is_empty());
+        }
     }
 
     #[test]

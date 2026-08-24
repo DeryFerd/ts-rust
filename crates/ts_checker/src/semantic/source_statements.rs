@@ -310,6 +310,24 @@ pub(super) struct SourceSwitchFunctionStatementsSyntax {
     pub(super) no_match_flow: Option<FlowRef>,
 }
 
+/// One grouped `typeof` case whose expression is followed by an unlabeled break.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceTypeofSwitchExpressionSyntax {
+    pub(super) clause: NodeRef,
+    pub(super) statement: NodeRef,
+    pub(super) expression: NodeRef,
+    pub(super) tag: SourceTypeofTag,
+}
+
+/// One inferred-void switch over a directly referenced function parameter.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceTypeofSwitchFunctionStatementsSyntax {
+    pub(super) body: NodeRef,
+    pub(super) switch: SourceControlSwitchSyntax,
+    pub(super) identifier: NodeRef,
+    pub(super) expressions: Vec<SourceTypeofSwitchExpressionSyntax>,
+}
+
 /// One fallthrough arm containing initialized locals only.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SourceFallthroughBranchSyntax {
@@ -1285,6 +1303,22 @@ pub(super) fn plan_source_switch_function_statements_syntax(
     .plan_switch()
 }
 
+/// Proves grouped `typeof` cases that contain one expression and an unlabeled break.
+pub(super) fn plan_source_typeof_switch_function_statements_syntax(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    callable: &SourceCallablePlan,
+) -> Result<SourceTypeofSwitchFunctionStatementsSyntax, SourceFunctionStatementsError> {
+    SyntaxPlanner {
+        arena,
+        bound,
+        store,
+        callable,
+    }
+    .plan_typeof_switch()
+}
+
 /// Proves one local-plus-fallthrough-`if`-plus-return body and its binder join.
 ///
 /// This is intentionally separate from [`plan_source_function_statements_syntax`]
@@ -1314,6 +1348,308 @@ struct SyntaxPlanner<'a> {
 }
 
 impl SyntaxPlanner<'_> {
+    fn plan_typeof_switch(
+        &self,
+    ) -> Result<SourceTypeofSwitchFunctionStatementsSyntax, SourceFunctionStatementsError> {
+        let declaration = self.callable.declaration;
+        if !declaration.is_for(self.arena.id(), self.bound.file_id())
+            || self.bound.node_arena_id() != self.arena.id()
+            || self.bound.node_arena_revision() != self.arena.revision()
+        {
+            return Err(SourceFunctionStatementsInvariant::BoundSourceMismatch(declaration).into());
+        }
+        if self.callable.family != SourceCallableFamily::FunctionDeclaration
+            || !self.callable.return_type.is_inferred()
+            || !self.callable.type_parameters.is_empty()
+        {
+            return Err(self.unsupported(
+                declaration,
+                self.node(declaration)?.kind,
+                SourceFunctionStatementsRole::Callable,
+            ));
+        }
+        let [parameter] = self.callable.parameters.as_slice() else {
+            return Err(self.unsupported(
+                declaration,
+                self.node(declaration)?.kind,
+                SourceFunctionStatementsRole::Callable,
+            ));
+        };
+        let declaration_record = self.node(declaration)?;
+        let NodeData::FunctionDeclaration(function) = &declaration_record.data else {
+            return Err(self.unsupported(
+                declaration,
+                declaration_record.kind,
+                SourceFunctionStatementsRole::Callable,
+            ));
+        };
+        if declaration_record.kind != SyntaxKind::FunctionDeclaration
+            || function.body != Some(self.callable.body.node)
+            || function.type_.is_some()
+            || self.bound.symbol(parameter.declaration) != Some(parameter.symbol)
+        {
+            return Err(SourceFunctionStatementsInvariant::InvalidCallableEdge(declaration).into());
+        }
+
+        let body = self.callable.body;
+        self.validate_range(body, declaration)?;
+        let statements = self.plan_body(body, declaration)?;
+        let [statement] = statements.as_slice() else {
+            return Err(self.unsupported(
+                body,
+                self.node(body)?.kind,
+                SourceFunctionStatementsRole::FunctionBody,
+            ));
+        };
+        let switch = plan_source_control_switch_syntax(
+            self.arena,
+            self.bound,
+            self.reference(*statement),
+            body,
+        )?;
+        for node in [switch.statement, switch.expression, switch.case_block] {
+            self.validate_block_scope_container(node, declaration)?;
+        }
+
+        let discriminant = self.node(switch.expression)?;
+        let NodeData::TypeOfExpression(type_of) = &discriminant.data else {
+            return Err(self.unsupported(
+                switch.expression,
+                discriminant.kind,
+                SourceFunctionStatementsRole::Condition,
+            ));
+        };
+        if discriminant.kind != SyntaxKind::TypeOfExpression || discriminant.flags.0 != 0 {
+            return Err(self.unsupported(
+                switch.expression,
+                discriminant.kind,
+                SourceFunctionStatementsRole::Condition,
+            ));
+        }
+        let identifier = self.reference(type_of.expression);
+        self.validate_parent(
+            identifier,
+            Some(switch.expression.node),
+            SourceFunctionStatementsRole::Condition,
+        )?;
+        self.validate_range(identifier, switch.expression)?;
+        self.validate_container(identifier, declaration)?;
+        self.validate_block_scope_container(identifier, declaration)?;
+        let identifier_record = self.node(identifier)?;
+        let NodeData::Identifier(identifier_data) = &identifier_record.data else {
+            return Err(self.unsupported(
+                identifier,
+                identifier_record.kind,
+                SourceFunctionStatementsRole::Condition,
+            ));
+        };
+        let parameter_record = self.node(parameter.declaration)?;
+        let NodeData::ParameterDeclaration(parameter_data) = &parameter_record.data else {
+            return Err(SourceFunctionStatementsInvariant::InvalidCallableEdge(declaration).into());
+        };
+        let parameter_name = self.reference(parameter_data.name);
+        let parameter_name_record = self.node(parameter_name)?;
+        let NodeData::Identifier(parameter_identifier) = &parameter_name_record.data else {
+            return Err(SourceFunctionStatementsInvariant::InvalidCallableEdge(declaration).into());
+        };
+        if identifier_record.kind != SyntaxKind::Identifier
+            || identifier_record.flags.0 != 0
+            || identifier_data.flow_node.is_some()
+            || identifier_data.text != parameter_identifier.text
+            || parameter_name_record.kind != SyntaxKind::Identifier
+            || parameter_name_record.parent != Some(parameter.declaration.node)
+        {
+            return Err(self.unsupported(
+                identifier,
+                identifier_record.kind,
+                SourceFunctionStatementsRole::Condition,
+            ));
+        }
+
+        let graph = self.bound.flow_graph();
+        let start = graph.container_start(declaration).ok_or(
+            SourceFunctionStatementsInvariant::MissingFlowStart(declaration),
+        )?;
+        if graph.container_is_complete(declaration) != Some(true)
+            || graph.container_return(declaration).is_some()
+            || graph.container_end(declaration).is_none()
+            || self.switch_flow_at(switch.statement, declaration)? != start
+            || self.switch_flow_at(identifier, declaration)? != start
+        {
+            return Err(Self::incomplete_switch_flow(switch.statement));
+        }
+
+        let mut expressions = Vec::new();
+        let mut seen_cases = HashSet::new();
+        let mut group_start = 0usize;
+        for (index, clause) in switch.clauses.iter().enumerate() {
+            self.validate_block_scope_container(clause.clause, switch.case_block)?;
+            let Some(expression) = clause.expression else {
+                return Err(self.unsupported(
+                    clause.clause,
+                    self.node(clause.clause)?.kind,
+                    SourceFunctionStatementsRole::BranchStatement,
+                ));
+            };
+            self.validate_block_scope_container(expression, switch.case_block)?;
+            let literal_record = self.node(expression)?;
+            let NodeData::StringLiteral(literal) = &literal_record.data else {
+                return Err(self.unsupported(
+                    expression,
+                    literal_record.kind,
+                    SourceFunctionStatementsRole::Condition,
+                ));
+            };
+            if literal_record.kind != SyntaxKind::StringLiteral
+                || literal_record.flags.0 != 0
+                || literal.token_flags.0 != 0
+                || !seen_cases.insert(literal.text.as_str())
+                || !clause.unreachable_ranges.is_empty()
+            {
+                return Err(self.unsupported(
+                    expression,
+                    literal_record.kind,
+                    SourceFunctionStatementsRole::Condition,
+                ));
+            }
+            if clause.statements.is_empty() {
+                if index + 1 == switch.clauses.len() {
+                    return Err(self.unsupported(
+                        clause.clause,
+                        self.node(clause.clause)?.kind,
+                        SourceFunctionStatementsRole::BranchStatement,
+                    ));
+                }
+                continue;
+            }
+            let [statement, break_statement] = clause.statements.as_slice() else {
+                return Err(self.unsupported(
+                    clause.statements[0],
+                    self.node(clause.statements[0])?.kind,
+                    SourceFunctionStatementsRole::BranchStatement,
+                ));
+            };
+            let tag = match literal.text.as_str() {
+                "string" => SourceTypeofTag::String,
+                "number" => SourceTypeofTag::Number,
+                "boolean" => SourceTypeofTag::Boolean,
+                "bigint" => SourceTypeofTag::BigInt,
+                "symbol" => SourceTypeofTag::Symbol,
+                "undefined" => SourceTypeofTag::Undefined,
+                "object" => SourceTypeofTag::Object,
+                "function" => SourceTypeofTag::Function,
+                _ => {
+                    return Err(self.unsupported(
+                        expression,
+                        literal_record.kind,
+                        SourceFunctionStatementsRole::Condition,
+                    ));
+                }
+            };
+            let statement_record = self.node(*statement)?;
+            let NodeData::ExpressionStatement(expression_statement) = &statement_record.data else {
+                return Err(self.unsupported(
+                    *statement,
+                    statement_record.kind,
+                    SourceFunctionStatementsRole::BranchStatement,
+                ));
+            };
+            if statement_record.kind != SyntaxKind::ExpressionStatement
+                || statement_record.flags.0 != 0
+                || statement_record.parent != Some(clause.clause.node)
+                || expression_statement.flow_node.is_some()
+            {
+                return Err(self.unsupported(
+                    *statement,
+                    statement_record.kind,
+                    SourceFunctionStatementsRole::BranchStatement,
+                ));
+            }
+            self.validate_block_scope_container(*statement, switch.case_block)?;
+            let value = self.reference(expression_statement.expression);
+            self.validate_parent(
+                value,
+                Some(statement.node),
+                SourceFunctionStatementsRole::BranchStatement,
+            )?;
+            self.validate_range(value, *statement)?;
+            self.validate_container(value, declaration)?;
+            self.validate_block_scope_container(value, switch.case_block)?;
+            if self.node(value)?.kind != SyntaxKind::CallExpression {
+                return Err(self.unsupported(
+                    value,
+                    self.node(value)?.kind,
+                    SourceFunctionStatementsRole::BranchStatement,
+                ));
+            }
+
+            let break_record = self.node(*break_statement)?;
+            let NodeData::BreakStatement(break_data) = &break_record.data else {
+                return Err(self.unsupported(
+                    *break_statement,
+                    break_record.kind,
+                    SourceFunctionStatementsRole::BranchStatement,
+                ));
+            };
+            if break_record.kind != SyntaxKind::BreakStatement
+                || break_record.flags.0 != 0
+                || break_record.parent != Some(clause.clause.node)
+                || break_data.label.is_some()
+                || break_data.flow_node.is_some()
+            {
+                return Err(self.unsupported(
+                    *break_statement,
+                    break_record.kind,
+                    SourceFunctionStatementsRole::BranchStatement,
+                ));
+            }
+            self.validate_block_scope_container(*break_statement, switch.case_block)?;
+            let statement_flow = self.switch_flow_at(*statement, declaration)?;
+            let node = graph
+                .nodes()
+                .get(statement_flow)
+                .ok_or_else(|| Self::incomplete_switch_flow(*statement))?;
+            let clause_start =
+                i32::try_from(group_start).map_err(|_| Self::incomplete_switch_flow(*statement))?;
+            let clause_end =
+                i32::try_from(index + 1).map_err(|_| Self::incomplete_switch_flow(*statement))?;
+            if joined_semantic_flow_flags(node.flags) != FlowFlags::SWITCH_CLAUSE.bits()
+                || node.payload
+                    != Some(FlowNodePayload::SwitchClause {
+                        switch_statement: switch.statement,
+                        clause_start,
+                        clause_end,
+                    })
+                || node.antecedent != Some(start)
+                || !node.antecedents.is_empty()
+            {
+                return Err(Self::incomplete_switch_flow(*statement));
+            }
+            self.switch_flow_at(*break_statement, declaration)?;
+            expressions.push(SourceTypeofSwitchExpressionSyntax {
+                clause: clause.clause,
+                statement: *statement,
+                expression: value,
+                tag,
+            });
+            group_start = index + 1;
+        }
+        if expressions.is_empty() {
+            return Err(self.unsupported(
+                switch.statement,
+                SyntaxKind::SwitchStatement,
+                SourceFunctionStatementsRole::BodyStatement,
+            ));
+        }
+
+        Ok(SourceTypeofSwitchFunctionStatementsSyntax {
+            body,
+            switch,
+            identifier,
+            expressions,
+        })
+    }
+
     fn plan_conditional_enum(
         &self,
     ) -> Result<SourceConditionalEnumFunctionStatementsSyntax, SourceFunctionStatementsError> {
@@ -5806,6 +6142,97 @@ mod joined_tests {
             ),
             before,
         );
+    }
+
+    #[test]
+    fn typeof_switch_retains_grouped_case_and_narrowed_expression() {
+        let fixture = JoinedFixture::new(
+            concat!(
+                "function choose(value: string | number) {\n",
+                "  switch (typeof value) {\n",
+                "    case '':\n",
+                "    case 'string':\n",
+                "      value.charAt(0);\n",
+                "      break;\n",
+                "  }\n",
+                "}\n",
+            ),
+            FileId::new(1_336),
+        );
+        let callable = fixture.callable();
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.mapper_len(),
+        );
+        let first = plan_source_typeof_switch_function_statements_syntax(
+            &fixture.parsed.arena,
+            &fixture.bound,
+            &fixture.store,
+            &callable,
+        )
+        .unwrap();
+        let second = plan_source_typeof_switch_function_statements_syntax(
+            &fixture.parsed.arena,
+            &fixture.bound,
+            &fixture.store,
+            &callable,
+        )
+        .unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(first.switch.clauses.len(), 2);
+        let [expression] = first.expressions.as_slice() else {
+            panic!("expected one grouped switch expression")
+        };
+        assert_eq!(expression.tag, SourceTypeofTag::String);
+        assert_eq!(expression.clause, first.switch.clauses[1].clause);
+        assert_eq!(
+            fixture
+                .parsed
+                .arena
+                .get(expression.expression.node)
+                .unwrap()
+                .kind,
+            SyntaxKind::CallExpression,
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.mapper_len(),
+            ),
+            before,
+        );
+    }
+
+    #[test]
+    fn typeof_switch_rejects_unknown_execution_tags_and_missing_breaks() {
+        for (index, source) in [
+            "function f(value: string) { switch (typeof value) { case 'other': value.charAt(0); break; } }",
+            "function f(value: string) { switch (typeof value) { case 'string': value.charAt(0); } }",
+            "function f(value: string) { switch (typeof value) { default: value.charAt(0); break; } }",
+            "function f(value: string, other: string) { switch (typeof other) { case 'string': value.charAt(0); break; } }",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture =
+                JoinedFixture::new(source, FileId::new(1_337 + u32::try_from(index).unwrap()));
+            let callable = fixture.callable();
+            assert!(
+                matches!(
+                    plan_source_typeof_switch_function_statements_syntax(
+                        &fixture.parsed.arena,
+                        &fixture.bound,
+                        &fixture.store,
+                        &callable,
+                    ),
+                    Err(SourceFunctionStatementsError::Unsupported(_)),
+                ),
+                "{source}",
+            );
+        }
     }
 
     #[test]
