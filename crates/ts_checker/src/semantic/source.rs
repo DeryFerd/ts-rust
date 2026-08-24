@@ -36614,6 +36614,91 @@ mod tests {
     }
 
     #[test]
+    fn noncontiguous_javascript_duplicate_functions_preserve_owner_and_parameter_diagnostics() {
+        let source = parse_javascript_source_file(concat!(
+            "function repeated(first) {} ",
+            "const marker = 1; ",
+            "function repeated(second, third) {} ",
+            "function repeated(last) {}",
+        ));
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+
+        for (index, no_implicit_any) in [false, true].into_iter().enumerate() {
+            let file = FileId::new(8_360 + u32::try_from(index).unwrap());
+            let mut context = javascript_context(
+                file,
+                &source,
+                CanonicalCheckerOptions {
+                    no_implicit_any,
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+
+            context.check_source_file(file).unwrap();
+
+            let expected: &[&str] = if no_implicit_any {
+                &["first", "second", "third", "last"]
+            } else {
+                &[]
+            };
+            assert_eq!(
+                context
+                    .diagnostics()
+                    .as_slice()
+                    .iter()
+                    .map(|diagnostic| {
+                        assert_eq!(diagnostic.diagnostic.code(), 7006);
+                        node_text(&source, diagnostic.node.unwrap())
+                    })
+                    .collect::<Vec<_>>(),
+                expected,
+            );
+
+            let first = function_declaration(&source, file, "repeated");
+            let (_, bound) = context.file(file).unwrap();
+            let owner = bound.symbol(first).unwrap();
+            let declarations = context
+                .store()
+                .symbol(owner)
+                .unwrap()
+                .declarations()
+                .unwrap();
+            assert_eq!(declarations.len(), 3);
+            assert_eq!(declarations[0], first);
+            assert!(declarations[1..].iter().all(|declaration| {
+                bound.symbol(*declaration) == Some(owner)
+                    && context
+                        .store()
+                        .source_callable_type_for_declaration(*declaration)
+                        .is_none()
+            }));
+
+            let callable = context
+                .store()
+                .source_callable_type_for_owner(owner)
+                .unwrap();
+            let signature = context
+                .store()
+                .source_callable_provenance(callable)
+                .map(|provenance| provenance.signature)
+                .unwrap();
+            assert_eq!(
+                context
+                    .store()
+                    .signature(signature)
+                    .unwrap()
+                    .parameters()
+                    .len(),
+                1,
+            );
+
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
     fn javascript_jsdoc_callback_contextualizes_parenthesized_arrow_parameters() {
         let source = parse_javascript_source_file(concat!(
             "/** @callback NS.MyCallback\n",

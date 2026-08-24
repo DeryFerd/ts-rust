@@ -259,7 +259,10 @@ pub(super) fn plan_source_namespace_ambient_overload_group(
         || store.get_parent_of_symbol(owner_symbol) != Some(namespace_symbol)
         || owner.export_symbol().is_some()
         || store.get_merged_symbol(owner_symbol) != Some(owner_symbol)
-        || exports.get(owner.name()) != Some(owner_symbol)
+        || exports
+            .get(owner.name())
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            != Some(owner_symbol)
     {
         return Err(namespace_overload_group_error(first));
     }
@@ -375,8 +378,6 @@ fn plan_namespace_ambient_overload_declaration(
     if record.kind != SyntaxKind::FunctionDeclaration
         || record.flags.0 != 0
         || record.parent != Some(body.node)
-        || function.asterisk_token.is_some()
-        || function.body.is_some()
         || function.end_flow_node.is_some()
         || function.flow_node.is_some()
         || function.full_signature.is_some()
@@ -385,14 +386,24 @@ fn plan_namespace_ambient_overload_declaration(
         || function.return_flow_node.is_some()
         || function.symbol.is_some()
         || function.facts != 0
-        || function.parameters.has_trailing_comma
         || bound.symbol(declaration) != Some(owner_symbol)
         || bound.local_symbol(declaration) != Some(local_symbol)
-        || store
-            .signature_links(declaration)
-            .is_some_and(|links| links != &SignatureLinks::default())
     {
         return Err(namespace_overload_group_error(declaration));
+    }
+    if function.asterisk_token.is_some()
+        || function.body.is_some()
+        || function.parameters.has_trailing_comma
+    {
+        return Err(SourceOverloadError::Unsupported(declaration));
+    }
+    if store
+        .signature_links(declaration)
+        .is_some_and(|links| links != &SignatureLinks::default())
+    {
+        return Err(SourceOverloadError::Invariant(
+            SourceOverloadInvariant::Cache(declaration),
+        ));
     }
     if let Some(modifiers) = function.modifiers.as_ref() {
         let [modifier] = modifiers.list.nodes.as_slice() else {
@@ -447,6 +458,12 @@ fn plan_namespace_ambient_overload_declaration(
                 let NodeData::TypeParameterDeclaration(data) = &record.data else {
                     return Err(namespace_overload_group_error(parameter));
                 };
+                if data.expression.is_some()
+                    || data.modifiers.is_some()
+                    || default_seen && data.default_type.is_none()
+                {
+                    return Err(SourceOverloadError::Unsupported(parameter));
+                }
                 let name = namespace_overload_child(parameter, data.name);
                 let name_record = namespace_overload_node(host, name)?;
                 let NodeData::Identifier(identifier) = &name_record.data else {
@@ -461,9 +478,7 @@ fn plan_namespace_ambient_overload_declaration(
                 if record.kind != SyntaxKind::TypeParameter
                     || record.flags.0 != 0
                     || record.parent != Some(declaration.node)
-                    || data.expression.is_some()
                     || data.symbol.is_some()
-                    || data.modifiers.is_some()
                     || name_record.kind != SyntaxKind::Identifier
                     || name_record.flags.0 != 0
                     || name_record.parent != Some(parameter.node)
@@ -480,7 +495,6 @@ fn plan_namespace_ambient_overload_declaration(
                     || symbol_record.export_symbol().is_some()
                     || store.get_merged_symbol(symbol) != Some(symbol)
                     || locals.and_then(|locals| locals.get_source(&identifier.text)) != Some(symbol)
-                    || default_seen && data.default_type.is_none()
                 {
                     return Err(namespace_overload_group_error(parameter));
                 }
@@ -521,6 +535,17 @@ fn plan_namespace_ambient_overload_declaration(
         let NodeData::Identifier(identifier) = &name_record.data else {
             return Err(SourceOverloadError::Unsupported(parameter));
         };
+        let optional = data.question_token.is_some();
+        let rest = data.dot_dot_dot_token.is_some();
+        if data.initializer.is_some()
+            || data.modifiers.is_some()
+            || identifier.text == "this"
+            || optional && rest
+            || optional_seen && !optional && !rest
+            || rest && index + 1 != function.parameters.nodes.len()
+        {
+            return Err(SourceOverloadError::Unsupported(parameter));
+        }
         let annotation = data
             .type_
             .map(|node| namespace_overload_child(parameter, node))
@@ -532,21 +557,16 @@ fn plan_namespace_ambient_overload_declaration(
         let symbol_record = store
             .symbol(symbol)
             .ok_or_else(|| namespace_overload_group_error(parameter))?;
-        let optional = data.question_token.is_some();
-        let rest = data.dot_dot_dot_token.is_some();
         if record.kind != SyntaxKind::Parameter
             || record.flags.0 != 0
             || record.parent != Some(declaration.node)
-            || data.initializer.is_some()
             || data.symbol.is_some()
-            || data.modifiers.is_some()
             || data.facts != 0
             || name_record.kind != SyntaxKind::Identifier
             || name_record.flags.0 != 0
             || name_record.parent != Some(parameter.node)
             || identifier.flow_node.is_some()
             || identifier.text.is_empty()
-            || identifier.text == "this"
             || annotation_record.parent != Some(parameter.node)
             || symbol_record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
             || symbol_record.check_flags() != CheckFlags::NONE
@@ -558,9 +578,6 @@ fn plan_namespace_ambient_overload_declaration(
             || symbol_record.export_symbol().is_some()
             || store.get_merged_symbol(symbol) != Some(symbol)
             || locals.and_then(|locals| locals.get_source(&identifier.text)) != Some(symbol)
-            || optional && rest
-            || optional_seen && !optional && !rest
-            || rest && index + 1 != function.parameters.nodes.len()
         {
             return Err(namespace_overload_group_error(parameter));
         }
@@ -1473,6 +1490,175 @@ mod tests {
     }
 
     #[test]
+    fn ambient_namespace_overloads_preserve_noncontiguous_react_groups() {
+        for (index, source) in [
+            concat!(
+                "declare namespace React { ",
+                "function createRef<T>(): T; ",
+                "interface Separator { value: string; } ",
+                "function forwardRef<T, P = {}>(value: T): P; ",
+                "type Between = number; ",
+                "function createRef<T>(): T; ",
+                "interface AnotherSeparator {} ",
+                "function forwardRef<T, P = {}>(value: T): P; ",
+                "}",
+            ),
+            concat!(
+                "declare module 'react' { ",
+                "export = React; ",
+                "namespace React { ",
+                "function createRef<T>(): T; ",
+                "interface Separator { value: string; } ",
+                "function forwardRef<T, P = {}>(value: T): P; ",
+                "type Between = number; ",
+                "function createRef<T>(): T; ",
+                "interface AnotherSeparator {} ",
+                "function forwardRef<T, P = {}>(value: T): P; ",
+                "} }",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let parsed = parse_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(2_544 + u32::try_from(index).unwrap());
+            let context = namespace_overload_context(&parsed, file, true);
+            let namespace = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::ModuleDeclaration(module) = &record.data else {
+                        return None;
+                    };
+                    let NodeData::Identifier(name) = &parsed.arena.get(module.name)?.data else {
+                        return None;
+                    };
+                    (name.text == "React").then_some(NodeRef::new(parsed.arena.id(), file, node))
+                })
+                .unwrap();
+            let (_, bound) = context.file(file).unwrap();
+            let namespace_symbol = bound
+                .symbol(namespace)
+                .and_then(|symbol| context.store().get_merged_symbol(symbol))
+                .unwrap();
+            let exports = context
+                .store()
+                .symbol(namespace_symbol)
+                .and_then(ts_binder::semantic::Symbol::exports)
+                .and_then(|exports| context.store().symbol_table(exports))
+                .unwrap();
+            let host = DeclaredTypeHost::new([(&parsed.arena, bound)]).unwrap();
+            let before = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+
+            for name in ["createRef", "forwardRef"] {
+                let owner = exports
+                    .get_source(name)
+                    .and_then(|symbol| context.store().get_merged_symbol(symbol))
+                    .unwrap();
+                let declarations = context
+                    .store()
+                    .symbol(owner)
+                    .and_then(ts_binder::semantic::Symbol::declarations)
+                    .unwrap();
+                assert_eq!(declarations.len(), 2, "{name}: {source}");
+                let first = plan_source_namespace_ambient_overload_group(
+                    context.store(),
+                    &host,
+                    (namespace, namespace_symbol),
+                    owner,
+                    declarations,
+                )
+                .unwrap_or_else(|error| panic!("{name}: {source}: {error:?}"));
+                let second = plan_source_namespace_ambient_overload_group(
+                    context.store(),
+                    &host,
+                    (namespace, namespace_symbol),
+                    owner,
+                    declarations,
+                )
+                .unwrap();
+
+                assert_eq!(first, second, "{name}: {source}");
+                assert_eq!(first.declarations.len(), 2, "{name}: {source}");
+                assert_eq!(
+                    first
+                        .declarations
+                        .iter()
+                        .map(|declaration| declaration.type_parameters.len())
+                        .collect::<Vec<_>>(),
+                    if name == "createRef" {
+                        vec![1, 1]
+                    } else {
+                        vec![2, 2]
+                    },
+                    "{name}: {source}",
+                );
+                assert!(context.store().value_symbol_links(owner).is_none());
+            }
+
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                before,
+                "{source}",
+            );
+        }
+    }
+
+    #[test]
+    fn namespace_overloads_classify_unsupported_signatures_without_cache_failures() {
+        for (index, source) in [
+            concat!(
+                "declare namespace React { ",
+                "function select(value: string,): string; ",
+                "function select(value: number): number; ",
+                "}",
+            ),
+            concat!(
+                "declare namespace React { ",
+                "function select(this: object, value: string): string; ",
+                "function select(value: number): number; ",
+                "}",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let parsed = parse_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(2_546 + u32::try_from(index).unwrap());
+            let context = namespace_overload_context(&parsed, file, true);
+            let (namespace, declarations) = namespace_overload_nodes(&parsed, file);
+            let (_, bound) = context.file(file).unwrap();
+            let namespace_symbol = bound.symbol(namespace).unwrap();
+            let owner = bound.symbol(declarations[0]).unwrap();
+            let host = DeclaredTypeHost::new([(&parsed.arena, bound)]).unwrap();
+
+            assert!(
+                matches!(
+                    plan_source_namespace_ambient_overload_group(
+                        context.store(),
+                        &host,
+                        (namespace, namespace_symbol),
+                        owner,
+                        &declarations,
+                    ),
+                    Err(SourceOverloadError::Unsupported(_))
+                ),
+                "{source}",
+            );
+        }
+    }
+
+    #[test]
     fn ambient_namespace_overloads_reject_reordered_groups_and_poisoned_owners() {
         let source = concat!(
             "declare namespace React { ",
@@ -1536,6 +1722,44 @@ mod tests {
             Err(SourceOverloadError::Invariant(
                 SourceOverloadInvariant::Cache(_)
             )),
+        ));
+    }
+
+    #[test]
+    fn namespace_overloads_classify_poisoned_signature_links_as_cache_errors() {
+        let parsed = parse_source_file(concat!(
+            "declare namespace React { ",
+            "function createRef<T>(): T; ",
+            "function createRef<T>(): T; ",
+            "}",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(2_548);
+        let mut context = namespace_overload_context(&parsed, file, true);
+        let (namespace, declarations) = namespace_overload_nodes(&parsed, file);
+        let (_, bound) = context.file(file).unwrap();
+        let namespace_symbol = bound.symbol(namespace).unwrap();
+        let owner = bound.symbol(declarations[0]).unwrap();
+        assert!(context.store_mut_for_test().set_signature_links(
+            declarations[1],
+            SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolving,
+                ..SignatureLinks::default()
+            },
+        ));
+        let (_, bound) = context.file(file).unwrap();
+        let host = DeclaredTypeHost::new([(&parsed.arena, bound)]).unwrap();
+
+        assert!(matches!(
+            plan_source_namespace_ambient_overload_group(
+                context.store(),
+                &host,
+                (namespace, namespace_symbol),
+                owner,
+                &declarations,
+            ),
+            Err(SourceOverloadError::Invariant(SourceOverloadInvariant::Cache(node)))
+                if node == declarations[1],
         ));
     }
 
