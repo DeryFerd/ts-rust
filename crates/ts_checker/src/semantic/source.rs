@@ -7444,6 +7444,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             target
                 .value_declaration()
                 .filter(|value| target_declarations.contains(value))
+                .or_else(|| {
+                    (target.flags().without(SymbolFlags::MODULE) == SymbolFlags::NONE)
+                        .then(|| target_declarations.first().copied())
+                        .flatten()
+                })
         } else {
             match target_declarations {
                 [declaration] => Some(*declaration),
@@ -7499,6 +7504,79 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         .and_then(|candidate| store.get_merged_symbol(candidate))
                         == Some(target_symbol)
             });
+        let export_equals_variable = export_equals
+            && target.flags().intersects(
+                SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::BLOCK_SCOPED_VARIABLE,
+            )
+            && target.flags().without(
+                SymbolFlags::FUNCTION_SCOPED_VARIABLE
+                    | SymbolFlags::BLOCK_SCOPED_VARIABLE
+                    | SymbolFlags::MODULE,
+            ) == SymbolFlags::NONE
+            && target.check_flags() == CheckFlags::NONE
+            && target.name().as_utf8() == Some(identifier.text.as_str())
+            && target.members().is_none()
+            && target.parent().is_none()
+            && target.export_symbol().is_none()
+            && self.prior_variables.contains(&target_symbol)
+            && self.readable_variables.contains(&target_symbol)
+            && target_record.kind == SyntaxKind::VariableDeclaration
+            && target_declarations.iter().all(|candidate| {
+                candidate.is_for(declaration.arena, declaration.file)
+                    && self.arena.get(candidate.node).is_some_and(|record| {
+                        record.range.end <= declaration_start
+                            && match record.kind {
+                                SyntaxKind::VariableDeclaration => record
+                                    .parent
+                                    .and_then(|parent| self.arena.get(parent))
+                                    .is_some_and(|list| {
+                                        list.kind == SyntaxKind::VariableDeclarationList
+                                            && list
+                                                .parent
+                                                .and_then(|parent| self.arena.get(parent))
+                                                .is_some_and(|statement| {
+                                                    statement.kind == SyntaxKind::VariableStatement
+                                                        && statement.parent
+                                                            == Some(self.source.node_ref().node)
+                                                })
+                                    }),
+                                SyntaxKind::ModuleDeclaration => {
+                                    record.parent == Some(self.source.node_ref().node)
+                                }
+                                _ => false,
+                            }
+                    })
+                    && self
+                        .bound
+                        .symbol(*candidate)
+                        .and_then(|candidate| store.get_merged_symbol(candidate))
+                        == Some(target_symbol)
+            });
+        let export_equals_namespace = export_equals
+            && target.flags().intersects(SymbolFlags::MODULE)
+            && target.flags().without(SymbolFlags::MODULE) == SymbolFlags::NONE
+            && target.check_flags() == CheckFlags::NONE
+            && target.name().as_utf8() == Some(identifier.text.as_str())
+            && target.members().is_none()
+            && target.parent().is_none()
+            && target.export_symbol().is_none()
+            && target_record.kind == SyntaxKind::ModuleDeclaration
+            && self
+                .bound
+                .source_facts()
+                .is_some_and(ts_binder::CanonicalSourceFileFacts::is_declaration_file)
+            && target_declarations.iter().all(|candidate| {
+                candidate.is_for(declaration.arena, declaration.file)
+                    && self.arena.get(candidate.node).is_some_and(|record| {
+                        record.kind == SyntaxKind::ModuleDeclaration
+                            && record.parent == Some(self.source.node_ref().node)
+                    })
+                    && self
+                        .bound
+                        .symbol(*candidate)
+                        .and_then(|candidate| store.get_merged_symbol(candidate))
+                        == Some(target_symbol)
+            });
         let supported_target = !export_equals
             && target.flags() == SymbolFlags::INTERFACE
             && target_record.kind == SyntaxKind::InterfaceDeclaration
@@ -7509,10 +7587,14 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 )
                 && target_record.kind == SyntaxKind::EnumDeclaration
             || imported_enum_alias
-            || export_equals_callable;
+            || export_equals_callable
+            || export_equals_variable
+            || export_equals_namespace;
         if !supported_target
-            || !imported_enum_alias && target_record.parent != Some(self.source.node_ref().node)
-            || target_record.range.end > declaration_start
+            || !imported_enum_alias
+                && !export_equals_variable
+                && target_record.parent != Some(self.source.node_ref().node)
+            || !export_equals_namespace && target_record.range.end > declaration_start
             || target.flags() == SymbolFlags::INTERFACE
                 && (target.value_declaration().is_some()
                     || store
@@ -19715,6 +19797,104 @@ fn planned_commonjs_export_annotations(
     Ok(annotations)
 }
 
+fn non_module_value_augmentation_diagnostic(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    namespace: &SourceNamespacePlan,
+    imports: &[SourceImportPlan],
+    resolved_imports: &HashMap<SemanticSymbolId, ResolvedSourceImportBinding>,
+) -> Result<Option<CanonicalCheckerDiagnostic>, SourceCheckError> {
+    let Some(name_record) = arena.get(namespace.name.node) else {
+        return Err(SourceCheckError::Provenance(
+            SourceCheckProvenanceError::MissingNode(namespace.name),
+        ));
+    };
+    let NodeData::StringLiteral(module_name) = &name_record.data else {
+        return Ok(None);
+    };
+    if name_record.kind != SyntaxKind::StringLiteral
+        || !bound
+            .module_augmentations()
+            .iter()
+            .any(|augmentation| augmentation.name() == namespace.name)
+    {
+        return Ok(None);
+    }
+
+    let has_value_export = namespace.members.iter().any(|member| {
+        let symbol = match member {
+            SourceNamespaceMemberPlan::Namespace(nested) => nested.symbol,
+            SourceNamespaceMemberPlan::TypeAlias { symbol, .. }
+            | SourceNamespaceMemberPlan::Interface { symbol, .. }
+            | SourceNamespaceMemberPlan::EmptyEnum { symbol, .. }
+            | SourceNamespaceMemberPlan::Function { symbol, .. }
+            | SourceNamespaceMemberPlan::DeferredAmbientFunction { symbol, .. }
+            | SourceNamespaceMemberPlan::DeferredAmbientClass { symbol, .. }
+            | SourceNamespaceMemberPlan::AmbientVariable { symbol, .. } => *symbol,
+        };
+        store
+            .symbol(symbol)
+            .is_some_and(|record| record.flags().intersects(SymbolFlags::VALUE))
+    });
+    if !has_value_export {
+        return Ok(None);
+    }
+
+    for import in imports {
+        let Some(specifier) = arena.get(import.module_specifier.node) else {
+            return Err(SourceCheckError::Provenance(
+                SourceCheckProvenanceError::MissingNode(import.module_specifier),
+            ));
+        };
+        let NodeData::StringLiteral(import_name) = &specifier.data else {
+            continue;
+        };
+        if specifier.kind != SyntaxKind::StringLiteral || import_name.text != module_name.text {
+            continue;
+        }
+        for binding in &import.bindings {
+            if binding.imported_text != "*" {
+                continue;
+            }
+            let Some(resolved) = resolved_imports.get(&binding.alias_symbol) else {
+                continue;
+            };
+            let Some(target) = store.symbol(resolved.target_symbol) else {
+                return Err(SourceCheckError::Import(binding.declaration));
+            };
+            let Some(declaration) = target.value_declaration() else {
+                continue;
+            };
+            if !target
+                .flags()
+                .contains(SymbolFlags::FUNCTION_SCOPED_VARIABLE)
+                || target
+                    .flags()
+                    .without(SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::NAMESPACE_MODULE)
+                    != SymbolFlags::NONE
+                || target.check_flags() != CheckFlags::NONE
+                || store.get_merged_symbol(resolved.target_symbol) != Some(resolved.target_symbol)
+                || store.source_node_kind(declaration) != Some(SyntaxKind::VariableDeclaration)
+            {
+                continue;
+            }
+
+            return Ok(Some(CanonicalCheckerDiagnostic {
+                node: Some(namespace.name),
+                range_override: None,
+                diagnostic: Diagnostic::with_arguments(
+                    message_by_code(2649).ok_or(SourceCheckError::MissingDiagnostic(2649))?,
+                    [module_name.text.clone()],
+                ),
+                related_information: Vec::new(),
+            }));
+        }
+    }
+
+    Ok(None)
+}
+
 /// Checks one already-retained source into context-owned private staging.
 #[allow(clippy::too_many_arguments)] // Mirrors the context-owned source execution boundary.
 pub(super) fn check_source_file(
@@ -21101,6 +21281,16 @@ pub(super) fn check_source_file(
                 );
             }
             PlannedStatement::Namespace(namespace) => {
+                if let Some(diagnostic) = non_module_value_augmentation_diagnostic(
+                    arena,
+                    bound,
+                    store,
+                    &namespace,
+                    &value_imports,
+                    &resolved_imports,
+                )? {
+                    merge_retry_diagnostic(diagnostics, diagnostic);
+                }
                 execute_source_namespace(
                     store,
                     host,
@@ -30750,6 +30940,85 @@ mod tests {
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn value_augmentations_of_export_equals_variables_report_ts2649() {
+        let library = parsed(concat!(
+            "declare var callable: () => void; ",
+            "declare namespace callable {} ",
+            "export = callable;",
+        ));
+        let extension = parsed(concat!(
+            "import * as callable from './library'; ",
+            "declare module './library' { export function extra(): void; }",
+        ));
+        let library_file = FileId::new(8_356);
+        let extension_file = FileId::new(8_357);
+        let files = [(library_file, &library), (extension_file, &extension)];
+        let mut binder = CanonicalBinder::new();
+        for (file, parsed) in files {
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(format!("\"/project/{}.d.ts\"", file.index())),
+                        CanonicalSourceLanguage::TypeScript,
+                        true,
+                        CanonicalModuleState::External,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let specifiers = source_module_specifiers(&extension);
+        let [specifier] = specifiers.as_slice() else {
+            panic!("the extension must retain one authenticated library import")
+        };
+        let manifest = CanonicalModuleResolutionManifestInput::new([
+            CanonicalModuleResolutionEntry::resolved(
+                NodeRef::new(extension.arena.id(), extension_file, *specifier),
+                CanonicalResolvedModuleInput::new(
+                    library_file,
+                    CanonicalModuleResolutionMode::Esm,
+                    CanonicalModuleResolutionMode::Esm,
+                ),
+            ),
+        ]);
+        let mut context = CanonicalCheckerContext::new_with_module_resolutions(
+            binder.finish(),
+            vec![
+                (library_file, &library.arena),
+                (extension_file, &extension.arena),
+            ],
+            CanonicalCheckerOptions::default(),
+            manifest,
+        )
+        .unwrap();
+
+        context.check_source_file(library_file).unwrap();
+        context.check_source_file(extension_file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected one diagnostic for augmenting an exported non-module value")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2649);
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "Cannot augment module './library' with value exports because it resolves to a non-module entity.",
+        );
+        assert_eq!(
+            node_text(&extension, diagnostic.node.unwrap()),
+            "'./library'",
+        );
+
+        let warm = observable_state(&context, extension_file);
+        context.recheck_source_file(extension_file).unwrap();
+        assert_eq!(observable_state(&context, extension_file), warm);
     }
 
     #[test]
