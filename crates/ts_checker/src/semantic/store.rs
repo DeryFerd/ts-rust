@@ -1698,6 +1698,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                     self.node_is_declared_callable_signature(node)
                         || self.node_is_global_interface_method(node)
                         || self.node_is_interface_method(node)
+                        || self.node_is_type_literal_method(node)
                 })
             })
     }
@@ -1774,6 +1775,68 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         Some((owner, interface_type))
     }
 
+    /// Authenticates a binder-owned method against its exact type-literal owner.
+    pub(super) fn authenticated_type_literal_method_owner(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> Option<(SemanticSymbolId, TypeId)> {
+        let method = self.symbol(symbol)?;
+        let declarations = method.declarations()?;
+        let owner = method
+            .parent()
+            .and_then(|parent| self.get_merged_symbol(parent))?;
+        let literal = self.symbol(owner)?;
+        let [owner_declaration] = literal.declarations()? else {
+            return None;
+        };
+        let owner_declaration = *owner_declaration;
+        let links = self.type_node_links(owner_declaration)?;
+        let literal_type = links.resolved_type?;
+        if declarations.is_empty()
+            || method.flags() != SymbolFlags::METHOD
+            || method.check_flags() != CheckFlags::NONE
+            || method.name().is_reserved_member_name()
+            || method.name().is_private_identifier()
+            || method.name().is_late_bound()
+            || method.value_declaration() != declarations.first().copied()
+            || method.members().is_some()
+            || method.exports().is_some()
+            || method.export_symbol().is_some()
+            || self.get_merged_symbol(symbol) != Some(symbol)
+            || literal.flags() != SymbolFlags::TYPE_LITERAL
+            || literal.check_flags() != CheckFlags::NONE
+            || literal.name() != InternalSymbolName::Type.as_ref()
+            || literal.value_declaration().is_some()
+            || literal.parent().is_some()
+            || literal.exports().is_some()
+            || literal.export_symbol().is_some()
+            || self.get_merged_symbol(owner) != Some(owner)
+            || self.source_node_kind(owner_declaration) != Some(SyntaxKind::TypeLiteral)
+            || links
+                != &(TypeNodeLinks {
+                    resolved_type: Some(literal_type),
+                    ..TypeNodeLinks::default()
+                })
+            || self.types.get(literal_type).is_none()
+            || literal
+                .members()
+                .and_then(|members| self.symbol_table(members))
+                .and_then(|members| members.get(method.name()))
+                .and_then(|member| self.get_merged_symbol(member))
+                != Some(symbol)
+            || declarations.iter().enumerate().any(|(index, declaration)| {
+                declarations[..index].contains(declaration)
+                    || self.source_node_kind(*declaration) != Some(SyntaxKind::MethodSignature)
+                    || self.source_node_parent(*declaration)
+                        != Some(SourceNodeParent::Parent(owner_declaration))
+            })
+        {
+            return None;
+        }
+
+        Some((owner, literal_type))
+    }
+
     fn interface_method_for_declaration(&self, declaration: NodeRef) -> Option<SemanticSymbolId> {
         if self.source_node_kind(declaration) != Some(SyntaxKind::MethodSignature) {
             return None;
@@ -1826,12 +1889,62 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.interface_method_for_declaration(node).is_some()
     }
 
+    fn type_literal_method_for_declaration(
+        &self,
+        declaration: NodeRef,
+    ) -> Option<SemanticSymbolId> {
+        if self.source_node_kind(declaration) != Some(SyntaxKind::MethodSignature) {
+            return None;
+        }
+        let SourceNodeParent::Parent(owner_declaration) = self.source_node_parent(declaration)?
+        else {
+            return None;
+        };
+        if self.source_node_kind(owner_declaration) != Some(SyntaxKind::TypeLiteral) {
+            return None;
+        }
+        self.type_node_links(owner_declaration)?.resolved_type?;
+        self.links
+            .value_symbol
+            .find_key(|method| {
+                self.symbol(*method)
+                    .and_then(Symbol::declarations)
+                    .is_some_and(|declarations| declarations.contains(&declaration))
+                    && self
+                        .authenticated_type_literal_method_owner(*method)
+                        .is_some_and(|(owner, _)| {
+                            self.symbol(owner).and_then(Symbol::declarations)
+                                == Some(&[owner_declaration][..])
+                        })
+            })
+            .copied()
+    }
+
+    fn node_is_type_literal_method(&self, node: NodeRef) -> bool {
+        self.type_literal_method_for_declaration(node).is_some()
+    }
+
     /// Validates every declaration and signature before exposing a method type.
     /// Immutable return and parameter caches may still be unpublished.
     pub(super) fn interface_method_linked_type(&self, requested: SignatureId) -> Option<TypeId> {
         let declaration = self.signature(requested)?.declaration()?;
         let method_symbol = self.interface_method_for_declaration(declaration)?;
         self.authenticated_interface_method_owner(method_symbol)?;
+        self.declared_method_linked_type(requested, method_symbol)
+    }
+
+    pub(super) fn type_literal_method_linked_type(&self, requested: SignatureId) -> Option<TypeId> {
+        let declaration = self.signature(requested)?.declaration()?;
+        let method_symbol = self.type_literal_method_for_declaration(declaration)?;
+        self.authenticated_type_literal_method_owner(method_symbol)?;
+        self.declared_method_linked_type(requested, method_symbol)
+    }
+
+    fn declared_method_linked_type(
+        &self,
+        requested: SignatureId,
+        method_symbol: SemanticSymbolId,
+    ) -> Option<TypeId> {
         let method = self.symbol(method_symbol)?;
         let declarations = method.declarations()?;
         let value_links = self.value_symbol_links(method_symbol)?;
@@ -2260,6 +2373,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 || self.node_is_declared_callable_signature(node)
                 || self.node_is_global_interface_method(node)
                 || self.node_is_interface_method(node)
+                || self.node_is_type_literal_method(node)
             {
                 return true;
             }
@@ -2284,6 +2398,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                         || self.node_is_declared_callable_signature(parent)
                         || self.node_is_global_interface_method(parent)
                         || self.node_is_interface_method(parent)
+                        || self.node_is_type_literal_method(parent)
             )
     }
 
@@ -2292,6 +2407,9 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             || self.source_overload_types_by_owner.contains_key(&symbol)
             || self.authenticated_global_interface_method(symbol).is_some()
             || self.authenticated_interface_method_owner(symbol).is_some()
+            || self
+                .authenticated_type_literal_method_owner(symbol)
+                .is_some()
     }
 
     fn signature_is_callable(&self, signature: SignatureId) -> bool {
@@ -2309,6 +2427,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                         .global_interface_method_linked_type(signature)
                         .is_some()
                     || self.interface_method_linked_type(signature).is_some()
+                    || self.type_literal_method_linked_type(signature).is_some()
                     || self
                         .source_callable_type_for_signature(signature)
                         .and_then(|type_| self.source_callable_provenance(type_))
@@ -2348,6 +2467,8 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             self.global_interface_method_linked_type(signature)
         } else if self.node_is_interface_method(declaration) {
             self.interface_method_linked_type(signature)
+        } else if self.node_is_type_literal_method(declaration) {
+            self.type_literal_method_linked_type(signature)
         } else {
             self.source_callable_type_for_signature(signature)
                 .filter(|type_| {
@@ -2835,7 +2956,8 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             || self.node_is_source_overload_declaration(node)
             || self.node_is_declared_callable_signature(node)
             || self.node_is_global_interface_method(node)
-            || self.node_is_interface_method(node))
+            || self.node_is_interface_method(node)
+            || self.node_is_type_literal_method(node))
             && published
             && changed;
         self.links.signature.replace_key(node, links);
@@ -4400,6 +4522,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             || self.node_is_declared_callable_signature(declaration)
             || self.node_is_global_interface_method(declaration)
             || self.interface_method_linked_type(id).is_some()
+            || self.type_literal_method_linked_type(id).is_some()
             || self
                 .source_callable_type_for_signature(id)
                 .and_then(|type_| self.source_callable_provenance(type_))
@@ -4422,7 +4545,9 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                     self.signature(id).and_then(Signature::resolved_return_type)
                         == Some(bootstrap.string_type)
                 })
-        } else if self.node_is_interface_method(declaration) {
+        } else if self.node_is_interface_method(declaration)
+            || self.node_is_type_literal_method(declaration)
+        {
             self.source_direct_type_annotation(declaration) == Some(annotation)
                 && !null_literal_identity
                 && self
@@ -4503,6 +4628,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                     record.declaration().is_some_and(|declaration| {
                         self.node_is_global_interface_method(declaration)
                             || self.node_is_interface_method(declaration)
+                            || self.node_is_type_literal_method(declaration)
                     }) && record.parameters().iter().copied().zip(types).any(
                         |(parameter, type_)| {
                             self.value_symbol_links(parameter)

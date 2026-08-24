@@ -16,7 +16,8 @@ use super::{
     DeclaredTypeUnavailable, SignatureId, TypeId, TypeResolutionTarget, TypeSystemPropertyName,
     UnsupportedDeclaredTypeKind,
     array_types::CanonicalArrayTargets,
-    bootstrap::{LiteralTypeCacheError, PreparedTypeQueryTypes},
+    bootstrap::{LiteralTypeCacheError, PreparedTypeQueryTypes, UnionReduction},
+    callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
     conditional_types::{
         ConditionalTypeBranches, ConditionalTypeInstantiation, ConditionalTypeRequest,
         conditional_check_is_assignable, get_conditional_type_instantiation,
@@ -49,7 +50,8 @@ use super::{
         get_deferred_indexed_access_type, plan_concrete_indexed_access,
     },
     instantiate::{
-        InstantiationLimits, InstantiationSession, instantiate_type_with_vector_and_session,
+        InstantiationLimits, InstantiationSession, instantiate_type_with_session,
+        instantiate_type_with_vector_and_session,
     },
     interface_heritage::DirectInterfaceBaseKind,
     intersection_types::IntersectionTypeError,
@@ -1717,9 +1719,18 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             SyntaxKind::ArrayType if union_constituent && self.array_targets.is_none() => Err(
                 type_node_unavailable(TypeNodeUnavailable::UnsupportedUnionConstituent(node)),
             ),
-            SyntaxKind::IndexedAccessType | SyntaxKind::TypeOperator if union_constituent => Err(
-                type_node_unavailable(TypeNodeUnavailable::UnsupportedUnionConstituent(node)),
-            ),
+            SyntaxKind::IndexedAccessType if union_constituent => {
+                if self.is_authenticated_bivariant_method_indexed_access(node)? {
+                    self.plan_concrete_indexed_access_type(node, alias_owner)
+                } else {
+                    Err(type_node_unavailable(
+                        TypeNodeUnavailable::UnsupportedUnionConstituent(node),
+                    ))
+                }
+            }
+            SyntaxKind::TypeOperator if union_constituent => Err(type_node_unavailable(
+                TypeNodeUnavailable::UnsupportedUnionConstituent(node),
+            )),
             SyntaxKind::ArrayType => self.plan_array_type(node, alias_owner),
             SyntaxKind::TypeLiteral => self.plan_property_type_literal(node, alias_owner),
             SyntaxKind::FunctionType => self.plan_function_type(node, alias_owner),
@@ -3190,12 +3201,14 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             if self.try_plan_generic_mapped_indexed_alias(node, alias)? {
                 return Ok(());
             }
-            return Err(type_node_unavailable(
-                TypeNodeUnavailable::GenericReferenceUnsupported {
-                    node,
-                    symbol: alias,
-                },
-            ));
+            if !self.is_authenticated_bivariant_method_indexed_access(node)? {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::GenericReferenceUnsupported {
+                        node,
+                        symbol: alias,
+                    },
+                ));
+            }
         }
         if self.try_plan_recovered_indexed_access_type(node)? {
             return Ok(());
@@ -3214,6 +3227,58 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         self.plan.indexed_accesses.insert(node, planned.clone());
         self.plan_type_node_in_context(planned.object(), None, false)?;
         self.plan_type_node_in_context(planned.index(), None, false)
+    }
+
+    fn is_authenticated_bivariant_method_indexed_access(
+        &self,
+        node: NodeRef,
+    ) -> Result<bool, DeclaredTypeError> {
+        let record = preflight_node(self.store, self.host, node)?;
+        let NodeData::IndexedAccessTypeNode(indexed) = &record.data else {
+            return Ok(false);
+        };
+        let object = NodeRef::new(node.arena, node.file, indexed.object_type);
+        let index = NodeRef::new(node.arena, node.file, indexed.index_type);
+        let object_record = preflight_node(self.store, self.host, object)?;
+        let index_record = preflight_node(self.store, self.host, index)?;
+        if record.kind != SyntaxKind::IndexedAccessType
+            || object_record.kind != SyntaxKind::TypeLiteral
+            || object_record.parent != Some(node.node)
+            || index_record.kind != SyntaxKind::LiteralType
+            || index_record.parent != Some(node.node)
+        {
+            return Ok(false);
+        }
+        let NodeData::LiteralTypeNode(index_literal) = &index_record.data else {
+            return Ok(false);
+        };
+        let key = NodeRef::new(index.arena, index.file, index_literal.literal);
+        let key_record = preflight_node(self.store, self.host, key)?;
+        let NodeData::StringLiteral(key_data) = &key_record.data else {
+            return Ok(false);
+        };
+        if key_record.kind != SyntaxKind::StringLiteral
+            || key_record.parent != Some(index.node)
+            || key_data.token_flags.0 != 0
+            || key_data.text != "bivarianceHack"
+        {
+            return Ok(false);
+        }
+        let literal = object_members::plan_concrete_indexed_access_type_literal(
+            self.store, self.host, object,
+        )
+        .map_err(property_object_error)?;
+        let [property] = literal.properties.as_slice() else {
+            return Ok(false);
+        };
+        Ok(property.name == key_data.text
+            && !literal.methods.is_empty()
+            && literal
+                .methods
+                .iter()
+                .all(|method| method.symbol == property.symbol)
+            && literal.indexes.is_empty()
+            && literal.call_signatures.is_empty())
     }
 
     fn try_plan_generic_mapped_indexed_alias(
@@ -14952,6 +15017,35 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 return_type,
             });
         }
+        let mut method_types = Vec::with_capacity(literal.methods.len());
+        for method in &literal.methods {
+            let mut parameter_types = Vec::with_capacity(method.parameters.len());
+            for parameter in &method.parameters {
+                parameter_types.push(self.execute_type_node(
+                    parameter.type_node,
+                    plan,
+                    prepared,
+                )?);
+            }
+            let return_type = self.execute_type_node(method.return_type, plan, prepared)?;
+            method_types.push(object_members::ResolvedCallSignatureTypes {
+                parameter_types,
+                return_type,
+            });
+        }
+        let method_values =
+            object_members::publish_interface_method_values(self.store, &literal, &method_types)
+                .map_err(property_object_error)?;
+        for (method, value) in literal.methods.iter().zip(method_values) {
+            let property = literal
+                .properties
+                .iter()
+                .position(|property| property.symbol == method.symbol)
+                .ok_or_else(|| {
+                    type_node_unavailable(TypeNodeUnavailable::InvalidLiteralType(node))
+                })?;
+            types[property] = value;
+        }
         if state.is_resolved() {
             object_members::validate_resolved_declared_member_types(
                 self.store,
@@ -15797,6 +15891,21 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 .get(&symbol)
                 .copied(),
         )?;
+        if self.alias_type_contains_literal_method(declared_type)
+            && let Some(cached) = links
+                .instantiations
+                .as_ref()
+                .and_then(|instantiations| instantiations.get(&key))
+                .copied()
+        {
+            return self.validate_cached_method_alias_instantiation(
+                symbol,
+                declared_type,
+                cached,
+                &type_parameters,
+                &type_arguments,
+            );
+        }
         if matches!(
             self.store.type_payload(declared_type).map(TypeRecord::data),
             Some(TypeData::Mapped(_))
@@ -16577,13 +16686,33 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
     }
 
     fn instantiate_direct_alias_type(
-        &self,
+        &mut self,
         symbol: SemanticSymbolId,
         type_: TypeId,
         mapped_parameters: &[TypeId],
         type_arguments: &[TypeId],
     ) -> Result<TypeId, DeclaredTypeError> {
         self.validate_direct_alias_type(symbol, type_, mapped_parameters)?;
+        if self.is_literal_method_callable(type_) {
+            return self.instantiate_literal_method_alias_type(
+                symbol,
+                type_,
+                mapped_parameters,
+                type_arguments,
+            );
+        }
+        if matches!(
+            self.store.type_payload(type_).map(TypeRecord::data),
+            Some(TypeData::Union(_))
+        ) && self.alias_type_contains_literal_method(type_)
+        {
+            return self.instantiate_literal_method_alias_union(
+                symbol,
+                type_,
+                mapped_parameters,
+                type_arguments,
+            );
+        }
         if matches!(
             self.store.type_payload(type_).map(TypeRecord::data),
             Some(TypeData::TypeParameter(_))
@@ -16596,6 +16725,320 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             });
         }
         Ok(type_)
+    }
+
+    fn is_literal_method_callable(&self, type_: TypeId) -> bool {
+        self.store
+            .type_payload(type_)
+            .and_then(TypeRecord::symbol)
+            .is_some_and(|method| {
+                self.store
+                    .authenticated_type_literal_method_owner(method)
+                    .is_some()
+                    && matches!(
+                        validate_stored_callable_set(self.store, type_),
+                        StoredCallableSetValidation::Valid { .. }
+                    )
+            })
+    }
+
+    fn alias_type_contains_literal_method(&self, type_: TypeId) -> bool {
+        self.is_literal_method_callable(type_)
+            || matches!(
+                self.store.type_payload(type_).map(TypeRecord::data),
+                Some(TypeData::Union(union))
+                    if union
+                        .union
+                        .types
+                        .iter()
+                        .any(|constituent| self.is_literal_method_callable(*constituent))
+            )
+    }
+
+    fn validate_cached_method_alias_instantiation(
+        &self,
+        alias: SemanticSymbolId,
+        source: TypeId,
+        cached: TypeId,
+        parameters: &[TypeId],
+        arguments: &[TypeId],
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let invalid = || {
+            type_node_unavailable(TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(
+                alias,
+            ))
+        };
+        if parameters == arguments && cached == source {
+            return Ok(cached);
+        }
+        let source_types = match self.store.type_payload(source).map(TypeRecord::data) {
+            Some(TypeData::Union(union)) => union.union.types.as_slice(),
+            Some(_) => std::slice::from_ref(&source),
+            None => return Err(invalid()),
+        };
+        let cached_types = match self.store.type_payload(cached).map(TypeRecord::data) {
+            Some(TypeData::Union(union)) => union.union.types.as_slice(),
+            Some(_) => std::slice::from_ref(&cached),
+            None => return Err(invalid()),
+        };
+        if source_types.len() != cached_types.len() {
+            return Err(invalid());
+        }
+        let mut matched = HashSet::new();
+        let mut mapper = None;
+        for original in source_types {
+            if !self.is_literal_method_callable(*original) {
+                continue;
+            }
+            let candidate = cached_types.iter().copied().find(|candidate| {
+                let Some(record) = self.store.type_payload(*candidate) else {
+                    return false;
+                };
+                let TypeData::Object(object) = record.data() else {
+                    return false;
+                };
+                object.target == Some(*original)
+                    && object.mapper.is_some_and(|candidate_mapper| {
+                        self.store.type_mapper_has_exact_endpoints(
+                            candidate_mapper,
+                            parameters,
+                            arguments,
+                        ) == Some(true)
+                            && matches!(
+                                validate_stored_callable_set(self.store, *candidate),
+                                StoredCallableSetValidation::Valid { .. }
+                            )
+                    })
+            });
+            let candidate = candidate.ok_or_else(invalid)?;
+            if !matched.insert(candidate) {
+                return Err(invalid());
+            }
+            let TypeData::Object(object) = self
+                .store
+                .type_payload(candidate)
+                .expect("the method candidate was checked")
+                .data()
+            else {
+                unreachable!("the method candidate is an object")
+            };
+            mapper.get_or_insert(object.mapper.expect("mapped methods retain a mapper"));
+        }
+        let mapper = mapper.ok_or_else(invalid)?;
+        for original in source_types {
+            if self.is_literal_method_callable(*original) {
+                continue;
+            }
+            let candidate = cached_types.iter().copied().find(|candidate| {
+                !matched.contains(candidate)
+                    && (*candidate == *original
+                        || super::instantiate::instantiated_member_type_matches(
+                            self.store,
+                            *original,
+                            *candidate,
+                            mapper,
+                            self.global_types
+                                .as_ref()
+                                .map(CanonicalArrayTargets::from_global_types),
+                        )
+                        .unwrap_or(false))
+            });
+            if !matched.insert(candidate.ok_or_else(invalid)?) {
+                return Err(invalid());
+            }
+        }
+        Ok(cached)
+    }
+
+    fn instantiate_literal_method_alias_union(
+        &mut self,
+        alias: SemanticSymbolId,
+        type_: TypeId,
+        parameters: &[TypeId],
+        arguments: &[TypeId],
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let Some(TypeData::Union(union)) = self.store.type_payload(type_).map(TypeRecord::data)
+        else {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(alias),
+            ));
+        };
+        let constituents = union.union.types.clone();
+        let mut instantiated = Vec::with_capacity(constituents.len());
+        for constituent in constituents {
+            let mapped = if self.is_literal_method_callable(constituent) {
+                self.instantiate_literal_method_alias_type(
+                    alias,
+                    constituent,
+                    parameters,
+                    arguments,
+                )?
+            } else {
+                self.instantiate_dependent_alias_type(alias, constituent, parameters, arguments)?
+            };
+            instantiated.push(mapped);
+        }
+        let result = match self.global_types.as_ref() {
+            Some(global_types) => self.store.expression_union_type_with_global_types(
+                global_types,
+                &instantiated,
+                UnionReduction::Literal,
+            ),
+            None => self
+                .store
+                .expression_union_type(&instantiated, UnionReduction::Literal),
+        };
+        result.map_err(Self::literal_cache_error)
+    }
+
+    fn instantiate_literal_method_alias_type(
+        &mut self,
+        alias: SemanticSymbolId,
+        source: TypeId,
+        parameters: &[TypeId],
+        arguments: &[TypeId],
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let unsupported = || {
+            type_node_unavailable(TypeNodeUnavailable::GenericAliasInstantiationUnsupported {
+                alias,
+                declared_type: source,
+            })
+        };
+        if parameters.len() != arguments.len() {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::MissingGenericAliasMetadata(alias),
+            ));
+        }
+        if parameters == arguments {
+            return Ok(source);
+        }
+        let StoredCallableSetValidation::Valid { projection, .. } =
+            validate_stored_callable_set(self.store, source)
+        else {
+            return Err(unsupported());
+        };
+        let method = self
+            .store
+            .type_payload(source)
+            .and_then(TypeRecord::symbol)
+            .ok_or_else(unsupported)?;
+        if self
+            .store
+            .authenticated_type_literal_method_owner(method)
+            .is_none()
+            || projection.call_signatures.is_empty()
+            || !projection.construct_signatures.is_empty()
+        {
+            return Err(unsupported());
+        }
+        if !self.store.try_reserve_mappers(1)
+            || !self.store.try_reserve_types(1)
+            || !self
+                .store
+                .try_reserve_signatures(projection.call_signatures.len())
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::LiteralTypeCapacity,
+            ));
+        }
+        let mapper = self
+            .store
+            .new_type_mapper(parameters.to_vec(), arguments.to_vec())
+            .ok_or_else(unsupported)?;
+        let targets = self
+            .global_types
+            .as_ref()
+            .map(CanonicalArrayTargets::from_global_types);
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let mut signatures = Vec::with_capacity(projection.call_signatures.len());
+        for original in &projection.call_signatures {
+            let original_types = self
+                .store
+                .callable_signature_parameter_types(original.signature)
+                .ok_or_else(unsupported)?
+                .to_vec();
+            let mut parameter_types = Vec::with_capacity(original_types.len());
+            for parameter in original_types {
+                parameter_types.push(
+                    instantiate_type_with_session(
+                        self.store,
+                        parameter,
+                        mapper,
+                        targets,
+                        &mut session,
+                    )
+                    .map_err(|_| unsupported())?,
+                );
+            }
+            let original_return = original.return_type.ok_or_else(unsupported)?;
+            let return_type = instantiate_type_with_session(
+                self.store,
+                original_return,
+                mapper,
+                targets,
+                &mut session,
+            )
+            .map_err(|_| unsupported())?;
+            let signature = self
+                .store
+                .instantiate_signature(original.signature, mapper)
+                .map_err(|_| unsupported())?;
+            let symbols = self
+                .store
+                .signature(signature)
+                .ok_or_else(unsupported)?
+                .parameters()
+                .to_vec();
+            for (parameter, type_) in symbols.into_iter().zip(parameter_types) {
+                let links = self
+                    .store
+                    .value_symbol_links(parameter)
+                    .cloned()
+                    .ok_or_else(unsupported)?;
+                if links.resolved_type.is_some_and(|cached| cached != type_)
+                    || links.resolved_type.is_none()
+                        && !self.store.set_value_symbol_links(
+                            parameter,
+                            super::ValueSymbolLinks {
+                                resolved_type: Some(type_),
+                                ..links
+                            },
+                        )
+                {
+                    return Err(unsupported());
+                }
+            }
+            if !self
+                .store
+                .set_signature_resolved_return_type(signature, Some(return_type))
+            {
+                return Err(unsupported());
+            }
+            signatures.push(signature);
+        }
+        let callable = self
+            .store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(method))
+            .ok_or_else(unsupported)?;
+        if !self
+            .store
+            .set_object_target_and_mapper(callable, Some(source), Some(mapper))
+            || !self.store.set_structured_type_members(
+                callable,
+                None,
+                None,
+                Some(signatures),
+                None,
+                None,
+            )
+            || !matches!(
+                validate_stored_callable_set(self.store, callable),
+                StoredCallableSetValidation::Valid { .. }
+            )
+        {
+            return Err(unsupported());
+        }
+        Ok(callable)
     }
 
     fn validate_direct_alias_type(
@@ -16627,12 +17070,18 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             | TypeData::Intrinsic(_)
             | TypeData::Literal(_)
             | TypeData::Interface(_) => Ok(()),
+            TypeData::Object(_) if self.is_literal_method_callable(type_) => Ok(()),
             TypeData::Union(union)
                 if !union
                     .union
                     .types
                     .iter()
-                    .any(|constituent| mapped_parameters.contains(constituent)) =>
+                    .any(|constituent| mapped_parameters.contains(constituent))
+                    || union
+                        .union
+                        .types
+                        .iter()
+                        .any(|constituent| self.is_literal_method_callable(*constituent)) =>
             {
                 Ok(())
             }
@@ -27958,6 +28407,588 @@ mod tests {
     }
 
     #[test]
+    fn type_literal_methods_publish_binder_owned_callable_values_and_replay_warm() {
+        let mut fixture = fixture("type Direct = { method(value: string): number };");
+        let direct = canonical_fixture_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Direct");
+        let literal = alias_parts(&fixture, "Direct").2;
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let object = query_declared(
+            &mut fixture,
+            direct,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let owner = fixture
+            .store
+            .type_payload(object)
+            .unwrap()
+            .symbol()
+            .unwrap();
+        let method = fixture
+            .store
+            .symbol(owner)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| fixture.store.symbol_table(members))
+            .and_then(|members| members.get_source("method"))
+            .unwrap();
+        let callable = fixture
+            .store
+            .value_symbol_links(method)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let StoredCallableSetValidation::Valid { projection, .. } =
+            validate_stored_callable_set(&fixture.store, callable)
+        else {
+            panic!("type-literal methods retain an authenticated callable")
+        };
+        let [signature] = projection.call_signatures.as_ref() else {
+            panic!("the type literal publishes exactly one method signature")
+        };
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        assert_eq!(signature.parameters, [bootstrap.string_type]);
+        assert_eq!(signature.return_type, Some(bootstrap.number_type));
+        assert!(signature.strict_variance_exempt);
+        assert_eq!(
+            fixture.store.type_payload(callable).unwrap().symbol(),
+            Some(method)
+        );
+        assert_eq!(
+            fixture
+                .store
+                .authenticated_type_literal_method_owner(method),
+            Some((owner, object)),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .type_node_links(literal)
+                .and_then(|links| links.resolved_type),
+            Some(object),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .callable_signature_parameter_types(signature.signature),
+            Some([bootstrap.string_type].as_slice()),
+        );
+
+        let warm = (store_state(&fixture.store), fixture.store.signature_len());
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                direct,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(object),
+        );
+        assert_eq!(
+            (store_state(&fixture.store), fixture.store.signature_len()),
+            warm,
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn interface_method_annotations_support_named_reference_parameters_and_returns() {
+        let mut fixture = fixture(concat!(
+            "interface Other { value: string } ",
+            "interface Contract { method(value: Other): Other }",
+        ));
+        let contract =
+            canonical_fixture_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Contract");
+        let other = canonical_fixture_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Other");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let contract_type = query_declared(
+            &mut fixture,
+            contract,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let other_type = fixture
+            .store
+            .declared_type_links(other)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let method = fixture
+            .store
+            .symbol(contract)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| fixture.store.symbol_table(members))
+            .and_then(|members| members.get_source("method"))
+            .unwrap();
+        let callable = fixture
+            .store
+            .value_symbol_links(method)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let StoredCallableSetValidation::Valid { projection, .. } =
+            validate_stored_callable_set(&fixture.store, callable)
+        else {
+            panic!("interface methods accept named annotation references")
+        };
+        let [signature] = projection.call_signatures.as_ref() else {
+            panic!("the interface owns one method signature")
+        };
+        assert_eq!(signature.parameters, [other_type]);
+        assert_eq!(signature.return_type, Some(other_type));
+        assert!(signature.strict_variance_exempt);
+
+        let warm = (store_state(&fixture.store), fixture.store.signature_len());
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                contract,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(contract_type),
+        );
+        assert_eq!(
+            (store_state(&fixture.store), fixture.store.signature_len()),
+            warm,
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn interface_method_annotations_support_nullable_reference_unions() {
+        let mut fixture = fixture_with_intrinsic(
+            concat!(
+                "interface Other { value: string } ",
+                "interface Contract { method(value: Other | null): Other | null }",
+            ),
+            IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                exact_optional_property_types: false,
+            },
+        );
+        let contract =
+            canonical_fixture_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Contract");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        query_declared(
+            &mut fixture,
+            contract,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let method = fixture
+            .store
+            .symbol(contract)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| fixture.store.symbol_table(members))
+            .and_then(|members| members.get_source("method"))
+            .unwrap();
+        let callable = fixture
+            .store
+            .value_symbol_links(method)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let StoredCallableSetValidation::Valid { projection, .. } =
+            validate_stored_callable_set(&fixture.store, callable)
+        else {
+            panic!("interface methods retain nullable reference annotations")
+        };
+        let [signature] = projection.call_signatures.as_ref() else {
+            panic!("the interface owns one nullable method signature")
+        };
+        let parameter = signature.parameters[0];
+        assert_eq!(signature.return_type, Some(parameter));
+        let TypeData::Union(union) = fixture.store.type_payload(parameter).unwrap().data() else {
+            panic!("both method annotations resolve to the same nullable union")
+        };
+        assert!(
+            union
+                .union
+                .types
+                .contains(&fixture.store.intrinsic_bootstrap().unwrap().null_type)
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn indexed_type_literal_methods_preserve_their_callable_identity_and_warm_cache() {
+        let mut fixture = fixture(concat!(
+            "type Picked = ",
+            "{ bivarianceHack(value: string): void }['bivarianceHack'];",
+        ));
+        let picked = canonical_fixture_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Picked");
+        let (indexed, object, _) = indexed_access_parts(&fixture, "Picked");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let callable = query_declared(
+            &mut fixture,
+            picked,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let method = fixture
+            .store
+            .type_payload(callable)
+            .unwrap()
+            .symbol()
+            .unwrap();
+        let owner = fixture.store.get_parent_of_symbol(method).unwrap();
+        let owner_type = fixture
+            .store
+            .type_node_links(object)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .authenticated_type_literal_method_owner(method),
+            Some((owner, owner_type)),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .type_node_links(indexed)
+                .and_then(|links| links.resolved_type),
+            Some(callable),
+        );
+        let StoredCallableSetValidation::Valid { projection, .. } =
+            validate_stored_callable_set(&fixture.store, callable)
+        else {
+            panic!("indexed access returns the original binder-owned method callable")
+        };
+        assert!(projection.call_signatures[0].strict_variance_exempt);
+
+        let warm = (store_state(&fixture.store), fixture.store.signature_len());
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                picked,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(callable),
+        );
+        assert_eq!(
+            (store_state(&fixture.store), fixture.store.signature_len()),
+            warm,
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn nested_type_literal_index_values_can_contain_method_signatures() {
+        let mut fixture = fixture("type Nested = { [key: string]: { method(): void } };");
+        let nested = canonical_fixture_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Nested");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let object = query_declared(
+            &mut fixture,
+            nested,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let TypeData::Object(outer) = fixture.store.type_payload(object).unwrap().data() else {
+            panic!("the outer index declaration remains a type literal")
+        };
+        let [index] = outer.structured.index_infos.as_deref().unwrap() else {
+            panic!("the outer type literal publishes one index")
+        };
+        let inner = fixture.store.index_info(*index).unwrap().value_type();
+        let owner = fixture.store.type_payload(inner).unwrap().symbol().unwrap();
+        let method = fixture
+            .store
+            .symbol(owner)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| fixture.store.symbol_table(members))
+            .and_then(|members| members.get_source("method"))
+            .unwrap();
+        let callable = fixture
+            .store
+            .value_symbol_links(method)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        assert!(matches!(
+            validate_stored_callable_set(&fixture.store, callable),
+            StoredCallableSetValidation::Valid { .. }
+        ));
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn generic_indexed_method_aliases_substitute_parameter_types_without_changing_declarations() {
+        let mut fixture = fixture_with_intrinsic(
+            concat!(
+                "type Handler<T> = ",
+                "{ bivarianceHack(value: T): void }['bivarianceHack']; ",
+                "type Nullable<T> = ",
+                "{ bivarianceHack(value: T | null): any }['bivarianceHack']; ",
+                "let handler: Handler<string>; ",
+                "let nullable: Nullable<number>;",
+            ),
+            IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                exact_optional_property_types: false,
+            },
+        );
+        let handler_alias =
+            canonical_fixture_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Handler");
+        let nullable_alias =
+            canonical_fixture_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Nullable");
+        let handler_node = variable_type_node(&fixture, "handler");
+        let nullable_node = variable_type_node(&fixture, "nullable");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let original_handler = query_declared(
+            &mut fixture,
+            handler_alias,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let original_nullable = query_declared(
+            &mut fixture,
+            nullable_alias,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let handler = query_node(&mut fixture, handler_node, &mut diagnostics).unwrap();
+        let nullable = query_node(&mut fixture, nullable_node, &mut diagnostics).unwrap();
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let string = bootstrap.string_type;
+        let number = bootstrap.number_type;
+        let null = bootstrap.null_type;
+        for (instantiated, source, expected) in [
+            (handler, original_handler, string),
+            (nullable, original_nullable, number),
+        ] {
+            let record = fixture.store.type_payload(instantiated).unwrap();
+            let TypeData::Object(object) = record.data() else {
+                panic!("generic aliases instantiate their extracted callable")
+            };
+            assert_eq!(object.target, Some(source));
+            assert!(object.mapper.is_some());
+            let StoredCallableSetValidation::Valid { projection, .. } =
+                validate_stored_callable_set(&fixture.store, instantiated)
+            else {
+                panic!("mapped type-literal methods retain authenticated callable provenance")
+            };
+            let [signature] = projection.call_signatures.as_ref() else {
+                panic!("each extracted handler has one method signature")
+            };
+            let [parameter] = signature.parameters.as_slice() else {
+                panic!("the handler keeps one parameter")
+            };
+            if instantiated == nullable {
+                let TypeData::Union(union) = fixture.store.type_payload(*parameter).unwrap().data()
+                else {
+                    panic!("nullable handlers preserve their mapped nullable union")
+                };
+                assert!(union.union.types.contains(&number));
+                assert!(union.union.types.contains(&null));
+            } else {
+                assert_eq!(*parameter, expected);
+            }
+            assert!(signature.strict_variance_exempt);
+            let mapped = fixture.store.signature(signature.signature).unwrap();
+            let original = mapped.target().unwrap();
+            assert_eq!(
+                fixture.store.signature(original).unwrap().declaration(),
+                mapped.declaration(),
+            );
+            assert_ne!(
+                mapped.parameters(),
+                fixture.store.signature(original).unwrap().parameters()
+            );
+        }
+
+        let original_parameter = fixture
+            .store
+            .type_alias_links(handler_alias)
+            .and_then(|links| links.type_parameters.as_ref())
+            .unwrap()[0];
+        let StoredCallableSetValidation::Valid { projection, .. } =
+            validate_stored_callable_set(&fixture.store, original_handler)
+        else {
+            panic!("the source handler remains valid after instantiation")
+        };
+        assert_eq!(
+            projection.call_signatures[0].parameters,
+            [original_parameter]
+        );
+
+        let warm = (store_state(&fixture.store), fixture.store.signature_len());
+        assert_eq!(
+            query_node(&mut fixture, handler_node, &mut diagnostics),
+            Ok(handler)
+        );
+        assert_eq!(
+            query_node(&mut fixture, nullable_node, &mut diagnostics),
+            Ok(nullable)
+        );
+        assert_eq!(
+            (store_state(&fixture.store), fixture.store.signature_len()),
+            warm,
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn instantiated_type_literal_methods_reject_forged_parameter_proxies() {
+        let source = concat!(
+            "type Handler<T> = ",
+            "{ bivarianceHack(value: T): void }['bivarianceHack']; ",
+            "let value: Handler<string>;",
+        );
+        for corruption in 0..2 {
+            let mut fixture = fixture(source);
+            let value = variable_type_node(&fixture, "value");
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let callable = query_node(&mut fixture, value, &mut diagnostics).unwrap();
+            let StoredCallableSetValidation::Valid { projection, .. } =
+                validate_stored_callable_set(&fixture.store, callable)
+            else {
+                panic!("the instantiated method starts authenticated")
+            };
+            let signature = projection.call_signatures[0].signature;
+            let parameter = fixture.store.signature(signature).unwrap().parameters()[0];
+            let mut links = fixture.store.value_symbol_links(parameter).unwrap().clone();
+            match corruption {
+                0 => links.target = None,
+                1 => links.mapper = None,
+                _ => unreachable!("corruption cases are bounded"),
+            }
+            assert!(fixture.store.set_value_symbol_links(parameter, links));
+            assert!(matches!(
+                validate_stored_callable_set(&fixture.store, callable),
+                StoredCallableSetValidation::Malformed { .. }
+            ));
+            let before = (store_state(&fixture.store), fixture.store.signature_len());
+            assert!(query_node(&mut fixture, value, &mut diagnostics).is_err());
+            assert_eq!(
+                (store_state(&fixture.store), fixture.store.signature_len()),
+                before,
+            );
+        }
+    }
+
+    #[test]
+    fn react_style_ref_unions_admit_and_instantiate_bivariant_method_members() {
+        let mut fixture = fixture_with_intrinsic(
+            concat!(
+                "interface RefObject<T> { current: T } ",
+                "type Ref<T> = string | ",
+                "{ bivarianceHack(instance: T | null): any }['bivarianceHack'] | ",
+                "RefObject<T>; ",
+                "let value: Ref<number>;",
+            ),
+            IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                exact_optional_property_types: false,
+            },
+        );
+        let alias = canonical_fixture_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Ref");
+        let value = variable_type_node(&fixture, "value");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let original = query_declared(
+            &mut fixture,
+            alias,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let instantiated = query_node(&mut fixture, value, &mut diagnostics).unwrap();
+        assert_ne!(instantiated, original);
+        let TypeData::Union(union) = fixture.store.type_payload(instantiated).unwrap().data()
+        else {
+            panic!("React-style refs remain a union after generic substitution")
+        };
+        let callable = union
+            .union
+            .types
+            .iter()
+            .copied()
+            .find(|type_| {
+                matches!(
+                    validate_stored_callable_set(&fixture.store, *type_),
+                    StoredCallableSetValidation::Valid { .. }
+                )
+            })
+            .unwrap();
+        let StoredCallableSetValidation::Valid { projection, .. } =
+            validate_stored_callable_set(&fixture.store, callable)
+        else {
+            unreachable!("the callable union constituent was authenticated")
+        };
+        let parameter = projection.call_signatures[0].parameters[0];
+        let TypeData::Union(nullable) = fixture.store.type_payload(parameter).unwrap().data()
+        else {
+            panic!("the ref callback preserves its concrete nullable instance")
+        };
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        assert!(nullable.union.types.contains(&bootstrap.number_type));
+        assert!(nullable.union.types.contains(&bootstrap.null_type));
+        assert!(projection.call_signatures[0].strict_variance_exempt);
+
+        let warm = (store_state(&fixture.store), fixture.store.signature_len());
+        assert_eq!(
+            query_node(&mut fixture, value, &mut diagnostics),
+            Ok(instantiated)
+        );
+        assert_eq!(
+            (store_state(&fixture.store), fixture.store.signature_len()),
+            warm,
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn indexed_method_callables_remain_bivariant_under_strict_function_types() {
+        let mut fixture = fixture(concat!(
+            "type Wide = ",
+            "{ bivarianceHack(value: string | number): void }['bivarianceHack']; ",
+            "type Narrow = ",
+            "{ bivarianceHack(value: string): void }['bivarianceHack'];",
+        ));
+        let wide = canonical_fixture_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Wide");
+        let narrow = canonical_fixture_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Narrow");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let wide_type = query_declared(
+            &mut fixture,
+            wide,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let narrow_type = query_declared(
+            &mut fixture,
+            narrow,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to_with_strict_function_types(narrow_type, wide_type, true),
+            Ok(true),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .is_type_assignable_to_with_strict_function_types(wide_type, narrow_type, true),
+            Ok(true),
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
     fn type_literal_index_boundaries_fail_before_publication() {
         for (source, alias, expected_kind) in [
             (
@@ -27989,16 +29020,6 @@ mod tests {
                 "type InvalidKey = { [key: boolean]: number };",
                 "InvalidKey",
                 SyntaxKind::IndexSignature,
-            ),
-            (
-                "type Method = { method(): void };",
-                "Method",
-                SyntaxKind::MethodSignature,
-            ),
-            (
-                "type NestedMethod = { [key: string]: { method(): void } };",
-                "NestedMethod",
-                SyntaxKind::MethodSignature,
             ),
         ] {
             let mut fixture = fixture(source);
@@ -28500,6 +29521,142 @@ mod tests {
                         fixture.store.type_alias_links(bad).cloned(),
                         diagnostics.clone(),
                     ),
+                    before,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cold_indexed_method_rejects_poisoned_parameter_annotation_before_publication() {
+        let mut fixture = fixture(concat!(
+            "type Bad = ",
+            "{ bivarianceHack(value: string): void }['bivarianceHack'];",
+        ));
+        let bad = canonical_fixture_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Bad");
+        let (_, object, _) = indexed_access_parts(&fixture, "Bad");
+        let object_plan = {
+            let host = post_global_host(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            );
+            object_members::plan_concrete_indexed_access_type_literal(&fixture.store, &host, object)
+                .unwrap()
+        };
+        let method = &object_plan.methods[0];
+        let annotation = method.parameters[0].type_node;
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        assert!(fixture.store.set_type_node_links(
+            annotation,
+            TypeNodeLinks {
+                resolved_type: Some(number),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let before = (
+            store_state(&fixture.store),
+            fixture.store.signature_len(),
+            fixture.store.value_symbol_links(method.symbol).cloned(),
+            fixture.store.type_alias_links(bad).cloned(),
+        );
+
+        for _ in 0..2 {
+            assert!(matches!(
+                query_declared(
+                    &mut fixture,
+                    bad,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                ),
+                Err(DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::InvalidIndexedAccessType(node)
+                )) if node == annotation
+            ));
+            assert_eq!(
+                (
+                    store_state(&fixture.store),
+                    fixture.store.signature_len(),
+                    fixture.store.value_symbol_links(method.symbol).cloned(),
+                    fixture.store.type_alias_links(bad).cloned(),
+                ),
+                before,
+            );
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn warm_indexed_methods_reject_forged_parameter_signature_and_owner_caches() {
+        for corruption in 0..3 {
+            let mut fixture = fixture(concat!(
+                "type Bad = ",
+                "{ bivarianceHack(value: string): void }['bivarianceHack'];",
+            ));
+            let bad = canonical_fixture_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Bad");
+            let (_, object, _) = indexed_access_parts(&fixture, "Bad");
+            let object_plan = {
+                let host = post_global_host(
+                    &fixture.parsed.arena,
+                    fixture.files.get(&fixture.file).unwrap(),
+                );
+                object_members::plan_concrete_indexed_access_type_literal(
+                    &fixture.store,
+                    &host,
+                    object,
+                )
+                .unwrap()
+            };
+            let method = &object_plan.methods[0];
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let callable = query_declared(
+                &mut fixture,
+                bad,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap();
+            let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+            match corruption {
+                0 => assert!(fixture.store.set_value_symbol_links(
+                    method.parameters[0].symbol,
+                    ValueSymbolLinks {
+                        resolved_type: Some(number),
+                        ..ValueSymbolLinks::default()
+                    },
+                )),
+                1 => assert!(
+                    fixture
+                        .store
+                        .set_signature_links(method.declaration, SignatureLinks::default())
+                ),
+                2 => assert!(fixture.store.set_value_symbol_links(
+                    method.symbol,
+                    ValueSymbolLinks {
+                        resolved_type: Some(number),
+                        ..ValueSymbolLinks::default()
+                    },
+                )),
+                _ => unreachable!("corruption cases are bounded"),
+            }
+            assert!(matches!(
+                validate_stored_callable_set(&fixture.store, callable),
+                StoredCallableSetValidation::Malformed { .. }
+            ));
+            let before = (store_state(&fixture.store), fixture.store.signature_len());
+            for _ in 0..2 {
+                assert!(
+                    query_declared(
+                        &mut fixture,
+                        bad,
+                        CanonicalTypeQueryOptions::default(),
+                        &mut diagnostics,
+                    )
+                    .is_err(),
+                    "corruption case {corruption}",
+                );
+                assert_eq!(
+                    (store_state(&fixture.store), fixture.store.signature_len()),
                     before,
                 );
             }

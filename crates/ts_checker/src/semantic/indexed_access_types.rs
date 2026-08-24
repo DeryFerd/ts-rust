@@ -24,6 +24,7 @@ use ts_jsnum::Number;
 use super::{
     CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, TypeId,
     bootstrap::LiteralTypeCacheError,
+    callable_sets::{StoredCallableSetValidation, validate_stored_declared_method_callable_set},
     declared::{cached_ordinary_type_parameter_owner, preflight_node},
     links::ValueSymbolLinks,
     object_members::{self, PropertyObjectError, PropertyObjectPlan, PropertyObjectState},
@@ -452,6 +453,26 @@ fn validate_member_annotation_cache(
         for property in &object.properties {
             validate_cold_annotation_subtree(store, host, property.type_node)?;
         }
+        for method in &object.methods {
+            if store
+                .signature_links(method.declaration)
+                .is_some_and(|links| links != &super::SignatureLinks::default())
+            {
+                return Err(ConcreteIndexedAccessError::InvalidCache(method.declaration));
+            }
+            validate_cold_annotation_subtree(store, host, method.return_type)?;
+            for parameter in &method.parameters {
+                if store
+                    .value_symbol_links(parameter.symbol)
+                    .is_some_and(|links| links != &ValueSymbolLinks::default())
+                {
+                    return Err(ConcreteIndexedAccessError::InvalidCache(
+                        parameter.type_node,
+                    ));
+                }
+                validate_cold_annotation_subtree(store, host, parameter.type_node)?;
+            }
+        }
         for index in &object.indexes {
             validate_cold_annotation_subtree(store, host, index.key_type_node)?;
             validate_cold_annotation_subtree(store, host, index.value_type_node)?;
@@ -464,8 +485,50 @@ fn validate_member_annotation_cache(
             .value_symbol_links(property.symbol)
             .and_then(|links| links.resolved_type)
             .ok_or(ConcreteIndexedAccessError::InvalidCache(property.type_node))?;
-        if cached_annotation_identity(store, host, property.type_node)? != published {
+        let method_count = object
+            .methods
+            .iter()
+            .filter(|method| method.symbol == property.symbol)
+            .count();
+        if method_count == 0
+            && cached_annotation_identity(store, host, property.type_node)? != published
+        {
             return Err(ConcreteIndexedAccessError::InvalidCache(property.type_node));
+        }
+        if method_count != 0 {
+            let Some(StoredCallableSetValidation::Valid { projection, .. }) =
+                validate_stored_declared_method_callable_set(store, published)
+            else {
+                return Err(ConcreteIndexedAccessError::InvalidCache(property.type_node));
+            };
+            if projection.call_signatures.len() != method_count {
+                return Err(ConcreteIndexedAccessError::InvalidCache(property.type_node));
+            }
+            let methods = object
+                .methods
+                .iter()
+                .filter(|method| method.symbol == property.symbol);
+            for (method, callable) in methods.zip(projection.call_signatures.iter()) {
+                if cached_annotation_identity(store, host, method.return_type)?
+                    != callable
+                        .return_type
+                        .ok_or(ConcreteIndexedAccessError::InvalidCache(method.return_type))?
+                {
+                    return Err(ConcreteIndexedAccessError::InvalidCache(method.return_type));
+                }
+                let parameters = callable
+                    .parameters
+                    .iter()
+                    .copied()
+                    .chain(callable.rest_parameter);
+                for (parameter, expected) in method.parameters.iter().zip(parameters) {
+                    if cached_annotation_identity(store, host, parameter.type_node)? != expected {
+                        return Err(ConcreteIndexedAccessError::InvalidCache(
+                            parameter.type_node,
+                        ));
+                    }
+                }
+            }
         }
     }
 

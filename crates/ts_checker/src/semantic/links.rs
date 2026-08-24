@@ -970,6 +970,11 @@ impl<K: Eq + Hash, V> LinkStore<K, V> {
         self.arena.get(slot)
     }
 
+    /// Finds one stored key without exposing sparse-store iteration.
+    pub(super) fn find_key(&self, mut matches: impl FnMut(&K) -> bool) -> Option<&K> {
+        self.entries.keys().find(|key| matches(*key))
+    }
+
     /// Reads a record through a stable handle. Foreign handles are rejected.
     #[must_use]
     pub fn value(&self, handle: LinkHandle<V>) -> Option<&V> {

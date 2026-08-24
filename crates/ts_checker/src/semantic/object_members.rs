@@ -5,8 +5,9 @@
 //! and executes property, index, and signature annotations so one query
 //! retains a single dependency graph and resolution stack. Declared signature
 //! sets are limited to pure nongeneric, fixed-arity call or construct members.
-//! Named interface methods retain their own binder symbols, required primitive
-//! parameters, and an optional authenticated `any[]` rest parameter.
+//! Named interface and type-literal methods retain their own binder symbols,
+//! required annotated parameters, and an optional authenticated `any[]` rest
+//! parameter.
 
 use std::collections::{HashMap, HashSet};
 
@@ -106,7 +107,7 @@ pub(super) struct PlannedCallParameter {
     null_literal_identity: bool,
 }
 
-/// One named, nongeneric interface method in declaration order.
+/// One named, nongeneric interface or type-literal method in declaration order.
 ///
 /// Overloads share the binder-owned method symbol but keep separate signature
 /// declarations and parameter lists.
@@ -3870,6 +3871,7 @@ fn plan_members(
                 member_record.kind,
                 SyntaxKind::PropertyDeclaration
                     | SyntaxKind::PropertySignature
+                    | SyntaxKind::MethodSignature
                     | SyntaxKind::IndexSignature
                     | SyntaxKind::CallSignature
                     | SyntaxKind::ConstructSignature
@@ -3952,7 +3954,9 @@ fn plan_members(
         }
 
         if member_record.kind == SyntaxKind::MethodSignature {
-            if kind != PropertyObjectKind::Interface || policy != TypeLiteralMemberPolicy::General {
+            if kind == PropertyObjectKind::ObjectLiteral
+                || policy == TypeLiteralMemberPolicy::GenericInterface
+            {
                 return Err(PropertyObjectError::UnsupportedMember {
                     node: member,
                     kind: SyntaxKind::MethodSignature,
@@ -4512,9 +4516,7 @@ fn plan_interface_method(
         .map(|type_| NodeRef::new(declaration.arena, declaration.file, type_))
         .ok_or_else(unsupported)?;
     let return_record = preflight_node(store, host, return_type).map_err(|_| unsupported())?;
-    if !return_record.kind.is_keyword_type()
-        || !matches!(return_record.data, NodeData::KeywordTypeNode(_))
-        || return_record.flags.0 != 0
+    if return_record.flags.0 != 0
         || return_record.parent != Some(declaration.node)
         || return_record.range.start < method.parameters.range.end
         || return_record.range.end > record.range.end
@@ -4699,10 +4701,6 @@ fn plan_interface_method_parameter(
         {
             return Err(unsupported());
         }
-    } else if !type_record.kind.is_keyword_type()
-        || !matches!(type_record.data, NodeData::KeywordTypeNode(_))
-    {
-        return Err(unsupported());
     }
 
     let bound = host.bound_file(declaration).ok_or_else(unsupported)?;
@@ -7141,7 +7139,7 @@ fn resolved_interface_method_value(
     Some(type_)
 }
 
-/// Publishes one callable object per binder-owned interface method symbol.
+/// Publishes one callable object per binder-owned declared method symbol.
 ///
 /// `resolved` and the returned values follow `plan.methods` in declaration
 /// order. Overloads share one returned object and keep their signature order.
@@ -7162,11 +7160,17 @@ pub(super) fn publish_interface_method_values(
     if plan.methods.is_empty() && resolved.is_empty() {
         return Ok(Vec::new());
     }
-    let owner_type = store
-        .declared_type_links(plan.symbol)
-        .and_then(|links| links.declared_type)
-        .ok_or_else(|| invalid_plan(plan))?;
-    if plan.kind != PropertyObjectKind::Interface || resolved.len() != plan.methods.len() {
+    let owner_type = match plan.kind {
+        PropertyObjectKind::Interface => store
+            .declared_type_links(plan.symbol)
+            .and_then(|links| links.declared_type),
+        PropertyObjectKind::TypeLiteral => store
+            .type_node_links(plan.node)
+            .and_then(|links| links.resolved_type),
+        PropertyObjectKind::ObjectLiteral => None,
+    }
+    .ok_or_else(|| invalid_plan(plan))?;
+    if resolved.len() != plan.methods.len() {
         return Err(invalid_cache(plan, owner_type));
     }
 
