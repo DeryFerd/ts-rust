@@ -59,7 +59,6 @@ pub(super) enum SourceFunctionStatementsUnsupported {
         kind: SyntaxKind,
         role: SourceFunctionStatementsRole,
     },
-    InferredCallable(NodeRef),
     MissingFinalIf(NodeRef),
     MissingElse(NodeRef),
     MissingReturn(NodeRef),
@@ -4321,12 +4320,6 @@ impl SyntaxPlanner<'_> {
                 SourceFunctionStatementsRole::Callable,
             ));
         }
-        if self.callable.return_type.is_inferred() {
-            return Err(SourceFunctionStatementsError::Unsupported(
-                SourceFunctionStatementsUnsupported::InferredCallable(declaration),
-            ));
-        }
-
         let declaration_record = self.node(declaration)?;
         let NodeData::FunctionDeclaration(function) = &declaration_record.data else {
             return Err(self.unsupported(
@@ -8223,6 +8216,60 @@ mod joined_tests {
         assert_eq!(syntax.leading.len(), 1);
         assert_eq!(syntax.final_if.then_branch.locals.len(), 1);
         assert_eq!(syntax.final_if.else_branch.locals.len(), 1);
+    }
+
+    #[test]
+    fn final_if_accepts_inferred_functions_without_losing_branch_scope() {
+        let fixture = JoinedFixture::new(
+            concat!(
+                "function infer(value: string | undefined) {\n",
+                "  const before: string | undefined = value;\n",
+                "  if (value) {\n",
+                "    const selected: string = value;\n",
+                "    return selected;\n",
+                "  } else {\n",
+                "    const fallback = 1;\n",
+                "    return fallback;\n",
+                "  }\n",
+                "}\n",
+            ),
+            FileId::new(1_360),
+        );
+        let callable = fixture.callable();
+        assert!(callable.return_type.is_inferred());
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.mapper_len(),
+        );
+
+        let first = plan_source_function_statements_syntax(
+            &fixture.parsed.arena,
+            &fixture.bound,
+            &fixture.store,
+            &callable,
+        )
+        .unwrap();
+        let second = plan_source_function_statements_syntax(
+            &fixture.parsed.arena,
+            &fixture.bound,
+            &fixture.store,
+            &callable,
+        )
+        .unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(first.leading.len(), 1);
+        assert_eq!(first.final_if.then_branch.locals.len(), 1);
+        assert_eq!(first.final_if.else_branch.locals.len(), 1);
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.mapper_len(),
+            ),
+            before,
+        );
     }
 
     #[test]

@@ -14243,6 +14243,24 @@ fn preflight_inferred_function_return_dependencies(
         }
     }
 
+    fn local_initializers_are_closed(
+        declarations: &[PlannedVariable],
+        parameters: &[SourceCallableParameterPlan],
+        locals: &mut HashSet<SemanticSymbolId>,
+        functions: &[PlannedFunction],
+    ) -> bool {
+        declarations.iter().all(|local| {
+            let PlannedVariableInitializer::Expression(initializer) = &local.initializer else {
+                return false;
+            };
+            if !expression_is_closed(initializer, parameters, locals, functions) {
+                return false;
+            }
+            locals.insert(local.symbol);
+            true
+        })
+    }
+
     for function in functions {
         if !function.callable.return_type.is_inferred() {
             continue;
@@ -14293,36 +14311,22 @@ fn preflight_inferred_function_return_dependencies(
                         None
                     }
                 }));
-                let mut supported = true;
-                for local in &statements.locals {
-                    let PlannedVariableInitializer::Expression(initializer) = &local.initializer
-                    else {
-                        supported = false;
-                        break;
-                    };
-                    if !expression_is_closed(
-                        initializer,
-                        &function.callable.parameters,
-                        &locals,
-                        functions,
-                    ) {
-                        supported = false;
-                        break;
-                    }
-                    locals.insert(local.symbol);
-                }
-                supported
-                    && statements
-                        .return_expression
-                        .as_ref()
-                        .is_none_or(|expression| {
-                            expression_is_closed(
-                                expression,
-                                &function.callable.parameters,
-                                &locals,
-                                functions,
-                            )
-                        })
+                local_initializers_are_closed(
+                    &statements.locals,
+                    &function.callable.parameters,
+                    &mut locals,
+                    functions,
+                ) && statements
+                    .return_expression
+                    .as_ref()
+                    .is_none_or(|expression| {
+                        expression_is_closed(
+                            expression,
+                            &function.callable.parameters,
+                            &locals,
+                            functions,
+                        )
+                    })
             }
             PlannedFunctionBody::Switch(statements) => {
                 expression_is_closed(
@@ -14404,7 +14408,50 @@ fn preflight_inferred_function_return_dependencies(
                 &locals,
                 functions,
             ),
-            PlannedFunctionBody::Statements(_) | PlannedFunctionBody::JoinedStatements(_) => false,
+            PlannedFunctionBody::Statements(statements) => {
+                local_initializers_are_closed(
+                    &statements.leading,
+                    &function.callable.parameters,
+                    &mut locals,
+                    functions,
+                ) && match &statements.condition {
+                    PlannedSourceCondition::Truthiness { expression, .. } => expression_is_closed(
+                        expression,
+                        &function.callable.parameters,
+                        &locals,
+                        functions,
+                    ),
+                    PlannedSourceCondition::Typeof(condition) => {
+                        expression_is_closed(
+                            &condition.identifier,
+                            &function.callable.parameters,
+                            &locals,
+                            functions,
+                        ) && expression_is_closed(
+                            &condition.literal,
+                            &function.callable.parameters,
+                            &locals,
+                            functions,
+                        )
+                    }
+                } && [&statements.then_branch, &statements.else_branch]
+                    .into_iter()
+                    .all(|branch| {
+                        let mut branch_locals = locals.clone();
+                        local_initializers_are_closed(
+                            &branch.locals,
+                            &function.callable.parameters,
+                            &mut branch_locals,
+                            functions,
+                        ) && expression_is_closed(
+                            &branch.return_expression,
+                            &function.callable.parameters,
+                            &branch_locals,
+                            functions,
+                        )
+                    })
+            }
+            PlannedFunctionBody::JoinedStatements(_) => false,
         };
         if !initializers_supported || !body_supported {
             return Err(SourceCheckError::Unsupported(
@@ -19720,6 +19767,103 @@ fn check_planned_function_statements(
     )
 }
 
+#[allow(clippy::too_many_arguments)] // Uses the same source transaction as annotated branch bodies.
+fn check_planned_inferred_function_statements(
+    bound: &BoundFile,
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source: SourceFileRef,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    base_flow_types: HashMap<SemanticSymbolId, TypeId>,
+    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    type_import_capabilities: &HashMap<NodeRef, Vec<CanonicalTypeReferenceAliasTarget>>,
+    deferred: &mut Vec<DeferredAssertion>,
+    callable: &SourceCallablePlan,
+    statements: &PlannedFunctionStatements,
+    staged_value_types: &mut HashMap<SemanticSymbolId, TypeId>,
+    value_order: &mut Vec<SemanticSymbolId>,
+) -> Result<Vec<TypeId>, SourceCheckError> {
+    let mut frame = statements
+        .flow
+        .frame(bound, base_flow_types)
+        .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
+    check_planned_function_locals(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        session,
+        diagnostics,
+        &mut frame,
+        preflighted_type_import_value_uses,
+        type_import_capabilities,
+        deferred,
+        callable,
+        &statements.leading,
+        staged_value_types,
+        value_order,
+    )?;
+    check_planned_source_condition(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        session,
+        diagnostics,
+        &mut frame,
+        preflighted_type_import_value_uses,
+        deferred,
+        callable,
+        &statements.condition,
+    )?;
+
+    let mut return_types = Vec::with_capacity(2);
+    for branch in [&statements.then_branch, &statements.else_branch] {
+        check_planned_function_locals(
+            store,
+            host,
+            global_types,
+            source,
+            options,
+            session,
+            diagnostics,
+            &mut frame,
+            preflighted_type_import_value_uses,
+            type_import_capabilities,
+            deferred,
+            callable,
+            &branch.locals,
+            staged_value_types,
+            value_order,
+        )?;
+        let snapshot = frame
+            .snapshot_at(store, global_types, branch.return_statement)
+            .map_err(|error| SourcePlanner::source_flow_plan_error(callable, error))?;
+        session.reset_query();
+        let returned = check_expression_type(
+            store,
+            host,
+            global_types,
+            source,
+            options,
+            session,
+            diagnostics,
+            snapshot.types(),
+            preflighted_type_import_value_uses,
+            &branch.return_expression,
+            None,
+            deferred,
+        )?;
+        return_types.push(returned.result);
+    }
+    Ok(return_types)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn check_planned_joined_function_statements(
     bound: &BoundFile,
@@ -23643,6 +23787,42 @@ pub(super) fn check_source_file(
                 inferred_function_diagnostics[index] = Some(function_diagnostics);
                 continue;
             }
+            PlannedFunctionBody::Statements(statements) => {
+                let return_types = check_planned_inferred_function_statements(
+                    bound,
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    &mut function_diagnostics,
+                    body_flow_types,
+                    &preflighted_type_import_value_uses,
+                    &type_import_capabilities,
+                    &mut deferred,
+                    &function.callable,
+                    statements,
+                    &mut staged_value_types,
+                    &mut value_order,
+                )?;
+                let combined = store.expression_union_type_with_global_types(
+                    global_types,
+                    &return_types,
+                    UnionReduction::Subtype,
+                )?;
+                let widened = widened_fresh_literal_union_type(store, global_types, combined)?;
+                let inferred = store.get_widened_type_with_global_types(widened, global_types)?;
+                publish_inferred_source_callable_return(
+                    store,
+                    &function.callable,
+                    materialized.signature,
+                    inferred,
+                )
+                .map_err(SourcePlanner::callable_plan_error)?;
+                inferred_function_diagnostics[index] = Some(function_diagnostics);
+                continue;
+            }
             PlannedFunctionBody::Linear(statements) => {
                 let flow_types = check_planned_linear_function_statements(
                     bound,
@@ -23808,9 +23988,7 @@ pub(super) fn check_source_file(
                 inferred_function_diagnostics[index] = Some(function_diagnostics);
                 continue;
             }
-            PlannedFunctionBody::Ambient
-            | PlannedFunctionBody::Statements(_)
-            | PlannedFunctionBody::JoinedStatements(_) => {
+            PlannedFunctionBody::Ambient | PlannedFunctionBody::JoinedStatements(_) => {
                 return Err(SourceCheckError::Function(
                     SourceFunctionInvariant::Callable(function.callable.body),
                 ));
@@ -40160,6 +40338,88 @@ mod tests {
         assert!(bivariant.diagnostics().is_empty());
         assert!(is_type_checked(&strict, relation_file));
         assert!(is_type_checked(&bivariant, relation_file));
+    }
+
+    #[test]
+    fn inferred_branch_returns_preserve_flow_narrowing_and_canonical_union_identity() {
+        let source = parsed(concat!(
+            "function choose(value: string | undefined) { ",
+            "const before: string | undefined = value; ",
+            "if (value) { const selected: string = value; return selected; } ",
+            "else { const fallback = 1; return fallback; } } ",
+            "function classify(value: string | number) { ",
+            "if (typeof value === 'string') { ",
+            "const text: string = value; return text; ",
+            "} else { const count: number = value; return count; } } ",
+            "const chosen = choose('ready'); ",
+            "const classified = classify(1);",
+        ));
+        let file = FileId::new(8_520);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let expected = bootstrap.string_or_number_type;
+        for name in ["choose", "classify"] {
+            let owner = function_symbol(&context, &source, file, name);
+            let callable = context
+                .store()
+                .source_callable_type_for_owner(owner)
+                .unwrap();
+            let signature = context
+                .store()
+                .source_callable_provenance(callable)
+                .unwrap()
+                .signature;
+            assert_eq!(
+                context
+                    .store()
+                    .signature(signature)
+                    .unwrap()
+                    .resolved_return_type(),
+                Some(expected),
+                "{name}",
+            );
+        }
+        assert_eq!(
+            variable_value_type(&context, &source, file, "chosen"),
+            expected,
+        );
+        assert_eq!(
+            variable_value_type(&context, &source, file, "classified"),
+            expected,
+        );
+
+        for (name, expected) in [
+            ("selected", bootstrap.string_type),
+            ("text", bootstrap.string_type),
+            ("count", bootstrap.number_type),
+        ] {
+            let symbol = variable_symbol(&context, &source, file, name);
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(symbol)
+                    .and_then(|links| links.resolved_type),
+                Some(expected),
+                "{name}",
+            );
+        }
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
     }
 
     #[test]
