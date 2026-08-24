@@ -41941,7 +41941,8 @@ mod tests {
     fn anonymous_function_expression_callbacks_retain_their_inferred_signatures() {
         let source = parsed(concat!(
             "function accept(callback: () => number): void {} ",
-            "accept(function () { return 42; });",
+            "const callback = function () { return 42; }; ",
+            "accept(callback);",
         ));
         let file = FileId::new(8_708);
         let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
