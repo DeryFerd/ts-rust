@@ -27,7 +27,7 @@ use super::{
     },
     array_types::CanonicalArrayTargets,
     bootstrap::UnionReduction,
-    declared::cached_ordinary_type_parameter_owner,
+    declared::{cached_ordinary_type_parameter_owner, preflight_class_or_interface_reference},
     instantiate::InstantiationSession,
     object_members::{self, PropertyObjectError, PropertyObjectPlan},
     reference_types::validate_direct_generic_reference,
@@ -44,6 +44,9 @@ const GLOBAL_AUGMENTATION_DECLARE: u32 = 2_670;
 const AMBIENT_EXPORT_ASSIGNMENT_MUST_BE_ENTITY_NAME: u32 = 2_714;
 const USE_NAMESPACE_KEYWORD: u32 = 1_540;
 const CIRCULAR_DEFINITION_OF_IMPORT_ALIAS: u32 = 2_303;
+const PROPERTY_DOES_NOT_EXIST: u32 = 2_339;
+const TYPE_IS_NOT_A_CONSTRUCTOR: u32 = 2_507;
+const PROPERTY_HAS_NO_INITIALIZER: u32 = 2_564;
 const VARIABLE_IMPLICITLY_HAS_ANY_TYPE: u32 = 7_005;
 const NODE_FLAG_LET: u32 = 1 << 0;
 const NODE_FLAG_CONST: u32 = 1 << 1;
@@ -166,6 +169,35 @@ struct SourceNamespaceObjectInitializerPlan {
     object: PropertyObjectPlan,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SourceNamespaceClassHeritagePlan {
+    MissingPrivateExport {
+        property: NodeRef,
+        property_name: String,
+        namespace_name: String,
+    },
+    NonConstructorVariable {
+        expression: NodeRef,
+        symbol: SemanticSymbolId,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SourceNamespaceClassPropertyPlan {
+    declaration: NodeRef,
+    name: NodeRef,
+    symbol: SemanticSymbolId,
+    annotation: NodeRef,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SourceNamespaceClassPlan {
+    declaration: NodeRef,
+    symbol: SemanticSymbolId,
+    heritage: Option<SourceNamespaceClassHeritagePlan>,
+    property: Option<SourceNamespaceClassPropertyPlan>,
+}
+
 struct NamespaceVariablePlans<'a> {
     members: &'a mut Vec<SourceNamespaceMemberPlan>,
     implicit_variables: &'a mut Vec<SourceNamespaceImplicitVariablePlan>,
@@ -186,6 +218,7 @@ pub(super) struct SourceNamespacePlan {
     implicit_variables: Vec<SourceNamespaceImplicitVariablePlan>,
     ambient_variables: Vec<SourceNamespaceAmbientVariablePlan>,
     object_initializers: Vec<SourceNamespaceObjectInitializerPlan>,
+    classes: Vec<SourceNamespaceClassPlan>,
     diagnostics: Vec<NamespaceDiagnosticPlan>,
 }
 
@@ -2649,6 +2682,424 @@ fn plan_namespace_ambient_enum_member(
     })
 }
 
+#[allow(clippy::too_many_arguments)] // Class heritage must retain its namespace and prior locals.
+fn plan_namespace_class_heritage(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    namespace: (NodeRef, SemanticSymbolId),
+    declaration: NodeRef,
+    clauses: &ts_ast::NodeList,
+    prior_class_plans: &[SourceNamespaceClassPlan],
+    variables: &[SourceNamespaceImplicitVariablePlan],
+) -> Result<SourceNamespaceClassHeritagePlan, SourceCheckError> {
+    let (namespace, owner) = namespace;
+    let unsupported_heritage =
+        |node: NodeRef, kind: SyntaxKind| unsupported(node, kind, SourceSyntaxRole::Statement);
+    let [clause_id] = clauses.nodes.as_slice() else {
+        return Err(unsupported_heritage(
+            declaration,
+            SyntaxKind::ClassDeclaration,
+        ));
+    };
+    let clause = child(declaration, *clause_id);
+    let clause_record = owned_node(arena, bound, store, clause)?;
+    let NodeData::HeritageClause(heritage) = &clause_record.data else {
+        return Err(unsupported_heritage(clause, clause_record.kind));
+    };
+    let [base_id] = heritage.types.nodes.as_slice() else {
+        return Err(unsupported_heritage(clause, clause_record.kind));
+    };
+    if clauses.has_trailing_comma
+        || clause_record.kind != SyntaxKind::HeritageClause
+        || clause_record.flags.0 != 0
+        || clause_record.parent != Some(declaration.node)
+        || heritage.token != SyntaxKind::ExtendsKeyword
+        || heritage.facts != 0
+        || heritage.types.has_trailing_comma
+    {
+        return Err(unsupported_heritage(clause, clause_record.kind));
+    }
+
+    let base = child(clause, *base_id);
+    let base_record = owned_node(arena, bound, store, base)?;
+    let NodeData::ExpressionWithTypeArguments(target) = &base_record.data else {
+        return Err(unsupported_heritage(base, base_record.kind));
+    };
+    if base_record.kind != SyntaxKind::ExpressionWithTypeArguments
+        || base_record.flags.0 != 0
+        || base_record.parent != Some(clause.node)
+        || target.type_arguments.is_some()
+        || target.facts != 0
+    {
+        return Err(unsupported_heritage(base, base_record.kind));
+    }
+
+    let expression = child(base, target.expression);
+    let expression_record = owned_node(arena, bound, store, expression)?;
+    if expression_record.flags.0 != 0 || expression_record.parent != Some(base.node) {
+        return Err(unsupported_heritage(expression, expression_record.kind));
+    }
+    match &expression_record.data {
+        NodeData::PropertyAccessExpression(_) | NodeData::QualifiedName(_) => {
+            let (receiver_id, property_id) = match &expression_record.data {
+                NodeData::PropertyAccessExpression(access)
+                    if expression_record.kind == SyntaxKind::PropertyAccessExpression
+                        && access.flow_node.is_none()
+                        && access.question_dot_token.is_none()
+                        && access.facts == 0 =>
+                {
+                    (access.expression, access.name)
+                }
+                NodeData::QualifiedName(qualified)
+                    if expression_record.kind == SyntaxKind::QualifiedName
+                        && qualified.flow_node.is_none()
+                        && qualified.facts == 0 =>
+                {
+                    (qualified.left, qualified.right)
+                }
+                _ => return Err(unsupported_heritage(expression, expression_record.kind)),
+            };
+            let receiver = child(expression, receiver_id);
+            let receiver_record = owned_node(arena, bound, store, receiver)?;
+            let NodeData::Identifier(receiver_name) = &receiver_record.data else {
+                return Err(unsupported_heritage(receiver, receiver_record.kind));
+            };
+            let property = child(expression, property_id);
+            let property_record = owned_node(arena, bound, store, property)?;
+            let NodeData::Identifier(property_name) = &property_record.data else {
+                return Err(unsupported_heritage(property, property_record.kind));
+            };
+            let namespace_record = owned_node(arena, bound, store, namespace)?;
+            let NodeData::ModuleDeclaration(namespace_data) = &namespace_record.data else {
+                return Err(unsupported_heritage(namespace, namespace_record.kind));
+            };
+            let namespace_name = child(namespace, namespace_data.name);
+            let namespace_name_record = owned_node(arena, bound, store, namespace_name)?;
+            let NodeData::Identifier(namespace_identifier) = &namespace_name_record.data else {
+                return Err(unsupported_heritage(
+                    namespace_name,
+                    namespace_name_record.kind,
+                ));
+            };
+            let private_class = prior_class_plans.iter().find(|class| {
+                store
+                    .symbol(class.symbol)
+                    .and_then(|symbol| symbol.name().as_utf8())
+                    == Some(property_name.text.as_str())
+            });
+            let Some(private_class) = private_class else {
+                return Err(unsupported_heritage(property, property_record.kind));
+            };
+            if receiver_record.kind != SyntaxKind::Identifier
+                || receiver_record.flags.0 != 0
+                || receiver_record.parent != Some(expression.node)
+                || receiver_record.range.start < expression_record.range.start
+                || receiver_name.flow_node.is_some()
+                || receiver_name.text != namespace_identifier.text
+                || property_record.kind != SyntaxKind::Identifier
+                || property_record.flags.0 != 0
+                || property_record.parent != Some(expression.node)
+                || property_record.range.start < receiver_record.range.end
+                || property_record.range.end > expression_record.range.end
+                || property_name.flow_node.is_some()
+                || namespace_name_record.kind != SyntaxKind::Identifier
+                || namespace_name_record.parent != Some(namespace.node)
+                || store
+                    .symbol(owner)
+                    .and_then(|symbol| symbol.name().as_utf8())
+                    != Some(receiver_name.text.as_str())
+                || bound
+                    .locals(namespace)
+                    .and_then(|locals| store.symbol_table(locals))
+                    .and_then(|locals| locals.get_source(&property_name.text))
+                    != Some(private_class.symbol)
+                || store
+                    .symbol(owner)
+                    .and_then(ts_binder::semantic::Symbol::exports)
+                    .and_then(|exports| store.symbol_table(exports))
+                    .is_some_and(|exports| exports.get_source(&property_name.text).is_some())
+                || store.symbol_node_links(receiver).is_some_and(|links| {
+                    links.resolved_symbol.is_some_and(|symbol| symbol != owner)
+                })
+            {
+                return Err(unsupported_heritage(expression, expression_record.kind));
+            }
+            Ok(SourceNamespaceClassHeritagePlan::MissingPrivateExport {
+                property,
+                property_name: property_name.text.clone(),
+                namespace_name: receiver_name.text.clone(),
+            })
+        }
+        NodeData::Identifier(identifier)
+            if expression_record.kind == SyntaxKind::Identifier
+                && identifier.flow_node.is_none()
+                && !identifier.text.is_empty() =>
+        {
+            let Some(variable) = variables.iter().find(|variable| {
+                variable.name == identifier.text && variable.initializer.is_some()
+            }) else {
+                return Err(unsupported_heritage(expression, expression_record.kind));
+            };
+            if store
+                .symbol(variable.symbol)
+                .is_none_or(|record| record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE)
+                || bound
+                    .locals(namespace)
+                    .and_then(|locals| store.symbol_table(locals))
+                    .and_then(|locals| locals.get_source(&identifier.text))
+                    != Some(variable.symbol)
+                || store.symbol_node_links(expression).is_some_and(|links| {
+                    links
+                        .resolved_symbol
+                        .is_some_and(|symbol| symbol != variable.symbol)
+                })
+            {
+                return Err(unsupported_heritage(expression, expression_record.kind));
+            }
+            Ok(SourceNamespaceClassHeritagePlan::NonConstructorVariable {
+                expression,
+                symbol: variable.symbol,
+            })
+        }
+        _ => Err(unsupported_heritage(expression, expression_record.kind)),
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // Local class ownership includes earlier namespace members.
+fn plan_namespace_class(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    namespace: (NodeRef, SemanticSymbolId),
+    ambient: bool,
+    declaration: NodeRef,
+    classes: &[SourceNamespaceClassPlan],
+    variables: &[SourceNamespaceImplicitVariablePlan],
+) -> Result<SourceNamespaceClassPlan, SourceCheckError> {
+    let (namespace, owner) = namespace;
+    let record = owned_node(arena, bound, store, declaration)?;
+    let NodeData::ClassDeclaration(class) = &record.data else {
+        return Err(unsupported(
+            declaration,
+            record.kind,
+            SourceSyntaxRole::Statement,
+        ));
+    };
+    let Some(name_id) = class.name else {
+        return Err(unsupported(
+            declaration,
+            record.kind,
+            SourceSyntaxRole::Statement,
+        ));
+    };
+    let name = child(declaration, name_id);
+    let name_record = owned_node(arena, bound, store, name)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(unsupported(
+            name,
+            name_record.kind,
+            SourceSyntaxRole::Statement,
+        ));
+    };
+    let symbol = declaration_symbol(bound, store, declaration, SymbolFlags::CLASS)?;
+    let class_record = store
+        .symbol(symbol)
+        .ok_or(SourceCheckError::Class(declaration))?;
+    let exports = class_record
+        .exports()
+        .and_then(|exports| store.symbol_table(exports))
+        .ok_or(SourceCheckError::Class(declaration))?;
+    let prototype = exports
+        .get_source("prototype")
+        .and_then(|symbol| store.symbol(symbol).map(|record| (symbol, record)))
+        .ok_or(SourceCheckError::Class(declaration))?;
+    if ambient
+        || record.kind != SyntaxKind::ClassDeclaration
+        || record.flags.0 != 0
+        || class.flow_node.is_some()
+        || class.local_symbol.is_some()
+        || class.next_container.is_some()
+        || class.symbol.is_some()
+        || class.type_parameters.is_some()
+        || class.modifiers.is_some()
+        || class.facts != 0
+        || class.members.has_trailing_comma
+        || class.members.nodes.len() > 1
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(declaration.node)
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+        || class_record.flags() != SymbolFlags::CLASS
+        || class_record.check_flags() != CheckFlags::NONE
+        || class_record.name().as_utf8() != Some(identifier.text.as_str())
+        || class_record.declarations() != Some(&[declaration])
+        || class_record.value_declaration() != Some(declaration)
+        || class_record.parent().is_some()
+        || class_record.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || bound.local_symbol(declaration).is_some()
+        || bound
+            .locals(namespace)
+            .and_then(|locals| store.symbol_table(locals))
+            .and_then(|locals| locals.get_source(&identifier.text))
+            != Some(symbol)
+        || store
+            .symbol(owner)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| store.symbol_table(exports))
+            .is_some_and(|exports| exports.get_source(&identifier.text).is_some())
+        || exports.len() != 1
+        || prototype.1.flags() != SymbolFlags::PROPERTY | SymbolFlags::PROTOTYPE
+        || prototype.1.check_flags() != CheckFlags::NONE
+        || prototype.1.name().as_utf8() != Some("prototype")
+        || prototype.1.declarations().is_some()
+        || prototype.1.value_declaration().is_some()
+        || prototype.1.members().is_some()
+        || prototype.1.exports().is_some()
+        || prototype.1.parent() != Some(symbol)
+        || prototype.1.export_symbol().is_some()
+        || store.get_merged_symbol(prototype.0) != Some(prototype.0)
+    {
+        return Err(unsupported(
+            declaration,
+            record.kind,
+            SourceSyntaxRole::Statement,
+        ));
+    }
+
+    let property = match class.members.nodes.as_slice() {
+        [] => None,
+        [member_id] => {
+            let member = child(declaration, *member_id);
+            let member_record = owned_node(arena, bound, store, member)?;
+            let NodeData::PropertyDeclaration(property) = &member_record.data else {
+                return Err(unsupported(
+                    member,
+                    member_record.kind,
+                    SourceSyntaxRole::Statement,
+                ));
+            };
+            let Some(annotation_id) = property.type_ else {
+                return Err(unsupported(
+                    member,
+                    member_record.kind,
+                    SourceSyntaxRole::Statement,
+                ));
+            };
+            let annotation = child(member, annotation_id);
+            let annotation_record = owned_node(arena, bound, store, annotation)?;
+            let property_name = child(member, property.name);
+            let property_name_record = owned_node(arena, bound, store, property_name)?;
+            let NodeData::Identifier(property_identifier) = &property_name_record.data else {
+                return Err(unsupported(
+                    property_name,
+                    property_name_record.kind,
+                    SourceSyntaxRole::Statement,
+                ));
+            };
+            let property_symbol = declaration_symbol(bound, store, member, SymbolFlags::PROPERTY)?;
+            let property_owner = store
+                .symbol(property_symbol)
+                .ok_or(SourceCheckError::Class(declaration))?;
+            if member_record.kind != SyntaxKind::PropertyDeclaration
+                || member_record.flags.0 != 0
+                || member_record.parent != Some(declaration.node)
+                || property.initializer.is_some()
+                || property.postfix_token.is_some()
+                || property.symbol.is_some()
+                || property.modifiers.is_some()
+                || property.facts != 0
+                || !matches!(
+                    annotation_record.kind,
+                    SyntaxKind::StringKeyword | SyntaxKind::NumberKeyword
+                )
+                || annotation_record.flags.0 != 0
+                || annotation_record.parent != Some(member.node)
+                || !matches!(annotation_record.data, NodeData::KeywordTypeNode(_))
+                || property_name_record.kind != SyntaxKind::Identifier
+                || property_name_record.flags.0 != 0
+                || property_name_record.parent != Some(member.node)
+                || property_identifier.flow_node.is_some()
+                || property_identifier.text.is_empty()
+                || property_owner.flags() != SymbolFlags::PROPERTY
+                || property_owner.check_flags() != CheckFlags::NONE
+                || property_owner.name().as_utf8() != Some(property_identifier.text.as_str())
+                || property_owner.declarations() != Some(&[member])
+                || property_owner.value_declaration() != Some(member)
+                || property_owner.members().is_some()
+                || property_owner.exports().is_some()
+                || property_owner.parent() != Some(symbol)
+                || property_owner.export_symbol().is_some()
+                || store.get_merged_symbol(property_symbol) != Some(property_symbol)
+                || class_record
+                    .members()
+                    .and_then(|members| store.symbol_table(members))
+                    .and_then(|members| members.get_source(&property_identifier.text))
+                    != Some(property_symbol)
+            {
+                return Err(unsupported(
+                    member,
+                    member_record.kind,
+                    SourceSyntaxRole::Statement,
+                ));
+            }
+            Some(SourceNamespaceClassPropertyPlan {
+                declaration: member,
+                name: property_name,
+                symbol: property_symbol,
+                annotation,
+            })
+        }
+        _ => unreachable!("namespace classes admit at most one member"),
+    };
+    if class_record
+        .members()
+        .and_then(|members| store.symbol_table(members))
+        .map_or(0, ts_binder::semantic::SymbolTable::len)
+        != usize::from(property.is_some())
+    {
+        return Err(SourceCheckError::Class(declaration));
+    }
+
+    let heritage = class
+        .heritage_clauses
+        .as_ref()
+        .map(|clauses| {
+            plan_namespace_class_heritage(
+                arena,
+                bound,
+                store,
+                (namespace, owner),
+                declaration,
+                clauses,
+                classes,
+                variables,
+            )
+        })
+        .transpose()?;
+    if property.is_some()
+        && !matches!(
+            heritage,
+            Some(SourceNamespaceClassHeritagePlan::NonConstructorVariable { .. })
+        )
+    {
+        return Err(unsupported(
+            declaration,
+            record.kind,
+            SourceSyntaxRole::Statement,
+        ));
+    }
+
+    Ok(SourceNamespaceClassPlan {
+        declaration,
+        symbol,
+        heritage,
+        property,
+    })
+}
+
 fn plan_namespace_variables(
     arena: &NodeArena,
     bound: &BoundFile,
@@ -3404,6 +3855,7 @@ fn plan_namespace(
     let mut implicit_variables = Vec::new();
     let mut ambient_variables = Vec::new();
     let mut object_initializers = Vec::new();
+    let mut classes = Vec::new();
     if let Some(body) = namespace.body {
         let body = child(declaration, body);
         let body_record = owned_node(arena, bound, store, body)?;
@@ -3495,6 +3947,19 @@ fn plan_namespace(
                                 statement,
                             )?);
                         }
+                        SyntaxKind::ClassDeclaration if !ambient => {
+                            let class = plan_namespace_class(
+                                arena,
+                                bound,
+                                store,
+                                (declaration, symbol),
+                                ambient,
+                                statement,
+                                &classes,
+                                &implicit_variables,
+                            )?;
+                            classes.push(class);
+                        }
                         SyntaxKind::VariableStatement => {
                             plan_namespace_variables(
                                 arena,
@@ -3575,6 +4040,7 @@ fn plan_namespace(
         implicit_variables,
         ambient_variables,
         object_initializers,
+        classes,
         diagnostics,
     })
 }
@@ -3678,6 +4144,18 @@ fn namespace_object_initializers<'plan>(
     for member in &plan.members {
         if let SourceNamespaceMemberPlan::Namespace(nested) = member {
             namespace_object_initializers(nested, initializers);
+        }
+    }
+}
+
+fn namespace_classes<'plan>(
+    plan: &'plan SourceNamespacePlan,
+    classes: &mut Vec<&'plan SourceNamespaceClassPlan>,
+) {
+    classes.extend(&plan.classes);
+    for member in &plan.members {
+        if let SourceNamespaceMemberPlan::Namespace(nested) = member {
+            namespace_classes(nested, classes);
         }
     }
 }
@@ -4245,6 +4723,7 @@ pub(super) fn execute_source_namespace(
     let mut implicit_variables = Vec::new();
     let mut ambient_variables = Vec::new();
     let mut object_initializers = Vec::new();
+    let mut classes = Vec::new();
     namespace_annotations(
         plan,
         &mut annotations,
@@ -4254,6 +4733,40 @@ pub(super) fn execute_source_namespace(
     namespace_implicit_variables(plan, &mut implicit_variables);
     namespace_ambient_variables(plan, &mut ambient_variables);
     namespace_object_initializers(plan, &mut object_initializers);
+    namespace_classes(plan, &mut classes);
+    for class in &classes {
+        if let Some(property) = class.property.as_ref() {
+            annotations.push(property.annotation);
+        }
+        if preflight_class_or_interface_reference(store, host, class.symbol, SymbolFlags::CLASS)?
+            != 0
+        {
+            return Err(SourceCheckError::Class(class.declaration));
+        }
+        let diagnostic = match class.heritage.as_ref() {
+            Some(SourceNamespaceClassHeritagePlan::MissingPrivateExport { .. }) => {
+                Some(PROPERTY_DOES_NOT_EXIST)
+            }
+            Some(SourceNamespaceClassHeritagePlan::NonConstructorVariable { .. }) => {
+                Some(TYPE_IS_NOT_A_CONSTRUCTOR)
+            }
+            None => None,
+        };
+        if let Some(code) = diagnostic
+            && message_by_code(code).is_none()
+        {
+            return Err(SourceCheckError::MissingDiagnostic(code));
+        }
+        if class.property.is_some()
+            && options.intrinsic.strict_null_checks
+            && options.strict_property_initialization
+            && message_by_code(PROPERTY_HAS_NO_INITIALIZER).is_none()
+        {
+            return Err(SourceCheckError::MissingDiagnostic(
+                PROPERTY_HAS_NO_INITIALIZER,
+            ));
+        }
+    }
     implicit_variables.sort_by_key(|variable| {
         host.node(variable.declaration)
             .map_or(u32::MAX, |node| node.range.start.get())
@@ -4732,6 +5245,38 @@ pub(super) fn execute_source_namespace(
         }
     }
 
+    for class in &classes {
+        let instance = store.get_declared_type_of_symbol(host, class.symbol)?;
+        let Some(record) = store.type_payload(instance) else {
+            return Err(SourceCheckError::Class(class.declaration));
+        };
+        if record.symbol() != Some(class.symbol)
+            || !record.object_flags().contains(ObjectFlags::CLASS)
+            || !matches!(record.data(), TypeData::Interface(_))
+        {
+            return Err(SourceCheckError::Class(class.declaration));
+        }
+        if let Some(property) = class.property.as_ref() {
+            session.reset_query();
+            let type_ = CanonicalTypeQuery::new_with_global_types_and_session(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                diagnostics,
+            )?
+            .get_type_from_type_node(property.annotation)?;
+            stage_namespace_value(
+                store,
+                &mut values,
+                property.declaration,
+                property.symbol,
+                type_,
+            )?;
+        }
+    }
+
     let mut ambient_expression_types = Vec::<(NodeRef, TypeId)>::new();
     let mut ambient_expression_symbols = Vec::<(NodeRef, SemanticSymbolId)>::new();
     for variable in ambient_variables {
@@ -4948,6 +5493,74 @@ pub(super) fn execute_source_namespace(
             },
         );
     }
+    for class in classes {
+        if let Some(heritage) = class.heritage.as_ref() {
+            let (node, code, arguments) = match heritage {
+                SourceNamespaceClassHeritagePlan::MissingPrivateExport {
+                    property,
+                    property_name,
+                    namespace_name,
+                } => (
+                    *property,
+                    PROPERTY_DOES_NOT_EXIST,
+                    vec![property_name.clone(), format!("typeof {namespace_name}")],
+                ),
+                SourceNamespaceClassHeritagePlan::NonConstructorVariable { expression, symbol } => {
+                    let number = store
+                        .intrinsic_bootstrap()
+                        .ok_or(SourceCheckError::LiteralCache(
+                            SourceLiteralCacheError::BootstrapUninitialized,
+                        ))?
+                        .number_type;
+                    if store
+                        .value_symbol_links(*symbol)
+                        .and_then(|links| links.resolved_type)
+                        != Some(number)
+                    {
+                        return Err(SourceCheckError::Class(class.declaration));
+                    }
+                    (
+                        *expression,
+                        TYPE_IS_NOT_A_CONSTRUCTOR,
+                        vec!["number".to_owned()],
+                    )
+                }
+            };
+            let message = message_by_code(code).ok_or(SourceCheckError::MissingDiagnostic(code))?;
+            super::source::merge_retry_diagnostic(
+                diagnostics,
+                super::CanonicalCheckerDiagnostic {
+                    node: Some(node),
+                    range_override: None,
+                    diagnostic: Diagnostic::with_arguments(message, arguments),
+                    related_information: Vec::new(),
+                },
+            );
+        }
+        if let Some(property) = class.property.as_ref()
+            && options.intrinsic.strict_null_checks
+            && options.strict_property_initialization
+        {
+            let name = host
+                .node(property.name)
+                .ok_or_else(|| missing_node(property.name))?;
+            let NodeData::Identifier(identifier) = &name.data else {
+                return Err(SourceCheckError::Class(class.declaration));
+            };
+            let message = message_by_code(PROPERTY_HAS_NO_INITIALIZER).ok_or(
+                SourceCheckError::MissingDiagnostic(PROPERTY_HAS_NO_INITIALIZER),
+            )?;
+            super::source::merge_retry_diagnostic(
+                diagnostics,
+                super::CanonicalCheckerDiagnostic {
+                    node: Some(property.name),
+                    range_override: None,
+                    diagnostic: Diagnostic::with_arguments(message, [identifier.text.clone()]),
+                    related_information: Vec::new(),
+                },
+            );
+        }
+    }
     Ok(())
 }
 
@@ -5115,6 +5728,265 @@ mod tests {
         assert!(leaf.members.is_empty());
         assert_ne!(outer.symbol, middle.symbol);
         assert_ne!(middle.symbol, leaf.symbol);
+    }
+
+    #[test]
+    fn private_namespace_classes_report_unexported_qualified_bases_cold_and_warm() {
+        let mut fixture = fixture(
+            "namespace M { class C {} class D extends M.C {} }",
+            CanonicalModuleState::Script,
+        );
+        let namespace = plan(&fixture, 0);
+        let [base, derived] = namespace.classes.as_slice() else {
+            panic!("the namespace must retain both private classes")
+        };
+        let base_symbol = base.symbol;
+        let derived_symbol = derived.symbol;
+        let Some(SourceNamespaceClassHeritagePlan::MissingPrivateExport { property, .. }) =
+            derived.heritage.as_ref()
+        else {
+            panic!("the derived class must retain its missing private export")
+        };
+        let property = *property;
+        let qualified = fixture
+            .parsed
+            .arena
+            .get(property.node)
+            .and_then(|record| record.parent)
+            .and_then(|parent| fixture.parsed.arena.get(parent))
+            .expect("the private class name must retain its heritage expression");
+        assert_eq!(qualified.kind, SyntaxKind::QualifiedName);
+
+        let diagnostics = execute(&mut fixture, &namespace).unwrap();
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("the private qualified base must produce one diagnostic")
+        };
+        assert_eq!(diagnostic.node, Some(property));
+        assert_eq!(diagnostic.diagnostic.code(), PROPERTY_DOES_NOT_EXIST);
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "Property 'C' does not exist on type 'typeof M'.",
+        );
+        for symbol in [base_symbol, derived_symbol] {
+            let type_ = fixture
+                .context
+                .store()
+                .declared_type_links(symbol)
+                .and_then(|links| links.declared_type)
+                .unwrap();
+            assert!(
+                fixture
+                    .context
+                    .store()
+                    .type_payload(type_)
+                    .unwrap()
+                    .object_flags()
+                    .contains(ObjectFlags::CLASS)
+            );
+            assert!(fixture.context.store().value_symbol_links(symbol).is_none());
+        }
+
+        let warm = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+        let diagnostics = execute(&mut fixture, &namespace).unwrap();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn private_namespace_classes_report_numeric_base_and_strict_field_in_order() {
+        let mut options = CanonicalCheckerOptions::default();
+        options.intrinsic.strict_null_checks = true;
+        options.strict_property_initialization = true;
+        let mut fixture = fixture_with_options(
+            "namespace Foo { var A = 1; class B extends A { b: string; } }",
+            CanonicalModuleState::Script,
+            options,
+        );
+        let namespace = plan(&fixture, 0);
+        let [class] = namespace.classes.as_slice() else {
+            panic!("the namespace must retain its private derived class")
+        };
+        let class_symbol = class.symbol;
+        let property = class.property.as_ref().unwrap().clone();
+        let Some(SourceNamespaceClassHeritagePlan::NonConstructorVariable { expression, symbol }) =
+            class.heritage.as_ref()
+        else {
+            panic!("the class must retain its numeric local base")
+        };
+        let expression = *expression;
+        let base_symbol = *symbol;
+
+        let diagnostics = execute(&mut fixture, &namespace).unwrap();
+        assert_eq!(
+            diagnostics
+                .as_slice()
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [TYPE_IS_NOT_A_CONSTRUCTOR, PROPERTY_HAS_NO_INITIALIZER],
+        );
+        assert_eq!(diagnostics.as_slice()[0].node, Some(expression));
+        assert_eq!(diagnostics.as_slice()[1].node, Some(property.name));
+        assert_eq!(
+            diagnostics.as_slice()[0].diagnostic.render().unwrap(),
+            "Type 'number' is not a constructor function type.",
+        );
+        assert_eq!(
+            diagnostics.as_slice()[1].diagnostic.render().unwrap(),
+            "Property 'b' has no initializer and is not definitely assigned in the constructor.",
+        );
+        let bootstrap = fixture.context.store().intrinsic_bootstrap().unwrap();
+        assert_eq!(
+            fixture
+                .context
+                .store()
+                .value_symbol_links(base_symbol)
+                .and_then(|links| links.resolved_type),
+            Some(bootstrap.number_type),
+        );
+        assert_eq!(
+            fixture
+                .context
+                .store()
+                .value_symbol_links(property.symbol)
+                .and_then(|links| links.resolved_type),
+            Some(bootstrap.string_type),
+        );
+        assert!(
+            fixture
+                .context
+                .store()
+                .declared_type_links(class_symbol)
+                .and_then(|links| links.declared_type)
+                .is_some()
+        );
+
+        let warm = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+        assert_eq!(execute(&mut fixture, &namespace).unwrap().len(), 2);
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn private_namespace_class_fields_follow_strict_initialization_options() {
+        for (strict_null_checks, strict_property_initialization, expected) in [
+            (false, false, 1),
+            (true, false, 1),
+            (false, true, 1),
+            (true, true, 2),
+        ] {
+            let mut options = CanonicalCheckerOptions::default();
+            options.intrinsic.strict_null_checks = strict_null_checks;
+            options.strict_property_initialization = strict_property_initialization;
+            let mut fixture = fixture_with_options(
+                "namespace Foo { var A = 1; class B extends A { b: string; } }",
+                CanonicalModuleState::Script,
+                options,
+            );
+            let namespace = plan(&fixture, 0);
+
+            assert_eq!(execute(&mut fixture, &namespace).unwrap().len(), expected);
+        }
+    }
+
+    #[test]
+    fn private_namespace_class_diagnostics_preserve_earlier_top_level_class_order() {
+        let mut options = CanonicalCheckerOptions::default();
+        options.intrinsic.strict_null_checks = true;
+        options.strict_property_initialization = true;
+        let mut fixture = fixture_with_options(
+            "class A { a: number; } namespace Foo { var A = 1; class B extends A { b: string; } }",
+            CanonicalModuleState::Script,
+            options,
+        );
+
+        fixture.context.check_source_file(fixture.file).unwrap();
+
+        assert_eq!(
+            fixture
+                .context
+                .diagnostics()
+                .as_slice()
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [
+                PROPERTY_HAS_NO_INITIALIZER,
+                TYPE_IS_NOT_A_CONSTRUCTOR,
+                PROPERTY_HAS_NO_INITIALIZER,
+            ],
+        );
+    }
+
+    #[test]
+    fn forged_namespace_class_plans_fail_before_publication() {
+        let mut fixture = fixture(
+            "namespace M { class C {} class D extends M.C {} }",
+            CanonicalModuleState::Script,
+        );
+        let namespace = plan(&fixture, 0);
+        let mut forged = namespace.clone();
+        forged.classes[0].symbol = namespace.symbol;
+        let before = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+
+        assert!(matches!(
+            execute(&mut fixture, &forged),
+            Err(SourceCheckError::Unsupported(_))
+        ));
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+    }
+
+    #[test]
+    fn namespace_classes_reject_exported_generic_and_unsupported_shapes() {
+        for source in [
+            "namespace M { export class C {} }",
+            "namespace M { class C<T> {} }",
+            "namespace M { class C { value: string; } }",
+            "namespace M { class C {} class D extends C {} }",
+            "namespace M { class C {} class D extends Other.C {} }",
+            "namespace M { class C {} class D extends M.Unknown {} }",
+        ] {
+            let fixture = fixture(source, CanonicalModuleState::Script);
+            let declaration = declaration(&fixture, 0);
+            let (arena, bound) = fixture.context.file(fixture.file).unwrap();
+
+            assert!(matches!(
+                plan_source_namespace(arena, bound, fixture.context.store(), declaration),
+                Err(SourceCheckError::Unsupported(_))
+            ));
+        }
     }
 
     #[test]
