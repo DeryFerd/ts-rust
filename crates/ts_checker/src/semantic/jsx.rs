@@ -1,11 +1,11 @@
 //! Canonical checking for basic JSX elements.
 //!
 //! This module follows the pinned JSX checker for global `JSX` namespaces,
-//! named or indexed intrinsic tags, and fixed or inferred function components.
-//! It writes only to the existing semantic graph. Inline object-literal and
-//! identifier spreads reuse canonical object publication. Dotted component
-//! names retain authenticated namespace exports. Other spreads, broader
-//! contextual child expressions, and factory imports remain explicit boundaries.
+//! named, indexed, or string-union intrinsic tags, and fixed or inferred
+//! function components. Inline object-literal and identifier spreads reuse
+//! canonical object publication. Dotted component names retain authenticated
+//! namespace exports. Other spreads, broader contextual child expressions,
+//! and factory imports remain explicit capability boundaries.
 
 use std::collections::HashSet;
 
@@ -45,6 +45,7 @@ use super::{
     source_calls::resolve_jsx_generic_component_signature,
     spelling::get_spelling_suggestion,
     type_nodes::CanonicalTypeQuery,
+    type_records::LiteralValue,
     types::{ObjectFlags, TypeFlags},
 };
 
@@ -1541,7 +1542,10 @@ fn resolve_jsx_namespace(
     plan: &JsxElementPlan,
 ) -> Result<JsxNamespace, SourceCheckError> {
     let location = plan.expression;
-    let intrinsic_names = jsx_plan_intrinsic_names(plan);
+    let (arena, bound) = host.source(location).ok_or(SourceCheckError::Provenance(
+        SourceCheckProvenanceError::MissingNode(location),
+    ))?;
+    let intrinsic_names = jsx_plan_intrinsic_names(store, arena, bound, plan);
     let needs_intrinsics = !intrinsic_names.is_empty();
     let (globals, unknown_symbol, error_type, any_type) = {
         let bootstrap = store
@@ -1984,13 +1988,24 @@ fn is_unchecked_global_jsx_namespace_alias(
             == Some(alias)
 }
 
-fn jsx_plan_intrinsic_names(plan: &JsxElementPlan) -> HashSet<String> {
+fn jsx_plan_intrinsic_names(
+    store: &CanonicalTypeMapperStore,
+    arena: &NodeArena,
+    bound: &BoundFile,
+    plan: &JsxElementPlan,
+) -> HashSet<String> {
     let mut names = HashSet::new();
-    collect_jsx_plan_intrinsic_names(plan, &mut names);
+    collect_jsx_plan_intrinsic_names(store, arena, bound, plan, &mut names);
     names
 }
 
-fn collect_jsx_plan_intrinsic_names(plan: &JsxElementPlan, names: &mut HashSet<String>) {
+fn collect_jsx_plan_intrinsic_names(
+    store: &CanonicalTypeMapperStore,
+    arena: &NodeArena,
+    bound: &BoundFile,
+    plan: &JsxElementPlan,
+    names: &mut HashSet<String>,
+) {
     match &plan.kind {
         JsxElementPlanKind::Element {
             tag,
@@ -2000,6 +2015,11 @@ fn collect_jsx_plan_intrinsic_names(plan: &JsxElementPlan, names: &mut HashSet<S
         } => {
             if tag.intrinsic {
                 names.insert(tag.name.clone());
+            } else if let Some(symbol) = resolve_source_value_symbol(store, bound, &tag.name)
+                && let Ok(type_) = jsx_component_value_type(store, arena, bound, symbol, tag.node)
+                && let Some(intrinsics) = jsx_intrinsic_component_names(store, type_)
+            {
+                names.extend(intrinsics);
             }
             if let Some(closing) = closing
                 && closing.tag.intrinsic
@@ -2010,19 +2030,19 @@ fn collect_jsx_plan_intrinsic_names(plan: &JsxElementPlan, names: &mut HashSet<S
                 JsxAttributesPlan::Properties(properties) => {
                     for property in properties {
                         if let JsxAttributeValue::Expression { value, .. } = &property.value {
-                            collect_jsx_scalar_intrinsic_names(value, names);
+                            collect_jsx_scalar_intrinsic_names(store, arena, bound, value, names);
                         }
                     }
                 }
                 JsxAttributesPlan::ObjectSpread(spread) => {
                     for property in &spread.properties {
                         if let JsxAttributeValue::Expression { value, .. } = &property.value {
-                            collect_jsx_scalar_intrinsic_names(value, names);
+                            collect_jsx_scalar_intrinsic_names(store, arena, bound, value, names);
                         }
                     }
                 }
                 JsxAttributesPlan::SourceSpread(spread) => {
-                    collect_jsx_scalar_intrinsic_names(&spread.value, names);
+                    collect_jsx_scalar_intrinsic_names(store, arena, bound, &spread.value, names);
                 }
             }
         }
@@ -2032,21 +2052,31 @@ fn collect_jsx_plan_intrinsic_names(plan: &JsxElementPlan, names: &mut HashSet<S
         match child {
             JsxChildPlan::Text { .. } => {}
             JsxChildPlan::Expression { value, .. } => {
-                collect_jsx_scalar_intrinsic_names(value, names);
+                collect_jsx_scalar_intrinsic_names(store, arena, bound, value, names);
             }
-            JsxChildPlan::Element(element) => collect_jsx_plan_intrinsic_names(element, names),
+            JsxChildPlan::Element(element) => {
+                collect_jsx_plan_intrinsic_names(store, arena, bound, element, names);
+            }
         }
     }
 }
 
-fn collect_jsx_scalar_intrinsic_names(scalar: &JsxScalarPlan, names: &mut HashSet<String>) {
+fn collect_jsx_scalar_intrinsic_names(
+    store: &CanonicalTypeMapperStore,
+    arena: &NodeArena,
+    bound: &BoundFile,
+    scalar: &JsxScalarPlan,
+    names: &mut HashSet<String>,
+) {
     match scalar {
-        JsxScalarPlan::Element(element) => collect_jsx_plan_intrinsic_names(element, names),
+        JsxScalarPlan::Element(element) => {
+            collect_jsx_plan_intrinsic_names(store, arena, bound, element, names);
+        }
         JsxScalarPlan::Property { receiver, .. } => {
-            collect_jsx_scalar_intrinsic_names(receiver, names);
+            collect_jsx_scalar_intrinsic_names(store, arena, bound, receiver, names);
         }
         JsxScalarPlan::TypeAssertion { value, .. } | JsxScalarPlan::Parenthesized { value, .. } => {
-            collect_jsx_scalar_intrinsic_names(value, names);
+            collect_jsx_scalar_intrinsic_names(store, arena, bound, value, names);
         }
         JsxScalarPlan::Conditional {
             condition,
@@ -2054,13 +2084,13 @@ fn collect_jsx_scalar_intrinsic_names(scalar: &JsxScalarPlan, names: &mut HashSe
             when_false,
             ..
         } => {
-            collect_jsx_scalar_intrinsic_names(condition, names);
-            collect_jsx_scalar_intrinsic_names(when_true, names);
-            collect_jsx_scalar_intrinsic_names(when_false, names);
+            collect_jsx_scalar_intrinsic_names(store, arena, bound, condition, names);
+            collect_jsx_scalar_intrinsic_names(store, arena, bound, when_true, names);
+            collect_jsx_scalar_intrinsic_names(store, arena, bound, when_false, names);
         }
         JsxScalarPlan::AdjacentElements { left, right, .. } => {
-            collect_jsx_plan_intrinsic_names(left, names);
-            collect_jsx_plan_intrinsic_names(right, names);
+            collect_jsx_plan_intrinsic_names(store, arena, bound, left, names);
+            collect_jsx_plan_intrinsic_names(store, arena, bound, right, names);
         }
         JsxScalarPlan::String { .. }
         | JsxScalarPlan::Number { .. }
@@ -2068,6 +2098,39 @@ fn collect_jsx_scalar_intrinsic_names(scalar: &JsxScalarPlan, names: &mut HashSe
         | JsxScalarPlan::Null(_)
         | JsxScalarPlan::GlobalThis(_)
         | JsxScalarPlan::Identifier { .. } => {}
+    }
+}
+
+fn jsx_intrinsic_component_names(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Option<Vec<String>> {
+    let record = store.type_payload(type_)?;
+    match record.data() {
+        super::TypeData::Literal(literal) if record.flags().contains(TypeFlags::STRING_LITERAL) => {
+            let LiteralValue::String(name) = &literal.value else {
+                return None;
+            };
+            (!name.is_empty()).then(|| vec![name.clone()])
+        }
+        super::TypeData::Union(union) if record.flags().contains(TypeFlags::UNION) => {
+            let mut names = Vec::with_capacity(union.union.types.len());
+            for constituent in &union.union.types {
+                let record = store.type_payload(*constituent)?;
+                let super::TypeData::Literal(literal) = record.data() else {
+                    return None;
+                };
+                let LiteralValue::String(name) = &literal.value else {
+                    return None;
+                };
+                if !record.flags().contains(TypeFlags::STRING_LITERAL) || name.is_empty() {
+                    return None;
+                }
+                names.push(name.clone());
+            }
+            (!names.is_empty()).then_some(names)
+        }
+        _ => None,
     }
 }
 
@@ -4478,6 +4541,18 @@ fn resolve_component_tag(
             .any_signature;
         return Ok((namespace.any_type, any_signature));
     }
+    if let Some(names) = jsx_intrinsic_component_names(store, component) {
+        return resolve_intrinsic_component_tag(
+            store,
+            bound,
+            namespace,
+            opening,
+            tag,
+            &names,
+            options,
+            diagnostics,
+        );
+    }
 
     let callable = match validate_stored_callable_set(store, component) {
         StoredCallableSetValidation::Valid { projection, .. }
@@ -4835,6 +4910,48 @@ fn jsx_namespace_value_type(
     Ok(type_)
 }
 
+#[allow(clippy::too_many_arguments)] // Dynamic intrinsic tags retain their source and runtime facts.
+fn resolve_intrinsic_component_tag(
+    store: &mut CanonicalTypeMapperStore,
+    bound: &BoundFile,
+    namespace: &JsxNamespace,
+    opening: NodeRef,
+    tag: &JsxTagPlan,
+    names: &[String],
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+) -> Result<(TypeId, SignatureId), SourceCheckError> {
+    let mut attributes = Vec::with_capacity(names.len());
+    for name in names {
+        let intrinsic = resolve_intrinsic_tag(
+            store,
+            bound,
+            namespace,
+            opening,
+            &JsxTagPlan {
+                node: tag.node,
+                name: name.clone(),
+                intrinsic: true,
+                namespace_member: None,
+            },
+            options,
+            diagnostics,
+        )?;
+        if !attributes.contains(&intrinsic.attributes_type) {
+            attributes.push(intrinsic.attributes_type);
+        }
+    }
+    let attributes = match attributes.as_slice() {
+        [attributes] => *attributes,
+        [] => return Err(SourceCheckError::Call(opening)),
+        _ => store
+            .canonical_intersection_type(&attributes, None)
+            .map_err(|_| unsupported(opening, SyntaxKind::JsxOpeningElement))?,
+    };
+    let signature = intrinsic_signature(store, opening, attributes, namespace.element_type)?;
+    Ok((attributes, signature))
+}
+
 fn jsx_component_value_type(
     store: &CanonicalTypeMapperStore,
     arena: &NodeArena,
@@ -4860,6 +4977,13 @@ fn jsx_component_value_type(
     if let Some(initializer) = variable.initializer {
         let initializer = child_ref(declaration, initializer);
         let initializer_record = jsx_node(arena, bound, store, initializer)?;
+        if let Some(type_) = store
+            .type_node_links(initializer)
+            .and_then(|links| links.resolved_type)
+            && jsx_intrinsic_component_names(store, type_).is_some()
+        {
+            return Ok(type_);
+        }
         let unavailable = || unsupported(initializer, initializer_record.kind);
         if initializer_record.kind != SyntaxKind::ArrowFunction
             || initializer_record.parent != Some(declaration.node)
@@ -9308,6 +9432,244 @@ mod runtime_tests {
         assert_eq!(
             diagnostic.diagnostic.render().unwrap(),
             "Property 'plain-panel' does not exist on type 'JSX.IntrinsicElements'.",
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep union inference, tag ownership, and warm caches together.
+    fn string_union_component_tags_resolve_intrinsic_props_and_replay_warm() {
+        let source = concat!(
+            "declare namespace JSX {\n",
+            "  interface Element {}\n",
+            "  interface ElementChildrenAttribute { children: any; }\n",
+            "  interface IntrinsicElements {\n",
+            "    h1: { label: string; children?: string };\n",
+            "    h2: { label: string; children?: string };\n",
+            "  }\n",
+            "}\n",
+            "declare const Fixed: 'h1';\n",
+            "const Heading = true ? 'h1' : 'h2';\n",
+            "const single = <Fixed label='ready' />;\n",
+            "const valid = <Heading label='ready'>title</Heading>;\n",
+            "const invalid = <Heading label={1}>title</Heading>;\n",
+        );
+        let parsed = parse_jsx_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(8_185);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/intrinsic-union.tsx\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = crate::semantic::CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("only the numeric heading label must fail")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2322);
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "Type 'number' is not assignable to type 'string'.",
+        );
+        let NodeData::Identifier(invalid_name) = &parsed
+            .arena
+            .get(diagnostic.node.unwrap().node)
+            .unwrap()
+            .data
+        else {
+            panic!("the invalid label must own its assignment diagnostic")
+        };
+        assert_eq!(invalid_name.text, "label");
+
+        let (_, bound) = context.file(file).unwrap();
+        let heading = bound
+            .locals(bound.source_file())
+            .and_then(|locals| context.store().symbol_table(locals))
+            .and_then(|locals| locals.get_source("Heading"))
+            .unwrap();
+        let heading_type = context
+            .store()
+            .value_symbol_links(heading)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let mut heading_tags = 0;
+        for (node, record) in parsed.arena.iter() {
+            let NodeData::Identifier(name) = &record.data else {
+                continue;
+            };
+            if name.text != "Heading"
+                || record
+                    .parent
+                    .and_then(|parent| parsed.arena.get(parent))
+                    .is_none_or(|parent| {
+                        !matches!(
+                            parent.kind,
+                            SyntaxKind::JsxOpeningElement | SyntaxKind::JsxClosingElement
+                        )
+                    })
+            {
+                continue;
+            }
+            let node = NodeRef::new(parsed.arena.id(), file, node);
+            assert_eq!(
+                context
+                    .store()
+                    .symbol_node_links(node)
+                    .and_then(|links| links.resolved_symbol),
+                Some(heading),
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .type_node_links(node)
+                    .and_then(|links| links.resolved_type),
+                Some(heading_type),
+            );
+            heading_tags += 1;
+        }
+        assert_eq!(heading_tags, 4);
+
+        let cold = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().signature_len(),
+            context.store().checker_link_allocated_lengths(),
+            context.diagnostics().as_slice().to_vec(),
+        );
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.diagnostics().as_slice().to_vec(),
+            ),
+            cold,
+        );
+    }
+
+    #[test]
+    fn namespaced_intrinsic_attributes_ignore_nonmatching_template_indexes() {
+        let source = concat!(
+            "interface Attributes {\n",
+            "  [key: `do-${string}`]: number;\n",
+            "  'ns:thing'?: string;\n",
+            "}\n",
+            "declare namespace JSX {\n",
+            "  interface Element {}\n",
+            "  interface IntrinsicElements { div: Attributes; }\n",
+            "}\n",
+            "const valid = <div ns:thing='ready' />;\n",
+            "const matching = <div do-work={1} />;\n",
+            "const wrongIndex = <div do-work='wrong' />;\n",
+            "const wrongNamed = <div ns:thing={1} />;\n",
+        );
+        let parsed = parse_jsx_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(8_186);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/namespaced-index.tsx\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = crate::semantic::CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions {
+                jsx_runtime: CanonicalJsxRuntime::Automatic,
+                ..CanonicalCheckerOptions::default()
+            },
+        )
+        .unwrap();
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.diagnostic.code() == 2322)
+        );
+        assert_eq!(
+            diagnostics[0].diagnostic.render().unwrap(),
+            "Type 'string' is not assignable to type 'number'.",
+        );
+        assert_eq!(
+            diagnostics[1].diagnostic.render().unwrap(),
+            "Type 'number' is not assignable to type 'string'.",
+        );
+        let NodeData::JsxNamespacedName(name) = &parsed
+            .arena
+            .get(diagnostics[1].node.unwrap().node)
+            .unwrap()
+            .data
+        else {
+            panic!("the named-property mismatch must retain its complete namespaced name")
+        };
+        let NodeData::Identifier(namespace) = &parsed.arena.get(name.namespace).unwrap().data
+        else {
+            unreachable!("the namespaced attribute has an identifier namespace")
+        };
+        let NodeData::Identifier(local) = &parsed.arena.get(name.name).unwrap().data else {
+            unreachable!("the namespaced attribute has an identifier local name")
+        };
+        assert_eq!(
+            (namespace.text.as_str(), local.text.as_str()),
+            ("ns", "thing"),
+        );
+
+        let cold = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().signature_len(),
+            context.store().index_info_len(),
+            context.store().checker_link_allocated_lengths(),
+            diagnostics.to_vec(),
+        );
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().signature_len(),
+                context.store().index_info_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.diagnostics().as_slice().to_vec(),
+            ),
+            cold,
         );
     }
 
