@@ -4,7 +4,8 @@
 //! function-body semantics. It proves one retained `FunctionDeclaration`,
 //! anonymous `FunctionExpression`, or `ArrowFunction` and its binder-owned
 //! FUNCTION symbol, publishes the callable shell/signature/parameter types,
-//! including implicit `any` on ordinary function declarations, and validates
+//! including implicit `any` on ordinary function declarations and implicit
+//! `any[]` rest parameters, and validates
 //! the resulting store shape.
 //! Source values never borrow `FunctionType` `TypeNode` or `__call` provenance.
 
@@ -27,6 +28,7 @@ use super::{
     },
     declared::{
         cached_ordinary_type_parameter_owner, explicit_type_parameter_symbols, preflight_node,
+        type_list_key,
     },
     functions::{StoredFunctionTypeValidation, validate_stored_function_type},
     jsdoc::{
@@ -89,12 +91,13 @@ impl SourceCallableParameterPlan {
         }
     }
 
-    /// Returns the written, contextual `JSDoc`, or implicit `any` type.
+    /// Returns the written, contextual `JSDoc`, implicit `any`, or implicit `any[]` type.
     pub(super) fn base_type(self, store: &CanonicalTypeMapperStore) -> Option<TypeId> {
         if let Some(type_) = self.jsdoc_contextual_type {
             return Some(type_);
         }
         match self.explicit_type_node() {
+            None if self.rest => implicit_any_array_type(store),
             None => store
                 .intrinsic_bootstrap()
                 .map(|bootstrap| bootstrap.any_type),
@@ -111,6 +114,31 @@ impl SourceCallableParameterPlan {
     pub(super) const fn has_jsdoc_function_type(self) -> bool {
         self.jsdoc_function
     }
+}
+
+/// Returns the eagerly initialized `Array<any>` identity, including its missing-library fallback.
+pub(super) fn implicit_any_array_type(store: &CanonicalTypeMapperStore) -> Option<TypeId> {
+    let bootstrap = store.intrinsic_bootstrap()?;
+    let globals = store.symbol_table(bootstrap.globals)?;
+    let Some(array) = globals.get_source("Array") else {
+        return Some(bootstrap.empty_object_type);
+    };
+    let array = store.get_merged_symbol(array)?;
+    let target = store.declared_type_links(array)?.declared_type?;
+    if target == bootstrap.empty_generic_type {
+        return Some(bootstrap.empty_object_type);
+    }
+    let TypeData::Interface(interface) = store.type_payload(target)?.data() else {
+        return None;
+    };
+    let TypeCacheState::Allocated(instantiations) = &interface.reference.object.instantiations
+    else {
+        return None;
+    };
+    let array_type = *instantiations.get(&type_list_key(&[bootstrap.any_type]))?;
+    let reference = validate_direct_generic_reference(store, array_type).ok()?;
+    (reference.target == target && reference.type_arguments.as_slice() == [bootstrap.any_type])
+        .then_some(array_type)
 }
 
 /// One exact declared type-parameter identity owned by a source signature.
@@ -1950,6 +1978,22 @@ fn plan_source_callable_with_owner_shape(
     let eligible_implicit_any_arrow = implicit_any_arrow_shape && view.parameters.nodes.len() == 1;
     let direct_implicit_any_arrow = eligible_implicit_any_arrow
         && is_direct_noncontextual_source_arrow(store, host, declaration)?;
+    let direct_implicit_any_rest_arrow = implicit_any_arrow_shape
+        && view.parameters.nodes.iter().any(|parameter| {
+            host.node(NodeRef::new(
+                declaration.arena,
+                declaration.file,
+                *parameter,
+            ))
+            .is_some_and(|record| {
+                matches!(
+                    &record.data,
+                    NodeData::ParameterDeclaration(parameter)
+                        if parameter.dot_dot_dot_token.is_some() && parameter.type_.is_none()
+                )
+            })
+        })
+        && is_direct_noncontextual_source_arrow(store, host, declaration)?;
     let array_implicit_any_arrow = eligible_implicit_any_arrow
         && !direct_implicit_any_arrow
         && is_ambiguous_union_array_source_arrow(store, host, declaration)?;
@@ -2163,11 +2207,18 @@ fn plan_source_callable_with_owner_shape(
                         && view.parameters.range.end > parameter_record.range.end
                     || object_property_arrow
                         && view.parameters.nodes.as_slice() == [parameter.node]
-                    || direct_call_argument_arrow)
-                    || body_mode.is_ambient()
+                    || direct_call_argument_arrow
+                    || direct_implicit_any_rest_arrow)
+                    || body_mode.is_ambient() && !rest
                     || !type_parameters.is_empty()
-                    || rest
                     || initializer.is_some()
+                    || rest
+                        && implicit_any_array_type(store).is_none_or(|array| {
+                            array_targets.is_none()
+                                && store
+                                    .intrinsic_bootstrap()
+                                    .is_none_or(|bootstrap| array != bootstrap.empty_object_type)
+                        })
                 {
                     return Err(SourceCallableError::Unsupported(
                         SourceCallableUnsupported::MissingParameterType(parameter),
@@ -7042,9 +7093,27 @@ pub(super) fn publish_source_callable_parameter_types(
                     parameter.declaration,
                 ))
             })?;
-            if cached != *base
+            let supplied_base = if parameter.is_implicit_any() && parameter.rest {
+                store
+                    .intrinsic_bootstrap()
+                    .map(|bootstrap| bootstrap.any_type)
+                    .filter(|any| *base == *any)
+                    .map(|_| cached)
+                    .ok_or_else(|| {
+                        invariant(SourceCallableInvariant::InvalidParameterCache(
+                            parameter.declaration,
+                        ))
+                    })?
+            } else {
+                *base
+            };
+            if cached != supplied_base
                 || store
-                    .validate_cached_array_capability_prepared(*base, global_types, prepared)
+                    .validate_cached_array_capability_prepared(
+                        supplied_base,
+                        global_types,
+                        prepared,
+                    )
                     .is_err()
                 || generic_type_parameters
                     .as_ref()
@@ -7052,7 +7121,7 @@ pub(super) fn publish_source_callable_parameter_types(
                         !valid_generic_source_parameter_type(
                             store,
                             callable.plan.array_targets,
-                            *base,
+                            supplied_base,
                             type_parameters,
                         )
                     })
@@ -7069,33 +7138,40 @@ pub(super) fn publish_source_callable_parameter_types(
         let signature = exact_signature_link(store, callable.plan.declaration)?;
         let mut callable_parameter_types = Vec::with_capacity(callable.plan.parameters.len());
         for (parameter, base) in callable.plan.parameters.iter().zip(&callable.base_types) {
+            let base = if parameter.is_implicit_any() && parameter.rest {
+                parameter.base_type(store).ok_or_else(|| {
+                    invariant(SourceCallableInvariant::InvalidParameterCache(
+                        parameter.declaration,
+                    ))
+                })?
+            } else {
+                *base
+            };
             let call_type = if strict && (parameter.optional || parameter.initializer.is_some()) {
-                let already_contains_undefined = *base == undefined
-                    || store.type_payload(*base).is_some_and(|record| {
+                let already_contains_undefined = base == undefined
+                    || store.type_payload(base).is_some_and(|record| {
                         matches!(
                             record.data(),
                             TypeData::Union(union) if union.union.types.contains(&undefined)
                         )
                     });
                 if already_contains_undefined {
-                    *base
+                    base
                 } else {
                     match global_types {
                         Some(global_types) => store.literal_union_type_prepared_with_global_types(
                             global_types,
-                            &[*base, undefined],
+                            &[base, undefined],
                             None,
                             prepared,
                         )?,
-                        None => store.literal_union_type_prepared(
-                            &[*base, undefined],
-                            None,
-                            prepared,
-                        )?,
+                        None => {
+                            store.literal_union_type_prepared(&[base, undefined], None, prepared)?
+                        }
                     }
                 }
             } else {
-                *base
+                base
             };
             if store
                 .validate_cached_array_capability_prepared(call_type, global_types, prepared)
@@ -7106,7 +7182,7 @@ pub(super) fn publish_source_callable_parameter_types(
                 )));
             }
             let value_type = if parameter.initializer.is_some() {
-                *base
+                base
             } else {
                 call_type
             };
@@ -14475,10 +14551,212 @@ mod tests {
     }
 
     #[test]
-    fn unannotated_generic_rest_ambient_and_initialized_parameters_remain_boundaries() {
+    fn unannotated_rest_parameters_preserve_array_identity_and_replay_warm() {
+        for (index, (source, expected_minimum, ambient)) in [
+            ("function rest(...values) {}", 0, false),
+            ("function rest(first, ...values) {}", 1, false),
+            ("declare function rest(...values): any;", 0, true),
+            ("const rest = (...values) => {};", 0, false),
+            ("const rest = (first, ...values) => {};", 1, false),
+            ("const rest = (first: string, ...values) => {};", 1, false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut fixture =
+                QueryFixture::new(source, FileId::new(1_330 + u32::try_from(index).unwrap()));
+            let declaration = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    matches!(
+                        record.kind,
+                        SyntaxKind::FunctionDeclaration | SyntaxKind::ArrowFunction
+                    )
+                    .then_some(NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let owner = fixture.bound.symbol(declaration).unwrap();
+            let plan = {
+                let host = DeclaredTypeHost::new_after_global_merge(
+                    [(&fixture.parsed.arena, &fixture.bound)],
+                    GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+                )
+                .unwrap();
+                plan_source_callable(&fixture.store, &host, declaration, owner, None)
+                    .unwrap_or_else(|error| panic!("{source}: {error:?}"))
+            };
+            let rest = plan.parameters.last().unwrap();
+            let any_array = fixture
+                .store
+                .intrinsic_bootstrap()
+                .unwrap()
+                .empty_object_type;
+            assert_eq!(plan.flags, SignatureFlags::HAS_REST_PARAMETER, "{source}");
+            assert_eq!(plan.min_argument_count, expected_minimum, "{source}");
+            assert_eq!(plan.body_mode.is_ambient(), ambient, "{source}");
+            assert!(rest.rest && rest.is_implicit_any(), "{source}");
+            assert_eq!(rest.explicit_type_node(), None, "{source}");
+            assert_eq!(rest.base_type(&fixture.store), Some(any_array), "{source}");
+
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let callable = fixture
+                .query_callable(declaration, owner, &mut diagnostics)
+                .unwrap_or_else(|error| panic!("{source}: {error:?}"));
+            let signature = fixture
+                .store
+                .source_callable_provenance(callable)
+                .unwrap()
+                .signature;
+            assert_eq!(
+                fixture
+                    .store
+                    .callable_signature_parameter_types(signature)
+                    .and_then(|types| types.last().copied()),
+                Some(any_array),
+                "{source}"
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .value_symbol_links(rest.symbol)
+                    .and_then(|links| links.resolved_type),
+                Some(any_array),
+                "{source}"
+            );
+            if plan.return_type.is_inferred() {
+                let void = fixture.store.intrinsic_bootstrap().unwrap().void_type;
+                publish_inferred_source_callable_return(&mut fixture.store, &plan, signature, void)
+                    .unwrap();
+            }
+            assert!(matches!(
+                validate_stored_source_callable(&fixture.store, callable),
+                StoredSourceCallableValidation::Valid(_)
+            ));
+            let warm = publication_state(&fixture.store);
+            assert_eq!(
+                fixture.query_callable(declaration, owner, &mut diagnostics),
+                Ok(callable),
+                "{source}"
+            );
+            assert_eq!(publication_state(&fixture.store), warm, "{source}");
+            assert!(diagnostics.is_empty(), "{source}: {diagnostics:?}");
+        }
+    }
+
+    #[test]
+    fn unannotated_rest_parameters_reuse_the_authoritative_global_array() {
+        let parsed = parse_source_file(
+            "interface Array<T> {} interface ReadonlyArray<T> {} \
+             function rest(first: string, ...values) {}",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(1_336);
+        let mut context = bind_context(&parsed, file);
+        let global_types = context.global_types().clone();
+        let bound = context.file(file).unwrap().1.clone();
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionDeclaration).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let owner = bound.symbol(declaration).unwrap();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let cold = publication_state(context.store());
+        assert!(matches!(
+            plan_source_callable(context.store(), &host, declaration, owner, None),
+            Err(SourceCallableError::Unsupported(
+                SourceCallableUnsupported::MissingParameterType(_)
+            ))
+        ));
+        assert_eq!(publication_state(context.store()), cold);
+        let plan = plan_source_callable(
+            context.store(),
+            &host,
+            declaration,
+            owner,
+            Some(CanonicalArrayTargets::from_global_types(&global_types)),
+        )
+        .unwrap();
+        let rest = plan.parameters.last().unwrap();
+        assert_eq!(
+            rest.base_type(context.store()),
+            Some(global_types.any_array_type)
+        );
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let callable = CanonicalTypeQuery::new_with_global_types(
+            context.store_mut_for_test(),
+            &host,
+            &global_types,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_type_of_source_callable(declaration, owner)
+        .unwrap();
+        let signature = context
+            .store()
+            .source_callable_provenance(callable)
+            .unwrap()
+            .signature;
+        assert_eq!(
+            context
+                .store()
+                .callable_signature_parameter_types(signature)
+                .and_then(|types| types.last().copied()),
+            Some(global_types.any_array_type)
+        );
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(rest.symbol)
+                .and_then(|links| links.resolved_type),
+            Some(global_types.any_array_type)
+        );
+        let void = context.store().intrinsic_bootstrap().unwrap().void_type;
+        publish_inferred_source_callable_return(
+            context.store_mut_for_test(),
+            &plan,
+            signature,
+            void,
+        )
+        .unwrap();
+        let warm = publication_state(context.store());
+        let replay = CanonicalTypeQuery::new_with_global_types(
+            context.store_mut_for_test(),
+            &host,
+            &global_types,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_type_of_source_callable(declaration, owner)
+        .unwrap();
+        assert_eq!(replay, callable);
+        assert_eq!(publication_state(context.store()), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn unannotated_generic_ambient_and_initialized_parameters_remain_boundaries() {
         for (index, source) in [
             "function generic<T>(value): T { return value; }",
-            "function rest(...values) {}",
             "declare function ambient(value): void;",
             "function initialized(value = 1) {}",
         ]

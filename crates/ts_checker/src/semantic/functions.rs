@@ -1,6 +1,7 @@
-//! Exact annotated function-type signatures for the dependency-closed type-node cut.
+//! Exact function-type signatures for the dependency-closed type-node cut.
 //!
-//! This module owns nongeneric function types and one constrained generic form.
+//! This module owns nongeneric function types, implicit `any[]` rest parameters,
+//! and one constrained generic form.
 //! The type-node planner/executor only supplies recursive annotation callbacks;
 //! binder proof, cache validation, shell publication, signatures, parameter
 //! value types, and lazy return-type validation stay here.
@@ -28,6 +29,7 @@ use super::{
         SymbolNodeLinks, TypeAliasLinks, TypeNodeLinks, ValueSymbolLinks,
     },
     signatures::{ElementFlags, Signature, SignatureFlags},
+    source_callables::implicit_any_array_type,
     store::SourceNodeParent,
     type_records::{ConstrainedTypeData, StructuredTypeData, TypeCacheState, TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
@@ -35,7 +37,7 @@ use super::{
 
 const NODE_FLAG_JSDOC: u32 = 1 << 22;
 
-/// One identifier parameter whose annotation belongs to this exact slice.
+/// One identifier parameter and the existing type-node dependency required by its signature.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct FunctionParameterPlan {
     pub(super) declaration: NodeRef,
@@ -45,6 +47,7 @@ pub(super) struct FunctionParameterPlan {
     null_literal_identity: bool,
     pub(super) optional: bool,
     rest_tuple_element: Option<FunctionRestTupleElementPlan>,
+    implicit_any_rest: bool,
 }
 
 /// One required labeled tuple element expanded into a fixed signature parameter.
@@ -332,6 +335,18 @@ pub(super) fn plan_function_type(
     }
     validate_alias_symbol(store, node, alias_symbol)?;
 
+    let return_id = function.type_.ok_or(FunctionTypeError::Unsupported(
+        FunctionTypeUnsupported::MissingReturnType(node),
+    ))?;
+    let return_type = NodeRef::new(node.arena, node.file, return_id);
+    let return_record = preflight_node(store, host, return_type)?;
+    if return_record.parent != Some(node.node)
+        || return_record.range.start < function.parameters.range.end
+        || return_record.range.end > record.range.end
+    {
+        return Err(invariant(FunctionTypeInvariant::InvalidSyntax(node)));
+    }
+
     let mut parameters = Vec::with_capacity(function.parameters.nodes.len());
     let mut previous_end = function.parameters.range.start;
     let mut min_argument_count = 0usize;
@@ -399,28 +414,66 @@ pub(super) fn plan_function_type(
             ));
         }
 
-        let Some(type_id) = data.type_ else {
+        let implicit_any_rest = data.type_.is_none() && data.dot_dot_dot_token.is_some();
+        let (type_node, type_start) = if let Some(type_id) = data.type_ {
+            let type_node = NodeRef::new(node.arena, node.file, type_id);
+            let type_record = preflight_node(store, host, type_node)?;
+            if type_record.parent != Some(parameter.node)
+                || type_record.range.start < name_record.range.end
+                || type_record.range.end > parameter_record.range.end
+            {
+                return Err(invariant(FunctionTypeInvariant::InvalidParameter(
+                    parameter,
+                )));
+            }
+            (type_node, type_record.range.start)
+        } else if implicit_any_rest {
+            let dependency = parameters
+                .last()
+                .map(|previous: &FunctionParameterPlan| previous.type_node)
+                .unwrap_or(return_type);
+            if implicit_any_array_type(store).is_none_or(|array| {
+                array_targets.is_none()
+                    && store
+                        .intrinsic_bootstrap()
+                        .is_none_or(|bootstrap| array != bootstrap.empty_object_type)
+            }) || parameters.len() + 1 != function.parameters.nodes.len()
+                || data.question_token.is_some()
+                || parameters.is_empty()
+                    && !matches!(
+                        return_record.kind,
+                        SyntaxKind::AnyKeyword
+                            | SyntaxKind::UnknownKeyword
+                            | SyntaxKind::StringKeyword
+                            | SyntaxKind::NumberKeyword
+                            | SyntaxKind::BigIntKeyword
+                            | SyntaxKind::BooleanKeyword
+                            | SyntaxKind::SymbolKeyword
+                            | SyntaxKind::VoidKeyword
+                            | SyntaxKind::UndefinedKeyword
+                            | SyntaxKind::NullKeyword
+                            | SyntaxKind::NeverKeyword
+                            | SyntaxKind::ObjectKeyword
+                            | SyntaxKind::IntrinsicKeyword
+                    )
+            {
+                return Err(FunctionTypeError::Unsupported(
+                    FunctionTypeUnsupported::RestParameter(parameter),
+                ));
+            }
+            (dependency, parameter_record.range.end)
+        } else {
             return Err(FunctionTypeError::Unsupported(
                 FunctionTypeUnsupported::MissingParameterType(parameter),
             ));
         };
-        let type_node = NodeRef::new(node.arena, node.file, type_id);
-        let type_record = preflight_node(store, host, type_node)?;
-        if type_record.parent != Some(parameter.node)
-            || type_record.range.start < name_record.range.end
-            || type_record.range.end > parameter_record.range.end
-        {
-            return Err(invariant(FunctionTypeInvariant::InvalidParameter(
-                parameter,
-            )));
-        }
         let optional = if let Some(question_id) = data.question_token {
             let question = NodeRef::new(node.arena, node.file, question_id);
             let question_record = preflight_node(store, host, question)?;
             if question_record.kind != SyntaxKind::QuestionToken
                 || question_record.parent != Some(parameter.node)
                 || question_record.range.start < name_record.range.end
-                || question_record.range.end > type_record.range.start
+                || question_record.range.end > type_start
             {
                 return Err(invariant(FunctionTypeInvariant::InvalidParameter(
                     parameter,
@@ -431,6 +484,21 @@ pub(super) fn plan_function_type(
             false
         };
         let rest_tuple_element = match data.dot_dot_dot_token {
+            Some(token) if implicit_any_rest => {
+                let token = NodeRef::new(node.arena, node.file, token);
+                let token_record = preflight_node(store, host, token)?;
+                if token_record.kind != SyntaxKind::DotDotDotToken
+                    || token_record.parent != Some(parameter.node)
+                    || token_record.range.start < parameter_record.range.start
+                    || token_record.range.end > name_record.range.start
+                {
+                    return Err(invariant(FunctionTypeInvariant::InvalidParameter(
+                        parameter,
+                    )));
+                }
+                flags |= SignatureFlags::HAS_REST_PARAMETER;
+                None
+            }
             Some(token) => Some(plan_rest_tuple_parameter(
                 store,
                 host,
@@ -471,38 +539,34 @@ pub(super) fn plan_function_type(
                 parameter,
             )));
         }
-        let identity_node = peel_parenthesized_type(store, host, type_node)?;
-        let signature_type_record = match rest_tuple_element {
-            Some(element) => preflight_node(store, host, element.identity_node)?,
-            None => type_record,
+        let identity_node = if implicit_any_rest {
+            name
+        } else {
+            peel_parenthesized_type(store, host, type_node)?
         };
-        if signature_type_record.kind == SyntaxKind::LiteralType {
-            flags |= SignatureFlags::HAS_LITERAL_TYPES;
+        if !implicit_any_rest {
+            let signature_type_record = match rest_tuple_element {
+                Some(element) => preflight_node(store, host, element.identity_node)?,
+                None => preflight_node(store, host, type_node)?,
+            };
+            if signature_type_record.kind == SyntaxKind::LiteralType {
+                flags |= SignatureFlags::HAS_LITERAL_TYPES;
+            }
         }
         parameters.push(FunctionParameterPlan {
             declaration: parameter,
             symbol: parameter_symbol,
             type_node,
             identity_node,
-            null_literal_identity: is_null_literal_type(store, host, identity_node)?,
+            null_literal_identity: !implicit_any_rest
+                && is_null_literal_type(store, host, identity_node)?,
             optional,
             rest_tuple_element,
+            implicit_any_rest,
         });
-        if !optional {
+        if !optional && !implicit_any_rest {
             min_argument_count = parameters.len();
         }
-    }
-
-    let return_id = function.type_.ok_or(FunctionTypeError::Unsupported(
-        FunctionTypeUnsupported::MissingReturnType(node),
-    ))?;
-    let return_type = NodeRef::new(node.arena, node.file, return_id);
-    let return_record = preflight_node(store, host, return_type)?;
-    if return_record.parent != Some(node.node)
-        || return_record.range.start < function.parameters.range.end
-        || return_record.range.end > record.range.end
-    {
-        return Err(invariant(FunctionTypeInvariant::InvalidSyntax(node)));
     }
 
     let min_argument_count = i32::try_from(min_argument_count)
@@ -1400,21 +1464,32 @@ pub(super) fn publish_parameter_types(
                     parameter.declaration,
                 )));
             }
-            let cached_base = cached_annotation_identity(
-                store,
-                parameter.identity_node,
-                parameter.null_literal_identity,
-            )
-            .ok_or_else(|| {
+            let cached_base = function_parameter_base_type(store, parameter).ok_or_else(|| {
                 invariant(FunctionTypeInvariant::InvalidParameterCache(
                     parameter.declaration,
                 ))
             })?;
-            if cached_base != *base
+            let supplied_base = if parameter.implicit_any_rest {
+                cached_annotation_identity(store, parameter.type_node, false)
+                    .filter(|dependency| dependency == base)
+                    .map(|_| cached_base)
+                    .ok_or_else(|| {
+                        invariant(FunctionTypeInvariant::InvalidParameterCache(
+                            parameter.declaration,
+                        ))
+                    })?
+            } else {
+                *base
+            };
+            if cached_base != supplied_base
                 || store
-                    .validate_cached_array_capability_prepared(*base, global_types, prepared)
+                    .validate_cached_array_capability_prepared(
+                        supplied_base,
+                        global_types,
+                        prepared,
+                    )
                     .is_err()
-                || planned_signature_parameter_type(store, parameter, *base).is_none()
+                || planned_signature_parameter_type(store, parameter, supplied_base).is_none()
             {
                 return Err(invariant(FunctionTypeInvariant::InvalidParameterCache(
                     parameter.declaration,
@@ -1429,33 +1504,40 @@ pub(super) fn publish_parameter_types(
         let signature = exact_signature_link(store, function.plan.node)?;
         let mut function_parameter_types = Vec::with_capacity(function.plan.parameters.len());
         for (parameter, base) in function.plan.parameters.iter().zip(&function.base_types) {
+            let base = if parameter.implicit_any_rest {
+                function_parameter_base_type(store, parameter).ok_or_else(|| {
+                    invariant(FunctionTypeInvariant::InvalidParameterCache(
+                        parameter.declaration,
+                    ))
+                })?
+            } else {
+                *base
+            };
             let type_ = if strict && parameter.optional {
-                let already_contains_undefined = *base == undefined
-                    || store.type_payload(*base).is_some_and(|record| {
+                let already_contains_undefined = base == undefined
+                    || store.type_payload(base).is_some_and(|record| {
                         matches!(
                             record.data(),
                             TypeData::Union(union) if union.union.types.contains(&undefined)
                         )
                     });
                 if already_contains_undefined {
-                    *base
+                    base
                 } else {
                     match global_types {
                         Some(global_types) => store.literal_union_type_prepared_with_global_types(
                             global_types,
-                            &[*base, undefined],
+                            &[base, undefined],
                             None,
                             prepared,
                         )?,
-                        None => store.literal_union_type_prepared(
-                            &[*base, undefined],
-                            None,
-                            prepared,
-                        )?,
+                        None => {
+                            store.literal_union_type_prepared(&[base, undefined], None, prepared)?
+                        }
                     }
                 }
             } else {
-                *base
+                base
             };
             if store
                 .validate_cached_array_capability_prepared(type_, global_types, prepared)
@@ -1858,6 +1940,12 @@ pub(super) fn validate_stored_function_type(
         .iter()
         .enumerate()
         .all(|(index, parameter)| !signature_record.parameters()[..index].contains(parameter));
+    let rest_valid = !signature_record.has_rest_parameter()
+        || !signature_record.parameters().is_empty()
+            && usize::try_from(signature_record.min_argument_count())
+                .is_ok_and(|minimum| minimum < signature_record.parameters().len())
+            && expected_parameter_types
+                .is_none_or(|types| types.last().copied() == implicit_any_array_type(store));
     let alias_state = stored_alias_state(store, type_, record, declaration);
     if record.flags() != TypeFlags::OBJECT
         || record.object_flags() != ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
@@ -1884,7 +1972,9 @@ pub(super) fn validate_stored_function_type(
         || call_record.parent().is_some()
         || call_record.export_symbol().is_some()
         || store.get_merged_symbol(call_symbol) != Some(call_symbol)
-        || signature_record.flags().bits() & !SignatureFlags::HAS_LITERAL_TYPES.bits() != 0
+        || signature_record.flags().bits()
+            & !(SignatureFlags::HAS_LITERAL_TYPES | SignatureFlags::HAS_REST_PARAMETER).bits()
+            != 0
         || signature_record.min_argument_count() < 0
         || usize::try_from(signature_record.min_argument_count()).map_or(true, |minimum| {
             minimum > signature_record.parameters().len()
@@ -1898,6 +1988,7 @@ pub(super) fn validate_stored_function_type(
         || signature_record.isolated_signature_type().is_some()
         || signature_record.composite().is_some()
         || !parameters_valid
+        || !rest_valid
         || default_parameter_count != 0
             && default_parameter_count != signature_record.parameters().len()
         || !parameters_unique
@@ -2287,12 +2378,7 @@ fn validate_parameter_links(
             parameter.declaration,
         )));
     }
-    let base = cached_annotation_identity(
-        store,
-        parameter.identity_node,
-        parameter.null_literal_identity,
-    )
-    .ok_or_else(|| {
+    let base = function_parameter_base_type(store, parameter).ok_or_else(|| {
         invariant(FunctionTypeInvariant::InvalidParameterCache(
             parameter.declaration,
         ))
@@ -2317,6 +2403,21 @@ fn validate_parameter_links(
         )));
     }
     Ok(())
+}
+
+fn function_parameter_base_type(
+    store: &CanonicalTypeMapperStore,
+    parameter: &FunctionParameterPlan,
+) -> Option<TypeId> {
+    if parameter.implicit_any_rest {
+        implicit_any_array_type(store)
+    } else {
+        cached_annotation_identity(
+            store,
+            parameter.identity_node,
+            parameter.null_literal_identity,
+        )
+    }
 }
 
 fn validate_cached_return_type(
@@ -2527,6 +2628,7 @@ mod tests {
     use super::*;
     use crate::semantic::{
         CanonicalCheckerDiagnostics, IntrinsicBootstrapOptions,
+        global_types::initialize_global_library_types,
         production::GlobalMergeCompletion,
         type_nodes::{CanonicalTypeQuery, CanonicalTypeQueryOptions},
     };
@@ -2889,6 +2991,234 @@ mod tests {
             ),
             warm
         );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn implicit_any_rest_function_signatures_preserve_arity_and_replay_warm() {
+        for (index, (signature_text, expected_minimum)) in [
+            ("(...values) => void", 0),
+            ("(first: number, ...values) => void", 1),
+            ("(first: string, second?: number, ...values) => any", 1),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = format!("declare let value: {signature_text};");
+            let mut fixture = fixture(&source, FileId::new(95_040 + u32::try_from(index).unwrap()));
+            let function = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::FunctionType).then_some(NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let plan = {
+                let host = DeclaredTypeHost::new_after_global_merge(
+                    [(&fixture.parsed.arena, &fixture.bound)],
+                    GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+                )
+                .unwrap();
+                plan_function_type(&fixture.store, &host, function, None, false, None)
+                    .unwrap_or_else(|error| panic!("{signature_text}: {error:?}"))
+            };
+            let rest = plan.parameters.last().unwrap();
+            let any_array = fixture
+                .store
+                .intrinsic_bootstrap()
+                .unwrap()
+                .empty_object_type;
+            assert_eq!(plan.flags, SignatureFlags::HAS_REST_PARAMETER);
+            assert_eq!(plan.min_argument_count, expected_minimum);
+            assert!(rest.implicit_any_rest);
+            assert!(rest.rest_tuple_element.is_none());
+
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let function_type = {
+                let host = DeclaredTypeHost::new_after_global_merge(
+                    [(&fixture.parsed.arena, &fixture.bound)],
+                    GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+                )
+                .unwrap();
+                CanonicalTypeQuery::new(
+                    &mut fixture.store,
+                    &host,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_type_from_type_node(function)
+                .unwrap_or_else(|error| panic!("{signature_text}: {error:?}"))
+            };
+            let FunctionTypeState::Resolved { signature, .. } =
+                function_type_state(&fixture.store, &plan, false).unwrap()
+            else {
+                panic!("{signature_text}: expected a resolved rest signature")
+            };
+            let signature_record = fixture.store.signature(signature).unwrap();
+            assert!(signature_record.has_rest_parameter());
+            assert_eq!(signature_record.min_argument_count(), expected_minimum);
+            assert_eq!(
+                fixture
+                    .store
+                    .callable_signature_parameter_types(signature)
+                    .and_then(|types| types.last().copied()),
+                Some(any_array)
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .value_symbol_links(rest.symbol)
+                    .and_then(|links| links.resolved_type),
+                Some(any_array)
+            );
+            assert!(matches!(
+                validate_stored_function_type(&fixture.store, function_type),
+                StoredFunctionTypeValidation::Valid(_)
+            ));
+
+            let warm = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+            let replay = {
+                let host = DeclaredTypeHost::new_after_global_merge(
+                    [(&fixture.parsed.arena, &fixture.bound)],
+                    GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+                )
+                .unwrap();
+                CanonicalTypeQuery::new(
+                    &mut fixture.store,
+                    &host,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_type_from_type_node(function)
+                .unwrap()
+            };
+            assert_eq!(replay, function_type);
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                warm
+            );
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn implicit_any_rest_function_signatures_reuse_the_global_array_identity() {
+        let mut fixture = fixture(
+            "interface IArguments {} interface Array<T> {} interface Object {} \
+             interface Function {} interface String {} interface Number {} \
+             interface Boolean {} interface RegExp {} interface ReadonlyArray<T> {} \
+             interface ThisType<T> {} \
+             declare let value: (first: number, ...values) => void;",
+            FileId::new(95_043),
+        );
+        let globals = fixture.store.intrinsic_bootstrap().unwrap().globals;
+        let locals = fixture.bound.locals(fixture.bound.source_file()).unwrap();
+        let symbols = fixture
+            .store
+            .symbol_table(locals)
+            .unwrap()
+            .iter()
+            .map(|(_, symbol)| symbol)
+            .collect::<Vec<_>>();
+        for symbol in symbols {
+            fixture.store.merge_global_symbol(globals, symbol).unwrap();
+        }
+        let global_types = {
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            initialize_global_library_types(&mut fixture.store, &host, globals, false).unwrap()
+        };
+        let function = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionType).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        {
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            assert!(matches!(
+                plan_function_type(&fixture.store, &host, function, None, false, None),
+                Err(FunctionTypeError::Unsupported(
+                    FunctionTypeUnsupported::RestParameter(_)
+                ))
+            ));
+        }
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let function_type = {
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            CanonicalTypeQuery::new_with_global_types(
+                &mut fixture.store,
+                &host,
+                &global_types,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_from_type_node(function)
+            .unwrap()
+        };
+        let signature = fixture
+            .store
+            .signature_links(function)
+            .and_then(|links| links.resolved_signature.signature())
+            .unwrap();
+        let rest = *fixture
+            .store
+            .signature(signature)
+            .unwrap()
+            .parameters()
+            .last()
+            .unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .callable_signature_parameter_types(signature)
+                .and_then(|types| types.last().copied()),
+            Some(global_types.any_array_type)
+        );
+        assert_eq!(
+            fixture
+                .store
+                .value_symbol_links(rest)
+                .and_then(|links| links.resolved_type),
+            Some(global_types.any_array_type)
+        );
+        assert!(matches!(
+            validate_stored_function_type(&fixture.store, function_type),
+            StoredFunctionTypeValidation::Valid(_)
+        ));
         assert!(diagnostics.is_empty());
     }
 
