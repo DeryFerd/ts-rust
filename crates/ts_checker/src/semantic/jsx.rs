@@ -4,8 +4,8 @@
 //! named or indexed intrinsic tags, and fixed function components. It writes
 //! only to the existing semantic graph. Inline object-literal spreads reuse
 //! canonical object publication. Other spreads, generic components, dotted
-//! component names, contextual children, and factory imports remain explicit
-//! source-capability boundaries.
+//! component names, contextual child expressions, and factory imports remain
+//! explicit source-capability boundaries.
 
 use std::collections::HashSet;
 
@@ -175,6 +175,7 @@ struct JsxNamespace {
     element_type: TypeId,
     element_type_constraint: Option<TypeId>,
     intrinsic_elements: Option<TypeId>,
+    children_attribute: Option<SemanticSymbolId>,
     unknown_symbol: SemanticSymbolId,
     error_type: TypeId,
     any_type: TypeId,
@@ -197,6 +198,7 @@ struct CheckedJsxAttribute {
 struct CheckedJsxChildren {
     node: NodeRef,
     type_: TypeId,
+    name: Option<SemanticSymbolId>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1405,6 +1407,7 @@ fn resolve_jsx_namespace(
     let mut element_type = error_type;
     let mut element_type_constraint = None;
     let mut intrinsic_elements = None;
+    let mut children_attribute = None;
     if let Some(namespace) = namespace {
         let exports = store
             .symbol(namespace)
@@ -1416,6 +1419,7 @@ fn resolve_jsx_namespace(
         let element = table.get_source("Element");
         let element_type_symbol = table.get_source("ElementType");
         let intrinsic = table.get_source("IntrinsicElements");
+        let children = table.get_source("ElementChildrenAttribute");
         if let Some(symbol) = element {
             validate_jsx_namespace_type_symbol(store, symbol, location)?;
             element_type = resolve_jsx_namespace_element_type(
@@ -1452,16 +1456,76 @@ fn resolve_jsx_namespace(
                 location,
             )?;
         }
+        if options.jsx_runtime != CanonicalJsxRuntime::Automatic
+            && !plan.children.is_empty()
+            && let Some(symbol) = children
+        {
+            validate_jsx_namespace_type_symbol(store, symbol, location)?;
+            children_attribute = resolve_jsx_children_attribute(
+                store,
+                host,
+                namespace,
+                symbol,
+                options,
+                diagnostics,
+                location,
+            )?;
+        }
     }
 
     Ok(JsxNamespace {
         element_type,
         element_type_constraint,
         intrinsic_elements,
+        children_attribute,
         unknown_symbol,
         error_type,
         any_type,
     })
+}
+
+#[allow(clippy::too_many_arguments)] // Keep namespace ownership and diagnostic state explicit.
+fn resolve_jsx_children_attribute(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    namespace: SemanticSymbolId,
+    symbol: SemanticSymbolId,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    location: NodeRef,
+) -> Result<Option<SemanticSymbolId>, SourceCheckError> {
+    let type_ =
+        resolve_namespace_export_type(store, host, namespace, symbol, None, options, diagnostics)?;
+    let properties = store
+        .type_payload(type_)
+        .and_then(|record| record.data().structured())
+        .ok_or(SourceCheckError::Property(location))?
+        .properties
+        .as_deref()
+        .unwrap_or_default();
+    match properties {
+        [] => Ok(None),
+        [property] => {
+            let record = store
+                .symbol(*property)
+                .ok_or(SourceCheckError::Property(location))?;
+            if !record.flags().contains(SymbolFlags::PROPERTY)
+                || record.name().as_utf8().is_none_or(str::is_empty)
+            {
+                return Err(SourceCheckError::Property(location));
+            }
+            Ok(Some(*property))
+        }
+        _ => {
+            let declaration = store
+                .symbol(symbol)
+                .and_then(ts_binder::semantic::Symbol::declarations)
+                .and_then(|declarations| declarations.first().copied())
+                .ok_or(SourceCheckError::Property(location))?;
+            add_diagnostic(diagnostics, declaration, 2608, ["ElementChildrenAttribute"])?;
+            Ok(None)
+        }
+    }
 }
 
 fn validate_jsx_namespace_type_symbol(
@@ -2839,8 +2903,10 @@ fn execute_jsx_element(
 
             publish_signature_links(store, plan.opening, signature)?;
             check_jsx_element_type_constraint(store, host, namespace, tag, diagnostics)?;
-            let children = if options.jsx_runtime == CanonicalJsxRuntime::Automatic {
-                check_automatic_jsx_children(
+            let children = if options.jsx_runtime == CanonicalJsxRuntime::Automatic
+                || namespace.children_attribute.is_some()
+            {
+                check_jsx_implicit_children(
                     store,
                     source,
                     namespace,
@@ -2972,7 +3038,7 @@ fn check_jsx_element_type_constraint(
     Ok(())
 }
 
-fn check_automatic_jsx_children(
+fn check_jsx_implicit_children(
     store: &mut CanonicalTypeMapperStore,
     source: (&NodeArena, &BoundFile, &DeclaredTypeHost<'_>),
     namespace: &JsxNamespace,
@@ -2984,16 +3050,34 @@ fn check_automatic_jsx_children(
     if plan.children.is_empty() {
         return Ok(None);
     }
+    let name = if options.jsx_runtime == CanonicalJsxRuntime::Automatic {
+        None
+    } else {
+        namespace.children_attribute
+    };
+    let property_name = name.map_or_else(
+        || Ok("children".to_owned()),
+        |symbol| {
+            store
+                .symbol(symbol)
+                .and_then(|record| record.name().as_utf8())
+                .map(str::to_owned)
+                .ok_or(SourceCheckError::Property(plan.opening))
+        },
+    )?;
     match attributes {
         JsxAttributesPlan::Properties(attributes)
             if attributes
                 .iter()
-                .any(|attribute| attribute.name == "children") =>
+                .any(|attribute| attribute.name == property_name) =>
         {
             return Err(unsupported(plan.opening, SyntaxKind::JsxAttributes));
         }
         JsxAttributesPlan::ObjectSpread(spread) => {
-            return Err(unsupported(spread.node, SyntaxKind::JsxSpreadAttribute));
+            if options.jsx_runtime == CanonicalJsxRuntime::Automatic {
+                return Err(unsupported(spread.node, SyntaxKind::JsxSpreadAttribute));
+            }
+            return Ok(None);
         }
         JsxAttributesPlan::Properties(_) => {}
     }
@@ -3034,7 +3118,7 @@ fn check_automatic_jsx_children(
         let element = store.literal_union_type_prepared(&child_types, None, &mut prepared)?;
         automatic_jsx_children_array_type(store, source.2, element, node)?
     };
-    Ok(Some(CheckedJsxChildren { node, type_ }))
+    Ok(Some(CheckedJsxChildren { node, type_, name }))
 }
 
 fn automatic_jsx_children_array_type(
@@ -4283,10 +4367,11 @@ fn publish_attribute_object(
         properties.push(symbol);
     }
     if let Some(children) = children {
+        let name = checked_jsx_children_name(store, children)?.to_owned();
         let symbol = store
             .alloc_symbol(SymbolData::new(
                 SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT,
-                EscapedName::source("children"),
+                EscapedName::source(&name),
             ))
             .ok_or(SourceCheckError::Property(children.node))?;
         if !store.set_value_symbol_links(
@@ -4296,7 +4381,7 @@ fn publish_attribute_object(
                 ..ValueSymbolLinks::default()
             },
         ) || store
-            .insert_symbol(members, EscapedName::source("children"), symbol)
+            .insert_symbol(members, EscapedName::source(&name), symbol)
             .is_none()
         {
             return Err(SourceCheckError::Property(children.node));
@@ -4374,15 +4459,16 @@ fn validate_attribute_object(
         }
     }
     if let Some(children) = children {
+        let name = checked_jsx_children_name(store, children)?;
         let symbol = members
-            .get_source("children")
+            .get_source(name)
             .ok_or(SourceCheckError::Property(node))?;
         let record = store
             .symbol(symbol)
             .ok_or(SourceCheckError::Property(node))?;
         if record.flags() != SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT
             || record.check_flags() != CheckFlags::NONE
-            || record.name().as_utf8() != Some("children")
+            || record.name().as_utf8() != Some(name)
             || record.declarations().is_some()
             || record.value_declaration().is_some()
             || record.members().is_some()
@@ -4426,6 +4512,9 @@ fn check_attribute_assignability(
     let expected_members = structured.members;
     let required = structured.properties.clone().unwrap_or_default();
     let index_infos = structured.index_infos.clone().unwrap_or_default();
+    let children_name = children
+        .map(|children| checked_jsx_children_name(store, children).map(str::to_owned))
+        .transpose()?;
     let mut present = HashSet::with_capacity(attributes.len());
     let mut has_excess_attribute = false;
     for attribute in attributes {
@@ -4494,10 +4583,13 @@ fn check_attribute_assignability(
     }
 
     if let Some(children) = children {
-        present.insert("children");
+        let name = children_name
+            .as_deref()
+            .expect("checked JSX children retain their property name");
+        present.insert(name);
         if let Some(expected_type) = expected_members
             .and_then(|members| store.symbol_table(members))
-            .and_then(|members| members.get_source("children"))
+            .and_then(|members| members.get_source(name))
             .and_then(|symbol| store.value_symbol_links(symbol))
             .and_then(|links| links.resolved_type)
             && !store.is_type_assignable_to(children.type_, expected_type)?
@@ -5298,7 +5390,8 @@ fn format_attribute_object(
         .collect::<Result<Vec<_>, _>>()?;
     if let Some(children) = children {
         names.push(format!(
-            "children: {};",
+            "{}: {};",
+            checked_jsx_children_name(store, children)?,
             type_to_string_with_host_and_flags(
                 store,
                 host,
@@ -5308,6 +5401,18 @@ fn format_attribute_object(
         ));
     }
     Ok(format!("{{ {} }}", names.join(" ")))
+}
+
+fn checked_jsx_children_name(
+    store: &CanonicalTypeMapperStore,
+    children: CheckedJsxChildren,
+) -> Result<&str, SourceCheckError> {
+    children.name.map_or(Ok("children"), |symbol| {
+        store
+            .symbol(symbol)
+            .and_then(|record| record.name().as_utf8())
+            .ok_or(SourceCheckError::Property(children.node))
+    })
 }
 
 fn emit_intrinsic_type_argument_diagnostic(
@@ -9137,6 +9242,208 @@ mod runtime_tests {
                 .type_node_links(reference)
                 .and_then(|links| links.resolved_type),
             Some(any),
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Both legacy runtimes must retain child links and warm state.
+    fn classic_and_preserve_runtimes_use_declared_children_attribute_and_replay_warm() {
+        let source = concat!(
+            "declare var React: any;\n",
+            "declare namespace JSX {\n",
+            "  interface Element {}\n",
+            "  interface ElementChildrenAttribute { offspring: any; }\n",
+            "  interface IntrinsicElements { span: { offspring: string }; }\n",
+            "}\n",
+            "const Box = (props: { offspring: string }) => <span>{props.offspring}</span>;\n",
+            "const valid = <Box>ready</Box>;\n",
+            "const invalid = <Box>{123}</Box>;\n",
+        );
+
+        for (index, runtime) in [CanonicalJsxRuntime::Classic, CanonicalJsxRuntime::Preserve]
+            .into_iter()
+            .enumerate()
+        {
+            let parsed = parse_jsx_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(8_170 + u32::try_from(index).unwrap());
+            let mut binder = CanonicalBinder::new();
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source("\"/project/legacy-children.tsx\""),
+                        CanonicalSourceLanguage::TypeScript,
+                        false,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+            let mut context = crate::semantic::CanonicalCheckerContext::new(
+                binder.finish(),
+                vec![(file, &parsed.arena)],
+                CanonicalCheckerOptions {
+                    jsx_runtime: runtime,
+                    ..CanonicalCheckerOptions::default()
+                },
+            )
+            .unwrap();
+
+            context.check_source_file(file).unwrap();
+
+            let [diagnostic] = context.diagnostics().as_slice() else {
+                panic!("only the invalid child must fail in {runtime:?} mode")
+            };
+            assert_eq!(diagnostic.diagnostic.code(), 2322);
+            let range = parsed
+                .arena
+                .get(diagnostic.node.unwrap().node)
+                .unwrap()
+                .range;
+            assert_eq!(
+                source.get(range.start.get() as usize..range.end.get() as usize),
+                Some("{123}"),
+            );
+
+            let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+            let mut child_properties = 0;
+            for (node, record) in parsed.arena.iter() {
+                if record.kind != SyntaxKind::JsxAttributes {
+                    continue;
+                }
+                let attributes = NodeRef::new(parsed.arena.id(), file, node);
+                let type_ = context
+                    .store()
+                    .type_node_links(attributes)
+                    .and_then(|links| links.resolved_type)
+                    .unwrap();
+                let members = context
+                    .store()
+                    .type_payload(type_)
+                    .and_then(|record| record.data().structured())
+                    .and_then(|structured| structured.members)
+                    .and_then(|members| context.store().symbol_table(members))
+                    .unwrap();
+                let child = members.get_source("offspring").unwrap();
+                assert!(members.get_source("children").is_none());
+                let child_type = context
+                    .store()
+                    .value_symbol_links(child)
+                    .and_then(|links| links.resolved_type)
+                    .unwrap();
+                assert!(
+                    child_type == string
+                        || context
+                            .store()
+                            .type_payload(child_type)
+                            .unwrap()
+                            .flags()
+                            .intersects(TypeFlags::NUMBER_LITERAL),
+                );
+                child_properties += 1;
+            }
+            assert_eq!(child_properties, 3);
+
+            let cold = (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().signature_len(),
+                context.store().symbol_store().symbol_table_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.diagnostics().as_slice().to_vec(),
+            );
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().signature_len(),
+                    context.store().symbol_store().symbol_table_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    context.diagnostics().as_slice().to_vec(),
+                ),
+                cold,
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_children_attributes_with_multiple_properties_keep_exact_ts2608_and_warm_state() {
+        let source = concat!(
+            "declare namespace JSX {\n",
+            "  interface ElementChildrenAttribute { first: any; second: any; }\n",
+            "  interface IntrinsicElements { panel: {}; }\n",
+            "}\n",
+            "const view = <panel>ready</panel>;\n",
+        );
+        let parsed = parse_jsx_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(8_172);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/invalid-child-name.tsx\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = crate::semantic::CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("an ambiguous child property must produce one TS2608 diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2608);
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "The global type 'JSX.ElementChildrenAttribute' may not have more than one property.",
+        );
+        assert_eq!(
+            parsed
+                .arena
+                .get(diagnostic.node.unwrap().node)
+                .unwrap()
+                .kind,
+            SyntaxKind::InterfaceDeclaration,
+        );
+
+        let cold = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().signature_len(),
+            context.store().checker_link_allocated_lengths(),
+            context.diagnostics().as_slice().to_vec(),
+        );
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.diagnostics().as_slice().to_vec(),
+            ),
+            cold,
         );
     }
 
