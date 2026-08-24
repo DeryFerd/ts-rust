@@ -35556,21 +35556,43 @@ mod tests {
             .and_then(ts_binder::semantic::Symbol::exports)
             .and_then(|exports| context.store().symbol_table(exports))
             .unwrap();
-        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
-        for (name, expected_type) in [
-            ("value", bootstrap.number_type),
-            ("ready", bootstrap.boolean_type),
-        ] {
-            let export = exports.get_source(name).unwrap();
-            assert_eq!(
+        let value = exports.get_source("value").unwrap();
+        let value_type = context
+            .store()
+            .value_symbol_links(value)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let TypeData::Union(union) = context.store().type_payload(value_type).unwrap().data()
+        else {
+            panic!("repeated CommonJS exports must retain their regular literal union")
+        };
+        assert_eq!(union.union.types.len(), 2);
+        for index in 0..2 {
+            let (_, right) = assignment_parts(&source, file, index);
+            let TypeData::Literal(literal) = context
+                .store()
+                .type_payload(resolved_node_type(&context, right))
+                .unwrap()
+                .data()
+            else {
+                panic!("CommonJS export assignments must retain their source literal")
+            };
+            assert!(union.union.types.contains(&literal.regular_type));
+        }
+        let ready = exports.get_source("ready").unwrap();
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(ready)
+                .and_then(|links| links.resolved_type),
+            Some(
                 context
                     .store()
-                    .value_symbol_links(export)
-                    .and_then(|links| links.resolved_type),
-                Some(expected_type),
-                "{name}",
-            );
-        }
+                    .intrinsic_bootstrap()
+                    .unwrap()
+                    .regular_true_type,
+            ),
+        );
         assert!(context.diagnostics().is_empty());
 
         let warm = observable_state(&context, file);
@@ -35599,20 +35621,40 @@ mod tests {
             .and_then(ts_binder::semantic::Symbol::exports)
             .and_then(|exports| context.store().symbol_table(exports))
             .unwrap();
-        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
-        assert_eq!(
-            context
+        let value_type = context
+            .store()
+            .value_symbol_links(exports.get_source("value").unwrap())
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let TypeData::Union(union) = context.store().type_payload(value_type).unwrap().data()
+        else {
+            panic!("computed CommonJS exports must retain their regular literal union")
+        };
+        assert_eq!(union.union.types.len(), 2);
+        for index in 0..2 {
+            let (_, right) = assignment_parts(&source, file, index);
+            let TypeData::Literal(literal) = context
                 .store()
-                .value_symbol_links(exports.get_source("value").unwrap())
-                .and_then(|links| links.resolved_type),
-            Some(bootstrap.number_type),
-        );
+                .type_payload(resolved_node_type(&context, right))
+                .unwrap()
+                .data()
+            else {
+                panic!("computed CommonJS assignments must retain their source literal")
+            };
+            assert!(union.union.types.contains(&literal.regular_type));
+        }
         assert_eq!(
             context
                 .store()
                 .value_symbol_links(exports.get_source("ready").unwrap())
                 .and_then(|links| links.resolved_type),
-            Some(bootstrap.boolean_type),
+            Some(
+                context
+                    .store()
+                    .intrinsic_bootstrap()
+                    .unwrap()
+                    .regular_true_type,
+            ),
         );
         assert!(context.diagnostics().is_empty());
 
@@ -35689,9 +35731,24 @@ mod tests {
         context.check_source_file(target_file).unwrap();
         context.check_source_file(importer_file).unwrap();
 
+        let (_, target_bound) = context.file(target_file).unwrap();
+        let target_module = target_bound.symbol(target_bound.source_file()).unwrap();
+        let exported = context
+            .store()
+            .symbol(target_module)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| context.store().symbol_table(exports))
+            .and_then(|exports| exports.get_source("value"))
+            .unwrap();
+        let exported_type = context
+            .store()
+            .value_symbol_links(exported)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        assert_eq!(context.type_to_string(exported_type).unwrap(), "1");
         assert_eq!(
             variable_value_type(&context, &importer, importer_file, "copied"),
-            context.store().intrinsic_bootstrap().unwrap().number_type,
+            exported_type,
         );
         assert!(context.diagnostics().is_empty());
         let warm = observable_state(&context, importer_file);
