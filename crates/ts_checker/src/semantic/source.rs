@@ -28461,6 +28461,88 @@ mod tests {
     }
 
     #[test]
+    fn initialized_static_fields_preserve_inherited_symbols_and_literal_types() {
+        let source = parsed(concat!(
+            "class Base { static count = 123; static readonly exact = 7; } ",
+            "class Derived extends Base { public static total: number = 456; } ",
+            "const inherited = Derived.count; ",
+            "const own = Derived.total; ",
+            "const fixed = Derived.exact;",
+        ));
+        let file = FileId::new(8_550);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let derived = global_symbol(&context, "Derived");
+        let members = context.get_nongeneric_class_members(derived).unwrap();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        for (name, property) in [("inherited", "count"), ("own", "total"), ("fixed", "exact")] {
+            let symbol = context
+                .store()
+                .symbol_table(members.static_members())
+                .and_then(|exports| exports.get_source(property))
+                .expect("the static field remains in the derived member table");
+            let expected = context
+                .store()
+                .value_symbol_links(symbol)
+                .and_then(|links| links.resolved_type)
+                .expect("the static field retains its published type");
+            let access = variable_initializer(&source, file, name);
+            assert_eq!(variable_value_type(&context, &source, file, name), expected);
+            assert_eq!(resolved_node_type(&context, access), expected);
+            assert_eq!(
+                context
+                    .store()
+                    .symbol_node_links(access)
+                    .and_then(|links| links.resolved_symbol),
+                Some(symbol),
+            );
+            if property != "exact" {
+                assert_eq!(expected, number);
+            } else {
+                assert_ne!(expected, number);
+            }
+        }
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, file));
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn javascript_numeric_static_fields_publish_inherited_members_and_replay_warm() {
+        let source = parse_javascript_source_file(concat!(
+            "class C { static blah1 = 123; } ",
+            "class D extends C { static blah2 = 456; } ",
+            "const inherited = D.blah1; ",
+            "const own = D.blah2;",
+        ));
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let file = FileId::new(8_551);
+        let mut context = javascript_context(file, &source, CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        for name in ["inherited", "own"] {
+            assert_eq!(variable_value_type(&context, &source, file, name), number);
+            assert_eq!(
+                resolved_node_type(&context, variable_initializer(&source, file, name)),
+                number,
+            );
+        }
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, file));
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
     fn merged_null_base_class_reports_exact_static_and_super_diagnostics_and_replays_warm() {
         let source = parsed(concat!(
             "interface Base {}\n\n",

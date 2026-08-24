@@ -20,9 +20,9 @@
 //! One direct getter/setter pair can expose an annotated numeric property.
 //! A constructor may retain one string or number parameter. Decorated
 //! parameters remain restricted to one authenticated string parameter.
-//! Numeric instance fields can retain a direct numeric initializer. An instance
-//! field may also reference its own constructor parameter and retain the
-//! upstream error-recovery `any` type for the source diagnostic.
+//! Numeric instance and static fields can retain a direct numeric initializer.
+//! An instance field may also reference its own constructor parameter and
+//! retain the upstream error-recovery `any` type for the source diagnostic.
 //! Simple same-file namespaces can merge with a class and contribute numeric
 //! variable exports to its static member table.
 //! A class may extend the literal `null` without acquiring an instance base.
@@ -2389,8 +2389,7 @@ fn plan_property(
     let (initializer_text, initializer_parameter_name) =
         if let Some(initializer_node) = initializer_node {
             let initializer_record = preflight_node(store, host, initializer_node)?;
-            if side != ClassPropertySide::Instance
-                || property.postfix_token.is_some()
+            if property.postfix_token.is_some()
                 || initializer_record.flags.0 != 0
                 || initializer_record.parent != Some(member.node)
                 || initializer_record.range.start < type_record.range.end
@@ -2433,7 +2432,8 @@ fn plan_property(
                     (Some(literal.text.clone()), None)
                 }
                 NodeData::Identifier(identifier) => {
-                    if initializer_record.kind != SyntaxKind::Identifier
+                    if side != ClassPropertySide::Instance
+                        || initializer_record.kind != SyntaxKind::Identifier
                         || initializer_node != type_node
                         || property.type_.is_some()
                         || readonly
@@ -10406,12 +10406,17 @@ fn exact_stored_property(
                     && literal_record.flags() == TypeFlags::NUMBER_LITERAL
                     && bootstrap.cached_number_literal_type(*number) == Some(literal.regular_type)
                     && store.fresh_type_of_literal_type(literal.regular_type) == Ok(fresh)
-                    && store
-                        .symbol(owner)
-                        .and_then(Symbol::members)
-                        .and_then(|members| store.symbol_table(members))
-                        .and_then(|members| members.get(record.name()))
-                        == Some(property)
+                    && store.symbol(owner).is_some_and(|owner| {
+                        [owner.members(), owner.exports()]
+                            .into_iter()
+                            .flatten()
+                            .any(|members| {
+                                store
+                                    .symbol_table(members)
+                                    .and_then(|members| members.get(record.name()))
+                                    == Some(property)
+                            })
+                    })
             },
             |annotation| store.source_type_node_result_is_exact(annotation, property_type, &[]),
         );
@@ -14688,6 +14693,7 @@ mod tests {
             "const x = 1; class Model { value = x; constructor(y: string) {} }",
             "const x = 1; class Model { value = x; }",
             "const x = 1; class Model { readonly value = x; constructor(x: string) {} }",
+            "const x = 1; class Model { static value = x; constructor(x: string) {} }",
         ] {
             let fixture = fixture(source);
             let owner = class_symbol(&fixture, "Model");
@@ -14785,6 +14791,180 @@ mod tests {
             ),
             warm
         );
+    }
+
+    #[test]
+    fn static_numeric_fields_preserve_owner_tables_and_replay_warm() {
+        for (source, annotated, readonly, namespace_export) in [
+            ("class Model { static value = 1; }", false, false, false),
+            (
+                "class Model { public static value: number = 1; }",
+                true,
+                false,
+                false,
+            ),
+            (
+                "class Model { static readonly value = 1; }",
+                false,
+                true,
+                false,
+            ),
+            (
+                "class Model { static readonly value: number = 1; }",
+                true,
+                true,
+                false,
+            ),
+            (
+                concat!(
+                    "class Model { static value = 1; } ",
+                    "namespace Model { export var extra = 2; }",
+                ),
+                false,
+                false,
+                true,
+            ),
+        ] {
+            let mut fixture = fixture(source);
+            let owner = class_symbol(&fixture, "Model");
+            let bound = &fixture.files[&fixture.file];
+            let host = host(&fixture.parsed.arena, bound);
+            let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
+            let ClassMemberQueryPlan::Direct(class) = &plan else {
+                panic!("a numeric static field belongs to one direct class")
+            };
+            let property = class.class.static_properties[0].clone();
+            let initializer = property.initializer_node.unwrap();
+            assert_eq!(property.side, ClassPropertySide::Static, "{source}");
+            assert_eq!(property.type_node != initializer, annotated, "{source}");
+            assert_eq!(property.readonly, readonly, "{source}");
+
+            let members =
+                execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan).unwrap();
+
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            let regular = bootstrap
+                .cached_number_literal_type(Number::new(1.0))
+                .unwrap();
+            let fresh = fixture.store.fresh_type_of_literal_type(regular).unwrap();
+            let expected = if readonly && !annotated {
+                regular
+            } else {
+                bootstrap.number_type
+            };
+            assert_eq!(
+                fixture
+                    .store
+                    .symbol(owner)
+                    .and_then(Symbol::exports)
+                    .and_then(|exports| fixture.store.symbol_table(exports))
+                    .and_then(|exports| exports.get_source("value")),
+                Some(property.symbol),
+                "{source}",
+            );
+            assert_eq!(
+                fixture.store.type_node_links(initializer),
+                Some(&TypeNodeLinks {
+                    resolved_type: Some(fresh),
+                    ..TypeNodeLinks::default()
+                }),
+                "{source}",
+            );
+            assert_eq!(
+                fixture.store.value_symbol_links(property.symbol),
+                Some(&ValueSymbolLinks {
+                    resolved_type: Some(expected),
+                    ..ValueSymbolLinks::default()
+                }),
+                "{source}",
+            );
+            assert_eq!(
+                members.static_properties().len(),
+                1 + usize::from(namespace_export),
+                "{source}",
+            );
+            assert_eq!(
+                validate_class_heritage_members(&fixture.store, members.shells().instance_type()),
+                ClassHeritageMembersValidation::Valid,
+                "{source}",
+            );
+
+            let warm = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+            assert_eq!(
+                execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan),
+                Ok(members),
+                "{source}",
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                warm,
+                "{source}",
+            );
+        }
+    }
+
+    #[test]
+    fn poisoned_static_numeric_field_caches_reject_before_class_publication() {
+        for poison_initializer in [false, true] {
+            let mut fixture = fixture("class Model { static readonly value = 1; }");
+            let owner = class_symbol(&fixture, "Model");
+            let bound = &fixture.files[&fixture.file];
+            let host = host(&fixture.parsed.arena, bound);
+            let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
+            let ClassMemberQueryPlan::Direct(class) = &plan else {
+                panic!("a numeric static field belongs to one direct class")
+            };
+            let property = &class.class.static_properties[0];
+            let wrong = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+            let expected = if poison_initializer {
+                let initializer = property.initializer_node.unwrap();
+                assert!(fixture.store.set_type_node_links(
+                    initializer,
+                    TypeNodeLinks {
+                        resolved_type: Some(wrong),
+                        ..TypeNodeLinks::default()
+                    },
+                ));
+                invariant(ClassInvariant::InvalidPropertyTypeCache(initializer))
+            } else {
+                assert!(fixture.store.set_value_symbol_links(
+                    property.symbol,
+                    ValueSymbolLinks {
+                        resolved_type: Some(wrong),
+                        ..ValueSymbolLinks::default()
+                    },
+                ));
+                invariant(ClassInvariant::InvalidPropertyValueCache(property.symbol))
+            };
+            let poisoned = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            assert_eq!(
+                plan_nongeneric_class_member_query(&fixture.store, &host, owner),
+                Err(expected),
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                poisoned,
+            );
+            assert!(fixture.store.declared_type_links(owner).is_none());
+            assert!(fixture.store.value_symbol_links(owner).is_none());
+        }
     }
 
     #[test]

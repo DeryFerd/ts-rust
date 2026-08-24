@@ -3438,8 +3438,22 @@ mod tests {
                 "count",
             ),
             (
+                "class Model { static count = 123; } const result = Model.count;",
+                "Model",
+                "count",
+            ),
+            (
                 concat!(
                     "class Base { static count: number; } ",
+                    "class Derived extends Base {} ",
+                    "const result = Derived.count;",
+                ),
+                "Derived",
+                "count",
+            ),
+            (
+                concat!(
+                    "class Base { static count = 123; } ",
                     "class Derived extends Base {} ",
                     "const result = Derived.count;",
                 ),
