@@ -3357,15 +3357,30 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         if body_record.kind == SyntaxKind::IndexedAccessType {
             return self.is_authenticated_bivariant_method_indexed_access(body);
         }
-        let NodeData::UnionTypeNode(union) = &body_record.data else {
+        self.is_authenticated_bivariant_generic_union_alias(body, alias_symbol)
+    }
+
+    fn is_authenticated_bivariant_generic_union_alias(
+        &self,
+        node: NodeRef,
+        alias: SemanticSymbolId,
+    ) -> Result<bool, DeclaredTypeError> {
+        let Some(plan) = self.plan.aliases.get(&alias) else {
             return Ok(false);
         };
-        if body_record.kind != SyntaxKind::UnionType {
+        if plan.type_node != node || plan.type_parameters.is_empty() {
+            return Ok(false);
+        }
+        let record = preflight_node(self.store, self.host, node)?;
+        let NodeData::UnionTypeNode(union) = &record.data else {
+            return Ok(false);
+        };
+        if record.kind != SyntaxKind::UnionType {
             return Ok(false);
         }
         for constituent in &union.types.nodes {
-            let constituent = NodeRef::new(body.arena, body.file, *constituent);
-            if preflight_node(self.store, self.host, constituent)?.parent != Some(body.node) {
+            let constituent = NodeRef::new(node.arena, node.file, *constituent);
+            if preflight_node(self.store, self.host, constituent)?.parent != Some(node.node) {
                 return Ok(false);
             }
             if self.is_authenticated_bivariant_method_indexed_access(constituent)? {
@@ -4489,6 +4504,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                         .type_parameters
                         .as_ref()
                         .is_some_and(|parameters| !parameters.nodes.is_empty())
+                        && !self.is_authenticated_bivariant_generic_union_alias(node, symbol)?
                     {
                         return Err(type_node_unavailable(
                             TypeNodeUnavailable::GenericReferenceUnsupported { node, symbol },
