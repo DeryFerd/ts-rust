@@ -7,8 +7,8 @@
 //! declarations or admitted annotated uninitialized variables. Those
 //! routes independently revalidate their direct `var`/`let` AST and binder shape
 //! before admission.
-//! A separate `CommonJS` route admits binder-authenticated assignments of
-//! local identifiers and object literals to `module.exports`.
+//! Separate `CommonJS` routes admit binder-authenticated assignments to
+//! `module.exports` and direct named assignments to `exports.name`.
 //! Name lookup follows the pinned lexical resolver and checker export/merge routing.
 //! Valid syntax outside that closure is a typed unsupported result; malformed AST,
 //! binder, or semantic-store provenance is an invariant failure.
@@ -221,6 +221,16 @@ struct CommonJsAssignmentPlanner<'a> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CommonJsNamedAssignmentShape {
+    expression: NodeRef,
+    left: NodeRef,
+    right: NodeRef,
+    receiver: NodeRef,
+    name: NodeRef,
+    alias: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RoutedValueSymbol {
     target: SemanticSymbolId,
     redirect: Option<(SemanticSymbolId, SemanticSymbolId)>,
@@ -260,6 +270,22 @@ pub(super) fn plan_commonjs_assignment(
         store,
     }
     .plan(statement)
+}
+
+/// Authenticates a direct `exports.name = value` assignment and its merged writes.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn plan_commonjs_named_assignment(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    statement: NodeRef,
+) -> Result<Option<CommonJsAssignmentPlan>, AssignmentPlanError> {
+    CommonJsAssignmentPlanner {
+        arena,
+        bound,
+        store,
+    }
+    .plan_named(statement)
 }
 
 /// Plans one assignment with source-minted capabilities for exact mutable
@@ -334,6 +360,412 @@ pub(super) fn plan_simple_assignment_with_all_source_targets(
 }
 
 impl CommonJsAssignmentPlanner<'_> {
+    fn plan_named(
+        &self,
+        statement: NodeRef,
+    ) -> Result<Option<CommonJsAssignmentPlan>, AssignmentPlanError> {
+        self.preflight_program()?;
+        if self
+            .bound
+            .source_facts()
+            .is_none_or(|facts| !facts.is_javascript_file() || !facts.is_common_js_module())
+        {
+            return Ok(None);
+        }
+
+        let Some(assignment) = self.named_assignment_shape(statement)? else {
+            return Ok(None);
+        };
+        let NodeData::Identifier(name) = &self.node(assignment.name)?.data else {
+            return Err(AssignmentInvariant::InvalidIdentifierShape(assignment.name).into());
+        };
+        let source = self.bound.source_file();
+        let source_symbol = self
+            .bound
+            .symbol(source)
+            .ok_or(AssignmentInvariant::MissingSourceSymbol(source))?;
+        let source_record = self
+            .store
+            .symbol(source_symbol)
+            .ok_or(AssignmentInvariant::InvalidSymbol(source_symbol))?;
+        if source_record.flags() != SymbolFlags::VALUE_MODULE {
+            return Err(AssignmentInvariant::InvalidSymbolShape(source_symbol).into());
+        }
+        let merged_source = self
+            .store
+            .get_merged_symbol(source_symbol)
+            .ok_or(AssignmentInvariant::InvalidMergedSymbol(source_symbol))?;
+        if merged_source != source_symbol {
+            return Err(AssignmentPlanError::Unsupported(
+                AssignmentUnsupported::MergedTarget {
+                    node: source,
+                    source: source_symbol,
+                    target: merged_source,
+                },
+            ));
+        }
+
+        let expected = source_record
+            .exports()
+            .and_then(|exports| self.store.symbol_table(exports))
+            .and_then(|exports| exports.get_source(&name.text))
+            .ok_or(AssignmentInvariant::MissingExportSymbol(source_symbol))?;
+        let target_symbol = self.bound.symbol(assignment.expression).ok_or(
+            AssignmentInvariant::MissingDeclarationSymbol(assignment.expression),
+        )?;
+        if target_symbol != expected {
+            return Err(AssignmentInvariant::DeclarationSymbolMismatch {
+                declaration: assignment.expression,
+                expected,
+                actual: target_symbol,
+            }
+            .into());
+        }
+
+        self.validate_named_export_assignment(&assignment, &name.text, source_symbol)?;
+
+        Ok(Some(CommonJsAssignmentPlan {
+            expression: assignment.expression,
+            left: assignment.left,
+            right: assignment.right,
+            target_symbol,
+        }))
+    }
+
+    fn named_assignment_shape(
+        &self,
+        statement: NodeRef,
+    ) -> Result<Option<CommonJsNamedAssignmentShape>, AssignmentPlanError> {
+        let statement_node = self.node(statement)?;
+        let NodeData::ExpressionStatement(statement_data) = &statement_node.data else {
+            return Ok(None);
+        };
+        if statement_node.flags.0 != 0 || statement_data.flow_node.is_some() {
+            return Err(AssignmentInvariant::InvalidStatementShape(statement).into());
+        }
+        if statement_node.parent != Some(self.bound.source_file().node) {
+            return Err(AssignmentPlanError::Unsupported(
+                AssignmentUnsupported::NestedTarget(statement),
+            ));
+        }
+
+        let expression = self.reference(statement_data.expression);
+        self.require_parent(expression, Some(statement.node))?;
+        let expression_node = self.node(expression)?;
+        let NodeData::BinaryExpression(binary) = &expression_node.data else {
+            return Ok(None);
+        };
+        if expression_node.flags.0 != 0
+            || binary.symbol.is_some()
+            || binary.type_.is_some()
+            || binary.facts != 0
+            || binary.modifiers.is_some()
+        {
+            return Err(AssignmentPlanError::Unsupported(
+                AssignmentUnsupported::NonOrdinaryAssignment(expression),
+            ));
+        }
+
+        let operator = self.reference(binary.operator_token);
+        self.require_parent(operator, Some(expression.node))?;
+        let operator_node = self.node(operator)?;
+        if !matches!(operator_node.data, NodeData::Token(_)) || operator_node.flags.0 != 0 {
+            return Err(AssignmentInvariant::InvalidOperatorToken(operator).into());
+        }
+        if operator_node.kind != SyntaxKind::EqualsToken {
+            return Ok(None);
+        }
+
+        let left = self.reference(binary.left);
+        let right = self.reference(binary.right);
+        self.require_parent(left, Some(expression.node))?;
+        self.require_parent(right, Some(expression.node))?;
+        let left_node = self.node(left)?;
+        let NodeData::PropertyAccessExpression(access) = &left_node.data else {
+            return Ok(None);
+        };
+        if left_node.flags.0 != 0
+            || access.flow_node.is_some()
+            || access.question_dot_token.is_some()
+            || access.facts != 0
+        {
+            return Err(AssignmentPlanError::Unsupported(
+                AssignmentUnsupported::Syntax {
+                    node: left,
+                    kind: left_node.kind,
+                    role: AssignmentSyntaxRole::LeftHandSide,
+                },
+            ));
+        }
+
+        let receiver = self.reference(access.expression);
+        let name = self.reference(access.name);
+        self.require_parent(receiver, Some(left.node))?;
+        self.require_parent(name, Some(left.node))?;
+        if !self.is_identifier_named(receiver, "exports")? {
+            return Ok(None);
+        }
+        let name_node = self.node(name)?;
+        let NodeData::Identifier(identifier) = &name_node.data else {
+            return Ok(None);
+        };
+        if name_node.flags.0 != 0 || identifier.flow_node.is_some() || identifier.text.is_empty() {
+            return Err(AssignmentInvariant::InvalidIdentifierShape(name).into());
+        }
+        let Some(alias) = self.named_assignment_value_is_alias(right)? else {
+            return Ok(None);
+        };
+
+        Ok(Some(CommonJsNamedAssignmentShape {
+            expression,
+            left,
+            right,
+            receiver,
+            name,
+            alias,
+        }))
+    }
+
+    fn named_assignment_value_is_alias(
+        &self,
+        value: NodeRef,
+    ) -> Result<Option<bool>, AssignmentPlanError> {
+        let record = self.node(value)?;
+        if record.flags.0 != 0 {
+            return Ok(None);
+        }
+        match &record.data {
+            NodeData::Identifier(identifier) => {
+                if identifier.flow_node.is_some() || identifier.text.is_empty() {
+                    return Err(AssignmentInvariant::InvalidIdentifierShape(value).into());
+                }
+                Ok(Some(true))
+            }
+            NodeData::NumericLiteral(literal) if literal.token_flags.0 == 0 => Ok(Some(false)),
+            NodeData::StringLiteral(literal) if literal.token_flags.0 == 0 => Ok(Some(false)),
+            NodeData::KeywordExpression(keyword)
+                if keyword.flow_node.is_none()
+                    && matches!(
+                        record.kind,
+                        SyntaxKind::TrueKeyword
+                            | SyntaxKind::FalseKeyword
+                            | SyntaxKind::NullKeyword
+                    ) =>
+            {
+                Ok(Some(false))
+            }
+            NodeData::ObjectLiteralExpression(object)
+                if object.symbol.is_none() && object.facts == 0 =>
+            {
+                Ok(Some(false))
+            }
+            NodeData::ArrayLiteralExpression(array) if array.facts == 0 => Ok(Some(false)),
+            _ => Ok(None),
+        }
+    }
+
+    fn validate_named_export_assignment(
+        &self,
+        assignment: &CommonJsNamedAssignmentShape,
+        name: &str,
+        source_symbol: SemanticSymbolId,
+    ) -> Result<(), AssignmentPlanError> {
+        let target = self.bound.symbol(assignment.expression).ok_or(
+            AssignmentInvariant::MissingDeclarationSymbol(assignment.expression),
+        )?;
+        let merged = self
+            .store
+            .get_merged_symbol(target)
+            .ok_or(AssignmentInvariant::InvalidMergedSymbol(target))?;
+        if merged != target {
+            return Err(AssignmentPlanError::Unsupported(
+                AssignmentUnsupported::MergedTarget {
+                    node: assignment.left,
+                    source: target,
+                    target: merged,
+                },
+            ));
+        }
+
+        let record = self
+            .store
+            .symbol(target)
+            .ok_or(AssignmentInvariant::InvalidSymbol(target))?;
+        let expected_flags = if assignment.alias {
+            SymbolFlags::ALIAS
+        } else {
+            SymbolFlags::FUNCTION_SCOPED_VARIABLE
+        };
+        if record.flags() == (SymbolFlags::ALIAS | SymbolFlags::FUNCTION_SCOPED_VARIABLE) {
+            return Err(AssignmentPlanError::Unsupported(
+                AssignmentUnsupported::NonVariableTarget {
+                    node: assignment.left,
+                    symbol: target,
+                    flags: record.flags(),
+                },
+            ));
+        }
+        if record.flags() != expected_flags
+            || record.check_flags() != CheckFlags::NONE
+            || record.name().as_bytes() != name.as_bytes()
+            || record.members().is_some()
+            || record.exports().is_some()
+            || record.export_symbol().is_some()
+        {
+            return Err(AssignmentInvariant::InvalidSymbolShape(target).into());
+        }
+        if record.parent() != Some(source_symbol) {
+            return Err(AssignmentInvariant::InvalidTargetParent {
+                symbol: target,
+                expected: Some(source_symbol),
+                actual: record.parent(),
+            }
+            .into());
+        }
+
+        let declarations = record
+            .declarations()
+            .filter(|declarations| !declarations.is_empty())
+            .ok_or(AssignmentInvariant::MissingDeclarations(target))?;
+        let expected_value = (!assignment.alias).then_some(declarations[0]);
+        if record.value_declaration() != expected_value {
+            return Err(AssignmentInvariant::ValueDeclarationMismatch {
+                symbol: target,
+                declaration: declarations[0],
+                value_declaration: record.value_declaration(),
+            }
+            .into());
+        }
+
+        let mut occurrences = 0;
+        for &declaration in declarations {
+            if declaration.file != assignment.expression.file
+                || declaration.arena != assignment.expression.arena
+            {
+                return Err(AssignmentPlanError::Unsupported(
+                    AssignmentUnsupported::CrossFileTarget {
+                        node: assignment.left,
+                        declaration,
+                    },
+                ));
+            }
+            if self.bound.symbol(declaration) != Some(target) {
+                return Err(AssignmentInvariant::DeclarationSymbolMismatch {
+                    declaration,
+                    expected: target,
+                    actual: self
+                        .bound
+                        .symbol(declaration)
+                        .ok_or(AssignmentInvariant::MissingDeclarationSymbol(declaration))?,
+                }
+                .into());
+            }
+            let statement = self
+                .node(declaration)?
+                .parent
+                .map(|node| self.reference(node))
+                .ok_or(AssignmentInvariant::InvalidStatementShape(declaration))?;
+            let Some(candidate) = self.named_assignment_shape(statement)? else {
+                return Err(AssignmentPlanError::Unsupported(
+                    AssignmentUnsupported::NonUniqueTarget {
+                        node: assignment.left,
+                        symbol: target,
+                        declaration_count: declarations.len(),
+                    },
+                ));
+            };
+            let candidate_name = self.node(candidate.name)?;
+            if candidate.expression != declaration
+                || !matches!(
+                    &candidate_name.data,
+                    NodeData::Identifier(identifier) if identifier.text == name
+                )
+                || candidate.alias != assignment.alias
+            {
+                return Err(AssignmentInvariant::InvalidSymbolShape(target).into());
+            }
+            self.validate_implicit_exports(candidate.receiver, source_symbol)?;
+            if candidate.alias {
+                let NodeData::Identifier(local) = &self.node(candidate.right)?.data else {
+                    return Err(AssignmentInvariant::InvalidIdentifierShape(candidate.right).into());
+                };
+                self.validate_local_identifier(candidate.right, &local.text)?;
+            }
+            occurrences += usize::from(declaration == assignment.expression);
+        }
+        if occurrences != 1 {
+            return Err(AssignmentInvariant::InvalidSymbolShape(target).into());
+        }
+
+        Ok(())
+    }
+
+    fn validate_implicit_exports(
+        &self,
+        receiver: NodeRef,
+        source_symbol: SemanticSymbolId,
+    ) -> Result<(), AssignmentPlanError> {
+        let source = self.bound.source_file();
+        let exports = self
+            .bound
+            .locals(source)
+            .and_then(|locals| self.store.symbol_table(locals))
+            .and_then(|locals| locals.get_source("exports"))
+            .ok_or(AssignmentInvariant::MissingExportSymbol(source_symbol))?;
+        let record = self
+            .store
+            .symbol(exports)
+            .ok_or(AssignmentInvariant::InvalidSymbol(exports))?;
+        if !record.flags().contains(SymbolFlags::MODULE_EXPORTS) {
+            return Err(AssignmentPlanError::Unsupported(
+                AssignmentUnsupported::ShadowedCommonJsModule {
+                    node: receiver,
+                    symbol: exports,
+                },
+            ));
+        }
+        let merged = self
+            .store
+            .get_merged_symbol(exports)
+            .ok_or(AssignmentInvariant::InvalidMergedSymbol(exports))?;
+        if merged != exports {
+            return Err(AssignmentPlanError::Unsupported(
+                AssignmentUnsupported::MergedTarget {
+                    node: receiver,
+                    source: exports,
+                    target: merged,
+                },
+            ));
+        }
+        if record.flags() != (SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::MODULE_EXPORTS)
+            || record.check_flags() != CheckFlags::NONE
+            || record.name().as_bytes() != b"exports"
+            || record.declarations() != Some(&[source])
+            || record.value_declaration() != Some(source)
+            || record.members().is_some()
+            || record.exports().is_some()
+            || record.parent().is_some()
+            || record.export_symbol().is_some()
+        {
+            return Err(AssignmentInvariant::InvalidSymbolShape(exports).into());
+        }
+        if let Some(cached) = self
+            .store
+            .symbol_node_links(receiver)
+            .and_then(|links| links.resolved_symbol)
+            && cached != exports
+        {
+            return Err(AssignmentInvariant::ResolvedSymbolMismatch {
+                node: receiver,
+                expected: exports,
+                actual: cached,
+            }
+            .into());
+        }
+
+        Ok(())
+    }
+
     fn plan(
         &self,
         statement: NodeRef,
@@ -2084,6 +2516,18 @@ mod tests {
                 self.expression_statement(index),
             )
         }
+
+        fn commonjs_named_plan(
+            &self,
+            index: usize,
+        ) -> Result<Option<CommonJsAssignmentPlan>, AssignmentPlanError> {
+            plan_commonjs_named_assignment(
+                &self.parsed.arena,
+                &self.bound,
+                &self.store,
+                self.expression_statement(index),
+            )
+        }
     }
 
     fn source_facts(file: FileId) -> CanonicalSourceFileFacts {
@@ -2265,6 +2709,284 @@ mod tests {
             );
             assert_eq!(observable_state(&fixture.store), before, "{source}");
         }
+    }
+
+    #[test]
+    fn plans_named_commonjs_exports_without_semantic_writes() {
+        for (source, expected_flags) in [
+            ("exports.value = 1;", SymbolFlags::FUNCTION_SCOPED_VARIABLE),
+            (
+                r#"exports.value = "hello";"#,
+                SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+            ),
+            (
+                "exports.value = true;",
+                SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+            ),
+            (
+                "exports.value = false;",
+                SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+            ),
+            (
+                "exports.value = null;",
+                SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+            ),
+            (
+                "exports.value = { nested: 1 };",
+                SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+            ),
+            (
+                "exports.value = [1, 2];",
+                SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+            ),
+            (
+                "const local = 1; exports.value = local;",
+                SymbolFlags::ALIAS,
+            ),
+        ] {
+            let fixture = Fixture::javascript(source);
+            let statement = fixture.expression_statement(0);
+            let (expression, left, right) = assignment_parts(&fixture.parsed, statement);
+            let target_symbol = fixture.bound.symbol(expression).unwrap();
+            let before = observable_state(&fixture.store);
+
+            assert_eq!(
+                fixture.store.symbol(target_symbol).unwrap().flags(),
+                expected_flags,
+                "{source}",
+            );
+            assert_eq!(
+                fixture.commonjs_named_plan(0),
+                Ok(Some(CommonJsAssignmentPlan {
+                    expression,
+                    left,
+                    right,
+                    target_symbol,
+                })),
+                "{source}",
+            );
+            assert_eq!(observable_state(&fixture.store), before, "{source}");
+        }
+    }
+
+    #[test]
+    fn named_commonjs_exports_authenticate_repeated_assignments() {
+        for (source, expected_flags) in [
+            (
+                r#"exports.value = 1; exports.value = "text"; exports.value = true;"#,
+                SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+            ),
+            (
+                concat!(
+                    "const first = 1; const second = 2; ",
+                    "exports.value = first; exports.value = second;",
+                ),
+                SymbolFlags::ALIAS,
+            ),
+        ] {
+            let fixture = Fixture::javascript(source);
+            let statements = expression_statements(&fixture.parsed, fixture.file);
+            let target = fixture
+                .bound
+                .symbol(assignment_parts(&fixture.parsed, statements[0]).0)
+                .unwrap();
+            let record = fixture.store.symbol(target).unwrap();
+            assert_eq!(record.flags(), expected_flags, "{source}");
+            assert_eq!(record.declarations().unwrap().len(), statements.len());
+            let before = observable_state(&fixture.store);
+
+            for (index, statement) in statements.into_iter().enumerate() {
+                let (expression, left, right) = assignment_parts(&fixture.parsed, statement);
+                assert_eq!(
+                    fixture.commonjs_named_plan(index),
+                    Ok(Some(CommonJsAssignmentPlan {
+                        expression,
+                        left,
+                        right,
+                        target_symbol: target,
+                    })),
+                    "{source}",
+                );
+                assert_eq!(observable_state(&fixture.store), before, "{source}");
+            }
+        }
+    }
+
+    #[test]
+    fn named_commonjs_exports_leave_other_assignment_families_untouched() {
+        let ordinary = Fixture::new("var local: number = 0; local = 1;");
+        let before = observable_state(&ordinary.store);
+        assert_eq!(ordinary.commonjs_named_plan(0), Ok(None));
+        assert_eq!(observable_state(&ordinary.store), before);
+
+        for source in [
+            "const local = 1; module.exports = local;",
+            "module.exports = {};",
+            "module.exports.value = 1;",
+            r#"exports["value"] = 1;"#,
+            "const local = { value: 1 }; exports.value = local.value;",
+        ] {
+            let fixture = Fixture::javascript(source);
+            let before = observable_state(&fixture.store);
+
+            assert_eq!(fixture.commonjs_named_plan(0), Ok(None), "{source}");
+            assert_eq!(observable_state(&fixture.store), before, "{source}");
+        }
+    }
+
+    #[test]
+    fn named_commonjs_exports_reject_shadowed_exports() {
+        for source in [
+            "const exports = {}; exports.value = 1;",
+            "var exports = {}; exports.value = 1;",
+            "function exports() {} exports.value = 1;",
+        ] {
+            let fixture = Fixture::javascript(source);
+            let exports = fixture.source_local("exports");
+            let before = observable_state(&fixture.store);
+
+            assert!(matches!(
+                fixture.commonjs_named_plan(0),
+                Err(AssignmentPlanError::Unsupported(
+                    AssignmentUnsupported::ShadowedCommonJsModule { symbol, .. }
+                )) if symbol == exports
+            ));
+            assert_eq!(observable_state(&fixture.store), before, "{source}");
+        }
+    }
+
+    #[test]
+    fn named_commonjs_exports_reject_mixed_alias_and_value_declarations() {
+        let fixture = Fixture::javascript(concat!(
+            "const local = 1; ",
+            "exports.value = 1; exports.value = local;",
+        ));
+        let statement = fixture.expression_statement(0);
+        let (expression, _, _) = assignment_parts(&fixture.parsed, statement);
+        let target = fixture.bound.symbol(expression).unwrap();
+        let before = observable_state(&fixture.store);
+
+        for index in 0..2 {
+            assert!(matches!(
+                fixture.commonjs_named_plan(index),
+                Err(AssignmentPlanError::Unsupported(
+                    AssignmentUnsupported::NonVariableTarget { symbol, flags, .. }
+                )) if symbol == target
+                    && flags == (SymbolFlags::ALIAS | SymbolFlags::FUNCTION_SCOPED_VARIABLE)
+            ));
+            assert_eq!(observable_state(&fixture.store), before);
+        }
+    }
+
+    #[test]
+    fn named_commonjs_exports_reject_invalid_symbol_provenance_atomically() {
+        let mut invalid_flags = Fixture::javascript("exports.value = 1;");
+        let statement = invalid_flags.expression_statement(0);
+        let (expression, _, _) = assignment_parts(&invalid_flags.parsed, statement);
+        let target = invalid_flags.bound.symbol(expression).unwrap();
+        assert!(invalid_flags.store.set_symbol_flags(
+            target,
+            SymbolFlags::PROPERTY,
+            CheckFlags::NONE,
+        ));
+        let before = observable_state(&invalid_flags.store);
+        assert!(matches!(
+            invalid_flags.commonjs_named_plan(0),
+            Err(AssignmentPlanError::Invariant(
+                AssignmentInvariant::InvalidSymbolShape(symbol)
+            )) if symbol == target
+        ));
+        assert_eq!(observable_state(&invalid_flags.store), before);
+
+        let mut missing_value = Fixture::javascript("exports.value = 1;");
+        let statement = missing_value.expression_statement(0);
+        let (expression, _, _) = assignment_parts(&missing_value.parsed, statement);
+        let target = missing_value.bound.symbol(expression).unwrap();
+        assert!(
+            missing_value
+                .store
+                .set_symbol_declarations(target, Some(vec![expression]), None,)
+        );
+        let before = observable_state(&missing_value.store);
+        assert!(matches!(
+            missing_value.commonjs_named_plan(0),
+            Err(AssignmentPlanError::Invariant(
+                AssignmentInvariant::ValueDeclarationMismatch { symbol, .. }
+            )) if symbol == target
+        ));
+        assert_eq!(observable_state(&missing_value.store), before);
+
+        let mut missing_parent = Fixture::javascript("exports.value = 1;");
+        let statement = missing_parent.expression_statement(0);
+        let (expression, _, _) = assignment_parts(&missing_parent.parsed, statement);
+        let target = missing_parent.bound.symbol(expression).unwrap();
+        assert!(
+            missing_parent
+                .store
+                .set_symbol_relationships(target, None, None, None, None,)
+        );
+        let before = observable_state(&missing_parent.store);
+        assert!(matches!(
+            missing_parent.commonjs_named_plan(0),
+            Err(AssignmentPlanError::Invariant(
+                AssignmentInvariant::InvalidTargetParent { symbol, .. }
+            )) if symbol == target
+        ));
+        assert_eq!(observable_state(&missing_parent.store), before);
+    }
+
+    #[test]
+    fn named_commonjs_exports_authenticate_implicit_exports_and_receiver_cache() {
+        let mut forged_exports = Fixture::javascript("const local = 1; exports.value = 1;");
+        let exports = forged_exports.source_local("exports");
+        let declaration = forged_exports.variable_declaration("local");
+        assert!(forged_exports.store.set_symbol_declarations(
+            exports,
+            Some(vec![declaration]),
+            Some(declaration),
+        ));
+        let before = observable_state(&forged_exports.store);
+        assert!(matches!(
+            forged_exports.commonjs_named_plan(0),
+            Err(AssignmentPlanError::Invariant(
+                AssignmentInvariant::InvalidSymbolShape(symbol)
+            )) if symbol == exports
+        ));
+        assert_eq!(observable_state(&forged_exports.store), before);
+
+        let mut poisoned_cache = Fixture::javascript("const local = 1; exports.value = 1;");
+        let statement = poisoned_cache.expression_statement(0);
+        let (_, left, _) = assignment_parts(&poisoned_cache.parsed, statement);
+        let NodeData::PropertyAccessExpression(access) =
+            &poisoned_cache.parsed.arena.get(left.node).unwrap().data
+        else {
+            panic!("expected exports.value property access")
+        };
+        let receiver = NodeRef::new(
+            poisoned_cache.parsed.arena.id(),
+            poisoned_cache.file,
+            access.expression,
+        );
+        let exports = poisoned_cache.source_local("exports");
+        let local = poisoned_cache.source_local("local");
+        assert!(poisoned_cache.store.set_symbol_node_links(
+            receiver,
+            SymbolNodeLinks {
+                resolved_symbol: Some(local),
+            },
+        ));
+        let before = observable_state(&poisoned_cache.store);
+        assert!(matches!(
+            poisoned_cache.commonjs_named_plan(0),
+            Err(AssignmentPlanError::Invariant(
+                AssignmentInvariant::ResolvedSymbolMismatch {
+                    node,
+                    expected,
+                    actual,
+                }
+            )) if node == receiver && expected == exports && actual == local
+        ));
+        assert_eq!(observable_state(&poisoned_cache.store), before);
     }
 
     #[test]

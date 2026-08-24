@@ -2881,10 +2881,12 @@ fn display_array_type(
             state,
             visiting,
         )?;
-        let union_parentheses =
-            element_record.flags().intersects(TypeFlags::UNION) && element_record.alias().is_none();
+        let composite_parentheses = element_record
+            .flags()
+            .intersects(TypeFlags::UNION_OR_INTERSECTION)
+            && element_record.alias().is_none();
         let function_parentheses = is_unaliased_single_callable_type(store, element_type);
-        if union_parentheses || function_parentheses {
+        if composite_parentheses || function_parentheses {
             element = format!("({element})");
         }
         if readonly {
@@ -6179,6 +6181,50 @@ mod tests {
                 target: "number[]".to_owned(),
             }
         );
+    }
+
+    #[test]
+    fn array_display_parenthesizes_inline_intersections_and_preserves_aliases() {
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} ",
+            "interface ReadonlyArray<T> {} ",
+            "interface Left { left: string } ",
+            "interface Right { right: number } ",
+            "type Named = Left & Right; ",
+            "declare const inline: Left & Right;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(211);
+        let mut context = parsed_context(&parsed, file, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+
+        let inline = context
+            .get_type_from_type_node(variable_type_node(&parsed, file, "inline"))
+            .unwrap();
+        let named = context
+            .get_type_from_type_node(type_alias_body(&parsed, file, "Named"))
+            .unwrap();
+        let global_types = context.global_types().clone();
+        let store = context.store_mut_for_test();
+        assert!(store.validate_intersection_type(inline).is_ok());
+        assert!(store.validate_intersection_type(named).is_ok());
+        assert!(store.type_payload(inline).unwrap().alias().is_none());
+        assert!(store.type_payload(named).unwrap().alias().is_some());
+
+        for (element, readonly, expected) in [
+            (inline, false, "(Left & Right)[]"),
+            (inline, true, "readonly (Left & Right)[]"),
+            (named, false, "Named[]"),
+            (named, true, "readonly Named[]"),
+        ] {
+            let array = store
+                .create_canonical_array_type(&global_types, element, readonly)
+                .unwrap();
+            assert_eq!(
+                type_to_string_with_global_types(store, &global_types, array).unwrap(),
+                expected,
+            );
+        }
     }
 
     #[test]

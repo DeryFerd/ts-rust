@@ -287,6 +287,393 @@ pub(super) fn check_direct_source_element(
     )
 }
 
+/// Checks one array binding against the numeric index declared by its real
+/// global array target, without publishing expression-owned node links.
+pub(super) fn check_array_binding_element(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    binding: NodeRef,
+    receiver_type: TypeId,
+) -> Result<CheckedSourceElement, SourceElementError> {
+    let (name, index) = array_binding_name_and_index(store, host, binding)?;
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(RelationUnavailable::MissingBootstrap)?;
+    let any = bootstrap.any_type;
+    let error = bootstrap.error_type;
+    if receiver_type == any || receiver_type == error {
+        return Ok(CheckedSourceElement {
+            type_: receiver_type,
+            diagnostic: None,
+        });
+    }
+
+    let array = store
+        .canonical_array_reference(global_types, receiver_type)?
+        .ok_or(SourceElementError::Unsupported(
+            SourceElementUnsupported::Receiver(binding),
+        ))?;
+    let target = if array.readonly {
+        global_types.readonly_array_type
+    } else {
+        global_types.array_type
+    };
+    if array_target_has_numeric_index(store, host, target, index)? {
+        return Ok(CheckedSourceElement {
+            type_: unchecked_index_read_type(
+                store,
+                Some(global_types),
+                options,
+                name,
+                array.element_type,
+            )?,
+            diagnostic: None,
+        });
+    }
+
+    let receiver = display_type(store, host, Some(global_types), options, receiver_type)?;
+    Ok(CheckedSourceElement {
+        type_: error,
+        diagnostic: Some(CanonicalCheckerDiagnostic {
+            node: Some(name),
+            range_override: None,
+            diagnostic: Diagnostic::with_arguments(
+                message_by_code(2339).ok_or(SourceElementError::MissingDiagnostic(2339))?,
+                [index.to_string(), receiver],
+            ),
+            related_information: Vec::new(),
+        }),
+    })
+}
+
+fn array_binding_name_and_index(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    binding: NodeRef,
+) -> Result<(NodeRef, usize), SourceElementError> {
+    let invalid = || SourceElementError::InvalidCache(binding);
+    let (_, bound) = host.source(binding).ok_or_else(invalid)?;
+    let record = host.node(binding).ok_or_else(invalid)?;
+    let NodeData::BindingElement(element) = &record.data else {
+        return Err(unsupported_access(binding));
+    };
+    if !store.contains_node_ref(binding)
+        || record.kind != SyntaxKind::BindingElement
+        || record.flags.0 != 0
+        || element.dot_dot_dot_token.is_some()
+        || element.flow_node.is_some()
+        || element.initializer.is_some()
+        || element.local_symbol.is_some()
+        || element.property_name.is_some()
+        || element.symbol.is_some()
+        || element.facts != 0
+        || bound
+            .symbol(binding)
+            .is_none_or(|symbol| store.symbol(symbol).is_none())
+    {
+        return Err(unsupported_access(binding));
+    }
+
+    let pattern = record
+        .parent
+        .map(|parent| NodeRef::new(binding.arena, binding.file, parent))
+        .ok_or_else(invalid)?;
+    let pattern_record = host.node(pattern).ok_or_else(invalid)?;
+    let NodeData::BindingPattern(data) = &pattern_record.data else {
+        return Err(unsupported_access(binding));
+    };
+    let mut positions = data
+        .elements
+        .nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, element)| (*element == binding.node).then_some(index));
+    let index = positions.next().ok_or_else(invalid)?;
+    if positions.next().is_some()
+        || pattern_record.kind != SyntaxKind::ArrayBindingPattern
+        || pattern_record.flags.0 != 0
+        || data.elements.has_trailing_comma
+        || data.elements.range != pattern_record.range
+        || data.facts != 0
+        || record.range.start < pattern_record.range.start
+        || record.range.end > pattern_record.range.end
+    {
+        return Err(unsupported_access(binding));
+    }
+
+    let name = element
+        .name
+        .map(|name| NodeRef::new(binding.arena, binding.file, name))
+        .ok_or_else(|| unsupported_access(binding))?;
+    let name_record = host.node(name).ok_or_else(invalid)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(unsupported_access(binding));
+    };
+    if !store.contains_node_ref(name)
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(binding.node)
+        || name_record.range.start < record.range.start
+        || name_record.range.end > record.range.end
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+    {
+        return Err(unsupported_access(binding));
+    }
+    Ok((name, index))
+}
+
+fn array_target_has_numeric_index(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    target: TypeId,
+    position: usize,
+) -> Result<bool, SourceElementError> {
+    let invalid = || SourceElementError::InvalidType(target);
+    let unsupported =
+        || SourceElementError::Unsupported(SourceElementUnsupported::IndexSignatureSurface(target));
+    let record = store.type_payload(target).ok_or_else(invalid)?;
+    let TypeData::Interface(interface) = record.data() else {
+        return Err(invalid());
+    };
+    let owner = record.symbol().ok_or_else(invalid)?;
+    let symbol = store.symbol(owner).ok_or_else(invalid)?;
+    let declarations = symbol
+        .declarations()
+        .filter(|declarations| !declarations.is_empty())
+        .ok_or_else(invalid)?;
+    let members = symbol.members().ok_or_else(invalid)?;
+    let table = store.symbol_table(members).ok_or_else(invalid)?;
+    if record.flags() != TypeFlags::OBJECT
+        || !record.object_flags().contains(ObjectFlags::INTERFACE)
+        || store.get_merged_symbol(owner) != Some(owner)
+        || !symbol.flags().contains(SymbolFlags::INTERFACE)
+        || symbol.flags().without(
+            SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::TRANSIENT,
+        ) != SymbolFlags::NONE
+        || symbol.check_flags() != CheckFlags::NONE
+        || symbol.exports().is_some()
+        || symbol.export_symbol().is_some()
+    {
+        return Err(invalid());
+    }
+
+    let mut signature_declarations = Vec::new();
+    let mut value_declarations = Vec::new();
+    for declaration in declarations {
+        let declaration_record = host.node(*declaration).ok_or_else(invalid)?;
+        if let NodeData::VariableDeclaration(_) = &declaration_record.data {
+            if declaration_record.kind != SyntaxKind::VariableDeclaration
+                || !host.symbol_matches(store, *declaration, owner)
+            {
+                return Err(invalid());
+            }
+            value_declarations.push(*declaration);
+            continue;
+        }
+        let NodeData::InterfaceDeclaration(data) = &declaration_record.data else {
+            return Err(invalid());
+        };
+        if declaration_record.kind != SyntaxKind::InterfaceDeclaration
+            || !host.symbol_matches(store, *declaration, owner)
+            || data.type_parameters.as_ref().is_none_or(|parameters| {
+                parameters.nodes.len() != 1 || parameters.has_trailing_comma
+            })
+        {
+            return Err(invalid());
+        }
+        if data.heritage_clauses.is_some() {
+            return Err(unsupported());
+        }
+        for member in &data.members.nodes {
+            let member = NodeRef::new(declaration.arena, declaration.file, *member);
+            let member_record = host.node(member).ok_or_else(invalid)?;
+            if member_record.kind == SyntaxKind::IndexSignature {
+                signature_declarations.push(member);
+            }
+        }
+    }
+    if symbol
+        .flags()
+        .contains(SymbolFlags::FUNCTION_SCOPED_VARIABLE)
+        == value_declarations.is_empty()
+        || match symbol.value_declaration() {
+            Some(declaration) => !value_declarations.contains(&declaration),
+            None => !value_declarations.is_empty(),
+        }
+    {
+        return Err(invalid());
+    }
+
+    if table.get_source(&position.to_string()).is_some() {
+        return Err(unsupported());
+    }
+
+    let Some(index_symbol) = table.get(InternalSymbolName::Index.as_ref()) else {
+        if !signature_declarations.is_empty()
+            || interface.declared_index_infos.is_some()
+            || interface.reference.object.structured.index_infos.is_some()
+        {
+            return Err(invalid());
+        }
+        return Ok(false);
+    };
+    validate_array_numeric_index(
+        store,
+        host,
+        target,
+        owner,
+        index_symbol,
+        &signature_declarations,
+    )
+}
+
+fn validate_array_numeric_index(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    target: TypeId,
+    owner: SemanticSymbolId,
+    index_symbol: SemanticSymbolId,
+    declarations: &[NodeRef],
+) -> Result<bool, SourceElementError> {
+    let invalid = || SourceElementError::InvalidType(target);
+    let unsupported =
+        || SourceElementError::Unsupported(SourceElementUnsupported::IndexSignatureSurface(target));
+    let TypeData::Interface(interface) = store
+        .type_payload(target)
+        .map(TypeRecord::data)
+        .ok_or_else(invalid)?
+    else {
+        return Err(invalid());
+    };
+    let table = store
+        .symbol(owner)
+        .and_then(ts_binder::semantic::Symbol::members)
+        .and_then(|members| store.symbol_table(members))
+        .ok_or_else(invalid)?;
+    let index_record = store.symbol(index_symbol).ok_or_else(invalid)?;
+    if store.get_merged_symbol(index_symbol) != Some(index_symbol)
+        || index_record.flags() != SymbolFlags::SIGNATURE
+        || index_record.check_flags() != CheckFlags::NONE
+        || index_record.name() != InternalSymbolName::Index.as_ref()
+        || index_record.declarations() != Some(declarations)
+        || index_record.value_declaration().is_some()
+        || index_record.members().is_some()
+        || index_record.exports().is_some()
+        || index_record
+            .parent()
+            .and_then(|parent| store.get_merged_symbol(parent))
+            != Some(owner)
+        || index_record.export_symbol().is_some()
+    {
+        return Err(invalid());
+    }
+
+    let parameter = interface
+        .all_type_parameters
+        .as_deref()
+        .and_then(|parameters| parameters.first())
+        .copied()
+        .ok_or_else(invalid)?;
+    let parameter_symbol = store
+        .type_payload(parameter)
+        .and_then(TypeRecord::symbol)
+        .ok_or_else(invalid)?;
+    let parameter_name = store
+        .symbol(parameter_symbol)
+        .and_then(|symbol| symbol.name().as_utf8())
+        .ok_or_else(invalid)?;
+    if table.get_source(parameter_name) != Some(parameter_symbol) {
+        return Err(invalid());
+    }
+
+    for declaration in declarations.iter().copied() {
+        if array_index_signature_matches_parameter(
+            store,
+            host,
+            target,
+            index_symbol,
+            declaration,
+            parameter_name,
+        )? {
+            return Ok(true);
+        }
+    }
+
+    Err(unsupported())
+}
+
+fn array_index_signature_matches_parameter(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    target: TypeId,
+    index_symbol: SemanticSymbolId,
+    declaration: NodeRef,
+    parameter_name: &str,
+) -> Result<bool, SourceElementError> {
+    let invalid = || SourceElementError::InvalidType(target);
+    let unsupported =
+        || SourceElementError::Unsupported(SourceElementUnsupported::IndexSignatureSurface(target));
+    let declaration_record = host.node(declaration).ok_or_else(invalid)?;
+    let NodeData::IndexSignatureDeclaration(signature) = &declaration_record.data else {
+        return Err(invalid());
+    };
+    let [index_parameter] = signature.parameters.nodes.as_slice() else {
+        return Err(unsupported());
+    };
+    if !host.symbol_matches(store, declaration, index_symbol)
+        || signature.full_signature.is_some()
+        || signature.next_container.is_some()
+        || signature.symbol.is_some()
+        || signature.type_parameters.is_some()
+        || signature.parameters.has_trailing_comma
+    {
+        return Err(invalid());
+    }
+    let index_parameter = NodeRef::new(declaration.arena, declaration.file, *index_parameter);
+    let parameter_record = host.node(index_parameter).ok_or_else(invalid)?;
+    let NodeData::ParameterDeclaration(index_parameter_data) = &parameter_record.data else {
+        return Err(invalid());
+    };
+    let Some(key_node) = index_parameter_data.type_ else {
+        return Err(unsupported());
+    };
+    let key_node = NodeRef::new(index_parameter.arena, index_parameter.file, key_node);
+    let key_record = host.node(key_node).ok_or_else(invalid)?;
+    if parameter_record.kind != SyntaxKind::Parameter
+        || parameter_record.parent != Some(declaration.node)
+        || key_record.parent != Some(index_parameter.node)
+    {
+        return Err(invalid());
+    }
+    if key_record.kind != SyntaxKind::NumberKeyword {
+        return Ok(false);
+    }
+
+    let value = NodeRef::new(declaration.arena, declaration.file, signature.type_);
+    let value_record = host.node(value).ok_or_else(invalid)?;
+    let NodeData::TypeReferenceNode(reference) = &value_record.data else {
+        return Err(unsupported());
+    };
+    let name = NodeRef::new(value.arena, value.file, reference.type_name);
+    let name_record = host.node(name).ok_or_else(invalid)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(unsupported());
+    };
+    if value_record.kind != SyntaxKind::TypeReference
+        || value_record.parent != Some(declaration.node)
+        || reference.type_arguments.is_some()
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.parent != Some(value.node)
+        || identifier.text != parameter_name
+    {
+        return Err(unsupported());
+    }
+    Ok(true)
+}
+
 /// Checks a broad computed object-binding key without using element-access
 /// diagnostic policy or publishing expression caches owned by source checking.
 #[allow(clippy::too_many_arguments)] // Keeps the authenticated binding and type identities explicit.
@@ -356,7 +743,7 @@ fn check_computed_binding_element_worker(
         };
         if let Some(value) = value {
             return Ok(CheckedSourceElement {
-                type_: value,
+                type_: unchecked_index_read_type(store, global_types, options, binding, value)?,
                 diagnostic: None,
             });
         }
@@ -595,24 +982,32 @@ fn check_direct_source_element_worker(
                     ));
                 }
             };
-            ElementResolution::success(type_, None)
+            if resolutions
+                .iter()
+                .any(|resolution| resolution.from_index_signature)
+            {
+                ElementResolution::index_signature(type_)
+            } else {
+                ElementResolution::success(type_, None)
+            }
         }
     };
 
-    let type_ = if propagate_undefined
-        && resolution.type_ != any
-        && resolution.type_ != error
-        && resolution.type_ != undefined
-    {
+    let type_ = if resolution.from_index_signature {
+        unchecked_index_read_type(store, global_types, options, plan.node, resolution.type_)?
+    } else {
+        resolution.type_
+    };
+    let type_ = if propagate_undefined && type_ != any && type_ != error && type_ != undefined {
         element_union_type(
             store,
             global_types,
             plan.node,
-            &[resolution.type_, undefined],
+            &[type_, undefined],
             resolution.property,
         )?
     } else {
-        resolution.type_
+        type_
     };
 
     let diagnostic = prepare_element_diagnostic(
@@ -729,7 +1124,7 @@ fn resolve_element_index(
         store.canonical_array_reference_with_targets(array_targets, receiver_type)?
     {
         if index.is_number_applicable() {
-            ElementResolution::success(array.element_type, None)
+            ElementResolution::index_signature(array.element_type)
         } else if index.is_string_or_number() {
             ElementResolution::diagnostic(error, ElementDiagnostic::NumberIndexRequired)
         } else {
@@ -739,7 +1134,7 @@ fn resolve_element_index(
         tuple
     } else if is_string_receiver(store, receiver_type)? {
         if index.is_number_applicable() {
-            ElementResolution::success(string, None)
+            ElementResolution::index_signature(string)
         } else if index.is_string_or_number() {
             ElementResolution::diagnostic(error, ElementDiagnostic::NumberIndexRequired)
         } else {
@@ -949,6 +1344,7 @@ struct ElementResolution {
     type_: TypeId,
     property: Option<SemanticSymbolId>,
     diagnostic: Option<ElementDiagnostic>,
+    from_index_signature: bool,
 }
 
 impl ElementResolution {
@@ -957,6 +1353,16 @@ impl ElementResolution {
             type_,
             property,
             diagnostic: None,
+            from_index_signature: false,
+        }
+    }
+
+    const fn index_signature(type_: TypeId) -> Self {
+        Self {
+            type_,
+            property: None,
+            diagnostic: None,
+            from_index_signature: true,
         }
     }
 
@@ -965,6 +1371,7 @@ impl ElementResolution {
             type_,
             property: None,
             diagnostic: Some(diagnostic),
+            from_index_signature: false,
         }
     }
 }
@@ -1076,7 +1483,7 @@ fn resolve_object_element(
             signatures.string
         };
         if let Some(value) = selected {
-            return Ok(ElementResolution::success(value, None));
+            return Ok(ElementResolution::index_signature(value));
         }
         return Ok(ElementResolution::diagnostic(
             error_type,
@@ -1326,6 +1733,30 @@ fn enum_has_numeric_index(
         }
     }
     Ok(false)
+}
+
+fn unchecked_index_read_type(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    options: CanonicalCheckerOptions,
+    node: NodeRef,
+    type_: TypeId,
+) -> Result<TypeId, SourceElementError> {
+    if !options.no_unchecked_indexed_access {
+        return Ok(type_);
+    }
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(RelationUnavailable::MissingBootstrap)?;
+    if !bootstrap.options.strict_null_checks
+        || type_ == bootstrap.any_type
+        || type_ == bootstrap.error_type
+        || type_ == bootstrap.undefined_or_missing_type
+    {
+        return Ok(type_);
+    }
+    let undefined = bootstrap.undefined_or_missing_type;
+    element_union_type(store, global_types, node, &[type_, undefined], None)
 }
 
 fn optional_element_read_type(
@@ -1966,6 +2397,43 @@ mod tests {
         (store, bound, binding, index)
     }
 
+    fn array_binding_context<'arena>(
+        globals: &'arena ParseResult,
+        globals_file: FileId,
+        source: &'arena ParseResult,
+        source_file: FileId,
+        options: CanonicalCheckerOptions,
+    ) -> CanonicalCheckerContext<'arena> {
+        let mut binder = CanonicalBinder::new();
+        for (parsed, file, path) in [
+            (globals, globals_file, "\"/project/globals.ts\""),
+            (source, source_file, "\"/project/input.ts\""),
+        ] {
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(path),
+                        CanonicalSourceLanguage::TypeScript,
+                        false,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(globals_file, &globals.arena), (source_file, &source.arena)],
+            options,
+        )
+        .unwrap()
+    }
+
     fn published_enum(
         parsed: &ParseResult,
         file: FileId,
@@ -2151,6 +2619,196 @@ mod tests {
             no_implicit_any: true,
             ..CanonicalCheckerOptions::default()
         }
+    }
+
+    #[test]
+    fn array_binding_without_numeric_index_reports_direct_ts2339_on_its_name() {
+        const GLOBALS: &str = concat!(
+            "interface Array<T> {}\n",
+            "interface Boolean {}\n",
+            "interface Function {}\n",
+            "interface CallableFunction {}\n",
+            "interface NewableFunction {}\n",
+            "interface IArguments {}\n",
+            "interface Number {}\n",
+            "interface Object {}\n",
+            "interface RegExp {}\n",
+            "interface String {}\n",
+        );
+        const INPUT: &str = "declare var values: string[];\nvar [value] = values;";
+        let globals = parse_fixture(GLOBALS);
+        let source = parse_fixture(INPUT);
+        let globals_file = FileId::new(650);
+        let source_file = FileId::new(651);
+        let mut context = array_binding_context(
+            &globals,
+            globals_file,
+            &source,
+            source_file,
+            CanonicalCheckerOptions::default(),
+        );
+        context.check_source_file(globals_file).unwrap();
+        let global_types = context.global_types().clone();
+        let globals_bound = context.file(globals_file).unwrap().1.clone();
+        let source_bound = context.file(source_file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new([
+            (&globals.arena, &globals_bound),
+            (&source.arena, &source_bound),
+        ])
+        .unwrap();
+        let (string, error) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.error_type)
+        };
+        let array = context
+            .store_mut_for_test()
+            .create_canonical_array_type(&global_types, string, false)
+            .unwrap();
+        let binding = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::BindingElement).then_some(NodeRef::new(
+                    source.arena.id(),
+                    source_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let NodeData::BindingElement(element) = &source.arena.get(binding.node).unwrap().data
+        else {
+            panic!("expected the array binding element")
+        };
+        let name = NodeRef::new(source.arena.id(), source_file, element.name.unwrap());
+
+        for no_implicit_any in [false, true] {
+            let before = (
+                context.store().type_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+            let checked = check_array_binding_element(
+                context.store_mut_for_test(),
+                &host,
+                &global_types,
+                CanonicalCheckerOptions {
+                    no_implicit_any,
+                    no_unchecked_indexed_access: true,
+                    ..CanonicalCheckerOptions::default()
+                },
+                binding,
+                array,
+            )
+            .unwrap();
+            assert_eq!(checked.type_, error);
+            let diagnostic = checked.diagnostic.unwrap();
+            assert_eq!(diagnostic.node, Some(name));
+            assert_eq!(diagnostic.diagnostic.code(), 2339);
+            assert_eq!(
+                diagnostic.diagnostic.render().unwrap(),
+                "Property '0' does not exist on type 'string[]'."
+            );
+            let range = source.arena.get(name.node).unwrap().range;
+            assert_eq!(
+                &INPUT[range.start.get() as usize..range.end.get() as usize],
+                "value"
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                before
+            );
+            assert!(context.store().type_node_links(name).is_none());
+            assert!(context.store().symbol_node_links(name).is_none());
+        }
+    }
+
+    #[test]
+    fn array_binding_uses_real_numeric_indexes_and_applies_unchecked_access() {
+        let globals = parse_fixture(concat!(
+            "interface Array<T> { [index: number]: T; }\n",
+            "interface Boolean {}\n",
+            "interface Function {}\n",
+            "interface IArguments {}\n",
+            "interface Number {}\n",
+            "interface Object {}\n",
+            "interface RegExp {}\n",
+            "interface String {}\n",
+        ));
+        let source = parse_fixture("declare var values: string[]; var [value] = values;");
+        let globals_file = FileId::new(652);
+        let source_file = FileId::new(653);
+        let options = CanonicalCheckerOptions {
+            intrinsic: IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                exact_optional_property_types: false,
+            },
+            no_unchecked_indexed_access: true,
+            ..CanonicalCheckerOptions::default()
+        };
+        let mut context =
+            array_binding_context(&globals, globals_file, &source, source_file, options);
+        let global_types = context.global_types().clone();
+        let globals_bound = context.file(globals_file).unwrap().1.clone();
+        let source_bound = context.file(source_file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new([
+            (&globals.arena, &globals_bound),
+            (&source.arena, &source_bound),
+        ])
+        .unwrap();
+        let (string, undefined) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.undefined_type)
+        };
+        let array = context
+            .store_mut_for_test()
+            .create_canonical_array_type(&global_types, string, false)
+            .unwrap();
+        let binding = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::BindingElement).then_some(NodeRef::new(
+                    source.arena.id(),
+                    source_file,
+                    node,
+                ))
+            })
+            .unwrap();
+
+        let checked = check_array_binding_element(
+            context.store_mut_for_test(),
+            &host,
+            &global_types,
+            CanonicalCheckerOptions {
+                no_unchecked_indexed_access: false,
+                ..options
+            },
+            binding,
+            array,
+        )
+        .unwrap();
+        assert_eq!(checked.type_, string);
+        assert!(checked.diagnostic.is_none());
+
+        let checked = check_array_binding_element(
+            context.store_mut_for_test(),
+            &host,
+            &global_types,
+            options,
+            binding,
+            array,
+        )
+        .unwrap();
+        let TypeData::Union(union) = context.store().type_payload(checked.type_).unwrap().data()
+        else {
+            panic!("unchecked numeric array bindings include undefined")
+        };
+        assert!(union.union.types.contains(&string));
+        assert!(union.union.types.contains(&undefined));
+        assert!(checked.diagnostic.is_none());
+        assert!(context.store().type_node_links(binding).is_none());
     }
 
     #[test]
@@ -3292,21 +3950,26 @@ mod tests {
             receiver_symbol,
         );
 
-        assert_eq!(
-            check_direct_source_element_with_array_targets(
-                &mut store,
-                &empty_host(),
-                CanonicalArrayTargets::for_test(array_target, array_target),
-                strict_options(),
-                &plan,
-                tuple,
-                one,
-            ),
-            Ok(CheckedSourceElement {
-                type_: number,
-                diagnostic: None,
-            }),
-        );
+        for no_unchecked_indexed_access in [false, true] {
+            assert_eq!(
+                check_direct_source_element_with_array_targets(
+                    &mut store,
+                    &empty_host(),
+                    CanonicalArrayTargets::for_test(array_target, array_target),
+                    CanonicalCheckerOptions {
+                        no_unchecked_indexed_access,
+                        ..strict_options()
+                    },
+                    &plan,
+                    tuple,
+                    one,
+                ),
+                Ok(CheckedSourceElement {
+                    type_: number,
+                    diagnostic: None,
+                }),
+            );
+        }
     }
 
     #[test]
@@ -3632,6 +4295,147 @@ mod tests {
                 diagnostic: None,
             })
         );
+    }
+
+    #[test]
+    fn unchecked_index_signature_reads_include_undefined_without_changing_known_properties() {
+        let parsed = parse_fixture("const result = dictionary[key];");
+        let file = FileId::new(654);
+        let mut store = registered_store(&parsed, file);
+        let (string, number, undefined) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.string_type,
+                bootstrap.number_type,
+                bootstrap.undefined_type,
+            )
+        };
+        let dictionary = index_object(&mut store, string, number);
+        let receiver_symbol =
+            alloc_symbol(&mut store, SymbolFlags::BLOCK_SCOPED_VARIABLE, "dictionary");
+        let key_symbol = alloc_symbol(&mut store, SymbolFlags::BLOCK_SCOPED_VARIABLE, "key");
+        let plan = source_plan(
+            &parsed,
+            file,
+            &store,
+            PlannedExpressionKind::Identifier(PlannedIdentifierRead {
+                resolved_symbol: key_symbol,
+                value_symbol: key_symbol,
+                kind: PlannedIdentifierReadKind::Variable,
+            }),
+            receiver_symbol,
+        );
+        let checked = check_direct_source_element_with_array_targets(
+            &mut store,
+            &empty_host(),
+            CanonicalArrayTargets::for_single_target_validation(dictionary),
+            CanonicalCheckerOptions {
+                no_unchecked_indexed_access: true,
+                ..strict_options()
+            },
+            &plan,
+            dictionary,
+            string,
+        )
+        .unwrap();
+        let TypeData::Union(union) = store.type_payload(checked.type_).unwrap().data() else {
+            panic!("unchecked index signatures include undefined")
+        };
+        assert!(union.union.types.contains(&number));
+        assert!(union.union.types.contains(&undefined));
+        assert!(checked.diagnostic.is_none());
+
+        let property_parsed = parse_fixture("const result = object[\"known\"];");
+        let property_file = FileId::new(655);
+        let mut property_store = registered_store(&property_parsed, property_file);
+        let property_number = property_store.intrinsic_bootstrap().unwrap().number_type;
+        let (object, property) =
+            property_object(&mut property_store, "known", property_number, false);
+        let receiver_symbol = alloc_symbol(
+            &mut property_store,
+            SymbolFlags::BLOCK_SCOPED_VARIABLE,
+            "object",
+        );
+        let key = property_store
+            .regular_string_literal_type("known".into())
+            .unwrap();
+        let plan = source_plan(
+            &property_parsed,
+            property_file,
+            &property_store,
+            PlannedExpressionKind::String("known".into()),
+            receiver_symbol,
+        );
+        let checked = check_direct_source_element_with_array_targets(
+            &mut property_store,
+            &empty_host(),
+            CanonicalArrayTargets::for_single_target_validation(object),
+            CanonicalCheckerOptions {
+                no_unchecked_indexed_access: true,
+                ..strict_options()
+            },
+            &plan,
+            object,
+            key,
+        )
+        .unwrap();
+        assert_eq!(checked.type_, property_number);
+        assert_eq!(
+            property_store
+                .symbol_node_links(plan.node)
+                .and_then(|links| links.resolved_symbol),
+            Some(property)
+        );
+        assert!(checked.diagnostic.is_none());
+    }
+
+    #[test]
+    fn unchecked_array_index_reads_include_undefined() {
+        let parsed = parse_fixture("const first = array[0];");
+        let file = FileId::new(656);
+        let mut store = registered_store(&parsed, file);
+        let (string, undefined) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.undefined_type)
+        };
+        let zero = store
+            .regular_number_literal_type(ts_jsnum::Number::new(0.0))
+            .unwrap();
+        let target = canonical_array_target(&mut store);
+        let array =
+            create_type_from_generic_global_type(&mut store, target, string, ObjectFlags::NONE)
+                .unwrap();
+        let receiver_symbol = alloc_symbol(&mut store, SymbolFlags::BLOCK_SCOPED_VARIABLE, "array");
+        let plan = source_plan(
+            &parsed,
+            file,
+            &store,
+            PlannedExpressionKind::Number {
+                value: ts_jsnum::Number::new(0.0),
+                unary_operand: None,
+            },
+            receiver_symbol,
+        );
+
+        let checked = check_direct_source_element_with_array_targets(
+            &mut store,
+            &empty_host(),
+            CanonicalArrayTargets::for_test(target, target),
+            CanonicalCheckerOptions {
+                no_unchecked_indexed_access: true,
+                ..strict_options()
+            },
+            &plan,
+            array,
+            zero,
+        )
+        .unwrap();
+        let TypeData::Union(union) = store.type_payload(checked.type_).unwrap().data() else {
+            panic!("unchecked array indices include undefined")
+        };
+        assert!(union.union.types.contains(&string));
+        assert!(union.union.types.contains(&undefined));
+        assert!(checked.diagnostic.is_none());
     }
 
     #[test]

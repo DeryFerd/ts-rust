@@ -1,12 +1,13 @@
-//! Exact source integration for one admitted class construction.
+//! Exact source integration for admitted class and declared constructions.
 //!
 //! This is the dependency-closed `new Model()`, `new Model`, and single-literal
 //! constructor branch of pinned TypeScript-Go `checkCallExpression`,
-//! `getResolvedSignature`, `resolveNewExpression`, and `resolveCall`. The
-//! admitted constructor belongs to one preceding local class and has either no
-//! parameters or one authenticated required `string` or `number` parameter.
-//! Planning proves the syntax, resolver route, class provenance, and cold/warm
-//! caches before source execution may publish class or expression state.
+//! `getResolvedSignature`, `resolveNewExpression`, and `resolveCall`.
+//! An admitted constructor belongs to one preceding local class or an earlier
+//! ambient variable with an authenticated declared construct signature. Both
+//! forms accept no arguments or one compatible primitive literal. Planning
+//! proves syntax, resolver routes, provider provenance, and cold/warm caches
+//! before source execution may publish class or expression state.
 
 use std::collections::{HashMap, HashSet};
 
@@ -22,11 +23,14 @@ use super::{
     ResolvedSignatureState, SignatureId, SignatureLinks, SymbolNodeLinks, TypeData, TypeId,
     TypeNodeLinks, ValueSymbolLinks,
     bootstrap::LiteralTypeCacheError,
+    callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
+    callables::CallableFamily,
     classes::{
         ClassConstructorVisibility, ClassMemberPlan, ClassMemberQueryPlan,
         execute_nongeneric_class_member_query, plan_nongeneric_class_member_query,
         preflight_nongeneric_class_member_query,
     },
+    object_members::{PropertyObjectPlan, plan_interface, plan_type_literal},
     signatures::SignatureFlags,
     type_nodes::normalize_numeric_separators,
 };
@@ -131,14 +135,27 @@ const fn invariant(reason: SourceNewInvariant) -> SourceNewError {
     SourceNewError::Invariant(reason)
 }
 
-/// Opaque syntax, resolver, and class proof for one default construction.
+/// Opaque syntax, resolver, and provider proof for one direct construction.
 #[derive(Clone, Debug)]
 pub(super) struct SourceDefaultNewPlan {
     node: NodeRef,
     constructor: NodeRef,
     resolved_symbol: SemanticSymbolId,
-    class: ClassMemberQueryPlan,
+    target: SourceNewTarget,
     argument: Option<SourceNewArgument>,
+    parameter: Option<SourceNewParameter>,
+}
+
+#[derive(Clone, Debug)]
+enum SourceNewTarget {
+    Class(Box<ClassMemberQueryPlan>),
+    Declared(SourceDeclaredConstructorPlan),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SourceDeclaredConstructorPlan {
+    annotation: NodeRef,
+    declaration: NodeRef,
     parameter: Option<SourceNewParameter>,
 }
 
@@ -182,7 +199,7 @@ pub(super) struct CheckedSourceDefaultNew {
     pub(super) signature: SignatureId,
 }
 
-/// Proves the complete direct-new syntax and its preceding local class.
+/// Proves direct-new syntax and its preceding class or ambient constructor.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn plan_direct_default_new(
     arena: &NodeArena,
@@ -337,63 +354,86 @@ pub(super) fn plan_direct_default_new(
     let symbol_record = store
         .symbol(symbol)
         .ok_or_else(|| invariant(SourceNewInvariant::InvalidSymbol(symbol)))?;
-    if symbol_record.flags() != SymbolFlags::CLASS
-        || symbol_record.check_flags() != CheckFlags::NONE
-    {
+    if symbol_record.check_flags() != CheckFlags::NONE {
         return Err(unsupported(SourceNewUnsupported::ConstructorClass {
             node: constructor,
             symbol,
         }));
     }
-    let class = if let Some(class) = prior_classes.get(&symbol) {
-        ClassMemberQueryPlan::Direct(class.clone())
-    } else {
-        let class = plan_nongeneric_class_member_query(store, host, symbol)?;
-        let ClassMemberQueryPlan::Derived {
-            class: derived,
-            base,
-        } = &class
-        else {
-            return Err(unsupported(SourceNewUnsupported::ConstructorNotPrior {
-                node: constructor,
-                symbol,
-            }));
+    let (target, parameter) = if symbol_record.flags() == SymbolFlags::CLASS {
+        let class = if let Some(class) = prior_classes.get(&symbol) {
+            ClassMemberQueryPlan::Direct(class.clone())
+        } else {
+            let class = plan_nongeneric_class_member_query(store, host, symbol)?;
+            let ClassMemberQueryPlan::Derived {
+                class: derived,
+                base,
+            } = &class
+            else {
+                return Err(unsupported(SourceNewUnsupported::ConstructorNotPrior {
+                    node: constructor,
+                    symbol,
+                }));
+            };
+            let declaration = derived.declaration();
+            if !declaration.is_for(node.arena, node.file) {
+                return Err(unsupported(SourceNewUnsupported::ConstructorNotPrior {
+                    node: constructor,
+                    symbol,
+                }));
+            }
+            let declaration_record = arena
+                .get(declaration.node)
+                .ok_or_else(|| invariant(SourceNewInvariant::MissingNode(declaration)))?;
+            if declaration_record.range.end > record.range.start
+                || prior_classes.get(&base.symbol()) != Some(base.as_ref())
+            {
+                return Err(unsupported(SourceNewUnsupported::ConstructorNotPrior {
+                    node: constructor,
+                    symbol,
+                }));
+            }
+            class
         };
-        let declaration = derived.declaration();
-        if !declaration.is_for(node.arena, node.file) {
-            return Err(unsupported(SourceNewUnsupported::ConstructorNotPrior {
+        if class.symbol() != symbol {
+            return Err(invariant(SourceNewInvariant::InvalidClassPlan(
+                class.declaration(),
+            )));
+        }
+        if class.constructor_visibility() != ClassConstructorVisibility::Public {
+            return Err(unsupported(SourceNewUnsupported::ConstructorClass {
                 node: constructor,
                 symbol,
             }));
         }
-        let declaration_record = arena
-            .get(declaration.node)
-            .ok_or_else(|| invariant(SourceNewInvariant::MissingNode(declaration)))?;
-        if declaration_record.range.end > record.range.start
-            || prior_classes.get(&base.symbol()) != Some(base.as_ref())
-        {
-            return Err(unsupported(SourceNewUnsupported::ConstructorNotPrior {
-                node: constructor,
-                symbol,
-            }));
+        preflight_nongeneric_class_member_query(store, host, &class)?;
+        let parameter = constructor_parameter(store, host, &class)?;
+        if argument.is_some() && class.direct_plan().is_none() {
+            return Err(unsupported(SourceNewUnsupported::Arguments(node)));
         }
-        class
-    };
-    if class.symbol() != symbol {
-        return Err(invariant(SourceNewInvariant::InvalidClassPlan(
-            class.declaration(),
-        )));
-    }
-    if class.constructor_visibility() != ClassConstructorVisibility::Public {
+        (SourceNewTarget::Class(Box::new(class)), parameter)
+    } else if matches!(
+        symbol_record.flags(),
+        SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::BLOCK_SCOPED_VARIABLE
+    ) {
+        let declared = plan_declared_constructor(
+            arena,
+            bound,
+            store,
+            host,
+            node,
+            constructor,
+            symbol,
+            argument.as_ref(),
+        )?;
+        (SourceNewTarget::Declared(declared), declared.parameter)
+    } else {
         return Err(unsupported(SourceNewUnsupported::ConstructorClass {
             node: constructor,
             symbol,
         }));
-    }
-    preflight_nongeneric_class_member_query(store, host, &class)?;
-    let parameter = constructor_parameter(store, host, &class)?;
+    };
     if argument.is_some() != parameter.is_some()
-        || argument.is_some() && class.direct_plan().is_none()
         || argument
             .as_ref()
             .zip(parameter)
@@ -408,12 +448,280 @@ pub(super) fn plan_direct_default_new(
         node,
         constructor,
         resolved_symbol,
-        class,
+        target,
         argument,
         parameter,
     };
     preflight_default_new_cache(store, &plan)?;
     Ok(plan)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_declared_constructor(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+    constructor: NodeRef,
+    symbol: SemanticSymbolId,
+    argument: Option<&SourceNewArgument>,
+) -> Result<SourceDeclaredConstructorPlan, SourceNewError> {
+    let reject = || {
+        unsupported(SourceNewUnsupported::ConstructorClass {
+            node: constructor,
+            symbol,
+        })
+    };
+    let owner = store.symbol(symbol).ok_or_else(reject)?;
+    let Some([declaration]) = owner.declarations() else {
+        return Err(reject());
+    };
+    let declaration = *declaration;
+    let declaration_record = arena.get(declaration.node).ok_or_else(reject)?;
+    let NodeData::VariableDeclaration(variable) = &declaration_record.data else {
+        return Err(reject());
+    };
+    let list = declaration_record
+        .parent
+        .map(|list| NodeRef::new(declaration.arena, declaration.file, list))
+        .ok_or_else(reject)?;
+    let list_record = arena.get(list.node).ok_or_else(reject)?;
+    let NodeData::VariableDeclarationList(declarations) = &list_record.data else {
+        return Err(reject());
+    };
+    let statement = list_record
+        .parent
+        .map(|statement| NodeRef::new(declaration.arena, declaration.file, statement))
+        .ok_or_else(reject)?;
+    let statement_record = arena.get(statement.node).ok_or_else(reject)?;
+    let NodeData::VariableStatement(statement_data) = &statement_record.data else {
+        return Err(reject());
+    };
+    let Some(modifiers) = statement_data.modifiers.as_ref() else {
+        return Err(reject());
+    };
+    let [modifier] = modifiers.list.nodes.as_slice() else {
+        return Err(reject());
+    };
+    let modifier = NodeRef::new(declaration.arena, declaration.file, *modifier);
+    let modifier_record = arena.get(modifier.node).ok_or_else(reject)?;
+    let name = NodeRef::new(declaration.arena, declaration.file, variable.name);
+    let name_record = arena.get(name.node).ok_or_else(reject)?;
+    let NodeData::Identifier(name_data) = &name_record.data else {
+        return Err(reject());
+    };
+    let annotation = variable
+        .type_
+        .map(|annotation| NodeRef::new(declaration.arena, declaration.file, annotation))
+        .ok_or_else(reject)?;
+    let annotation_record = arena.get(annotation.node).ok_or_else(reject)?;
+    let construction = arena.get(node.node).ok_or_else(reject)?;
+
+    if !declaration.is_for(node.arena, node.file)
+        || owner.check_flags() != CheckFlags::NONE
+        || owner.value_declaration() != Some(declaration)
+        || owner.name().as_utf8() != Some(name_data.text.as_str())
+        || owner.members().is_some()
+        || owner.exports().is_some()
+        || owner.parent().is_some()
+        || owner.export_symbol().is_some()
+        || bound.symbol(declaration) != Some(symbol)
+        || declaration_record.kind != SyntaxKind::VariableDeclaration
+        || declaration_record.flags.0 != 0
+        || declaration_record.parent != Some(list.node)
+        || variable.initializer.is_some()
+        || variable.exclamation_token.is_some()
+        || variable.local_symbol.is_some()
+        || variable.symbol.is_some()
+        || variable.facts != 0
+        || list_record.kind != SyntaxKind::VariableDeclarationList
+        || list_record.parent != Some(statement.node)
+        || !matches!(list_record.flags.0, 0..=2)
+        || declarations.declarations.has_trailing_comma
+        || !declarations.declarations.nodes.contains(&declaration.node)
+        || statement_record.kind != SyntaxKind::VariableStatement
+        || statement_record.flags.0 != 0
+        || statement_record.parent != Some(bound.source_file().node)
+        || statement_record.range.end > construction.range.start
+        || statement_data.declaration_list != list.node
+        || statement_data.flow_node.is_some()
+        || statement_data.facts != 0
+        || modifiers.flags.0 != 0
+        || modifiers.list.has_trailing_comma
+        || modifier_record.kind != SyntaxKind::DeclareKeyword
+        || modifier_record.flags.0 != 0
+        || modifier_record.parent != Some(statement.node)
+        || !matches!(modifier_record.data, NodeData::Token(_))
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(declaration.node)
+        || name_data.flow_node.is_some()
+        || name_data.text.is_empty()
+        || annotation_record.flags.0 != 0
+        || annotation_record.parent != Some(declaration.node)
+    {
+        return Err(reject());
+    }
+
+    let object = plan_declared_constructor_object(arena, bound, store, host, annotation)
+        .map_err(|_| reject())?;
+    if object.call_signatures.is_empty()
+        || !object.properties.is_empty()
+        || !object.methods.is_empty()
+        || !object.spreads.is_empty()
+        || !object.indexes.is_empty()
+        || object.heritage.is_some()
+        || object.call_signatures.iter().any(|signature| {
+            host.node(signature.declaration)
+                .is_none_or(|record| record.kind != SyntaxKind::ConstructSignature)
+        })
+    {
+        return Err(reject());
+    }
+
+    for signature in object.call_signatures {
+        if signature.parameters.len() != usize::from(argument.is_some()) {
+            continue;
+        }
+        let parameter = signature
+            .parameters
+            .first()
+            .map(|parameter| {
+                declared_constructor_parameter_type(store, host, parameter.type_node).map(|type_| {
+                    type_.map(|type_| SourceNewParameter {
+                        symbol: parameter.symbol,
+                        type_,
+                    })
+                })
+            })
+            .transpose()?
+            .flatten();
+        if argument.is_some() != parameter.is_some() {
+            return Err(reject());
+        }
+        if argument
+            .zip(parameter)
+            .is_some_and(|(argument, parameter)| {
+                !argument_matches_parameter(store, argument, parameter)
+            })
+        {
+            continue;
+        }
+        return Ok(SourceDeclaredConstructorPlan {
+            annotation,
+            declaration: signature.declaration,
+            parameter,
+        });
+    }
+
+    Err(unsupported(SourceNewUnsupported::Arguments(node)))
+}
+
+fn plan_declared_constructor_object(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    annotation: NodeRef,
+) -> Result<PropertyObjectPlan, SourceNewError> {
+    let reject = || unsupported(SourceNewUnsupported::Constructor(annotation));
+    let record = arena.get(annotation.node).ok_or_else(reject)?;
+    match &record.data {
+        NodeData::TypeLiteralNode(_) if record.kind == SyntaxKind::TypeLiteral => {
+            plan_type_literal(store, host, annotation, None).map_err(|_| reject())
+        }
+        NodeData::TypeReferenceNode(reference)
+            if record.kind == SyntaxKind::TypeReference && reference.type_arguments.is_none() =>
+        {
+            let name = NodeRef::new(annotation.arena, annotation.file, reference.type_name);
+            let name_record = arena.get(name.node).ok_or_else(reject)?;
+            let NodeData::Identifier(identifier) = &name_record.data else {
+                return Err(reject());
+            };
+            if name_record.kind != SyntaxKind::Identifier
+                || name_record.flags.0 != 0
+                || name_record.parent != Some(annotation.node)
+                || identifier.flow_node.is_some()
+                || identifier.text.is_empty()
+            {
+                return Err(reject());
+            }
+
+            let mut callback_host = host.name_resolver_host(store)?;
+            let mut resolver =
+                CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut callback_host)
+                    .map_err(|error| {
+                        invariant(SourceNewInvariant::NameResolution { node: name, error })
+                    })?;
+            let raw_type_symbol = resolver
+                .resolve(
+                    Some(CanonicalResolutionLocation::Bound(name)),
+                    &identifier.text,
+                    SymbolFlags::TYPE,
+                    None,
+                    false,
+                    false,
+                )
+                .map_err(|error| {
+                    invariant(SourceNewInvariant::NameResolution { node: name, error })
+                })?
+                .ok_or_else(reject)?;
+            let symbol = store
+                .get_merged_symbol(raw_type_symbol)
+                .ok_or_else(reject)?;
+            let owner = store.symbol(symbol).ok_or_else(reject)?;
+            if symbol != raw_type_symbol || owner.check_flags() != CheckFlags::NONE {
+                return Err(reject());
+            }
+            if owner.flags() == SymbolFlags::INTERFACE {
+                return plan_interface(store, host, symbol).map_err(|_| reject());
+            }
+            if owner.flags() != SymbolFlags::TYPE_ALIAS {
+                return Err(reject());
+            }
+            let Some([declaration]) = owner.declarations() else {
+                return Err(reject());
+            };
+            let declaration = *declaration;
+            let declaration_record = host.node(declaration).ok_or_else(reject)?;
+            let NodeData::TypeAliasDeclaration(alias) = &declaration_record.data else {
+                return Err(reject());
+            };
+            let literal = NodeRef::new(declaration.arena, declaration.file, alias.type_);
+            let literal_record = host.node(literal).ok_or_else(reject)?;
+            if declaration_record.kind != SyntaxKind::TypeAliasDeclaration
+                || alias.type_parameters.is_some()
+                || literal_record.parent != Some(declaration.node)
+                || literal_record.kind != SyntaxKind::TypeLiteral
+                || !host.symbol_matches(store, declaration, symbol)
+            {
+                return Err(reject());
+            }
+            plan_type_literal(store, host, literal, Some(symbol)).map_err(|_| reject())
+        }
+        _ => Err(reject()),
+    }
+}
+
+fn declared_constructor_parameter_type(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+) -> Result<Option<TypeId>, SourceNewError> {
+    let record = host
+        .node(node)
+        .ok_or_else(|| invariant(SourceNewInvariant::MissingNode(node)))?;
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or_else(|| invariant(SourceNewInvariant::InvalidExpressionCache(node)))?;
+    Ok(match record.kind {
+        SyntaxKind::StringKeyword => Some(bootstrap.string_type),
+        SyntaxKind::NumberKeyword => Some(bootstrap.number_type),
+        SyntaxKind::AnyKeyword => Some(bootstrap.any_type),
+        SyntaxKind::UnknownKeyword => Some(bootstrap.unknown_type),
+        _ => None,
+    })
 }
 
 fn constructor_parameter(
@@ -477,25 +785,53 @@ fn argument_matches_parameter(
     parameter: SourceNewParameter,
 ) -> bool {
     store.intrinsic_bootstrap().is_some_and(|bootstrap| {
-        parameter.type_
-            == match &argument.value {
-                SourceNewArgumentValue::String(_) => bootstrap.string_type,
-                SourceNewArgumentValue::Number(_) => bootstrap.number_type,
-            }
+        let argument_type = match &argument.value {
+            SourceNewArgumentValue::String(_) => bootstrap.string_type,
+            SourceNewArgumentValue::Number(_) => bootstrap.number_type,
+        };
+        parameter.type_ == argument_type
+            || parameter.type_ == bootstrap.any_type
+            || parameter.type_ == bootstrap.unknown_type
     })
 }
 
-/// Revalidates the class and all observable cold/warm construction caches.
+/// Revalidates the constructor provider and all observable construction caches.
 pub(super) fn preflight_direct_default_new(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     plan: &SourceDefaultNewPlan,
 ) -> Result<(), SourceNewError> {
-    preflight_nongeneric_class_member_query(store, host, &plan.class)?;
-    if constructor_parameter(store, host, &plan.class)? != plan.parameter {
-        return Err(invariant(SourceNewInvariant::InvalidClassPlan(
-            plan.class.declaration(),
-        )));
+    match &plan.target {
+        SourceNewTarget::Class(class) => {
+            preflight_nongeneric_class_member_query(store, host, class)?;
+            if constructor_parameter(store, host, class)? != plan.parameter {
+                return Err(invariant(SourceNewInvariant::InvalidClassPlan(
+                    class.declaration(),
+                )));
+            }
+        }
+        SourceNewTarget::Declared(expected) => {
+            let (arena, bound) = host.source(plan.constructor).ok_or_else(|| {
+                invariant(SourceNewInvariant::InvalidConstructorCache(
+                    plan.constructor,
+                ))
+            })?;
+            let actual = plan_declared_constructor(
+                arena,
+                bound,
+                store,
+                host,
+                plan.node,
+                plan.constructor,
+                plan.resolved_symbol,
+                plan.argument.as_ref(),
+            )?;
+            if actual != *expected || expected.parameter != plan.parameter {
+                return Err(invariant(SourceNewInvariant::InvalidConstructorCache(
+                    plan.constructor,
+                )));
+            }
+        }
     }
     preflight_default_new_cache(store, plan)
 }
@@ -611,11 +947,37 @@ pub(super) fn check_direct_default_new(
 ) -> Result<CheckedSourceDefaultNew, SourceNewError> {
     preflight_direct_default_new(store, host, plan)?;
     preflight_prepared_default_new_cache(store, plan)?;
-    let members = execute_nongeneric_class_member_query(store, host, &plan.class)?;
-    let value_type = members.shells().value_type();
-    let instance_type = members.shells().instance_type();
-    let signature = members.default_construct_signature();
-    validate_selected_default_signature(store, plan, value_type, instance_type, signature)?;
+    let selected = match &plan.target {
+        SourceNewTarget::Class(class) => {
+            let members = execute_nongeneric_class_member_query(store, host, class)?;
+            let selected = CheckedSourceDefaultNew {
+                value_type: members.shells().value_type(),
+                instance_type: members.shells().instance_type(),
+                signature: members.default_construct_signature(),
+            };
+            validate_selected_default_signature(
+                store,
+                plan,
+                class,
+                selected.value_type,
+                selected.instance_type,
+                selected.signature,
+            )?;
+            selected
+        }
+        SourceNewTarget::Declared(declared) => {
+            resolved_declared_constructor(store, plan, declared)?.ok_or_else(|| {
+                invariant(SourceNewInvariant::InvalidConstructorCache(
+                    plan.constructor,
+                ))
+            })?
+        }
+    };
+    let CheckedSourceDefaultNew {
+        value_type,
+        instance_type,
+        signature,
+    } = selected;
     let argument_type = plan
         .argument
         .as_ref()
@@ -696,6 +1058,96 @@ fn preflight_prepared_default_new_cache(
     preflight_default_new_cache(store, plan)
 }
 
+fn resolved_declared_constructor(
+    store: &CanonicalTypeMapperStore,
+    plan: &SourceDefaultNewPlan,
+    declared: &SourceDeclaredConstructorPlan,
+) -> Result<Option<CheckedSourceDefaultNew>, SourceNewError> {
+    let invalid = || {
+        invariant(SourceNewInvariant::InvalidConstructorCache(
+            plan.constructor,
+        ))
+    };
+    let Some(value_type) = exact_type_cache(store, declared.annotation).map_err(|()| invalid())?
+    else {
+        if exact_class_value_type(store, plan.resolved_symbol)?.is_some() {
+            return Err(invalid());
+        }
+        return Ok(None);
+    };
+    if exact_class_value_type(store, plan.resolved_symbol)?
+        .is_some_and(|cached| cached != value_type)
+    {
+        return Err(invalid());
+    }
+
+    let StoredCallableSetValidation::Valid {
+        family: CallableFamily::DeclaredCallSignatures,
+        projection,
+        ..
+    } = validate_stored_callable_set(store, value_type)
+    else {
+        return Err(invalid());
+    };
+    if projection.owner != value_type
+        || !projection.call_signatures.is_empty()
+        || projection.construct_signatures.is_empty()
+    {
+        return Err(invalid());
+    }
+    let Some(signature) = projection
+        .construct_signatures
+        .iter()
+        .copied()
+        .find(|signature| {
+            store
+                .signature(*signature)
+                .is_some_and(|record| record.declaration() == Some(declared.declaration))
+        })
+    else {
+        return Err(invalid());
+    };
+    let record = store.signature(signature).ok_or_else(invalid)?;
+    let Some(instance_type) = record.resolved_return_type() else {
+        return Err(invalid());
+    };
+    let allowed_flags = SignatureFlags::CONSTRUCT | SignatureFlags::HAS_LITERAL_TYPES;
+    if !record.flags().contains(SignatureFlags::CONSTRUCT)
+        || record.flags().intersects(SignatureFlags::ABSTRACT)
+        || record.flags().bits() & !allowed_flags.bits() != 0
+        || record.parameters()
+            != declared
+                .parameter
+                .map(|parameter| parameter.symbol)
+                .as_slice()
+        || record.min_argument_count() != i32::from(declared.parameter.is_some())
+        || record.resolved_min_argument_count() != -1
+        || !record.type_parameters().is_empty()
+        || record.this_parameter().is_some()
+        || record.target().is_some()
+        || record.mapper().is_some()
+        || record.composite().is_some()
+        || store.callable_signature_parameter_types(signature)
+            != Some(
+                declared
+                    .parameter
+                    .map(|parameter| parameter.type_)
+                    .as_slice(),
+            )
+        || store.type_payload(instance_type).is_none()
+    {
+        return Err(invariant(SourceNewInvariant::InvalidConstructSignature(
+            signature,
+        )));
+    }
+
+    Ok(Some(CheckedSourceDefaultNew {
+        value_type,
+        instance_type,
+        signature,
+    }))
+}
+
 fn preflight_default_new_cache(
     store: &CanonicalTypeMapperStore,
     plan: &SourceDefaultNewPlan,
@@ -735,23 +1187,43 @@ fn preflight_default_new_cache(
         }
     }
 
-    let instance = store
-        .declared_type_links(plan.class.symbol())
-        .and_then(|links| links.declared_type);
-    let value = exact_class_value_type(store, plan.class.symbol())?;
-    if constructor_type.is_some_and(|constructor| Some(constructor) != value)
-        || result_type.is_some_and(|result| Some(result) != instance)
-    {
-        return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
-            plan.node,
-        )));
-    }
-    if let (Some(value), Some(instance), Some(signature)) = (value, instance, signature) {
-        validate_selected_default_signature(store, plan, value, instance, signature)?;
-    } else if signature.is_some() {
-        return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
-            plan.node,
-        )));
+    match &plan.target {
+        SourceNewTarget::Class(class) => {
+            let instance = store
+                .declared_type_links(class.symbol())
+                .and_then(|links| links.declared_type);
+            let value = exact_class_value_type(store, class.symbol())?;
+            if constructor_type.is_some_and(|constructor| Some(constructor) != value)
+                || result_type.is_some_and(|result| Some(result) != instance)
+            {
+                return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
+                    plan.node,
+                )));
+            }
+            if let (Some(value), Some(instance), Some(signature)) = (value, instance, signature) {
+                validate_selected_default_signature(
+                    store, plan, class, value, instance, signature,
+                )?;
+            } else if signature.is_some() {
+                return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
+                    plan.node,
+                )));
+            }
+        }
+        SourceNewTarget::Declared(declared) => {
+            let resolved = resolved_declared_constructor(store, plan, declared)?;
+            if constructor_type.is_some_and(|constructor| {
+                resolved.is_none_or(|resolved| constructor != resolved.value_type)
+            }) || result_type.is_some_and(|result| {
+                resolved.is_none_or(|resolved| result != resolved.instance_type)
+            }) || signature.is_some_and(|signature| {
+                resolved.is_none_or(|resolved| signature != resolved.signature)
+            }) {
+                return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
+                    plan.node,
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -923,16 +1395,17 @@ fn exact_class_value_type(
 fn validate_selected_default_signature(
     store: &CanonicalTypeMapperStore,
     plan: &SourceDefaultNewPlan,
+    class: &ClassMemberQueryPlan,
     value_type: TypeId,
     instance_type: TypeId,
     signature: SignatureId,
 ) -> Result<(), SourceNewError> {
     let value = store
         .type_payload(value_type)
-        .ok_or_else(|| invariant(SourceNewInvariant::InvalidClassValue(plan.class.symbol())))?;
+        .ok_or_else(|| invariant(SourceNewInvariant::InvalidClassValue(class.symbol())))?;
     let Some(structured) = value.data().structured() else {
         return Err(invariant(SourceNewInvariant::InvalidClassValue(
-            plan.class.symbol(),
+            class.symbol(),
         )));
     };
     if structured.call_signature_count != 0
@@ -949,7 +1422,7 @@ fn validate_selected_default_signature(
         || signature_record
             .flags()
             .intersects(SignatureFlags::ABSTRACT)
-        || signature_record.declaration() != plan.class.constructor_declaration()
+        || signature_record.declaration() != class.constructor_declaration()
         || !signature_record.type_parameters().is_empty()
         || signature_record.parameters()
             != plan.parameter.map(|parameter| parameter.symbol).as_slice()
@@ -981,15 +1454,15 @@ fn validate_selected_default_signature(
     let TypeData::Interface(instance) = store
         .type_payload(instance_type)
         .map(super::type_records::TypeRecord::data)
-        .ok_or_else(|| invariant(SourceNewInvariant::InvalidClassValue(plan.class.symbol())))?
+        .ok_or_else(|| invariant(SourceNewInvariant::InvalidClassValue(class.symbol())))?
     else {
         return Err(invariant(SourceNewInvariant::InvalidClassValue(
-            plan.class.symbol(),
+            class.symbol(),
         )));
     };
     if instance.reference.object.target != Some(instance_type) {
         return Err(invariant(SourceNewInvariant::InvalidClassValue(
-            plan.class.symbol(),
+            class.symbol(),
         )));
     }
     Ok(())
@@ -1103,6 +1576,267 @@ mod tests {
             construction.file,
             new_expression.arguments.as_ref().unwrap().nodes[0],
         )
+    }
+
+    fn ambient_constructor(
+        parsed: &ParseResult,
+        file: FileId,
+        context: &CanonicalCheckerContext<'_>,
+        expected: &str,
+    ) -> (NodeRef, SemanticSymbolId) {
+        let (declaration, annotation) = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::VariableDeclaration(variable) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(name) = &parsed.arena.get(variable.name)?.data else {
+                    return None;
+                };
+                (name.text == expected).then_some((
+                    NodeRef::new(parsed.arena.id(), file, node),
+                    NodeRef::new(parsed.arena.id(), file, variable.type_?),
+                ))
+            })
+            .unwrap_or_else(|| panic!("missing ambient constructor {expected}"));
+        let raw = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        (annotation, context.store().get_merged_symbol(raw).unwrap())
+    }
+
+    #[test]
+    fn declared_construct_signatures_publish_real_returns_and_replay_warm() {
+        for (source, returns_number, has_argument) in [
+            (
+                "declare const factory: { new(): string }; const result = new factory();",
+                false,
+                false,
+            ),
+            (
+                "declare const factory: { new(value: number): string }; const result = new factory(1);",
+                false,
+                true,
+            ),
+            (
+                concat!(
+                    "interface Factory { new(value: string): number; } ",
+                    "declare let factory: Factory; ",
+                    "const result = new factory(\"ready\");",
+                ),
+                true,
+                true,
+            ),
+            (
+                concat!(
+                    "type Factory = { ",
+                    "new(value: number): string; ",
+                    "new(value: string): number ",
+                    "}; ",
+                    "declare var factory: Factory; ",
+                    "const result = new factory(\"ready\");",
+                ),
+                true,
+                true,
+            ),
+            (
+                "declare const factory: { new(value: any): number }; const result = new factory(1);",
+                true,
+                true,
+            ),
+        ] {
+            let parsed = parse_source_file(source);
+            assert!(
+                parsed.diagnostics.is_empty(),
+                "{source}: {:?}",
+                parsed.diagnostics
+            );
+            let file = FileId::new(1_810);
+            let mut context = context(&parsed, file);
+            let (annotation, owner) = ambient_constructor(&parsed, file, &context, "factory");
+            let (construction, constructor) = variable_new(&parsed, file, "result");
+
+            context.check_source_file(file).unwrap();
+
+            let store = context.store();
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            let expected = if returns_number {
+                bootstrap.number_type
+            } else {
+                bootstrap.string_type
+            };
+            let value = store
+                .type_node_links(annotation)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            let signature = store
+                .signature_links(construction)
+                .and_then(|links| links.resolved_signature.signature())
+                .unwrap();
+            let record = store.signature(signature).unwrap();
+            assert!(record.flags().contains(SignatureFlags::CONSTRUCT));
+            assert!(!record.flags().intersects(SignatureFlags::ABSTRACT));
+            assert_eq!(record.resolved_return_type(), Some(expected));
+            assert_eq!(record.parameters().len(), usize::from(has_argument));
+            assert_eq!(
+                store
+                    .symbol_node_links(constructor)
+                    .and_then(|links| links.resolved_symbol),
+                Some(owner),
+            );
+            assert_eq!(
+                store
+                    .type_node_links(constructor)
+                    .and_then(|links| links.resolved_type),
+                Some(value),
+            );
+            assert_eq!(
+                store
+                    .type_node_links(construction)
+                    .and_then(|links| links.resolved_type),
+                Some(expected),
+            );
+            assert!(
+                matches!(
+                    validate_stored_callable_set(store, value),
+                    StoredCallableSetValidation::Valid {
+                        family: CallableFamily::DeclaredCallSignatures,
+                        ..
+                    }
+                ),
+                "{source}",
+            );
+            assert!(
+                context.diagnostics().is_empty(),
+                "{source}: {:?}",
+                context.diagnostics()
+            );
+            let warm = (
+                store.type_len(),
+                store.signature_len(),
+                store.checker_link_allocated_lengths(),
+            );
+
+            context.recheck_source_file(file).unwrap();
+
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                warm,
+                "{source}",
+            );
+        }
+    }
+
+    #[test]
+    fn incompatible_declared_constructor_arguments_do_not_publish_values() {
+        for source in [
+            concat!(
+                "declare const factory: { new(value: number): string }; ",
+                "const result = new factory(\"wrong\");",
+            ),
+            concat!(
+                "declare const factory: { new(value: number): string }; ",
+                "const result = new factory();",
+            ),
+            "declare const factory: { new(): string }; const result = new factory(1);",
+            concat!(
+                "declare const factory: abstract new () => string; ",
+                "const result = new factory();",
+            ),
+            concat!(
+                "declare const factory: { new(): string } | null; ",
+                "const result = new factory();",
+            ),
+        ] {
+            let parsed = parse_source_file(source);
+            assert!(
+                parsed.diagnostics.is_empty(),
+                "{source}: {:?}",
+                parsed.diagnostics
+            );
+            let file = FileId::new(1_811);
+            let mut context = context(&parsed, file);
+            let (annotation, owner) = ambient_constructor(&parsed, file, &context, "factory");
+            let (construction, _) = variable_new(&parsed, file, "result");
+            let before = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+
+            assert!(
+                matches!(
+                    context.check_source_file(file),
+                    Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::New(
+                        _
+                    )))
+                ),
+                "{source}",
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                before,
+                "{source}",
+            );
+            assert!(context.store().type_node_links(annotation).is_none());
+            assert!(context.store().type_node_links(construction).is_none());
+            assert!(context.store().value_symbol_links(owner).is_none());
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    fn abstract_declared_construct_signature_is_rejected_without_new_publication() {
+        let parsed = parse_source_file(
+            "declare const factory: { new(): string }; const result = new factory();",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(1_812);
+        let mut context = context(&parsed, file);
+        let (annotation, owner) = ambient_constructor(&parsed, file, &context, "factory");
+        let (construction, constructor) = variable_new(&parsed, file, "result");
+        let value = context.get_type_from_type_node(annotation).unwrap();
+        let signature = context
+            .store()
+            .type_payload(value)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.signatures.as_deref())
+            .and_then(|signatures| signatures.first())
+            .copied()
+            .unwrap();
+        assert!(context.store_mut_for_test().set_signature_flags(
+            signature,
+            SignatureFlags::CONSTRUCT | SignatureFlags::ABSTRACT,
+        ));
+        let before = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+
+        assert_eq!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Call(constructor)),
+        );
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+        assert!(context.store().type_node_links(construction).is_none());
+        assert!(context.store().symbol_node_links(constructor).is_none());
+        assert!(context.store().value_symbol_links(owner).is_none());
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]

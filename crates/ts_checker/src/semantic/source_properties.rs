@@ -2,9 +2,10 @@
 //!
 //! The recursively planned receiver must already have a canonical `any` type,
 //! a published enum value, a validated class constructor, an imported
-//! namespace, an authenticated published scalar-wrapper method, or belong to
-//! the validated own-property object domain in `relater`. Enum values reuse
-//! their published member identities. Class
+//! namespace, an authenticated published scalar-wrapper method, an exact global
+//! array reference with a published member, or belong to the validated
+//! own-property object domain in `relater`. Enum values reuse their published
+//! member identities. Class
 //! constructors read their validated static member tables without treating
 //! construct signatures as property-only objects. Namespace reexports retain
 //! their export alias while reading the final value symbol. Validated class
@@ -224,6 +225,12 @@ enum NamespaceProperty {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ClassStaticProperty {
+    Present(ResolvedOwnProperty),
+    Missing,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CanonicalArrayProperty {
     Present(ResolvedOwnProperty),
     Missing,
 }
@@ -534,7 +541,16 @@ pub(super) fn check_direct_source_property(
                 receiver_type,
             )? {
                 Some(method) => Some(method),
-                None => store.resolved_own_property(receiver_type, &plan.name)?,
+                None => match resolve_published_canonical_array_property(
+                    store,
+                    global_types,
+                    plan,
+                    receiver_type,
+                )? {
+                    Some(CanonicalArrayProperty::Present(property)) => Some(property),
+                    Some(CanonicalArrayProperty::Missing) => None,
+                    None => store.resolved_own_property(receiver_type, &plan.name)?,
+                },
             },
         },
     } {
@@ -732,6 +748,306 @@ fn resolve_published_scalar_wrapper_method(
         optional: false,
         readonly: false,
     }))
+}
+
+/// Reads a published member from the exact global target of a canonical array.
+fn resolve_published_canonical_array_property(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    plan: &SourcePropertyPlan,
+    receiver_type: TypeId,
+) -> Result<Option<CanonicalArrayProperty>, SourcePropertyError> {
+    let Some(global_types) = global_types else {
+        return Ok(None);
+    };
+    let receiver = store
+        .type_payload(receiver_type)
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    let candidate_target = match receiver.data() {
+        TypeData::TypeReference(reference) => reference.object.target,
+        TypeData::Interface(interface) => interface.reference.object.target,
+        _ => return Ok(None),
+    };
+    if candidate_target != Some(global_types.array_type)
+        && candidate_target != Some(global_types.readonly_array_type)
+    {
+        return Ok(None);
+    }
+    let array = store
+        .canonical_array_reference(global_types, receiver_type)
+        .map_err(|_| SourcePropertyError::InvalidCache(plan.node))?
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    let (target, owner_name) = if array.readonly {
+        (global_types.readonly_array_type, "ReadonlyArray")
+    } else {
+        (global_types.array_type, "Array")
+    };
+    let target_record = store
+        .type_payload(target)
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    let TypeData::Interface(interface) = target_record.data() else {
+        return Err(SourcePropertyError::InvalidCache(plan.node));
+    };
+    let owner = target_record
+        .symbol()
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    let owner_record = store
+        .symbol(owner)
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    let global_owner = store
+        .intrinsic_bootstrap()
+        .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+        .and_then(|globals| globals.get_source(owner_name))
+        .and_then(|symbol| store.get_merged_symbol(symbol));
+    let allowed_owner_flags =
+        SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::TRANSIENT;
+    if target_record.flags() != TypeFlags::OBJECT
+        || !target_record
+            .object_flags()
+            .contains(ObjectFlags::INTERFACE)
+        || target_record.object_flags().intersects(ObjectFlags::CLASS)
+        || target_record.alias().is_some()
+        || owner_record.flags() & SymbolFlags::TYPE != SymbolFlags::INTERFACE
+        || owner_record.flags().without(allowed_owner_flags) != SymbolFlags::NONE
+        || owner_record.check_flags() != CheckFlags::NONE
+        || owner_record.name().as_utf8() != Some(owner_name)
+        || owner_record.parent().is_some()
+        || owner_record.exports().is_some()
+        || owner_record.export_symbol().is_some()
+        || global_owner != Some(owner)
+        || store
+            .declared_type_links(owner)
+            .and_then(|links| links.declared_type)
+            != Some(target)
+    {
+        return Err(SourcePropertyError::InvalidCache(plan.node));
+    }
+
+    let members = owner_record
+        .members()
+        .and_then(|members| store.symbol_table(members))
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    let Some(symbol) = members.get_source(&plan.name) else {
+        if global_object_affects_missing_property(store, global_types, plan.node, &plan.name)? {
+            return Err(SourcePropertyError::Unsupported(
+                SourcePropertyUnsupported::ApparentObjectProperty {
+                    node: plan.node,
+                    receiver_type,
+                },
+            ));
+        }
+        return Ok(Some(CanonicalArrayProperty::Missing));
+    };
+    let symbol = store
+        .get_merged_symbol(symbol)
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    let member = store
+        .symbol(symbol)
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    let Some(declarations) = member
+        .declarations()
+        .filter(|declarations| !declarations.is_empty())
+    else {
+        return Err(SourcePropertyError::InvalidCache(plan.node));
+    };
+    let owner_declarations = owner_record
+        .declarations()
+        .filter(|declarations| !declarations.is_empty())
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    let flags = member.flags();
+    let is_method = flags == SymbolFlags::METHOD;
+    let is_property =
+        flags == SymbolFlags::PROPERTY || flags == (SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL);
+    let allowed_checks = if is_method {
+        CheckFlags::NONE
+    } else {
+        CheckFlags::READONLY
+    };
+    if (!is_method && !is_property)
+        || member.check_flags().bits() & !allowed_checks.bits() != 0
+        || member.name().as_utf8() != Some(plan.name.as_str())
+        || member.members().is_some()
+        || member.exports().is_some()
+        || member.export_symbol().is_some()
+        || member
+            .parent()
+            .and_then(|parent| store.get_merged_symbol(parent))
+            != Some(owner)
+        || member
+            .value_declaration()
+            .is_none_or(|declaration| !declarations.contains(&declaration))
+        || declarations.iter().any(|declaration| {
+            let valid_kind = if is_method {
+                store.source_node_kind(*declaration) == Some(SyntaxKind::MethodSignature)
+            } else {
+                matches!(
+                    store.source_node_kind(*declaration),
+                    Some(SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature)
+                )
+            };
+            !valid_kind
+                || !matches!(
+                    store.source_node_parent(*declaration),
+                    Some(super::store::SourceNodeParent::Parent(parent))
+                        if owner_declarations.contains(&parent)
+                )
+        })
+        || interface.declared_members.is_some_and(|declared| {
+            store.symbol_table(declared).is_none_or(|declared| {
+                declared
+                    .get_source(&plan.name)
+                    .is_some_and(|declared| store.get_merged_symbol(declared) != Some(symbol))
+            })
+        })
+    {
+        return Err(SourcePropertyError::InvalidCache(plan.node));
+    }
+
+    let Some(links) = store.value_symbol_links(symbol) else {
+        return Err(RelationUnavailable::UnresolvedPropertyType(symbol).into());
+    };
+    let Some(type_) = links.resolved_type else {
+        return if links == &ValueSymbolLinks::default() {
+            Err(RelationUnavailable::UnresolvedPropertyType(symbol).into())
+        } else {
+            Err(SourcePropertyError::InvalidCache(plan.node))
+        };
+    };
+    if links
+        != &(ValueSymbolLinks {
+            resolved_type: Some(type_),
+            ..ValueSymbolLinks::default()
+        })
+        || store.type_payload(type_).is_none()
+    {
+        return Err(SourcePropertyError::InvalidCache(plan.node));
+    }
+    let readonly = member.check_flags().contains(CheckFlags::READONLY);
+    if is_method {
+        validate_published_canonical_array_method(store, plan.node, symbol, declarations, type_)?;
+    }
+    let requires_instantiation = is_method
+        && store
+            .type_payload(type_)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.signatures.as_deref())
+            .is_some_and(|signatures| {
+                signatures.iter().any(|signature| {
+                    store
+                        .signature(*signature)
+                        .and_then(super::signatures::Signature::resolved_return_type)
+                        == Some(target)
+                })
+            });
+    let type_ = if requires_instantiation {
+        super::instantiated_members::instantiate_published_generic_interface_method(
+            store,
+            global_types,
+            receiver_type,
+            symbol,
+        )
+        .map_err(|error| match error {
+            super::instantiated_members::GenericInterfaceMemberError::Capacity(_) => {
+                SourcePropertyError::Capacity(plan.node)
+            }
+            super::instantiated_members::GenericInterfaceMemberError::UnsupportedTarget(_)
+            | super::instantiated_members::GenericInterfaceMemberError::UnsupportedMember(_)
+            | super::instantiated_members::GenericInterfaceMemberError::UnsupportedPropertyType(
+                _,
+            ) => SourcePropertyError::Unsupported(SourcePropertyUnsupported::Access(plan.node)),
+            super::instantiated_members::GenericInterfaceMemberError::Reference(_)
+            | super::instantiated_members::GenericInterfaceMemberError::InvalidTarget(_)
+            | super::instantiated_members::GenericInterfaceMemberError::InvalidMember(_)
+            | super::instantiated_members::GenericInterfaceMemberError::InvalidCachedMembers(_)
+            | super::instantiated_members::GenericInterfaceMemberError::InvalidCachedProperty(
+                _,
+            ) => SourcePropertyError::InvalidCache(plan.node),
+        })?
+    } else {
+        type_
+    };
+
+    Ok(Some(CanonicalArrayProperty::Present(ResolvedOwnProperty {
+        symbol,
+        type_,
+        optional: flags.contains(SymbolFlags::OPTIONAL),
+        readonly,
+    })))
+}
+
+fn validate_published_canonical_array_method(
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+    method: SemanticSymbolId,
+    declarations: &[NodeRef],
+    type_: TypeId,
+) -> Result<(), SourcePropertyError> {
+    let record = store
+        .type_payload(type_)
+        .ok_or(SourcePropertyError::InvalidCache(node))?;
+    let TypeData::Object(callable) = record.data() else {
+        return Err(SourcePropertyError::InvalidCache(node));
+    };
+    let Some(signatures) = callable
+        .structured
+        .signatures
+        .as_deref()
+        .filter(|signatures| !signatures.is_empty())
+    else {
+        return Err(SourcePropertyError::InvalidCache(node));
+    };
+    if record.flags() != TypeFlags::OBJECT
+        || record.symbol() != Some(method)
+        || record.alias().is_some()
+        || callable.structured.call_signature_count != signatures.len()
+        || signatures.len() != declarations.len()
+        || declarations.iter().any(|declaration| {
+            signatures
+                .iter()
+                .filter(|signature| {
+                    store
+                        .signature(**signature)
+                        .and_then(super::signatures::Signature::declaration)
+                        == Some(*declaration)
+                })
+                .count()
+                != 1
+        })
+        || signatures.iter().any(|signature| {
+            let Some(record) = store.signature(*signature) else {
+                return true;
+            };
+            let Some(declaration) = record.declaration() else {
+                return true;
+            };
+            store
+                .signature_links(declaration)
+                .and_then(|links| links.resolved_signature.signature())
+                != Some(*signature)
+                || record
+                    .resolved_return_type()
+                    .is_some_and(|return_type| store.type_payload(return_type).is_none())
+                || record.parameters().iter().any(|parameter| {
+                    let Some(parameter) = store.symbol(*parameter) else {
+                        return true;
+                    };
+                    let Some([parameter_declaration]) = parameter.declarations() else {
+                        return true;
+                    };
+                    store.source_node_kind(*parameter_declaration) != Some(SyntaxKind::Parameter)
+                        || store.source_node_parent(*parameter_declaration)
+                            != Some(super::store::SourceNodeParent::Parent(declaration))
+                })
+                || record
+                    .type_parameters()
+                    .iter()
+                    .any(|parameter| store.type_payload(*parameter).is_none())
+        })
+    {
+        return Err(SourcePropertyError::InvalidCache(node));
+    }
+    Ok(())
 }
 
 fn resolve_class_static_property(
@@ -1574,8 +1890,9 @@ mod tests {
     use crate::semantic::{
         AliasSymbolLinks, AliasTargetState, CanonicalCheckerContext, IntrinsicBootstrapOptions,
         ResolvedSignatureState, SignatureLinks,
-        signatures::SignatureFlags,
+        signatures::{ElementFlags, SignatureFlags},
         source::{PlannedExpressionKind, PlannedIdentifierRead, PlannedIdentifierReadKind},
+        tuple_types::CanonicalTupleTypeRequest,
         types::ObjectFlags,
     };
 
@@ -2004,6 +2321,370 @@ mod tests {
         (context, method, type_)
     }
 
+    fn array_property_context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/array-properties.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn published_array_concat(
+        parsed: &ParseResult,
+        file: FileId,
+    ) -> (
+        CanonicalCheckerContext<'_>,
+        SemanticSymbolId,
+        TypeId,
+        TypeId,
+        Vec<super::super::SignatureId>,
+    ) {
+        let mut context = array_property_context(parsed, file);
+        let global_types = context.global_types().clone();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let array = context
+            .store_mut_for_test()
+            .create_canonical_array_type(&global_types, number, false)
+            .unwrap();
+        let (method, declarations, parameters) = {
+            let store = context.store();
+            let owner = store
+                .type_payload(global_types.array_type)
+                .and_then(TypeRecord::symbol)
+                .and_then(|owner| store.get_merged_symbol(owner))
+                .unwrap();
+            let method = store
+                .symbol(owner)
+                .and_then(ts_binder::semantic::Symbol::members)
+                .and_then(|members| store.symbol_table(members))
+                .and_then(|members| members.get_source("concat"))
+                .unwrap();
+            let declarations = store
+                .symbol(method)
+                .unwrap()
+                .declarations()
+                .unwrap()
+                .to_vec();
+            let parameters = declarations
+                .iter()
+                .map(|declaration| {
+                    let NodeData::MethodSignatureDeclaration(signature) =
+                        &parsed.arena.get(declaration.node).unwrap().data
+                    else {
+                        panic!("expected an Array.concat overload")
+                    };
+                    let [parameter] = signature.parameters.nodes.as_slice() else {
+                        panic!("expected one Array.concat overload parameter")
+                    };
+                    let parameter = NodeRef::new(declaration.arena, declaration.file, *parameter);
+                    context.file(file).unwrap().1.symbol(parameter).unwrap()
+                })
+                .collect::<Vec<_>>();
+            (method, declarations, parameters)
+        };
+        let store = context.store_mut_for_test();
+        let callable = store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(method))
+            .unwrap();
+        let mut signatures = Vec::with_capacity(declarations.len());
+        for (index, (&declaration, &parameter)) in declarations.iter().zip(&parameters).enumerate()
+        {
+            let parameter_type = if index == 0 { number } else { array };
+            assert!(store.set_value_symbol_links(
+                parameter,
+                ValueSymbolLinks {
+                    resolved_type: Some(parameter_type),
+                    ..ValueSymbolLinks::default()
+                },
+            ));
+            let signature = store
+                .alloc_signature(
+                    SignatureFlags::NONE,
+                    Some(declaration),
+                    Vec::new(),
+                    None,
+                    vec![parameter],
+                    Some(array),
+                    None,
+                    1,
+                )
+                .unwrap();
+            assert!(store.set_signature_links(
+                declaration,
+                SignatureLinks {
+                    resolved_signature: ResolvedSignatureState::Resolved(signature),
+                    ..SignatureLinks::default()
+                },
+            ));
+            signatures.push(signature);
+        }
+        assert!(store.set_structured_type_members(
+            callable,
+            None,
+            None,
+            Some(signatures.clone()),
+            None,
+            None,
+        ));
+        assert!(store.set_value_symbol_links(
+            method,
+            ValueSymbolLinks {
+                resolved_type: Some(callable),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        (context, method, callable, array, signatures)
+    }
+
+    type PublishedGenericArrayConcat<'arena> = (
+        CanonicalCheckerContext<'arena>,
+        SemanticSymbolId,
+        TypeId,
+        TypeId,
+        TypeId,
+        Vec<super::super::SignatureId>,
+        Vec<(NodeRef, TypeId, NodeRef)>,
+    );
+
+    fn published_generic_array_concat(
+        parsed: &ParseResult,
+        file: FileId,
+    ) -> PublishedGenericArrayConcat<'_> {
+        let mut context = array_property_context(parsed, file);
+        let global_types = context.global_types().clone();
+        let (method, concat_owner, type_parameter, declarations) = {
+            let store = context.store();
+            let globals = store.intrinsic_bootstrap().unwrap().globals;
+            let owner = store
+                .symbol_table(globals)
+                .and_then(|globals| globals.get_source("Array"))
+                .and_then(|owner| store.get_merged_symbol(owner))
+                .unwrap();
+            let concat_owner = store
+                .symbol_table(globals)
+                .and_then(|globals| globals.get_source("ConcatArray"))
+                .and_then(|owner| store.get_merged_symbol(owner))
+                .unwrap();
+            let method = store
+                .symbol(owner)
+                .and_then(ts_binder::semantic::Symbol::members)
+                .and_then(|members| store.symbol_table(members))
+                .and_then(|members| members.get_source("concat"))
+                .unwrap();
+            let TypeData::Interface(array) =
+                store.type_payload(global_types.array_type).unwrap().data()
+            else {
+                panic!("Array must retain its global generic interface target")
+            };
+            let [type_parameter] = array.reference.resolved_type_arguments.as_deref().unwrap()
+            else {
+                panic!("Array must retain one declared element type parameter")
+            };
+            (
+                method,
+                concat_owner,
+                *type_parameter,
+                store
+                    .symbol(method)
+                    .unwrap()
+                    .declarations()
+                    .unwrap()
+                    .to_vec(),
+            )
+        };
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let required = context
+            .store()
+            .create_tuple_element_info(ElementFlags::REQUIRED, None)
+            .unwrap();
+        let pair = context
+            .store_mut_for_test()
+            .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(
+                &[number, number],
+                &[required, required],
+                false,
+            ))
+            .unwrap();
+        let concat_target = context.get_declared_type_of_symbol(concat_owner).unwrap();
+        let receiver = context
+            .store_mut_for_test()
+            .create_canonical_array_type(&global_types, pair, false)
+            .unwrap();
+        let concat_template = context
+            .store_mut_for_test()
+            .create_direct_generic_reference_type(concat_target, &[type_parameter])
+            .unwrap();
+        let first_parameter = context
+            .store_mut_for_test()
+            .create_canonical_array_type(&global_types, concat_template, false)
+            .unwrap();
+        let union = context
+            .store_mut_for_test()
+            .expression_union_type_with_global_types(
+                &global_types,
+                &[type_parameter, concat_template],
+                UnionReduction::Literal,
+            )
+            .unwrap();
+        let second_parameter = context
+            .store_mut_for_test()
+            .create_canonical_array_type(&global_types, union, false)
+            .unwrap();
+        let plans = declarations
+            .iter()
+            .copied()
+            .zip([first_parameter, second_parameter])
+            .map(|(declaration, parameter_type)| {
+                let NodeData::MethodSignatureDeclaration(signature) =
+                    &parsed.arena.get(declaration.node).unwrap().data
+                else {
+                    panic!("expected one original Array.concat method overload")
+                };
+                let [parameter] = signature.parameters.nodes.as_slice() else {
+                    panic!("expected one original Array.concat rest parameter")
+                };
+                let parameter = NodeRef::new(declaration.arena, declaration.file, *parameter);
+                let NodeData::ParameterDeclaration(parameter_data) =
+                    &parsed.arena.get(parameter.node).unwrap().data
+                else {
+                    panic!("expected a binder-owned Array.concat rest parameter")
+                };
+                (
+                    declaration,
+                    context.file(file).unwrap().1.symbol(parameter).unwrap(),
+                    NodeRef::new(
+                        parameter.arena,
+                        parameter.file,
+                        parameter_data.type_.unwrap(),
+                    ),
+                    NodeRef::new(
+                        declaration.arena,
+                        declaration.file,
+                        signature.type_.unwrap(),
+                    ),
+                    parameter_type,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let store = context.store_mut_for_test();
+        let template = store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(method))
+            .unwrap();
+        let mut signatures = Vec::with_capacity(plans.len());
+        let mut annotation_caches = Vec::with_capacity(plans.len());
+        for &(declaration, parameter, parameter_annotation, return_annotation, parameter_type) in
+            &plans
+        {
+            assert!(store.set_type_node_links(
+                parameter_annotation,
+                TypeNodeLinks {
+                    resolved_type: Some(parameter_type),
+                    ..TypeNodeLinks::default()
+                },
+            ));
+            assert!(store.set_type_node_links(
+                return_annotation,
+                TypeNodeLinks {
+                    resolved_type: Some(global_types.array_type),
+                    ..TypeNodeLinks::default()
+                },
+            ));
+            assert!(store.set_value_symbol_links(
+                parameter,
+                ValueSymbolLinks {
+                    resolved_type: Some(parameter_type),
+                    ..ValueSymbolLinks::default()
+                },
+            ));
+            let signature = store
+                .alloc_signature(
+                    SignatureFlags::HAS_REST_PARAMETER,
+                    Some(declaration),
+                    Vec::new(),
+                    None,
+                    vec![parameter],
+                    Some(global_types.array_type),
+                    None,
+                    0,
+                )
+                .unwrap();
+            assert!(store.set_signature_links(
+                declaration,
+                SignatureLinks {
+                    resolved_signature: ResolvedSignatureState::Resolved(signature),
+                    ..SignatureLinks::default()
+                },
+            ));
+            signatures.push(signature);
+            annotation_caches.push((parameter_annotation, parameter_type, return_annotation));
+        }
+        assert!(store.set_value_symbol_links(
+            method,
+            ValueSymbolLinks {
+                resolved_type: Some(template),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        assert!(store.set_structured_type_members(
+            template,
+            None,
+            None,
+            Some(signatures.clone()),
+            None,
+            None,
+        ));
+        for (&signature, &(_, _, _, return_annotation, _)) in signatures.iter().zip(&plans) {
+            assert!(store.set_function_signature_return_annotation(
+                signature,
+                return_annotation,
+                false,
+            ));
+        }
+        assert!(
+            store.set_callable_signature_parameter_types_batch(
+                signatures
+                    .iter()
+                    .copied()
+                    .zip(plans.iter().map(|plan| vec![plan.4]))
+                    .collect(),
+            )
+        );
+        (
+            context,
+            method,
+            template,
+            receiver,
+            pair,
+            signatures,
+            annotation_caches,
+        )
+    }
+
     #[test]
     fn required_own_property_publishes_exact_symbol_and_type_cold_and_warm() {
         let parsed = parsed("const result = object.value;");
@@ -2299,6 +2980,395 @@ mod tests {
                 string,
             ),
             Err(SourcePropertyError::InvalidCache(access)),
+        );
+        assert!(context.store().type_node_links(access).is_none());
+        assert!(context.store().symbol_node_links(access).is_none());
+    }
+
+    #[test]
+    fn canonical_array_method_preserves_every_published_overload_cold_and_warm() {
+        let parsed = parsed(concat!(
+            "interface Array<T> { ",
+            "concat(value: T): T[]; concat(values: T[]): T[]; ",
+            "} interface ReadonlyArray<T> {} ",
+            "const result = values.concat(1);",
+        ));
+        let file = FileId::new(544);
+        let access = property_access(&parsed, file);
+        let call = NodeRef::new(
+            parsed.arena.id(),
+            file,
+            parsed.arena.get(access.node).unwrap().parent.unwrap(),
+        );
+        let (mut context, method, callable, receiver, signatures) =
+            published_array_concat(&parsed, file);
+        let global_types = context.global_types().clone();
+        let syntax =
+            plan_direct_source_property_call_syntax(&parsed.arena, context.store(), access, call)
+                .unwrap();
+        let plan =
+            finish_direct_source_property_plan(&syntax, identifier_receiver(&syntax, method))
+                .unwrap();
+        let signature_count = context.store().signature_len();
+
+        for _ in 0..2 {
+            assert_eq!(
+                check_direct_source_property(
+                    context.store_mut_for_test(),
+                    Some(&global_types),
+                    &plan,
+                    receiver,
+                ),
+                Ok(CheckedSourceProperty {
+                    type_: callable,
+                    diagnostic: None,
+                }),
+            );
+        }
+        assert_eq!(context.store().signature_len(), signature_count);
+        assert_eq!(
+            context
+                .store()
+                .type_payload(callable)
+                .and_then(|record| record.data().structured())
+                .and_then(|structured| structured.signatures.as_ref()),
+            Some(&signatures),
+        );
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(access)
+                .and_then(|links| links.resolved_symbol),
+            Some(method),
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Proves both mapped overloads and their unchanged declarations.
+    fn canonical_array_method_specializes_tuple_receivers_and_preserves_generic_annotations() {
+        let parsed = parsed(concat!(
+            "interface ConcatArray<T> {} ",
+            "interface Array<T> { ",
+            "concat(...items: ConcatArray<T>[]): T[]; ",
+            "concat(...items: (T | ConcatArray<T>)[]): T[]; ",
+            "} interface ReadonlyArray<T> {} ",
+            "const result = values.concat([[1, 2]]);",
+        ));
+        let file = FileId::new(548);
+        let access = property_access(&parsed, file);
+        let call = NodeRef::new(
+            parsed.arena.id(),
+            file,
+            parsed.arena.get(access.node).unwrap().parent.unwrap(),
+        );
+        let (mut context, method, template, receiver, pair, originals, annotations) =
+            published_generic_array_concat(&parsed, file);
+        let global_types = context.global_types().clone();
+        let syntax =
+            plan_direct_source_property_call_syntax(&parsed.arena, context.store(), access, call)
+                .unwrap();
+        let plan =
+            finish_direct_source_property_plan(&syntax, identifier_receiver(&syntax, method))
+                .unwrap();
+
+        let checked = check_direct_source_property(
+            context.store_mut_for_test(),
+            Some(&global_types),
+            &plan,
+            receiver,
+        )
+        .unwrap();
+        assert_ne!(checked.type_, template);
+        assert_eq!(checked.diagnostic, None);
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(method)
+                .and_then(|links| links.resolved_type),
+            Some(template),
+        );
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(access)
+                .and_then(|links| links.resolved_symbol),
+            Some(method),
+        );
+        let TypeData::Object(specialized) =
+            context.store().type_payload(checked.type_).unwrap().data()
+        else {
+            panic!("the specialized method must retain a callable object")
+        };
+        assert_eq!(specialized.target, Some(template));
+        let mapper = specialized.mapper.unwrap();
+        let signatures = specialized.structured.signatures.as_ref().unwrap().clone();
+        assert_eq!(signatures.len(), originals.len());
+        let mut parameter_elements = Vec::new();
+        for (&signature, &original) in signatures.iter().zip(&originals) {
+            let record = context.store().signature(signature).unwrap();
+            assert_eq!(record.target(), Some(original));
+            assert_eq!(record.mapper(), Some(mapper));
+            assert_eq!(record.resolved_return_type(), Some(receiver));
+            let [parameter] = record.parameters() else {
+                panic!("the specialized overload must retain one rest parameter")
+            };
+            let type_ = context
+                .store()
+                .value_symbol_links(*parameter)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            let array = context
+                .store()
+                .canonical_array_reference(&global_types, type_)
+                .unwrap()
+                .unwrap();
+            parameter_elements.push(array.element_type);
+        }
+        let first = super::super::reference_types::validate_direct_generic_reference(
+            context.store(),
+            parameter_elements[0],
+        )
+        .unwrap();
+        assert_eq!(first.type_arguments.as_slice(), &[pair]);
+        let TypeData::Union(second) = context
+            .store()
+            .type_payload(parameter_elements[1])
+            .unwrap()
+            .data()
+        else {
+            panic!("the second overload must retain the tuple-or-ConcatArray union")
+        };
+        assert!(second.union.types.contains(&pair));
+        assert!(second.union.types.contains(&parameter_elements[0]));
+
+        for (&original, &(parameter_annotation, parameter_type, return_annotation)) in
+            originals.iter().zip(&annotations)
+        {
+            assert_eq!(
+                context
+                    .store()
+                    .signature_links(
+                        context
+                            .store()
+                            .signature(original)
+                            .unwrap()
+                            .declaration()
+                            .unwrap(),
+                    )
+                    .and_then(|links| links.resolved_signature.signature()),
+                Some(original),
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .type_node_links(parameter_annotation)
+                    .and_then(|links| links.resolved_type),
+                Some(parameter_type),
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .type_node_links(return_annotation)
+                    .and_then(|links| links.resolved_type),
+                Some(global_types.array_type),
+            );
+        }
+
+        let warm = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().mapper_len(),
+            context.store().symbol_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            check_direct_source_property(
+                context.store_mut_for_test(),
+                Some(&global_types),
+                &plan,
+                receiver,
+            ),
+            Ok(checked),
+        );
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().mapper_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn canonical_array_property_reads_preserve_the_published_member_identity() {
+        let parsed = parsed(concat!(
+            "interface Array<T> { readonly length: number; } ",
+            "interface ReadonlyArray<T> { readonly length: number; } ",
+            "const result = values.length;",
+        ));
+        let file = FileId::new(545);
+        let access = property_access(&parsed, file);
+
+        for readonly in [false, true] {
+            let mut context = array_property_context(&parsed, file);
+            let global_types = context.global_types().clone();
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            let target = if readonly {
+                global_types.readonly_array_type
+            } else {
+                global_types.array_type
+            };
+            let owner = context
+                .store()
+                .type_payload(target)
+                .and_then(TypeRecord::symbol)
+                .and_then(|owner| context.store().get_merged_symbol(owner))
+                .unwrap();
+            let property = context
+                .store()
+                .symbol(owner)
+                .and_then(ts_binder::semantic::Symbol::members)
+                .and_then(|members| context.store().symbol_table(members))
+                .and_then(|members| members.get_source("length"))
+                .unwrap();
+            assert!(context.store_mut_for_test().set_value_symbol_links(
+                property,
+                ValueSymbolLinks {
+                    resolved_type: Some(number),
+                    ..ValueSymbolLinks::default()
+                },
+            ));
+            let receiver = context
+                .store_mut_for_test()
+                .create_canonical_array_type(&global_types, number, readonly)
+                .unwrap();
+            let literal = (!readonly)
+                .then(|| {
+                    context
+                        .store_mut_for_test()
+                        .create_array_literal_type(&global_types, receiver)
+                })
+                .transpose()
+                .unwrap();
+            let syntax =
+                plan_direct_source_property_syntax(&parsed.arena, context.store(), access).unwrap();
+            let plan =
+                finish_direct_source_property_plan(&syntax, identifier_receiver(&syntax, property))
+                    .unwrap();
+
+            for receiver in std::iter::once(receiver).chain(literal) {
+                assert_eq!(
+                    check_direct_source_property(
+                        context.store_mut_for_test(),
+                        Some(&global_types),
+                        &plan,
+                        receiver,
+                    ),
+                    Ok(CheckedSourceProperty {
+                        type_: number,
+                        diagnostic: None,
+                    }),
+                    "readonly={readonly}",
+                );
+            }
+            assert_eq!(
+                context
+                    .store()
+                    .symbol_node_links(access)
+                    .and_then(|links| links.resolved_symbol),
+                Some(property),
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_array_method_rejects_missing_overloads_before_property_publication() {
+        let parsed = parsed(concat!(
+            "interface Array<T> { ",
+            "concat(value: T): T[]; concat(values: T[]): T[]; ",
+            "} interface ReadonlyArray<T> {} ",
+            "const result = values.concat;",
+        ));
+        let file = FileId::new(546);
+        let access = property_access(&parsed, file);
+        let (mut context, method, callable, receiver, signatures) =
+            published_array_concat(&parsed, file);
+        let global_types = context.global_types().clone();
+        assert!(context.store_mut_for_test().set_structured_type_members(
+            callable,
+            None,
+            None,
+            Some(vec![signatures[0]]),
+            None,
+            None,
+        ));
+        let syntax =
+            plan_direct_source_property_syntax(&parsed.arena, context.store(), access).unwrap();
+        let plan =
+            finish_direct_source_property_plan(&syntax, identifier_receiver(&syntax, method))
+                .unwrap();
+
+        assert_eq!(
+            check_direct_source_property(
+                context.store_mut_for_test(),
+                Some(&global_types),
+                &plan,
+                receiver,
+            ),
+            Err(SourcePropertyError::InvalidCache(access)),
+        );
+        assert!(context.store().type_node_links(access).is_none());
+        assert!(context.store().symbol_node_links(access).is_none());
+    }
+
+    #[test]
+    fn canonical_array_method_requires_an_existing_published_callable() {
+        let parsed = parsed(concat!(
+            "interface Array<T> { concat(value: T): T[]; } ",
+            "interface ReadonlyArray<T> {} ",
+            "const result = values.concat;",
+        ));
+        let file = FileId::new(547);
+        let access = property_access(&parsed, file);
+        let mut context = array_property_context(&parsed, file);
+        let global_types = context.global_types().clone();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let receiver = context
+            .store_mut_for_test()
+            .create_canonical_array_type(&global_types, number, false)
+            .unwrap();
+        let owner = context
+            .store()
+            .type_payload(global_types.array_type)
+            .and_then(TypeRecord::symbol)
+            .and_then(|owner| context.store().get_merged_symbol(owner))
+            .unwrap();
+        let method = context
+            .store()
+            .symbol(owner)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| context.store().symbol_table(members))
+            .and_then(|members| members.get_source("concat"))
+            .unwrap();
+        let syntax =
+            plan_direct_source_property_syntax(&parsed.arena, context.store(), access).unwrap();
+        let plan =
+            finish_direct_source_property_plan(&syntax, identifier_receiver(&syntax, method))
+                .unwrap();
+
+        assert_eq!(
+            check_direct_source_property(
+                context.store_mut_for_test(),
+                Some(&global_types),
+                &plan,
+                receiver,
+            ),
+            Err(SourcePropertyError::Relation(
+                RelationUnavailable::UnresolvedPropertyType(method),
+            )),
         );
         assert!(context.store().type_node_links(access).is_none());
         assert!(context.store().symbol_node_links(access).is_none());

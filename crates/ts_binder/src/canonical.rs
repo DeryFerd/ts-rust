@@ -10051,6 +10051,189 @@ Merged.fresh = 1;
     }
 
     #[test]
+    fn parsed_javascript_typedefs_keep_script_symbols_and_es_module_export_pairs() {
+        for (index, (source, module_state, exported)) in [
+            (
+                "/** @typedef {number} Value */\nconst value = 1;",
+                CanonicalModuleState::Script,
+                false,
+            ),
+            (
+                "/** @typedef {number} Value */\nexport const value = 1;",
+                CanonicalModuleState::External,
+                true,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let parsed = parse_javascript_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let aliases = nodes_of_kind(&parsed.arena, SyntaxKind::JsTypeAliasDeclaration);
+            let [alias] = aliases.as_slice() else {
+                panic!("expected one parser-owned JSDoc type alias")
+            };
+            let alias_node = parsed.arena.get(*alias).unwrap();
+            assert_eq!(alias_node.flags, NodeFlags::REPARSED);
+            assert_eq!(alias_node.parent, Some(parsed.source_file));
+
+            let file = FileId::new(9_370 + u32::try_from(index).unwrap());
+            let alias = node_ref(&parsed.arena, file, *alias);
+            let mut binder = CanonicalBinder::new();
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source("\"/project/typedef.js\""),
+                        CanonicalSourceLanguage::JavaScript,
+                        false,
+                        module_state,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_javascript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+
+            let bound = binder.file(file).unwrap();
+            assert_eq!(bound.phase(), BindingPhase::Declarations);
+            assert!(bound.diagnostics().is_empty(), "{:?}", bound.diagnostics());
+            assert_eq!(bound.container(alias), Some(bound.source_file()));
+            assert_eq!(
+                bound.block_scope_container(alias),
+                Some(bound.source_file())
+            );
+
+            let locals = binder
+                .symbol_store()
+                .symbol_table(bound.locals(bound.source_file()).unwrap())
+                .unwrap();
+            let local = locals.get_source("Value").unwrap();
+            let local_record = binder.symbol_store().symbol(local).unwrap();
+            assert_eq!(local_record.declarations(), Some(&[alias][..]));
+            assert_eq!(local_record.value_declaration(), None);
+            assert_eq!(local_record.parent(), None);
+
+            if exported {
+                let source = bound.symbol(bound.source_file()).unwrap();
+                let exports = binder
+                    .symbol_store()
+                    .symbol_table(
+                        binder
+                            .symbol_store()
+                            .symbol(source)
+                            .unwrap()
+                            .exports()
+                            .unwrap(),
+                    )
+                    .unwrap();
+                let export = exports.get_source("Value").unwrap();
+                let export_record = binder.symbol_store().symbol(export).unwrap();
+                assert_ne!(local, export);
+                assert_eq!(local_record.flags(), SymbolFlags::NONE);
+                assert_eq!(local_record.export_symbol(), Some(export));
+                assert_eq!(bound.symbol(alias), Some(export));
+                assert_eq!(bound.local_symbol(alias), Some(local));
+                assert_eq!(export_record.flags(), SymbolFlags::TYPE_ALIAS);
+                assert_eq!(export_record.parent(), Some(source));
+                assert_eq!(export_record.declarations(), Some(&[alias][..]));
+                assert_eq!(export_record.value_declaration(), None);
+            } else {
+                assert_eq!(bound.symbol(bound.source_file()), None);
+                assert_eq!(bound.symbol(alias), Some(local));
+                assert_eq!(bound.local_symbol(alias), None);
+                assert_eq!(local_record.flags(), SymbolFlags::TYPE_ALIAS);
+                assert_eq!(local_record.export_symbol(), None);
+            }
+        }
+    }
+
+    #[test]
+    fn parsed_commonjs_typedefs_promote_type_exports_to_the_export_equals_namespace() {
+        let parsed = parse_javascript_source_file(concat!(
+            "/** @typedef {number} Count */\n",
+            "/** @typedef {{ label: string }} Shape */\n",
+            "const value = {};\n",
+            "module.exports = value;\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let aliases = nodes_of_kind(&parsed.arena, SyntaxKind::JsTypeAliasDeclaration);
+        assert_eq!(aliases.len(), 2);
+        for alias in &aliases {
+            let node = parsed.arena.get(*alias).unwrap();
+            assert_eq!(node.flags, NodeFlags::REPARSED);
+            assert_eq!(node.parent, Some(parsed.source_file));
+        }
+
+        let file = FileId::new(9_372);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/typedef-commonjs.js\""),
+                    CanonicalSourceLanguage::JavaScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_javascript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+
+        let bound = binder.file(file).unwrap();
+        assert!(bound.source_facts().unwrap().is_common_js_module());
+        assert!(bound.diagnostics().is_empty(), "{:?}", bound.diagnostics());
+        let source = bound.symbol(bound.source_file()).unwrap();
+        let source_record = binder.symbol_store().symbol(source).unwrap();
+        assert_eq!(source_record.flags(), SymbolFlags::VALUE_MODULE);
+        let exports = binder
+            .symbol_store()
+            .symbol_table(source_record.exports().unwrap())
+            .unwrap();
+        let export_equals = exports
+            .get(InternalSymbolName::ExportEquals.as_ref())
+            .unwrap();
+        let export_equals_record = binder.symbol_store().symbol(export_equals).unwrap();
+        assert!(
+            export_equals_record
+                .flags()
+                .contains(SymbolFlags::NAMESPACE_MODULE)
+        );
+        assert_eq!(export_equals_record.parent(), Some(source));
+        let promoted = binder
+            .symbol_store()
+            .symbol_table(export_equals_record.exports().unwrap())
+            .unwrap();
+        let locals = binder
+            .symbol_store()
+            .symbol_table(bound.locals(bound.source_file()).unwrap())
+            .unwrap();
+
+        for (alias, name) in aliases.iter().copied().zip(["Count", "Shape"]) {
+            let alias = node_ref(&parsed.arena, file, alias);
+            let exported = exports.get_source(name).unwrap();
+            let local = locals.get_source(name).unwrap();
+            let exported_record = binder.symbol_store().symbol(exported).unwrap();
+            let local_record = binder.symbol_store().symbol(local).unwrap();
+
+            assert_eq!(bound.symbol(alias), Some(exported));
+            assert_eq!(bound.local_symbol(alias), Some(local));
+            assert_eq!(promoted.get_source(name), Some(exported));
+            assert_eq!(exported_record.flags(), SymbolFlags::TYPE_ALIAS);
+            assert_eq!(exported_record.parent(), Some(source));
+            assert_eq!(exported_record.declarations(), Some(&[alias][..]));
+            assert_eq!(local_record.flags(), SymbolFlags::NONE);
+            assert_eq!(local_record.export_symbol(), Some(exported));
+        }
+    }
+
+    #[test]
     fn javascript_scripts_bind_ordinary_declarations_with_jsdoc_comments() {
         let parsed = parse_javascript_source_file(concat!(
             "/** @param {number} value */\n",

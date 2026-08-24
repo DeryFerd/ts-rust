@@ -371,6 +371,19 @@ enum CanonicalArrayReferenceArguments {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CanonicalTupleArrayPair {
+    TupleToArray {
+        tuple: TypeId,
+        array: TypeId,
+        array_target: TypeId,
+    },
+    ArrayToTuple {
+        array: TypeId,
+        array_target: TypeId,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BroadStringRecordMappedState {
     Unresolved,
     Resolved {
@@ -396,6 +409,7 @@ pub(super) struct ResolvedOwnProperty {
 enum ObjectPropertyOrigin {
     Declared,
     ValidatedClass,
+    SyntheticStructural(TypeId),
     FiniteMappedRecord(TypeId),
     GenericReference(TypeId),
     Intersection(TypeId),
@@ -1194,6 +1208,11 @@ impl<'store> RelaterSession<'store> {
                 recursion_flags,
             );
         }
+        if let Some(pair) =
+            canonical_tuple_array_pair(self.store, self.global_types, source, target)?
+        {
+            return self.tuple_array_related_to(pair, intersection_state);
+        }
 
         if self.relation.is_identity() {
             if source_flags != target_flags {
@@ -1834,6 +1853,65 @@ impl<'store> RelaterSession<'store> {
                         intersection_state,
                     )?
                 };
+            if related == Ternary::False {
+                return Ok(Ternary::False);
+            }
+            result &= related;
+        }
+        Ok(result)
+    }
+
+    fn tuple_array_related_to(
+        &mut self,
+        pair: CanonicalTupleArrayPair,
+        intersection_state: IntersectionState,
+    ) -> Result<Ternary, RelationUnavailable> {
+        let (tuple, array, array_target) = match pair {
+            CanonicalTupleArrayPair::ArrayToTuple {
+                array,
+                array_target,
+            } => {
+                self.canonical_array_reference_argument(array, array_target)?;
+                return Ok(Ternary::False);
+            }
+            CanonicalTupleArrayPair::TupleToArray {
+                tuple,
+                array,
+                array_target,
+            } => (tuple, array, array_target),
+        };
+        let array_element = self.canonical_array_reference_argument(array, array_target)?;
+        if self.relation.is_identity() {
+            return Ok(Ternary::False);
+        }
+
+        let (tuple_readonly, tuple_elements) = {
+            let shape = self
+                .store
+                .canonical_tuple_shape(tuple)
+                .map_err(|_| RelationUnavailable::InvalidStructuredMembers(tuple))?
+                .ok_or(RelationUnavailable::InvalidStructuredMembers(tuple))?;
+            if shape.combined_flags().intersects(ElementFlags::VARIABLE) {
+                return Err(RelationUnavailable::UnsupportedStructuredType(tuple));
+            }
+            (shape.is_readonly(), shape.element_types().to_vec())
+        };
+        let array_readonly = self.global_types.is_some_and(|global_types| {
+            array_target == global_types.array_targets.readonly_array_type()
+                && array_target != global_types.array_targets.array_type()
+        });
+        if tuple_readonly && !array_readonly {
+            return Ok(Ternary::False);
+        }
+
+        let mut result = Ternary::True;
+        for tuple_element in tuple_elements {
+            let related = self.is_related_to_ex(
+                tuple_element,
+                array_element,
+                RecursionFlags::BOTH,
+                intersection_state,
+            )?;
             if related == Ternary::False {
                 return Ok(Ternary::False);
             }
@@ -3566,6 +3644,69 @@ impl<'store> RelaterSession<'store> {
                     Err(RelationUnavailable::InvalidStructuredMembers(receiver))
                 };
             }
+            ObjectPropertyOrigin::SyntheticStructural(receiver) => {
+                let invalid = || RelationUnavailable::InvalidStructuredMembers(receiver);
+                let owner = self.store.type_payload(receiver).ok_or_else(invalid)?;
+                let TypeData::Object(object) = owner.data() else {
+                    return Err(invalid());
+                };
+                let members = object.structured.members.ok_or_else(invalid)?;
+                let table = self.store.symbol_table(members).ok_or_else(invalid)?;
+                let properties = object
+                    .structured
+                    .properties
+                    .as_deref()
+                    .ok_or_else(invalid)?;
+                let links = self.store.value_symbol_links(symbol).ok_or_else(invalid)?;
+                let property_type = links.resolved_type.ok_or_else(invalid)?;
+                let allowed_flags =
+                    SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL | SymbolFlags::TRANSIENT;
+                return if owner.flags() == TypeFlags::OBJECT
+                    && owner.object_flags()
+                        == ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
+                    && owner.symbol().is_none()
+                    && owner.alias().is_none()
+                    && object.target.is_none()
+                    && object.mapper.is_none()
+                    && object.instantiations == TypeCacheState::Unallocated
+                    && object.structured.constrained == ConstrainedTypeData::default()
+                    && object
+                        .structured
+                        .object_type_without_abstract_construct_signatures
+                        .is_none()
+                    && object.structured.signatures.is_none()
+                    && object.structured.call_signature_count == 0
+                    && object.structured.index_infos.is_none()
+                    && !properties.is_empty()
+                    && properties.contains(&symbol)
+                    && table.get(record.name()) == Some(symbol)
+                    && record
+                        .flags()
+                        .contains(SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT)
+                    && record.flags().without(allowed_flags) == SymbolFlags::NONE
+                    && record.check_flags().bits() & !CheckFlags::READONLY.bits() == 0
+                    && !record.name().is_reserved_member_name()
+                    && !record.name().is_private_identifier()
+                    && !record.name().is_late_bound()
+                    && record.declarations().is_none()
+                    && record.value_declaration().is_none()
+                    && record.parent().is_none()
+                    && record.members().is_none()
+                    && record.exports().is_none()
+                    && record.export_symbol().is_none()
+                    && self.store.get_merged_symbol(symbol) == Some(symbol)
+                    && self.store.type_payload(property_type).is_some()
+                    && links
+                        == &(ValueSymbolLinks {
+                            resolved_type: Some(property_type),
+                            ..ValueSymbolLinks::default()
+                        })
+                {
+                    Ok(record)
+                } else {
+                    Err(invalid())
+                };
+            }
             ObjectPropertyOrigin::GenericReference(reference)
                 if record.flags().contains(SymbolFlags::TRANSIENT) =>
             {
@@ -3667,6 +3808,7 @@ impl<'store> RelaterSession<'store> {
                 ObjectPropertyOrigin::FreshObjectLiteral(_)
                 | ObjectPropertyOrigin::DerivedObjectLiteral { .. }
                 | ObjectPropertyOrigin::Intersection(_)
+                | ObjectPropertyOrigin::SyntheticStructural(_)
                 | ObjectPropertyOrigin::FiniteMappedRecord(_) => {
                     unreachable!("literal property origins return before declared validation")
                 }
@@ -4607,6 +4749,23 @@ impl<'store> RelaterSession<'store> {
             {
                 ObjectPropertyOrigin::GenericReference(type_id)
             }
+            DerivedObjectLiteralValidation::NotDerived
+                if record_symbol.is_none()
+                    && record_object_flags
+                        == ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
+                    && structured
+                        .as_ref()
+                        .and_then(|structured| structured.properties.as_deref())
+                        .is_some_and(|properties| {
+                            properties.iter().any(|property| {
+                                self.store.symbol(*property).is_some_and(|record| {
+                                    record.flags().contains(SymbolFlags::TRANSIENT)
+                                })
+                            })
+                        }) =>
+            {
+                ObjectPropertyOrigin::SyntheticStructural(type_id)
+            }
             DerivedObjectLiteralValidation::NotDerived => ObjectPropertyOrigin::Declared,
         };
         if !record_object_flags.intersects(ObjectFlags::MEMBERS_RESOLVED) {
@@ -4950,6 +5109,31 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             .ok_or(RelationUnavailable::Type(type_id))?;
         if !flags.intersects(TypeFlags::OBJECT) {
             return Ok(None);
+        }
+
+        let ownerless_synthetic = self.type_payload(type_id).is_some_and(|record| {
+            record.symbol().is_none()
+                && matches!(record.data(), TypeData::Object(object)
+                if object.structured.properties.as_deref().is_some_and(|properties| {
+                    properties.iter().any(|property| {
+                        self.symbol(*property).is_some_and(|property| {
+                            property.flags().contains(SymbolFlags::TRANSIENT)
+                        })
+                    })
+                }))
+        });
+        if ownerless_synthetic {
+            let bootstrap = self.relation_bootstrap_facts()?;
+            let mut session = RelaterSession::new(self, RelationKind::Assignable, bootstrap);
+            let resolved = session.resolved_object_members(type_id, false)?;
+            return if matches!(
+                resolved.property_origin,
+                ObjectPropertyOrigin::SyntheticStructural(receiver) if receiver == type_id
+            ) {
+                Err(RelationUnavailable::UnsupportedStructuredType(type_id))
+            } else {
+                Err(RelationUnavailable::InvalidStructuredMembers(type_id))
+            };
         }
 
         let empty_type_literal = self
@@ -5737,6 +5921,9 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         let supported_array_relation = source_flags.intersects(TypeFlags::OBJECT)
             && target_flags.intersects(TypeFlags::OBJECT)
             && configured_array_reference_targets(self, global_types, source, target)?.is_some();
+        let supported_tuple_array_relation = source_flags.intersects(TypeFlags::OBJECT)
+            && target_flags.intersects(TypeFlags::OBJECT)
+            && canonical_tuple_array_pair(self, global_types, source, target)?.is_some();
         let supported_apparent_primitive_relation = relation != RelationKind::Identity
             && target_flags.intersects(TypeFlags::OBJECT)
             && global_types
@@ -5745,6 +5932,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         if source_flags.intersects(TypeFlags::OBJECT)
             && target_flags.intersects(TypeFlags::OBJECT)
             && !supported_array_relation
+            && !supported_tuple_array_relation
             && !supported_fixed_tuple_relation
             && !supported_broad_string_record_relation
             && (strict_function_types.is_some() || self.claimed_strict_function_types().is_none())
@@ -5793,7 +5981,10 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     RecursionFlags::BOTH,
                     IntersectionState::NONE,
                 )?;
-                return if supported_array_relation || supported_apparent_primitive_relation {
+                return if supported_array_relation
+                    || supported_tuple_array_relation
+                    || supported_apparent_primitive_relation
+                {
                     Ok(session.finish_without_specialized_root_cache(result))
                 } else {
                     session.finish(source, target, result)
@@ -6448,6 +6639,59 @@ fn canonical_fixed_tuple_pair(
         }
     }
     Ok(Some((source_shape, target_shape)))
+}
+
+fn canonical_tuple_array_pair(
+    store: &SemanticStore<TypeRecord, TypeMapper>,
+    global_types: Option<RelationGlobalTypes>,
+    source: TypeId,
+    target: TypeId,
+) -> Result<Option<CanonicalTupleArrayPair>, RelationUnavailable> {
+    let Some(global_types) = global_types else {
+        return Ok(None);
+    };
+    let array_target = |type_id| {
+        let record = store
+            .type_payload(type_id)
+            .ok_or(RelationUnavailable::Type(type_id))?;
+        Ok::<_, RelationUnavailable>(match record.data() {
+            TypeData::TypeReference(reference) => reference
+                .object
+                .target
+                .filter(|target| global_types.contains_array_target(*target)),
+            _ => None,
+        })
+    };
+    let source_array = array_target(source)?;
+    let target_array = array_target(target)?;
+    let (tuple, pair) = match (source_array, target_array) {
+        (Some(array_target), None) => (
+            target,
+            CanonicalTupleArrayPair::ArrayToTuple {
+                array: source,
+                array_target,
+            },
+        ),
+        (None, Some(array_target)) => (
+            source,
+            CanonicalTupleArrayPair::TupleToArray {
+                tuple: source,
+                array: target,
+                array_target,
+            },
+        ),
+        _ => return Ok(None),
+    };
+    let Some(shape) = store
+        .canonical_tuple_shape(tuple)
+        .map_err(|_| RelationUnavailable::InvalidStructuredMembers(tuple))?
+    else {
+        return Ok(None);
+    };
+    if shape.combined_flags().intersects(ElementFlags::VARIABLE) {
+        return Err(RelationUnavailable::UnsupportedStructuredType(tuple));
+    }
+    Ok(Some(pair))
 }
 
 fn configured_array_reference_targets(
@@ -8911,6 +9155,283 @@ mod tests {
         assert_eq!(
             store.is_type_identical_to(readonly_wide, mutable_wide),
             Ok(false)
+        );
+    }
+
+    #[test]
+    fn canonical_fixed_tuples_compare_covariantly_with_arrays() {
+        let mut store = initialized(true);
+        let (string, number, undefined, empty_object) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.string_type,
+                bootstrap.number_type,
+                bootstrap.undefined_type,
+                bootstrap.empty_object_type,
+            )
+        };
+        let literal = store.regular_string_literal_type("fixed".into()).unwrap();
+        let string_or_number = canonical_union(&mut store, &[string, number]);
+        let string_or_undefined = canonical_union(&mut store, &[string, undefined]);
+        let array = alloc_canonical_array_target(&mut store, "Array");
+        let readonly_array = alloc_canonical_array_target(&mut store, "ReadonlyArray");
+        let global_types = RelationGlobalTypes {
+            array_targets: CanonicalArrayTargets::for_test(array.target, readonly_array.target),
+            string_wrapper: empty_object,
+            number_wrapper: empty_object,
+            boolean_wrapper: empty_object,
+        };
+        let array_string = canonical_array_reference(&mut store, array.target, string);
+        let array_literal = canonical_array_reference(&mut store, array.target, literal);
+        let array_union = canonical_array_reference(&mut store, array.target, string_or_number);
+        let array_optional =
+            canonical_array_reference(&mut store, array.target, string_or_undefined);
+        let readonly_string = canonical_array_reference(&mut store, readonly_array.target, string);
+        let narrow =
+            canonical_relation_tuple(&mut store, &[literal], &[ElementFlags::REQUIRED], false);
+        let wide =
+            canonical_relation_tuple(&mut store, &[string], &[ElementFlags::REQUIRED], false);
+        let mixed = canonical_relation_tuple(
+            &mut store,
+            &[string, number],
+            &[ElementFlags::REQUIRED, ElementFlags::REQUIRED],
+            false,
+        );
+        let optional = canonical_relation_tuple(
+            &mut store,
+            &[string_or_undefined],
+            &[ElementFlags::OPTIONAL],
+            false,
+        );
+        let empty = canonical_relation_tuple(&mut store, &[], &[], false);
+        let readonly =
+            canonical_relation_tuple(&mut store, &[string], &[ElementFlags::REQUIRED], true);
+
+        for relation in [
+            RelationKind::Assignable,
+            RelationKind::Subtype,
+            RelationKind::StrictSubtype,
+        ] {
+            for (source, target, expected) in [
+                (narrow, array_string, true),
+                (wide, array_literal, false),
+                (mixed, array_union, true),
+                (mixed, array_string, false),
+                (optional, array_string, false),
+                (optional, array_optional, true),
+                (empty, array_string, true),
+                (wide, readonly_string, true),
+                (readonly, array_string, false),
+                (readonly, readonly_string, true),
+                (array_string, narrow, false),
+                (array_string, empty, false),
+                (readonly_string, wide, false),
+            ] {
+                assert_eq!(
+                    store.is_type_related_to_with_optional_global_types(
+                        source,
+                        target,
+                        relation,
+                        Some(global_types),
+                    ),
+                    Ok(expected),
+                    "unexpected {relation:?} result for {source:?} -> {target:?}",
+                );
+            }
+        }
+
+        assert_eq!(
+            store.is_type_related_to_with_optional_global_types(
+                wide,
+                array_literal,
+                RelationKind::Comparable,
+                Some(global_types),
+            ),
+            Ok(true)
+        );
+        for (source, target) in [(wide, array_string), (array_string, wide)] {
+            assert_eq!(
+                store.is_type_related_to_with_optional_global_types(
+                    source,
+                    target,
+                    RelationKind::Identity,
+                    Some(global_types),
+                ),
+                Ok(false)
+            );
+        }
+    }
+
+    #[test]
+    fn variable_tuple_array_relations_remain_explicitly_unsupported() {
+        let mut store = initialized(true);
+        let (string, number, empty_object) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.string_type,
+                bootstrap.number_type,
+                bootstrap.empty_object_type,
+            )
+        };
+        let parameter = store.alloc_type_parameter(None).unwrap();
+        let array = alloc_canonical_array_target(&mut store, "Array");
+        let global_types = RelationGlobalTypes {
+            array_targets: CanonicalArrayTargets::for_test(array.target, array.target),
+            string_wrapper: empty_object,
+            number_wrapper: empty_object,
+            boolean_wrapper: empty_object,
+        };
+        let values = canonical_array_reference(&mut store, array.target, string);
+        let rest = canonical_relation_tuple(
+            &mut store,
+            &[string, number],
+            &[ElementFlags::REQUIRED, ElementFlags::REST],
+            false,
+        );
+        let variadic = canonical_relation_tuple(
+            &mut store,
+            &[string, parameter],
+            &[ElementFlags::REQUIRED, ElementFlags::VARIADIC],
+            false,
+        );
+
+        for tuple in [rest, variadic] {
+            for (source, target) in [(tuple, values), (values, tuple)] {
+                let before = store.relation_state_snapshot();
+                assert_eq!(
+                    store.is_type_related_to_with_optional_global_types(
+                        source,
+                        target,
+                        RelationKind::Assignable,
+                        Some(global_types),
+                    ),
+                    Err(RelationUnavailable::UnsupportedStructuredType(tuple))
+                );
+                assert_eq!(store.relation_state_snapshot(), before);
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_tuple_array_relations_revalidate_poisoned_warm_caches() {
+        let mut store = initialized(true);
+        let (string, number, empty_object) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.string_type,
+                bootstrap.number_type,
+                bootstrap.empty_object_type,
+            )
+        };
+        let array = alloc_canonical_array_target(&mut store, "Array");
+        let global_types = RelationGlobalTypes {
+            array_targets: CanonicalArrayTargets::for_test(array.target, array.target),
+            string_wrapper: empty_object,
+            number_wrapper: empty_object,
+            boolean_wrapper: empty_object,
+        };
+        let source_property = alloc_typed_property(&mut store, "value", string, false);
+        let source_object = alloc_property_object(&mut store, vec![source_property]);
+        let target_property = alloc_typed_property(&mut store, "value", string, false);
+        let target_object = alloc_property_object(&mut store, vec![target_property]);
+        let tuple = canonical_relation_tuple(
+            &mut store,
+            &[source_object],
+            &[ElementFlags::REQUIRED],
+            false,
+        );
+        let values = canonical_array_reference(&mut store, array.target, target_object);
+
+        assert_eq!(
+            store.is_type_related_to_with_optional_global_types(
+                tuple,
+                values,
+                RelationKind::Assignable,
+                Some(global_types),
+            ),
+            Ok(true)
+        );
+        let root_key = store
+            .relation_key_if_available(tuple, values, super::IntersectionState::NONE, false, false)
+            .unwrap()
+            .key();
+        let nested_key = store
+            .relation_key_if_available(
+                source_object,
+                target_object,
+                super::IntersectionState::NONE,
+                false,
+                false,
+            )
+            .unwrap()
+            .key();
+        assert_eq!(
+            store.relation_cache_get(RelationKind::Assignable, root_key),
+            RelationComparisonResult::NONE
+        );
+        assert!(
+            store
+                .relation_cache_get(RelationKind::Assignable, nested_key)
+                .intersects(RelationComparisonResult::SUCCEEDED)
+        );
+        let warm = store.relation_state_snapshot();
+        assert_eq!(
+            store.is_type_related_to_with_optional_global_types(
+                tuple,
+                values,
+                RelationKind::Assignable,
+                Some(global_types),
+            ),
+            Ok(true)
+        );
+        assert_eq!(store.relation_state_snapshot(), warm);
+
+        assert!(store.set_type_reference_resolution(values, None, Some(vec![number])));
+        let poisoned_array = store.relation_state_snapshot();
+        assert_eq!(
+            store.is_type_related_to_with_optional_global_types(
+                tuple,
+                values,
+                RelationKind::Assignable,
+                Some(global_types),
+            ),
+            Err(RelationUnavailable::MalformedCanonicalArrayReference(
+                values
+            ))
+        );
+        assert_eq!(store.relation_state_snapshot(), poisoned_array);
+        assert!(store.set_type_reference_resolution(values, None, Some(vec![target_object])));
+        assert_eq!(
+            store.is_type_related_to_with_optional_global_types(
+                tuple,
+                values,
+                RelationKind::Assignable,
+                Some(global_types),
+            ),
+            Ok(true)
+        );
+
+        assert!(store.set_type_reference_resolution(tuple, None, Some(vec![number])));
+        let poisoned_tuple = store.relation_state_snapshot();
+        assert_eq!(
+            store.is_type_related_to_with_optional_global_types(
+                tuple,
+                values,
+                RelationKind::Assignable,
+                Some(global_types),
+            ),
+            Err(RelationUnavailable::InvalidStructuredMembers(tuple))
+        );
+        assert_eq!(store.relation_state_snapshot(), poisoned_tuple);
+        assert!(store.set_type_reference_resolution(tuple, None, Some(vec![source_object])));
+        assert_eq!(
+            store.is_type_related_to_with_optional_global_types(
+                tuple,
+                values,
+                RelationKind::Assignable,
+                Some(global_types),
+            ),
+            Ok(true)
         );
     }
 
@@ -12462,6 +12983,117 @@ mod tests {
             Ok(false),
         );
         assert_eq!(fixture.store.relation_state_snapshot(), before);
+    }
+
+    #[test]
+    fn declarationless_jsdoc_structural_properties_compare_and_reject_forged_caches() {
+        fn jsdoc_object(
+            store: &mut TestStore,
+            properties: &[(&str, TypeId, bool, bool)],
+        ) -> (TypeId, Vec<SemanticSymbolId>) {
+            let members = store.alloc_symbol_table();
+            let mut symbols = Vec::with_capacity(properties.len());
+            for (name, type_, optional, readonly) in properties {
+                let flags = SymbolFlags::PROPERTY
+                    | if *optional {
+                        SymbolFlags::OPTIONAL
+                    } else {
+                        SymbolFlags::NONE
+                    };
+                let checks = if *readonly {
+                    CheckFlags::READONLY
+                } else {
+                    CheckFlags::NONE
+                };
+                let symbol =
+                    store.alloc_transient_symbol(flags, EscapedName::source(*name), checks);
+                assert!(store.set_value_symbol_links(
+                    symbol,
+                    ValueSymbolLinks {
+                        resolved_type: Some(*type_),
+                        ..ValueSymbolLinks::default()
+                    },
+                ));
+                assert_eq!(
+                    store.insert_symbol(members, EscapedName::source(*name), symbol),
+                    Some(None)
+                );
+                symbols.push(symbol);
+            }
+            let object = store
+                .alloc_plain_object_type(ObjectFlags::ANONYMOUS, None)
+                .unwrap();
+            assert!(store.set_structured_type_members(
+                object,
+                Some(members),
+                Some(symbols.clone()),
+                None,
+                None,
+                None,
+            ));
+            (object, symbols)
+        }
+
+        let mut store = initialized(true);
+        let (string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let (nested, _) = jsdoc_object(&mut store, &[("value", number, false, false)]);
+        let (source, properties) = jsdoc_object(
+            &mut store,
+            &[
+                ("id", string, false, true),
+                ("nested", nested, false, false),
+                ("label", string, true, false),
+            ],
+        );
+        let expected_nested_value = alloc_typed_property(&mut store, "value", number, false);
+        let expected_nested = alloc_property_object(&mut store, vec![expected_nested_value]);
+        let expected_id = alloc_typed_property(&mut store, "id", string, false);
+        assert!(store.set_source_property_readonly(expected_id, true));
+        let expected_nested_property =
+            alloc_typed_property(&mut store, "nested", expected_nested, false);
+        let expected_label = alloc_typed_property(&mut store, "label", string, true);
+        let expected = alloc_property_object(
+            &mut store,
+            vec![expected_id, expected_nested_property, expected_label],
+        );
+        let wrong_id = alloc_typed_property(&mut store, "id", number, false);
+        let wrong = alloc_property_object(&mut store, vec![wrong_id]);
+
+        assert_eq!(store.is_type_assignable_to(source, expected), Ok(true));
+        assert_eq!(store.is_type_assignable_to(expected, source), Ok(true));
+        assert_eq!(store.is_type_identical_to(source, expected), Ok(true));
+        assert_eq!(store.is_type_assignable_to(source, wrong), Ok(false));
+        let warm = store.relation_state_snapshot();
+        assert_eq!(store.is_type_assignable_to(source, expected), Ok(true));
+        assert_eq!(store.relation_state_snapshot(), warm);
+
+        let host = DeclaredTypeHost::new(std::iter::empty::<(&NodeArena, &BoundFile)>()).unwrap();
+        assert_eq!(
+            store.resolved_declared_property_object(&host, source),
+            Err(RelationUnavailable::UnsupportedStructuredType(source))
+        );
+        assert_eq!(store.relation_state_snapshot(), warm);
+
+        let property = properties[0];
+        let original = store.value_symbol_links(property).unwrap().clone();
+        assert!(store.set_value_symbol_links(
+            property,
+            ValueSymbolLinks {
+                target: Some(expected_id),
+                ..original.clone()
+            },
+        ));
+        let poisoned = store.relation_state_snapshot();
+        assert_eq!(
+            store.is_type_assignable_to(source, expected),
+            Err(RelationUnavailable::InvalidStructuredMembers(source))
+        );
+        assert_eq!(store.relation_state_snapshot(), poisoned);
+        assert!(store.set_value_symbol_links(property, original));
+        assert_eq!(store.is_type_assignable_to(source, expected), Ok(true));
     }
 
     #[test]

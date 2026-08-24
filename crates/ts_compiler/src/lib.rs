@@ -6,7 +6,7 @@ use std::{
     path::Path,
 };
 
-use ts_ast::{FileId, Node, NodeData, NodeId, NodeRef, SyntaxKind};
+use ts_ast::{FileId, Node, NodeData, NodeFlags, NodeId, NodeRef, SyntaxKind};
 use ts_binder::{
     BindResult, CanonicalBindError, CanonicalBinder, CanonicalDeclarationError,
     CanonicalModuleState, CanonicalNameResolutionError, CanonicalSourceFileFacts,
@@ -3841,6 +3841,10 @@ impl Program {
             strict_function_types: self.options.strict_function_types,
             strict_property_initialization: self.options.strict_property_initialization,
             no_implicit_any: self.options.no_implicit_any,
+            no_unchecked_indexed_access: self.options.no_unchecked_indexed_access,
+            no_unused_locals: self.options.no_unused_locals,
+            allow_unreachable_code: self.options.allow_unreachable_code,
+            isolated_modules: self.options.isolated_modules,
             jsx_runtime: if self.options.jsx_runtime_module_specifier().is_some() {
                 CanonicalJsxRuntime::Automatic
             } else if self.options.jsx == ts_options::JsxEmit::React {
@@ -7632,6 +7636,10 @@ fn canonical_static_module_specifiers(
                 source_ref,
             ));
         };
+        if node.kind == SyntaxKind::JsTypeAliasDeclaration {
+            canonical_jsdoc_typedef_module_specifiers(source, *statement, &mut specifiers)?;
+            continue;
+        }
         let (specifier, attributes, type_only, syntax_mode) = match &node.data {
             NodeData::ImportDeclaration(import) => (
                 Some(import.module_specifier),
@@ -7701,6 +7709,104 @@ fn canonical_static_module_specifiers(
         specifiers.push((specifier, text, requested_mode));
     }
     Ok(specifiers)
+}
+
+fn canonical_jsdoc_typedef_module_specifiers(
+    source: &SourceFile,
+    declaration: NodeId,
+    specifiers: &mut Vec<(NodeRef, String, Option<CanonicalModuleResolutionMode>)>,
+) -> Result<(), CanonicalProgramCheckError> {
+    let source_ref = NodeRef::new(source.parse.arena.id(), source.id, source.parse.source_file);
+    let Some(node) = source.parse.arena.get(declaration) else {
+        return Err(CanonicalProgramCheckError::InvalidModuleSourceFile(
+            source_ref,
+        ));
+    };
+    let NodeData::TypeAliasDeclaration(alias) = &node.data else {
+        return Err(CanonicalProgramCheckError::InvalidModuleSourceFile(
+            source_ref,
+        ));
+    };
+    if node.kind != SyntaxKind::JsTypeAliasDeclaration
+        || node.flags != NodeFlags::REPARSED
+        || node.parent != Some(source.parse.source_file)
+    {
+        return Err(CanonicalProgramCheckError::InvalidModuleSourceFile(
+            source_ref,
+        ));
+    }
+    let mut pending = vec![(alias.type_, declaration)];
+    let mut visited = HashSet::new();
+    while let Some((node_id, parent)) = pending.pop() {
+        let Some(node) = source.parse.arena.get(node_id) else {
+            return Err(CanonicalProgramCheckError::InvalidModuleSourceFile(
+                source_ref,
+            ));
+        };
+        if node.parent != Some(parent) || !visited.insert(node_id) {
+            return Err(CanonicalProgramCheckError::InvalidModuleSourceFile(
+                source_ref,
+            ));
+        }
+
+        if let NodeData::ImportTypeNode(import) = &node.data {
+            if node.kind != SyntaxKind::ImportType {
+                return Err(CanonicalProgramCheckError::InvalidModuleSourceFile(
+                    source_ref,
+                ));
+            }
+            let argument_ref = NodeRef::new(source.parse.arena.id(), source.id, import.argument);
+            let Some(argument) = source.parse.arena.get(import.argument) else {
+                return Err(CanonicalProgramCheckError::InvalidModuleSpecifier(
+                    argument_ref,
+                ));
+            };
+            let NodeData::LiteralTypeNode(literal) = &argument.data else {
+                return Err(CanonicalProgramCheckError::InvalidModuleSpecifier(
+                    argument_ref,
+                ));
+            };
+            if argument.kind != SyntaxKind::LiteralType || argument.parent != Some(node_id) {
+                return Err(CanonicalProgramCheckError::InvalidModuleSpecifier(
+                    argument_ref,
+                ));
+            }
+
+            let specifier = NodeRef::new(source.parse.arena.id(), source.id, literal.literal);
+            let Some(specifier_node) = source.parse.arena.get(specifier.node) else {
+                return Err(CanonicalProgramCheckError::InvalidModuleSpecifier(
+                    specifier,
+                ));
+            };
+            match (specifier_node.kind, &specifier_node.data) {
+                (SyntaxKind::StringLiteral, NodeData::StringLiteral(_)) => {}
+                (SyntaxKind::StringLiteral, _) | (_, NodeData::StringLiteral(_)) => {
+                    return Err(CanonicalProgramCheckError::InvalidModuleSpecifier(
+                        specifier,
+                    ));
+                }
+                _ => continue,
+            }
+            if specifier_node.parent != Some(import.argument) {
+                return Err(CanonicalProgramCheckError::InvalidModuleSpecifier(
+                    specifier,
+                ));
+            }
+            let requested_mode =
+                canonical_resolution_mode_override(source, import.attributes, true, specifier)?;
+            let Some((text, _)) = string_literal(&source.parse.arena, specifier.node) else {
+                return Err(CanonicalProgramCheckError::InvalidModuleSpecifier(
+                    specifier,
+                ));
+            };
+            specifiers.push((specifier, text, requested_mode));
+        }
+
+        let mut children = Vec::new();
+        node.for_each_child(|child| children.push(child));
+        pending.extend(children.into_iter().rev().map(|child| (child, node_id)));
+    }
+    Ok(())
 }
 
 fn canonical_resolution_mode_override(
@@ -7798,7 +7904,18 @@ fn module_specifiers(parse: &ParseResult) -> Vec<(String, TextRange, bool, bool)
         })
         .collect::<Vec<_>>();
     if let Some(source) = parse.arena.source_text() {
-        specifiers.extend(jsdoc_import_specifiers(source));
+        for (specifier, range, can_resolve_ambient, side_effect_only) in
+            jsdoc_import_specifiers(source)
+        {
+            let already_parsed = specifiers.iter().any(|(existing, existing_range, _, _)| {
+                existing == &specifier
+                    && existing_range.start <= range.start
+                    && existing_range.end >= range.end
+            });
+            if !already_parsed {
+                specifiers.push((specifier, range, can_resolve_ambient, side_effect_only));
+            }
+        }
     }
     specifiers
 }
@@ -9158,6 +9275,98 @@ mod tests {
     }
 
     #[test]
+    fn canonical_module_manifest_resolves_reparsed_jsdoc_typedef_imports_once() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/target.ts", "export const value: number = 1;")
+            .unwrap();
+        fs.write_file(
+            "/project/input.js",
+            concat!(
+                "/** @typedef {import('./target').First | import('./target').Second} Pair */\n",
+                "/** @typedef {import('./missing').Missing} Missing */\n",
+                "export const value = 1;\n",
+            ),
+        )
+        .unwrap();
+        let mut options = plain_esm_bundler_options();
+        options.allow_js = true;
+        options.no_check = false;
+        options.no_emit = true;
+
+        let (program, missing_range) = Program::try_new_with_canonical_checker_and_queries(
+            &fs,
+            "/project",
+            &["input.js".to_owned()],
+            options,
+            |program, queries| {
+                let target = program.source_file("/project/target.ts").unwrap();
+                let manifest = program.canonical_module_resolution_manifest().unwrap();
+                let entries = manifest.entries();
+                assert_eq!(entries.len(), 3);
+                assert_eq!(
+                    entries
+                        .iter()
+                        .map(|entry| {
+                            match &program.node(entry.specifier()).unwrap().data {
+                                NodeData::StringLiteral(literal) => literal.text.as_str(),
+                                other => panic!("unexpected JSDoc module specifier {other:?}"),
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                    ["./target", "./target", "./missing"],
+                );
+                assert_eq!(
+                    entries
+                        .iter()
+                        .map(|entry| entry.specifier())
+                        .collect::<BTreeSet<_>>()
+                        .len(),
+                    entries.len(),
+                );
+
+                for entry in &entries[..2] {
+                    let CanonicalModuleResolutionInput::Resolved(resolution) = entry.resolution()
+                    else {
+                        panic!("the JSDoc typedef target must resolve")
+                    };
+                    assert_eq!(resolution.target_file(), target.id);
+                    assert_eq!(resolution.usage_mode(), CanonicalModuleResolutionMode::Esm);
+                    assert_eq!(resolution.target_mode(), CanonicalModuleResolutionMode::Esm);
+                    assert!(matches!(
+                        queries.module_resolution(entry.specifier()),
+                        super::CanonicalModuleResolutionLookup::Resolved(resolved)
+                            if resolved.target_file() == target.id
+                    ));
+                }
+
+                let missing = entries[2];
+                assert_eq!(
+                    missing.resolution(),
+                    CanonicalModuleResolutionInput::Unresolved,
+                );
+                assert_eq!(
+                    queries.module_resolution(missing.specifier()),
+                    super::CanonicalModuleResolutionLookup::Unresolved,
+                );
+                program.node(missing.specifier()).unwrap().range
+            },
+        )
+        .unwrap();
+
+        let missing_range = missing_range.unwrap();
+        let missing_diagnostics = program
+            .diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == Some(2307))
+            .collect::<Vec<_>>();
+        let [diagnostic] = missing_diagnostics.as_slice() else {
+            panic!("expected one missing JSDoc import diagnostic: {missing_diagnostics:?}")
+        };
+        assert_eq!(diagnostic.file_name.as_deref(), Some("/project/input.js"));
+        assert_eq!(diagnostic.range, Some(missing_range));
+    }
+
+    #[test]
     fn canonical_module_manifest_ignores_detached_arena_declarations() {
         let fs = MemoryFileSystem::new(true);
         fs.write_file("/project/target.ts", "export const value: number = 1;")
@@ -9496,6 +9705,91 @@ mod tests {
                 } if target_file_name == "/project/script.ts"
             ));
         }
+    }
+
+    #[test]
+    fn canonical_program_projects_unchecked_indexed_access_to_array_reads() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/input.ts",
+            "const values: number[] = [1]; const value: number | undefined = values[0];",
+        )
+        .unwrap();
+
+        for (no_unchecked_indexed_access, expected) in
+            [(false, "number"), (true, "number | undefined")]
+        {
+            let (program, indexed_type) = Program::try_new_with_canonical_checker_and_queries(
+                &fs,
+                "/project",
+                &["input.ts".to_owned()],
+                CompilerOptions {
+                    lib: Some(vec!["es5".to_owned()]),
+                    strict_null_checks: true,
+                    strict_null_checks_specified: true,
+                    no_unchecked_indexed_access,
+                    ..CompilerOptions::default()
+                },
+                |program, queries| {
+                    let source = program.source_file("/project/input.ts").unwrap();
+                    let indexed = source
+                        .parse
+                        .arena
+                        .iter()
+                        .find_map(|(node, record)| {
+                            (record.kind == SyntaxKind::ElementAccessExpression)
+                                .then(|| source.node_ref(node).unwrap())
+                        })
+                        .unwrap();
+                    let indexed_type = queries.get_type_at_location(indexed).unwrap();
+                    queries.type_to_string(indexed_type).unwrap()
+                },
+            )
+            .unwrap();
+
+            assert_eq!(indexed_type.as_deref(), Some(expected));
+            assert!(
+                program.diagnostics().is_empty(),
+                "{:?}",
+                program.diagnostics()
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_program_projects_unused_unreachable_and_isolated_options() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/input.ts", "export const value = 1;")
+            .unwrap();
+
+        let (program, projected) = Program::try_new_with_canonical_checker_and_queries(
+            &fs,
+            "/project",
+            &["input.ts".to_owned()],
+            CompilerOptions {
+                lib: Some(vec!["es5".to_owned()]),
+                no_unused_locals: true,
+                allow_unreachable_code: Some(false),
+                isolated_modules: true,
+                ..CompilerOptions::default()
+            },
+            |_, queries| {
+                let options = queries.context.options();
+                (
+                    options.no_unused_locals,
+                    options.allow_unreachable_code,
+                    options.isolated_modules,
+                )
+            },
+        )
+        .unwrap();
+
+        assert_eq!(projected, Some((true, Some(false), true)));
+        assert!(
+            program.diagnostics().is_empty(),
+            "{:?}",
+            program.diagnostics()
+        );
     }
 
     #[test]

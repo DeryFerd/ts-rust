@@ -22,6 +22,7 @@ use super::{
     bootstrap::LiteralTypeCacheError,
     declared::preflight_node,
     functions::{FunctionTypeError, plan_function_type},
+    jsdoc::PlannedJavaScriptDeclaration,
     signatures::SignatureFlags,
     source_callables::{
         SourceCallableError, SourceCallableFamily, SourceCallableInvariant, SourceCallablePlan,
@@ -199,6 +200,7 @@ pub(super) enum SourceArrowUnsupported {
     NonArrowInitializer(NodeRef),
     ComplexBlock(NodeRef),
     BareReturn(NodeRef),
+    JsDocContext(NodeRef),
     Variable(VariableUnsupported),
     Callable(SourceCallableUnsupported),
 }
@@ -240,7 +242,8 @@ impl SourceArrowError {
                 | SourceArrowUnsupported::MissingInitializer(node)
                 | SourceArrowUnsupported::NonArrowInitializer(node)
                 | SourceArrowUnsupported::ComplexBlock(node)
-                | SourceArrowUnsupported::BareReturn(node) => Some(node),
+                | SourceArrowUnsupported::BareReturn(node)
+                | SourceArrowUnsupported::JsDocContext(node) => Some(node),
                 SourceArrowUnsupported::Variable(_) => None,
                 SourceArrowUnsupported::Callable(reason) => {
                     SourceCallableError::Unsupported(reason).node()
@@ -1414,6 +1417,91 @@ pub(super) fn resolve_contextual_arrow_parameter_origins(
     })
 }
 
+/// Proves one JavaScript arrow whose contextual signature comes from its own
+/// resolved `@callback` annotation instead of a written variable type node.
+pub(super) fn plan_jsdoc_contextual_source_arrow(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    variable_declaration: NodeRef,
+    jsdoc: &PlannedJavaScriptDeclaration,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<SourceArrowPlan, SourceArrowError> {
+    let invalid_context =
+        || unsupported(SourceArrowUnsupported::JsDocContext(variable_declaration));
+    if jsdoc.node() != variable_declaration {
+        return Err(invariant(SourceArrowInvariant::InvalidVariableDeclaration(
+            variable_declaration,
+        )));
+    }
+    let bound = host.bound_file(variable_declaration).ok_or_else(|| {
+        invariant(SourceArrowInvariant::InvalidSourceFile(
+            variable_declaration,
+        ))
+    })?;
+    if bound
+        .source_facts()
+        .is_none_or(|facts| !facts.is_javascript_file())
+    {
+        return Err(invalid_context());
+    }
+
+    let annotation = jsdoc.type_().ok_or_else(invalid_context)?;
+    let callback = annotation.resolved_callback().ok_or_else(invalid_context)?;
+    if annotation.resolved_alias_name() != Some(callback.name())
+        || jsdoc
+            .callbacks()
+            .iter()
+            .filter(|candidate| *candidate == callback)
+            .count()
+            != 1
+        || !callback.template_parameters().is_empty()
+        || callback.this_type().is_some()
+        || callback.return_type().is_none()
+        || callback.parameters().iter().any(|parameter| {
+            parameter.name().is_empty() || parameter.type_().is_none() || parameter.is_optional()
+        })
+    {
+        return Err(invalid_context());
+    }
+
+    let planned = plan_source_arrow(store, host, variable_declaration, array_targets)?;
+    let SourceArrowBodyPlan::EmptyBlock { block } = planned.body else {
+        return Err(unsupported(SourceArrowUnsupported::ComplexBlock(
+            planned.callable.body,
+        )));
+    };
+    let block_record = preflight_node(store, host, block)?;
+    let NodeData::Block(body) = &block_record.data else {
+        return Err(invariant(SourceArrowInvariant::InvalidBody(block)));
+    };
+    if !body.statements.nodes.is_empty() {
+        return Err(unsupported(SourceArrowUnsupported::ComplexBlock(block)));
+    }
+    if planned.callable.family != SourceCallableFamily::ArrowFunction
+        || !planned.callable.type_parameters.is_empty()
+        || !planned.callable.return_type.is_inferred()
+        || planned.callable.parameters.len() != callback.parameters().len()
+        || planned.callable.min_argument_count
+            != i32::try_from(planned.callable.parameters.len()).map_err(|_| invalid_context())?
+        || planned.callable.flags
+            != if planned.callable.parameters.is_empty() {
+                SignatureFlags::NONE
+            } else {
+                SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE
+            }
+        || planned.callable.parameters.iter().any(|parameter| {
+            parameter.explicit_type_node().is_some()
+                || parameter.initializer.is_some()
+                || parameter.optional
+                || parameter.rest
+        })
+    {
+        return Err(invalid_context());
+    }
+
+    Ok(planned)
+}
+
 /// Proves one direct annotated arrow without mutating semantic state.
 pub(super) fn plan_source_arrow(
     store: &CanonicalTypeMapperStore,
@@ -2086,11 +2174,12 @@ mod tests {
         BoundFile, CanonicalBinder, CanonicalModuleState, CanonicalNameResolverOptions,
         CanonicalSourceFileFacts, CanonicalSourceLanguage, EscapedName,
     };
-    use ts_parser::{ParseResult, parse_source_file};
+    use ts_parser::{ParseResult, parse_javascript_source_file, parse_source_file};
 
     use super::*;
     use crate::semantic::{
         IntrinsicBootstrapOptions,
+        jsdoc::plan_javascript_source_jsdoc,
         production::GlobalMergeCompletion,
         source_callables::{SourceCallableState, source_callable_state},
     };
@@ -2110,6 +2199,28 @@ mod tests {
         }
 
         fn from_parsed(parsed: ParseResult) -> Self {
+            Self::from_parsed_with_language(
+                parsed,
+                CanonicalSourceLanguage::TypeScript,
+                CanonicalModuleState::External,
+            )
+        }
+
+        fn javascript(source: &str) -> Self {
+            let parsed = parse_javascript_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            Self::from_parsed_with_language(
+                parsed,
+                CanonicalSourceLanguage::JavaScript,
+                CanonicalModuleState::Script,
+            )
+        }
+
+        fn from_parsed_with_language(
+            parsed: ParseResult,
+            language: CanonicalSourceLanguage,
+            module_state: CanonicalModuleState,
+        ) -> Self {
             let file = FileId::new(913);
             let mut binder = CanonicalBinder::new();
             binder
@@ -2118,16 +2229,26 @@ mod tests {
                     parsed.source_file,
                     file,
                     CanonicalSourceFileFacts::new(
-                        EscapedName::source("\"/project/source_arrows.ts\""),
-                        CanonicalSourceLanguage::TypeScript,
+                        EscapedName::source(if language == CanonicalSourceLanguage::JavaScript {
+                            "\"/project/source_arrows.js\""
+                        } else {
+                            "\"/project/source_arrows.ts\""
+                        }),
+                        language,
                         false,
-                        CanonicalModuleState::External,
+                        module_state,
                     ),
                 )
                 .unwrap();
-            binder
-                .bind_typescript_declaration_slice(&parsed.arena, file)
-                .unwrap();
+            if language == CanonicalSourceLanguage::JavaScript {
+                binder
+                    .bind_javascript_declaration_slice(&parsed.arena, file)
+                    .unwrap();
+            } else {
+                binder
+                    .bind_typescript_declaration_slice(&parsed.arena, file)
+                    .unwrap();
+            }
             let (symbols, mut files) = binder.finish().try_into_parts().unwrap();
             let bound = files.remove(&file).unwrap();
             let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
@@ -2773,6 +2894,135 @@ mod tests {
                 exported,
             );
             assert_ne!(plan.variable_symbol, plan.owner_symbol);
+        }
+    }
+
+    #[test]
+    fn jsdoc_callback_arrows_keep_source_ownership_without_a_written_type_node() {
+        let fixture = Fixture::javascript(concat!(
+            "/** @callback NS.MyCallback\n",
+            " * @param {string} name\n",
+            " * @returns {void}\n",
+            " */\n",
+            "/** @type {NS.MyCallback} */\n",
+            "const f = (name) => {};",
+        ));
+        let declaration = fixture.declarations()[0];
+        let jsdoc =
+            plan_javascript_source_jsdoc(&fixture.parsed.arena, fixture.bound.source_file())
+                .unwrap();
+        let hosted = jsdoc.declaration(declaration).unwrap();
+        assert_eq!(
+            hosted.type_().unwrap().resolved_alias_name(),
+            Some("NS.MyCallback")
+        );
+        let callback = hosted.type_().unwrap().resolved_callback().unwrap();
+        assert_eq!(callback.parameters().len(), 1);
+
+        let host = fixture.host();
+        assert!(matches!(
+            plan_contextual_source_arrow(&fixture.store, &host, declaration, None),
+            Err(SourceContextualArrowError::Unsupported(
+                SourceContextualArrowUnsupported::MissingVariableAnnotation(node),
+            )) if node == declaration
+        ));
+        let cold = (
+            fixture.store.type_len(),
+            fixture.store.symbol_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        let planned =
+            plan_jsdoc_contextual_source_arrow(&fixture.store, &host, declaration, hosted, None)
+                .unwrap();
+        assert_eq!(planned.variable_declaration, declaration);
+        assert_eq!(
+            fixture.bound.symbol(planned.variable_declaration),
+            Some(planned.variable_symbol)
+        );
+        assert_eq!(
+            fixture.bound.symbol(planned.callable.declaration),
+            Some(planned.callable.owner_symbol)
+        );
+        assert_ne!(planned.variable_symbol, planned.callable.owner_symbol);
+        assert_eq!(
+            planned.callable.flags,
+            SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE
+        );
+        assert_eq!(planned.callable.min_argument_count, 1);
+        assert_eq!(planned.callable.parameters.len(), 1);
+        assert!(planned.callable.parameters[0].is_implicit_any());
+        assert!(
+            planned.callable.parameters[0]
+                .explicit_type_node()
+                .is_none()
+        );
+        assert!(matches!(
+            planned.body,
+            SourceArrowBodyPlan::EmptyBlock { .. }
+        ));
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            cold
+        );
+        assert!(
+            fixture
+                .store
+                .source_callable_type_for_owner(planned.callable.owner_symbol)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn jsdoc_callback_arrows_reject_missing_context_and_mismatched_parameters() {
+        for source in [
+            "/** @type {number} */\nconst f = (name) => {};",
+            concat!(
+                "/** @callback Handler\n",
+                " * @param {string} first\n",
+                " * @param {string} second\n",
+                " * @returns {void}\n",
+                " */\n",
+                "/** @type {Handler} */\n",
+                "const f = (name) => {};",
+            ),
+        ] {
+            let fixture = Fixture::javascript(source);
+            let declaration = fixture.declarations()[0];
+            let jsdoc =
+                plan_javascript_source_jsdoc(&fixture.parsed.arena, fixture.bound.source_file())
+                    .unwrap();
+            let hosted = jsdoc.declaration(declaration).unwrap();
+            let host = fixture.host();
+            let cold = (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            assert!(matches!(
+                plan_jsdoc_contextual_source_arrow(
+                    &fixture.store,
+                    &host,
+                    declaration,
+                    hosted,
+                    None,
+                ),
+                Err(SourceArrowError::Unsupported(SourceArrowUnsupported::JsDocContext(node)))
+                    if node == declaration
+            ));
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.symbol_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                cold
+            );
         }
     }
 

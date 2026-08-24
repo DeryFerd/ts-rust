@@ -5415,6 +5415,7 @@ const RUST_APPLIED_COMPILER_OPTION_NAMES: &[&str] = &[
     "noImplicitAny",
     "noImplicitReturns",
     "noLib",
+    "noUncheckedIndexedAccess",
     "noUncheckedSideEffectImports",
     "noUnusedLocals",
     "noUnusedParameters",
@@ -8104,6 +8105,30 @@ mod tests {
     }
 
     #[test]
+    fn applies_no_unchecked_indexed_access_option_variants() {
+        let case = Case::parse(
+            "uncheckedIndexedAccess.ts",
+            concat!("// @noUncheckedIndexedAccess: *\n", "const value = 1;\n"),
+        )
+        .unwrap();
+        let variants = expand_option_matrix(&case);
+
+        assert_eq!(variants.len(), 2);
+        assert_eq!(matrix_axes(&case), ["noUncheckedIndexedAccess"]);
+        for (variant, expected) in variants.iter().zip([true, false]) {
+            assert!(
+                variant.unsupported_details.is_empty(),
+                "{:?}",
+                variant.unsupported_details
+            );
+            assert_eq!(
+                fixture_compiler_options(&case, variant).no_unchecked_indexed_access,
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn only_applies_unused_label_suppression_to_enabled_variants() {
         for (setting, expected_values, supported) in [
             ("true", &["true"][..], true),
@@ -8339,7 +8364,6 @@ mod tests {
             "deduplicatePackages",
             "noImplicitOverride",
             "noPropertyAccessFromIndexSignature",
-            "noUncheckedIndexedAccess",
         ] {
             let case = Case::parse(
                 format!("{option}.ts"),

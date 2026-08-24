@@ -15,7 +15,7 @@ use ts_binder::{
 
 use super::{
     CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, TypeId,
-    source_callables::valid_source_function_owner_shape,
+    source_callables::valid_source_function_owner_shape, store::SourceNodeParent,
 };
 
 /// Binder identities retained for one exact top-level function declaration.
@@ -322,7 +322,7 @@ pub(super) fn plan_function_identifier_read(
         .then(|| record.value_declaration())
         .flatten()
         .filter(|declaration| {
-            valid_source_function_owner_shape(store, routed.target, *declaration)
+            valid_source_function_declaration_owner_shape(store, routed.target, *declaration)
         });
     if record.flags() != SymbolFlags::FUNCTION && merged_declaration.is_none() {
         return Err(SourceFunctionPlanError::Unsupported(
@@ -547,7 +547,7 @@ fn validate_function_target(
     let record = store
         .symbol(symbol)
         .ok_or(SourceFunctionInvariant::InvalidSymbol(symbol))?;
-    let valid_owner = valid_source_function_owner_shape(store, symbol, declaration);
+    let valid_owner = valid_source_function_declaration_owner_shape(store, symbol, declaration);
     if record.flags() != SymbolFlags::FUNCTION && !valid_owner {
         return Err(SourceFunctionPlanError::Unsupported(
             SourceFunctionUnsupported::NonFunctionSymbol {
@@ -603,6 +603,110 @@ fn validate_function_target(
         .into());
     }
     Ok(())
+}
+
+fn valid_source_function_declaration_owner_shape(
+    store: &CanonicalTypeMapperStore,
+    owner_symbol: SemanticSymbolId,
+    declaration: NodeRef,
+) -> bool {
+    valid_source_function_owner_shape(store, owner_symbol, declaration)
+        || valid_source_function_value_namespace_owner_shape(store, owner_symbol, declaration)
+}
+
+fn valid_source_function_value_namespace_owner_shape(
+    store: &CanonicalTypeMapperStore,
+    owner_symbol: SemanticSymbolId,
+    declaration: NodeRef,
+) -> bool {
+    let Some(owner) = store.symbol(owner_symbol) else {
+        return false;
+    };
+    if owner.flags() != (SymbolFlags::FUNCTION | SymbolFlags::VALUE_MODULE)
+        || owner.check_flags() != CheckFlags::NONE
+        || owner.value_declaration() != Some(declaration)
+        || owner.members().is_some()
+        || owner.export_symbol().is_some()
+        || store.get_merged_symbol(owner_symbol) != Some(owner_symbol)
+    {
+        return false;
+    }
+
+    let Some(declarations) = owner.declarations() else {
+        return false;
+    };
+    if declarations.len() < 2
+        || declarations
+            .iter()
+            .filter(|candidate| **candidate == declaration)
+            .count()
+            != 1
+        || declarations.iter().any(|candidate| {
+            *candidate != declaration
+                && (!candidate.is_for(declaration.arena, declaration.file)
+                    || store.source_node_kind(*candidate)
+                        != Some(ts_ast::SyntaxKind::ModuleDeclaration)
+                    || store.source_node_parent(*candidate)
+                        != store.source_node_parent(declaration))
+        })
+    {
+        return false;
+    }
+
+    let Some(exports) = owner
+        .exports()
+        .and_then(|exports| store.symbol_table(exports))
+    else {
+        return false;
+    };
+    let mut has_value_export = false;
+    for (name, member) in exports.iter() {
+        let Some(record) = store.symbol(member) else {
+            return false;
+        };
+        if record.name() != name
+            || !record.flags().intersects(
+                SymbolFlags::TYPE
+                    | SymbolFlags::VALUE
+                    | SymbolFlags::NAMESPACE
+                    | SymbolFlags::ALIAS,
+            )
+            || store.get_merged_symbol(member) != Some(member)
+            || store.get_parent_of_symbol(member) != Some(owner_symbol)
+            || record.declarations().is_none_or(|member_declarations| {
+                member_declarations.is_empty()
+                    || member_declarations.iter().any(|member_declaration| {
+                        !member_declaration.is_for(declaration.arena, declaration.file)
+                            || !function_namespace_contains_declaration(
+                                store,
+                                declarations,
+                                *member_declaration,
+                            )
+                    })
+            })
+        {
+            return false;
+        }
+        has_value_export |= record.flags().intersects(SymbolFlags::VALUE);
+    }
+
+    has_value_export
+}
+
+fn function_namespace_contains_declaration(
+    store: &CanonicalTypeMapperStore,
+    owner_declarations: &[NodeRef],
+    mut declaration: NodeRef,
+) -> bool {
+    while let Some(SourceNodeParent::Parent(parent)) = store.source_node_parent(declaration) {
+        if owner_declarations.contains(&parent)
+            && store.source_node_kind(parent) == Some(ts_ast::SyntaxKind::ModuleDeclaration)
+        {
+            return true;
+        }
+        declaration = parent;
+    }
+    false
 }
 
 fn validate_export_local(
@@ -700,6 +804,151 @@ mod tests {
     use ts_parser::parse_source_file;
 
     use super::*;
+
+    fn value_namespace_function_fixture(
+        source: &str,
+        file: FileId,
+        declaration_file: bool,
+    ) -> (
+        ts_parser::ParseResult,
+        BoundFile,
+        CanonicalTypeMapperStore,
+        NodeRef,
+        NodeRef,
+    ) {
+        let parsed = parse_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source(format!("\"/project/function-{}.ts\"", file.index())),
+                    CanonicalSourceLanguage::TypeScript,
+                    declaration_file,
+                    CanonicalModuleState::External,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let (symbols, mut files) = binder.finish().try_into_parts().unwrap();
+        let bound = files.remove(&file).unwrap();
+        let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
+        assert!(
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .is_some()
+        );
+        let (declaration, name) = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::FunctionDeclaration(function) = &record.data else {
+                    return None;
+                };
+                Some((
+                    NodeRef::new(parsed.arena.id(), file, node),
+                    NodeRef::new(parsed.arena.id(), file, function.name?),
+                ))
+            })
+            .unwrap();
+
+        (parsed, bound, store, declaration, name)
+    }
+
+    #[test]
+    fn value_namespace_function_owners_preserve_declaration_identity_on_replay() {
+        for (index, (source, declaration_file)) in [
+            (
+                "declare function callable(): void; \
+                 declare namespace callable { export const value: string; } \
+                 export = callable;",
+                true,
+            ),
+            (
+                "function callable() {} \
+                 namespace callable { export var value = 1; } \
+                 export = callable;",
+                false,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (_, bound, store, declaration, name) = value_namespace_function_fixture(
+                source,
+                FileId::new(8_927 + u32::try_from(index).unwrap()),
+                declaration_file,
+            );
+            let owner = bound.symbol(declaration).unwrap();
+            assert_eq!(
+                store.symbol(owner).unwrap().flags(),
+                SymbolFlags::FUNCTION | SymbolFlags::VALUE_MODULE,
+            );
+            let before = (
+                store.type_len(),
+                store.symbol_len(),
+                store.symbol_store().symbol_table_len(),
+                store.checker_link_allocated_lengths(),
+            );
+
+            for _ in 0..2 {
+                assert_eq!(
+                    plan_top_level_function(&bound, &store, declaration, name, "callable", false),
+                    Ok(PlannedTopLevelFunction {
+                        declaration,
+                        owner_symbol: owner,
+                    }),
+                );
+                assert_eq!(
+                    (
+                        store.type_len(),
+                        store.symbol_len(),
+                        store.symbol_store().symbol_table_len(),
+                        store.checker_link_allocated_lengths(),
+                    ),
+                    before,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn value_namespace_function_owners_reject_unowned_exports() {
+        let (_, bound, mut store, declaration, name) = value_namespace_function_fixture(
+            "declare function callable(): void; \
+             declare namespace callable { export const value: string; } \
+             export = callable;",
+            FileId::new(8_929),
+            true,
+        );
+        let owner = bound.symbol(declaration).unwrap();
+        let member = store
+            .symbol(owner)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| store.symbol_table(exports))
+            .and_then(|exports| exports.get_source("value"))
+            .unwrap();
+        let record = store.symbol(member).unwrap();
+        let (members, exports, export_symbol) =
+            (record.members(), record.exports(), record.export_symbol());
+        assert!(store.set_symbol_relationships(member, members, exports, None, export_symbol));
+
+        assert_eq!(
+            plan_top_level_function(&bound, &store, declaration, name, "callable", false),
+            Err(SourceFunctionPlanError::Unsupported(
+                SourceFunctionUnsupported::NonFunctionSymbol {
+                    node: declaration,
+                    symbol: owner,
+                    flags: SymbolFlags::FUNCTION | SymbolFlags::VALUE_MODULE,
+                },
+            )),
+        );
+    }
 
     #[test]
     fn nested_function_uses_enclosing_locals_and_preserves_variable_shadowing() {

@@ -19,7 +19,7 @@ use ts_binder::{
 };
 
 use super::{
-    CanonicalTypeMapperStore, IndexInfoId, TypeId, TypeMapperId,
+    CanonicalGlobalTypes, CanonicalTypeMapperStore, IndexInfoId, SignatureId, TypeId, TypeMapperId,
     array_types::CanonicalArrayTargets,
     declared::{cached_ordinary_type_parameter_owner, type_list_key},
     instantiate::{
@@ -27,12 +27,13 @@ use super::{
         instantiable_member_type_contains_variables, instantiate_type_with_session,
         instantiate_type_with_vector_and_session, instantiated_member_type_matches,
     },
-    links::ValueSymbolLinks,
+    links::{MembersOrExportsResolutionKind, ValueSymbolLinks},
     object_members::{
         DeclaredPropertyObjectProof, DeclaredPropertyObjectValidation,
         validate_resolved_declared_property_object,
     },
     reference_types::{DirectGenericReferenceError, validate_direct_generic_reference},
+    signatures::{SignatureFlags, SignatureInstantiationError},
     store::SourceNodeParent,
     type_records::{
         ConstrainedTypeData, LiteralValue, StructuredTypeData, TypeCacheState, TypeData,
@@ -249,6 +250,23 @@ struct ColdMembersPlan {
     requires_mapper: bool,
     table: Option<PreparedSymbolTable>,
     properties: Vec<ColdPropertyPlan>,
+}
+
+#[derive(Clone, Debug)]
+struct PublishedInterfaceMethodSignature {
+    source: SignatureId,
+    parameter_types: Vec<TypeId>,
+    return_type: TypeId,
+}
+
+#[derive(Clone, Debug)]
+struct PublishedInterfaceMethodPlan {
+    method: SemanticSymbolId,
+    source: TypeId,
+    receiver: TypeId,
+    mapper_sources: Vec<TypeId>,
+    mapper_targets: Vec<TypeId>,
+    signatures: Vec<PublishedInterfaceMethodSignature>,
 }
 
 impl CanonicalTypeMapperStore {
@@ -526,6 +544,411 @@ pub(super) fn demand_instantiated_property_type(
     Ok(instantiated)
 }
 
+/// Instantiates a published global generic interface method for its receiver.
+///
+/// Shared declaration signatures and annotation caches remain generic. The
+/// returned callable owns mapped signatures and concrete parameter values.
+pub(super) fn instantiate_published_generic_interface_method(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    receiver: TypeId,
+    method: SemanticSymbolId,
+) -> Result<TypeId, GenericInterfaceMemberError> {
+    let targets = CanonicalArrayTargets::from_global_types(global_types);
+    let plan = plan_published_interface_method(store, targets, receiver, method)?;
+    if let Some(cached) = cached_published_interface_method(store, &plan, targets)? {
+        return Ok(cached);
+    }
+    if !store.try_reserve_mappers(1)
+        || !store.try_reserve_types(1)
+        || !store.try_reserve_signatures(plan.signatures.len())
+    {
+        return Err(GenericInterfaceMemberError::Capacity(plan.receiver));
+    }
+    let mapper = store
+        .new_type_mapper(plan.mapper_sources.clone(), plan.mapper_targets.clone())
+        .ok_or(GenericInterfaceMemberError::Capacity(plan.receiver))?;
+    let mut session = InstantiationSession::new(InstantiationLimits::default());
+    let mut signatures = Vec::with_capacity(plan.signatures.len());
+    for source in &plan.signatures {
+        let parameter_types = source
+            .parameter_types
+            .iter()
+            .copied()
+            .map(|parameter| {
+                instantiate_type_with_session(store, parameter, mapper, Some(targets), &mut session)
+                    .map_err(|error| property_instantiation_error(parameter, &error))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let return_type = instantiate_type_with_session(
+            store,
+            source.return_type,
+            mapper,
+            Some(targets),
+            &mut session,
+        )
+        .map_err(|error| property_instantiation_error(source.return_type, &error))?;
+        let signature = store
+            .instantiate_signature(source.source, mapper)
+            .map_err(|error| match error {
+                SignatureInstantiationError::Capacity(_) => {
+                    GenericInterfaceMemberError::Capacity(plan.receiver)
+                }
+                _ => GenericInterfaceMemberError::InvalidMember(plan.method),
+            })?;
+        let parameters = store
+            .signature(signature)
+            .ok_or(GenericInterfaceMemberError::InvalidCachedMembers(
+                plan.receiver,
+            ))?
+            .parameters()
+            .to_vec();
+        for (&parameter, &type_) in parameters.iter().zip(&parameter_types) {
+            let links = store.value_symbol_links(parameter).cloned().ok_or(
+                GenericInterfaceMemberError::InvalidCachedProperty(parameter),
+            )?;
+            if links.resolved_type.is_some_and(|cached| cached != type_) {
+                return Err(GenericInterfaceMemberError::InvalidCachedProperty(
+                    parameter,
+                ));
+            }
+            if links.resolved_type.is_none()
+                && !store.set_value_symbol_links(
+                    parameter,
+                    ValueSymbolLinks {
+                        resolved_type: Some(type_),
+                        ..links
+                    },
+                )
+            {
+                return Err(GenericInterfaceMemberError::InvalidCachedProperty(
+                    parameter,
+                ));
+            }
+        }
+        if !store.set_signature_resolved_return_type(signature, Some(return_type)) {
+            return Err(GenericInterfaceMemberError::InvalidCachedMembers(
+                plan.receiver,
+            ));
+        }
+        signatures.push(signature);
+    }
+    let callable = store
+        .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(plan.method))
+        .ok_or(GenericInterfaceMemberError::Capacity(plan.receiver))?;
+    if !store.set_object_target_and_mapper(callable, Some(plan.source), Some(mapper))
+        || !store.set_structured_type_members(callable, None, None, Some(signatures), None, None)
+    {
+        return Err(GenericInterfaceMemberError::InvalidCachedMembers(
+            plan.receiver,
+        ));
+    }
+    Ok(callable)
+}
+
+fn plan_published_interface_method(
+    store: &CanonicalTypeMapperStore,
+    targets: CanonicalArrayTargets,
+    receiver: TypeId,
+    method: SemanticSymbolId,
+) -> Result<PublishedInterfaceMethodPlan, GenericInterfaceMemberError> {
+    let array = store
+        .canonical_array_reference_with_targets(targets, receiver)
+        .map_err(|_| GenericInterfaceMemberError::InvalidTarget(receiver))?
+        .ok_or(GenericInterfaceMemberError::InvalidTarget(receiver))?;
+    let receiver = array.base_type;
+    let (owner, target) = store
+        .authenticated_interface_method_owner(method)
+        .ok_or(GenericInterfaceMemberError::InvalidMember(method))?;
+    let expected_target = if array.readonly {
+        targets.readonly_array_type()
+    } else {
+        targets.array_type()
+    };
+    if target != expected_target {
+        return Err(GenericInterfaceMemberError::InvalidTarget(receiver));
+    }
+    let reference = validate_direct_generic_reference(store, receiver)?;
+    if reference.target != target {
+        return Err(GenericInterfaceMemberError::InvalidTarget(receiver));
+    }
+    let TypeData::Interface(interface) = store
+        .type_payload(target)
+        .ok_or(GenericInterfaceMemberError::InvalidTarget(target))?
+        .data()
+    else {
+        return Err(GenericInterfaceMemberError::InvalidTarget(target));
+    };
+    let parameters = interface
+        .reference
+        .resolved_type_arguments
+        .as_deref()
+        .filter(|parameters| !parameters.is_empty())
+        .ok_or(GenericInterfaceMemberError::InvalidTarget(target))?;
+    let this_type = interface
+        .this_type
+        .ok_or(GenericInterfaceMemberError::InvalidTarget(target))?;
+    if parameters.len() != reference.type_arguments.len()
+        || interface.all_type_parameters.as_deref().is_none_or(|all| {
+            all.len() != parameters.len() + 1
+                || &all[..parameters.len()] != parameters
+                || all.last().copied() != Some(this_type)
+        })
+        || store
+            .symbol(owner)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| {
+                store
+                    .symbol(method)
+                    .and_then(|method| members.get(method.name()))
+            })
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            != Some(method)
+    {
+        return Err(GenericInterfaceMemberError::InvalidTarget(target));
+    }
+    let links = store
+        .value_symbol_links(method)
+        .ok_or(GenericInterfaceMemberError::InvalidMember(method))?;
+    let source = links
+        .resolved_type
+        .ok_or(GenericInterfaceMemberError::InvalidMember(method))?;
+    if links
+        != &(ValueSymbolLinks {
+            resolved_type: Some(source),
+            ..ValueSymbolLinks::default()
+        })
+    {
+        return Err(GenericInterfaceMemberError::InvalidMember(method));
+    }
+    let record = store
+        .type_payload(source)
+        .ok_or(GenericInterfaceMemberError::InvalidMember(method))?;
+    let TypeData::Object(callable) = record.data() else {
+        return Err(GenericInterfaceMemberError::InvalidMember(method));
+    };
+    let signatures = callable
+        .structured
+        .signatures
+        .as_deref()
+        .filter(|signatures| !signatures.is_empty())
+        .ok_or(GenericInterfaceMemberError::InvalidMember(method))?;
+    if record.flags() != TypeFlags::OBJECT
+        || record.object_flags() != (ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED)
+        || record.symbol() != Some(method)
+        || record.alias().is_some()
+        || callable.target.is_some()
+        || callable.mapper.is_some()
+        || callable.instantiations != TypeCacheState::Unallocated
+        || callable.structured.members.is_some()
+        || callable.structured.properties.is_some()
+        || callable.structured.call_signature_count != signatures.len()
+        || callable.structured.index_infos.is_some()
+        || callable.structured.constrained != ConstrainedTypeData::default()
+        || callable
+            .structured
+            .object_type_without_abstract_construct_signatures
+            .is_some()
+    {
+        return Err(GenericInterfaceMemberError::InvalidMember(method));
+    }
+    let mapper_sources = parameters
+        .iter()
+        .copied()
+        .chain(std::iter::once(this_type))
+        .collect::<Vec<_>>();
+    let mapper_targets = reference
+        .type_arguments
+        .iter()
+        .copied()
+        .chain(std::iter::once(receiver))
+        .collect::<Vec<_>>();
+    let mut planned = Vec::with_capacity(signatures.len());
+    for &signature in signatures {
+        if store.interface_method_linked_type(signature) != Some(source) {
+            return Err(GenericInterfaceMemberError::InvalidMember(method));
+        }
+        let record = store
+            .signature(signature)
+            .ok_or(GenericInterfaceMemberError::InvalidMember(method))?;
+        let return_type = record
+            .resolved_return_type()
+            .ok_or(GenericInterfaceMemberError::InvalidMember(method))?;
+        let parameter_types = store
+            .callable_signature_parameter_types(signature)
+            .filter(|types| types.len() == record.parameters().len())
+            .ok_or(GenericInterfaceMemberError::InvalidMember(method))?
+            .to_vec();
+        for type_ in parameter_types.iter().copied().chain([return_type]) {
+            member_type_requires_instantiation(store, type_, &mapper_sources, Some(targets))?;
+        }
+        planned.push(PublishedInterfaceMethodSignature {
+            source: signature,
+            parameter_types,
+            return_type,
+        });
+    }
+    Ok(PublishedInterfaceMethodPlan {
+        method,
+        source,
+        receiver,
+        mapper_sources,
+        mapper_targets,
+        signatures: planned,
+    })
+}
+
+fn cached_published_interface_method(
+    store: &CanonicalTypeMapperStore,
+    plan: &PublishedInterfaceMethodPlan,
+    targets: CanonicalArrayTargets,
+) -> Result<Option<TypeId>, GenericInterfaceMemberError> {
+    let mut cached = None;
+    for (type_, record) in store.types() {
+        let TypeData::Object(object) = record.data() else {
+            continue;
+        };
+        if record.symbol() != Some(plan.method) || object.target != Some(plan.source) {
+            continue;
+        }
+        let Some(mapper) = object.mapper else {
+            return Err(GenericInterfaceMemberError::InvalidCachedMembers(
+                plan.receiver,
+            ));
+        };
+        if store.type_mapper_has_exact_endpoints(mapper, &plan.mapper_sources, &plan.mapper_targets)
+            != Some(true)
+        {
+            continue;
+        }
+        if cached.replace(type_).is_some()
+            || record.flags() != TypeFlags::OBJECT
+            || record.object_flags() != (ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED)
+            || record.alias().is_some()
+            || object.instantiations != TypeCacheState::Unallocated
+            || object.structured.members.is_some()
+            || object.structured.properties.is_some()
+            || object.structured.index_infos.is_some()
+            || object.structured.constrained != ConstrainedTypeData::default()
+            || object
+                .structured
+                .object_type_without_abstract_construct_signatures
+                .is_some()
+            || object.structured.call_signature_count != plan.signatures.len()
+        {
+            return Err(GenericInterfaceMemberError::InvalidCachedMembers(
+                plan.receiver,
+            ));
+        }
+        let signatures = object
+            .structured
+            .signatures
+            .as_deref()
+            .filter(|signatures| signatures.len() == plan.signatures.len())
+            .ok_or(GenericInterfaceMemberError::InvalidCachedMembers(
+                plan.receiver,
+            ))?;
+        for (&signature, source) in signatures.iter().zip(&plan.signatures) {
+            validate_published_interface_method_signature(
+                store, plan, source, signature, mapper, targets,
+            )?;
+        }
+    }
+    Ok(cached)
+}
+
+fn validate_published_interface_method_signature(
+    store: &CanonicalTypeMapperStore,
+    plan: &PublishedInterfaceMethodPlan,
+    source: &PublishedInterfaceMethodSignature,
+    signature: SignatureId,
+    mapper: TypeMapperId,
+    targets: CanonicalArrayTargets,
+) -> Result<(), GenericInterfaceMemberError> {
+    let original = store
+        .signature(source.source)
+        .ok_or(GenericInterfaceMemberError::InvalidMember(plan.method))?;
+    let instantiated =
+        store
+            .signature(signature)
+            .ok_or(GenericInterfaceMemberError::InvalidCachedMembers(
+                plan.receiver,
+            ))?;
+    let return_type = instantiated.resolved_return_type().ok_or(
+        GenericInterfaceMemberError::InvalidCachedMembers(plan.receiver),
+    )?;
+    if instantiated.flags() != (original.flags() & SignatureFlags::PROPAGATING_FLAGS)
+        || instantiated.declaration() != original.declaration()
+        || !instantiated.type_parameters().is_empty()
+        || instantiated.this_parameter().is_some()
+        || instantiated.parameters().len() != original.parameters().len()
+        || instantiated.min_argument_count() != original.min_argument_count()
+        || instantiated.target() != Some(source.source)
+        || instantiated.mapper() != Some(mapper)
+        || !cached_instantiated_property_type_matches(
+            store,
+            source.return_type,
+            return_type,
+            mapper,
+            Some(targets),
+        )
+    {
+        return Err(GenericInterfaceMemberError::InvalidCachedMembers(
+            plan.receiver,
+        ));
+    }
+    for ((&parameter, &original_parameter), &template) in instantiated
+        .parameters()
+        .iter()
+        .zip(original.parameters())
+        .zip(&source.parameter_types)
+    {
+        let links = store.value_symbol_links(parameter).ok_or(
+            GenericInterfaceMemberError::InvalidCachedProperty(parameter),
+        )?;
+        let actual =
+            links
+                .resolved_type
+                .ok_or(GenericInterfaceMemberError::InvalidCachedProperty(
+                    parameter,
+                ))?;
+        let valid_links = if parameter == original_parameter {
+            links
+                == &(ValueSymbolLinks {
+                    resolved_type: Some(actual),
+                    ..ValueSymbolLinks::default()
+                })
+                && actual == template
+        } else {
+            links
+                == &(ValueSymbolLinks {
+                    resolved_type: Some(actual),
+                    target: Some(original_parameter),
+                    mapper: Some(mapper),
+                    name_type: store
+                        .value_symbol_links(original_parameter)
+                        .and_then(|links| links.name_type),
+                    ..ValueSymbolLinks::default()
+                })
+        };
+        if !valid_links
+            || !cached_instantiated_property_type_matches(
+                store,
+                template,
+                actual,
+                mapper,
+                Some(targets),
+            )
+        {
+            return Err(GenericInterfaceMemberError::InvalidCachedProperty(
+                parameter,
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn property_instantiation_error(
     type_: TypeId,
     error: &InstantiationError,
@@ -574,17 +997,17 @@ fn instantiate_generic_member_type(
         .map_err(|error| property_instantiation_error(template, &error))?;
     let index = instantiate_type_with_session(store, index, mapper, array_targets, session)
         .map_err(|error| property_instantiation_error(template, &error))?;
-    let name = indexed_property_name(store, index);
+    let name = indexed_property_escaped_name(store, index);
     if validate_direct_generic_reference(store, object).is_ok() {
         resolve_members_with_array_targets(store, object, array_targets)?;
     }
-    let symbol = name.as_deref().and_then(|name| {
+    let symbol = name.as_ref().and_then(|name| {
         store
             .type_payload(object)
             .and_then(|record| record.data().structured())
             .and_then(|structured| structured.members)
             .and_then(|members| store.symbol_table(members))
-            .and_then(|members| members.get_source(name))
+            .and_then(|members| members.get(name.as_ref()))
     });
     let Some(symbol) = symbol else {
         return indexed_signature_value_type(store, object, index).ok_or(
@@ -617,6 +1040,16 @@ fn indexed_property_name(store: &CanonicalTypeMapperStore, index: TypeId) -> Opt
             _ => None,
         },
         _ => None,
+    }
+}
+
+fn indexed_property_escaped_name(
+    store: &CanonicalTypeMapperStore,
+    index: TypeId,
+) -> Option<EscapedName> {
+    match store.type_payload(index)?.data() {
+        TypeData::UniqueEsSymbol(unique) => Some(unique.name.clone()),
+        _ => indexed_property_name(store, index).map(EscapedName::source),
     }
 }
 
@@ -1081,7 +1514,11 @@ fn declared_target_header(
             != (ObjectFlags::INTERFACE | ObjectFlags::REFERENCE)
         || !(record.object_flags() & !allowed_target_flags).is_empty()
         || record.alias().is_some()
-        || owner_record.flags() != SymbolFlags::INTERFACE
+        || !owner_record.flags().contains(SymbolFlags::INTERFACE)
+        || owner_record
+            .flags()
+            .without(SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT)
+            != SymbolFlags::NONE
         || owner_record.check_flags() != CheckFlags::NONE
         || owner_record.value_declaration().is_some()
         || owner_record.exports().is_some()
@@ -1173,13 +1610,20 @@ fn declared_target_header(
         }
     }
     let declared_count = declared_table.map_or(0, ts_binder::semantic::SymbolTable::len);
-    if raw_table.len() != declared_count + parameter_symbols.len() {
-        return Err(GenericInterfaceMemberError::InvalidTarget(target));
-    }
+    let resolved_table = store
+        .members_and_exports_links(owner)
+        .and_then(|links| links.table(MembersOrExportsResolutionKind::ResolvedMembers))
+        .map(|members| {
+            store
+                .symbol_table(members)
+                .ok_or(GenericInterfaceMemberError::InvalidTarget(target))
+        })
+        .transpose()?;
 
     let mut properties = Vec::with_capacity(declared_count);
     let mut seen = HashSet::with_capacity(declared_count);
     let mut seen_declarations = HashSet::with_capacity(declared_count);
+    let mut late_count = 0usize;
     for (name, symbol) in declared_table
         .into_iter()
         .flat_map(ts_binder::semantic::SymbolTable::iter)
@@ -1223,8 +1667,6 @@ fn declared_target_header(
         }
         let (owner_index, declaration) =
             earliest.ok_or(GenericInterfaceMemberError::InvalidMember(symbol))?;
-        let allowed_flags = SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL;
-        let allowed_checks = CheckFlags::READONLY;
         let links = store
             .value_symbol_links(symbol)
             .ok_or(GenericInterfaceMemberError::InvalidMember(symbol))?;
@@ -1236,14 +1678,39 @@ fn declared_target_header(
             type_,
             property.flags().contains(SymbolFlags::OPTIONAL),
         );
-        if !property.flags().contains(SymbolFlags::PROPERTY)
-            || property.flags().without(allowed_flags) != SymbolFlags::NONE
-            || property.check_flags().bits() & !allowed_checks.bits() != 0
+        let late = property.check_flags().contains(CheckFlags::LATE)
+            || property.flags().contains(SymbolFlags::TRANSIENT)
+            || property.name().is_late_bound()
+            || links.name_type.is_some();
+        let valid_identity = if late {
+            valid_late_bound_unique_symbol_member(
+                store,
+                owner,
+                symbol,
+                declarations,
+                links,
+                resolved_table,
+            )
+        } else {
+            let allowed_flags = SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL;
+            property.flags().contains(SymbolFlags::PROPERTY)
+                && property.flags().without(allowed_flags) == SymbolFlags::NONE
+                && property.check_flags().bits() & !CheckFlags::READONLY.bits() == 0
+                && property.name().as_utf8().is_some()
+                && raw_table
+                    .get(property.name())
+                    .and_then(|member| store.get_merged_symbol(member))
+                    == Some(symbol)
+                && links
+                    == &(ValueSymbolLinks {
+                        resolved_type: Some(type_),
+                        ..ValueSymbolLinks::default()
+                    })
+        };
+        if !valid_identity
             || property.name() != name
             || property.name().is_reserved_member_name()
             || property.name().is_private_identifier()
-            || property.name().is_late_bound()
-            || property.name().as_utf8().is_none()
             || property
                 .value_declaration()
                 .is_none_or(|value| !declarations.contains(&value))
@@ -1252,19 +1719,15 @@ fn declared_target_header(
             || property.exports().is_some()
             || property.export_symbol().is_some()
             || store.get_merged_symbol(symbol) != Some(symbol)
-            || raw_table
-                .get(property.name())
-                .and_then(|member| store.get_merged_symbol(member))
-                != Some(symbol)
-            || links
-                != &(ValueSymbolLinks {
-                    resolved_type: Some(type_),
-                    ..ValueSymbolLinks::default()
-                })
             || store.type_payload(type_).is_none()
             || !optional_type_is_valid
         {
             return Err(GenericInterfaceMemberError::InvalidMember(symbol));
+        }
+        if late {
+            late_count = late_count
+                .checked_add(1)
+                .ok_or(GenericInterfaceMemberError::InvalidTarget(target))?;
         }
         properties.push((
             owner_index,
@@ -1276,6 +1739,29 @@ fn declared_target_header(
                 requires_proxy: false,
             },
         ));
+    }
+    let early_count = declared_count
+        .checked_sub(late_count)
+        .ok_or(GenericInterfaceMemberError::InvalidTarget(target))?;
+    if raw_table.len()
+        != early_count
+            .checked_add(parameter_symbols.len())
+            .ok_or(GenericInterfaceMemberError::InvalidTarget(target))?
+    {
+        return Err(GenericInterfaceMemberError::InvalidTarget(target));
+    }
+    if late_count != 0
+        && resolved_table.is_none_or(|resolved| {
+            resolved.len() != raw_table.len() + late_count
+                || raw_table.iter().any(|(name, symbol)| {
+                    resolved
+                        .get(name)
+                        .and_then(|member| store.get_merged_symbol(member))
+                        != store.get_merged_symbol(symbol)
+                })
+        })
+    {
+        return Err(GenericInterfaceMemberError::InvalidTarget(target));
     }
     if raw_table.iter().any(|(name, symbol)| {
         let Some(canonical) = store.get_merged_symbol(symbol) else {
@@ -1300,6 +1786,86 @@ fn declared_target_header(
         .map(|(_, _, property)| property)
         .collect();
     Ok((owner, source_parameters, declared_members, properties))
+}
+
+fn valid_late_bound_unique_symbol_member(
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+    symbol: SemanticSymbolId,
+    declarations: &[ts_ast::NodeRef],
+    links: &ValueSymbolLinks,
+    resolved_table: Option<&ts_binder::semantic::SymbolTable>,
+) -> bool {
+    let Some(property) = store.symbol(symbol) else {
+        return false;
+    };
+    let allowed_flags = SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL | SymbolFlags::TRANSIENT;
+    let allowed_checks = CheckFlags::LATE | CheckFlags::READONLY;
+    let Some(name_type) = links.name_type else {
+        return false;
+    };
+    let Some(type_record) = store.type_payload(name_type) else {
+        return false;
+    };
+    let TypeData::UniqueEsSymbol(unique) = type_record.data() else {
+        return false;
+    };
+    let Some(key) = type_record.symbol() else {
+        return false;
+    };
+    let Some(key_record) = store.symbol(key) else {
+        return false;
+    };
+    let Some(global_id) = store.symbol_store().assigned_global_symbol_id(key) else {
+        return false;
+    };
+    let Some(suffix) = unique
+        .name
+        .as_bytes()
+        .strip_prefix(b"\xFE@")
+        .and_then(|name| name.strip_prefix(key_record.name().as_bytes()))
+        .and_then(|name| name.strip_prefix(b"@"))
+    else {
+        return false;
+    };
+
+    property
+        .flags()
+        .contains(SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT)
+        && property.flags().without(allowed_flags) == SymbolFlags::NONE
+        && property.check_flags().contains(CheckFlags::LATE)
+        && property.check_flags().bits() & !allowed_checks.bits() == 0
+        && property.name().is_late_bound()
+        && property.name() == unique.name.as_ref()
+        && suffix == global_id.to_string().as_bytes()
+        && type_record.flags() == TypeFlags::UNIQUE_ES_SYMBOL
+        && type_record.object_flags() == ObjectFlags::NONE
+        && type_record.alias().is_none()
+        && key_record
+            .flags()
+            .contains(SymbolFlags::BLOCK_SCOPED_VARIABLE)
+        && store.get_merged_symbol(key) == Some(key)
+        && store.get_parent_of_symbol(key) == store.get_parent_of_symbol(owner)
+        && key_record.value_declaration().is_some_and(|declaration| {
+            store.source_node_kind(declaration) == Some(SyntaxKind::VariableDeclaration)
+        })
+        && store
+            .value_symbol_links(key)
+            .and_then(|links| links.resolved_type)
+            == Some(name_type)
+        && resolved_table.and_then(|table| table.get(property.name())) == Some(symbol)
+        && declarations.iter().all(|declaration| {
+            store
+                .symbol_node_links(*declaration)
+                .and_then(|links| links.resolved_symbol)
+                == Some(symbol)
+        })
+        && links
+            == &(ValueSymbolLinks {
+                resolved_type: links.resolved_type,
+                name_type: Some(name_type),
+                ..ValueSymbolLinks::default()
+            })
 }
 
 fn valid_generic_interface_declaration_owner(
@@ -1416,13 +1982,13 @@ fn cached_instantiated_property_type_matches(
         let Some(index) = mapped_index_component(store, indexed.index_type, mapper) else {
             return false;
         };
-        let named = indexed_property_name(store, index).and_then(|name| {
+        let named = indexed_property_escaped_name(store, index).and_then(|name| {
             store
                 .type_payload(object)
                 .and_then(|record| record.data().structured())
                 .and_then(|structured| structured.members)
                 .and_then(|members| store.symbol_table(members))
-                .and_then(|members| members.get_source(&name))
+                .and_then(|members| members.get(name.as_ref()))
                 .and_then(|symbol| store.value_symbol_links(symbol))
                 .and_then(|links| links.resolved_type)
         });
@@ -1937,10 +2503,14 @@ mod tests {
     use super::*;
     use crate::semantic::{
         CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions,
+        LateBoundLinks, MembersAndExportsLinks, ResolvedSignatureState, SignatureLinks,
+        SymbolNodeLinks, TypeNodeLinks, bootstrap::UnionReduction, signatures::ElementFlags,
+        tuple_types::CanonicalTupleTypeRequest,
     };
     use ts_ast::{FileId, NodeData, NodeRef};
     use ts_binder::{
         CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
+        InternalSymbolName,
     };
     use ts_parser::{ParseResult, parse_source_file};
 
@@ -2064,6 +2634,153 @@ mod tests {
             );
         }
         assert!(store.set_interface_declared_members(target, true, members, None, None, None));
+    }
+
+    #[derive(Clone, Copy)]
+    struct LateBoundUniqueSymbolTarget {
+        target: TypeId,
+        key_type: TypeId,
+        declaration: NodeRef,
+        anonymous: SemanticSymbolId,
+        late: SemanticSymbolId,
+    }
+
+    fn publish_late_bound_unique_symbol_target_for_test(
+        parsed: &ParseResult,
+        file: FileId,
+        context: &mut CanonicalCheckerContext<'_>,
+    ) -> LateBoundUniqueSymbolTarget {
+        let owner = source_symbol(parsed, file, context, "Box");
+        let key = source_symbol(parsed, file, context, "key");
+        let target = context.get_declared_type_of_symbol(owner).unwrap();
+        let parameter = match context.store().type_payload(target).unwrap().data() {
+            TypeData::Interface(interface) => interface
+                .reference
+                .resolved_type_arguments
+                .as_ref()
+                .unwrap()[0],
+            _ => panic!("Box must retain its generic interface target"),
+        };
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let name = match &record.data {
+                    NodeData::PropertyDeclaration(property) => property.name,
+                    NodeData::PropertySignatureDeclaration(property) => property.name,
+                    _ => return None,
+                };
+                (parsed.arena.get(name)?.kind == SyntaxKind::ComputedPropertyName)
+                    .then_some(NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .expect("Box must retain its computed property declaration");
+        let anonymous = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        let raw_members = context.store().symbol(owner).unwrap().members().unwrap();
+        let first = context
+            .store()
+            .symbol_table(raw_members)
+            .and_then(|members| members.get_source("first"))
+            .unwrap();
+        let last = context
+            .store()
+            .symbol_table(raw_members)
+            .and_then(|members| members.get_source("last"))
+            .unwrap();
+        let (string, number) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let store = context.store_mut_for_test();
+        let key_type = store.alloc_unique_es_symbol_type(key).unwrap();
+        let key_name = match store.type_payload(key_type).unwrap().data() {
+            TypeData::UniqueEsSymbol(unique) => unique.name.clone(),
+            _ => panic!("the key must retain its unique symbol identity"),
+        };
+        assert!(store.set_value_symbol_links(
+            key,
+            ValueSymbolLinks {
+                resolved_type: Some(key_type),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+
+        let source_flags = store.symbol(anonymous).unwrap().flags();
+        let mut late_data =
+            SymbolData::new(source_flags | SymbolFlags::TRANSIENT, key_name.clone());
+        late_data.check_flags = CheckFlags::LATE;
+        late_data.declarations = Some(vec![declaration]);
+        late_data.value_declaration = Some(declaration);
+        late_data.parent = Some(owner);
+        let late = store.alloc_symbol(late_data).unwrap();
+        assert!(store.set_value_symbol_links(
+            late,
+            ValueSymbolLinks {
+                resolved_type: Some(parameter),
+                name_type: Some(key_type),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        assert!(store.set_late_bound_links(
+            anonymous,
+            LateBoundLinks {
+                late_symbol: Some(late),
+            },
+        ));
+        assert!(store.set_symbol_node_links(
+            declaration,
+            SymbolNodeLinks {
+                resolved_symbol: Some(late),
+            },
+        ));
+
+        let resolved_members = store.clone_symbol_table(raw_members).unwrap();
+        assert_eq!(
+            store.insert_symbol(resolved_members, key_name.clone(), late),
+            Some(None),
+        );
+        let mut member_links = MembersAndExportsLinks::default();
+        member_links.tables[MembersOrExportsResolutionKind::ResolvedMembers as usize] =
+            Some(resolved_members);
+        assert!(store.set_members_and_exports_links(owner, member_links));
+
+        assert!(store.publish_interface_no_base_resolution(target));
+        let declared_members = store.alloc_symbol_table();
+        for (name, symbol, type_) in [
+            (EscapedName::source("first"), first, string),
+            (EscapedName::source("last"), last, number),
+        ] {
+            assert!(store.set_value_symbol_links(
+                symbol,
+                ValueSymbolLinks {
+                    resolved_type: Some(type_),
+                    ..ValueSymbolLinks::default()
+                },
+            ));
+            assert_eq!(
+                store.insert_symbol(declared_members, name, symbol),
+                Some(None)
+            );
+        }
+        assert_eq!(
+            store.insert_symbol(declared_members, key_name, late),
+            Some(None),
+        );
+        assert!(store.set_interface_declared_members(
+            target,
+            true,
+            Some(declared_members),
+            None,
+            None,
+            None,
+        ));
+
+        LateBoundUniqueSymbolTarget {
+            target,
+            key_type,
+            declaration,
+            anonymous,
+            late,
+        }
     }
 
     #[test]
@@ -2286,6 +3003,598 @@ mod tests {
                 string,
             );
         }
+    }
+
+    #[test]
+    fn global_array_method_overloads_instantiate_for_a_tuple_receiver() {
+        let parsed = parse_source_file(concat!(
+            "interface ConcatArray<T> {} ",
+            "interface Array<T> { ",
+            "concat(...items: ConcatArray<T>[]): T[]; ",
+            "concat(...items: (T | ConcatArray<T>)[]): T[]; ",
+            "} interface ReadonlyArray<T> {}",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(6_217);
+        let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+        let global_types = context.global_types().clone();
+        let concat_owner = source_symbol(&parsed, file, &context, "ConcatArray");
+        let concat_target = context.get_declared_type_of_symbol(concat_owner).unwrap();
+        let (method, element, declarations) = {
+            let store = context.store();
+            let owner = store
+                .type_payload(global_types.array_type)
+                .and_then(super::super::type_records::TypeRecord::symbol)
+                .unwrap();
+            let method = store
+                .symbol(owner)
+                .and_then(ts_binder::semantic::Symbol::members)
+                .and_then(|members| store.symbol_table(members))
+                .and_then(|members| members.get_source("concat"))
+                .unwrap();
+            let TypeData::Interface(array) =
+                store.type_payload(global_types.array_type).unwrap().data()
+            else {
+                panic!("Array must retain its generic interface target")
+            };
+            let [element] = array.reference.resolved_type_arguments.as_deref().unwrap() else {
+                panic!("Array must have one generic element")
+            };
+            (
+                method,
+                *element,
+                store
+                    .symbol(method)
+                    .unwrap()
+                    .declarations()
+                    .unwrap()
+                    .to_vec(),
+            )
+        };
+        let plans = declarations
+            .iter()
+            .copied()
+            .map(|declaration| {
+                let NodeData::MethodSignatureDeclaration(signature) =
+                    &parsed.arena.get(declaration.node).unwrap().data
+                else {
+                    panic!("concat must preserve its method declaration")
+                };
+                let [parameter] = signature.parameters.nodes.as_slice() else {
+                    panic!("concat must preserve one rest parameter")
+                };
+                let parameter = NodeRef::new(declaration.arena, declaration.file, *parameter);
+                let NodeData::ParameterDeclaration(parameter_data) =
+                    &parsed.arena.get(parameter.node).unwrap().data
+                else {
+                    panic!("concat must preserve its parameter declaration")
+                };
+                (
+                    declaration,
+                    context.file(file).unwrap().1.symbol(parameter).unwrap(),
+                    NodeRef::new(
+                        parameter.arena,
+                        parameter.file,
+                        parameter_data.type_.unwrap(),
+                    ),
+                    NodeRef::new(
+                        declaration.arena,
+                        declaration.file,
+                        signature.type_.unwrap(),
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let store = context.store_mut_for_test();
+        let concat_element = store
+            .create_direct_generic_reference_type(concat_target, &[element])
+            .unwrap();
+        let combined_element = store
+            .expression_union_type_with_global_types(
+                &global_types,
+                &[element, concat_element],
+                UnionReduction::Literal,
+            )
+            .unwrap();
+        let source_parameter_types = [concat_element, combined_element].map(|type_| {
+            store
+                .create_canonical_array_type(&global_types, type_, false)
+                .unwrap()
+        });
+        let source = store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(method))
+            .unwrap();
+        let mut source_signatures = Vec::new();
+        for ((declaration, parameter, parameter_annotation, return_annotation), parameter_type) in
+            plans.iter().copied().zip(source_parameter_types)
+        {
+            assert!(store.set_type_node_links(
+                parameter_annotation,
+                TypeNodeLinks {
+                    resolved_type: Some(parameter_type),
+                    ..TypeNodeLinks::default()
+                },
+            ));
+            assert!(store.set_type_node_links(
+                return_annotation,
+                TypeNodeLinks {
+                    resolved_type: Some(global_types.array_type),
+                    ..TypeNodeLinks::default()
+                },
+            ));
+            assert!(store.set_value_symbol_links(
+                parameter,
+                ValueSymbolLinks {
+                    resolved_type: Some(parameter_type),
+                    ..ValueSymbolLinks::default()
+                },
+            ));
+            let signature = store
+                .alloc_signature(
+                    SignatureFlags::HAS_REST_PARAMETER,
+                    Some(declaration),
+                    Vec::new(),
+                    None,
+                    vec![parameter],
+                    Some(global_types.array_type),
+                    None,
+                    0,
+                )
+                .unwrap();
+            assert!(store.set_signature_links(
+                declaration,
+                SignatureLinks {
+                    resolved_signature: ResolvedSignatureState::Resolved(signature),
+                    ..SignatureLinks::default()
+                },
+            ));
+            source_signatures.push(signature);
+        }
+        assert!(store.set_value_symbol_links(
+            method,
+            ValueSymbolLinks {
+                resolved_type: Some(source),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        assert!(store.set_structured_type_members(
+            source,
+            None,
+            None,
+            Some(source_signatures.clone()),
+            None,
+            None,
+        ));
+        for (&signature, &(_, _, _, annotation)) in source_signatures.iter().zip(&plans) {
+            assert!(store.set_function_signature_return_annotation(signature, annotation, false));
+        }
+        assert!(
+            store.set_callable_signature_parameter_types_batch(
+                source_signatures
+                    .iter()
+                    .copied()
+                    .zip(source_parameter_types)
+                    .map(|(signature, type_)| (signature, vec![type_]))
+                    .collect(),
+            )
+        );
+
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let info = store
+            .create_tuple_element_info(ElementFlags::REQUIRED, None)
+            .unwrap();
+        let tuple = store
+            .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(
+                &[number, number],
+                &[info, info],
+                false,
+            ))
+            .unwrap();
+        let receiver = store
+            .create_canonical_array_type(&global_types, tuple, false)
+            .unwrap();
+        let specialized =
+            instantiate_published_generic_interface_method(store, &global_types, receiver, method)
+                .unwrap();
+        assert_ne!(specialized, source);
+        let TypeData::Object(callable) = store.type_payload(specialized).unwrap().data() else {
+            panic!("the receiver must own a specialized callable object")
+        };
+        let mapper = callable.mapper.unwrap();
+        let signatures = callable.structured.signatures.as_ref().unwrap().clone();
+        assert_eq!(callable.target, Some(source));
+        assert_eq!(signatures.len(), 2);
+        assert_eq!(callable.structured.call_signature_count, 2);
+
+        let specialized_concat = store
+            .create_direct_generic_reference_type(concat_target, &[tuple])
+            .unwrap();
+        let specialized_union = store
+            .expression_union_type_with_global_types(
+                &global_types,
+                &[tuple, specialized_concat],
+                UnionReduction::Literal,
+            )
+            .unwrap();
+        let expected_parameters = [specialized_concat, specialized_union].map(|element| {
+            store
+                .create_canonical_array_type(&global_types, element, false)
+                .unwrap()
+        });
+        for ((&signature, &original), expected) in signatures
+            .iter()
+            .zip(&source_signatures)
+            .zip(expected_parameters)
+        {
+            let record = store.signature(signature).unwrap();
+            let [parameter] = record.parameters() else {
+                panic!("each specialized overload must retain its rest parameter")
+            };
+            let parameter = *parameter;
+            assert_eq!(record.flags(), SignatureFlags::HAS_REST_PARAMETER);
+            assert_eq!(record.target(), Some(original));
+            assert_eq!(record.mapper(), Some(mapper));
+            assert_eq!(record.resolved_return_type(), Some(receiver));
+            assert_eq!(
+                store
+                    .value_symbol_links(parameter)
+                    .and_then(|links| links.resolved_type),
+                Some(expected),
+            );
+            assert!(
+                store
+                    .symbol(parameter)
+                    .unwrap()
+                    .flags()
+                    .contains(SymbolFlags::TRANSIENT)
+            );
+        }
+        for ((_, parameter, parameter_annotation, return_annotation), expected) in
+            plans.iter().copied().zip(source_parameter_types)
+        {
+            assert_eq!(
+                store
+                    .value_symbol_links(parameter)
+                    .and_then(|links| links.resolved_type),
+                Some(expected),
+            );
+            assert_eq!(
+                store
+                    .type_node_links(parameter_annotation)
+                    .and_then(|links| links.resolved_type),
+                Some(expected),
+            );
+            assert_eq!(
+                store
+                    .type_node_links(return_annotation)
+                    .and_then(|links| links.resolved_type),
+                Some(global_types.array_type),
+            );
+        }
+        let warm = (
+            store.type_len(),
+            store.mapper_len(),
+            store.signature_len(),
+            store.symbol_len(),
+            store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            instantiate_published_generic_interface_method(store, &global_types, receiver, method),
+            Ok(specialized),
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.mapper_len(),
+                store.signature_len(),
+                store.symbol_len(),
+                store.checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn late_bound_unique_symbol_members_keep_declaration_and_instantiation_identity() {
+        let parsed = parse_source_file(concat!(
+            "declare module \"prop-types\" {\n",
+            "  export const key: unique symbol;\n",
+            "  export interface Box<T> { first: string; [key]?: T; last: number }\n",
+            "}\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(6_214);
+        let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+        let target = publish_late_bound_unique_symbol_target_for_test(&parsed, file, &mut context);
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let reference = context
+            .store_mut_for_test()
+            .create_direct_generic_reference_type(target.target, &[string])
+            .unwrap();
+
+        let members = context
+            .store_mut_for_test()
+            .resolve_generic_interface_members(reference, None)
+            .unwrap();
+        let [first, computed, last] = members.properties() else {
+            panic!("the interface must preserve all members in declaration order")
+        };
+        let (first, computed, last) = (*first, *computed, *last);
+        let store = context.store();
+        let anonymous = store.symbol(target.anonymous).unwrap();
+        let late = store.symbol(target.late).unwrap();
+        let instantiated = store.symbol(computed).unwrap();
+        let key_name = match store.type_payload(target.key_type).unwrap().data() {
+            TypeData::UniqueEsSymbol(unique) => unique.name.clone(),
+            _ => panic!("the computed property must retain its unique symbol key"),
+        };
+
+        assert_eq!(anonymous.name(), InternalSymbolName::Computed.as_ref());
+        assert!(!anonymous.flags().contains(SymbolFlags::TRANSIENT));
+        assert_eq!(anonymous.flags() | SymbolFlags::TRANSIENT, late.flags());
+        assert_eq!(anonymous.declarations(), late.declarations());
+        assert_eq!(anonymous.parent(), late.parent());
+        assert_eq!(
+            store.late_bound_links(target.anonymous),
+            Some(&LateBoundLinks {
+                late_symbol: Some(target.late),
+            }),
+        );
+        assert_eq!(
+            store
+                .symbol_node_links(target.declaration)
+                .and_then(|links| links.resolved_symbol),
+            Some(target.late),
+        );
+        assert_eq!(store.symbol(first).unwrap().name().as_utf8(), Some("first"));
+        assert_eq!(store.symbol(last).unwrap().name().as_utf8(), Some("last"));
+        assert_ne!(computed, target.anonymous);
+        assert_ne!(computed, target.late);
+        assert_eq!(late.name(), key_name.as_ref());
+        assert_eq!(instantiated.name(), key_name.as_ref());
+        assert_eq!(
+            instantiated.flags(),
+            SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL | SymbolFlags::TRANSIENT,
+        );
+        assert_eq!(
+            instantiated.check_flags(),
+            CheckFlags::LATE | CheckFlags::INSTANTIATED,
+        );
+        assert_eq!(instantiated.declarations(), Some(&[target.declaration][..]));
+        assert_eq!(instantiated.parent(), late.parent());
+        assert_eq!(
+            store
+                .symbol_table(members.members().unwrap())
+                .and_then(|table| table.get(key_name.as_ref())),
+            Some(computed),
+        );
+        assert_eq!(
+            store.value_symbol_links(computed),
+            Some(&ValueSymbolLinks {
+                target: Some(target.late),
+                mapper: members.mapper(),
+                name_type: Some(target.key_type),
+                ..ValueSymbolLinks::default()
+            }),
+        );
+
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        assert_eq!(
+            demand_instantiated_property_type(
+                context.store_mut_for_test(),
+                reference,
+                computed,
+                None,
+                &mut session,
+            ),
+            Ok(string),
+        );
+        let warm = (
+            context.store().type_len(),
+            context.store().mapper_len(),
+            context.store().symbol_len(),
+            context.store().symbol_store().symbol_table_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .resolve_generic_interface_members(reference, None),
+            Ok(members),
+        );
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().mapper_len(),
+                context.store().symbol_len(),
+                context.store().symbol_store().symbol_table_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn malformed_late_bound_unique_symbol_members_fail_before_instantiation() {
+        let parsed = parse_source_file(concat!(
+            "declare const key: unique symbol;\n",
+            "declare const other: unique symbol;\n",
+            "interface Box<T> { first: string; [key]?: T; last: number }\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(6_215);
+        let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+        let target = publish_late_bound_unique_symbol_target_for_test(&parsed, file, &mut context);
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let reference = context
+            .store_mut_for_test()
+            .create_direct_generic_reference_type(target.target, &[string])
+            .unwrap();
+        let owner = context
+            .store()
+            .type_payload(target.target)
+            .and_then(super::super::type_records::TypeRecord::symbol)
+            .unwrap();
+        let member_links = context
+            .store()
+            .members_and_exports_links(owner)
+            .cloned()
+            .unwrap();
+        let other = source_symbol(&parsed, file, &context, "other");
+        let other_type = context
+            .store_mut_for_test()
+            .alloc_unique_es_symbol_type(other)
+            .unwrap();
+        assert!(context.store_mut_for_test().set_value_symbol_links(
+            other,
+            ValueSymbolLinks {
+                resolved_type: Some(other_type),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        let before = (
+            context.store().type_len(),
+            context.store().mapper_len(),
+            context.store().symbol_len(),
+            context.store().symbol_store().symbol_table_len(),
+        );
+
+        for invalid in [0, 1, 2, 3, 4] {
+            let original_links = context
+                .store()
+                .value_symbol_links(target.late)
+                .cloned()
+                .unwrap();
+            match invalid {
+                0 => {
+                    assert!(context.store_mut_for_test().set_symbol_flags(
+                        target.late,
+                        SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL | SymbolFlags::TRANSIENT,
+                        CheckFlags::NONE,
+                    ));
+                }
+                1 => {
+                    assert!(context.store_mut_for_test().set_value_symbol_links(
+                        target.late,
+                        ValueSymbolLinks {
+                            name_type: None,
+                            ..original_links.clone()
+                        },
+                    ));
+                }
+                2 => {
+                    assert!(
+                        context
+                            .store_mut_for_test()
+                            .set_symbol_node_links(target.declaration, SymbolNodeLinks::default(),)
+                    );
+                }
+                3 => {
+                    assert!(context.store_mut_for_test().set_value_symbol_links(
+                        target.late,
+                        ValueSymbolLinks {
+                            name_type: Some(other_type),
+                            ..original_links.clone()
+                        },
+                    ));
+                }
+                4 => {
+                    assert!(
+                        context.store_mut_for_test().set_members_and_exports_links(
+                            owner,
+                            MembersAndExportsLinks::default(),
+                        )
+                    );
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                validate_generic_interface_members(context.store(), reference, None),
+                Err(GenericInterfaceMemberError::InvalidMember(target.late)),
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().mapper_len(),
+                    context.store().symbol_len(),
+                    context.store().symbol_store().symbol_table_len(),
+                ),
+                before,
+            );
+            assert!(context.store_mut_for_test().set_symbol_flags(
+                target.late,
+                SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL | SymbolFlags::TRANSIENT,
+                CheckFlags::LATE,
+            ));
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_value_symbol_links(target.late, original_links)
+            );
+            assert!(context.store_mut_for_test().set_symbol_node_links(
+                target.declaration,
+                SymbolNodeLinks {
+                    resolved_symbol: Some(target.late),
+                },
+            ));
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_members_and_exports_links(owner, member_links.clone())
+            );
+        }
+    }
+
+    #[test]
+    fn indexed_generic_members_use_unique_symbol_property_identity() {
+        let parsed = parse_source_file(concat!(
+            "declare const key: unique symbol;\n",
+            "interface Box<T> { first: string; [key]?: T; last: number }\n",
+            "interface Pick<T> { selected: T }\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(6_216);
+        let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+        let boxed = publish_late_bound_unique_symbol_target_for_test(&parsed, file, &mut context);
+        let pick_symbol = source_symbol(&parsed, file, &context, "Pick");
+        let pick_target = context.get_declared_type_of_symbol(pick_symbol).unwrap();
+        let pick_parameter = match context.store().type_payload(pick_target).unwrap().data() {
+            TypeData::Interface(interface) => interface
+                .reference
+                .resolved_type_arguments
+                .as_ref()
+                .unwrap()[0],
+            _ => panic!("Pick must retain its generic interface target"),
+        };
+        let template = context
+            .store_mut_for_test()
+            .alloc_indexed_access_type(pick_parameter, boxed.key_type, AccessFlags::NONE)
+            .unwrap();
+        publish_generic_target_for_test(&mut context, pick_target, &[("selected", template)], None);
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let boxed_number = context
+            .store_mut_for_test()
+            .create_direct_generic_reference_type(boxed.target, &[number])
+            .unwrap();
+        let selected = context
+            .store_mut_for_test()
+            .create_direct_generic_reference_type(pick_target, &[boxed_number])
+            .unwrap();
+
+        let property = context
+            .store_mut_for_test()
+            .resolve_generic_interface_property(selected, "selected", None)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(property.type_id(), number);
+        assert_eq!(
+            context
+                .store_mut_for_test()
+                .resolve_generic_interface_property(selected, "selected", None),
+            Ok(Some(property)),
+        );
     }
 
     #[test]

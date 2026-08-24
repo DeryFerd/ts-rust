@@ -4,11 +4,12 @@
 //! `getTypeFromIndexedAccessTypeNode`, `getIndexedAccessTypeOrUndefined`, and
 //! `getPropertyTypeForIndexType`. The object operand is one direct, possibly
 //! parenthesized type literal admitted by [`super::object_members`]. Required
-//! own properties and string/number index signatures are supported, including
-//! mixed surfaces: an exact literal property wins, then an applicable number
-//! index wins over a string index. Generic type-parameter pairs have a
-//! separate deferred constructor. Other named operands, optional properties,
-//! union keys, tuples, apparent types, and diagnostic recovery remain explicit
+//! own properties and string/number/template-pattern index signatures are
+//! supported, including mixed surfaces: an exact literal property wins, then
+//! one applicable number or template index wins over a string index. Generic
+//! type-parameter pairs have a separate deferred constructor. Other named
+//! operands, optional properties, overlapping non-string indexes, union keys,
+//! tuples, apparent types, and diagnostic recovery remain explicit
 //! concrete-planner boundaries.
 //!
 //! Planning chooses the exact property symbol or index-info slot before any
@@ -82,6 +83,7 @@ impl ConcretePropertyName<'_> {
 enum PlannedIndexKind {
     String,
     Number,
+    Template,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -255,7 +257,7 @@ pub(super) fn plan_concrete_indexed_access(
     validate_member_domains(store, host, &object_plan)?;
     validate_member_annotation_cache(store, host, &object_plan)?;
     let key = classify_index(store, host, index)?;
-    let selection = select_concrete_member(store, &object_plan, &key, index)?;
+    let selection = select_concrete_member(store, host, &object_plan, &key, index)?;
 
     validate_transparent_object_links(store, &object_wrappers)?;
     validate_existing_index_links(store, index, &key)?;
@@ -301,6 +303,10 @@ impl PrimitiveDomain {
         Self(self.0 | other.0)
     }
 
+    const fn intersection(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
+
     const fn is_subset_of(self, other: Self) -> bool {
         self.0 & !other.0 == 0
     }
@@ -310,9 +316,10 @@ impl PrimitiveDomain {
 ///
 /// General source checking does not yet run `checkIndexConstraints`, so this
 /// leaf may only publish a mixed type literal when primitive syntax proves
-/// every property is assignable to the string index and the number index is
-/// assignable to the string index. Single-index, property-free literals have
-/// no cross-member obligation and retain the broader annotation capability.
+/// every applicable property is assignable to its indexes and every narrower
+/// index is assignable to the string index. Single-index, property-free
+/// literals have no cross-member obligation and retain the broader annotation
+/// capability.
 fn validate_member_domains(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -328,25 +335,63 @@ fn validate_member_domains(
     let number_index = object.indexes.iter().find(|index| {
         store.source_node_kind(index.key_type_node) == Some(SyntaxKind::NumberKeyword)
     });
-    let Some(string_index) = string_index else {
+    let string_domain = string_index
+        .map(|index| {
+            primitive_domain(store, host, index.value_type_node).ok_or(
+                ConcreteIndexedAccessError::UnsupportedObjectSurface(object.node),
+            )
+        })
+        .transpose()?;
+
+    if string_domain.is_none()
+        && (number_index.is_some()
+            || object.indexes.iter().any(|index| {
+                store.source_node_kind(index.key_type_node) != Some(SyntaxKind::TemplateLiteralType)
+            }))
+    {
         return Err(ConcreteIndexedAccessError::UnsupportedObjectSurface(
             object.node,
         ));
-    };
-    let string_domain = primitive_domain(store, host, string_index.value_type_node).ok_or(
-        ConcreteIndexedAccessError::UnsupportedObjectSurface(object.node),
-    )?;
+    }
 
     let number_domain =
         number_index.and_then(|index| primitive_domain(store, host, index.value_type_node));
     if number_index.is_some()
-        && !number_domain.is_some_and(|domain| domain.is_subset_of(string_domain))
+        && !number_domain
+            .is_some_and(|domain| string_domain.is_some_and(|string| domain.is_subset_of(string)))
     {
         return Err(ConcreteIndexedAccessError::UnsupportedObjectSurface(
             object.node,
         ));
     }
     for property in &object.properties {
+        let mut applicable_domain = string_domain;
+        if is_numeric_literal_name(&property.name)
+            && let Some(number) = number_domain
+        {
+            applicable_domain =
+                Some(applicable_domain.map_or(number, |existing| existing.intersection(number)));
+        }
+        for index in &object.indexes {
+            if store.source_node_kind(index.key_type_node) != Some(SyntaxKind::TemplateLiteralType)
+                || !template_pattern_syntax_matches_name(
+                    store,
+                    host,
+                    index.key_type_node,
+                    &property.name,
+                )?
+            {
+                continue;
+            }
+            let domain = primitive_domain(store, host, index.value_type_node).ok_or(
+                ConcreteIndexedAccessError::UnsupportedObjectSurface(object.node),
+            )?;
+            applicable_domain =
+                Some(applicable_domain.map_or(domain, |existing| existing.intersection(domain)));
+        }
+        let Some(applicable_domain) = applicable_domain else {
+            continue;
+        };
         let Some(domain) = (!property.optional)
             .then(|| primitive_domain(store, host, property.type_node))
             .flatten()
@@ -355,13 +400,26 @@ fn validate_member_domains(
                 object.node,
             ));
         };
-        if !domain.is_subset_of(string_domain)
-            || is_numeric_literal_name(&property.name)
-                && !number_domain.is_none_or(|number| domain.is_subset_of(number))
-        {
+        if !domain.is_subset_of(applicable_domain) {
             return Err(ConcreteIndexedAccessError::UnsupportedObjectSurface(
                 object.node,
             ));
+        }
+    }
+    if let Some(string) = string_domain {
+        for index in &object.indexes {
+            if store.source_node_kind(index.key_type_node) != Some(SyntaxKind::TemplateLiteralType)
+            {
+                continue;
+            }
+            let domain = primitive_domain(store, host, index.value_type_node).ok_or(
+                ConcreteIndexedAccessError::UnsupportedObjectSurface(object.node),
+            )?;
+            if !domain.is_subset_of(string) {
+                return Err(ConcreteIndexedAccessError::UnsupportedObjectSurface(
+                    object.node,
+                ));
+            }
         }
     }
     Ok(())
@@ -767,8 +825,87 @@ pub(super) fn template_pattern_index_matches_name(
     store.template_pattern_index_matches_name(key_type, name)
 }
 
+/// Checks one exact `prefix-${string}-suffix` index before its type is cached.
+fn template_pattern_syntax_matches_name(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    pattern: NodeRef,
+    name: &str,
+) -> Result<bool, ConcreteIndexedAccessError> {
+    let unsupported = || ConcreteIndexedAccessError::UnsupportedObjectSurface(pattern);
+    let record = preflight_node(store, host, pattern)?;
+    let NodeData::TemplateLiteralTypeNode(template) = &record.data else {
+        return Err(unsupported());
+    };
+    let [span] = template.template_spans.nodes.as_slice() else {
+        return Err(unsupported());
+    };
+    let head = NodeRef::new(pattern.arena, pattern.file, template.head);
+    let span = NodeRef::new(pattern.arena, pattern.file, *span);
+    let head_record = preflight_node(store, host, head)?;
+    let span_record = preflight_node(store, host, span)?;
+    let NodeData::TemplateHead(head_data) = &head_record.data else {
+        return Err(unsupported());
+    };
+    let NodeData::TemplateLiteralTypeSpan(span_data) = &span_record.data else {
+        return Err(unsupported());
+    };
+    let placeholder = NodeRef::new(pattern.arena, pattern.file, span_data.type_);
+    let tail = NodeRef::new(pattern.arena, pattern.file, span_data.literal);
+    let placeholder_record = preflight_node(store, host, placeholder)?;
+    let tail_record = preflight_node(store, host, tail)?;
+    let NodeData::TemplateTail(tail_data) = &tail_record.data else {
+        return Err(unsupported());
+    };
+    if record.kind != SyntaxKind::TemplateLiteralType
+        || record.flags.0 != 0
+        || template.template_spans.has_trailing_comma
+        || head_record.kind != SyntaxKind::TemplateHead
+        || head_record.flags.0 != 0
+        || head_record.parent != Some(pattern.node)
+        || head_data.token_flags.0 != 0
+        || head_data.template_flags.0 != 0
+        || span_record.kind != SyntaxKind::TemplateLiteralTypeSpan
+        || span_record.flags.0 != 0
+        || span_record.parent != Some(pattern.node)
+        || placeholder_record.kind != SyntaxKind::StringKeyword
+        || placeholder_record.flags.0 != 0
+        || placeholder_record.parent != Some(span.node)
+        || !matches!(placeholder_record.data, NodeData::KeywordTypeNode(_))
+        || tail_record.kind != SyntaxKind::TemplateTail
+        || tail_record.flags.0 != 0
+        || tail_record.parent != Some(span.node)
+        || tail_data.token_flags.0 != 0
+        || tail_data.template_flags.0 != 0
+        || head_data.text.is_empty() && tail_data.text.is_empty()
+        || head_record.range.start < record.range.start
+        || head_record.range.end > placeholder_record.range.start
+        || placeholder_record.range.end > tail_record.range.start
+        || tail_record.range.end > record.range.end
+    {
+        return Err(unsupported());
+    }
+
+    let matches = name
+        .strip_prefix(&head_data.text)
+        .is_some_and(|remaining| remaining.ends_with(&tail_data.text));
+    if let Some(links) = store.type_node_links(pattern) {
+        if links.outer_type_parameters.is_some() {
+            return Err(ConcreteIndexedAccessError::InvalidCache(pattern));
+        }
+        if let Some(key_type) = links.resolved_type
+            && (!is_template_pattern_index_key(store, key_type)
+                || template_pattern_index_matches_name(store, key_type, name) != matches)
+        {
+            return Err(ConcreteIndexedAccessError::InvalidCache(pattern));
+        }
+    }
+    Ok(matches)
+}
+
 fn select_concrete_member(
     store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
     object: &PropertyObjectPlan,
     key: &ConcreteIndexKey,
     index: NodeRef,
@@ -809,30 +946,45 @@ fn select_concrete_member(
 
     let mut string = None;
     let mut number = None;
+    let mut template = None;
     for (slot, planned) in object.indexes.iter().enumerate() {
         let target = match store.source_node_kind(planned.key_type_node) {
-            Some(SyntaxKind::StringKeyword) => &mut string,
-            Some(SyntaxKind::NumberKeyword) => &mut number,
+            Some(SyntaxKind::StringKeyword) => Some(&mut string),
+            Some(SyntaxKind::NumberKeyword) => Some(&mut number),
+            Some(SyntaxKind::TemplateLiteralType) => {
+                let ConcreteIndexKey::StringLiteral { value, .. } = key else {
+                    continue;
+                };
+                if template_pattern_syntax_matches_name(store, host, planned.key_type_node, value)?
+                {
+                    Some(&mut template)
+                } else {
+                    None
+                }
+            }
             _ => {
                 return Err(ConcreteIndexedAccessError::UnsupportedObjectSurface(
                     object.node,
                 ));
             }
         };
-        if target.replace(slot).is_some() {
+        if target.is_some_and(|target| target.replace(slot).is_some()) {
             return Err(ConcreteIndexedAccessError::UnsupportedObjectSurface(
                 object.node,
             ));
         }
     }
-    let (slot, kind) = if key.number_applicable() {
-        number
-            .map(|slot| (slot, PlannedIndexKind::Number))
-            .or_else(|| string.map(|slot| (slot, PlannedIndexKind::String)))
-    } else {
-        string.map(|slot| (slot, PlannedIndexKind::String))
+    let number = number.filter(|_| key.number_applicable());
+    if number.is_some() && template.is_some() {
+        return Err(ConcreteIndexedAccessError::UnsupportedObjectSurface(
+            object.node,
+        ));
     }
-    .ok_or(ConcreteIndexedAccessError::MissingIndexSignature(index))?;
+    let (slot, kind) = template
+        .map(|slot| (slot, PlannedIndexKind::Template))
+        .or_else(|| number.map(|slot| (slot, PlannedIndexKind::Number)))
+        .or_else(|| string.map(|slot| (slot, PlannedIndexKind::String)))
+        .ok_or(ConcreteIndexedAccessError::MissingIndexSignature(index))?;
     Ok(ConcreteIndexedSelection::Index { slot, kind })
 }
 
@@ -1029,6 +1181,27 @@ fn resolved_selection_type(
                 let expected_key = match kind {
                     PlannedIndexKind::String => bootstrap.string_type,
                     PlannedIndexKind::Number => bootstrap.number_type,
+                    PlannedIndexKind::Template => {
+                        let key_type = store
+                            .type_node_links(plan.object_plan.indexes[slot].key_type_node)
+                            .and_then(|links| links.resolved_type)
+                            .ok_or(ConcreteIndexedAccessError::InvalidCache(
+                                plan.object_literal,
+                            ))?;
+                        let ConcreteIndexKey::StringLiteral { value, .. } = &plan.key else {
+                            return Err(ConcreteIndexedAccessError::InvalidCache(
+                                plan.object_literal,
+                            ));
+                        };
+                        if !is_template_pattern_index_key(store, key_type)
+                            || !template_pattern_index_matches_name(store, key_type, value)
+                        {
+                            return Err(ConcreteIndexedAccessError::InvalidCache(
+                                plan.object_literal,
+                            ));
+                        }
+                        key_type
+                    }
                 };
                 if info.key_type() != expected_key
                     || info.declaration() != Some(plan.object_plan.indexes[slot].declaration)
@@ -1048,15 +1221,63 @@ fn resolved_selection_type(
 
 #[cfg(test)]
 mod tests {
-    use ts_binder::{CheckFlags, EscapedName, SymbolFlags};
+    use ts_ast::{FileId, NodeData, NodeRef, SyntaxKind};
+    use ts_binder::{
+        CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
+        CheckFlags, EscapedName, SymbolFlags,
+    };
+    use ts_parser::{ParseResult, parse_source_file};
 
     use super::{
         AccessFlags, get_deferred_indexed_access_type, is_template_pattern_index_key,
         template_pattern_index_matches_name,
     };
     use crate::semantic::{
-        CanonicalTypeMapperStore, DeclaredTypeLinks, IntrinsicBootstrapOptions, TypeData, TypeId,
+        CanonicalCheckerContext, CanonicalCheckerOptions, CanonicalTypeMapperStore,
+        DeclaredTypeLinks, IntrinsicBootstrapOptions, TypeData, TypeId,
     };
+
+    fn checker_context(parsed: &ParseResult) -> CanonicalCheckerContext<'_> {
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(0);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/indexed-access-unit.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap()
+    }
+
+    fn indexed_access_node(parsed: &ParseResult) -> NodeRef {
+        parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::IndexedAccessType).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    FileId::new(0),
+                    node,
+                ))
+            })
+            .expect("the source must contain one indexed-access type")
+    }
 
     fn owned_type_parameter(store: &mut CanonicalTypeMapperStore, name: &str) -> TypeId {
         let symbol = store.alloc_transient_symbol(
@@ -1148,6 +1369,165 @@ mod tests {
             None,
         );
         assert_eq!(store.type_len(), poisoned);
+    }
+
+    #[test]
+    fn concrete_template_pattern_index_resolves_and_replays_without_allocations() {
+        let parsed =
+            parse_source_file("type Value = { [name: `do-${string}`]: number }['do-click'];");
+        let indexed = indexed_access_node(&parsed);
+        let mut context = checker_context(&parsed);
+        let expected = context.store().intrinsic_bootstrap().unwrap().number_type;
+
+        assert_eq!(context.get_type_from_type_node(indexed), Ok(expected));
+        let NodeData::IndexedAccessTypeNode(access) = &parsed.arena.get(indexed.node).unwrap().data
+        else {
+            unreachable!("the fixture retained its indexed-access node")
+        };
+        let object = NodeRef::new(indexed.arena, indexed.file, access.object_type);
+        let object_type = context
+            .store()
+            .type_node_links(object)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let TypeData::Object(object_record) =
+            context.store().type_payload(object_type).unwrap().data()
+        else {
+            panic!("the template index belongs to an anonymous type literal")
+        };
+        let [index] = object_record.structured.index_infos.as_deref().unwrap() else {
+            panic!("the literal publishes exactly one template index")
+        };
+        let index = context.store().index_info(*index).unwrap();
+        assert!(is_template_pattern_index_key(
+            context.store(),
+            index.key_type(),
+        ));
+        assert_eq!(index.value_type(), expected);
+        let warm = (
+            context.store().type_len(),
+            context.store().index_info_len(),
+            context.store().checker_link_allocated_lengths(),
+            context.store().type_node_links(indexed).cloned(),
+        );
+
+        assert_eq!(context.get_type_from_type_node(indexed), Ok(expected));
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().index_info_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.store().type_node_links(indexed).cloned(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn concrete_template_indexes_preserve_exact_property_and_string_fallback_order() {
+        for (source, expected_string) in [
+            (
+                concat!(
+                    "type Value = { ",
+                    "[name: `do-${string}`]: number; ",
+                    "'ns:thing': string; ",
+                    "}['ns:thing'];",
+                ),
+                true,
+            ),
+            (
+                concat!(
+                    "type Value = { ",
+                    "[name: string]: string | number; ",
+                    "[name: `do-${string}`]: number; ",
+                    "}['do-click'];",
+                ),
+                false,
+            ),
+            (
+                concat!(
+                    "type Value = { ",
+                    "[name: string]: string | number; ",
+                    "[name: `do-${string}`]: number; ",
+                    "}['other'];",
+                ),
+                true,
+            ),
+            (
+                "type Value = { [name: `${string}-ready`]: string }['widget-ready'];",
+                true,
+            ),
+        ] {
+            let parsed = parse_source_file(source);
+            let indexed = indexed_access_node(&parsed);
+            let mut context = checker_context(&parsed);
+            let (string, number) = {
+                let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+                (bootstrap.string_type, bootstrap.number_type)
+            };
+            let expected = if expected_string { string } else { number };
+            let resolved = context.get_type_from_type_node(indexed).unwrap();
+            if source.contains("}['other']") {
+                let TypeData::Union(union) = context.store().type_payload(resolved).unwrap().data()
+                else {
+                    panic!("a nonmatching pattern falls back to the string index")
+                };
+                assert!(union.union.types.contains(&string));
+                assert!(union.union.types.contains(&number));
+            } else {
+                assert_eq!(resolved, expected, "source: {source}");
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_template_indexes_fail_before_cache_publication() {
+        for source in [
+            "type Value = { [name: `do-${string}`]: number }['ns:thing'];",
+            concat!(
+                "type Value = { ",
+                "[name: `do-${string}`]: number; ",
+                "'do-click': string; ",
+                "}['do-click'];",
+            ),
+            concat!(
+                "type Value = { ",
+                "[name: string]: number; ",
+                "[name: `do-${string}`]: string; ",
+                "}['do-click'];",
+            ),
+            concat!(
+                "type Value = { ",
+                "[name: `do-${string}`]: number; ",
+                "[name: `${string}-ready`]: string; ",
+                "}['do-ready'];",
+            ),
+            "type Value = { [name: `id-${number}`]: string }['id-1'];",
+        ] {
+            let parsed = parse_source_file(source);
+            let indexed = indexed_access_node(&parsed);
+            let mut context = checker_context(&parsed);
+            let before = (
+                context.store().type_len(),
+                context.store().index_info_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+
+            assert!(
+                context.get_type_from_type_node(indexed).is_err(),
+                "source: {source}",
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().index_info_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                before,
+                "source: {source}",
+            );
+            assert!(context.store().type_node_links(indexed).is_none());
+        }
     }
 
     #[test]

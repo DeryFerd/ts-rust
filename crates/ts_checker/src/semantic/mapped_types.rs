@@ -16,8 +16,8 @@ use ts_binder::{
 use xxhash_rust::xxh3::Xxh3;
 
 use super::{
-    CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, TypeId, TypeResolutionTarget,
-    TypeSystemPropertyName,
+    CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, TypeId, TypeMapperId,
+    TypeResolutionTarget, TypeSystemPropertyName,
     bootstrap::{LiteralTypeCacheError, PreparedTypeQueryTypes},
     declared::{
         cached_ordinary_type_parameter_owner, preflight_node, preflight_type_parameter_symbol,
@@ -27,6 +27,10 @@ use super::{
     instantiate::{
         InstantiationError, InstantiationLimits, InstantiationSession, canonical_anonymous_union,
         instantiate_type_with_session,
+    },
+    keyof_types::{
+        NongenericKeyofError, cached_nongeneric_keyof_type, plan_nongeneric_keyof_type,
+        resolve_nongeneric_keyof_type,
     },
     links::{MappedSymbolLinks, TypeNodeLinks, ValueSymbolLinks},
     mapper::TypeMapperApplication,
@@ -526,6 +530,15 @@ struct RecordMappedAliasShape {
     key_argument: TypeId,
     value_argument: TypeId,
     modifiers_type: TypeId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HomomorphicMappedAliasShape {
+    declaration: NodeRef,
+    symbol: SemanticSymbolId,
+    parameter: TypeId,
+    parameter_symbol: SemanticSymbolId,
+    source_argument: TypeId,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1312,6 +1325,227 @@ impl CanonicalTypeMapperStore {
         Ok(())
     }
 
+    /// Instantiates an authenticated `{ [K in keyof T]: T[K] }` alias.
+    ///
+    /// The concrete source supplies both the canonical `keyof` constraint and
+    /// the property modifiers. Indexed values remain unresolved until their
+    /// mapped property is requested.
+    #[allow(dead_code)] // The generic-alias router is maintained separately.
+    pub(super) fn instantiate_homomorphic_mapped_alias(
+        &mut self,
+        alias: SemanticSymbolId,
+        declared_type: TypeId,
+        type_parameters: &[TypeId],
+        type_arguments: &[TypeId],
+        modifiers: MappedTypeModifiers,
+    ) -> Result<TypeId, MappedTypeError> {
+        let shape = validate_homomorphic_mapped_alias_request(
+            self,
+            alias,
+            declared_type,
+            type_parameters,
+            type_arguments,
+            modifiers,
+        )?;
+        if type_arguments == type_parameters {
+            return Ok(declared_type);
+        }
+
+        let key_plan = plan_nongeneric_keyof_type(self, shape.source_argument)
+            .map_err(|error| mapped_keyof_error(shape.source_argument, error))?;
+        cached_nongeneric_keyof_type(self, &key_plan)
+            .map_err(|error| mapped_keyof_error(shape.source_argument, error))?;
+        if !self.try_reserve_types(3) || !self.try_reserve_mappers(3) {
+            return Err(MappedTypeError::Capacity);
+        }
+        let constraint = resolve_nongeneric_keyof_type(self, &key_plan)
+            .map_err(|error| mapped_keyof_error(shape.source_argument, error))?;
+
+        let outer_mapper = self
+            .new_type_mapper(type_parameters.to_vec(), type_arguments.to_vec())
+            .ok_or(MappedTypeError::InvalidMappedType(declared_type))?;
+        let parameter = self
+            .alloc_type_parameter(Some(shape.parameter_symbol))
+            .ok_or(MappedTypeError::Capacity)?;
+        let parameter_mapper = self
+            .new_simple_type_mapper(shape.parameter, parameter)
+            .ok_or(MappedTypeError::InvalidTypeParameter(shape.parameter))?;
+        let mapper = self
+            .combine_type_mappers(Some(parameter_mapper), outer_mapper)
+            .ok_or(MappedTypeError::InvalidMappedType(declared_type))?;
+        if !self.set_type_parameter_resolution(
+            parameter,
+            Some(constraint),
+            Some(shape.parameter),
+            Some(mapper),
+            None,
+        ) {
+            return Err(MappedTypeError::InvalidTypeParameter(parameter));
+        }
+
+        let template = self
+            .alloc_indexed_access_type(shape.source_argument, parameter, AccessFlags::NONE)
+            .ok_or(MappedTypeError::Capacity)?;
+        let instantiated = self
+            .alloc_mapped_type(
+                ObjectFlags::INSTANTIATED_MAPPED,
+                Some(shape.symbol),
+                Some(shape.declaration),
+            )
+            .ok_or(MappedTypeError::Capacity)?;
+        if !self.set_object_target_and_mapper(instantiated, Some(declared_type), Some(mapper))
+            || !self.set_mapped_type_resolution(
+                instantiated,
+                Some(shape.declaration),
+                Some(parameter),
+                Some(constraint),
+                None,
+                Some(template),
+                Some(shape.source_argument),
+                None,
+                false,
+            )
+        {
+            return Err(MappedTypeError::InvalidMappedType(instantiated));
+        }
+
+        self.validate_homomorphic_mapped_alias_instantiation(
+            alias,
+            declared_type,
+            type_parameters,
+            type_arguments,
+            instantiated,
+            modifiers,
+        )?;
+        Ok(instantiated)
+    }
+
+    /// Checks a homomorphic alias clone and any published mapped members.
+    #[allow(dead_code)] // The generic-alias router is maintained separately.
+    pub(super) fn validate_homomorphic_mapped_alias_instantiation(
+        &self,
+        alias: SemanticSymbolId,
+        declared_type: TypeId,
+        type_parameters: &[TypeId],
+        type_arguments: &[TypeId],
+        instantiated: TypeId,
+        modifiers: MappedTypeModifiers,
+    ) -> Result<(), MappedTypeError> {
+        let shape = validate_homomorphic_mapped_alias_request(
+            self,
+            alias,
+            declared_type,
+            type_parameters,
+            type_arguments,
+            modifiers,
+        )?;
+        if type_arguments == type_parameters {
+            return if instantiated == declared_type {
+                Ok(())
+            } else {
+                Err(MappedTypeError::InvalidMappedType(instantiated))
+            };
+        }
+
+        let key_plan = plan_nongeneric_keyof_type(self, shape.source_argument)
+            .map_err(|error| mapped_keyof_error(shape.source_argument, error))?;
+        let constraint = cached_nongeneric_keyof_type(self, &key_plan)
+            .map_err(|error| mapped_keyof_error(shape.source_argument, error))?
+            .ok_or(MappedTypeError::InvalidMappedType(instantiated))?;
+        let record = self
+            .type_payload(instantiated)
+            .ok_or(MappedTypeError::InvalidMappedType(instantiated))?;
+        let TypeData::Mapped(mapped) = record.data() else {
+            return Err(MappedTypeError::InvalidMappedType(instantiated));
+        };
+        let parameter = mapped
+            .type_parameter
+            .ok_or(MappedTypeError::InvalidMappedType(instantiated))?;
+        let type_mapper = mapped
+            .object
+            .mapper
+            .ok_or(MappedTypeError::InvalidMappedType(instantiated))?;
+        let Some(TypeMapperApplication::Composite { first, second }) =
+            self.mapper_application(type_mapper, shape.parameter)
+        else {
+            return Err(MappedTypeError::InvalidMappedType(instantiated));
+        };
+        let Some(TypeData::IndexedAccess(template)) = mapped
+            .template_type
+            .and_then(|template| self.type_payload(template))
+            .map(TypeRecord::data)
+        else {
+            return Err(MappedTypeError::InvalidMappedType(instantiated));
+        };
+        let allowed_flags = ObjectFlags::INSTANTIATED_MAPPED
+            | ObjectFlags::MEMBERS_RESOLVED
+            | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
+            | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES
+            | ObjectFlags::PROPAGATING_FLAGS;
+        if record.flags() != TypeFlags::OBJECT
+            || !record
+                .object_flags()
+                .contains(ObjectFlags::INSTANTIATED_MAPPED)
+            || !(record.object_flags() & !allowed_flags).is_empty()
+            || record.alias().is_some_and(|identity| {
+                self.type_alias(identity).is_none_or(|identity| {
+                    let Some(symbol) = identity.symbol() else {
+                        return true;
+                    };
+                    self.get_merged_symbol(symbol) != Some(symbol)
+                        || self
+                            .symbol(symbol)
+                            .is_none_or(|record| record.flags() != SymbolFlags::TYPE_ALIAS)
+                        || identity.type_arguments().is_none_or(|arguments| {
+                            arguments
+                                .iter()
+                                .any(|argument| self.type_payload(*argument).is_none())
+                                || symbol == alias && arguments != type_arguments
+                        })
+                })
+            })
+            || record.symbol() != Some(shape.symbol)
+            || mapped.declaration != Some(shape.declaration)
+            || mapped.object.target != Some(declared_type)
+            || mapped.object.instantiations != TypeCacheState::Unallocated
+            || mapped.constraint_type != Some(constraint)
+            || mapped.modifiers_type != Some(shape.source_argument)
+            || mapped.name_type.is_some()
+            || mapped.contains_error
+            || parameter == shape.parameter
+            || mapped_type_parameter_owner(self, instantiated, parameter)
+                != Some(shape.parameter_symbol)
+            || self.type_mapper_has_exact_endpoints(first, &[shape.parameter], &[parameter])
+                != Some(true)
+            || self.type_mapper_has_exact_endpoints(second, type_parameters, type_arguments)
+                != Some(true)
+            || template.object_type != shape.source_argument
+            || template.index_type != parameter
+            || template.access_flags != AccessFlags::NONE
+        {
+            return Err(MappedTypeError::InvalidMappedType(instantiated));
+        }
+
+        if record
+            .object_flags()
+            .contains(ObjectFlags::MEMBERS_RESOLVED)
+        {
+            let member_shape = validate_mapped_shape(self, instantiated)
+                .map_err(|_| MappedTypeError::InvalidMappedType(instantiated))?;
+            let (properties, indexes) = plan_mapped_members(self, &member_shape, modifiers)
+                .map_err(|_| MappedTypeError::InvalidMappedType(instantiated))?;
+            if !matches!(
+                validate_warm_mapped_members(self, &member_shape, &properties, &indexes),
+                Ok(Some(_))
+            ) {
+                return Err(MappedTypeError::InvalidMappedType(instantiated));
+            }
+        } else if mapped.object.structured != StructuredTypeData::default() {
+            return Err(MappedTypeError::InvalidMappedType(instantiated));
+        }
+        Ok(())
+    }
+
     /// Publishes or validates the lazy property symbols of one mapped type.
     ///
     /// # Errors
@@ -1579,6 +1813,177 @@ fn finite_record_mapped_shape(
         return Err(MappedTypeError::UnsupportedConstraint(key));
     }
     Ok((declaration, shape, properties))
+}
+
+fn validate_homomorphic_mapped_alias_request(
+    store: &CanonicalTypeMapperStore,
+    alias: SemanticSymbolId,
+    declared_type: TypeId,
+    type_parameters: &[TypeId],
+    type_arguments: &[TypeId],
+    modifiers: MappedTypeModifiers,
+) -> Result<HomomorphicMappedAliasShape, MappedTypeError> {
+    if !modifiers.valid() {
+        return Err(MappedTypeError::InvalidModifiers);
+    }
+    let [source_parameter] = type_parameters else {
+        return Err(MappedTypeError::InvalidSymbol(alias));
+    };
+    let [source_argument] = type_arguments else {
+        return Err(MappedTypeError::InvalidSymbol(alias));
+    };
+    let alias_record = store
+        .symbol(alias)
+        .ok_or(MappedTypeError::InvalidSymbol(alias))?;
+    let Some([alias_declaration]) = alias_record.declarations() else {
+        return Err(MappedTypeError::InvalidSymbol(alias));
+    };
+    let links = store
+        .type_alias_links(alias)
+        .ok_or(MappedTypeError::InvalidSymbol(alias))?;
+    if alias_record.flags() != SymbolFlags::TYPE_ALIAS
+        || store.get_merged_symbol(alias) != Some(alias)
+        || store.source_node_kind(*alias_declaration) != Some(SyntaxKind::TypeAliasDeclaration)
+        || links.declared_type != Some(declared_type)
+        || links.type_parameters.as_deref() != Some(type_parameters)
+        || links.instantiations.as_ref().is_none_or(|instantiations| {
+            instantiations.get(&type_list_key(type_parameters)) != Some(&declared_type)
+                || instantiations
+                    .values()
+                    .any(|instantiation| store.type_payload(*instantiation).is_none())
+        })
+    {
+        return Err(MappedTypeError::InvalidSymbol(alias));
+    }
+
+    let source_owner = cached_ordinary_type_parameter_owner(store, *source_parameter)
+        .ok_or(MappedTypeError::InvalidTypeParameter(*source_parameter))?;
+    let Some([source_declaration]) = store
+        .symbol(source_owner)
+        .and_then(|owner| owner.declarations())
+    else {
+        return Err(MappedTypeError::InvalidTypeParameter(*source_parameter));
+    };
+    if store.source_node_parent(*source_declaration)
+        != Some(SourceNodeParent::Parent(*alias_declaration))
+    {
+        return Err(MappedTypeError::InvalidTypeParameter(*source_parameter));
+    }
+
+    let record = store
+        .type_payload(declared_type)
+        .ok_or(MappedTypeError::InvalidMappedType(declared_type))?;
+    let TypeData::Mapped(mapped) = record.data() else {
+        return Err(MappedTypeError::InvalidMappedType(declared_type));
+    };
+    let declaration = mapped
+        .declaration
+        .ok_or(MappedTypeError::InvalidMappedType(declared_type))?;
+    let symbol = record
+        .symbol()
+        .ok_or(MappedTypeError::InvalidMappedType(declared_type))?;
+    let parameter = mapped
+        .type_parameter
+        .ok_or(MappedTypeError::InvalidMappedType(declared_type))?;
+    let parameter_symbol = cached_ordinary_type_parameter_owner(store, parameter)
+        .ok_or(MappedTypeError::InvalidTypeParameter(parameter))?;
+    let constraint = mapped
+        .constraint_type
+        .ok_or(MappedTypeError::InvalidMappedType(declared_type))?;
+    let constraint_record = store
+        .type_payload(constraint)
+        .ok_or(MappedTypeError::InvalidMappedType(declared_type))?;
+    let TypeData::Index(index) = constraint_record.data() else {
+        return Err(MappedTypeError::InvalidMappedType(declared_type));
+    };
+    let template = mapped
+        .template_type
+        .ok_or(MappedTypeError::InvalidMappedType(declared_type))?;
+    let template_record = store
+        .type_payload(template)
+        .ok_or(MappedTypeError::InvalidMappedType(declared_type))?;
+    let TypeData::IndexedAccess(indexed) = template_record.data() else {
+        return Err(MappedTypeError::UnsupportedTemplate(template));
+    };
+    let Some([parameter_declaration]) = store
+        .symbol(parameter_symbol)
+        .and_then(|owner| owner.declarations())
+    else {
+        return Err(MappedTypeError::InvalidTypeParameter(parameter));
+    };
+    let Some(TypeData::TypeParameter(mapped_parameter)) =
+        store.type_payload(parameter).map(TypeRecord::data)
+    else {
+        return Err(MappedTypeError::InvalidTypeParameter(parameter));
+    };
+
+    if record.flags() != TypeFlags::OBJECT
+        || !record.object_flags().contains(ObjectFlags::MAPPED)
+        || record.object_flags().contains(ObjectFlags::INSTANTIATED)
+        || record.alias().is_some()
+        || store.source_node_kind(declaration) != Some(SyntaxKind::MappedType)
+        || store.source_node_parent(declaration)
+            != Some(SourceNodeParent::Parent(*alias_declaration))
+        || store
+            .type_node_links(declaration)
+            .and_then(|links| links.resolved_type)
+            != Some(declared_type)
+        || mapped.object.target.is_some()
+        || mapped.object.mapper.is_some()
+        || mapped.object.instantiations != TypeCacheState::Unallocated
+        || mapped.modifiers_type != Some(*source_parameter)
+        || mapped.name_type.is_some()
+        || mapped.contains_error
+        || constraint_record.flags() != TypeFlags::INDEX
+        || constraint_record.object_flags() != ObjectFlags::NONE
+        || constraint_record.symbol().is_some()
+        || constraint_record.alias().is_some()
+        || index.target != *source_parameter
+        || index.index_flags != IndexFlags::NONE
+        || template_record.flags() != TypeFlags::INDEXED_ACCESS
+        || template_record.object_flags() != ObjectFlags::NONE
+        || template_record.symbol().is_some()
+        || template_record.alias().is_some()
+        || indexed.object_type != *source_parameter
+        || indexed.index_type != parameter
+        || indexed.access_flags != AccessFlags::NONE
+        || store.source_node_parent(*parameter_declaration)
+            != Some(SourceNodeParent::Parent(declaration))
+        || store.source_node_kind(*parameter_declaration) != Some(SyntaxKind::TypeParameter)
+        || mapped_parameter.constraint != Some(constraint)
+        || store.symbol(symbol).is_none_or(|owner| {
+            owner.flags() != SymbolFlags::TYPE_LITERAL
+                || !owner
+                    .declarations()
+                    .is_some_and(|declarations| declarations.contains(&declaration))
+        })
+        || store.get_merged_symbol(symbol) != Some(symbol)
+    {
+        return Err(MappedTypeError::InvalidMappedType(declared_type));
+    }
+
+    if source_argument != source_parameter {
+        let source = store
+            .type_payload(*source_argument)
+            .ok_or(MappedTypeError::InvalidSource(*source_argument))?;
+        if source.flags() != TypeFlags::OBJECT
+            || !source
+                .object_flags()
+                .contains(ObjectFlags::MEMBERS_RESOLVED)
+        {
+            return Err(MappedTypeError::UnsupportedSource(*source_argument));
+        }
+        source_properties(store, *source_argument)?;
+        source_indexes(store, *source_argument)?;
+    }
+
+    Ok(HomomorphicMappedAliasShape {
+        declaration,
+        symbol,
+        parameter,
+        parameter_symbol,
+        source_argument: *source_argument,
+    })
 }
 
 fn validate_record_mapped_alias_request(
@@ -2199,10 +2604,60 @@ fn mapped_type_parameter_owner(
         && record.symbol() == store.type_payload(target)?.symbol()
         && store.type_mapper_has_exact_endpoints(first, &[original_parameter], &[parameter])
             == Some(true)
-        && store.map_type(second, original.constraint_type?) == mapped.constraint_type
-        && store.map_type(second, original.template_type?) == mapped.template_type
+        && mapped_instantiated_operand_matches(
+            store,
+            second,
+            original.constraint_type?,
+            mapped.constraint_type?,
+            original_parameter,
+            parameter,
+        )
+        && mapped_instantiated_operand_matches(
+            store,
+            second,
+            original.template_type?,
+            mapped.template_type?,
+            original_parameter,
+            parameter,
+        )
         && store.map_type(second, original.modifiers_type?) == mapped.modifiers_type)
         .then_some(owner)
+}
+
+fn mapped_instantiated_operand_matches(
+    store: &CanonicalTypeMapperStore,
+    mapper: TypeMapperId,
+    original: TypeId,
+    instantiated: TypeId,
+    original_parameter: TypeId,
+    instantiated_parameter: TypeId,
+) -> bool {
+    if store.map_type(mapper, original) == Some(instantiated) {
+        return true;
+    }
+
+    match (
+        store.type_payload(original).map(TypeRecord::data),
+        store.type_payload(instantiated).map(TypeRecord::data),
+    ) {
+        (Some(TypeData::Index(index)), _) if index.index_flags == IndexFlags::NONE => {
+            let Some(source) = store.map_type(mapper, index.target) else {
+                return false;
+            };
+            plan_nongeneric_keyof_type(store, source)
+                .ok()
+                .and_then(|plan| cached_nongeneric_keyof_type(store, &plan).ok())
+                == Some(Some(instantiated))
+        }
+        (Some(TypeData::IndexedAccess(original)), Some(TypeData::IndexedAccess(instantiated))) => {
+            original.index_type == original_parameter
+                && instantiated.index_type == instantiated_parameter
+                && original.access_flags == AccessFlags::NONE
+                && instantiated.access_flags == AccessFlags::NONE
+                && store.map_type(mapper, original.object_type) == Some(instantiated.object_type)
+        }
+        _ => false,
+    }
 }
 
 fn source_properties(
@@ -2475,12 +2930,6 @@ fn mapped_index_value_type(
     let template = store
         .type_payload(shape.template_type)
         .ok_or(MappedTypeError::UnsupportedTemplate(shape.template_type))?;
-    if store
-        .type_payload(shape.type_)
-        .is_some_and(|record| record.object_flags().contains(ObjectFlags::INSTANTIATED))
-    {
-        return Ok(shape.template_type);
-    }
     match template.data() {
         TypeData::IndexedAccess(indexed)
             if indexed.object_type == shape.modifiers_type
@@ -2489,6 +2938,12 @@ fn mapped_index_value_type(
             source
                 .map(|index| index.value_type)
                 .ok_or(MappedTypeError::UnsupportedTemplate(shape.template_type))
+        }
+        _ if store
+            .type_payload(shape.type_)
+            .is_some_and(|record| record.object_flags().contains(ObjectFlags::INSTANTIATED)) =>
+        {
+            Ok(shape.template_type)
         }
         TypeData::Intrinsic(_) | TypeData::Literal(_) => Ok(shape.template_type),
         _ => Err(MappedTypeError::UnsupportedTemplate(shape.template_type)),
@@ -3249,13 +3704,6 @@ fn instantiate_mapped_template(
     let template = store
         .type_payload(shape.template_type)
         .ok_or(MappedTypeError::UnsupportedTemplate(shape.template_type))?;
-    if shape.template_type != shape.type_parameter
-        && store
-            .type_payload(shape.type_)
-            .is_some_and(|record| record.object_flags().contains(ObjectFlags::INSTANTIATED))
-    {
-        return Ok(shape.template_type);
-    }
     let indexed = match template.data() {
         TypeData::IndexedAccess(indexed)
             if indexed.object_type == shape.modifiers_type
@@ -3270,6 +3718,13 @@ fn instantiate_mapped_template(
     };
     if indexed.is_some() {
         return indexed_mapped_template(store, shape, key_type);
+    }
+    if shape.template_type != shape.type_parameter
+        && store
+            .type_payload(shape.type_)
+            .is_some_and(|record| record.object_flags().contains(ObjectFlags::INSTANTIATED))
+    {
+        return Ok(shape.template_type);
     }
     if shape.template_type == shape.type_parameter {
         return Ok(key_type);
@@ -3437,6 +3892,21 @@ fn set_mapped_contains_error(
     Ok(())
 }
 
+fn mapped_keyof_error(source: TypeId, error: NongenericKeyofError) -> MappedTypeError {
+    match error {
+        NongenericKeyofError::LiteralCache(error) => mapped_cache_error(error),
+        NongenericKeyofError::InvalidType(_)
+        | NongenericKeyofError::MalformedObject(_)
+        | NongenericKeyofError::InvalidCachedResult(_)
+        | NongenericKeyofError::CachePublication(_) => MappedTypeError::InvalidSource(source),
+        NongenericKeyofError::UnsupportedObject(_)
+        | NongenericKeyofError::UnsupportedPropertyName { .. }
+        | NongenericKeyofError::PropertiesCacheRequired { .. } => {
+            MappedTypeError::UnsupportedSource(source)
+        }
+    }
+}
+
 fn mapped_cache_error(error: LiteralTypeCacheError) -> MappedTypeError {
     match error {
         LiteralTypeCacheError::BootstrapUninitialized => MappedTypeError::BootstrapUninitialized,
@@ -3484,8 +3954,10 @@ mod tests {
         declared::{execute_type_parameter, type_list_key},
         keyof_types::{cached_nongeneric_keyof_type, plan_nongeneric_keyof_type},
         links::TypeAliasLinks,
+        object_members,
+        signatures::IndexFlags,
         type_records::{LiteralValue, TypeCacheState},
-        types::ObjectFlags,
+        types::{AccessFlags, ObjectFlags},
     };
 
     fn checker_context(parsed: &ParseResult) -> CanonicalCheckerContext<'_> {
@@ -3657,6 +4129,143 @@ mod tests {
         (alias, declared, parameters)
     }
 
+    fn homomorphic_mapped_fixture(
+        parsed: &ParseResult,
+        context: &mut CanonicalCheckerContext<'_>,
+    ) -> (
+        SemanticSymbolId,
+        TypeId,
+        [TypeId; 1],
+        TypeId,
+        MappedTypeModifiers,
+    ) {
+        let file = FileId::new(0);
+        let (interface_node, alias_node, alias_data) =
+            {
+                let interface =
+                    parsed
+                        .arena
+                        .iter()
+                        .find_map(|(node, record)| {
+                            (record.kind == SyntaxKind::InterfaceDeclaration)
+                                .then_some(NodeRef::new(parsed.arena.id(), file, node))
+                        })
+                        .unwrap();
+                let (alias_node, alias_data) = parsed
+                    .arena
+                    .iter()
+                    .find_map(|(node, record)| match &record.data {
+                        NodeData::TypeAliasDeclaration(alias) => {
+                            Some((NodeRef::new(parsed.arena.id(), file, node), alias))
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                (interface, alias_node, alias_data)
+            };
+        let mapped_node = NodeRef::new(alias_node.arena, alias_node.file, alias_data.type_);
+        let NodeData::MappedTypeNode(mapped) = &parsed.arena.get(mapped_node.node).unwrap().data
+        else {
+            panic!("the homomorphic alias must retain a mapped declaration")
+        };
+        let [outer_node] = alias_data
+            .type_parameters
+            .as_ref()
+            .unwrap()
+            .nodes
+            .as_slice()
+        else {
+            panic!("the homomorphic alias must have one type parameter")
+        };
+        let parameter_node =
+            NodeRef::new(mapped_node.arena, mapped_node.file, mapped.type_parameter);
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new([(&parsed.arena, &bound)]).unwrap();
+        let source_symbol = bound.symbol(interface_node).unwrap();
+        let source_plan = object_members::plan_interface(context.store(), &host, source_symbol)
+            .expect("the source interface must retain an authenticated member plan");
+        let mapped_plan = plan_mapped_type_declaration(context.store(), &host, mapped_node)
+            .expect("the mapped declaration must retain its keyof and indexed operands");
+        let alias = bound.symbol(alias_node).unwrap();
+        let symbol = bound.symbol(mapped_node).unwrap();
+        let outer_symbol = bound
+            .symbol(NodeRef::new(alias_node.arena, alias_node.file, *outer_node))
+            .unwrap();
+        let parameter_symbol = bound.symbol(parameter_node).unwrap();
+        let store = context.store_mut_for_test();
+
+        let source = store
+            .get_declared_type_of_symbol(&host, source_symbol)
+            .unwrap();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let (string, number) = (bootstrap.string_type, bootstrap.number_type);
+        let property_types = source_plan
+            .property_type_nodes()
+            .map(|node| match store.source_node_kind(node) {
+                Some(SyntaxKind::StringKeyword) => string,
+                Some(SyntaxKind::NumberKeyword) => number,
+                other => panic!("unexpected homomorphic source property type: {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        let index_types = source_plan
+            .index_type_nodes()
+            .map(|(key, value)| {
+                let key = match store.source_node_kind(key) {
+                    Some(SyntaxKind::StringKeyword) => string,
+                    Some(SyntaxKind::NumberKeyword) => number,
+                    other => panic!("unexpected homomorphic source index key: {other:?}"),
+                };
+                let value = match store.source_node_kind(value) {
+                    Some(SyntaxKind::StringKeyword) => string,
+                    Some(SyntaxKind::NumberKeyword) => number,
+                    other => panic!("unexpected homomorphic source index value: {other:?}"),
+                };
+                (key, value)
+            })
+            .collect::<Vec<_>>();
+        let state = object_members::interface_state(store, &source_plan, source).unwrap();
+        object_members::publish_declared_members(
+            store,
+            &source_plan,
+            state,
+            &property_types,
+            &index_types,
+            &[],
+        )
+        .unwrap();
+
+        let outer = execute_type_parameter(store, outer_symbol);
+        let parameter = execute_type_parameter(store, parameter_symbol);
+        let constraint = store.alloc_index_type(outer, IndexFlags::NONE).unwrap();
+        assert!(
+            store.set_type_parameter_resolution(parameter, Some(constraint), None, None, None,)
+        );
+        let template = store
+            .alloc_indexed_access_type(outer, parameter, AccessFlags::NONE)
+            .unwrap();
+        let declared = store
+            .create_mapped_type(super::MappedTypeRequest::new(
+                mapped_node,
+                symbol,
+                parameter,
+                constraint,
+                template,
+                outer,
+            ))
+            .unwrap();
+        let parameters = [outer];
+        assert!(store.set_type_alias_links(
+            alias,
+            TypeAliasLinks {
+                declared_type: Some(declared),
+                type_parameters: Some(parameters.to_vec()),
+                instantiations: Some(HashMap::from([(type_list_key(&parameters), declared)])),
+                ..TypeAliasLinks::default()
+            },
+        ));
+        (alias, declared, parameters, source, mapped_plan.modifiers())
+    }
+
     fn replace_mapped_name(store: &mut CanonicalTypeMapperStore, mapped: TypeId, name: TypeId) {
         let TypeData::Mapped(record) = store.type_payload(mapped).unwrap().data() else {
             panic!("expected a mapped type");
@@ -3783,6 +4392,308 @@ mod tests {
         assert_eq!(
             plan.modifiers(),
             MappedTypeModifiers::EXCLUDE_READONLY | MappedTypeModifiers::EXCLUDE_OPTIONAL,
+        );
+    }
+
+    #[test]
+    fn homomorphic_aliases_preserve_keyof_origins_and_mapped_property_modifiers() {
+        for (alias, expected_modifiers, fixed_readonly, fixed_optional, optional_optional) in [
+            (
+                "type InferPropsInner<T> = { [K in keyof T]: T[K] };",
+                MappedTypeModifiers::NONE,
+                true,
+                false,
+                true,
+            ),
+            (
+                "type ValidationMap<T> = { [K in keyof T]-?: T[K] };",
+                MappedTypeModifiers::EXCLUDE_OPTIONAL,
+                true,
+                false,
+                false,
+            ),
+            (
+                "type WeakValidationMap<T> = { [K in keyof T]?: T[K] };",
+                MappedTypeModifiers::INCLUDE_OPTIONAL,
+                true,
+                true,
+                true,
+            ),
+            (
+                "type MutableValidationMap<T> = { -readonly [K in keyof T]-?: T[K] };",
+                MappedTypeModifiers::EXCLUDE_READONLY | MappedTypeModifiers::EXCLUDE_OPTIONAL,
+                false,
+                false,
+                false,
+            ),
+        ] {
+            let source = format!(
+                "interface Shape {{ readonly fixed: string; optional?: number }}\n{alias}\n",
+            );
+            let parsed = parse_source_file(&source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let mut context = checker_context(&parsed);
+            let fixed_source = source_property(&parsed, &context, "fixed");
+            let optional_source = source_property(&parsed, &context, "optional");
+            let (symbol, declared, parameters, argument, modifiers) =
+                homomorphic_mapped_fixture(&parsed, &mut context);
+            assert_eq!(modifiers, expected_modifiers);
+            let store = context.store_mut_for_test();
+            let identity_state = (cache_state(store), store.properties_type_cache_len());
+            assert_eq!(
+                store.instantiate_homomorphic_mapped_alias(
+                    symbol,
+                    declared,
+                    &parameters,
+                    &parameters,
+                    modifiers,
+                ),
+                Ok(declared),
+            );
+            assert_eq!(
+                (cache_state(store), store.properties_type_cache_len()),
+                identity_state,
+            );
+
+            let instantiated = store
+                .instantiate_homomorphic_mapped_alias(
+                    symbol,
+                    declared,
+                    &parameters,
+                    &[argument],
+                    modifiers,
+                )
+                .unwrap();
+            let key_plan = plan_nongeneric_keyof_type(store, argument).unwrap();
+            let keys = cached_nongeneric_keyof_type(store, &key_plan)
+                .unwrap()
+                .unwrap();
+            let TypeData::Mapped(mapped) = store.type_payload(instantiated).unwrap().data() else {
+                panic!("the homomorphic instantiation must remain a mapped object")
+            };
+            assert_eq!(mapped.object.target, Some(declared));
+            assert_eq!(mapped.constraint_type, Some(keys));
+            assert_eq!(mapped.modifiers_type, Some(argument));
+
+            let members = store
+                .resolve_mapped_type_members(instantiated, modifiers)
+                .unwrap();
+            assert_eq!(members.properties().len(), 2);
+            let table = store.symbol_table(members.members()).unwrap();
+            let fixed = table.get_source("fixed").unwrap();
+            let optional = table.get_source("optional").unwrap();
+            assert_eq!(
+                store.mapped_symbol_links(fixed).unwrap().synthetic_origin,
+                Some(fixed_source),
+            );
+            assert_eq!(
+                store
+                    .mapped_symbol_links(optional)
+                    .unwrap()
+                    .synthetic_origin,
+                Some(optional_source),
+            );
+            assert_eq!(
+                store.symbol(fixed).unwrap().declarations(),
+                store.symbol(fixed_source).unwrap().declarations(),
+            );
+            assert!(
+                store
+                    .value_symbol_links(fixed)
+                    .unwrap()
+                    .resolved_type
+                    .is_none()
+            );
+            assert!(
+                store
+                    .value_symbol_links(optional)
+                    .unwrap()
+                    .resolved_type
+                    .is_none()
+            );
+
+            let (string, number) = {
+                let bootstrap = store.intrinsic_bootstrap().unwrap();
+                (bootstrap.string_type, bootstrap.number_type)
+            };
+            let fixed = store
+                .resolve_mapped_type_property(instantiated, "fixed", modifiers)
+                .unwrap()
+                .unwrap();
+            assert_eq!(fixed.type_id(), string);
+            assert_eq!(fixed.is_readonly(), fixed_readonly);
+            assert_eq!(fixed.is_optional(), fixed_optional);
+            let optional = store
+                .resolve_mapped_type_property(instantiated, "optional", modifiers)
+                .unwrap()
+                .unwrap();
+            assert_eq!(optional.type_id(), number);
+            assert_eq!(optional.is_optional(), optional_optional);
+
+            let warm = (cache_state(store), store.properties_type_cache_len());
+            assert_eq!(
+                store.validate_homomorphic_mapped_alias_instantiation(
+                    symbol,
+                    declared,
+                    &parameters,
+                    &[argument],
+                    instantiated,
+                    modifiers,
+                ),
+                Ok(()),
+            );
+            assert_eq!(
+                store.resolve_mapped_type_members(instantiated, modifiers),
+                Ok(members),
+            );
+            assert_eq!(
+                (cache_state(store), store.properties_type_cache_len()),
+                warm,
+            );
+        }
+    }
+
+    #[test]
+    fn homomorphic_aliases_preserve_index_values_and_remove_readonly() {
+        let parsed = parse_source_file(concat!(
+            "interface Shape { readonly fixed: number; readonly [name: string]: number }\n",
+            "type ValidationMap<T> = { -readonly [K in keyof T]-?: T[K] };\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut context = checker_context(&parsed);
+        let (alias, declared, parameters, source, modifiers) =
+            homomorphic_mapped_fixture(&parsed, &mut context);
+        let store = context.store_mut_for_test();
+        let instantiated = store
+            .instantiate_homomorphic_mapped_alias(
+                alias,
+                declared,
+                &parameters,
+                &[source],
+                modifiers,
+            )
+            .unwrap();
+        let members = store
+            .resolve_mapped_type_members(instantiated, modifiers)
+            .unwrap();
+        assert_eq!(members.properties().len(), 1);
+        let TypeData::Mapped(mapped) = store.type_payload(instantiated).unwrap().data() else {
+            unreachable!()
+        };
+        let [index] = mapped.object.structured.index_infos.as_deref().unwrap() else {
+            panic!("the source string index must remain on the mapped result")
+        };
+        let index = store.index_info(*index).unwrap();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        assert_eq!(index.key_type(), bootstrap.string_type);
+        assert_eq!(index.value_type(), bootstrap.number_type);
+        assert!(!index.is_readonly());
+
+        let property = store
+            .resolve_mapped_type_property(instantiated, "fixed", modifiers)
+            .unwrap()
+            .unwrap();
+        assert!(!property.is_readonly());
+        assert_eq!(
+            property.type_id(),
+            store.intrinsic_bootstrap().unwrap().number_type,
+        );
+        assert_eq!(
+            store.validate_homomorphic_mapped_alias_instantiation(
+                alias,
+                declared,
+                &parameters,
+                &[source],
+                instantiated,
+                modifiers,
+            ),
+            Ok(()),
+        );
+    }
+
+    #[test]
+    fn homomorphic_aliases_reject_invalid_sources_and_poisoned_clones_without_writes() {
+        let parsed = parse_source_file(concat!(
+            "interface Shape { value: string }\n",
+            "type ValidationMap<T> = { [K in keyof T]-?: T[K] };\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut context = checker_context(&parsed);
+        let (alias, declared, parameters, source, modifiers) =
+            homomorphic_mapped_fixture(&parsed, &mut context);
+        let store = context.store_mut_for_test();
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let before = (cache_state(store), store.properties_type_cache_len());
+        assert_eq!(
+            store.instantiate_homomorphic_mapped_alias(
+                alias,
+                declared,
+                &parameters,
+                &[number],
+                modifiers,
+            ),
+            Err(MappedTypeError::UnsupportedSource(number)),
+        );
+        assert_eq!(
+            store.instantiate_homomorphic_mapped_alias(
+                alias,
+                declared,
+                &parameters,
+                &[source],
+                MappedTypeModifiers::INCLUDE_OPTIONAL | MappedTypeModifiers::EXCLUDE_OPTIONAL,
+            ),
+            Err(MappedTypeError::InvalidModifiers),
+        );
+        assert_eq!(
+            (cache_state(store), store.properties_type_cache_len()),
+            before,
+        );
+
+        let instantiated = store
+            .instantiate_homomorphic_mapped_alias(
+                alias,
+                declared,
+                &parameters,
+                &[source],
+                modifiers,
+            )
+            .unwrap();
+        let parameter = match store.type_payload(instantiated).unwrap().data() {
+            TypeData::Mapped(mapped) => mapped.type_parameter.unwrap(),
+            _ => unreachable!(),
+        };
+        let (target, mapper) = match store.type_payload(parameter).unwrap().data() {
+            TypeData::TypeParameter(parameter) => {
+                (parameter.target.unwrap(), parameter.mapper.unwrap())
+            }
+            _ => unreachable!(),
+        };
+        assert!(store.set_type_parameter_resolution(
+            parameter,
+            Some(number),
+            Some(target),
+            Some(mapper),
+            None,
+        ));
+        let poisoned = (cache_state(store), store.properties_type_cache_len());
+        assert_eq!(
+            store.validate_homomorphic_mapped_alias_instantiation(
+                alias,
+                declared,
+                &parameters,
+                &[source],
+                instantiated,
+                modifiers,
+            ),
+            Err(MappedTypeError::InvalidMappedType(instantiated)),
+        );
+        assert_eq!(
+            store.resolve_mapped_type_members(instantiated, modifiers),
+            Err(MappedTypeError::InvalidTypeParameter(parameter)),
+        );
+        assert_eq!(
+            (cache_state(store), store.properties_type_cache_len()),
+            poisoned,
         );
     }
 

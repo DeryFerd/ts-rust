@@ -1697,6 +1697,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 signature.declaration().is_some_and(|node| {
                     self.node_is_declared_callable_signature(node)
                         || self.node_is_global_interface_method(node)
+                        || self.node_is_interface_method(node)
                 })
             })
     }
@@ -1716,6 +1717,272 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             self.source_node_kind(node),
             Some(SyntaxKind::CallSignature | SyntaxKind::ConstructSignature)
         )
+    }
+
+    /// Authenticates a binder-owned method against its merged interface owner.
+    pub(super) fn authenticated_interface_method_owner(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> Option<(SemanticSymbolId, TypeId)> {
+        let method = self.symbol(symbol)?;
+        let declarations = method.declarations()?;
+        let owner = method
+            .parent()
+            .and_then(|parent| self.get_merged_symbol(parent))?;
+        let interface = self.symbol(owner)?;
+        let owner_declarations = interface.declarations()?;
+        let interface_type = self.declared_type_links(owner)?.declared_type?;
+        let allowed_owner_flags =
+            SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::TRANSIENT;
+        if declarations.is_empty()
+            || method.flags() != SymbolFlags::METHOD
+            || method.check_flags() != CheckFlags::NONE
+            || method.name().is_reserved_member_name()
+            || method.name().is_private_identifier()
+            || method.name().is_late_bound()
+            || method.value_declaration() != declarations.first().copied()
+            || method.members().is_some()
+            || method.exports().is_some()
+            || method.export_symbol().is_some()
+            || self.get_merged_symbol(symbol) != Some(symbol)
+            || interface.flags() & SymbolFlags::TYPE != SymbolFlags::INTERFACE
+            || interface.flags().without(allowed_owner_flags) != SymbolFlags::NONE
+            || interface.check_flags() != CheckFlags::NONE
+            || self.get_merged_symbol(owner) != Some(owner)
+            || self.types.get(interface_type).is_none()
+            || interface
+                .members()
+                .and_then(|members| self.symbol_table(members))
+                .and_then(|members| members.get(method.name()))
+                .and_then(|member| self.get_merged_symbol(member))
+                != Some(symbol)
+            || declarations.iter().enumerate().any(|(index, declaration)| {
+                declarations[..index].contains(declaration)
+                    || self.source_node_kind(*declaration) != Some(SyntaxKind::MethodSignature)
+                    || !matches!(
+                        self.source_node_parent(*declaration),
+                        Some(SourceNodeParent::Parent(owner_declaration))
+                            if owner_declarations.contains(&owner_declaration)
+                                && self.source_node_kind(owner_declaration)
+                                    == Some(SyntaxKind::InterfaceDeclaration)
+                    )
+            })
+        {
+            return None;
+        }
+
+        Some((owner, interface_type))
+    }
+
+    fn interface_method_for_declaration(&self, declaration: NodeRef) -> Option<SemanticSymbolId> {
+        if self.source_node_kind(declaration) != Some(SyntaxKind::MethodSignature) {
+            return None;
+        }
+        let SourceNodeParent::Parent(owner_declaration) = self.source_node_parent(declaration)?
+        else {
+            return None;
+        };
+        let globals = self.symbol_table(self.intrinsic_bootstrap.as_ref()?.globals)?;
+        for (_, global) in globals.iter() {
+            let Some(owner) = self.get_merged_symbol(global) else {
+                continue;
+            };
+            let Some(interface) = self.symbol(owner) else {
+                continue;
+            };
+            if !interface.flags().contains(SymbolFlags::INTERFACE)
+                || interface
+                    .declarations()
+                    .is_none_or(|declarations| !declarations.contains(&owner_declaration))
+            {
+                continue;
+            }
+            let Some(members) = interface
+                .members()
+                .and_then(|members| self.symbol_table(members))
+            else {
+                continue;
+            };
+            for (_, member) in members.iter() {
+                let Some(method) = self.get_merged_symbol(member) else {
+                    continue;
+                };
+                if self
+                    .symbol(method)
+                    .and_then(Symbol::declarations)
+                    .is_some_and(|declarations| declarations.contains(&declaration))
+                    && self
+                        .authenticated_interface_method_owner(method)
+                        .is_some_and(|(method_owner, _)| method_owner == owner)
+                {
+                    return Some(method);
+                }
+            }
+        }
+        None
+    }
+
+    fn node_is_interface_method(&self, node: NodeRef) -> bool {
+        self.interface_method_for_declaration(node).is_some()
+    }
+
+    /// Validates every declaration and signature before exposing a method type.
+    /// Immutable return and parameter caches may still be unpublished.
+    pub(super) fn interface_method_linked_type(&self, requested: SignatureId) -> Option<TypeId> {
+        let declaration = self.signature(requested)?.declaration()?;
+        let method_symbol = self.interface_method_for_declaration(declaration)?;
+        self.authenticated_interface_method_owner(method_symbol)?;
+        let method = self.symbol(method_symbol)?;
+        let declarations = method.declarations()?;
+        let value_links = self.value_symbol_links(method_symbol)?;
+        let type_ = value_links.resolved_type?;
+        if value_links
+            != &(ValueSymbolLinks {
+                resolved_type: Some(type_),
+                ..ValueSymbolLinks::default()
+            })
+            || self.types.get(type_).is_none()
+        {
+            return None;
+        }
+
+        let mut requested_found = false;
+        for method_declaration in declarations {
+            let links = self.signature_links(*method_declaration)?;
+            let signature_id = links.resolved_signature.signature()?;
+            let signature = self.signature(signature_id)?;
+            let return_type = signature.resolved_return_type()?;
+            let return_annotation = self.source_direct_type_annotation(*method_declaration)?;
+            let allowed_flags =
+                SignatureFlags::HAS_REST_PARAMETER | SignatureFlags::HAS_LITERAL_TYPES;
+            if links
+                != &(SignatureLinks {
+                    resolved_signature: ResolvedSignatureState::Resolved(signature_id),
+                    ..SignatureLinks::default()
+                })
+                || signature.declaration() != Some(*method_declaration)
+                || signature.flags() & !allowed_flags != SignatureFlags::NONE
+                || !signature.type_parameters().is_empty()
+                || signature.this_parameter().is_some()
+                || signature.resolved_min_argument_count() != -1
+                || signature.resolved_type_predicate().is_some()
+                || signature.target().is_some()
+                || signature.mapper().is_some()
+                || signature.isolated_signature_type().is_some()
+                || signature.composite().is_some()
+                || self.types.get(return_type).is_none()
+                || !self.source_direct_type_annotation_is_exact(return_annotation, return_type)
+                || self
+                    .function_signature_return_annotations
+                    .get(&signature_id)
+                    .is_some_and(|annotation| *annotation != (return_annotation, false))
+            {
+                return None;
+            }
+
+            let facts = self.source_node_facts.get(&method_declaration.arena)?;
+            let actual_parameter_count = facts
+                .iter()
+                .flatten()
+                .filter(|facts| {
+                    facts.kind == SyntaxKind::Parameter
+                        && facts.parent == Some(method_declaration.node)
+                })
+                .count();
+            if actual_parameter_count != signature.parameters().len() {
+                return None;
+            }
+
+            let mut minimum = 0usize;
+            let mut has_rest = false;
+            for (index, parameter) in signature.parameters().iter().copied().enumerate() {
+                let parameter_symbol = self.symbol(parameter)?;
+                let [parameter_declaration] = parameter_symbol.declarations()? else {
+                    return None;
+                };
+                let parameter_declaration = *parameter_declaration;
+                let parameter_links = self.value_symbol_links(parameter)?;
+                let parameter_type = parameter_links.resolved_type?;
+                let parameter_annotation =
+                    self.source_direct_type_annotation(parameter_declaration)?;
+                let expected_parameter = facts
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, facts)| {
+                        let facts = facts.as_ref()?;
+                        (facts.kind == SyntaxKind::Parameter
+                            && facts.parent == Some(method_declaration.node))
+                        .then_some(index)
+                    })
+                    .nth(index)?;
+                if parameter_symbol.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+                    || parameter_symbol.check_flags() != CheckFlags::NONE
+                    || parameter_symbol.value_declaration() != Some(parameter_declaration)
+                    || parameter_symbol.members().is_some()
+                    || parameter_symbol.exports().is_some()
+                    || parameter_symbol.parent().is_some()
+                    || parameter_symbol.export_symbol().is_some()
+                    || self.get_merged_symbol(parameter) != Some(parameter)
+                    || parameter_declaration.node.index() != expected_parameter
+                    || self.source_node_kind(parameter_declaration) != Some(SyntaxKind::Parameter)
+                    || self.source_node_parent(parameter_declaration)
+                        != Some(SourceNodeParent::Parent(*method_declaration))
+                    || parameter_links
+                        != &(ValueSymbolLinks {
+                            resolved_type: Some(parameter_type),
+                            ..ValueSymbolLinks::default()
+                        })
+                    || self.types.get(parameter_type).is_none()
+                    || !self.source_direct_type_annotation_is_exact(
+                        parameter_annotation,
+                        parameter_type,
+                    )
+                {
+                    return None;
+                }
+
+                let rest = facts.iter().flatten().any(|facts| {
+                    facts.kind == SyntaxKind::DotDotDotToken
+                        && facts.parent == Some(parameter_declaration.node)
+                });
+                let optional = facts.iter().flatten().any(|facts| {
+                    facts.kind == SyntaxKind::QuestionToken
+                        && facts.parent == Some(parameter_declaration.node)
+                });
+                if rest && (has_rest || index + 1 != signature.parameters().len()) {
+                    return None;
+                }
+                has_rest |= rest;
+                if !rest && !optional {
+                    minimum = minimum.checked_add(1)?;
+                }
+            }
+
+            if signature
+                .flags()
+                .contains(SignatureFlags::HAS_REST_PARAMETER)
+                != has_rest
+                || signature.min_argument_count() != i32::try_from(minimum).ok()?
+                || self
+                    .callable_signature_parameter_types
+                    .get(&signature_id)
+                    .is_some_and(|cached| {
+                        cached.len() != signature.parameters().len()
+                            || signature.parameters().iter().zip(cached).any(
+                                |(parameter, expected)| {
+                                    self.value_symbol_links(*parameter)
+                                        .and_then(|links| links.resolved_type)
+                                        != Some(*expected)
+                                },
+                            )
+                    })
+            {
+                return None;
+            }
+            requested_found |= signature_id == requested;
+        }
+
+        requested_found.then_some(type_)
     }
 
     /// Authenticates one narrowly supported method on its canonical global interface.
@@ -1992,6 +2259,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 || self.node_is_source_overload_declaration(node)
                 || self.node_is_declared_callable_signature(node)
                 || self.node_is_global_interface_method(node)
+                || self.node_is_interface_method(node)
             {
                 return true;
             }
@@ -2015,6 +2283,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                         || self.node_is_source_overload_declaration(parent)
                         || self.node_is_declared_callable_signature(parent)
                         || self.node_is_global_interface_method(parent)
+                        || self.node_is_interface_method(parent)
             )
     }
 
@@ -2022,6 +2291,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.source_callable_types_by_owner.contains_key(&symbol)
             || self.source_overload_types_by_owner.contains_key(&symbol)
             || self.authenticated_global_interface_method(symbol).is_some()
+            || self.authenticated_interface_method_owner(symbol).is_some()
     }
 
     fn signature_is_callable(&self, signature: SignatureId) -> bool {
@@ -2033,6 +2303,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                     || self
                         .global_interface_method_linked_type(signature)
                         .is_some()
+                    || self.interface_method_linked_type(signature).is_some()
                     || self
                         .source_callable_type_for_signature(signature)
                         .and_then(|type_| self.source_callable_provenance(type_))
@@ -2068,6 +2339,8 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 .filter(|type_| self.type_has_declared_call_set_provenance(*type_))
         } else if self.node_is_global_interface_method(declaration) {
             self.global_interface_method_linked_type(signature)
+        } else if self.node_is_interface_method(declaration) {
+            self.interface_method_linked_type(signature)
         } else {
             self.source_callable_type_for_signature(signature)
                 .filter(|type_| {
@@ -2554,7 +2827,8 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             || self.node_is_source_callable_declaration(node)
             || self.node_is_source_overload_declaration(node)
             || self.node_is_declared_callable_signature(node)
-            || self.node_is_global_interface_method(node))
+            || self.node_is_global_interface_method(node)
+            || self.node_is_interface_method(node))
             && published
             && changed;
         self.links.signature.replace_key(node, links);
@@ -4118,6 +4392,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         let valid_callable = self.node_is_function_type(declaration)
             || self.node_is_declared_callable_signature(declaration)
             || self.node_is_global_interface_method(declaration)
+            || self.interface_method_linked_type(id).is_some()
             || self
                 .source_callable_type_for_signature(id)
                 .and_then(|type_| self.source_callable_provenance(type_))
@@ -4140,6 +4415,15 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                     self.signature(id).and_then(Signature::resolved_return_type)
                         == Some(bootstrap.string_type)
                 })
+        } else if self.node_is_interface_method(declaration) {
+            self.source_direct_type_annotation(declaration) == Some(annotation)
+                && !null_literal_identity
+                && self
+                    .signature(id)
+                    .and_then(Signature::resolved_return_type)
+                    .is_some_and(|return_type| {
+                        self.source_direct_type_annotation_is_exact(annotation, return_type)
+                    })
         } else {
             true
         };
@@ -4211,6 +4495,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 || self.signature(*signature).is_some_and(|record| {
                     record.declaration().is_some_and(|declaration| {
                         self.node_is_global_interface_method(declaration)
+                            || self.node_is_interface_method(declaration)
                     }) && record.parameters().iter().copied().zip(types).any(
                         |(parameter, type_)| {
                             self.value_symbol_links(parameter)
@@ -4710,9 +4995,9 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         })
     }
 
-    /// Returns the sole direct primitive annotation on a registered declaration.
+    /// Returns the final direct type annotation on a registered declaration.
     #[must_use]
-    pub(super) fn source_primitive_type_annotation(&self, declaration: NodeRef) -> Option<NodeRef> {
+    pub(super) fn source_direct_type_annotation(&self, declaration: NodeRef) -> Option<NodeRef> {
         if !self.contains_node_ref(declaration) {
             return None;
         }
@@ -4723,11 +5008,68 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             .and_then(|facts| facts.get(annotation))
             .copied()
             .flatten()?;
-        if fact.parent != Some(declaration.node) || !fact.kind.is_keyword_type() {
+        let is_type = fact.kind.is_keyword_type()
+            || (SyntaxKind::FIRST_TYPE_NODE as u16..=SyntaxKind::LAST_TYPE_NODE as u16)
+                .contains(&(fact.kind as u16));
+        if fact.parent != Some(declaration.node) || !is_type {
             return None;
         }
         let node = NodeId::new(u32::try_from(annotation).ok()?);
         Some(NodeRef::new(declaration.arena, declaration.file, node))
+    }
+
+    /// Primitive annotations may resolve directly without allocating node links.
+    /// Composite annotations must retain their exact published type identity.
+    pub(super) fn source_direct_type_annotation_is_exact(
+        &self,
+        annotation: NodeRef,
+        type_: TypeId,
+    ) -> bool {
+        let Some(bootstrap) = self.intrinsic_bootstrap.as_ref() else {
+            return false;
+        };
+        let intrinsic = match self.source_node_kind(annotation) {
+            Some(SyntaxKind::AnyKeyword) => Some(bootstrap.any_type),
+            Some(SyntaxKind::UnknownKeyword) => Some(bootstrap.unknown_type),
+            Some(SyntaxKind::StringKeyword) => Some(bootstrap.string_type),
+            Some(SyntaxKind::NumberKeyword) => Some(bootstrap.number_type),
+            Some(SyntaxKind::BigIntKeyword) => Some(bootstrap.bigint_type),
+            Some(SyntaxKind::BooleanKeyword) => Some(bootstrap.boolean_type),
+            Some(SyntaxKind::SymbolKeyword) => Some(bootstrap.es_symbol_type),
+            Some(SyntaxKind::VoidKeyword) => Some(bootstrap.void_type),
+            Some(SyntaxKind::UndefinedKeyword) => Some(bootstrap.undefined_type),
+            Some(SyntaxKind::NullKeyword) => Some(bootstrap.null_type),
+            Some(SyntaxKind::NeverKeyword) => Some(bootstrap.never_type),
+            Some(SyntaxKind::ObjectKeyword) => Some(bootstrap.non_primitive_type),
+            Some(SyntaxKind::IntrinsicKeyword) => Some(bootstrap.intrinsic_marker_type),
+            _ => None,
+        };
+        let exact_links = TypeNodeLinks {
+            resolved_type: Some(type_),
+            outer_type_parameters: None,
+        };
+        match intrinsic {
+            Some(intrinsic) => {
+                type_ == intrinsic
+                    && self.type_node_links(annotation).is_none_or(|links| {
+                        links == &TypeNodeLinks::default() || links == &exact_links
+                    })
+                    && self
+                        .symbol_node_links(annotation)
+                        .is_none_or(|links| links == &SymbolNodeLinks::default())
+            }
+            None => self.type_node_links(annotation) == Some(&exact_links),
+        }
+    }
+
+    /// Returns the sole direct primitive annotation on a registered declaration.
+    #[must_use]
+    pub(super) fn source_primitive_type_annotation(&self, declaration: NodeRef) -> Option<NodeRef> {
+        self.source_direct_type_annotation(declaration)
+            .filter(|annotation| {
+                self.source_node_kind(*annotation)
+                    .is_some_and(SyntaxKind::is_keyword_type)
+            })
     }
 
     #[must_use]
@@ -4905,6 +5247,252 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
 }
 
 impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
+    /// Publishes the canonical late-bound symbol for one computed property.
+    ///
+    /// The declaration must retain its binder-owned `__computed` property,
+    /// while `key_type` must be the already-created unique-symbol identity.
+    /// `members` must be a checker-owned table separate from the binder's
+    /// original member table. Existing complete publication replays without
+    /// allocating another symbol or changing any links.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the symbol identity space is exhausted or an already
+    /// prevalidated publication step violates an internal store invariant.
+    pub fn create_late_bound_property_symbol(
+        &mut self,
+        owner: SemanticSymbolId,
+        early_symbol: SemanticSymbolId,
+        key_type: TypeId,
+        members: SymbolTableId,
+    ) -> Option<SemanticSymbolId> {
+        let owner_record = self.symbol(owner)?;
+        let binder_members = owner_record.members()?;
+        let early = self.symbol(early_symbol)?;
+        let [declaration] = early.declarations()? else {
+            return None;
+        };
+        let declaration = *declaration;
+        let SourceNodeParent::Parent(owner_declaration) = self.source_node_parent(declaration)?
+        else {
+            return None;
+        };
+        let key_record = self.type_payload(key_type)?;
+        let TypeData::UniqueEsSymbol(unique) = key_record.data() else {
+            return None;
+        };
+        let key_symbol = key_record.symbol()?;
+        let key = self.symbol(key_symbol)?;
+        let allowed_property_flags = SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL;
+        if !owner_record
+            .flags()
+            .intersects(SymbolFlags::LATE_BINDING_CONTAINER)
+            || owner_record.check_flags() != CheckFlags::NONE
+            || owner_record
+                .declarations()
+                .is_none_or(|declarations| !declarations.contains(&owner_declaration))
+            || self.get_merged_symbol(owner) != Some(owner)
+            || members == binder_members
+            || self.symbol_table(members).is_none()
+            || !early.flags().contains(SymbolFlags::PROPERTY)
+            || early.flags().without(allowed_property_flags) != SymbolFlags::NONE
+            || early.check_flags() != CheckFlags::NONE
+            || early.name() != InternalSymbolName::Computed.as_ref()
+            || early.value_declaration() != Some(declaration)
+            || early.members().is_some()
+            || early.exports().is_some()
+            || early.export_symbol().is_some()
+            || early
+                .parent()
+                .and_then(|parent| self.get_merged_symbol(parent))
+                != Some(owner)
+            || self.get_merged_symbol(early_symbol) != Some(early_symbol)
+            || !matches!(
+                self.source_node_kind(declaration),
+                Some(SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature)
+            )
+            || !matches!(
+                self.source_node_kind(owner_declaration),
+                Some(SyntaxKind::InterfaceDeclaration | SyntaxKind::TypeLiteral)
+            )
+            || key_record.flags() != TypeFlags::UNIQUE_ES_SYMBOL
+            || key_record.object_flags() != ObjectFlags::NONE
+            || key_record.alias().is_some()
+            || !unique.name.as_ref().is_late_bound()
+            || !key.flags().contains(SymbolFlags::BLOCK_SCOPED_VARIABLE)
+            || key.check_flags() != CheckFlags::NONE
+            || key.value_declaration().is_none()
+            || self.get_merged_symbol(key_symbol) != Some(key_symbol)
+            || self
+                .symbol_store()
+                .assigned_global_symbol_id(key_symbol)
+                .is_none()
+            || self.value_symbol_links(key_symbol).is_some_and(|links| {
+                links != &ValueSymbolLinks::default()
+                    && links
+                        != &(ValueSymbolLinks {
+                            resolved_type: Some(key_type),
+                            ..ValueSymbolLinks::default()
+                        })
+            })
+        {
+            return None;
+        }
+
+        let optional = early.flags().contains(SymbolFlags::OPTIONAL);
+        let facts = self.source_node_facts.get(&declaration.arena)?;
+        let mut computed = None;
+        let mut optional_count = 0usize;
+        for (index, facts) in facts.iter().enumerate() {
+            let Some(facts) = facts else {
+                continue;
+            };
+            if facts.parent != Some(declaration.node) {
+                continue;
+            }
+            match facts.kind {
+                SyntaxKind::ComputedPropertyName => {
+                    if computed.is_some() {
+                        return None;
+                    }
+                    computed = Some(NodeRef::new(
+                        declaration.arena,
+                        declaration.file,
+                        NodeId::new(u32::try_from(index).ok()?),
+                    ));
+                }
+                SyntaxKind::QuestionToken => optional_count = optional_count.checked_add(1)?,
+                _ => {}
+            }
+        }
+        let computed = computed?;
+        if optional_count != usize::from(optional) {
+            return None;
+        }
+        let mut key_expression = None;
+        for (index, facts) in facts.iter().enumerate() {
+            let Some(facts) = facts else {
+                continue;
+            };
+            if facts.parent == Some(computed.node) && facts.kind == SyntaxKind::Identifier {
+                if key_expression.is_some() {
+                    return None;
+                }
+                key_expression = Some(NodeRef::new(
+                    declaration.arena,
+                    declaration.file,
+                    NodeId::new(u32::try_from(index).ok()?),
+                ));
+            }
+        }
+        let key_expression = key_expression?;
+        if self.symbol_node_links(key_expression).is_some_and(|links| {
+            links != &SymbolNodeLinks::default()
+                && links
+                    != &(SymbolNodeLinks {
+                        resolved_symbol: Some(key_symbol),
+                    })
+        }) {
+            return None;
+        }
+
+        let expected_name = unique.name.clone();
+        let original_flags = early.flags();
+        let canonical_name = self.unique_symbol_name(key_symbol)?;
+        if canonical_name != expected_name {
+            return None;
+        }
+
+        let current_late = self
+            .late_bound_links(early_symbol)
+            .and_then(|links| links.late_symbol);
+        if let Some(late) = current_late {
+            let late_record = self.symbol(late)?;
+            let value_links = self.value_symbol_links(late)?;
+            if late_record.flags() != (original_flags | SymbolFlags::TRANSIENT)
+                || late_record.check_flags() != CheckFlags::LATE
+                || late_record.name() != expected_name.as_ref()
+                || late_record.declarations() != Some(&[declaration])
+                || late_record.value_declaration() != Some(declaration)
+                || late_record.members().is_some()
+                || late_record.exports().is_some()
+                || late_record.parent() != Some(owner)
+                || late_record.export_symbol().is_some()
+                || self.get_merged_symbol(late) != Some(late)
+                || value_links
+                    != &(ValueSymbolLinks {
+                        resolved_type: value_links.resolved_type,
+                        name_type: Some(key_type),
+                        ..ValueSymbolLinks::default()
+                    })
+                || !self.valid_optional_type(value_links.resolved_type)
+                || self.symbol_node_links(declaration)
+                    != Some(&SymbolNodeLinks {
+                        resolved_symbol: Some(late),
+                    })
+                || self.symbol_table(members)?.get(expected_name.as_ref()) != Some(late)
+            {
+                return None;
+            }
+            return Some(late);
+        }
+        if self
+            .late_bound_links(early_symbol)
+            .is_some_and(|links| links != &LateBoundLinks::default())
+            || self
+                .symbol_node_links(declaration)
+                .is_some_and(|links| links != &SymbolNodeLinks::default())
+            || self
+                .symbol_table(members)?
+                .get(expected_name.as_ref())
+                .is_some()
+        {
+            return None;
+        }
+
+        let missing_late_links = usize::from(self.late_bound_links(early_symbol).is_none());
+        let missing_node_links = usize::from(self.symbol_node_links(declaration).is_none());
+        if !self.try_reserve_checker_symbol_allocations(1, 0)
+            || !self.links.late_bound.try_reserve(missing_late_links)
+            || !self.links.symbol_node.try_reserve(missing_node_links)
+            || !self.links.value_symbol.try_reserve(1)
+        {
+            return None;
+        }
+        let mut declarations = Vec::new();
+        declarations.try_reserve_exact(1).ok()?;
+        declarations.push(declaration);
+
+        let late =
+            self.alloc_transient_symbol(original_flags, canonical_name.clone(), CheckFlags::LATE);
+        assert!(self.set_symbol_declarations(late, Some(declarations), Some(declaration)));
+        assert!(self.set_symbol_relationships(late, None, None, Some(owner), None));
+        assert!(self.set_value_symbol_links(
+            late,
+            ValueSymbolLinks {
+                name_type: Some(key_type),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        assert!(self.set_late_bound_links(
+            early_symbol,
+            LateBoundLinks {
+                late_symbol: Some(late),
+            },
+        ));
+        assert!(self.set_symbol_node_links(
+            declaration,
+            SymbolNodeLinks {
+                resolved_symbol: Some(late),
+            },
+        ));
+        assert_eq!(
+            self.insert_symbol(members, canonical_name, late),
+            Some(None)
+        );
+        Some(late)
+    }
+
     /// Returns a published global interface method only when its callable
     /// object, signature, and binder-owned parameter graph remain authentic.
     pub(super) fn global_interface_method_callable_type(
@@ -5754,6 +6342,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         ) {
             (None, None, true) => {
                 self.source_node_kind(annotation) != Some(SyntaxKind::TypeReference)
+                    || self.source_named_generic_return_annotation_is_exact(annotation, resolved)
             }
             (Some(declaration), Some(type_parameter), false) => {
                 let Some(row) = resolved.iter().find(|row| {
@@ -5782,6 +6371,90 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             }
             _ => false,
         }
+    }
+
+    fn source_named_generic_return_annotation_is_exact(
+        &self,
+        annotation: NodeRef,
+        resolved: &[ResolvedSourceCallableTypeParameter],
+    ) -> bool {
+        if self.source_node_kind(annotation) != Some(SyntaxKind::TypeReference) {
+            return false;
+        }
+        let symbol_links = self.symbol_node_links(annotation);
+        let type_links = self.type_node_links(annotation);
+        let cold = symbol_links.is_none_or(|links| links == &SymbolNodeLinks::default())
+            && type_links.is_none_or(|links| links == &TypeNodeLinks::default());
+        if !cold {
+            return type_links
+                .and_then(|links| links.resolved_type)
+                .is_some_and(|result| {
+                    self.source_named_generic_type_reference_is_exact(annotation, result, resolved)
+                });
+        }
+
+        let Some(facts) = self.source_node_facts.get(&annotation.arena) else {
+            return false;
+        };
+        let mut names = 0usize;
+        let mut arguments = 0usize;
+        for (index, child) in facts.iter().enumerate() {
+            let Some(child) = child else {
+                continue;
+            };
+            if child.parent != Some(annotation.node) {
+                continue;
+            }
+            if child.kind == SyntaxKind::Identifier {
+                names += 1;
+                continue;
+            }
+            let Some(index) = u32::try_from(index).ok() else {
+                return false;
+            };
+            let argument = NodeRef::new(annotation.arena, annotation.file, NodeId::new(index));
+            if child.kind != SyntaxKind::TypeReference {
+                return false;
+            }
+            let argument_symbol = self.symbol_node_links(argument);
+            let argument_type = self.type_node_links(argument);
+            let argument_cold = argument_symbol
+                .is_none_or(|links| links == &SymbolNodeLinks::default())
+                && argument_type.is_none_or(|links| links == &TypeNodeLinks::default());
+            let naked = facts
+                .iter()
+                .flatten()
+                .filter(|facts| {
+                    facts.parent == Some(argument.node) && facts.kind == SyntaxKind::Identifier
+                })
+                .count()
+                == 1
+                && facts.iter().flatten().all(|facts| {
+                    facts.parent != Some(argument.node) || facts.kind == SyntaxKind::Identifier
+                });
+            let valid_argument = if naked {
+                argument_cold
+                    || resolved.iter().any(|row| {
+                        argument_symbol
+                            == Some(&SymbolNodeLinks {
+                                resolved_symbol: Some(row.provenance.symbol),
+                            })
+                            && argument_type
+                                == Some(&TypeNodeLinks {
+                                    resolved_type: Some(row.provenance.type_parameter),
+                                    outer_type_parameters: None,
+                                })
+                    })
+            } else {
+                self.source_named_generic_return_annotation_is_exact(argument, resolved)
+            };
+            if !valid_argument {
+                return false;
+            }
+            arguments += 1;
+        }
+
+        names == 1 && arguments != 0
     }
 
     fn validate_source_generic_type_parameters(
@@ -5960,7 +6633,156 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             || annotation.is_some_and(|node| {
                 self.source_named_interface_keyof_result_is_exact(node, constraint)
                     || self.source_recovered_unresolved_type_reference_is_exact(node, constraint)
+                    || self.source_named_generic_type_reference_is_exact(node, constraint, &[])
             })
+    }
+
+    /// Authenticates an instantiated interface, class, or alias annotation.
+    /// Arguments must match their source nodes and previously resolved generics.
+    pub(super) fn source_named_generic_type_reference_is_exact(
+        &self,
+        node: NodeRef,
+        result: TypeId,
+        earlier: &[ResolvedSourceCallableTypeParameter],
+    ) -> bool {
+        if self.source_node_kind(node) != Some(SyntaxKind::TypeReference)
+            || self.type_node_links(node)
+                != Some(&TypeNodeLinks {
+                    resolved_type: Some(result),
+                    outer_type_parameters: None,
+                })
+        {
+            return false;
+        }
+        let Some(owner) = self
+            .symbol_node_links(node)
+            .and_then(|links| links.resolved_symbol)
+        else {
+            return false;
+        };
+        if self.symbol_node_links(node)
+            != Some(&SymbolNodeLinks {
+                resolved_symbol: Some(owner),
+            })
+            || self.get_merged_symbol(owner) != Some(owner)
+        {
+            return false;
+        }
+        let Some(owner_record) = self.symbol(owner) else {
+            return false;
+        };
+        if owner_record.check_flags() != CheckFlags::NONE
+            || owner_record.declarations().is_none_or(|declarations| {
+                declarations.is_empty()
+                    || declarations.iter().any(|declaration| {
+                        !matches!(
+                            self.source_node_kind(*declaration),
+                            Some(
+                                SyntaxKind::InterfaceDeclaration
+                                    | SyntaxKind::ClassDeclaration
+                                    | SyntaxKind::TypeAliasDeclaration
+                            )
+                        )
+                    })
+            })
+        {
+            return false;
+        }
+
+        let Some(record) = self.type_payload(result) else {
+            return false;
+        };
+        let arguments = if owner_record
+            .flags()
+            .intersects(SymbolFlags::INTERFACE | SymbolFlags::CLASS)
+        {
+            let Some(target) = self
+                .declared_type_links(owner)
+                .and_then(|links| links.declared_type)
+            else {
+                return false;
+            };
+            let Some(target_record) = self.type_payload(target) else {
+                return false;
+            };
+            let TypeData::Interface(target_interface) = target_record.data() else {
+                return false;
+            };
+            let reference = match record.data() {
+                TypeData::TypeReference(reference) => reference,
+                TypeData::Interface(interface) if result == target => &interface.reference,
+                _ => return false,
+            };
+            let Some(arguments) = reference.resolved_type_arguments.as_deref() else {
+                return false;
+            };
+            let TypeCacheState::Allocated(instantiations) =
+                &target_interface.reference.object.instantiations
+            else {
+                return false;
+            };
+            if record.flags() != TypeFlags::OBJECT
+                || !record.object_flags().contains(ObjectFlags::REFERENCE)
+                || record.symbol() != Some(owner)
+                || record.alias().is_some()
+                || target_record.symbol() != Some(owner)
+                || !target_record
+                    .object_flags()
+                    .intersects(ObjectFlags::CLASS | ObjectFlags::INTERFACE)
+                || reference.object.target != Some(target)
+                || reference.object.mapper.is_some()
+                || reference.node.is_some()
+                || arguments.is_empty()
+                || instantiations.get(&type_list_key(arguments)) != Some(&result)
+            {
+                return false;
+            }
+            arguments
+        } else if owner_record.flags().contains(SymbolFlags::TYPE_ALIAS) {
+            let Some(alias) = record.alias().and_then(|alias| self.type_alias(alias)) else {
+                return false;
+            };
+            let Some(arguments) = alias.type_arguments() else {
+                return false;
+            };
+            if alias.symbol() != Some(owner) || arguments.is_empty() {
+                return false;
+            }
+            arguments
+        } else {
+            return false;
+        };
+
+        let Some(facts) = self.source_node_facts.get(&node.arena) else {
+            return false;
+        };
+        let mut name_count = 0usize;
+        let mut argument_count = 0usize;
+        for (index, facts) in facts.iter().enumerate() {
+            let Some(facts) = facts else {
+                continue;
+            };
+            if facts.parent != Some(node.node) {
+                continue;
+            }
+            if facts.kind == SyntaxKind::Identifier {
+                name_count += 1;
+                continue;
+            }
+            let Some(expected) = arguments.get(argument_count).copied() else {
+                return false;
+            };
+            let Some(index) = u32::try_from(index).ok() else {
+                return false;
+            };
+            let argument = NodeRef::new(node.arena, node.file, NodeId::new(index));
+            if !self.source_type_node_result_is_exact(argument, expected, earlier) {
+                return false;
+            }
+            argument_count += 1;
+        }
+
+        name_count == 1 && argument_count == arguments.len()
     }
 
     /// Authenticates the cached error result for an unresolved generic bound.
@@ -6345,6 +7167,9 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         if self.source_recovered_unresolved_type_reference_is_exact(node, result) {
             return true;
         }
+        if self.source_named_generic_type_reference_is_exact(node, result, earlier) {
+            return true;
+        }
         let Some(earlier) = earlier
             .iter()
             .find(|row| row.provenance.type_parameter == result)
@@ -6578,8 +7403,8 @@ mod tests {
     };
     use ts_binder::{
         CanonicalBinder, CanonicalModuleState, CanonicalNameResolverOptions,
-        CanonicalSourceFileFacts, CanonicalSourceLanguage, EscapedName, SymbolData, SymbolFlags,
-        SymbolStore,
+        CanonicalSourceFileFacts, CanonicalSourceLanguage, CheckFlags, EscapedName,
+        InternalSymbolName, SymbolData, SymbolFlags, SymbolStore,
     };
     use ts_core::TextRange;
     use ts_parser::{parse_isolated_entity_name, parse_source_file};
@@ -6599,8 +7424,10 @@ mod tests {
         SpreadLinks, SwitchStatementLinks, SymbolNodeLinks, SymbolReferenceLinks, TypeAliasLinks,
         TypeNodeLinks, TypeRecord, TypeResolutionTarget, TypeSystemPropertyName, ValueSymbolLinks,
         VarianceFlags, VarianceLinks,
+        bootstrap::UnionReduction,
         declared::execute_type_parameter,
         production::GlobalMergeCompletion,
+        reference_types::create_direct_generic_reference,
         signatures::{ElementFlags, SignatureFlags, TypePredicateKind},
         source_callables::plan_source_callable,
         types::{ObjectFlags, TypeFlags},
@@ -7337,6 +8164,303 @@ mod tests {
                 )]),
         );
         (type_, signature)
+    }
+
+    struct InterfaceMethodFixture {
+        store: CanonicalTypeMapperStore,
+        owner: crate::semantic::SemanticSymbolId,
+        method: crate::semantic::SemanticSymbolId,
+        type_: crate::semantic::TypeId,
+        declarations: Vec<NodeRef>,
+        signatures: Vec<crate::semantic::SignatureId>,
+        return_annotations: Vec<NodeRef>,
+        parameters: Vec<crate::semantic::SemanticSymbolId>,
+        parameter_types: Vec<crate::semantic::TypeId>,
+    }
+
+    fn interface_method_fixture() -> InterfaceMethodFixture {
+        interface_method_fixture_with_keyword_annotation_links(true)
+    }
+
+    fn interface_method_fixture_with_keyword_annotation_links(
+        publish_annotations: bool,
+    ) -> InterfaceMethodFixture {
+        let parsed = parse_source_file(concat!(
+            "interface Contract { ",
+            "run(value: string): number; ",
+            "run(value: number): string; ",
+            "}",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(90_042);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/interface-methods.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+
+        let interface = node_ref_of_kind(&parsed.arena, file, SyntaxKind::InterfaceDeclaration);
+        let declarations = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::MethodSignature).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let bound = binder.file(file).unwrap();
+        let owner = bound.symbol(interface).unwrap();
+        let method = bound.symbol(declarations[0]).unwrap();
+        let plans = declarations
+            .iter()
+            .copied()
+            .map(|declaration| {
+                let NodeData::MethodSignatureDeclaration(method) =
+                    &parsed.arena.get(declaration.node).unwrap().data
+                else {
+                    panic!("the fixture contains only interface method signatures")
+                };
+                let return_annotation = NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    method.type_.expect("each method has a return annotation"),
+                );
+                let parameter_declaration =
+                    NodeRef::new(parsed.arena.id(), file, method.parameters.nodes[0]);
+                let NodeData::ParameterDeclaration(parameter) =
+                    &parsed.arena.get(parameter_declaration.node).unwrap().data
+                else {
+                    panic!("each overload has one parameter")
+                };
+                let parameter_annotation = NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    parameter.type_.expect("each parameter has an annotation"),
+                );
+                (
+                    declaration,
+                    return_annotation,
+                    bound.symbol(parameter_declaration).unwrap(),
+                    parameter_annotation,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let (symbols, _) = binder.finish().try_into_parts().unwrap();
+        let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
+        assert!(
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .is_some()
+        );
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let globals = bootstrap.globals;
+        let string = bootstrap.string_type;
+        let number = bootstrap.number_type;
+        assert_eq!(store.merge_global_symbol(globals, owner), Ok(owner));
+        let interface_type = store
+            .alloc_interface_type(ObjectFlags::INTERFACE, Some(owner))
+            .unwrap();
+        assert!(store.set_declared_type_links(
+            owner,
+            DeclaredTypeLinks {
+                declared_type: Some(interface_type),
+                ..DeclaredTypeLinks::default()
+            },
+        ));
+        let type_ = store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(method))
+            .unwrap();
+        let mut signatures = Vec::new();
+        let mut return_annotations = Vec::new();
+        let mut parameters = Vec::new();
+        let mut parameter_types = Vec::new();
+
+        for (declaration, return_annotation, parameter, parameter_annotation) in plans {
+            let return_type = match store.source_node_kind(return_annotation) {
+                Some(SyntaxKind::StringKeyword) => string,
+                Some(SyntaxKind::NumberKeyword) => number,
+                _ => panic!("method return annotations are primitive"),
+            };
+            let parameter_type = match store.source_node_kind(parameter_annotation) {
+                Some(SyntaxKind::StringKeyword) => string,
+                Some(SyntaxKind::NumberKeyword) => number,
+                _ => panic!("method parameter annotations are primitive"),
+            };
+            if publish_annotations {
+                assert!(store.set_type_node_links(
+                    return_annotation,
+                    TypeNodeLinks {
+                        resolved_type: Some(return_type),
+                        ..TypeNodeLinks::default()
+                    },
+                ));
+                assert!(store.set_type_node_links(
+                    parameter_annotation,
+                    TypeNodeLinks {
+                        resolved_type: Some(parameter_type),
+                        ..TypeNodeLinks::default()
+                    },
+                ));
+            }
+            assert!(store.set_value_symbol_links(
+                parameter,
+                ValueSymbolLinks {
+                    resolved_type: Some(parameter_type),
+                    ..ValueSymbolLinks::default()
+                },
+            ));
+            let signature = store
+                .alloc_signature(
+                    SignatureFlags::NONE,
+                    Some(declaration),
+                    Vec::new(),
+                    None,
+                    vec![parameter],
+                    Some(return_type),
+                    None,
+                    1,
+                )
+                .unwrap();
+            assert!(store.set_signature_links(
+                declaration,
+                SignatureLinks {
+                    resolved_signature: ResolvedSignatureState::Resolved(signature),
+                    ..SignatureLinks::default()
+                },
+            ));
+            signatures.push(signature);
+            return_annotations.push(return_annotation);
+            parameters.push(parameter);
+            parameter_types.push(parameter_type);
+        }
+        assert!(store.set_value_symbol_links(
+            method,
+            ValueSymbolLinks {
+                resolved_type: Some(type_),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        assert!(store.set_structured_type_members(
+            type_,
+            None,
+            None,
+            Some(signatures.clone()),
+            None,
+            None,
+        ));
+
+        InterfaceMethodFixture {
+            store,
+            owner,
+            method,
+            type_,
+            declarations,
+            signatures,
+            return_annotations,
+            parameters,
+            parameter_types,
+        }
+    }
+
+    struct LateBoundPropertyFixture {
+        store: CanonicalTypeMapperStore,
+        owner: crate::semantic::SemanticSymbolId,
+        early: crate::semantic::SemanticSymbolId,
+        key: crate::semantic::SemanticSymbolId,
+        key_type: crate::semantic::TypeId,
+        declaration: NodeRef,
+        members: crate::semantic::SymbolTableId,
+    }
+
+    fn late_bound_property_fixture(optional: bool) -> LateBoundPropertyFixture {
+        let postfix = if optional { "?" } else { "" };
+        let parsed = parse_source_file(&format!(
+            "declare const key: unique symbol; interface Validator<T> {{ [key]{postfix}: T; }}"
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(90_040 + u32::from(optional));
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/late-bound.d.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    true,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                matches!(
+                    record.kind,
+                    SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature
+                )
+                .then_some(NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .expect("the interface has one computed property");
+        let interface = node_ref_of_kind(&parsed.arena, file, SyntaxKind::InterfaceDeclaration);
+        let key_declaration =
+            node_ref_of_kind(&parsed.arena, file, SyntaxKind::VariableDeclaration);
+        let bound = binder.file(file).unwrap();
+        let owner = bound.symbol(interface).unwrap();
+        let early = bound.symbol(declaration).unwrap();
+        let key = bound.symbol(key_declaration).unwrap();
+        let (symbols, _) = binder.finish().try_into_parts().unwrap();
+        let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
+        assert!(
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .is_some()
+        );
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        let key_type = store.alloc_unique_es_symbol_type(key).unwrap();
+        assert!(store.set_value_symbol_links(
+            key,
+            ValueSymbolLinks {
+                resolved_type: Some(key_type),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        let members = store.alloc_symbol_table();
+        LateBoundPropertyFixture {
+            store,
+            owner,
+            early,
+            key,
+            key_type,
+            declaration,
+            members,
+        }
     }
 
     fn empty_signature<TypePayload, MapperPayload>(
@@ -8362,6 +9486,651 @@ mod tests {
             if let Some((parameter, _)) = fixture.parameter {
                 assert!(fixture.store.symbol_is_callable_parameter(parameter));
             }
+        }
+    }
+
+    #[test]
+    fn interface_method_overloads_publish_owned_caches_and_replay_without_mutation() {
+        let mut fixture = interface_method_fixture();
+        assert_eq!(
+            fixture
+                .store
+                .authenticated_interface_method_owner(fixture.method)
+                .map(|(owner, _)| owner),
+            Some(fixture.owner),
+        );
+
+        for ((signature, annotation), parameter) in fixture
+            .signatures
+            .iter()
+            .copied()
+            .zip(fixture.return_annotations.iter().copied())
+            .zip(fixture.parameters.iter().copied())
+        {
+            assert_eq!(
+                fixture.store.interface_method_linked_type(signature),
+                Some(fixture.type_),
+            );
+            assert!(fixture.store.signature_is_callable(signature));
+            assert!(fixture.store.symbol_is_callable_parameter(parameter));
+            assert!(fixture.store.node_has_callable_ancestor(annotation));
+            assert!(
+                fixture
+                    .store
+                    .set_function_signature_return_annotation(signature, annotation, false)
+            );
+        }
+        assert!(
+            fixture.store.set_callable_signature_parameter_types_batch(
+                fixture
+                    .signatures
+                    .iter()
+                    .copied()
+                    .zip(fixture.parameter_types.iter().copied())
+                    .map(|(signature, type_)| (signature, vec![type_]))
+                    .collect(),
+            )
+        );
+
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.symbol_len(),
+            fixture.store.checker_link_allocated_lengths(),
+            fixture.store.callable_signature_parameter_types_len(),
+            fixture.store.function_signature_return_annotations.len(),
+        );
+        for ((signature, annotation), type_) in fixture
+            .signatures
+            .iter()
+            .copied()
+            .zip(fixture.return_annotations.iter().copied())
+            .zip(fixture.parameter_types.iter().copied())
+        {
+            assert_eq!(
+                fixture.store.interface_method_linked_type(signature),
+                Some(fixture.type_),
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .function_signature_return_annotation(signature),
+                Some((annotation, false)),
+            );
+            assert_eq!(
+                fixture.store.callable_signature_parameter_types(signature),
+                Some([type_].as_slice()),
+            );
+        }
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.symbol_len(),
+                fixture.store.checker_link_allocated_lengths(),
+                fixture.store.callable_signature_parameter_types_len(),
+                fixture.store.function_signature_return_annotations.len(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn interface_methods_accept_uncached_intrinsic_return_and_parameter_annotations() {
+        let mut fixture = interface_method_fixture_with_keyword_annotation_links(false);
+        for ((signature, return_annotation), parameter) in fixture
+            .signatures
+            .iter()
+            .copied()
+            .zip(fixture.return_annotations.iter().copied())
+            .zip(fixture.parameters.iter().copied())
+        {
+            let parameter_declaration = fixture
+                .store
+                .symbol(parameter)
+                .unwrap()
+                .value_declaration()
+                .unwrap();
+            let parameter_annotation = fixture
+                .store
+                .source_direct_type_annotation(parameter_declaration)
+                .unwrap();
+            assert!(fixture.store.type_node_links(return_annotation).is_none());
+            assert!(
+                fixture
+                    .store
+                    .type_node_links(parameter_annotation)
+                    .is_none()
+            );
+            assert_eq!(
+                fixture.store.interface_method_linked_type(signature),
+                Some(fixture.type_),
+            );
+            assert!(fixture.store.set_function_signature_return_annotation(
+                signature,
+                return_annotation,
+                false,
+            ));
+        }
+
+        assert!(
+            fixture.store.set_callable_signature_parameter_types_batch(
+                fixture
+                    .signatures
+                    .iter()
+                    .copied()
+                    .zip(fixture.parameter_types.iter().copied())
+                    .map(|(signature, type_)| (signature, vec![type_]))
+                    .collect(),
+            )
+        );
+
+        let return_annotation = fixture.return_annotations[0];
+        let wrong_type = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        assert!(fixture.store.set_type_node_links(
+            return_annotation,
+            TypeNodeLinks {
+                resolved_type: Some(wrong_type),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        assert_eq!(
+            fixture
+                .store
+                .interface_method_linked_type(fixture.signatures[0]),
+            None,
+        );
+    }
+
+    #[test]
+    fn interface_method_overloads_reject_forged_owners_signatures_and_parameters() {
+        for poison in 0..3 {
+            let mut fixture = interface_method_fixture();
+            match poison {
+                0 => {
+                    let members = fixture
+                        .store
+                        .symbol(fixture.owner)
+                        .unwrap()
+                        .members()
+                        .unwrap();
+                    assert_eq!(
+                        fixture.store.insert_symbol(
+                            members,
+                            EscapedName::source("run"),
+                            fixture.parameters[0],
+                        ),
+                        Some(Some(fixture.method)),
+                    );
+                }
+                1 => {
+                    assert!(fixture.store.set_signature_links(
+                        fixture.declarations[0],
+                        SignatureLinks {
+                            resolved_signature: ResolvedSignatureState::Resolved(
+                                fixture.signatures[1],
+                            ),
+                            ..SignatureLinks::default()
+                        },
+                    ));
+                }
+                2 => {
+                    assert!(fixture.store.set_value_symbol_links(
+                        fixture.parameters[0],
+                        ValueSymbolLinks {
+                            resolved_type: Some(fixture.parameter_types[0]),
+                            target: Some(fixture.method),
+                            ..ValueSymbolLinks::default()
+                        },
+                    ));
+                }
+                _ => unreachable!("poison cases are bounded"),
+            }
+
+            let before = (
+                fixture.store.callable_signature_parameter_types_len(),
+                fixture.store.function_signature_return_annotations.len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .interface_method_linked_type(fixture.signatures[0]),
+                None,
+                "poison case {poison}",
+            );
+            assert!(!fixture.store.set_function_signature_return_annotation(
+                fixture.signatures[0],
+                fixture.return_annotations[0],
+                false,
+            ));
+            assert!(
+                !fixture
+                    .store
+                    .set_callable_signature_parameter_types_batch(vec![(
+                        fixture.signatures[0],
+                        vec![fixture.parameter_types[0]]
+                    ),])
+            );
+            assert_eq!(
+                (
+                    fixture.store.callable_signature_parameter_types_len(),
+                    fixture.store.function_signature_return_annotations.len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                before,
+                "poison case {poison}",
+            );
+        }
+    }
+
+    #[test]
+    fn global_array_concat_overloads_publish_exact_generic_array_annotations() {
+        let parsed = parse_source_file(concat!(
+            "interface ConcatArray<T> {} ",
+            "interface Array<T> { ",
+            "concat(...items: ConcatArray<T>[]): T[]; ",
+            "concat(...items: (T | ConcatArray<T>)[]): T[]; ",
+            "} ",
+            "interface ReadonlyArray<T> {}",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(90_043);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/array-concat.d.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    true,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        let global_types = context.global_types().clone();
+        let (owner, concat_owner, method, declarations, element) = {
+            let store = context.store();
+            let globals = store.intrinsic_bootstrap().unwrap().globals;
+            let owner = store
+                .symbol_table(globals)
+                .and_then(|globals| globals.get_source("Array"))
+                .and_then(|owner| store.get_merged_symbol(owner))
+                .unwrap();
+            let concat_owner = store
+                .symbol_table(globals)
+                .and_then(|globals| globals.get_source("ConcatArray"))
+                .and_then(|owner| store.get_merged_symbol(owner))
+                .unwrap();
+            let method = store
+                .symbol(owner)
+                .and_then(ts_binder::semantic::Symbol::members)
+                .and_then(|members| store.symbol_table(members))
+                .and_then(|members| members.get_source("concat"))
+                .unwrap();
+            let declarations = store
+                .symbol(method)
+                .unwrap()
+                .declarations()
+                .unwrap()
+                .to_vec();
+            let super::TypeData::Interface(array) =
+                store.type_payload(global_types.array_type).unwrap().data()
+            else {
+                panic!("Array must own one generic interface target")
+            };
+            let [element] = array.reference.resolved_type_arguments.as_deref().unwrap() else {
+                panic!("Array must have exactly one type parameter")
+            };
+            (owner, concat_owner, method, declarations, *element)
+        };
+        let concat_target = context.get_declared_type_of_symbol(concat_owner).unwrap();
+        let plans = declarations
+            .iter()
+            .copied()
+            .map(|declaration| {
+                let NodeData::MethodSignatureDeclaration(signature) =
+                    &parsed.arena.get(declaration.node).unwrap().data
+                else {
+                    panic!("concat must retain its method declarations")
+                };
+                let parameter = NodeRef::new(
+                    declaration.arena,
+                    declaration.file,
+                    signature.parameters.nodes[0],
+                );
+                let NodeData::ParameterDeclaration(parameter_data) =
+                    &parsed.arena.get(parameter.node).unwrap().data
+                else {
+                    panic!("concat must retain its binder-owned rest parameters")
+                };
+                (
+                    declaration,
+                    context.file(file).unwrap().1.symbol(parameter).unwrap(),
+                    NodeRef::new(
+                        declaration.arena,
+                        declaration.file,
+                        parameter_data.type_.unwrap(),
+                    ),
+                    NodeRef::new(
+                        declaration.arena,
+                        declaration.file,
+                        signature.type_.unwrap(),
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        let store = context.store_mut_for_test();
+        let concat_element =
+            create_direct_generic_reference(store, concat_target, &[element], ObjectFlags::NONE)
+                .unwrap();
+        let combined_element = store
+            .expression_union_type_with_global_types(
+                &global_types,
+                &[element, concat_element],
+                UnionReduction::Literal,
+            )
+            .unwrap();
+        let return_type = store
+            .create_canonical_array_type(&global_types, element, false)
+            .unwrap();
+        let parameter_types = [concat_element, combined_element].map(|element| {
+            store
+                .create_canonical_array_type(&global_types, element, false)
+                .unwrap()
+        });
+        let callable = store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(method))
+            .unwrap();
+        let mut signatures = Vec::new();
+        let mut return_annotations = Vec::new();
+        for ((declaration, parameter, parameter_annotation, return_annotation), parameter_type) in
+            plans.iter().copied().zip(parameter_types)
+        {
+            assert_eq!(
+                store.source_direct_type_annotation(declaration),
+                Some(return_annotation),
+            );
+            let parameter_declaration = store
+                .symbol(parameter)
+                .unwrap()
+                .value_declaration()
+                .unwrap();
+            assert_eq!(
+                store.source_direct_type_annotation(parameter_declaration),
+                Some(parameter_annotation),
+            );
+            assert!(store.set_type_node_links(
+                parameter_annotation,
+                TypeNodeLinks {
+                    resolved_type: Some(parameter_type),
+                    ..TypeNodeLinks::default()
+                },
+            ));
+            assert!(store.set_type_node_links(
+                return_annotation,
+                TypeNodeLinks {
+                    resolved_type: Some(return_type),
+                    ..TypeNodeLinks::default()
+                },
+            ));
+            assert!(store.set_value_symbol_links(
+                parameter,
+                ValueSymbolLinks {
+                    resolved_type: Some(parameter_type),
+                    ..ValueSymbolLinks::default()
+                },
+            ));
+            let signature = store
+                .alloc_signature(
+                    SignatureFlags::HAS_REST_PARAMETER,
+                    Some(declaration),
+                    Vec::new(),
+                    None,
+                    vec![parameter],
+                    Some(return_type),
+                    None,
+                    0,
+                )
+                .unwrap();
+            assert!(store.set_signature_links(
+                declaration,
+                SignatureLinks {
+                    resolved_signature: ResolvedSignatureState::Resolved(signature),
+                    ..SignatureLinks::default()
+                },
+            ));
+            signatures.push(signature);
+            return_annotations.push(return_annotation);
+        }
+        assert!(store.set_value_symbol_links(
+            method,
+            ValueSymbolLinks {
+                resolved_type: Some(callable),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        assert!(store.set_structured_type_members(
+            callable,
+            None,
+            None,
+            Some(signatures.clone()),
+            None,
+            None,
+        ));
+        assert_eq!(
+            store.authenticated_interface_method_owner(method),
+            Some((owner, global_types.array_type)),
+        );
+        for (signature, annotation) in signatures.iter().copied().zip(return_annotations) {
+            assert_eq!(
+                store.interface_method_linked_type(signature),
+                Some(callable)
+            );
+            assert!(store.set_function_signature_return_annotation(signature, annotation, false));
+        }
+        assert!(
+            store.set_callable_signature_parameter_types_batch(
+                signatures
+                    .iter()
+                    .copied()
+                    .zip(parameter_types)
+                    .map(|(signature, type_)| (signature, vec![type_]))
+                    .collect(),
+            )
+        );
+
+        let warm = (
+            store.type_len(),
+            store.signature_len(),
+            store.symbol_len(),
+            store.checker_link_allocated_lengths(),
+        );
+        for signature in signatures {
+            assert_eq!(
+                store.interface_method_linked_type(signature),
+                Some(callable)
+            );
+        }
+        assert_eq!(
+            (
+                store.type_len(),
+                store.signature_len(),
+                store.symbol_len(),
+                store.checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn late_bound_unique_symbol_properties_preserve_flags_links_and_warm_identity() {
+        for optional in [false, true] {
+            let mut fixture = late_bound_property_fixture(optional);
+            let expected_name = fixture.store.unique_symbol_name(fixture.key).unwrap();
+            let before_symbols = fixture.store.symbol_len();
+
+            let late = fixture
+                .store
+                .create_late_bound_property_symbol(
+                    fixture.owner,
+                    fixture.early,
+                    fixture.key_type,
+                    fixture.members,
+                )
+                .expect("an authenticated computed property must receive one late symbol");
+
+            assert_eq!(fixture.store.symbol_len(), before_symbols + 1);
+            let late_record = fixture.store.symbol(late).unwrap();
+            let expected_flags = SymbolFlags::PROPERTY
+                | SymbolFlags::TRANSIENT
+                | if optional {
+                    SymbolFlags::OPTIONAL
+                } else {
+                    SymbolFlags::NONE
+                };
+            assert_eq!(late_record.flags(), expected_flags);
+            assert_eq!(late_record.check_flags(), CheckFlags::LATE);
+            assert_eq!(late_record.name(), expected_name.as_ref());
+            assert_eq!(late_record.declarations(), Some(&[fixture.declaration][..]));
+            assert_eq!(late_record.value_declaration(), Some(fixture.declaration));
+            assert_eq!(late_record.parent(), Some(fixture.owner));
+            assert_eq!(
+                fixture.store.late_bound_links(fixture.early),
+                Some(&LateBoundLinks {
+                    late_symbol: Some(late),
+                }),
+            );
+            assert_eq!(
+                fixture.store.symbol_node_links(fixture.declaration),
+                Some(&SymbolNodeLinks {
+                    resolved_symbol: Some(late),
+                }),
+            );
+            assert_eq!(
+                fixture.store.value_symbol_links(late),
+                Some(&ValueSymbolLinks {
+                    name_type: Some(fixture.key_type),
+                    ..ValueSymbolLinks::default()
+                }),
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .symbol_table(fixture.members)
+                    .and_then(|members| members.get(expected_name.as_ref())),
+                Some(late),
+            );
+            let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+            assert!(fixture.store.set_value_symbol_links(
+                late,
+                ValueSymbolLinks {
+                    resolved_type: Some(number),
+                    name_type: Some(fixture.key_type),
+                    ..ValueSymbolLinks::default()
+                },
+            ));
+            let warm = (
+                fixture.store.symbol_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            assert_eq!(
+                fixture.store.create_late_bound_property_symbol(
+                    fixture.owner,
+                    fixture.early,
+                    fixture.key_type,
+                    fixture.members,
+                ),
+                Some(late),
+            );
+            assert_eq!(
+                (
+                    fixture.store.symbol_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                warm,
+            );
+        }
+    }
+
+    #[test]
+    fn late_bound_unique_symbol_properties_reject_forged_inputs_without_publication() {
+        for poison in 0..4 {
+            let mut fixture = late_bound_property_fixture(true);
+            let members = if poison == 0 {
+                fixture
+                    .store
+                    .symbol(fixture.owner)
+                    .unwrap()
+                    .members()
+                    .unwrap()
+            } else {
+                fixture.members
+            };
+            let key_type = if poison == 1 {
+                fixture.store.intrinsic_bootstrap().unwrap().es_symbol_type
+            } else {
+                fixture.key_type
+            };
+            if poison == 2 {
+                assert!(fixture.store.set_symbol_flags(
+                    fixture.early,
+                    SymbolFlags::PROPERTY,
+                    CheckFlags::NONE,
+                ));
+            }
+            if poison == 3 {
+                let name = fixture.store.unique_symbol_name(fixture.key).unwrap();
+                assert_eq!(
+                    fixture.store.insert_symbol(members, name, fixture.early),
+                    Some(None),
+                );
+            }
+            let before = (
+                fixture.store.symbol_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            assert_eq!(
+                fixture.store.create_late_bound_property_symbol(
+                    fixture.owner,
+                    fixture.early,
+                    key_type,
+                    members,
+                ),
+                None,
+                "poison case {poison}",
+            );
+            assert_eq!(
+                (
+                    fixture.store.symbol_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+            assert!(fixture.store.late_bound_links(fixture.early).is_none());
+            assert!(
+                fixture
+                    .store
+                    .symbol_node_links(fixture.declaration)
+                    .is_none()
+            );
+            assert_eq!(
+                fixture.store.symbol(fixture.early).unwrap().name(),
+                InternalSymbolName::Computed.as_ref(),
+            );
         }
     }
 

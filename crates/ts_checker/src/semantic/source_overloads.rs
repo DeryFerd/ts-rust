@@ -1,4 +1,4 @@
-//! Exact local ambient function overload groups.
+//! Exact local and ambient-namespace function overload groups.
 //!
 //! The binder owns declaration grouping and order. This provider retains that
 //! order, publishes one anonymous callable object with one signature per
@@ -7,7 +7,7 @@
 
 use std::collections::HashSet;
 
-use ts_ast::{NodeData, NodeRef, SyntaxKind};
+use ts_ast::{Node, NodeData, NodeId, NodeRef, SyntaxKind};
 use ts_binder::{CheckFlags, SemanticSymbolId, SymbolFlags};
 
 use super::{
@@ -36,6 +36,68 @@ pub(super) struct SourceOverloadPlan {
     pub(super) owner_symbol: SemanticSymbolId,
     pub(super) declarations: Vec<SourceCallablePlan>,
     pub(super) array_targets: Option<CanonicalArrayTargets>,
+}
+
+/// One annotated parameter retained without publishing a namespace overload.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceNamespaceAmbientOverloadParameter {
+    pub(super) declaration: NodeRef,
+    pub(super) symbol: SemanticSymbolId,
+    pub(super) annotation: NodeRef,
+    pub(super) optional: bool,
+    pub(super) rest: bool,
+}
+
+/// One generic parameter and its optional source-written bounds.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceNamespaceAmbientOverloadTypeParameter {
+    pub(super) declaration: NodeRef,
+    pub(super) symbol: SemanticSymbolId,
+    pub(super) constraint: Option<NodeRef>,
+    pub(super) default_type: Option<NodeRef>,
+}
+
+/// One namespace-owned ambient signature in binder declaration order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceNamespaceAmbientOverloadDeclaration {
+    pub(super) declaration: NodeRef,
+    pub(super) type_parameters: Vec<SourceNamespaceAmbientOverloadTypeParameter>,
+    pub(super) parameters: Vec<SourceNamespaceAmbientOverloadParameter>,
+    pub(super) return_type: NodeRef,
+}
+
+/// An authenticated ambient namespace overload group with its export-local alias.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceNamespaceAmbientOverloadPlan {
+    pub(super) namespace: SemanticSymbolId,
+    pub(super) namespace_declaration: NodeRef,
+    pub(super) owner_symbol: SemanticSymbolId,
+    pub(super) export_local: SemanticSymbolId,
+    pub(super) declarations: Vec<SourceNamespaceAmbientOverloadDeclaration>,
+}
+
+impl SourceNamespaceAmbientOverloadPlan {
+    /// Returns generic bounds, parameter annotations, and return types in source order.
+    pub(super) fn annotations(&self) -> impl Iterator<Item = NodeRef> + '_ {
+        self.declarations.iter().flat_map(|declaration| {
+            declaration
+                .type_parameters
+                .iter()
+                .flat_map(|parameter| {
+                    parameter
+                        .constraint
+                        .into_iter()
+                        .chain(parameter.default_type)
+                })
+                .chain(
+                    declaration
+                        .parameters
+                        .iter()
+                        .map(|parameter| parameter.annotation),
+                )
+                .chain(std::iter::once(declaration.return_type))
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -100,6 +162,443 @@ impl From<LiteralTypeCacheError> for SourceOverloadError {
     fn from(error: LiteralTypeCacheError) -> Self {
         Self::Literal(error)
     }
+}
+
+/// Authenticates an implicitly or explicitly exported ambient overload group.
+///
+/// Generic declarations and rest parameters remain intact. Their later type
+/// resolution and signature publication stay with the namespace executor.
+#[allow(clippy::too_many_lines)] // Binder ownership and export provenance must be checked together.
+pub(super) fn plan_source_namespace_ambient_overload_group(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    namespace: (NodeRef, SemanticSymbolId),
+    owner_symbol: SemanticSymbolId,
+    declarations: &[NodeRef],
+) -> Result<SourceNamespaceAmbientOverloadPlan, SourceOverloadError> {
+    let Some(first) = declarations.first().copied() else {
+        return Err(SourceOverloadError::Invariant(
+            SourceOverloadInvariant::EmptyGroup,
+        ));
+    };
+    if declarations.len() < 2
+        || declarations
+            .iter()
+            .enumerate()
+            .any(|(index, declaration)| declarations[..index].contains(declaration))
+    {
+        return Err(namespace_overload_group_error(first));
+    }
+
+    let (namespace_declaration, namespace_symbol) = namespace;
+    let (arena, bound) = host
+        .source(namespace_declaration)
+        .ok_or_else(|| namespace_overload_group_error(namespace_declaration))?;
+    if declarations.iter().any(|declaration| {
+        !declaration.is_for(namespace_declaration.arena, namespace_declaration.file)
+    }) || bound
+        .source_facts()
+        .is_none_or(|facts| !facts.is_declaration_file() || facts.is_javascript_file())
+    {
+        return Err(SourceOverloadError::Unsupported(first));
+    }
+
+    let namespace_record = namespace_overload_node(host, namespace_declaration)?;
+    let NodeData::ModuleDeclaration(module) = &namespace_record.data else {
+        return Err(namespace_overload_group_error(namespace_declaration));
+    };
+    let body = module
+        .body
+        .map(|node| namespace_overload_child(namespace_declaration, node))
+        .ok_or_else(|| namespace_overload_group_error(namespace_declaration))?;
+    let body_record = namespace_overload_node(host, body)?;
+    let NodeData::ModuleBlock(block) = &body_record.data else {
+        return Err(namespace_overload_group_error(body));
+    };
+    let namespace_owner = store
+        .symbol(namespace_symbol)
+        .ok_or_else(|| namespace_overload_group_error(namespace_declaration))?;
+    if namespace_record.kind != SyntaxKind::ModuleDeclaration
+        || body_record.kind != SyntaxKind::ModuleBlock
+        || body_record.parent != Some(namespace_declaration.node)
+        || block.flow_node.is_some()
+        || block.facts != 0
+        || block.statements.has_trailing_comma
+        || bound
+            .symbol(namespace_declaration)
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            != Some(namespace_symbol)
+        || !namespace_owner.flags().intersects(SymbolFlags::MODULE)
+        || store.get_merged_symbol(namespace_symbol) != Some(namespace_symbol)
+    {
+        return Err(namespace_overload_group_error(namespace_declaration));
+    }
+
+    let owner = store
+        .symbol(owner_symbol)
+        .ok_or_else(|| namespace_overload_group_error(first))?;
+    let Some(owner_name) = owner.name().as_utf8() else {
+        return Err(namespace_overload_group_error(first));
+    };
+    let Some(exports) = namespace_owner
+        .exports()
+        .and_then(|exports| store.symbol_table(exports))
+    else {
+        return Err(namespace_overload_group_error(first));
+    };
+    if owner.flags() != SymbolFlags::FUNCTION
+        || owner.check_flags() != CheckFlags::NONE
+        || owner.declarations() != Some(declarations)
+        || owner.value_declaration() != Some(first)
+        || owner.members().is_some()
+        || owner.exports().is_some()
+        || owner
+            .parent()
+            .and_then(|parent| store.get_merged_symbol(parent))
+            != Some(namespace_symbol)
+        || store.get_parent_of_symbol(owner_symbol) != Some(namespace_symbol)
+        || owner.export_symbol().is_some()
+        || store.get_merged_symbol(owner_symbol) != Some(owner_symbol)
+        || exports.get(owner.name()) != Some(owner_symbol)
+    {
+        return Err(namespace_overload_group_error(first));
+    }
+
+    let local = bound
+        .local_symbol(first)
+        .ok_or_else(|| namespace_overload_group_error(first))?;
+    let local_record = store
+        .symbol(local)
+        .ok_or_else(|| namespace_overload_group_error(first))?;
+    let namespace_locals = bound
+        .locals(namespace_declaration)
+        .and_then(|locals| store.symbol_table(locals))
+        .ok_or_else(|| namespace_overload_group_error(first))?;
+    if local == owner_symbol
+        || local_record.flags() != SymbolFlags::EXPORT_VALUE
+        || local_record.check_flags() != CheckFlags::NONE
+        || local_record.name() != owner.name()
+        || local_record.declarations() != Some(declarations)
+        || local_record.value_declaration().is_some()
+        || local_record.members().is_some()
+        || local_record.exports().is_some()
+        || local_record.parent().is_some()
+        || local_record.export_symbol() != Some(owner_symbol)
+        || store.get_merged_symbol(local) != Some(local)
+        || namespace_locals.get(owner.name()) != Some(local)
+    {
+        return Err(namespace_overload_group_error(first));
+    }
+    if store
+        .value_symbol_links(owner_symbol)
+        .is_some_and(|links| links != &ValueSymbolLinks::default())
+        || store
+            .value_symbol_links(local)
+            .is_some_and(|links| links != &ValueSymbolLinks::default())
+        || store.source_overload_type_for_owner(owner_symbol).is_some()
+        || store.source_callable_type_for_owner(owner_symbol).is_some()
+    {
+        return Err(SourceOverloadError::Invariant(
+            SourceOverloadInvariant::Cache(first),
+        ));
+    }
+
+    let owned_declarations = block
+        .statements
+        .nodes
+        .iter()
+        .copied()
+        .filter_map(|node| {
+            let candidate = namespace_overload_child(namespace_declaration, node);
+            (bound.symbol(candidate) == Some(owner_symbol)).then_some(candidate)
+        })
+        .collect::<Vec<_>>();
+    if owned_declarations != declarations {
+        return Err(namespace_overload_group_error(first));
+    }
+
+    let mut planned = Vec::with_capacity(declarations.len());
+    for &declaration in declarations {
+        planned.push(plan_namespace_ambient_overload_declaration(
+            store,
+            host,
+            bound,
+            body,
+            owner_symbol,
+            local,
+            owner_name,
+            declaration,
+        )?);
+    }
+    debug_assert_eq!(arena.id(), namespace_declaration.arena);
+
+    Ok(SourceNamespaceAmbientOverloadPlan {
+        namespace: namespace_symbol,
+        namespace_declaration,
+        owner_symbol,
+        export_local: local,
+        declarations: planned,
+    })
+}
+
+fn namespace_overload_group_error(node: NodeRef) -> SourceOverloadError {
+    SourceOverloadError::Invariant(SourceOverloadInvariant::Group(node))
+}
+
+fn namespace_overload_node<'a>(
+    host: &'a DeclaredTypeHost<'_>,
+    node: NodeRef,
+) -> Result<&'a Node, SourceOverloadError> {
+    host.node(node)
+        .ok_or_else(|| namespace_overload_group_error(node))
+}
+
+fn namespace_overload_child(parent: NodeRef, node: NodeId) -> NodeRef {
+    NodeRef::new(parent.arena, parent.file, node)
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Retains every source-owned signature edge.
+fn plan_namespace_ambient_overload_declaration(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    bound: &ts_binder::BoundFile,
+    body: NodeRef,
+    owner_symbol: SemanticSymbolId,
+    local_symbol: SemanticSymbolId,
+    owner_name: &str,
+    declaration: NodeRef,
+) -> Result<SourceNamespaceAmbientOverloadDeclaration, SourceOverloadError> {
+    let record = namespace_overload_node(host, declaration)?;
+    let NodeData::FunctionDeclaration(function) = &record.data else {
+        return Err(namespace_overload_group_error(declaration));
+    };
+    if record.kind != SyntaxKind::FunctionDeclaration
+        || record.flags.0 != 0
+        || record.parent != Some(body.node)
+        || function.asterisk_token.is_some()
+        || function.body.is_some()
+        || function.end_flow_node.is_some()
+        || function.flow_node.is_some()
+        || function.full_signature.is_some()
+        || function.local_symbol.is_some()
+        || function.next_container.is_some()
+        || function.return_flow_node.is_some()
+        || function.symbol.is_some()
+        || function.facts != 0
+        || function.parameters.has_trailing_comma
+        || bound.symbol(declaration) != Some(owner_symbol)
+        || bound.local_symbol(declaration) != Some(local_symbol)
+        || store
+            .signature_links(declaration)
+            .is_some_and(|links| links != &SignatureLinks::default())
+    {
+        return Err(namespace_overload_group_error(declaration));
+    }
+    if let Some(modifiers) = function.modifiers.as_ref() {
+        let [modifier] = modifiers.list.nodes.as_slice() else {
+            return Err(SourceOverloadError::Unsupported(declaration));
+        };
+        let modifier = namespace_overload_child(declaration, *modifier);
+        let modifier_record = namespace_overload_node(host, modifier)?;
+        if modifiers.flags.0 != 0
+            || modifiers.list.has_trailing_comma
+            || modifier_record.kind != SyntaxKind::ExportKeyword
+            || modifier_record.flags.0 != 0
+            || modifier_record.parent != Some(declaration.node)
+            || !matches!(modifier_record.data, NodeData::Token(_))
+        {
+            return Err(SourceOverloadError::Unsupported(modifier));
+        }
+    }
+
+    let name = function
+        .name
+        .map(|name| namespace_overload_child(declaration, name))
+        .ok_or_else(|| namespace_overload_group_error(declaration))?;
+    let name_record = namespace_overload_node(host, name)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(namespace_overload_group_error(name));
+    };
+    if name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(declaration.node)
+        || identifier.flow_node.is_some()
+        || identifier.text != owner_name
+    {
+        return Err(namespace_overload_group_error(name));
+    }
+
+    let locals = bound
+        .locals(declaration)
+        .and_then(|locals| store.symbol_table(locals));
+    let type_parameters = function
+        .type_parameters
+        .as_ref()
+        .map(|parameters| {
+            if parameters.nodes.is_empty() || parameters.has_trailing_comma {
+                return Err(SourceOverloadError::Unsupported(declaration));
+            }
+            let mut planned = Vec::with_capacity(parameters.nodes.len());
+            let mut seen_names = HashSet::with_capacity(parameters.nodes.len());
+            let mut default_seen = false;
+            for &node in &parameters.nodes {
+                let parameter = namespace_overload_child(declaration, node);
+                let record = namespace_overload_node(host, parameter)?;
+                let NodeData::TypeParameterDeclaration(data) = &record.data else {
+                    return Err(namespace_overload_group_error(parameter));
+                };
+                let name = namespace_overload_child(parameter, data.name);
+                let name_record = namespace_overload_node(host, name)?;
+                let NodeData::Identifier(identifier) = &name_record.data else {
+                    return Err(namespace_overload_group_error(name));
+                };
+                let symbol = bound
+                    .symbol(parameter)
+                    .ok_or_else(|| namespace_overload_group_error(parameter))?;
+                let symbol_record = store
+                    .symbol(symbol)
+                    .ok_or_else(|| namespace_overload_group_error(parameter))?;
+                if record.kind != SyntaxKind::TypeParameter
+                    || record.flags.0 != 0
+                    || record.parent != Some(declaration.node)
+                    || data.expression.is_some()
+                    || data.symbol.is_some()
+                    || data.modifiers.is_some()
+                    || name_record.kind != SyntaxKind::Identifier
+                    || name_record.flags.0 != 0
+                    || name_record.parent != Some(parameter.node)
+                    || identifier.flow_node.is_some()
+                    || identifier.text.is_empty()
+                    || !seen_names.insert(identifier.text.as_str())
+                    || symbol_record.flags() != SymbolFlags::TYPE_PARAMETER
+                    || symbol_record.check_flags() != CheckFlags::NONE
+                    || symbol_record.declarations() != Some(&[parameter])
+                    || symbol_record.value_declaration().is_some()
+                    || symbol_record.members().is_some()
+                    || symbol_record.exports().is_some()
+                    || symbol_record.parent().is_some()
+                    || symbol_record.export_symbol().is_some()
+                    || store.get_merged_symbol(symbol) != Some(symbol)
+                    || locals.and_then(|locals| locals.get_source(&identifier.text)) != Some(symbol)
+                    || default_seen && data.default_type.is_none()
+                {
+                    return Err(namespace_overload_group_error(parameter));
+                }
+                let constraint = data
+                    .constraint
+                    .map(|node| namespace_overload_child(parameter, node));
+                let default_type = data
+                    .default_type
+                    .map(|node| namespace_overload_child(parameter, node));
+                for annotation in [constraint, default_type].into_iter().flatten() {
+                    if namespace_overload_node(host, annotation)?.parent != Some(parameter.node) {
+                        return Err(namespace_overload_group_error(annotation));
+                    }
+                }
+                default_seen |= default_type.is_some();
+                planned.push(SourceNamespaceAmbientOverloadTypeParameter {
+                    declaration: parameter,
+                    symbol,
+                    constraint,
+                    default_type,
+                });
+            }
+            Ok(planned)
+        })
+        .transpose()?
+        .unwrap_or_default();
+
+    let mut parameters = Vec::with_capacity(function.parameters.nodes.len());
+    let mut optional_seen = false;
+    for (index, &node) in function.parameters.nodes.iter().enumerate() {
+        let parameter = namespace_overload_child(declaration, node);
+        let record = namespace_overload_node(host, parameter)?;
+        let NodeData::ParameterDeclaration(data) = &record.data else {
+            return Err(namespace_overload_group_error(parameter));
+        };
+        let name = namespace_overload_child(parameter, data.name);
+        let name_record = namespace_overload_node(host, name)?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Err(SourceOverloadError::Unsupported(parameter));
+        };
+        let annotation = data
+            .type_
+            .map(|node| namespace_overload_child(parameter, node))
+            .ok_or(SourceOverloadError::Unsupported(parameter))?;
+        let annotation_record = namespace_overload_node(host, annotation)?;
+        let symbol = bound
+            .symbol(parameter)
+            .ok_or_else(|| namespace_overload_group_error(parameter))?;
+        let symbol_record = store
+            .symbol(symbol)
+            .ok_or_else(|| namespace_overload_group_error(parameter))?;
+        let optional = data.question_token.is_some();
+        let rest = data.dot_dot_dot_token.is_some();
+        if record.kind != SyntaxKind::Parameter
+            || record.flags.0 != 0
+            || record.parent != Some(declaration.node)
+            || data.initializer.is_some()
+            || data.symbol.is_some()
+            || data.modifiers.is_some()
+            || data.facts != 0
+            || name_record.kind != SyntaxKind::Identifier
+            || name_record.flags.0 != 0
+            || name_record.parent != Some(parameter.node)
+            || identifier.flow_node.is_some()
+            || identifier.text.is_empty()
+            || identifier.text == "this"
+            || annotation_record.parent != Some(parameter.node)
+            || symbol_record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+            || symbol_record.check_flags() != CheckFlags::NONE
+            || symbol_record.declarations() != Some(&[parameter])
+            || symbol_record.value_declaration() != Some(parameter)
+            || symbol_record.members().is_some()
+            || symbol_record.exports().is_some()
+            || symbol_record.parent().is_some()
+            || symbol_record.export_symbol().is_some()
+            || store.get_merged_symbol(symbol) != Some(symbol)
+            || locals.and_then(|locals| locals.get_source(&identifier.text)) != Some(symbol)
+            || optional && rest
+            || optional_seen && !optional && !rest
+            || rest && index + 1 != function.parameters.nodes.len()
+        {
+            return Err(namespace_overload_group_error(parameter));
+        }
+        for (token, expected) in [
+            (data.question_token, SyntaxKind::QuestionToken),
+            (data.dot_dot_dot_token, SyntaxKind::DotDotDotToken),
+        ] {
+            if let Some(token) = token {
+                let token = namespace_overload_child(parameter, token);
+                let token_record = namespace_overload_node(host, token)?;
+                if token_record.kind != expected || token_record.parent != Some(parameter.node) {
+                    return Err(namespace_overload_group_error(token));
+                }
+            }
+        }
+        optional_seen |= optional;
+        parameters.push(SourceNamespaceAmbientOverloadParameter {
+            declaration: parameter,
+            symbol,
+            annotation,
+            optional,
+            rest,
+        });
+    }
+
+    let return_type = function
+        .type_
+        .map(|node| namespace_overload_child(declaration, node))
+        .ok_or(SourceOverloadError::Unsupported(declaration))?;
+    if namespace_overload_node(host, return_type)?.parent != Some(declaration.node) {
+        return Err(namespace_overload_group_error(return_type));
+    }
+    Ok(SourceNamespaceAmbientOverloadDeclaration {
+        declaration,
+        type_parameters,
+        parameters,
+        return_type,
+    })
 }
 
 pub(super) fn plan_source_ambient_overload_group(
@@ -821,6 +1320,253 @@ mod tests {
         CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions,
         SourceCheckError, TypeNodeLinks, bootstrap::UnionReduction,
     };
+
+    fn namespace_overload_context(
+        parsed: &ts_parser::ParseResult,
+        file: FileId,
+        declaration_file: bool,
+    ) -> CanonicalCheckerContext<'_> {
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/namespace-overloads.d.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    declaration_file,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            [(file, &parsed.arena)].into_iter().collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap()
+    }
+
+    fn namespace_overload_nodes(
+        parsed: &ts_parser::ParseResult,
+        file: FileId,
+    ) -> (NodeRef, Vec<NodeRef>) {
+        let namespace = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ModuleDeclaration).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let mut declarations = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionDeclaration).then_some((
+                    record.range.start,
+                    NodeRef::new(parsed.arena.id(), file, node),
+                ))
+            })
+            .collect::<Vec<_>>();
+        declarations.sort_by_key(|(start, _)| *start);
+        (
+            namespace,
+            declarations
+                .into_iter()
+                .map(|(_, declaration)| declaration)
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn ambient_namespace_overloads_retain_implicit_exports_generics_and_rest() {
+        for (index, source) in [
+            concat!(
+                "declare namespace React { ",
+                "function createFactory(value: string): string; ",
+                "function createFactory<T extends object>(value: T): T; ",
+                "function createFactory(...children: string[]): string; ",
+                "}",
+            ),
+            concat!(
+                "declare module 'react' { ",
+                "export function createFactory(value: string): string; ",
+                "export function createFactory<T extends object>(value: T): T; ",
+                "export function createFactory(...children: string[]): string; ",
+                "}",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let parsed = parse_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(2_540 + u32::try_from(index).unwrap());
+            let context = namespace_overload_context(&parsed, file, true);
+            let (namespace, declarations) = namespace_overload_nodes(&parsed, file);
+            let (_, bound) = context.file(file).unwrap();
+            let namespace_symbol = bound
+                .symbol(namespace)
+                .and_then(|symbol| context.store().get_merged_symbol(symbol))
+                .unwrap();
+            let owner = bound.symbol(declarations[0]).unwrap();
+            let local = bound.local_symbol(declarations[0]).unwrap();
+            let host = DeclaredTypeHost::new([(&parsed.arena, bound)]).unwrap();
+            let before = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.store().source_callable_provenance_lengths(),
+            );
+
+            let first = plan_source_namespace_ambient_overload_group(
+                context.store(),
+                &host,
+                (namespace, namespace_symbol),
+                owner,
+                &declarations,
+            )
+            .unwrap_or_else(|error| panic!("{source}: {error:?}"));
+            let second = plan_source_namespace_ambient_overload_group(
+                context.store(),
+                &host,
+                (namespace, namespace_symbol),
+                owner,
+                &declarations,
+            )
+            .unwrap();
+
+            assert_eq!(first, second, "{source}");
+            assert_eq!(first.namespace, namespace_symbol, "{source}");
+            assert_eq!(first.owner_symbol, owner, "{source}");
+            assert_eq!(first.export_local, local, "{source}");
+            assert_eq!(first.declarations.len(), 3, "{source}");
+            assert_eq!(first.declarations[1].type_parameters.len(), 1, "{source}");
+            assert!(
+                first.declarations[1].type_parameters[0]
+                    .constraint
+                    .is_some()
+            );
+            assert!(first.declarations[2].parameters[0].rest, "{source}");
+            assert_eq!(first.annotations().count(), 7, "{source}");
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    context.store().source_callable_provenance_lengths(),
+                ),
+                before,
+                "{source}",
+            );
+            assert!(context.store().value_symbol_links(owner).is_none());
+            assert!(context.store().value_symbol_links(local).is_none());
+        }
+    }
+
+    #[test]
+    fn ambient_namespace_overloads_reject_reordered_groups_and_poisoned_owners() {
+        let source = concat!(
+            "declare namespace React { ",
+            "function createFactory(value: string): string; ",
+            "function createFactory(value: number): number; ",
+            "}",
+        );
+        let parsed = parse_source_file(source);
+        let file = FileId::new(2_542);
+        let mut context = namespace_overload_context(&parsed, file, true);
+        let (namespace, declarations) = namespace_overload_nodes(&parsed, file);
+        let (_, bound) = context.file(file).unwrap();
+        let namespace_symbol = bound.symbol(namespace).unwrap();
+        let owner = bound.symbol(declarations[0]).unwrap();
+        {
+            let host = DeclaredTypeHost::new([(&parsed.arena, bound)]).unwrap();
+            assert!(matches!(
+                plan_source_namespace_ambient_overload_group(
+                    context.store(),
+                    &host,
+                    (namespace, namespace_symbol),
+                    owner,
+                    &[declarations[1], declarations[0]],
+                ),
+                Err(SourceOverloadError::Invariant(
+                    SourceOverloadInvariant::Group(_)
+                )),
+            ));
+            assert!(matches!(
+                plan_source_namespace_ambient_overload_group(
+                    context.store(),
+                    &host,
+                    (namespace, namespace_symbol),
+                    owner,
+                    &declarations[..1],
+                ),
+                Err(SourceOverloadError::Invariant(
+                    SourceOverloadInvariant::Group(_)
+                )),
+            ));
+        }
+
+        let wrong = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert!(context.store_mut_for_test().set_value_symbol_links(
+            owner,
+            ValueSymbolLinks {
+                resolved_type: Some(wrong),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        let (_, bound) = context.file(file).unwrap();
+        let host = DeclaredTypeHost::new([(&parsed.arena, bound)]).unwrap();
+        assert!(matches!(
+            plan_source_namespace_ambient_overload_group(
+                context.store(),
+                &host,
+                (namespace, namespace_symbol),
+                owner,
+                &declarations,
+            ),
+            Err(SourceOverloadError::Invariant(
+                SourceOverloadInvariant::Cache(_)
+            )),
+        ));
+    }
+
+    #[test]
+    fn namespace_overloads_require_declaration_file_ambientness() {
+        let source = concat!(
+            "declare namespace React { ",
+            "function createFactory(value: string): string; ",
+            "function createFactory(value: number): number; ",
+            "}",
+        );
+        let parsed = parse_source_file(source);
+        let file = FileId::new(2_543);
+        let context = namespace_overload_context(&parsed, file, false);
+        let (namespace, declarations) = namespace_overload_nodes(&parsed, file);
+        let (_, bound) = context.file(file).unwrap();
+        let namespace_symbol = bound.symbol(namespace).unwrap();
+        let owner = bound.symbol(declarations[0]).unwrap();
+        let host = DeclaredTypeHost::new([(&parsed.arena, bound)]).unwrap();
+
+        assert!(matches!(
+            plan_source_namespace_ambient_overload_group(
+                context.store(),
+                &host,
+                (namespace, namespace_symbol),
+                owner,
+                &declarations,
+            ),
+            Err(SourceOverloadError::Unsupported(node)) if node == declarations[0],
+        ));
+    }
 
     #[test]
     fn later_bad_callable_provider_preflights_before_overload_publication() {

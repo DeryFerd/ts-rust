@@ -11,7 +11,7 @@ use super::{
         create_type_from_generic_global_type, preflight_generic_global_type_target,
         preflight_relation_generic_global_type_target,
     },
-    type_records::{TypeCacheState, TypeData, TypeReferenceData},
+    type_records::{TypeCacheState, TypeData, TypeRecord, TypeReferenceData},
     types::{ObjectFlags, TypeFlags},
 };
 
@@ -267,21 +267,69 @@ impl CanonicalTypeMapperStore {
         )?)
     }
 
-    /// Creates or reuses the derived array-literal clone of an ordinary
-    /// canonical array reference. Passing an already validated clone is
-    /// idempotent; a non-reference fallback is returned unchanged.
+    /// Creates or reuses the derived array-literal clone of a canonical array
+    /// or tuple reference. Passing an already validated clone is idempotent;
+    /// a non-reference fallback is returned unchanged.
     pub(super) fn create_array_literal_type(
         &mut self,
         global_types: &CanonicalGlobalTypes,
         type_id: TypeId,
     ) -> Result<TypeId, ArrayTypeError> {
-        let Some(reference) = self.canonical_array_reference(global_types, type_id)? else {
-            return Ok(type_id);
+        let base_type = match self.canonical_array_reference(global_types, type_id)? {
+            Some(reference) if reference.array_literal => return Ok(type_id),
+            Some(reference) => reference.base_type,
+            None => {
+                let record = self
+                    .type_payload(type_id)
+                    .ok_or(ArrayTypeError::InvalidReference(type_id))?;
+                let target = match record.data() {
+                    TypeData::Tuple(_) => Some(type_id),
+                    TypeData::TypeReference(reference) => {
+                        reference.object.target.filter(|target| {
+                            matches!(
+                                self.type_payload(*target).map(TypeRecord::data),
+                                Some(TypeData::Tuple(_))
+                            )
+                        })
+                    }
+                    _ => None,
+                };
+                let Some(target) = target else {
+                    return Ok(type_id);
+                };
+
+                if record.object_flags().contains(ObjectFlags::ARRAY_LITERAL) {
+                    let TypeData::TypeReference(reference) = record.data() else {
+                        return Err(ArrayTypeError::InvalidReference(type_id));
+                    };
+                    let arguments = reference
+                        .resolved_type_arguments
+                        .as_deref()
+                        .ok_or(ArrayTypeError::InvalidReference(type_id))?;
+                    let base_type = self
+                        .relation_object_instantiation(target, type_list_key(arguments))
+                        .ok_or(ArrayTypeError::InvalidReference(type_id))?;
+                    let shape = self
+                        .canonical_tuple_shape(base_type)
+                        .map_err(|_| ArrayTypeError::InvalidReference(base_type))?
+                        .ok_or(ArrayTypeError::InvalidReference(base_type))?;
+                    if shape.target() != target || shape.element_types() != arguments {
+                        return Err(ArrayTypeError::InvalidReference(type_id));
+                    }
+                    self.validate_array_literal_clone(base_type, type_id)?;
+                    return Ok(type_id);
+                }
+
+                let shape = self
+                    .canonical_tuple_shape(type_id)
+                    .map_err(|_| ArrayTypeError::InvalidReference(type_id))?
+                    .ok_or(ArrayTypeError::InvalidReference(type_id))?;
+                if shape.target() != target {
+                    return Err(ArrayTypeError::InvalidReference(type_id));
+                }
+                type_id
+            }
         };
-        if reference.array_literal {
-            return Ok(type_id);
-        }
-        let base_type = reference.base_type;
 
         if let Some(cached) = self
             .derived_types
@@ -296,18 +344,20 @@ impl CanonicalTypeMapperStore {
         let base = self
             .type_payload(base_type)
             .ok_or(ArrayTypeError::InvalidReference(base_type))?;
-        if !matches!(base.data(), TypeData::TypeReference(_)) {
+        if !matches!(base.data(), TypeData::TypeReference(_) | TypeData::Tuple(_)) {
             return Err(ArrayTypeError::InvalidReference(base_type));
         }
-        let clone_flags = base.object_flags() & !ObjectFlags::MEMBERS_RESOLVED
-            | ObjectFlags::ARRAY_LITERAL
-            | ObjectFlags::CONTAINS_OBJECT_OR_ARRAY_LITERAL;
+        let reference =
+            direct_reference(base.data()).ok_or(ArrayTypeError::InvalidReference(base_type))?;
+        let clone_flags = array_literal_clone_flags(base.object_flags(), base.data());
         let symbol = base.symbol();
-        let target = direct_reference(base.data())
-            .and_then(|reference| reference.object.target)
+        let target = reference
+            .object
+            .target
             .ok_or(ArrayTypeError::InvalidReference(base_type))?;
-        let resolved_type_arguments = direct_reference(base.data())
-            .and_then(|reference| reference.resolved_type_arguments.clone())
+        let resolved_type_arguments = reference
+            .resolved_type_arguments
+            .clone()
             .ok_or(ArrayTypeError::InvalidReference(base_type))?;
 
         if !self.derived_types.try_reserve_array_literals(1) || !self.try_reserve_types(1) {
@@ -416,15 +466,13 @@ impl CanonicalTypeMapperStore {
         }
         let base = self.type_payload(base_type).ok_or_else(invalid)?;
         let clone = self.type_payload(cached).ok_or_else(invalid)?;
-        let TypeData::TypeReference(base_reference) = base.data() else {
+        let Some(base_reference) = direct_reference(base.data()) else {
             return Err(invalid());
         };
         let TypeData::TypeReference(clone_reference) = clone.data() else {
             return Err(invalid());
         };
-        let expected_flags = base.object_flags() & !ObjectFlags::MEMBERS_RESOLVED
-            | ObjectFlags::ARRAY_LITERAL
-            | ObjectFlags::CONTAINS_OBJECT_OR_ARRAY_LITERAL;
+        let expected_flags = array_literal_clone_flags(base.object_flags(), base.data());
         let mutable_flags = ObjectFlags::MEMBERS_RESOLVED
             | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
             | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES
@@ -451,10 +499,23 @@ impl CanonicalTypeMapperStore {
     }
 }
 
+fn array_literal_clone_flags(flags: ObjectFlags, data: &TypeData) -> ObjectFlags {
+    // Tuple is an origin-payload flag in Rust. Cloned references retain tuple
+    // identity through their target instead of carrying that incompatible flag.
+    let excluded = ObjectFlags::MEMBERS_RESOLVED
+        | if matches!(data, TypeData::Tuple(_)) {
+            ObjectFlags::TUPLE
+        } else {
+            ObjectFlags::NONE
+        };
+    flags & !excluded | ObjectFlags::ARRAY_LITERAL | ObjectFlags::CONTAINS_OBJECT_OR_ARRAY_LITERAL
+}
+
 fn direct_reference(data: &TypeData) -> Option<&TypeReferenceData> {
     match data {
         TypeData::TypeReference(reference) => Some(reference),
         TypeData::Interface(interface) => Some(&interface.reference),
+        TypeData::Tuple(tuple) => Some(&tuple.interface.reference),
         _ => None,
     }
 }
@@ -472,6 +533,8 @@ mod tests {
     use crate::semantic::{
         CanonicalCheckerContext, CanonicalCheckerOptions,
         bootstrap::{LiteralTypeCacheError, UnionReduction},
+        signatures::ElementFlags,
+        tuple_types::CanonicalTupleTypeRequest,
     };
 
     fn context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
@@ -759,6 +822,227 @@ mod tests {
                 .create_array_literal_type(&global_types, base)
                 .unwrap(),
             literal
+        );
+    }
+
+    #[test]
+    fn concrete_tuple_literals_preserve_target_identity_and_reference_flags() {
+        for (index, readonly) in [false, true].into_iter().enumerate() {
+            let mut context = array_context(FileId::new(920 + u32::try_from(index).unwrap()));
+            let global_types = context.global_types().clone();
+            let (number, string) = {
+                let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+                (bootstrap.number_type, bootstrap.string_type)
+            };
+            let store = context.store_mut_for_test();
+            let elements = [number, string];
+            let infos = [
+                store
+                    .create_tuple_element_info(ElementFlags::REQUIRED, None)
+                    .unwrap(),
+                store
+                    .create_tuple_element_info(ElementFlags::REQUIRED, None)
+                    .unwrap(),
+            ];
+            let base = store
+                .create_canonical_tuple_type(
+                    CanonicalTupleTypeRequest::new(&elements, &infos, readonly)
+                        .with_creation_flags(ObjectFlags::FROM_TYPE_NODE),
+                )
+                .unwrap();
+            assert!(store.add_type_object_flags(base, ObjectFlags::MEMBERS_RESOLVED));
+
+            let literal = store
+                .create_array_literal_type(&global_types, base)
+                .unwrap();
+            assert_ne!(literal, base);
+            assert_eq!(
+                store.create_array_literal_type(&global_types, base),
+                Ok(literal)
+            );
+            assert_eq!(
+                store.create_array_literal_type(&global_types, literal),
+                Ok(literal)
+            );
+            assert_eq!(
+                store.derived_types.array_literal_types.get(&base),
+                Some(&literal)
+            );
+            assert_eq!(store.validate_array_literal_clone(base, literal), Ok(()));
+            assert_eq!(
+                store.canonical_array_reference(&global_types, literal),
+                Ok(None)
+            );
+
+            let base_record = store.type_payload(base).unwrap();
+            let literal_record = store.type_payload(literal).unwrap();
+            assert_eq!(literal_record.symbol(), base_record.symbol());
+            assert_eq!(
+                literal_record.object_flags(),
+                base_record.object_flags() & !ObjectFlags::MEMBERS_RESOLVED
+                    | ObjectFlags::ARRAY_LITERAL
+                    | ObjectFlags::CONTAINS_OBJECT_OR_ARRAY_LITERAL,
+            );
+            let TypeData::TypeReference(base_reference) = base_record.data() else {
+                panic!("nonempty tuple must have a concrete reference")
+            };
+            let TypeData::TypeReference(literal_reference) = literal_record.data() else {
+                panic!("tuple literal must clone its concrete reference")
+            };
+            assert_eq!(
+                literal_reference.object.target,
+                base_reference.object.target
+            );
+            assert_eq!(
+                literal_reference.resolved_type_arguments.as_deref(),
+                Some(elements.as_slice())
+            );
+            assert_eq!(
+                literal_reference.object.instantiations,
+                TypeCacheState::Unallocated
+            );
+
+            let target = base_reference.object.target.unwrap();
+            let TypeData::Tuple(tuple) = store.type_payload(target).unwrap().data() else {
+                panic!("concrete tuple reference must retain its tuple target")
+            };
+            assert_eq!(tuple.metadata.is_readonly(), readonly);
+            let TypeCacheState::Allocated(instantiations) =
+                &tuple.interface.reference.object.instantiations
+            else {
+                panic!("tuple target must own its concrete instantiation cache")
+            };
+            assert_eq!(instantiations.get(&type_list_key(&elements)), Some(&base));
+            assert!(!instantiations.values().any(|cached| *cached == literal));
+        }
+    }
+
+    #[test]
+    fn empty_tuple_literals_preserve_target_metadata_with_valid_reference_flags() {
+        for (index, readonly) in [false, true].into_iter().enumerate() {
+            let mut context = array_context(FileId::new(922 + u32::try_from(index).unwrap()));
+            let global_types = context.global_types().clone();
+            let store = context.store_mut_for_test();
+            let base = store
+                .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(&[], &[], readonly))
+                .unwrap();
+
+            let literal = store
+                .create_array_literal_type(&global_types, base)
+                .unwrap();
+            assert_ne!(literal, base);
+            assert_eq!(
+                store.create_array_literal_type(&global_types, base),
+                Ok(literal)
+            );
+            assert_eq!(
+                store.create_array_literal_type(&global_types, literal),
+                Ok(literal)
+            );
+            assert_eq!(store.validate_array_literal_clone(base, literal), Ok(()));
+
+            let base_record = store.type_payload(base).unwrap();
+            let TypeData::Tuple(tuple) = base_record.data() else {
+                panic!("empty tuple must retain its original target identity")
+            };
+            assert_eq!(tuple.metadata.is_readonly(), readonly);
+            let literal_record = store.type_payload(literal).unwrap();
+            assert_eq!(
+                literal_record.object_flags(),
+                ObjectFlags::REFERENCE
+                    | ObjectFlags::ARRAY_LITERAL
+                    | ObjectFlags::CONTAINS_OBJECT_OR_ARRAY_LITERAL,
+            );
+            let TypeData::TypeReference(reference) = literal_record.data() else {
+                panic!("empty tuple literal must clone its tuple target as a reference")
+            };
+            assert_eq!(reference.object.target, Some(base));
+            assert_eq!(reference.resolved_type_arguments.as_deref(), Some(&[][..]));
+            assert_eq!(reference.object.instantiations, TypeCacheState::Unallocated);
+            let shape = store.canonical_tuple_shape(literal).unwrap().unwrap();
+            assert_eq!(shape.type_(), literal);
+            assert_eq!(shape.target(), base);
+            assert_eq!(shape.is_readonly(), readonly);
+            assert!(shape.element_types().is_empty());
+
+            let TypeCacheState::Allocated(instantiations) =
+                &tuple.interface.reference.object.instantiations
+            else {
+                panic!("empty tuple target must own its self instantiation")
+            };
+            assert_eq!(instantiations.get(&type_list_key(&[])), Some(&base));
+            assert!(!instantiations.values().any(|cached| *cached == literal));
+        }
+    }
+
+    #[test]
+    fn forged_and_poisoned_tuple_literal_caches_fail_before_query_writes() {
+        let mut context = array_context(FileId::new(924));
+        let global_types = context.global_types().clone();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let store = context.store_mut_for_test();
+        let info = store
+            .create_tuple_element_info(ElementFlags::REQUIRED, None)
+            .unwrap();
+        let base = store
+            .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(&[number], &[info], false))
+            .unwrap();
+        let literal = store
+            .create_array_literal_type(&global_types, base)
+            .unwrap();
+        let (flags, symbol, target, arguments) = {
+            let record = store.type_payload(literal).unwrap();
+            let TypeData::TypeReference(reference) = record.data() else {
+                panic!("tuple literal must be a reference clone")
+            };
+            (
+                record.object_flags(),
+                record.symbol(),
+                reference.object.target,
+                reference.resolved_type_arguments.clone(),
+            )
+        };
+        let forged = store.alloc_type_reference(flags, symbol).unwrap();
+        assert!(store.set_object_target_and_mapper(forged, target, None));
+        assert!(store.set_type_reference_resolution(forged, None, arguments));
+        let before = (
+            store.type_len(),
+            store.derived_types.array_literal_types.clone(),
+        );
+
+        assert_eq!(
+            store.create_array_literal_type(&global_types, forged),
+            Err(ArrayTypeError::InvalidArrayLiteralCache {
+                base,
+                cached: forged,
+            })
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.derived_types.array_literal_types.clone(),
+            ),
+            before
+        );
+
+        store.derived_types.array_literal_types.insert(base, number);
+        let before = (
+            store.type_len(),
+            store.derived_types.array_literal_types.clone(),
+        );
+        assert_eq!(
+            store.create_array_literal_type(&global_types, base),
+            Err(ArrayTypeError::InvalidArrayLiteralCache {
+                base,
+                cached: number,
+            })
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.derived_types.array_literal_types.clone(),
+            ),
+            before
         );
     }
 

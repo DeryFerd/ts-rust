@@ -431,11 +431,21 @@ pub fn emit_source_file_with_context(
     let NodeData::SourceFile(data) = &node.data else {
         return Err(Printer::unsupported(source_file, node.kind));
     };
+    let first_source_statement = data.statements.nodes.iter().copied().find(|statement| {
+        arena
+            .get(*statement)
+            .is_some_and(|node| !is_reparsed_javascript_type_alias(node))
+    });
     if context.preemitted_source_prologues {
         let prologues = data
             .statements
             .nodes
             .iter()
+            .filter(|statement| {
+                arena
+                    .get(**statement)
+                    .is_none_or(|node| !is_reparsed_javascript_type_alias(node))
+            })
             .take_while(|statement| printer.statement_is_string_prologue(**statement))
             .copied()
             .collect::<Vec<_>>();
@@ -985,9 +995,9 @@ pub fn emit_source_file_with_context(
         printer.writer.newline();
         printer.node_esm_require_name = Some(require);
     }
-    let has_use_strict = data.statements.nodes.first().is_some_and(|statement| {
+    let has_use_strict = first_source_statement.is_some_and(|statement| {
         let Some(NodeData::ExpressionStatement(statement)) =
-            arena.get(*statement).map(|node| &node.data)
+            arena.get(statement).map(|node| &node.data)
         else {
             return false;
         };
@@ -1054,11 +1064,8 @@ pub fn emit_source_file_with_context(
         printer.writer.write("\"use strict\";");
         printer.writer.newline();
     }
-    let first_statement_start = data
-        .statements
-        .nodes
-        .first()
-        .and_then(|statement| arena.get(*statement))
+    let first_statement_start = first_source_statement
+        .and_then(|statement| arena.get(statement))
         .map(|node| node.range.start.get());
     let needs_extends_helper = settings.target < ScriptTarget::Es2015
         && source_needs_extends_helper(arena)
@@ -1080,9 +1087,9 @@ pub fn emit_source_file_with_context(
         )
     }) && !settings.no_emit_helpers;
     let defer_captured_while_leading_comments = settings.target < ScriptTarget::Es2015
-        && data.statements.nodes.first().is_some_and(|statement| {
+        && first_source_statement.is_some_and(|statement| {
             matches!(
-                arena.get(*statement).map(|node| &node.data),
+                arena.get(statement).map(|node| &node.data),
                 Some(NodeData::WhileStatement(while_statement))
                     if printer.es5_while_loop_needs_capture(while_statement)
             )
@@ -1096,10 +1103,10 @@ pub fn emit_source_file_with_context(
         if settings.module == ModuleKind::CommonJs
             && is_external_module
             && !(printer.automatic_jsx.any()
-                && data.statements.nodes.first().is_some_and(|statement| {
-                    arena.get(*statement).is_some_and(|node| {
+                && first_source_statement.is_some_and(|statement| {
+                    arena.get(statement).is_some_and(|node| {
                         matches!(node.data, NodeData::ImportDeclaration(_))
-                            && !printer.statement_emits_runtime(*statement, node)
+                            && !printer.statement_emits_runtime(statement, node)
                     })
                 }))
         {
@@ -1109,6 +1116,11 @@ pub fn emit_source_file_with_context(
             .statements
             .nodes
             .iter()
+            .filter(|statement| {
+                arena
+                    .get(**statement)
+                    .is_none_or(|node| !is_reparsed_javascript_type_alias(node))
+            })
             .take_while(|statement| printer.statement_is_string_prologue(**statement))
             .copied()
             .collect::<Vec<_>>();
@@ -1122,10 +1134,10 @@ pub fn emit_source_file_with_context(
         }
         if !defer_commonjs_leading_comments
             && !defer_captured_while_leading_comments
-            && data.statements.nodes.first().is_some_and(|statement| {
+            && first_source_statement.is_some_and(|statement| {
                 arena
-                    .get(*statement)
-                    .is_some_and(|node| printer.statement_emits_in_place(*statement, node))
+                    .get(statement)
+                    .is_some_and(|node| printer.statement_emits_in_place(statement, node))
             })
         {
             printer.emit_leading_pinned_source_comments(start);
@@ -1720,10 +1732,10 @@ pub fn emit_source_file_with_context(
     }
     if !(defer_captured_while_leading_comments
         || settings.module == ModuleKind::CommonJs && is_external_module)
-        && data.statements.nodes.first().is_some_and(|statement| {
+        && first_source_statement.is_some_and(|statement| {
             arena
-                .get(*statement)
-                .is_some_and(|node| printer.statement_emits_runtime(*statement, node))
+                .get(statement)
+                .is_some_and(|node| printer.statement_emits_runtime(statement, node))
         })
         && let Some(start) = first_statement_start
     {
@@ -1845,10 +1857,10 @@ pub fn emit_source_file_with_context(
     if settings.module == ModuleKind::CommonJs
         && is_external_module
         && let Some(start) = first_statement_start
-        && data.statements.nodes.first().is_some_and(|statement| {
+        && first_source_statement.is_some_and(|statement| {
             arena
-                .get(*statement)
-                .is_some_and(|node| printer.statement_emits_in_place(*statement, node))
+                .get(statement)
+                .is_some_and(|node| printer.statement_emits_in_place(statement, node))
         })
     {
         printer.emit_reference_directives_between(0, start);
@@ -1866,6 +1878,9 @@ pub fn emit_source_file_with_context(
     let mut pending_commonjs_imports = Vec::new();
     for (statement_index, statement) in data.statements.nodes.iter().enumerate() {
         let statement_node = arena.get(*statement);
+        if statement_node.is_some_and(is_reparsed_javascript_type_alias) {
+            continue;
+        }
         let current_emitted =
             statement_node.is_some_and(|node| printer.statement_emits_runtime(*statement, node));
         let current_owns_source_comments =
@@ -3719,6 +3734,11 @@ fn statement_emits_javascript(arena: &NodeArena, node: &Node) -> bool {
     }
 }
 
+fn is_reparsed_javascript_type_alias(node: &Node) -> bool {
+    node.kind == SyntaxKind::JsTypeAliasDeclaration
+        && node.flags.0 & ts_ast::NodeFlags::REPARSED.0 != 0
+}
+
 fn export_declaration_is_empty(arena: &NodeArena, node: &Node) -> bool {
     let NodeData::ExportDeclaration(export) = &node.data else {
         return false;
@@ -4332,6 +4352,11 @@ pub fn emit_declaration_file_with_semantics_and_options(
     let NodeData::SourceFile(data) = &node.data else {
         return Err(DeclarationPrinter::unsupported(source_file, node.kind));
     };
+    let first_source_statement = data.statements.nodes.iter().copied().find(|statement| {
+        arena
+            .get(*statement)
+            .is_some_and(|node| !is_reparsed_javascript_type_alias(node))
+    });
     let has_explicit_module_indicator = data.statements.nodes.iter().any(|statement| {
         printer
             .node(*statement)
@@ -4341,11 +4366,8 @@ pub fn emit_declaration_file_with_semantics_and_options(
         source_name_implies_external_module(source_name) && !has_explicit_module_indicator;
     printer.module_file =
         source_name_implies_external_module(source_name) || has_explicit_module_indicator;
-    if let Some(first_statement_start) = data
-        .statements
-        .nodes
-        .first()
-        .and_then(|statement| arena.get(*statement))
+    if let Some(first_statement_start) = first_source_statement
+        .and_then(|statement| arena.get(statement))
         .map(|node| node.range.start.get())
     {
         printer.emit_detached_pinned_header(first_statement_start);
@@ -4374,9 +4396,9 @@ pub fn emit_declaration_file_with_semantics_and_options(
     }
     let declaration_prefix_len = printer.writer.output.len();
     if printer.javascript_source
-        && let Some(statement) = data.statements.nodes.first()
+        && let Some(statement) = first_source_statement
     {
-        printer.emit_leading_jsdoc_declarations(*statement);
+        printer.emit_leading_jsdoc_declarations(statement);
     }
     if let Some((name, type_id)) = printer.amd_like_factory_export(data) {
         printer.writer.write("export = ");
@@ -4421,6 +4443,14 @@ pub fn emit_declaration_file_with_semantics_and_options(
         }
     }
     for statement in &data.statements.nodes {
+        if printer.javascript_source
+            && printer
+                .arena
+                .get(*statement)
+                .is_some_and(is_reparsed_javascript_type_alias)
+        {
+            continue;
+        }
         if printer.javascript_source {
             printer.emit_leading_jsdoc_declarations(*statement);
         }
@@ -5732,12 +5762,20 @@ impl DeclarationPrinter<'_> {
         scope: NodeId,
     ) -> Result<(), EmitError> {
         let node = self.node(id)?.clone();
+        if self.javascript_source && is_reparsed_javascript_type_alias(&node) {
+            return Ok(());
+        }
         if self.has_internal_annotation(id) {
             return Ok(());
         }
         if self.javascript_source
             && !self.jsdoc_typedef_names().is_empty()
             && export_declaration_is_empty(self.arena, &node)
+            && !self.arena.iter().any(|(_, candidate)| {
+                is_reparsed_javascript_type_alias(candidate)
+                    && candidate.parent == node.parent
+                    && candidate.range.end <= node.range.start
+            })
         {
             return Ok(());
         }
@@ -16885,7 +16923,7 @@ impl DeclarationPrinter<'_> {
                 .any(|line| Self::jsdoc_tag_line(line).starts_with("@callback"));
             let emitted = if typedef {
                 let preserve_comment = !Self::jsdoc_property_tags(&comment).is_empty();
-                self.emit_jsdoc_typedef_comment(&comment, preserve_comment)
+                self.emit_jsdoc_typedef_comment(start, &comment, preserve_comment)
             } else if callback {
                 self.emit_jsdoc_callback_comment(&comment)
             } else {
@@ -16988,7 +17026,7 @@ impl DeclarationPrinter<'_> {
                 .lines()
                 .any(|line| Self::jsdoc_tag_line(line).starts_with("@callback"));
             let emitted = if typedef {
-                self.emit_jsdoc_typedef_comment(comment, false)
+                self.emit_jsdoc_typedef_comment(comment_start, comment, false)
             } else if callback {
                 self.emit_jsdoc_callback_comment(comment)
             } else {
@@ -17001,11 +17039,63 @@ impl DeclarationPrinter<'_> {
         }
     }
 
-    fn emit_jsdoc_typedef_comment(&mut self, comment: &str, preserve_comment: bool) -> bool {
-        let Some(tag_start) = comment.find("@typedef") else {
+    fn emit_jsdoc_typedef_comment(
+        &mut self,
+        comment_start: usize,
+        comment: &str,
+        preserve_comment: bool,
+    ) -> bool {
+        let Some(comment_end) = comment_start.checked_add(comment.len()) else {
             return false;
         };
-        let tag = comment[tag_start + "@typedef".len()..].trim_start();
+        let mut aliases = self
+            .arena
+            .iter()
+            .filter_map(|(id, node)| {
+                if !is_reparsed_javascript_type_alias(node) {
+                    return None;
+                }
+                let start = usize::try_from(node.range.start.get()).ok()?;
+                let end = usize::try_from(node.range.end.get()).ok()?;
+                let offset = start.checked_sub(comment_start)?;
+                (end <= comment_end).then_some((offset, id))
+            })
+            .collect::<Vec<_>>();
+        aliases.sort_unstable_by_key(|(start, _)| *start);
+
+        if aliases.is_empty() {
+            return self.emit_jsdoc_typedef_tag(comment, comment, preserve_comment, None);
+        }
+
+        let mut emitted = false;
+        for (index, (start, declaration)) in aliases.iter().copied().enumerate() {
+            let end = aliases
+                .get(index + 1)
+                .map_or(comment.len(), |(next_start, _)| *next_start);
+            let Some(tag) = comment.get(start..end) else {
+                continue;
+            };
+            emitted |= self.emit_jsdoc_typedef_tag(
+                comment,
+                tag,
+                preserve_comment && !emitted,
+                Some(declaration),
+            );
+        }
+        emitted
+    }
+
+    fn emit_jsdoc_typedef_tag(
+        &mut self,
+        comment: &str,
+        tag_comment: &str,
+        preserve_comment: bool,
+        declaration: Option<NodeId>,
+    ) -> bool {
+        let Some(tag_start) = tag_comment.find("@typedef") else {
+            return false;
+        };
+        let tag = tag_comment[tag_start + "@typedef".len()..].trim_start();
         let typedef_line = tag.lines().next().unwrap_or_default().trim();
         if !typedef_line.contains('{') {
             let Some(name) = typedef_line
@@ -17022,13 +17112,16 @@ impl DeclarationPrinter<'_> {
                     tag.find(name).map_or(tag.len(), |start| start + name.len());
                 self.emit_jsdoc_tag_description(tag, description_start);
             }
+            if let Some(node) = declaration.and_then(|id| self.arena.get(id).cloned()) {
+                self.record_mapping(&node);
+            }
             if self.module_file {
                 self.writer.write("export ");
             }
             self.writer.write("type ");
             self.writer.write(name);
             self.writer.write(" = ");
-            self.emit_jsdoc_property_type(&Self::jsdoc_property_tags(comment), false);
+            self.emit_jsdoc_property_type(&Self::jsdoc_property_tags(tag_comment), false);
             self.writer.write(";");
             self.writer.newline();
             return true;
@@ -17054,13 +17147,16 @@ impl DeclarationPrinter<'_> {
                 .map_or(tag.len(), |start| start + name.len());
             self.emit_jsdoc_tag_description(tag, description_start);
         }
+        if let Some(node) = declaration.and_then(|id| self.arena.get(id).cloned()) {
+            self.record_mapping(&node);
+        }
         if self.module_file {
             self.writer.write("export ");
         }
         self.writer.write("type ");
         self.writer.write(name);
         self.writer.write(" = ");
-        let properties = Self::jsdoc_property_tags(comment);
+        let properties = Self::jsdoc_property_tags(tag_comment);
         if type_text.eq_ignore_ascii_case("Object") && !properties.is_empty() {
             self.emit_jsdoc_property_type(&properties, true);
         } else {
@@ -31463,6 +31559,11 @@ impl Printer<'_> {
         context: &EmitContext<'_>,
     ) -> Result<EmitResult, EmitError> {
         self.commonjs_module_transform = true;
+        let first_source_statement = data.statements.nodes.iter().copied().find(|statement| {
+            self.arena
+                .get(*statement)
+                .is_some_and(|node| !is_reparsed_javascript_type_alias(node))
+        });
         let named_dependency_aliases = context
             .amd_dependencies
             .iter()
@@ -31853,8 +31954,8 @@ impl Printer<'_> {
             self.arena
                 .get(*statement)
                 .is_none_or(|node| !self.statement_emits_runtime(*statement, node))
-        }) && let Some(first_statement) = data.statements.nodes.first()
-            && let Some(node) = self.arena.get(*first_statement)
+        }) && let Some(first_statement) = first_source_statement
+            && let Some(node) = self.arena.get(first_statement)
         {
             self.emit_detached_reference_directives_between(0, node.range.start.get());
         }
@@ -32126,9 +32227,9 @@ impl Printer<'_> {
             }
         }
         self.emit_automatic_jsx_prelude();
-        if let Some(first_statement) = data.statements.nodes.first()
-            && let Some(node) = self.arena.get(*first_statement)
-            && ((self.statement_emits_in_place(*first_statement, node)
+        if let Some(first_statement) = first_source_statement
+            && let Some(node) = self.arena.get(first_statement)
+            && ((self.statement_emits_in_place(first_statement, node)
                 && !match &node.data {
                     NodeData::ImportDeclaration(_) => true,
                     NodeData::ImportEqualsDeclaration(import) => {
@@ -32147,11 +32248,8 @@ impl Printer<'_> {
                 .collect::<Vec<_>>();
             self.emit_leading_source_comments_excluding(node.range.start.get(), &excluded);
         }
-        let mut previous_end = data
-            .statements
-            .nodes
-            .first()
-            .and_then(|statement| self.arena.get(*statement))
+        let mut previous_end = first_source_statement
+            .and_then(|statement| self.arena.get(statement))
             .map_or(0, |node| node.range.start.get());
         let mut reference_owner_start = 0;
         let mut previous_emitted = false;
@@ -32162,6 +32260,9 @@ impl Printer<'_> {
         });
         for statement in &data.statements.nodes {
             if let Some(node) = self.arena.get(*statement) {
+                if is_reparsed_javascript_type_alias(node) {
+                    continue;
+                }
                 let skip_import = match &node.data {
                     NodeData::ImportDeclaration(import) => {
                         self.settings.module != ModuleKind::Umd
@@ -32729,6 +32830,9 @@ impl Printer<'_> {
             let Some(node) = self.arena.get(*statement) else {
                 continue;
             };
+            if is_reparsed_javascript_type_alias(node) {
+                continue;
+            }
             let current_emitted = self.statement_emits_runtime(*statement, node)
                 && !declaration_has_modifier(self.arena, node, SyntaxKind::DeclareKeyword)
                 && !matches!(
@@ -36045,6 +36149,9 @@ impl Printer<'_> {
     #[allow(clippy::too_many_lines)]
     fn emit_statement(&mut self, id: NodeId) -> Result<(), EmitError> {
         let node = self.node(id)?.clone();
+        if is_reparsed_javascript_type_alias(&node) {
+            return Ok(());
+        }
         if self.statement_is_recovered_rest_tuple_type_tail(&node) {
             return Ok(());
         }
@@ -76286,7 +76393,7 @@ mod tests {
     use ts_binder::bind_source_file;
     use ts_checker::{CheckerOptions, ProgramSource, check_program, check_source_file};
     use ts_options::{JsxEmit, ModuleDetectionKind, ModuleKind, PrinterSettings, ScriptTarget};
-    use ts_parser::{parse_jsx_source_file, parse_source_file};
+    use ts_parser::{parse_javascript_source_file, parse_jsx_source_file, parse_source_file};
 
     use super::{
         AmdDependency, EmitConstantValue, EmitContext, canonical_bigint_literal,
@@ -76344,6 +76451,226 @@ mod tests {
         .unwrap()
         .code;
         assert_eq!(output, "~< /> <\n;\n");
+    }
+
+    #[test]
+    fn javascript_emit_preserves_comments_owned_by_reparsed_jsdoc_typedefs() {
+        for source in [
+            "/** @typedef {number} Value */\nconst value = 1;",
+            concat!(
+                "/** @typedef {number} Value */\n",
+                "/** @typedef {string} Label */\n",
+                "const value = 1;",
+            ),
+            concat!(
+                "/** @typedef {number} Value */\n",
+                "\"use strict\";\n",
+                "const value = 1;",
+            ),
+        ] {
+            let parsed = parse_javascript_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            assert!(
+                parsed
+                    .arena
+                    .iter()
+                    .any(|(_, node)| node.kind == ts_ast::SyntaxKind::JsTypeAliasDeclaration)
+            );
+            let mut settings = ts_options::CompilerOptions::default().printer_settings();
+            settings.always_strict = false;
+            settings.target = ScriptTarget::Es2015;
+            settings.module = ModuleKind::None;
+            let output = emit_source_file_with_settings(
+                &parsed.arena,
+                parsed.source_file,
+                "input.js",
+                source,
+                settings,
+            )
+            .unwrap()
+            .code;
+
+            assert_eq!(output, format!("{source}\n"));
+        }
+    }
+
+    #[test]
+    fn javascript_declaration_emit_prints_reparsed_jsdoc_typedefs_once() {
+        let source = concat!(
+            "/**\n",
+            " * @typedef {Object} Props\n",
+            " * @property {string} label Label docs\n",
+            " */\n",
+            "/** @typedef {number} Count */\n",
+            "export const value = { label: \"ready\" };\n",
+        );
+        let parsed = parse_javascript_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        assert_eq!(
+            parsed
+                .arena
+                .iter()
+                .filter(|(_, node)| node.kind == ts_ast::SyntaxKind::JsTypeAliasDeclaration)
+                .count(),
+            2,
+        );
+        let output =
+            emit_declaration_file(&parsed.arena, parsed.source_file, "input.js", source, false)
+                .unwrap()
+                .code;
+
+        assert_eq!(output.matches("export type Props =").count(), 1, "{output}");
+        assert_eq!(output.matches("export type Count =").count(), 1, "{output}");
+        assert_eq!(
+            output.matches("@typedef {Object} Props").count(),
+            1,
+            "{output}",
+        );
+        let props = output.find("export type Props =").unwrap();
+        let count = output.find("export type Count =").unwrap();
+        let value = output.find("export declare const value").unwrap();
+        assert!(props < count && count < value, "{output}");
+    }
+
+    #[test]
+    fn javascript_declaration_emit_preserves_explicit_empty_exports_after_typedefs() {
+        let source = "/** @typedef {string} Bar */\nexport {};\n";
+        let parsed = parse_javascript_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let output =
+            emit_declaration_file(&parsed.arena, parsed.source_file, "input.js", source, false)
+                .unwrap()
+                .code;
+
+        assert_eq!(
+            output,
+            concat!(
+                "export type Bar = string;\n",
+                "/** @typedef {string} Bar */\n",
+                "export {};\n",
+            ),
+        );
+    }
+
+    #[test]
+    fn javascript_declaration_emit_prints_each_typedef_in_one_comment() {
+        let source = concat!(
+            "/**\n",
+            " * @typedef {number} First\n",
+            " * @typedef {string} Second\n",
+            " */\n",
+            "export const value = 1;\n",
+        );
+        let parsed = parse_javascript_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        assert_eq!(
+            parsed
+                .arena
+                .iter()
+                .filter(|(_, node)| node.kind == ts_ast::SyntaxKind::JsTypeAliasDeclaration)
+                .count(),
+            2,
+        );
+        let output =
+            emit_declaration_file(&parsed.arena, parsed.source_file, "input.js", source, false)
+                .unwrap()
+                .code;
+
+        assert_eq!(
+            output.matches("export type First = number;").count(),
+            1,
+            "{output}",
+        );
+        assert_eq!(
+            output.matches("export type Second = string;").count(),
+            1,
+            "{output}",
+        );
+        let first = output.find("export type First = number;").unwrap();
+        let second = output.find("export type Second = string;").unwrap();
+        let value = output.find("export declare const value").unwrap();
+        assert!(first < second && second < value, "{output}");
+    }
+
+    #[test]
+    fn javascript_trailing_typedefs_ignore_earlier_statements_and_reparsed_aliases() {
+        for (source, expected) in [
+            (
+                "export {};\n/** @typedef {number} Last */\n",
+                &["export type Last = number;"][..],
+            ),
+            (
+                concat!(
+                    "/** @typedef {number} First */\n",
+                    "export const value = 1;\n",
+                    "/** @typedef {string} Last */\n",
+                ),
+                &["export type First = number;", "export type Last = string;"][..],
+            ),
+        ] {
+            let parsed = parse_javascript_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            for declaration_map in [false, true] {
+                let result = emit_declaration_file(
+                    &parsed.arena,
+                    parsed.source_file,
+                    "input.js",
+                    source,
+                    declaration_map,
+                )
+                .unwrap();
+                for declaration in expected {
+                    assert_eq!(
+                        result.code.matches(declaration).count(),
+                        1,
+                        "{}",
+                        result.code,
+                    );
+                }
+                assert_eq!(result.source_map.is_some(), declaration_map);
+            }
+        }
+    }
+
+    #[test]
+    fn javascript_typedef_declaration_maps_point_to_the_reparsed_alias() {
+        let source = "/** @typedef {number} Value */\nexport const value = 1;\n";
+        let parsed = parse_javascript_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let output =
+            emit_declaration_file(&parsed.arena, parsed.source_file, "input.js", source, true)
+                .unwrap();
+        let map = output.source_map.expect("declaration maps must be enabled");
+
+        assert_eq!(map.sources, ["input.js"]);
+        assert!(
+            map.mappings.starts_with("AAAI"),
+            "typedef mapping must point to the '@' at source column 4: {}",
+            map.mappings,
+        );
+        assert!(
+            map.mappings
+                .split(';')
+                .filter(|line| !line.is_empty())
+                .count()
+                >= 2,
+            "{}",
+            map.mappings,
+        );
+    }
+
+    #[test]
+    fn declaration_emit_retains_ordinary_typescript_type_aliases() {
+        let source = "export type Value = number;\nexport const value = 1;\n";
+        let parsed = parse_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let output =
+            emit_declaration_file(&parsed.arena, parsed.source_file, "input.ts", source, false)
+                .unwrap()
+                .code;
+
+        assert_eq!(output.matches("export type Value = number;").count(), 1);
+        assert!(output.contains("export declare const value"), "{output}");
     }
 
     #[test]

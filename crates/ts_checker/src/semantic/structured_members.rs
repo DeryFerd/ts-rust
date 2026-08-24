@@ -1338,42 +1338,28 @@ pub(super) fn valid_interface_method_value(
     method: SemanticSymbolId,
     type_: TypeId,
 ) -> Option<SignatureId> {
+    valid_interface_method_signatures(store, method, type_)
+        .and_then(|signatures| signatures.first().copied())
+}
+
+fn valid_interface_method_signatures(
+    store: &CanonicalTypeMapperStore,
+    method: SemanticSymbolId,
+    type_: TypeId,
+) -> Option<&[SignatureId]> {
     let method_record = store.symbol(method)?;
-    let [declaration] = method_record.declarations()? else {
-        return None;
-    };
-    let declaration = *declaration;
+    let declarations = method_record.declarations()?;
     let owner = method_record.parent()?;
     let owner_record = store.symbol(owner)?;
     let owner_declarations = owner_record.declarations()?;
-    let Some(SourceNodeParent::Parent(owner_declaration)) = store.source_node_parent(declaration)
-    else {
-        return None;
-    };
     let record = store.type_payload(type_)?;
     let TypeData::Object(object) = record.data() else {
         return None;
     };
-    let [signature] = object.structured.signatures.as_deref()? else {
-        return None;
-    };
-    let signature = *signature;
-    let callable = store.signature(signature)?;
-    let return_type = callable.resolved_return_type()?;
-    let annotation = store.source_primitive_type_annotation(declaration)?;
-    let parameter_types = match store.callable_signature_parameter_types(signature) {
-        Some(parameters) => parameters,
-        None if callable.parameters().is_empty() => &[],
-        None => return None,
-    };
-    let required_parameters = callable
-        .parameters()
-        .len()
-        .checked_sub(usize::from(callable.has_rest_parameter()))?;
+    let signatures = object.structured.signatures.as_deref()?;
     if owner_record.flags() != SymbolFlags::INTERFACE
-        || !owner_declarations.contains(&owner_declaration)
-        || store.source_node_kind(owner_declaration) != Some(SyntaxKind::InterfaceDeclaration)
-        || store.source_node_kind(declaration) != Some(SyntaxKind::MethodSignature)
+        || declarations.is_empty()
+        || declarations.len() != signatures.len()
         || record.flags() != TypeFlags::OBJECT
         || record.object_flags() != ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
         || record.symbol() != Some(method)
@@ -1384,66 +1370,95 @@ pub(super) fn valid_interface_method_value(
         || object.structured.constrained != ConstrainedTypeData::default()
         || object.structured.members.is_some()
         || object.structured.properties.is_some()
-        || object.structured.call_signature_count != 1
+        || object.structured.call_signature_count != signatures.len()
         || object.structured.index_infos.is_some()
         || object
             .structured
             .object_type_without_abstract_construct_signatures
             .is_some()
-        || callable.flags().bits()
-            & !(SignatureFlags::HAS_REST_PARAMETER | SignatureFlags::HAS_LITERAL_TYPES).bits()
-            != 0
-        || callable.declaration() != Some(declaration)
-        || !callable.type_parameters().is_empty()
-        || callable.this_parameter().is_some()
-        || usize::try_from(callable.min_argument_count()).ok() != Some(required_parameters)
-        || callable.resolved_min_argument_count() != -1
-        || callable.resolved_type_predicate().is_some()
-        || callable.target().is_some()
-        || callable.mapper().is_some()
-        || callable.isolated_signature_type().is_some()
-        || callable.composite().is_some()
-        || store.signature_has_circular_return_type(signature)
-        || parameter_types.len() != callable.parameters().len()
-        || !valid_call_return_annotation(store, annotation, false, return_type)
-        || store.signature_links(declaration)
-            != Some(&SignatureLinks {
-                resolved_signature: ResolvedSignatureState::Resolved(signature),
-                ..SignatureLinks::default()
-            })
     {
         return None;
     }
 
-    let mut seen_parameters = HashSet::with_capacity(parameter_types.len());
-    for (parameter, parameter_type) in callable.parameters().iter().copied().zip(parameter_types) {
-        let record = store.symbol(parameter)?;
-        let [parameter_declaration] = record.declarations()? else {
+    let mut seen_signatures = HashSet::with_capacity(signatures.len());
+    for (declaration, signature) in declarations.iter().copied().zip(signatures.iter().copied()) {
+        let Some(SourceNodeParent::Parent(owner_declaration)) =
+            store.source_node_parent(declaration)
+        else {
             return None;
         };
-        if !seen_parameters.insert(parameter)
-            || record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
-            || record.check_flags() != CheckFlags::NONE
-            || record.value_declaration() != Some(*parameter_declaration)
-            || record.members().is_some()
-            || record.exports().is_some()
-            || record.parent().is_some()
-            || record.export_symbol().is_some()
-            || store.get_merged_symbol(parameter) != Some(parameter)
-            || store.source_node_kind(*parameter_declaration) != Some(SyntaxKind::Parameter)
-            || store.source_node_parent(*parameter_declaration)
-                != Some(SourceNodeParent::Parent(declaration))
-            || store.type_payload(*parameter_type).is_none()
-            || store.value_symbol_links(parameter)
-                != Some(&ValueSymbolLinks {
-                    resolved_type: Some(*parameter_type),
-                    ..ValueSymbolLinks::default()
+        let callable = store.signature(signature)?;
+        let return_type = callable.resolved_return_type()?;
+        let annotation = store.source_primitive_type_annotation(declaration)?;
+        let cached_parameter_types = store.callable_signature_parameter_types(signature);
+        let required_parameters = callable
+            .parameters()
+            .len()
+            .checked_sub(usize::from(callable.has_rest_parameter()))?;
+        if !seen_signatures.insert(signature)
+            || !owner_declarations.contains(&owner_declaration)
+            || store.source_node_kind(owner_declaration) != Some(SyntaxKind::InterfaceDeclaration)
+            || store.source_node_kind(declaration) != Some(SyntaxKind::MethodSignature)
+            || callable.flags().bits()
+                & !(SignatureFlags::HAS_REST_PARAMETER | SignatureFlags::HAS_LITERAL_TYPES).bits()
+                != 0
+            || callable.declaration() != Some(declaration)
+            || !callable.type_parameters().is_empty()
+            || callable.this_parameter().is_some()
+            || usize::try_from(callable.min_argument_count()).ok() != Some(required_parameters)
+            || callable.resolved_min_argument_count() != -1
+            || callable.resolved_type_predicate().is_some()
+            || callable.target().is_some()
+            || callable.mapper().is_some()
+            || callable.isolated_signature_type().is_some()
+            || callable.composite().is_some()
+            || store.signature_has_circular_return_type(signature)
+            || cached_parameter_types
+                .is_some_and(|parameters| parameters.len() != callable.parameters().len())
+            || !valid_call_return_annotation(store, annotation, false, return_type)
+            || store.signature_links(declaration)
+                != Some(&SignatureLinks {
+                    resolved_signature: ResolvedSignatureState::Resolved(signature),
+                    ..SignatureLinks::default()
                 })
         {
             return None;
         }
+
+        let mut seen_parameters = HashSet::with_capacity(callable.parameters().len());
+        for (index, parameter) in callable.parameters().iter().copied().enumerate() {
+            let record = store.symbol(parameter)?;
+            let [parameter_declaration] = record.declarations()? else {
+                return None;
+            };
+            let links = store.value_symbol_links(parameter)?;
+            let parameter_type = links.resolved_type?;
+            if !seen_parameters.insert(parameter)
+                || record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+                || record.check_flags() != CheckFlags::NONE
+                || record.value_declaration() != Some(*parameter_declaration)
+                || record.members().is_some()
+                || record.exports().is_some()
+                || record.parent().is_some()
+                || record.export_symbol().is_some()
+                || store.get_merged_symbol(parameter) != Some(parameter)
+                || store.source_node_kind(*parameter_declaration) != Some(SyntaxKind::Parameter)
+                || store.source_node_parent(*parameter_declaration)
+                    != Some(SourceNodeParent::Parent(declaration))
+                || store.type_payload(parameter_type).is_none()
+                || links
+                    != &(ValueSymbolLinks {
+                        resolved_type: Some(parameter_type),
+                        ..ValueSymbolLinks::default()
+                    })
+                || cached_parameter_types
+                    .is_some_and(|parameters| parameters[index] != parameter_type)
+            {
+                return None;
+            }
+        }
     }
-    Some(signature)
+    Some(signatures)
 }
 
 fn matching_interface_method_contract(
@@ -1463,24 +1478,40 @@ fn matching_interface_method_contract(
     else {
         return false;
     };
-    let Some(first_signature) = valid_interface_method_value(store, first, first_type) else {
+    let Some(first_signatures) = valid_interface_method_signatures(store, first, first_type) else {
         return false;
     };
-    let Some(second_signature) = valid_interface_method_value(store, second, second_type) else {
+    let Some(second_signatures) = valid_interface_method_signatures(store, second, second_type)
+    else {
         return false;
     };
-    let Some(first_record) = store.signature(first_signature) else {
-        return false;
-    };
-    let Some(second_record) = store.signature(second_signature) else {
-        return false;
-    };
-    first_record.flags() == second_record.flags()
-        && first_record.min_argument_count() == second_record.min_argument_count()
-        && first_record.resolved_return_type() == second_record.resolved_return_type()
-        && first_record.parameters().len() == second_record.parameters().len()
-        && store.callable_signature_parameter_types(first_signature)
-            == store.callable_signature_parameter_types(second_signature)
+    first_signatures.len() == second_signatures.len()
+        && first_signatures.iter().zip(second_signatures).all(
+            |(first_signature, second_signature)| {
+                let Some(first_record) = store.signature(*first_signature) else {
+                    return false;
+                };
+                let Some(second_record) = store.signature(*second_signature) else {
+                    return false;
+                };
+                first_record.flags() == second_record.flags()
+                    && first_record.min_argument_count() == second_record.min_argument_count()
+                    && first_record.resolved_return_type() == second_record.resolved_return_type()
+                    && first_record.parameters().len() == second_record.parameters().len()
+                    && first_record
+                        .parameters()
+                        .iter()
+                        .zip(second_record.parameters())
+                        .all(|(first, second)| {
+                            store
+                                .value_symbol_links(*first)
+                                .and_then(|links| links.resolved_type)
+                                == store
+                                    .value_symbol_links(*second)
+                                    .and_then(|links| links.resolved_type)
+                        })
+            },
+        )
 }
 
 fn exact_property_table(
@@ -1834,6 +1865,164 @@ mod tests {
         (method, type_, signature)
     }
 
+    fn publish_overloaded_interface_method_for_test(
+        fixture: &mut Fixture,
+        owner: &str,
+    ) -> (SemanticSymbolId, TypeId, Vec<SignatureId>) {
+        let owner = interface_symbol(fixture, owner);
+        let method = fixture
+            .store
+            .symbol(owner)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| fixture.store.symbol_table(members))
+            .and_then(|members| members.get_source("method"))
+            .unwrap();
+        let declarations = fixture
+            .store
+            .symbol(method)
+            .unwrap()
+            .declarations()
+            .unwrap()
+            .to_vec();
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let (void, string, number) = (
+            bootstrap.void_type,
+            bootstrap.string_type,
+            bootstrap.number_type,
+        );
+        let type_ = fixture
+            .store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(method))
+            .unwrap();
+        let mut signatures = Vec::with_capacity(declarations.len());
+        for declaration in declarations {
+            let annotation = fixture
+                .store
+                .source_primitive_type_annotation(declaration)
+                .unwrap();
+            let return_type = match fixture.store.source_node_kind(annotation) {
+                Some(SyntaxKind::VoidKeyword) => void,
+                Some(SyntaxKind::StringKeyword) => string,
+                Some(SyntaxKind::NumberKeyword) => number,
+                _ => panic!("the overload fixture uses primitive return annotations"),
+            };
+            let signature = fixture
+                .store
+                .alloc_signature(
+                    SignatureFlags::NONE,
+                    Some(declaration),
+                    Vec::new(),
+                    None,
+                    Vec::new(),
+                    Some(return_type),
+                    None,
+                    0,
+                )
+                .unwrap();
+            assert!(fixture.store.set_signature_links(
+                declaration,
+                SignatureLinks {
+                    resolved_signature: ResolvedSignatureState::Resolved(signature),
+                    ..SignatureLinks::default()
+                },
+            ));
+            signatures.push(signature);
+        }
+        assert!(fixture.store.set_value_symbol_links(
+            method,
+            ValueSymbolLinks {
+                resolved_type: Some(type_),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        assert!(fixture.store.set_structured_type_members(
+            type_,
+            None,
+            None,
+            Some(signatures.clone()),
+            None,
+            None,
+        ));
+        (method, type_, signatures)
+    }
+
+    fn publish_parameterized_interface_method_for_test(
+        fixture: &mut Fixture,
+        owner: &str,
+        parameter_type: TypeId,
+    ) -> (SemanticSymbolId, TypeId, SignatureId, SemanticSymbolId) {
+        let owner = interface_symbol(fixture, owner);
+        let host = host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        let plan = object_members::plan_interface(&fixture.store, &host, owner).unwrap();
+        let flags = fixture.store.symbol(owner).unwrap().flags();
+        get_declared_class_interface_or_type_parameter(&mut fixture.store, &host, owner, flags)
+            .unwrap()
+            .unwrap();
+        let [method] = plan.methods.as_slice() else {
+            panic!("the parameterized method fixture contains one method")
+        };
+        let [parameter] = method.parameters.as_slice() else {
+            panic!("the parameterized method fixture contains one parameter")
+        };
+        let void = fixture.store.intrinsic_bootstrap().unwrap().void_type;
+        let type_ = fixture
+            .store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(method.symbol))
+            .unwrap();
+        let signature = fixture
+            .store
+            .alloc_signature(
+                method.flags,
+                Some(method.declaration),
+                Vec::new(),
+                None,
+                vec![parameter.symbol],
+                Some(void),
+                None,
+                1,
+            )
+            .unwrap();
+        assert!(fixture.store.set_signature_links(
+            method.declaration,
+            SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(signature),
+                ..SignatureLinks::default()
+            },
+        ));
+        assert!(fixture.store.set_value_symbol_links(
+            parameter.symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(parameter_type),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        assert!(fixture.store.set_value_symbol_links(
+            method.symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(type_),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        assert!(fixture.store.set_structured_type_members(
+            type_,
+            None,
+            None,
+            Some(vec![signature]),
+            None,
+            None,
+        ));
+        assert!(
+            fixture
+                .store
+                .callable_signature_parameter_types(signature)
+                .is_none()
+        );
+        (method.symbol, type_, signature, parameter.symbol)
+    }
+
     fn indexed_derived_plan(
         fixture: &Fixture,
         host: &DeclaredTypeHost<'_>,
@@ -2082,6 +2271,129 @@ mod tests {
             None
         );
         assert_ne!(derived_type, forged);
+    }
+
+    #[test]
+    fn overloaded_interface_methods_validate_every_signature_in_source_order() {
+        let mut fixture = fixture_with_source(
+            concat!(
+                "interface Base { method(): void; method(): string }\n",
+                "interface Derived { method(): void; method(): string }\n",
+                "interface Different { method(): void; method(): number }\n",
+            ),
+            807,
+        );
+        let (base, base_type, base_signatures) =
+            publish_overloaded_interface_method_for_test(&mut fixture, "Base");
+        let (derived, derived_type, derived_signatures) =
+            publish_overloaded_interface_method_for_test(&mut fixture, "Derived");
+        let (different, different_type, different_signatures) =
+            publish_overloaded_interface_method_for_test(&mut fixture, "Different");
+
+        assert_eq!(base_signatures.len(), 2);
+        assert_eq!(derived_signatures.len(), 2);
+        assert_eq!(different_signatures.len(), 2);
+        assert_eq!(
+            valid_interface_method_value(&fixture.store, base, base_type),
+            Some(base_signatures[0])
+        );
+        assert_eq!(
+            valid_interface_method_value(&fixture.store, derived, derived_type),
+            Some(derived_signatures[0])
+        );
+        assert_eq!(
+            valid_interface_method_value(&fixture.store, different, different_type),
+            Some(different_signatures[0])
+        );
+        assert!(valid_property_symbol(&fixture.store, base));
+        assert!(valid_property_symbol(&fixture.store, derived));
+        assert!(matching_interface_method_contract(
+            &fixture.store,
+            base,
+            derived
+        ));
+        assert!(!matching_interface_method_contract(
+            &fixture.store,
+            base,
+            different
+        ));
+
+        assert!(fixture.store.set_structured_type_members(
+            derived_type,
+            None,
+            None,
+            Some(vec![derived_signatures[1], derived_signatures[0]]),
+            None,
+            None,
+        ));
+        assert_eq!(
+            valid_interface_method_value(&fixture.store, derived, derived_type),
+            None
+        );
+        assert!(!valid_property_symbol(&fixture.store, derived));
+        assert!(!matching_interface_method_contract(
+            &fixture.store,
+            base,
+            derived
+        ));
+    }
+
+    #[test]
+    fn interface_methods_read_published_parameter_types_without_signature_cache() {
+        let mut fixture = fixture_with_source(
+            concat!(
+                "interface Base { method(value: string): void }\n",
+                "interface Derived { method(value: string): void }\n",
+                "interface Different { method(value: number): void }\n",
+            ),
+            808,
+        );
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let (string, number) = (bootstrap.string_type, bootstrap.number_type);
+        let (base, base_type, base_signature, _) =
+            publish_parameterized_interface_method_for_test(&mut fixture, "Base", string);
+        let (derived, derived_type, derived_signature, derived_parameter) =
+            publish_parameterized_interface_method_for_test(&mut fixture, "Derived", string);
+        let (different, different_type, different_signature, _) =
+            publish_parameterized_interface_method_for_test(&mut fixture, "Different", number);
+
+        assert_eq!(
+            valid_interface_method_value(&fixture.store, base, base_type),
+            Some(base_signature)
+        );
+        assert_eq!(
+            valid_interface_method_value(&fixture.store, derived, derived_type),
+            Some(derived_signature)
+        );
+        assert_eq!(
+            valid_interface_method_value(&fixture.store, different, different_type),
+            Some(different_signature)
+        );
+        assert!(matching_interface_method_contract(
+            &fixture.store,
+            base,
+            derived
+        ));
+        assert!(!matching_interface_method_contract(
+            &fixture.store,
+            base,
+            different
+        ));
+
+        assert!(
+            fixture
+                .store
+                .set_value_symbol_links(derived_parameter, ValueSymbolLinks::default())
+        );
+        assert_eq!(
+            valid_interface_method_value(&fixture.store, derived, derived_type),
+            None
+        );
+        assert!(!matching_interface_method_contract(
+            &fixture.store,
+            base,
+            derived
+        ));
     }
 
     #[test]

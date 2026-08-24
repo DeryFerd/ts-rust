@@ -12,7 +12,7 @@
 use std::collections::HashSet;
 
 use ts_ast::{NodeArena, NodeData, NodeRef, SyntaxKind};
-use ts_binder::SymbolFlags;
+use ts_binder::{InternalSymbolName, SymbolFlags};
 use ts_core::{TextPos, TextRange};
 use ts_diagnostics::{Diagnostic, message_by_code};
 
@@ -53,7 +53,7 @@ use super::{
     },
     source_callables::{StoredSourceCallableValidation, validate_stored_source_callable},
     type_nodes::CanonicalTypeQuery,
-    type_records::TypeData,
+    type_records::{TypeData, TypeRecord},
     types::TypeFlags,
 };
 
@@ -128,12 +128,13 @@ pub(super) struct CheckedSourceCall {
     pub(super) return_type: TypeId,
 }
 
-/// Returns the shared parameter context for an object, array, or arrow argument.
+/// Returns an authenticated parameter context for an object, array, or arrow.
 ///
-/// Generic signatures and overloads with different parameter types require
-/// inference or overload selection before they can provide an exact context.
+/// Array and object arguments can retain a shared indexed context when
+/// overload parameter identities differ. Generic signatures still require
+/// inference before they can provide an exact context.
 pub(super) fn source_call_argument_contextual_type(
-    store: &CanonicalTypeMapperStore,
+    store: &mut CanonicalTypeMapperStore,
     global_types: &CanonicalGlobalTypes,
     plan: &SourceCallPlan,
     callee_type: TypeId,
@@ -163,7 +164,7 @@ pub(super) fn source_call_argument_contextual_type(
         return Ok(None);
     }
 
-    let mut contextual_type = None;
+    let mut parameter_types = Vec::with_capacity(projection.call_signatures.len());
     for callable in &projection.call_signatures {
         let Some(signature) = store.signature(callable.signature) else {
             return Err(SourceCheckError::Call(plan.node));
@@ -182,13 +183,311 @@ pub(super) fn source_call_argument_contextual_type(
         let Some(parameter_type) = parameter_type else {
             return Ok(None);
         };
-        match contextual_type {
-            None => contextual_type = Some(parameter_type),
-            Some(existing) if existing == parameter_type => {}
-            Some(_) => return Ok(None),
+        parameter_types.push(parameter_type);
+    }
+
+    let Some(first) = parameter_types.first().copied() else {
+        return Ok(None);
+    };
+    if parameter_types.iter().all(|parameter| *parameter == first) {
+        return Ok(Some(first));
+    }
+
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(SourceCheckError::Call(plan.node))?;
+    let index_key = match argument.kind {
+        PlannedExpressionKind::Array(_) => bootstrap.number_type,
+        PlannedExpressionKind::Object { .. } => bootstrap.string_type,
+        PlannedExpressionKind::Arrow(_) => return Ok(None),
+        _ => unreachable!("only contextual call arguments pass the syntax gate"),
+    };
+    let Some(element_type) =
+        shared_overload_index_type(store, global_types, plan.node, &parameter_types, index_key)?
+    else {
+        return Ok(None);
+    };
+
+    if matches!(argument.kind, PlannedExpressionKind::Array(_)) {
+        for parameter in &parameter_types {
+            if let Some(array) = contextual_array_parameter_with_element(
+                store,
+                global_types,
+                plan.node,
+                *parameter,
+                element_type,
+            )? {
+                return Ok(Some(array));
+            }
+        }
+        return store
+            .create_canonical_array_type(global_types, element_type, false)
+            .map(Some)
+            .map_err(Into::into);
+    }
+
+    for parameter in parameter_types {
+        if let Some(object) = contextual_indexed_parameter_with_element(
+            store,
+            global_types,
+            plan.node,
+            parameter,
+            index_key,
+            element_type,
+        )? {
+            return Ok(Some(object));
         }
     }
-    Ok(contextual_type)
+    Ok(None)
+}
+
+fn shared_overload_index_type(
+    store: &CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    call: NodeRef,
+    parameters: &[TypeId],
+    key_type: TypeId,
+) -> Result<Option<TypeId>, SourceCheckError> {
+    let Some(first) = parameters.first().copied() else {
+        return Ok(None);
+    };
+    let mut common = contextual_indexed_element_types(
+        store,
+        global_types,
+        call,
+        first,
+        key_type,
+        &mut HashSet::new(),
+    )?;
+    common.dedup();
+    if common.is_empty() {
+        return Ok(None);
+    }
+    for parameter in &parameters[1..] {
+        let candidates = contextual_indexed_element_types(
+            store,
+            global_types,
+            call,
+            *parameter,
+            key_type,
+            &mut HashSet::new(),
+        )?;
+        common.retain(|candidate| candidates.contains(candidate));
+        if common.is_empty() {
+            return Ok(None);
+        }
+    }
+    Ok((common.len() == 1).then_some(common[0]))
+}
+
+fn contextual_indexed_element_types(
+    store: &CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    call: NodeRef,
+    contextual_type: TypeId,
+    key_type: TypeId,
+    visiting: &mut HashSet<TypeId>,
+) -> Result<Vec<TypeId>, SourceCheckError> {
+    if !visiting.insert(contextual_type) {
+        return Err(SourceCheckError::Call(call));
+    }
+    let result = contextual_indexed_element_types_inner(
+        store,
+        global_types,
+        call,
+        contextual_type,
+        key_type,
+        visiting,
+    );
+    visiting.remove(&contextual_type);
+    result
+}
+
+fn contextual_indexed_element_types_inner(
+    store: &CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    call: NodeRef,
+    contextual_type: TypeId,
+    key_type: TypeId,
+    visiting: &mut HashSet<TypeId>,
+) -> Result<Vec<TypeId>, SourceCheckError> {
+    let record = store
+        .type_payload(contextual_type)
+        .ok_or(SourceCheckError::Call(call))?;
+    if let TypeData::Union(union) = record.data() {
+        if union.union.types.is_empty() {
+            return Err(SourceCheckError::Call(call));
+        }
+        let mut elements = Vec::new();
+        for constituent in &union.union.types {
+            for element in contextual_indexed_element_types(
+                store,
+                global_types,
+                call,
+                *constituent,
+                key_type,
+                visiting,
+            )? {
+                if !elements.contains(&element) {
+                    elements.push(element);
+                }
+            }
+        }
+        return Ok(elements);
+    }
+
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(SourceCheckError::Call(call))?;
+    if key_type == bootstrap.number_type {
+        if let Some(element) = store.canonical_array_element_type(global_types, contextual_type)? {
+            return Ok(vec![element]);
+        }
+        if let Some(tuple) = store
+            .canonical_tuple_shape(contextual_type)
+            .map_err(|_| SourceCheckError::Call(call))?
+        {
+            let mut elements = Vec::new();
+            for element in tuple.element_types() {
+                if !elements.contains(element) {
+                    elements.push(*element);
+                }
+            }
+            return Ok(elements);
+        }
+    }
+
+    let mut elements = Vec::new();
+    if let Some(indexes) = record
+        .data()
+        .structured()
+        .and_then(|structured| structured.index_infos.as_deref())
+    {
+        for index in indexes {
+            let index = store
+                .index_info(*index)
+                .ok_or(SourceCheckError::Call(call))?;
+            if store.type_payload(index.key_type()).is_none()
+                || store.type_payload(index.value_type()).is_none()
+            {
+                return Err(SourceCheckError::Call(call));
+            }
+            if index.key_type() == key_type && !elements.contains(&index.value_type()) {
+                elements.push(index.value_type());
+            }
+        }
+    }
+    if !elements.is_empty() || key_type != bootstrap.number_type {
+        return Ok(elements);
+    }
+
+    let TypeData::TypeReference(reference) = record.data() else {
+        return Ok(elements);
+    };
+    let Some(target) = reference.object.target else {
+        return Ok(elements);
+    };
+    let Some([element]) = reference.resolved_type_arguments.as_deref() else {
+        return Ok(elements);
+    };
+    let Some(owner) = store.type_payload(target).and_then(TypeRecord::symbol) else {
+        return Ok(elements);
+    };
+    let Some(owner_record) = store.symbol(owner) else {
+        return Err(SourceCheckError::Call(call));
+    };
+    let Some(index) = owner_record
+        .members()
+        .and_then(|members| store.symbol_table(members))
+        .and_then(|members| members.get(InternalSymbolName::Index.as_ref()))
+    else {
+        return Ok(elements);
+    };
+    let Some(index_record) = store.symbol(index) else {
+        return Err(SourceCheckError::Call(call));
+    };
+    if owner_record.name().as_utf8() == Some("ConcatArray")
+        && owner_record.flags().contains(SymbolFlags::INTERFACE)
+        && store
+            .symbol_table(bootstrap.globals)
+            .and_then(|globals| globals.get_source("ConcatArray"))
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            == Some(owner)
+        && index_record.flags() == SymbolFlags::SIGNATURE
+        && index_record.parent() == Some(owner)
+        && index_record.declarations().is_some_and(|declarations| {
+            !declarations.is_empty()
+                && declarations.iter().all(|declaration| {
+                    store.source_node_kind(*declaration) == Some(SyntaxKind::IndexSignature)
+                })
+        })
+        && store.type_payload(*element).is_some()
+    {
+        elements.push(*element);
+    }
+    Ok(elements)
+}
+
+fn contextual_array_parameter_with_element(
+    store: &CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    call: NodeRef,
+    parameter: TypeId,
+    element: TypeId,
+) -> Result<Option<TypeId>, SourceCheckError> {
+    if store.canonical_array_element_type(global_types, parameter)? == Some(element) {
+        return Ok(Some(parameter));
+    }
+    let record = store
+        .type_payload(parameter)
+        .ok_or(SourceCheckError::Call(call))?;
+    let TypeData::Union(union) = record.data() else {
+        return Ok(None);
+    };
+    for constituent in &union.union.types {
+        if store.canonical_array_element_type(global_types, *constituent)? == Some(element) {
+            return Ok(Some(*constituent));
+        }
+    }
+    Ok(None)
+}
+
+fn contextual_indexed_parameter_with_element(
+    store: &CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    call: NodeRef,
+    parameter: TypeId,
+    key_type: TypeId,
+    element: TypeId,
+) -> Result<Option<TypeId>, SourceCheckError> {
+    let record = store
+        .type_payload(parameter)
+        .ok_or(SourceCheckError::Call(call))?;
+    if let TypeData::Union(union) = record.data() {
+        for constituent in &union.union.types {
+            if let Some(candidate) = contextual_indexed_parameter_with_element(
+                store,
+                global_types,
+                call,
+                *constituent,
+                key_type,
+                element,
+            )? {
+                return Ok(Some(candidate));
+            }
+        }
+        return Ok(None);
+    }
+    Ok(contextual_indexed_element_types(
+        store,
+        global_types,
+        call,
+        parameter,
+        key_type,
+        &mut HashSet::new(),
+    )?
+    .contains(&element)
+    .then_some(parameter))
 }
 
 /// Proves the complete direct-call syntax and rejects poisoned cold/warm cache
@@ -4355,6 +4654,144 @@ mod tests {
                 .store()
                 .validate_cached_union_result(callable_union, None),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn overload_array_arguments_retain_their_shared_element_context_and_signature() {
+        let library = parsed("interface Array<T> {} interface ReadonlyArray<T> {}");
+        let source = parsed(concat!(
+            "interface Choices { ",
+            "(values: number[]): string; ",
+            "(values: ReadonlyArray<number>): string; ",
+            "} ",
+            "declare const choose: Choices; ",
+            "const result = choose([1, 2]);",
+        ));
+        let library_file = FileId::new(4_880);
+        let source_file = FileId::new(4_881);
+        let mut context =
+            context_with_default_library(&library, library_file, &source, source_file);
+
+        context.check_source_file(source_file).unwrap();
+
+        let call_nodes = calls(&source, source_file);
+        let [call] = call_nodes.as_slice() else {
+            panic!("expected one overloaded call")
+        };
+        let call = *call;
+        let NodeData::CallExpression(call_data) = &source.arena.get(call.node).unwrap().data else {
+            panic!("expected an overloaded call expression")
+        };
+        let argument = NodeRef::new(source.arena.id(), source_file, call_data.arguments.nodes[0]);
+        let argument_type = context
+            .store()
+            .type_node_links(argument)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        assert_eq!(
+            context
+                .store()
+                .canonical_array_element_type(context.global_types(), argument_type)
+                .unwrap(),
+            Some(context.store().intrinsic_bootstrap().unwrap().number_type)
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let cold = call_publication_state(&context, call);
+        mark_source_unchecked(&mut context, source_file);
+        context.check_source_file(source_file).unwrap();
+        assert_eq!(call_publication_state(&context, call), cold);
+    }
+
+    #[test]
+    fn different_overload_array_elements_do_not_create_a_contextual_type() {
+        let library = parsed("interface Array<T> {} interface ReadonlyArray<T> {}");
+        let source = parsed("declare const unused: number;");
+        let library_file = FileId::new(4_882);
+        let source_file = FileId::new(4_883);
+        let mut context =
+            context_with_default_library(&library, library_file, &source, source_file);
+        let globals = context.global_types().clone();
+        let (number, string) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (bootstrap.number_type, bootstrap.string_type)
+        };
+        let store = context.store_mut_for_test();
+        let numbers = store
+            .create_canonical_array_type(&globals, number, false)
+            .unwrap();
+        let strings = store
+            .create_canonical_array_type(&globals, string, false)
+            .unwrap();
+        let node = NodeRef::new(source.arena.id(), source_file, source.source_file);
+        let before = (store.type_len(), store.mapper_len(), store.signature_len());
+
+        assert_eq!(
+            shared_overload_index_type(store, &globals, node, &[numbers, strings], number),
+            Ok(None)
+        );
+        assert_eq!(
+            (store.type_len(), store.mapper_len(), store.signature_len()),
+            before
+        );
+    }
+
+    #[test]
+    fn concat_array_overloads_keep_the_shared_tuple_index_type() {
+        let library = parsed(concat!(
+            "interface Array<T> {} ",
+            "interface ReadonlyArray<T> {} ",
+            "interface ConcatArray<T> { readonly [index: number]: T; }",
+        ));
+        let source = parsed("type Pair = [number, number];");
+        let library_file = FileId::new(4_884);
+        let source_file = FileId::new(4_885);
+        let mut context =
+            context_with_default_library(&library, library_file, &source, source_file);
+        let pair_declaration =
+            source
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    matches!(record.data, NodeData::TypeAliasDeclaration(_))
+                        .then_some(NodeRef::new(source.arena.id(), source_file, node))
+                })
+                .unwrap();
+        let pair_owner = context
+            .file(source_file)
+            .unwrap()
+            .1
+            .symbol(pair_declaration)
+            .unwrap();
+        let concat_owner = {
+            let store = context.store();
+            store
+                .symbol_table(store.intrinsic_bootstrap().unwrap().globals)
+                .and_then(|globals| globals.get_source("ConcatArray"))
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+                .unwrap()
+        };
+        let pair = context.get_declared_type_of_symbol(pair_owner).unwrap();
+        let concat_target = context.get_declared_type_of_symbol(concat_owner).unwrap();
+        let globals = context.global_types().clone();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let node = NodeRef::new(source.arena.id(), source_file, source.source_file);
+        let store = context.store_mut_for_test();
+        let values = store
+            .create_direct_generic_reference_type(concat_target, &[pair])
+            .unwrap();
+        let either = store
+            .expression_union_type_with_global_types(
+                &globals,
+                &[pair, values],
+                UnionReduction::Literal,
+            )
+            .unwrap();
+
+        assert_eq!(
+            shared_overload_index_type(store, &globals, node, &[values, either], number,),
+            Ok(Some(pair))
         );
     }
 

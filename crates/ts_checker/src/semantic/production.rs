@@ -104,6 +104,12 @@ impl CanonicalJsxRuntimeEvidence<'_> {
 /// admission check when intrinsic strict-null identity is also enabled.
 /// `no_implicit_any` controls diagnostics and evolving inference for
 /// unannotated declarations.
+/// `no_unchecked_indexed_access` includes `undefined` in unchecked index
+/// signature reads when strict null checking makes that distinction observable.
+/// `no_unused_locals` enables diagnostics for unreferenced local declarations.
+/// `allow_unreachable_code` preserves whether unreachable-code diagnostics were
+/// explicitly enabled, explicitly suppressed, or left at their default.
+/// `isolated_modules` enables per-file module restrictions.
 /// `jsx_runtime` retains classic or automatic JSX factory requirements.
 /// `emit_common_js` and `no_emit` preserve the emission conditions needed for
 /// module-scope reserved-name diagnostics.
@@ -119,6 +125,10 @@ pub struct CanonicalCheckerOptions {
     pub strict_function_types: bool,
     pub strict_property_initialization: bool,
     pub no_implicit_any: bool,
+    pub no_unchecked_indexed_access: bool,
+    pub no_unused_locals: bool,
+    pub allow_unreachable_code: Option<bool>,
+    pub isolated_modules: bool,
     pub jsx_runtime: CanonicalJsxRuntime,
     pub emit_common_js: bool,
     pub no_emit: bool,
@@ -136,6 +146,10 @@ impl From<IntrinsicBootstrapOptions> for CanonicalCheckerOptions {
             strict_function_types: false,
             strict_property_initialization: false,
             no_implicit_any: false,
+            no_unchecked_indexed_access: false,
+            no_unused_locals: false,
+            allow_unreachable_code: None,
+            isolated_modules: false,
             jsx_runtime: CanonicalJsxRuntime::Preserve,
             emit_common_js: false,
             no_emit: false,
@@ -2994,6 +3008,10 @@ mod tests {
         assert!(!defaults.strict_function_types);
         assert!(!defaults.strict_property_initialization);
         assert!(!defaults.no_implicit_any);
+        assert!(!defaults.no_unchecked_indexed_access);
+        assert!(!defaults.no_unused_locals);
+        assert_eq!(defaults.allow_unreachable_code, None);
+        assert!(!defaults.isolated_modules);
         assert_eq!(defaults.jsx_runtime, CanonicalJsxRuntime::Preserve);
         assert!(!defaults.emit_common_js);
         assert!(!defaults.no_emit);
@@ -3009,6 +3027,10 @@ mod tests {
         assert!(!options.strict_function_types);
         assert!(!options.strict_property_initialization);
         assert!(!options.no_implicit_any);
+        assert!(!options.no_unchecked_indexed_access);
+        assert!(!options.no_unused_locals);
+        assert_eq!(options.allow_unreachable_code, None);
+        assert!(!options.isolated_modules);
         assert_eq!(options.jsx_runtime, CanonicalJsxRuntime::Preserve);
         assert!(!options.emit_common_js);
         assert!(!options.no_emit);
@@ -3208,6 +3230,10 @@ mod tests {
             strict_builtin_iterator_return: true,
             strict_function_types: true,
             no_implicit_any: true,
+            no_unchecked_indexed_access: true,
+            no_unused_locals: true,
+            allow_unreachable_code: Some(false),
+            isolated_modules: true,
             emit_common_js: true,
             no_emit: true,
             uses_wildcard_types: true,
@@ -3262,6 +3288,10 @@ mod tests {
         );
         assert_eq!(context.store().claimed_strict_function_types(), Some(true));
         assert!(context.options().strict_function_types);
+        assert!(context.options().no_unchecked_indexed_access);
+        assert!(context.options().no_unused_locals);
+        assert_eq!(context.options().allow_unreachable_code, Some(false));
+        assert!(context.options().isolated_modules);
         assert!(context.options().emit_common_js);
         assert!(context.options().no_emit);
         assert!(context.options().uses_wildcard_types);

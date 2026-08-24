@@ -13,13 +13,16 @@ use ts_binder::{CheckFlags, SymbolFlags};
 use super::{
     CanonicalTypeMapperStore, ResolvedSignatureState, SignatureId, SignatureLinks, TypeId,
     TypeNodeLinks,
+    array_types::CanonicalArrayTargets,
     callables::{
         CallableFamily, StoredSingleCallableValidation, ValidatedSingleCallable,
         validate_stored_single_callable_provider,
     },
     classes::{ClassHeritageMembersValidation, validate_class_heritage_members},
+    instantiate::instantiated_member_type_matches,
     links::ValueSymbolLinks,
     object_members::{StoredDeclaredCallSetValidation, validate_stored_declared_call_set},
+    reference_types::validate_direct_generic_reference,
     signatures::SignatureFlags,
     source_overloads::{StoredSourceOverloadValidation, validate_stored_source_overload},
     store::{SourceCallableReturnProvenance, SourceNodeParent},
@@ -141,6 +144,16 @@ pub(super) fn validate_stored_callable_set(
     }
 
     if let Some(validation) = validate_stored_default_library_method_callable_set(store, type_) {
+        return validation;
+    }
+
+    if let Some(validation) =
+        validate_stored_instantiated_interface_method_callable_set(store, type_)
+    {
+        return validation;
+    }
+
+    if let Some(validation) = validate_stored_interface_method_callable_set(store, type_) {
         return validation;
     }
 
@@ -481,6 +494,518 @@ fn validate_stored_default_library_method_callable_set(
     })
 }
 
+fn validate_stored_instantiated_interface_method_callable_set(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Option<StoredCallableSetValidation> {
+    let record = store.type_payload(type_)?;
+    let TypeData::Object(object) = record.data() else {
+        return None;
+    };
+    let (Some(source), Some(mapper)) = (object.target, object.mapper) else {
+        return None;
+    };
+    let method = record.symbol()?;
+    let (owner, owner_type) = store.authenticated_interface_method_owner(method)?;
+    let family = CallableFamily::DeclaredCallSignatures;
+
+    let authenticated = (|| {
+        let source_validation = validate_stored_interface_method_callable_set(store, source)?;
+        let StoredCallableSetValidation::Valid {
+            projection: original,
+            ..
+        } = source_validation
+        else {
+            return None;
+        };
+        let method_record = store.symbol(method)?;
+        let owner_record = store.symbol(owner)?;
+        let declarations = method_record.declarations()?;
+        let TypeData::Interface(interface) = store.type_payload(owner_type)?.data() else {
+            return None;
+        };
+        let parameters = interface.reference.resolved_type_arguments.as_deref()?;
+        let this_type = interface.this_type?;
+        let receiver = store.map_type(mapper, this_type)?;
+        let receiver_reference = validate_direct_generic_reference(store, receiver).ok()?;
+        let globals = store.intrinsic_bootstrap()?.globals;
+        let global_owner = store
+            .symbol_table(globals)?
+            .get(owner_record.name())
+            .and_then(|owner| store.get_merged_symbol(owner));
+        let array_targets = CanonicalArrayTargets::for_single_target_validation(owner_type);
+        if !matches!(
+            owner_record.name().as_utf8(),
+            Some("Array" | "ReadonlyArray")
+        ) || global_owner != Some(owner)
+            || parameters.is_empty()
+            || receiver_reference.target != owner_type
+            || receiver_reference.type_arguments.len() != parameters.len()
+            || interface.all_type_parameters.as_deref().is_none_or(|all| {
+                all.len() != parameters.len() + 1
+                    || &all[..parameters.len()] != parameters
+                    || all.last().copied() != Some(this_type)
+            })
+            || store
+                .canonical_array_reference_with_targets(array_targets, receiver)
+                .ok()
+                .flatten()
+                .is_none_or(|reference| reference.base_type != receiver)
+        {
+            return None;
+        }
+        let mapper_sources = parameters
+            .iter()
+            .copied()
+            .chain(std::iter::once(this_type))
+            .collect::<Vec<_>>();
+        let mapper_targets = receiver_reference
+            .type_arguments
+            .iter()
+            .copied()
+            .chain(std::iter::once(receiver))
+            .collect::<Vec<_>>();
+        if store.type_mapper_has_exact_endpoints(mapper, &mapper_sources, &mapper_targets)
+            != Some(true)
+            || record.flags() != TypeFlags::OBJECT
+            || record.object_flags() != ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
+            || record.alias().is_some()
+            || object.instantiations != TypeCacheState::Unallocated
+            || object.structured.constrained != ConstrainedTypeData::default()
+            || object.structured.members.is_some()
+            || object.structured.properties.is_some()
+            || object.structured.index_infos.is_some()
+            || object
+                .structured
+                .object_type_without_abstract_construct_signatures
+                .is_some()
+            || object.structured.call_signature_count != original.call_signatures.len()
+            || declarations.len() != original.call_signatures.len()
+            || store.value_symbol_links(method)
+                != Some(&ValueSymbolLinks {
+                    resolved_type: Some(source),
+                    ..ValueSymbolLinks::default()
+                })
+        {
+            return None;
+        }
+        let stored_signatures = object.structured.signatures.as_deref()?;
+        if stored_signatures.len() != original.call_signatures.len() {
+            return None;
+        }
+
+        let projection =
+            validate_stored_callable_set_projection_with(store, type_, true, |signature| {
+                let target = store.signature(signature)?.target()?;
+                let source = original
+                    .call_signatures
+                    .iter()
+                    .find(|callable| callable.signature == target)?;
+                validated_instantiated_method_parameter_types(
+                    store,
+                    signature,
+                    source,
+                    mapper,
+                    array_targets,
+                )
+            })?;
+        if !projection.construct_signatures.is_empty()
+            || projection.call_signatures.len() != original.call_signatures.len()
+        {
+            return None;
+        }
+
+        let mut edges = Vec::new();
+        for ((callable, source_callable), declaration) in projection
+            .call_signatures
+            .iter()
+            .zip(original.call_signatures.iter())
+            .zip(declarations)
+        {
+            let signature = store.signature(callable.signature)?;
+            let original_signature = store.signature(source_callable.signature)?;
+            let return_type = callable.return_type?;
+            let source_return = source_callable.return_type?;
+            if signature.flags() != (original_signature.flags() & SignatureFlags::PROPAGATING_FLAGS)
+                || signature.declaration() != Some(*declaration)
+                || original_signature.declaration() != Some(*declaration)
+                || !signature.type_parameters().is_empty()
+                || signature.this_parameter().is_some()
+                || signature.parameters().len() != original_signature.parameters().len()
+                || signature.min_argument_count() != original_signature.min_argument_count()
+                || signature.resolved_min_argument_count() != -1
+                || signature.resolved_type_predicate().is_some()
+                || signature.target() != Some(source_callable.signature)
+                || signature.mapper() != Some(mapper)
+                || signature.isolated_signature_type().is_some()
+                || signature.composite().is_some()
+                || store.signature_has_circular_return_type(callable.signature)
+                || !instantiated_method_type_matches(
+                    store,
+                    source_return,
+                    return_type,
+                    mapper,
+                    array_targets,
+                )
+            {
+                return None;
+            }
+            edges.extend(callable.parameters.iter().copied());
+            edges.extend(callable.rest_parameter);
+            edges.push(return_type);
+        }
+
+        Some((projection, edges))
+    })();
+
+    Some(match authenticated {
+        Some((projection, edges)) => StoredCallableSetValidation::Valid {
+            family,
+            projection,
+            edges,
+        },
+        None => StoredCallableSetValidation::Malformed { family },
+    })
+}
+
+fn validated_instantiated_method_parameter_types(
+    store: &CanonicalTypeMapperStore,
+    signature: SignatureId,
+    original: &ValidatedSingleCallable,
+    mapper: super::TypeMapperId,
+    array_targets: CanonicalArrayTargets,
+) -> Option<Vec<TypeId>> {
+    let signature = store.signature(signature)?;
+    let original_signature = store.signature(original.signature)?;
+    if signature.target() != Some(original.signature)
+        || signature.mapper() != Some(mapper)
+        || signature.parameters().len() != original_signature.parameters().len()
+    {
+        return None;
+    }
+    let original_types = store.callable_signature_parameter_types(original.signature)?;
+    if original_types.len() != original_signature.parameters().len() {
+        return None;
+    }
+
+    let mut parameter_types = Vec::with_capacity(signature.parameters().len());
+    for ((parameter, original_parameter), template) in signature
+        .parameters()
+        .iter()
+        .zip(original_signature.parameters())
+        .zip(original_types)
+    {
+        let symbol = store.symbol(*parameter)?;
+        let original_symbol = store.symbol(*original_parameter)?;
+        let links = store.value_symbol_links(*parameter)?;
+        let type_ = links.resolved_type?;
+        let valid_links = if parameter == original_parameter {
+            links
+                == &(ValueSymbolLinks {
+                    resolved_type: Some(type_),
+                    ..ValueSymbolLinks::default()
+                })
+                && type_ == *template
+        } else {
+            let expected_checks = CheckFlags::INSTANTIATED
+                | (original_symbol.check_flags()
+                    & (CheckFlags::READONLY
+                        | CheckFlags::LATE
+                        | CheckFlags::OPTIONAL_PARAMETER
+                        | CheckFlags::REST_PARAMETER));
+            symbol.flags() == original_symbol.flags() | SymbolFlags::TRANSIENT
+                && symbol.check_flags() == expected_checks
+                && symbol.name() == original_symbol.name()
+                && symbol.declarations() == original_symbol.declarations()
+                && symbol.value_declaration() == original_symbol.value_declaration()
+                && symbol.parent() == original_symbol.parent()
+                && symbol.members().is_none()
+                && symbol.exports().is_none()
+                && symbol.export_symbol().is_none()
+                && store.get_merged_symbol(*parameter) == Some(*parameter)
+                && links
+                    == &(ValueSymbolLinks {
+                        resolved_type: Some(type_),
+                        target: Some(*original_parameter),
+                        mapper: Some(mapper),
+                        name_type: store
+                            .value_symbol_links(*original_parameter)
+                            .and_then(|links| links.name_type),
+                        ..ValueSymbolLinks::default()
+                    })
+        };
+        if !valid_links
+            || !instantiated_method_type_matches(store, *template, type_, mapper, array_targets)
+        {
+            return None;
+        }
+        parameter_types.push(type_);
+    }
+    Some(parameter_types)
+}
+
+fn instantiated_method_type_matches(
+    store: &CanonicalTypeMapperStore,
+    template: TypeId,
+    actual: TypeId,
+    mapper: super::TypeMapperId,
+    array_targets: CanonicalArrayTargets,
+) -> bool {
+    instantiated_member_type_matches(store, template, actual, mapper, Some(array_targets))
+        .unwrap_or(false)
+}
+
+fn validate_stored_interface_method_callable_set(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Option<StoredCallableSetValidation> {
+    let method_symbol = store.type_payload(type_)?.symbol()?;
+    let method = store.symbol(method_symbol)?;
+    if !method.flags().contains(SymbolFlags::METHOD) {
+        return None;
+    }
+    let owner_symbol = method
+        .parent()
+        .and_then(|parent| store.get_merged_symbol(parent))?;
+    let owner = store.symbol(owner_symbol)?;
+    if !owner.flags().contains(SymbolFlags::INTERFACE) {
+        return None;
+    }
+
+    let family = CallableFamily::DeclaredCallSignatures;
+    let authenticated = (|| {
+        let declarations = method.declarations()?;
+        let owner_declarations = owner.declarations()?;
+        let interface = store.declared_type_links(owner_symbol)?.declared_type?;
+        let interface_record = store.type_payload(interface)?;
+        let TypeData::Interface(_) = interface_record.data() else {
+            return None;
+        };
+        let allowed_owner_flags =
+            SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::TRANSIENT;
+        if declarations.is_empty()
+            || owner.flags() & SymbolFlags::TYPE != SymbolFlags::INTERFACE
+            || owner.flags().without(allowed_owner_flags) != SymbolFlags::NONE
+            || owner.check_flags() != CheckFlags::NONE
+            || store.get_merged_symbol(owner_symbol) != Some(owner_symbol)
+            || interface_record.flags() != TypeFlags::OBJECT
+            || !interface_record
+                .object_flags()
+                .contains(ObjectFlags::INTERFACE)
+            || interface_record.symbol() != Some(owner_symbol)
+            || interface_record.alias().is_some()
+            || method.flags() != SymbolFlags::METHOD
+            || method.check_flags() != CheckFlags::NONE
+            || method.name().is_reserved_member_name()
+            || method.name().is_private_identifier()
+            || method.name().is_late_bound()
+            || method
+                .value_declaration()
+                .is_none_or(|declaration| !declarations.contains(&declaration))
+            || method.members().is_some()
+            || method.exports().is_some()
+            || method.export_symbol().is_some()
+            || store.get_merged_symbol(method_symbol) != Some(method_symbol)
+            || owner
+                .members()
+                .and_then(|members| store.symbol_table(members))
+                .and_then(|members| members.get(method.name()))
+                .and_then(|method| store.get_merged_symbol(method))
+                != Some(method_symbol)
+            || store.value_symbol_links(method_symbol)
+                != Some(&ValueSymbolLinks {
+                    resolved_type: Some(type_),
+                    ..ValueSymbolLinks::default()
+                })
+        {
+            return None;
+        }
+
+        let record = store.type_payload(type_)?;
+        let TypeData::Object(object) = record.data() else {
+            return None;
+        };
+        let signatures = object.structured.signatures.as_deref()?;
+        if record.flags() != TypeFlags::OBJECT
+            || record.object_flags() != ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
+            || record.alias().is_some()
+            || object.target.is_some()
+            || object.mapper.is_some()
+            || object.instantiations != TypeCacheState::Unallocated
+            || object.structured.constrained != ConstrainedTypeData::default()
+            || object.structured.members.is_some()
+            || object.structured.properties.is_some()
+            || object.structured.call_signature_count != signatures.len()
+            || object.structured.index_infos.is_some()
+            || object
+                .structured
+                .object_type_without_abstract_construct_signatures
+                .is_some()
+            || signatures.len() != declarations.len()
+        {
+            return None;
+        }
+
+        let projection =
+            validate_stored_callable_set_projection_with(store, type_, true, |signature| {
+                validated_method_signature_parameter_types(store, signature)
+            })?;
+        if !projection.construct_signatures.is_empty()
+            || projection.call_signatures.len() != declarations.len()
+        {
+            return None;
+        }
+
+        let mut edges = Vec::new();
+        for (callable, declaration) in projection.call_signatures.iter().zip(declarations) {
+            let signature = store.signature(callable.signature)?;
+            let allowed_flags =
+                SignatureFlags::HAS_REST_PARAMETER | SignatureFlags::HAS_LITERAL_TYPES;
+            if store.source_node_kind(*declaration) != Some(SyntaxKind::MethodSignature)
+                || !matches!(
+                    store.source_node_parent(*declaration),
+                    Some(SourceNodeParent::Parent(owner_declaration))
+                        if owner_declarations.contains(&owner_declaration)
+                )
+                || signature.declaration() != Some(*declaration)
+                || signature.flags() & !allowed_flags != SignatureFlags::NONE
+                || !signature.type_parameters().is_empty()
+                || signature.this_parameter().is_some()
+                || signature.resolved_min_argument_count() != -1
+                || signature.resolved_type_predicate().is_some()
+                || signature.target().is_some()
+                || signature.mapper().is_some()
+                || signature.isolated_signature_type().is_some()
+                || signature.composite().is_some()
+                || store.signature_has_circular_return_type(callable.signature)
+                || store.signature_links(*declaration)
+                    != Some(&SignatureLinks {
+                        resolved_signature: ResolvedSignatureState::Resolved(callable.signature),
+                        ..SignatureLinks::default()
+                    })
+            {
+                return None;
+            }
+            let return_type = callable.return_type?;
+            let annotation = store.source_direct_type_annotation(*declaration)?;
+            if validated_method_annotation_type(store, annotation) != Some(return_type) {
+                return None;
+            }
+            edges.extend(callable.parameters.iter().copied());
+            edges.extend(callable.rest_parameter);
+            edges.push(return_type);
+        }
+
+        Some((projection, edges))
+    })();
+
+    Some(match authenticated {
+        Some((projection, edges)) => StoredCallableSetValidation::Valid {
+            family,
+            projection,
+            edges,
+        },
+        None => StoredCallableSetValidation::Malformed { family },
+    })
+}
+
+fn validated_method_signature_parameter_types(
+    store: &CanonicalTypeMapperStore,
+    signature: SignatureId,
+) -> Option<Vec<TypeId>> {
+    let record = store.signature(signature)?;
+    let declaration = record.declaration()?;
+    let mut parameter_types = Vec::with_capacity(record.parameters().len());
+    for parameter in record.parameters() {
+        let symbol = store.symbol(*parameter)?;
+        let [parameter_declaration] = symbol.declarations()? else {
+            return None;
+        };
+        let links = store.value_symbol_links(*parameter)?;
+        let type_ = links.resolved_type?;
+        if symbol.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+            || symbol.check_flags() != CheckFlags::NONE
+            || symbol.value_declaration() != Some(*parameter_declaration)
+            || symbol.members().is_some()
+            || symbol.exports().is_some()
+            || symbol.parent().is_some()
+            || symbol.export_symbol().is_some()
+            || store.get_merged_symbol(*parameter) != Some(*parameter)
+            || store.source_node_kind(*parameter_declaration) != Some(SyntaxKind::Parameter)
+            || store.source_node_parent(*parameter_declaration)
+                != Some(SourceNodeParent::Parent(declaration))
+            || links
+                != &(ValueSymbolLinks {
+                    resolved_type: Some(type_),
+                    ..ValueSymbolLinks::default()
+                })
+            || store.type_payload(type_).is_none()
+        {
+            return None;
+        }
+        let annotation = store.source_direct_type_annotation(*parameter_declaration)?;
+        let annotated = validated_method_annotation_type(store, annotation)?;
+        if annotated != type_ {
+            let undefined = store.intrinsic_bootstrap()?.undefined_type;
+            let TypeData::Union(union) = store.type_payload(type_)?.data() else {
+                return None;
+            };
+            if union.union.types.len() != 2
+                || !union.union.types.contains(&annotated)
+                || !union.union.types.contains(&undefined)
+            {
+                return None;
+            }
+        }
+        parameter_types.push(type_);
+    }
+    if store
+        .callable_signature_parameter_types(signature)
+        .is_some_and(|cached| cached != parameter_types.as_slice())
+    {
+        return None;
+    }
+    Some(parameter_types)
+}
+
+fn validated_method_annotation_type(
+    store: &CanonicalTypeMapperStore,
+    annotation: ts_ast::NodeRef,
+) -> Option<TypeId> {
+    let bootstrap = store.intrinsic_bootstrap()?;
+    let intrinsic = match store.source_node_kind(annotation)? {
+        SyntaxKind::AnyKeyword => Some(bootstrap.any_type),
+        SyntaxKind::UnknownKeyword => Some(bootstrap.unknown_type),
+        SyntaxKind::StringKeyword => Some(bootstrap.string_type),
+        SyntaxKind::NumberKeyword => Some(bootstrap.number_type),
+        SyntaxKind::BigIntKeyword => Some(bootstrap.bigint_type),
+        SyntaxKind::BooleanKeyword => Some(bootstrap.boolean_type),
+        SyntaxKind::SymbolKeyword => Some(bootstrap.es_symbol_type),
+        SyntaxKind::VoidKeyword => Some(bootstrap.void_type),
+        SyntaxKind::UndefinedKeyword => Some(bootstrap.undefined_type),
+        SyntaxKind::NullKeyword => Some(bootstrap.null_type),
+        SyntaxKind::NeverKeyword => Some(bootstrap.never_type),
+        SyntaxKind::ObjectKeyword => Some(bootstrap.non_primitive_type),
+        SyntaxKind::IntrinsicKeyword => Some(bootstrap.intrinsic_marker_type),
+        _ => None,
+    };
+    let Some(links) = store.type_node_links(annotation) else {
+        return intrinsic;
+    };
+    let resolved = links.resolved_type?;
+    if links
+        != &(TypeNodeLinks {
+            resolved_type: Some(resolved),
+            ..TypeNodeLinks::default()
+        })
+        || intrinsic.is_some_and(|expected| expected != resolved)
+        || store.type_payload(resolved).is_none()
+    {
+        return None;
+    }
+    Some(resolved)
+}
+
 fn validate_stored_class_method_callable_set(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
@@ -548,16 +1073,7 @@ fn validate_stored_class_method_callable_set(
 
         let projection =
             validate_stored_callable_set_projection_with(store, type_, true, |signature| {
-                store
-                    .callable_signature_parameter_types(signature)
-                    .map(<[TypeId]>::to_vec)
-                    .or_else(|| {
-                        store
-                            .signature(signature)?
-                            .parameters()
-                            .is_empty()
-                            .then(Vec::new)
-                    })
+                validated_method_signature_parameter_types(store, signature)
             })?;
         let [callable] = projection.call_signatures.as_ref() else {
             return None;
@@ -574,14 +1090,17 @@ fn validate_stored_class_method_callable_set(
         {
             return None;
         }
-        Some((projection, return_type))
+        let mut edges = callable.parameters.clone();
+        edges.extend(callable.rest_parameter);
+        edges.push(return_type);
+        Some((projection, edges))
     })();
 
     Some(match authenticated {
-        Some((projection, return_type)) => StoredCallableSetValidation::Valid {
+        Some((projection, edges)) => StoredCallableSetValidation::Valid {
             family,
             projection,
-            edges: vec![return_type],
+            edges,
         },
         None => StoredCallableSetValidation::Malformed { family },
     })
@@ -757,19 +1276,21 @@ mod tests {
 
     use ts_ast::{FileId, NodeData, NodeRef};
     use ts_binder::{
-        CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
-        EscapedName, SemanticSymbolId, SymbolData, SymbolFlags,
+        CanonicalBinder, CanonicalModuleState, CanonicalNameResolverOptions,
+        CanonicalSourceFileFacts, CanonicalSourceLanguage, EscapedName, SemanticSymbolId,
+        SymbolData, SymbolFlags,
     };
     use ts_parser::{ParseResult, parse_javascript_source_file, parse_source_file};
 
     use super::*;
     use crate::semantic::{
-        CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions, SemanticStore,
-        TypeRecord,
+        CanonicalCheckerContext, CanonicalCheckerOptions, DeclaredTypeLinks,
+        IntrinsicBootstrapOptions, SemanticStore, TypeRecord,
         bootstrap::UnionReduction,
         callables::validate_stored_single_callable,
         calls::{DirectCallApplicability, DirectCallForm, DirectCallRequest, resolve_direct_call},
         mapper::TypeMapper,
+        production::GlobalMergeCompletion,
         types::ObjectFlags,
     };
 
@@ -792,6 +1313,14 @@ mod tests {
         method: SemanticSymbolId,
         parameter: Option<SemanticSymbolId>,
         return_annotation: NodeRef,
+    }
+
+    struct PublishedInterfaceMethod {
+        type_: TypeId,
+        signatures: Vec<SignatureId>,
+        declarations: Vec<NodeRef>,
+        method: SemanticSymbolId,
+        parameters: Vec<SemanticSymbolId>,
     }
 
     fn default_library_context(
@@ -1015,6 +1544,207 @@ mod tests {
             method,
             parameter: parameter.map(|(symbol, _)| symbol),
             return_annotation,
+        }
+    }
+
+    fn publish_interface_method(
+        context: &mut CanonicalCheckerContext<'_>,
+        parsed: &ParseResult,
+        owner_name: &str,
+        method_name: &str,
+        publish_keyword_annotations: bool,
+    ) -> PublishedInterfaceMethod {
+        let global_types = context.global_types().clone();
+        let store = context.store();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let owner = store
+            .symbol_table(bootstrap.globals)
+            .and_then(|globals| globals.get_source(owner_name))
+            .and_then(|owner| store.get_merged_symbol(owner))
+            .unwrap();
+        let method = store
+            .symbol(owner)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get_source(method_name))
+            .and_then(|method| store.get_merged_symbol(method))
+            .unwrap();
+        let declarations = store
+            .symbol(method)
+            .unwrap()
+            .declarations()
+            .unwrap()
+            .to_vec();
+        let string = bootstrap.string_type;
+        let number = bootstrap.number_type;
+        let void = bootstrap.void_type;
+        let any_array = global_types.any_array_type;
+        let plans = declarations
+            .iter()
+            .copied()
+            .map(|declaration| {
+                let NodeData::MethodSignatureDeclaration(method) =
+                    &parsed.arena.get(declaration.node).unwrap().data
+                else {
+                    panic!("expected an interface method signature")
+                };
+                let parameters = method
+                    .parameters
+                    .nodes
+                    .iter()
+                    .map(|parameter| {
+                        let declaration =
+                            NodeRef::new(declaration.arena, declaration.file, *parameter);
+                        let NodeData::ParameterDeclaration(parameter) =
+                            &parsed.arena.get(declaration.node).unwrap().data
+                        else {
+                            panic!("expected an interface method parameter")
+                        };
+                        let annotation = NodeRef::new(
+                            declaration.arena,
+                            declaration.file,
+                            parameter.type_.unwrap(),
+                        );
+                        let type_ = match parsed.arena.get(annotation.node).unwrap().kind {
+                            SyntaxKind::StringKeyword => string,
+                            SyntaxKind::NumberKeyword => number,
+                            SyntaxKind::ArrayType => any_array,
+                            _ => panic!("unexpected interface method parameter type"),
+                        };
+                        let symbol = context
+                            .file(declaration.file)
+                            .unwrap()
+                            .1
+                            .symbol(declaration)
+                            .unwrap();
+                        (
+                            symbol,
+                            annotation,
+                            type_,
+                            parameter.dot_dot_dot_token.is_some(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let annotation =
+                    NodeRef::new(declaration.arena, declaration.file, method.type_.unwrap());
+                let return_type = match parsed.arena.get(annotation.node).unwrap().kind {
+                    SyntaxKind::StringKeyword => string,
+                    SyntaxKind::NumberKeyword => number,
+                    SyntaxKind::VoidKeyword => void,
+                    _ => panic!("unexpected interface method return type"),
+                };
+                (declaration, parameters, annotation, return_type)
+            })
+            .collect::<Vec<_>>();
+
+        let store = context.store_mut_for_test();
+        if store
+            .declared_type_links(owner)
+            .and_then(|links| links.declared_type)
+            .is_none()
+        {
+            let interface = store
+                .alloc_interface_type(ObjectFlags::INTERFACE, Some(owner))
+                .unwrap();
+            assert!(store.set_declared_type_links(
+                owner,
+                DeclaredTypeLinks {
+                    declared_type: Some(interface),
+                    ..DeclaredTypeLinks::default()
+                },
+            ));
+        }
+        let type_ = store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(method))
+            .unwrap();
+        let mut signatures = Vec::with_capacity(plans.len());
+        let mut all_parameters = Vec::new();
+        for (declaration, parameters, annotation, return_type) in plans {
+            if publish_keyword_annotations
+                || !store
+                    .source_node_kind(annotation)
+                    .is_some_and(SyntaxKind::is_keyword_type)
+            {
+                assert!(store.set_type_node_links(
+                    annotation,
+                    TypeNodeLinks {
+                        resolved_type: Some(return_type),
+                        ..TypeNodeLinks::default()
+                    },
+                ));
+            }
+            for (symbol, annotation, type_, _) in &parameters {
+                if publish_keyword_annotations
+                    || !store
+                        .source_node_kind(*annotation)
+                        .is_some_and(SyntaxKind::is_keyword_type)
+                {
+                    assert!(store.set_type_node_links(
+                        *annotation,
+                        TypeNodeLinks {
+                            resolved_type: Some(*type_),
+                            ..TypeNodeLinks::default()
+                        },
+                    ));
+                }
+                assert!(store.set_value_symbol_links(
+                    *symbol,
+                    ValueSymbolLinks {
+                        resolved_type: Some(*type_),
+                        ..ValueSymbolLinks::default()
+                    },
+                ));
+                all_parameters.push(*symbol);
+            }
+            let rest = parameters.last().is_some_and(|(_, _, _, rest)| *rest);
+            let minimum = parameters.len().saturating_sub(usize::from(rest));
+            let signature = store
+                .alloc_signature(
+                    if rest {
+                        SignatureFlags::HAS_REST_PARAMETER
+                    } else {
+                        SignatureFlags::NONE
+                    },
+                    Some(declaration),
+                    Vec::new(),
+                    None,
+                    parameters.iter().map(|(symbol, _, _, _)| *symbol).collect(),
+                    Some(return_type),
+                    None,
+                    i32::try_from(minimum).unwrap(),
+                )
+                .unwrap();
+            assert!(store.set_signature_links(
+                declaration,
+                SignatureLinks {
+                    resolved_signature: ResolvedSignatureState::Resolved(signature),
+                    ..SignatureLinks::default()
+                },
+            ));
+            signatures.push(signature);
+        }
+        assert!(store.set_value_symbol_links(
+            method,
+            ValueSymbolLinks {
+                resolved_type: Some(type_),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        assert!(store.set_structured_type_members(
+            type_,
+            None,
+            None,
+            Some(signatures.clone()),
+            None,
+            None,
+        ));
+
+        PublishedInterfaceMethod {
+            type_,
+            signatures,
+            declarations,
+            method,
+            parameters: all_parameters,
         }
     }
 
@@ -1628,6 +2358,367 @@ mod tests {
                 "poison case {poison}",
             );
         }
+    }
+
+    #[test]
+    fn interface_method_overloads_preserve_order_rest_and_binder_parameter_types() {
+        let parsed = parse_source_file(&format!(
+            "{DEFAULT_LIBRARY_METHODS} \
+             interface Contract {{ \
+                 run(value: string): number; \
+                 run(...args: any[]): void; \
+             }}",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(4_425);
+        let mut context = default_library_context(&parsed, file, false);
+        let method = publish_interface_method(&mut context, &parsed, "Contract", "run", true);
+        let store = context.store();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let any_array = context.global_types().any_array_type;
+        let before = (
+            store.type_len(),
+            store.signature_len(),
+            store.symbol_len(),
+            store.checker_link_allocated_lengths(),
+        );
+
+        for _ in 0..2 {
+            let StoredCallableSetValidation::Valid {
+                family,
+                projection,
+                edges,
+            } = validate_stored_callable_set(store, method.type_)
+            else {
+                panic!("expected an authenticated overloaded interface method")
+            };
+            assert_eq!(family, CallableFamily::DeclaredCallSignatures);
+            assert_eq!(projection.owner, method.type_);
+            assert!(projection.construct_signatures.is_empty());
+            let [fixed, rest] = projection.call_signatures.as_ref() else {
+                panic!("expected both interface method overloads")
+            };
+            assert_eq!(fixed.signature, method.signatures[0]);
+            assert_eq!(fixed.parameters.as_slice(), &[bootstrap.string_type]);
+            assert_eq!(fixed.min_argument_count, 1);
+            assert_eq!(fixed.return_type, Some(bootstrap.number_type));
+            assert!(fixed.rest_parameter.is_none());
+            assert!(fixed.strict_variance_exempt);
+            assert_eq!(rest.signature, method.signatures[1]);
+            assert!(rest.parameters.is_empty());
+            assert_eq!(rest.rest_parameter, Some(any_array));
+            assert_eq!(rest.min_argument_count, 0);
+            assert_eq!(rest.return_type, Some(bootstrap.void_type));
+            assert!(rest.strict_variance_exempt);
+            assert_eq!(
+                edges,
+                vec![
+                    bootstrap.string_type,
+                    bootstrap.number_type,
+                    any_array,
+                    bootstrap.void_type,
+                ],
+            );
+            assert_eq!(
+                (
+                    store.type_len(),
+                    store.signature_len(),
+                    store.symbol_len(),
+                    store.checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+        }
+    }
+
+    #[test]
+    fn interface_method_keywords_can_be_uncached_but_arrays_keep_exact_cached_types() {
+        for poison in 0..3 {
+            let parsed = parse_source_file(&format!(
+                "{DEFAULT_LIBRARY_METHODS} \
+                 interface Contract {{ \
+                     run(value: string): number; \
+                     run(...args: any[]): void; \
+                 }}",
+            ));
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(4_430 + poison);
+            let mut context = default_library_context(&parsed, file, false);
+            let method = publish_interface_method(&mut context, &parsed, "Contract", "run", false);
+            let store = context.store_mut_for_test();
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            let string = bootstrap.string_type;
+            let number = bootstrap.number_type;
+            let returns = method
+                .declarations
+                .iter()
+                .map(|declaration| store.source_direct_type_annotation(*declaration).unwrap())
+                .collect::<Vec<_>>();
+            let annotations = method
+                .parameters
+                .iter()
+                .map(|parameter| {
+                    let declaration = store
+                        .symbol(*parameter)
+                        .unwrap()
+                        .value_declaration()
+                        .unwrap();
+                    store.source_direct_type_annotation(declaration).unwrap()
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                returns
+                    .iter()
+                    .all(|annotation| store.type_node_links(*annotation).is_none())
+            );
+            assert!(store.type_node_links(annotations[0]).is_none());
+            assert!(
+                store
+                    .type_node_links(annotations[1])
+                    .and_then(|links| links.resolved_type)
+                    .is_some()
+            );
+
+            let before = (
+                store.type_len(),
+                store.signature_len(),
+                store.symbol_len(),
+                store.checker_link_allocated_lengths(),
+            );
+            for _ in 0..2 {
+                assert!(matches!(
+                    validate_stored_callable_set(store, method.type_),
+                    StoredCallableSetValidation::Valid {
+                        family: CallableFamily::DeclaredCallSignatures,
+                        ..
+                    }
+                ));
+                assert_eq!(
+                    (
+                        store.type_len(),
+                        store.signature_len(),
+                        store.symbol_len(),
+                        store.checker_link_allocated_lengths(),
+                    ),
+                    before,
+                );
+            }
+
+            match poison {
+                0 => {
+                    assert!(store.set_type_node_links(
+                        returns[0],
+                        TypeNodeLinks {
+                            resolved_type: Some(string),
+                            ..TypeNodeLinks::default()
+                        },
+                    ));
+                }
+                1 => {
+                    assert!(store.set_type_node_links(
+                        annotations[0],
+                        TypeNodeLinks {
+                            resolved_type: Some(number),
+                            ..TypeNodeLinks::default()
+                        },
+                    ));
+                }
+                2 => {
+                    assert!(store.set_type_node_links(annotations[1], TypeNodeLinks::default(),));
+                }
+                _ => unreachable!("poison cases are bounded"),
+            }
+            assert!(
+                matches!(
+                    validate_stored_callable_set(store, method.type_),
+                    StoredCallableSetValidation::Malformed {
+                        family: CallableFamily::DeclaredCallSignatures,
+                    }
+                ),
+                "poison case {poison}",
+            );
+        }
+    }
+
+    #[test]
+    fn interface_method_overloads_reject_forged_owner_parameter_and_signature_caches() {
+        for poison in 0..4 {
+            let parsed = parse_source_file(&format!(
+                "{DEFAULT_LIBRARY_METHODS} \
+                 interface Contract {{ \
+                     run(value: string): number; \
+                     run(...args: any[]): void; \
+                 }}",
+            ));
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(4_426 + poison);
+            let mut context = default_library_context(&parsed, file, false);
+            let method = publish_interface_method(&mut context, &parsed, "Contract", "run", true);
+            let store = context.store_mut_for_test();
+            let number = store.intrinsic_bootstrap().unwrap().number_type;
+            match poison {
+                0 => {
+                    assert!(store.set_value_symbol_links(
+                        method.method,
+                        ValueSymbolLinks {
+                            resolved_type: Some(number),
+                            ..ValueSymbolLinks::default()
+                        },
+                    ));
+                }
+                1 => {
+                    let string = store.intrinsic_bootstrap().unwrap().string_type;
+                    assert!(store.set_value_symbol_links(
+                        method.parameters[0],
+                        ValueSymbolLinks {
+                            resolved_type: Some(string),
+                            target: Some(method.method),
+                            ..ValueSymbolLinks::default()
+                        },
+                    ));
+                }
+                2 => {
+                    assert!(store.set_structured_type_members(
+                        method.type_,
+                        None,
+                        None,
+                        Some(vec![method.signatures[1], method.signatures[0]]),
+                        None,
+                        None,
+                    ));
+                }
+                3 => {
+                    assert!(store.set_signature_links(
+                        method.declarations[0],
+                        SignatureLinks::default(),
+                    ));
+                }
+                _ => unreachable!("poison cases are bounded"),
+            }
+            assert!(
+                matches!(
+                    validate_stored_callable_set(store, method.type_),
+                    StoredCallableSetValidation::Malformed {
+                        family: CallableFamily::DeclaredCallSignatures,
+                    }
+                ),
+                "poison case {poison}",
+            );
+        }
+    }
+
+    #[test]
+    fn instantiated_array_methods_preserve_mapped_overloads_and_reject_forged_proxies() {
+        let parsed = parse_source_file(concat!(
+            "interface IArguments {} ",
+            "interface ConcatArray<T> {} ",
+            "interface Array<T> { ",
+            "concat(...items: ConcatArray<T>[]): T[]; ",
+            "concat(...items: (T | ConcatArray<T>)[]): T[]; ",
+            "} ",
+            "interface Object {} ",
+            "interface Function {} ",
+            "interface String { toLowerCase(): string } ",
+            "interface Number { toFixed(fractionDigits?: number): string } ",
+            "interface Boolean {} ",
+            "interface RegExp {} ",
+            "interface ReadonlyArray<T> {} ",
+            "interface ThisType<T> {}",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(4_434);
+        let mut context = default_library_context(&parsed, file, false);
+        let global_types = context.global_types().clone();
+        let concat_array = context
+            .store()
+            .symbol_table(context.globals())
+            .and_then(|globals| globals.get_source("ConcatArray"))
+            .unwrap();
+        context.get_declared_type_of_symbol(concat_array).unwrap();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let receiver = context
+            .store_mut_for_test()
+            .create_canonical_array_type(&global_types, number, false)
+            .unwrap();
+        let bound = context.file(file).unwrap().1.clone();
+        let host = super::super::DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let store = context.store_mut_for_test();
+        let source = super::super::object_members::materialize_global_array_concat_method(
+            store,
+            &host,
+            &global_types,
+            receiver,
+        )
+        .unwrap()
+        .unwrap();
+        let method = store.type_payload(source).unwrap().symbol().unwrap();
+        let instantiated =
+            super::super::instantiated_members::instantiate_published_generic_interface_method(
+                store,
+                &global_types,
+                receiver,
+                method,
+            )
+            .unwrap();
+        let before = (
+            store.type_len(),
+            store.mapper_len(),
+            store.signature_len(),
+            store.symbol_len(),
+            store.checker_link_allocated_lengths(),
+        );
+
+        let mut proxy = None;
+        for _ in 0..2 {
+            let StoredCallableSetValidation::Valid {
+                family, projection, ..
+            } = validate_stored_callable_set(store, instantiated)
+            else {
+                panic!("expected both receiver-specialized Array.concat overloads")
+            };
+            assert_eq!(family, CallableFamily::DeclaredCallSignatures);
+            assert_eq!(projection.call_signatures.len(), 2);
+            assert!(projection.construct_signatures.is_empty());
+            for callable in &projection.call_signatures {
+                assert!(callable.parameters.is_empty());
+                assert!(callable.rest_parameter.is_some());
+                assert_eq!(callable.return_type, Some(receiver));
+                let [parameter] = store.signature(callable.signature).unwrap().parameters() else {
+                    panic!("each specialized overload must retain its rest proxy")
+                };
+                proxy = Some(*parameter);
+            }
+            assert_eq!(
+                (
+                    store.type_len(),
+                    store.mapper_len(),
+                    store.signature_len(),
+                    store.symbol_len(),
+                    store.checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+        }
+
+        let proxy = proxy.unwrap();
+        let links = store.value_symbol_links(proxy).unwrap().clone();
+        assert!(store.set_value_symbol_links(
+            proxy,
+            ValueSymbolLinks {
+                mapper: None,
+                ..links
+            },
+        ));
+        assert!(matches!(
+            validate_stored_callable_set(store, instantiated),
+            StoredCallableSetValidation::Malformed {
+                family: CallableFamily::DeclaredCallSignatures,
+            }
+        ));
     }
 
     #[test]

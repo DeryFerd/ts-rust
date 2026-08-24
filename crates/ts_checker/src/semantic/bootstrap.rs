@@ -2117,15 +2117,36 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
         };
         match record.data() {
-            TypeData::TypeReference(reference) => self
-                .validate_cached_type_reference_array_capability(
-                    type_,
-                    record,
-                    reference,
-                    array_validation,
-                    visited,
-                    allowed_pending,
-                ),
+            TypeData::Tuple(_) => self.validate_supported_canonical_tuple(
+                type_,
+                array_validation,
+                &mut HashSet::new(),
+                allowed_pending,
+            ),
+            TypeData::TypeReference(reference) => {
+                if reference.object.target.is_some_and(|target| {
+                    matches!(
+                        self.type_payload(target).map(TypeRecord::data),
+                        Some(TypeData::Tuple(_))
+                    )
+                }) {
+                    self.validate_supported_canonical_tuple(
+                        type_,
+                        array_validation,
+                        &mut HashSet::new(),
+                        allowed_pending,
+                    )
+                } else {
+                    self.validate_cached_type_reference_array_capability(
+                        type_,
+                        record,
+                        reference,
+                        array_validation,
+                        visited,
+                        allowed_pending,
+                    )
+                }
+            }
             TypeData::Union(data) => {
                 self.validate_union_structure(type_)?;
                 for constituent in &data.union.types {
@@ -2354,6 +2375,56 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             visiting,
             allowed_pending,
         );
+        visiting.remove(&type_);
+        result
+    }
+
+    fn validate_supported_generic_interface_reference(
+        &self,
+        type_: TypeId,
+        array_validation: UnionArrayValidation<'_>,
+        visiting: &mut HashSet<TypeId>,
+        allowed_pending: &HashSet<TypeId>,
+    ) -> Result<(), LiteralTypeCacheError> {
+        let reference = super::reference_types::validate_direct_generic_reference(self, type_)
+            .map_err(|_| LiteralTypeCacheError::InvalidCachedUnion(type_))?;
+        if !visiting.insert(type_) {
+            return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
+        }
+        let result = reference.type_arguments.iter().try_for_each(|argument| {
+            self.validate_union_constituent_worker(
+                *argument,
+                array_validation,
+                visiting,
+                allowed_pending,
+            )
+        });
+        visiting.remove(&type_);
+        result
+    }
+
+    fn validate_supported_canonical_tuple(
+        &self,
+        type_: TypeId,
+        array_validation: UnionArrayValidation<'_>,
+        visiting: &mut HashSet<TypeId>,
+        allowed_pending: &HashSet<TypeId>,
+    ) -> Result<(), LiteralTypeCacheError> {
+        let tuple = self
+            .canonical_tuple_shape(type_)
+            .map_err(|_| LiteralTypeCacheError::InvalidCachedUnion(type_))?
+            .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(type_))?;
+        if !visiting.insert(type_) {
+            return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
+        }
+        let result = tuple.element_types().iter().try_for_each(|element| {
+            self.validate_union_constituent_worker(
+                *element,
+                array_validation,
+                visiting,
+                allowed_pending,
+            )
+        });
         visiting.remove(&type_);
         result
     }
@@ -2749,12 +2820,51 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     }
                 }
             }
-            TypeData::TypeReference(_) => self.validate_supported_canonical_array(
+            TypeData::Tuple(_) => self.validate_supported_canonical_tuple(
                 type_,
                 array_validation,
                 visiting,
                 allowed_pending,
             ),
+            TypeData::TypeReference(reference) => {
+                let target = reference.object.target;
+                if target.is_some_and(|target| {
+                    matches!(
+                        self.type_payload(target).map(TypeRecord::data),
+                        Some(TypeData::Tuple(_))
+                    )
+                }) {
+                    self.validate_supported_canonical_tuple(
+                        type_,
+                        array_validation,
+                        visiting,
+                        allowed_pending,
+                    )
+                } else if target
+                    .and_then(|target| self.type_payload(target))
+                    .is_some_and(|target| {
+                        matches!(target.data(), TypeData::Interface(_))
+                            && target.object_flags().contains(ObjectFlags::INTERFACE)
+                            && target.symbol().is_some_and(|symbol| {
+                                !self.symbol_is_registered_global_array(symbol)
+                            })
+                    })
+                {
+                    self.validate_supported_generic_interface_reference(
+                        type_,
+                        array_validation,
+                        visiting,
+                        allowed_pending,
+                    )
+                } else {
+                    self.validate_supported_canonical_array(
+                        type_,
+                        array_validation,
+                        visiting,
+                        allowed_pending,
+                    )
+                }
+            }
             TypeData::Mapped(mapped) => self.validate_supported_record_mapped_union_constituent(
                 type_,
                 record,
@@ -4625,6 +4735,8 @@ mod tests {
     use crate::semantic::{
         AliasSymbolLinks, AliasTargetState, CanonicalCheckerContext, CanonicalCheckerOptions,
         DecoratorSignatureState, EffectsSignatureState, ResolvedSignatureState, SignatureLinks,
+        signatures::ElementFlags,
+        tuple_types::CanonicalTupleTypeRequest,
         type_records::{LiteralTypeData, TypeData},
     };
 
@@ -6745,6 +6857,248 @@ mod tests {
         assert_eq!(
             store.validate_union_constituent_with_array_targets(targets, mapped),
             Ok(()),
+        );
+    }
+
+    #[test]
+    fn tuple_literal_union_constituents_preserve_authenticated_clone_ownership() {
+        let parsed = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut context = checker_context(FileId::new(148), &parsed);
+        let global_types = context.global_types().clone();
+        let (number, string) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (bootstrap.number_type, bootstrap.string_type)
+        };
+        let store = context.store_mut_for_test();
+        let required = store
+            .create_tuple_element_info(ElementFlags::REQUIRED, None)
+            .unwrap();
+        let infos = [required, required];
+        let first = store
+            .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(
+                &[number, string],
+                &infos,
+                false,
+            ))
+            .unwrap();
+        let second = store
+            .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(
+                &[string, number],
+                &infos,
+                false,
+            ))
+            .unwrap();
+        let readonly = store
+            .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(
+                &[number, string],
+                &infos,
+                true,
+            ))
+            .unwrap();
+        let empty = store
+            .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(&[], &[], false))
+            .unwrap();
+        let first_literal = store
+            .create_array_literal_type(&global_types, first)
+            .unwrap();
+        let second_literal = store
+            .create_array_literal_type(&global_types, second)
+            .unwrap();
+        let readonly_literal = store
+            .create_array_literal_type(&global_types, readonly)
+            .unwrap();
+        let empty_literal = store
+            .create_array_literal_type(&global_types, empty)
+            .unwrap();
+
+        for tuple in [
+            first,
+            second,
+            readonly,
+            empty,
+            first_literal,
+            second_literal,
+            readonly_literal,
+            empty_literal,
+        ] {
+            assert_eq!(
+                store.validate_union_constituent_with_global_types(&global_types, tuple),
+                Ok(()),
+            );
+            assert_eq!(
+                store.validate_cached_array_capability_with_array_targets(
+                    CanonicalArrayTargets::from_global_types(&global_types),
+                    tuple,
+                ),
+                Ok(()),
+            );
+        }
+
+        let union = store
+            .expression_union_type_with_global_types(
+                &global_types,
+                &[first_literal, second_literal],
+                UnionReduction::None,
+            )
+            .unwrap();
+        let mut expected = [first_literal, second_literal];
+        expected.sort_unstable();
+        assert_eq!(union_types(store, union), expected.as_slice());
+        let warm = (
+            store.type_len(),
+            store.intrinsic_bootstrap().unwrap().union_cache_len(),
+        );
+        assert_eq!(
+            store.expression_union_type_with_global_types(
+                &global_types,
+                &[second_literal, first_literal],
+                UnionReduction::None,
+            ),
+            Ok(union),
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.intrinsic_bootstrap().unwrap().union_cache_len(),
+            ),
+            warm,
+        );
+
+        let (flags, symbol, target, arguments) = {
+            let record = store.type_payload(first_literal).unwrap();
+            let TypeData::TypeReference(reference) = record.data() else {
+                panic!("tuple literals retain a concrete reference clone")
+            };
+            (
+                record.object_flags(),
+                record.symbol(),
+                reference.object.target,
+                reference.resolved_type_arguments.clone(),
+            )
+        };
+        let forged = store.alloc_type_reference(flags, symbol).unwrap();
+        assert!(store.set_object_target_and_mapper(forged, target, None));
+        assert!(store.set_type_reference_resolution(forged, None, arguments));
+        let forged_state = (
+            store.type_len(),
+            store.intrinsic_bootstrap().unwrap().union_cache_len(),
+        );
+        assert_eq!(
+            store.validate_union_constituent_with_global_types(&global_types, forged),
+            Err(LiteralTypeCacheError::InvalidCachedUnion(forged)),
+        );
+        assert_eq!(
+            store.validate_cached_array_capability_with_array_targets(
+                CanonicalArrayTargets::from_global_types(&global_types),
+                forged,
+            ),
+            Err(LiteralTypeCacheError::InvalidCachedUnion(forged)),
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.intrinsic_bootstrap().unwrap().union_cache_len(),
+            ),
+            forged_state,
+        );
+
+        assert!(store.set_type_object_flags(first_literal, flags | ObjectFlags::FROM_TYPE_NODE));
+        assert_eq!(
+            store.validate_union_constituent_with_global_types(&global_types, first_literal),
+            Err(LiteralTypeCacheError::InvalidCachedUnion(first_literal)),
+        );
+        assert!(store.set_type_object_flags(first_literal, flags));
+        assert_eq!(
+            store.validate_union_constituent_with_global_types(&global_types, first_literal),
+            Ok(()),
+        );
+
+        let array = store
+            .create_canonical_array_type(&global_types, number, false)
+            .unwrap();
+        let (flags, symbol, target, arguments) = {
+            let record = store.type_payload(array).unwrap();
+            let TypeData::TypeReference(reference) = record.data() else {
+                panic!("the configured array must retain a canonical type reference")
+            };
+            (
+                record.object_flags(),
+                record.symbol(),
+                reference.object.target,
+                reference.resolved_type_arguments.clone(),
+            )
+        };
+        let forged_array = store.alloc_type_reference(flags, symbol).unwrap();
+        assert!(store.set_object_target_and_mapper(forged_array, target, None));
+        assert!(store.set_type_reference_resolution(forged_array, None, arguments));
+        assert!(matches!(
+            store.validate_union_constituent_with_global_types(&global_types, forged_array),
+            Err(LiteralTypeCacheError::ArrayType { type_, .. }) if type_ == forged_array
+        ));
+    }
+
+    #[test]
+    fn unresolved_jsx_element_heritage_shells_are_authenticated_union_constituents() {
+        let parsed = parse_source_file(concat!(
+            "interface ReactElement<T> { value: T } ",
+            "declare namespace JSX { interface Element extends ReactElement<any> {} }",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(149);
+        let mut context = checker_context(file, &parsed);
+        let owner = {
+            let store = context.store();
+            let namespace = store
+                .symbol_table(context.globals())
+                .and_then(|globals| globals.get_source("JSX"))
+                .unwrap();
+            store
+                .symbol(namespace)
+                .and_then(ts_binder::semantic::Symbol::exports)
+                .and_then(|exports| store.symbol_table(exports))
+                .and_then(|exports| exports.get_source("Element"))
+                .and_then(|element| store.get_merged_symbol(element))
+                .unwrap()
+        };
+        let element = context.get_declared_type_of_symbol(owner).unwrap();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let store = context.store_mut_for_test();
+        let TypeData::Interface(interface) = store.type_payload(element).unwrap().data() else {
+            panic!("JSX.Element must retain its declared interface shell")
+        };
+        assert!(!interface.base_types_resolved);
+        assert!(interface.resolved_base_types.is_none());
+        assert!(
+            store
+                .direct_interface_heritage_provenance(element)
+                .is_none()
+        );
+
+        assert_eq!(store.validate_union_constituent(element), Ok(()));
+        let union = store.literal_union_type(&[element, number], None).unwrap();
+        assert_eq!(union_types(store, union), &[number, element]);
+
+        let warm = (
+            store.type_len(),
+            store.intrinsic_bootstrap().unwrap().union_cache_len(),
+        );
+        assert_eq!(
+            store.literal_union_type(&[element, number], None),
+            Ok(union)
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.intrinsic_bootstrap().unwrap().union_cache_len(),
+            ),
+            warm,
+        );
+
+        assert!(store.set_interface_base_resolution(element, true, None, None));
+        assert_eq!(
+            store.validate_union_constituent(element),
+            Err(LiteralTypeCacheError::InvalidCachedUnion(element)),
         );
     }
 

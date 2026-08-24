@@ -1,16 +1,17 @@
 //! Parsed `JSDoc` types for the canonical JavaScript checker.
 //!
-//! The source parser does not yet attach structured `JSDoc` nodes to source
-//! declarations. This module uses its standalone comment scanner to identify
-//! tags, then parses each type with the ordinary TypeScript type parser. The
-//! resulting values never contain node identities from that temporary arena.
+//! The source parser exposes supported top-level typedefs as reparsed source
+//! declarations but does not attach structured `JSDoc` tags to their hosts.
+//! This module scans those comments and parses each type with the ordinary
+//! TypeScript type parser. Its values never retain temporary parser identities.
 
 use std::{
     collections::{HashMap, HashSet},
     fmt,
 };
 
-use ts_ast::{NodeArena, NodeData, NodeId, NodeRef, SyntaxKind};
+use ts_ast::{NodeArena, NodeData, NodeFlags, NodeId, NodeRef, SyntaxKind};
+use ts_binder::{CheckFlags, EscapedName, SymbolFlags, semantic::PreparedSymbolTable};
 use ts_core::{Diagnostic, DiagnosticCategory, TextPos, TextRange};
 use ts_diagnostics::{Category, Diagnostic as CheckerDiagnostic, message_by_code};
 use ts_jsnum::{Number, PseudoBigInt};
@@ -19,7 +20,8 @@ use ts_parser::{parse_jsdoc_comment, parse_source_file};
 use super::{
     ArrayTypeError, CanonicalCheckerDiagnostic, CanonicalCheckerDiagnosticRange,
     CanonicalCheckerOptions, CanonicalGlobalTypes, CanonicalTypeMapperStore,
-    IntrinsicBootstrapOptions, TypeId, bootstrap::UnionReduction,
+    IntrinsicBootstrapOptions, TypeId, ValueSymbolLinks, bootstrap::UnionReduction,
+    types::ObjectFlags,
 };
 
 const TYPE_PREFIX: &str = "type __JsDoc = ";
@@ -71,6 +73,7 @@ pub enum JsDocType {
     BigIntLiteral(String),
     ObjectLiteral(Vec<JsDocObjectProperty>),
     Function(Box<JsDocFunctionType>),
+    Callback(Box<PlannedJsDocCallback>),
     IndexedAccess { object: Box<Self>, index: Box<Self> },
     KeyOf(Box<Self>),
     Parenthesized(Box<Self>),
@@ -346,9 +349,20 @@ impl PlannedJsDocType {
                     | JsDocType::Optional(_)
                     | JsDocType::Array(_)
                     | JsDocType::ReadonlyArray(_)
-                    | JsDocType::Union(_),
+                    | JsDocType::Union(_)
+                    | JsDocType::ObjectLiteral(_)
+                    | JsDocType::Callback(_),
                 ),
             ) => Some(name),
+            _ => None,
+        }
+    }
+
+    /// Returns the independently owned signature behind a local callback alias.
+    #[must_use]
+    pub fn resolved_callback(&self) -> Option<&PlannedJsDocCallback> {
+        match self.resolution_type() {
+            JsDocType::Callback(callback) => Some(callback),
             _ => None,
         }
     }
@@ -640,7 +654,7 @@ impl PlannedJsDocSatisfies {
     }
 }
 
-/// A `JSDoc` typedef retained before its synthetic binder declaration exists.
+/// A `JSDoc` typedef and its optional source-owned reparsed declaration.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlannedJsDocTypedef {
     name: String,
@@ -648,6 +662,7 @@ pub struct PlannedJsDocTypedef {
     type_: Option<PlannedJsDocType>,
     properties: Vec<PlannedJsDocProperty>,
     template_parameters: Vec<PlannedJsDocTemplateParameter>,
+    source_declaration: Option<NodeRef>,
 }
 
 /// One synthetic `JSDoc` callback signature, separate from its host function.
@@ -717,6 +732,12 @@ impl PlannedJsDocTypedef {
     #[must_use]
     pub fn template_parameters(&self) -> &[PlannedJsDocTemplateParameter] {
         &self.template_parameters
+    }
+
+    /// Returns the authenticated source declaration for a reparsed typedef.
+    #[must_use]
+    pub const fn source_declaration(&self) -> Option<NodeRef> {
+        self.source_declaration
     }
 }
 
@@ -929,6 +950,7 @@ pub enum JsDocTypeResolutionError {
     },
     InvalidGlobalType(TypeId),
     LiteralConstruction(TextRange),
+    ObjectConstruction(TextRange),
     UnionConstruction(TextRange),
     ArrayConstruction {
         range: TextRange,
@@ -973,6 +995,12 @@ impl fmt::Display for JsDocTypeResolutionError {
                 write!(
                     formatter,
                     "JSDoc literal type could not be created at {range:?}"
+                )
+            }
+            Self::ObjectConstruction(range) => {
+                write!(
+                    formatter,
+                    "JSDoc object type could not be created at {range:?}"
                 )
             }
             Self::UnionConstruction(range) => {
@@ -1200,11 +1228,32 @@ pub fn plan_javascript_source_jsdoc(
     let root = arena
         .get(source.node)
         .ok_or(JsDocCommentError::InvalidSourceNode(source))?;
-    if root.kind != SyntaxKind::SourceFile || !matches!(root.data, NodeData::SourceFile(_)) {
+    let NodeData::SourceFile(root_data) = &root.data else {
+        return Err(JsDocCommentError::InvalidSourceNode(source));
+    };
+    if root.kind != SyntaxKind::SourceFile {
         return Err(JsDocCommentError::InvalidSourceNode(source));
     }
     if arena.source_text().is_none() {
         return Err(JsDocCommentError::MissingSourceText(source));
+    }
+
+    let mut source_typedefs = HashMap::new();
+    for node in &root_data.statements.nodes {
+        let record = arena
+            .get(*node)
+            .ok_or(JsDocCommentError::InvalidSourceNode(source))?;
+        if record.kind != SyntaxKind::JsTypeAliasDeclaration {
+            continue;
+        }
+        let declaration = NodeRef::new(arena.id(), source.file, *node);
+        let name = authenticate_reparsed_jsdoc_typedef(arena, source, declaration)?;
+        if source_typedefs
+            .insert((name.start.get(), name.end.get()), declaration)
+            .is_some()
+        {
+            return Err(JsDocCommentError::InvalidSourceNode(declaration));
+        }
     }
 
     let mut pending = vec![source.node];
@@ -1217,6 +1266,13 @@ pub fn plan_javascript_source_jsdoc(
             .get(node)
             .ok_or(JsDocCommentError::InvalidSourceNode(source))?;
         let reference = NodeRef::new(arena.id(), source.file, node);
+        if record.kind == SyntaxKind::JsTypeAliasDeclaration {
+            let name = authenticate_reparsed_jsdoc_typedef(arena, source, reference)?;
+            if source_typedefs.get(&(name.start.get(), name.end.get())) != Some(&reference) {
+                return Err(JsDocCommentError::InvalidSourceNode(reference));
+            }
+            continue;
+        }
         if is_jsdoc_declaration_candidate(record.kind) {
             let comments = leading_jsdoc_comments(arena, reference)?
                 .into_iter()
@@ -1244,6 +1300,11 @@ pub fn plan_javascript_source_jsdoc(
                     }
                     apply_comment_tags(arena, source, &mut planned, &comment, &mut diagnostics)?;
                 }
+                for alias in &mut planned.typedefs {
+                    alias.source_declaration = source_typedefs
+                        .get(&(alias.range.start.get(), alias.range.end.get()))
+                        .copied();
+                }
                 append_unmatched_parameter_diagnostics(arena, source, &planned, &mut diagnostics)?;
                 declarations.push(planned);
             }
@@ -1259,6 +1320,150 @@ pub fn plan_javascript_source_jsdoc(
         declarations,
         diagnostics,
     })
+}
+
+fn authenticate_reparsed_jsdoc_typedef(
+    arena: &NodeArena,
+    source: NodeRef,
+    declaration: NodeRef,
+) -> Result<TextRange, JsDocCommentError> {
+    let invalid = || JsDocCommentError::InvalidSourceNode(declaration);
+    let record = arena.get(declaration.node).ok_or_else(invalid)?;
+    let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+        return Err(invalid());
+    };
+    if !declaration.is_for(arena.id(), source.file)
+        || record.kind != SyntaxKind::JsTypeAliasDeclaration
+        || record.flags != NodeFlags::REPARSED
+        || record.parent != Some(source.node)
+        || alias.flow_node.is_some()
+        || alias.local_symbol.is_some()
+        || alias.symbol.is_some()
+        || alias.type_parameters.is_some()
+        || alias.modifiers.is_some()
+    {
+        return Err(invalid());
+    }
+
+    let name = arena.get(alias.name).ok_or_else(invalid)?;
+    let NodeData::Identifier(identifier) = &name.data else {
+        return Err(invalid());
+    };
+    let type_ = arena.get(alias.type_).ok_or_else(invalid)?;
+    let structural = match &type_.data {
+        NodeData::TypeLiteralNode(literal)
+            if type_.kind == SyntaxKind::TypeLiteral && type_.flags == NodeFlags::REPARSED =>
+        {
+            Some(literal)
+        }
+        _ => None,
+    };
+    if name.kind != SyntaxKind::Identifier
+        || name.flags != NodeFlags::default()
+        || name.parent != Some(declaration.node)
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+        || type_.parent != Some(declaration.node)
+        || record.range.end
+            != if structural.is_some() {
+                type_.range.end
+            } else {
+                name.range.end
+            }
+    {
+        return Err(invalid());
+    }
+
+    let text = arena.source_text().ok_or_else(invalid)?;
+    let start = usize::try_from(record.range.start.get()).map_err(|_| invalid())?;
+    let comment_start = text
+        .get(..start)
+        .and_then(|prefix| prefix.rfind("/**"))
+        .ok_or_else(invalid)?;
+    let comment_end = text
+        .get(start..)
+        .and_then(|suffix| suffix.find("*/"))
+        .and_then(|end| start.checked_add(end))
+        .and_then(|end| end.checked_add(2))
+        .ok_or_else(invalid)?;
+    if text
+        .get(comment_start..start)
+        .is_none_or(|prefix| prefix.contains("*/"))
+    {
+        return Err(invalid());
+    }
+    let range = checked_range(comment_start, comment_end).map_err(|_| invalid())?;
+    let comment = parse_jsdoc_comment_at(text, range).map_err(|_| invalid())?;
+    let Some((index, tag)) = comment.tags().iter().enumerate().find(|(_, tag)| {
+        tag.kind() == JsDocTagKind::Typedef
+            && tag.range().start == record.range.start
+            && tag.name().is_some_and(|tag_name| {
+                tag_name.range() == name.range && tag_name.text() == identifier.text
+            })
+    }) else {
+        return Err(invalid());
+    };
+    let annotation = tag.type_expression().ok_or_else(invalid)?;
+    if let Some(literal) = structural {
+        if !matches!(
+            annotation.type_(),
+            JsDocType::Intrinsic(JsDocIntrinsicType::Object)
+        ) && !matches!(annotation.type_(), JsDocType::Named(name) if name == "Object")
+            || literal.symbol.is_some()
+            || literal.members.nodes.is_empty()
+            || literal.members.has_trailing_comma
+            || literal.members.range != type_.range
+        {
+            return Err(invalid());
+        }
+        let properties = comment
+            .tags()
+            .iter()
+            .skip(index + 1)
+            .take_while(|tag| tag.kind() == JsDocTagKind::Property)
+            .collect::<Vec<_>>();
+        if properties.len() != literal.members.nodes.len() {
+            return Err(invalid());
+        }
+        for (member, tag) in literal.members.nodes.iter().zip(properties) {
+            let member_record = arena.get(*member).ok_or_else(invalid)?;
+            let NodeData::PropertyDeclaration(property) = &member_record.data else {
+                return Err(invalid());
+            };
+            let property_name = arena.get(property.name).ok_or_else(invalid)?;
+            let actual_name = match &property_name.data {
+                NodeData::Identifier(name) => name.text.as_str(),
+                NodeData::StringLiteral(name) => name.text.as_str(),
+                _ => return Err(invalid()),
+            };
+            let tag_name = tag.name().ok_or_else(invalid)?;
+            let property_type = property
+                .type_
+                .and_then(|type_| arena.get(type_))
+                .ok_or_else(invalid)?;
+            let tag_type = tag.type_expression().ok_or_else(invalid)?;
+            if member_record.kind != SyntaxKind::PropertyDeclaration
+                || member_record.flags != NodeFlags::REPARSED
+                || member_record.parent != Some(alias.type_)
+                || member_record.range.start != tag.range().start
+                || property_name.parent != Some(*member)
+                || property_name.range != tag_name.range()
+                || actual_name != tag_name.text()
+                || property_type.parent != Some(*member)
+                || property_type.range != tag_type.range()
+                || property.postfix_token.is_some() != tag.is_optional()
+                || property.initializer.is_some()
+                || property.symbol.is_some()
+                || property.modifiers.is_some()
+                || property.facts != 0
+            {
+                return Err(invalid());
+            }
+        }
+    } else if annotation.range() != type_.range {
+        return Err(invalid());
+    }
+    Ok(name.range)
 }
 
 /// Appends planned comment diagnostics with the source checker's retry rules.
@@ -1344,7 +1549,8 @@ pub fn resolve_jsdoc_type(
 /// # Errors
 ///
 /// Returns the same unsupported-reference, option, and global-identity errors
-/// as [`resolve_planned_jsdoc_type`].
+/// as [`resolve_planned_jsdoc_type`]. Callback aliases retain a separate
+/// signature and are resolved with [`resolve_planned_jsdoc_callback_signature`].
 pub fn preflight_planned_jsdoc_type(
     store: &CanonicalTypeMapperStore,
     global_types: &CanonicalGlobalTypes,
@@ -1606,6 +1812,7 @@ fn bind_jsdoc_type(type_: &JsDocType, bindings: &HashMap<String, TypeId>) -> Opt
         }
         JsDocType::Intrinsic(_)
         | JsDocType::BoundTypeParameter(_)
+        | JsDocType::Callback(_)
         | JsDocType::StringLiteral(_)
         | JsDocType::NumberLiteral(_)
         | JsDocType::BigIntLiteral(_)
@@ -1714,6 +1921,43 @@ fn attach_local_typedef_resolutions(declarations: &mut [PlannedJavaScriptDeclara
                 .is_some()
             {
                 duplicates.insert(alias.name.clone());
+            }
+        }
+    }
+    for name in &duplicates {
+        aliases.remove(name);
+    }
+
+    for declaration in declarations.iter() {
+        for callback in &declaration.callbacks {
+            if !callback.template_parameters.is_empty()
+                || callback.this_type.is_some()
+                || callback.return_type.is_none()
+                || callback
+                    .parameters
+                    .iter()
+                    .any(|parameter| parameter.type_.is_none())
+            {
+                continue;
+            }
+            let mut resolved = callback.clone();
+            let shadowed = HashSet::new();
+            for parameter in &mut resolved.parameters {
+                if let Some(annotation) = &mut parameter.type_ {
+                    attach_local_typedef_resolution(annotation, &aliases, &shadowed);
+                }
+            }
+            if let Some(annotation) = &mut resolved.return_type {
+                attach_local_typedef_resolution(annotation, &aliases, &shadowed);
+            }
+            if aliases
+                .insert(
+                    callback.name.clone(),
+                    JsDocType::Callback(Box::new(resolved)),
+                )
+                .is_some()
+            {
+                duplicates.insert(callback.name.clone());
             }
         }
     }
@@ -1863,6 +2107,29 @@ fn substitute_local_typedefs(
                 .collect::<Vec<_>>();
             changed.then_some(JsDocType::Union(resolved))
         }
+        JsDocType::ObjectLiteral(properties) => {
+            let mut changed = false;
+            let resolved = properties
+                .iter()
+                .map(|property| {
+                    let type_ = substitute_local_typedefs(&property.type_, aliases, shadowed)
+                        .map_or_else(
+                            || property.type_.clone(),
+                            |type_| {
+                                changed = true;
+                                type_
+                            },
+                        );
+                    JsDocObjectProperty {
+                        name: property.name.clone(),
+                        type_,
+                        optional: property.optional,
+                        readonly: property.readonly,
+                    }
+                })
+                .collect::<Vec<_>>();
+            changed.then_some(JsDocType::ObjectLiteral(resolved))
+        }
         JsDocType::Intrinsic(_)
         | JsDocType::BoundTypeParameter(_)
         | JsDocType::GenericReference { .. }
@@ -1870,8 +2137,8 @@ fn substitute_local_typedefs(
         | JsDocType::StringLiteral(_)
         | JsDocType::NumberLiteral(_)
         | JsDocType::BigIntLiteral(_)
-        | JsDocType::ObjectLiteral(_)
         | JsDocType::Function(_)
+        | JsDocType::Callback(_)
         | JsDocType::IndexedAccess { .. }
         | JsDocType::KeyOf(_)
         | JsDocType::Unsupported(_) => None,
@@ -1902,7 +2169,8 @@ fn resolve_local_typedef_target(
         scalar @ (JsDocType::Intrinsic(_)
         | JsDocType::StringLiteral(_)
         | JsDocType::NumberLiteral(_)
-        | JsDocType::BigIntLiteral(_)) => Some(scalar.clone()),
+        | JsDocType::BigIntLiteral(_)
+        | JsDocType::Callback(_)) => Some(scalar.clone()),
         JsDocType::Named(next) => resolve_local_typedef(next, aliases, visiting),
         JsDocType::Parenthesized(inner) => resolve_local_typedef_target(inner, aliases, visiting)
             .map(Box::new)
@@ -1927,6 +2195,20 @@ fn resolve_local_typedef_target(
             .map(|member| resolve_local_typedef_target(member, aliases, visiting))
             .collect::<Option<Vec<_>>>()
             .map(JsDocType::Union),
+        JsDocType::ObjectLiteral(properties) => properties
+            .iter()
+            .map(|property| {
+                resolve_local_typedef_target(&property.type_, aliases, visiting).map(|type_| {
+                    JsDocObjectProperty {
+                        name: property.name.clone(),
+                        type_,
+                        optional: property.optional,
+                        readonly: property.readonly,
+                    }
+                })
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(JsDocType::ObjectLiteral),
         _ => None,
     }
 }
@@ -2129,6 +2411,7 @@ fn apply_jsdoc_tag(
                     type_: tag.type_expression().map(JsDocTypeExpression::planned),
                     properties: Vec::new(),
                     template_parameters: Vec::new(),
+                    source_declaration: None,
                 });
             }
         }
@@ -3276,10 +3559,12 @@ fn resolve_intrinsic_type(
             kind: SyntaxKind::TypeLiteral,
             range,
         }),
-        JsDocType::Function(_) => Err(JsDocTypeResolutionError::UnsupportedType {
-            kind: SyntaxKind::FunctionType,
-            range,
-        }),
+        JsDocType::Function(_) | JsDocType::Callback(_) => {
+            Err(JsDocTypeResolutionError::UnsupportedType {
+                kind: SyntaxKind::FunctionType,
+                range,
+            })
+        }
         JsDocType::IndexedAccess { .. } => Err(JsDocTypeResolutionError::UnsupportedType {
             kind: SyntaxKind::IndexedAccessType,
             range,
@@ -3358,15 +3643,16 @@ fn validate_resolvable_type(
             kind: SyntaxKind::ImportType,
             range,
         }),
-        JsDocType::ObjectLiteral(properties) if properties.is_empty() => Ok(()),
-        JsDocType::ObjectLiteral(_) => Err(JsDocTypeResolutionError::UnsupportedType {
-            kind: SyntaxKind::TypeLiteral,
-            range,
+        JsDocType::ObjectLiteral(properties) => properties.iter().try_for_each(|property| {
+            validate_resolvable_type(store, global_types, options, &property.type_, range)
         }),
         JsDocType::Function(_) => Err(JsDocTypeResolutionError::UnsupportedType {
             kind: SyntaxKind::FunctionType,
             range,
         }),
+        JsDocType::Callback(callback) => {
+            validate_resolvable_callback(store, global_types, options, callback, range)
+        }
         JsDocType::IndexedAccess { .. } => Err(JsDocTypeResolutionError::UnsupportedType {
             kind: SyntaxKind::IndexedAccessType,
             range,
@@ -3449,14 +3735,15 @@ fn resolve_complete_type(
             .intrinsic_bootstrap()
             .ok_or(JsDocTypeResolutionError::MissingBootstrap)?
             .empty_type_literal_type),
-        JsDocType::ObjectLiteral(_) => Err(JsDocTypeResolutionError::UnsupportedType {
-            kind: SyntaxKind::TypeLiteral,
-            range,
-        }),
-        JsDocType::Function(_) => Err(JsDocTypeResolutionError::UnsupportedType {
-            kind: SyntaxKind::FunctionType,
-            range,
-        }),
+        JsDocType::ObjectLiteral(properties) => {
+            resolve_object_type(store, global_types, options, properties, range)
+        }
+        JsDocType::Function(_) | JsDocType::Callback(_) => {
+            Err(JsDocTypeResolutionError::UnsupportedType {
+                kind: SyntaxKind::FunctionType,
+                range,
+            })
+        }
         JsDocType::IndexedAccess { .. } => Err(JsDocTypeResolutionError::UnsupportedType {
             kind: SyntaxKind::IndexedAccessType,
             range,
@@ -3552,6 +3839,132 @@ fn resolve_complete_type(
             Err(JsDocTypeResolutionError::UnsupportedType { kind: *kind, range })
         }
     }
+}
+
+fn validate_resolvable_callback(
+    store: &CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    callback: &PlannedJsDocCallback,
+    range: TextRange,
+) -> Result<(), JsDocTypeResolutionError> {
+    let unsupported = || JsDocTypeResolutionError::UnsupportedType {
+        kind: SyntaxKind::FunctionType,
+        range,
+    };
+    if !callback.template_parameters.is_empty() || callback.this_type.is_some() {
+        return Err(unsupported());
+    }
+    let mut names = HashSet::with_capacity(callback.parameters.len());
+    let mut optional_seen = false;
+    for parameter in &callback.parameters {
+        let Some(annotation) = &parameter.type_ else {
+            return Err(unsupported());
+        };
+        if parameter.name.is_empty()
+            || !names.insert(parameter.name.as_str())
+            || optional_seen && !parameter.optional
+            || matches!(annotation.resolution_type(), JsDocType::Variadic(_))
+        {
+            return Err(unsupported());
+        }
+        optional_seen |= parameter.optional;
+        validate_resolvable_type(
+            store,
+            global_types,
+            options,
+            annotation.resolution_type(),
+            annotation.range(),
+        )?;
+    }
+    let Some(return_type) = &callback.return_type else {
+        return Err(unsupported());
+    };
+    validate_resolvable_type(
+        store,
+        global_types,
+        options,
+        return_type.resolution_type(),
+        return_type.range(),
+    )
+}
+
+fn resolve_object_type(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    properties: &[JsDocObjectProperty],
+    range: TextRange,
+) -> Result<TypeId, JsDocTypeResolutionError> {
+    let property_types = properties
+        .iter()
+        .map(|property| {
+            let type_ =
+                resolve_complete_type(store, global_types, options, &property.type_, range)?;
+            if !property.optional || !options.intrinsic.strict_null_checks {
+                return Ok(type_);
+            }
+            let optional = store
+                .intrinsic_bootstrap()
+                .ok_or(JsDocTypeResolutionError::MissingBootstrap)?
+                .undefined_or_missing_type;
+            store
+                .expression_union_type_with_global_types(
+                    global_types,
+                    &[type_, optional],
+                    UnionReduction::Literal,
+                )
+                .map_err(|_| JsDocTypeResolutionError::UnionConstruction(range))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let members = PreparedSymbolTable::new(properties.len())
+        .ok_or(JsDocTypeResolutionError::ObjectConstruction(range))?;
+    let mut property_symbols = Vec::new();
+    property_symbols
+        .try_reserve_exact(properties.len())
+        .map_err(|_| JsDocTypeResolutionError::ObjectConstruction(range))?;
+    if !store.try_reserve_types(1)
+        || !store.try_reserve_checker_symbol_allocations(properties.len(), 1)
+        || !store.try_reserve_value_symbol_links(properties.len())
+    {
+        return Err(JsDocTypeResolutionError::ObjectConstruction(range));
+    }
+
+    let members = store.alloc_prepared_symbol_table(members);
+    for (property, property_type) in properties.iter().zip(property_types) {
+        let mut flags = SymbolFlags::PROPERTY;
+        if property.optional {
+            flags |= SymbolFlags::OPTIONAL;
+        }
+        let checks = if property.readonly {
+            CheckFlags::READONLY
+        } else {
+            CheckFlags::NONE
+        };
+        let name = EscapedName::source(&property.name);
+        let symbol = store.alloc_transient_symbol(flags, name.clone(), checks);
+        assert!(store.set_value_symbol_links(
+            symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(property_type),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        assert_eq!(store.insert_symbol(members, name, symbol), Some(None));
+        property_symbols.push(symbol);
+    }
+    let type_ = store
+        .alloc_plain_object_type(ObjectFlags::ANONYMOUS, None)
+        .expect("a prepared JSDoc object type has valid synthetic ownership");
+    assert!(store.set_structured_type_members(
+        type_,
+        Some(members),
+        Some(property_symbols),
+        None,
+        None,
+        None,
+    ));
+    Ok(type_)
 }
 
 fn skip_doc_whitespace(source: &str, mut index: usize, end: usize) -> usize {
@@ -3725,7 +4138,7 @@ mod tests {
     use ts_parser::{ParseResult, parse_javascript_source_file, parse_source_file};
 
     use super::*;
-    use crate::semantic::{CanonicalCheckerContext, IntrinsicBootstrapOptions};
+    use crate::semantic::{CanonicalCheckerContext, IntrinsicBootstrapOptions, TypeData};
 
     fn context(
         parsed: &ParseResult,
@@ -3834,6 +4247,159 @@ mod tests {
                 resolve_jsdoc_type(context.store_mut_for_test(), &globals, options, annotation)
                     .unwrap();
             assert_eq!(function, globals.function_type);
+        }
+    }
+
+    #[test]
+    fn reparsed_typedefs_keep_comments_on_the_real_host_exactly_once() {
+        let javascript = parse_javascript_source_file(concat!(
+            "/** @typedef {number} Value */\n",
+            "/** @type {Value} */\n",
+            "const first = 1;\n",
+            "/** @typedef {{ label: string }} Shape */\n",
+            "/** @type {Shape} */\n",
+            "var second;",
+        ));
+        assert!(
+            javascript.diagnostics.is_empty(),
+            "{:?}",
+            javascript.diagnostics
+        );
+        let file = FileId::new(95);
+        let root = NodeRef::new(javascript.arena.id(), file, javascript.source_file);
+        let NodeData::SourceFile(source) = &javascript.arena.get(root.node).unwrap().data else {
+            panic!("expected a JavaScript source root")
+        };
+        let [first_alias, _, second_alias, _] = source.statements.nodes.as_slice() else {
+            panic!("expected two reparsed aliases and their host statements")
+        };
+        let aliases = [
+            NodeRef::new(javascript.arena.id(), file, *first_alias),
+            NodeRef::new(javascript.arena.id(), file, *second_alias),
+        ];
+
+        let plan = plan_javascript_source_jsdoc(&javascript.arena, root).unwrap();
+        assert!(plan.diagnostics().is_empty(), "{:?}", plan.diagnostics());
+        assert_eq!(plan.declarations().len(), 2);
+        for (declaration, (name, alias)) in plan
+            .declarations()
+            .iter()
+            .zip([("Value", aliases[0]), ("Shape", aliases[1])])
+        {
+            assert_eq!(
+                javascript.arena.get(declaration.node().node).unwrap().kind,
+                SyntaxKind::VariableDeclaration
+            );
+            let [typedef] = declaration.typedefs() else {
+                panic!("expected one typedef on its real JavaScript host")
+            };
+            assert_eq!(typedef.name(), name);
+            assert_eq!(typedef.source_declaration(), Some(alias));
+            assert_eq!(
+                declaration.type_().unwrap().type_(),
+                &JsDocType::Named(name.to_owned())
+            );
+            assert_eq!(
+                declaration.type_().unwrap().resolved_alias_name(),
+                Some(name)
+            );
+        }
+    }
+
+    #[test]
+    fn reparsed_import_typedefs_keep_their_unsupported_resolution_boundary() {
+        let javascript = parse_javascript_source_file(concat!(
+            "/** @typedef {{ a: 1, m: 1 }} Shape */\n",
+            "/** @typedef {import('./types').Shape} Imported */\n",
+            "/** @type {Imported} */\n",
+            "var value;",
+        ));
+        assert!(
+            javascript.diagnostics.is_empty(),
+            "{:?}",
+            javascript.diagnostics
+        );
+        let file = FileId::new(96);
+        let root = NodeRef::new(javascript.arena.id(), file, javascript.source_file);
+        let plan = plan_javascript_source_jsdoc(&javascript.arena, root).unwrap();
+        let [declaration] = plan.declarations() else {
+            panic!("expected one real JavaScript declaration")
+        };
+        let [shape, imported] = declaration.typedefs() else {
+            panic!("expected both ordered typedefs on their real host")
+        };
+        assert_eq!(shape.name(), "Shape");
+        assert_eq!(imported.name(), "Imported");
+        assert!(shape.source_declaration().is_some());
+        assert!(imported.source_declaration().is_some());
+
+        let parsed = parse_source_file("const marker = 1;");
+        let options = CanonicalCheckerOptions::default();
+        let context = context(&parsed, options);
+        let globals = context.global_types();
+        preflight_planned_jsdoc_type(context.store(), globals, options, shape.type_().unwrap())
+            .unwrap();
+        let import_annotation = imported.type_().unwrap();
+        assert_eq!(
+            preflight_planned_jsdoc_type(context.store(), globals, options, import_annotation),
+            Err(JsDocTypeResolutionError::UnsupportedType {
+                kind: SyntaxKind::ImportType,
+                range: import_annotation.range(),
+            })
+        );
+        let annotation = declaration.type_().unwrap();
+        assert_eq!(annotation.resolved_alias_name(), None);
+        assert_eq!(
+            preflight_planned_jsdoc_type(context.store(), globals, options, annotation),
+            Err(JsDocTypeResolutionError::UnresolvedTypeReference {
+                name: "Imported".to_owned(),
+                range: annotation.range(),
+            })
+        );
+    }
+
+    #[test]
+    fn forged_reparsed_typedefs_fail_before_comment_ownership_changes() {
+        for corruption in 0..3 {
+            let mut javascript = parse_javascript_source_file(concat!(
+                "/** @typedef {number} Value */\n",
+                "/** @type {Value} */\n",
+                "const value = 1;",
+            ));
+            let NodeData::SourceFile(source) =
+                &javascript.arena.get(javascript.source_file).unwrap().data
+            else {
+                panic!("expected a JavaScript source root")
+            };
+            let [alias, _] = source.statements.nodes.as_slice() else {
+                panic!("expected one reparsed typedef and its host")
+            };
+            let alias = *alias;
+            let name = match &javascript.arena.get(alias).unwrap().data {
+                NodeData::TypeAliasDeclaration(alias) => alias.name,
+                _ => panic!("expected a reparsed typedef payload"),
+            };
+            match corruption {
+                0 => javascript.arena.get_mut(alias).unwrap().flags = NodeFlags::default(),
+                1 => javascript.arena.get_mut(alias).unwrap().parent = None,
+                2 => {
+                    let NodeData::Identifier(identifier) =
+                        &mut javascript.arena.get_mut(name).unwrap().data
+                    else {
+                        panic!("expected the typedef identifier")
+                    };
+                    identifier.text = "Different".to_owned();
+                }
+                _ => unreachable!(),
+            }
+            let file = FileId::new(97 + corruption);
+            let root = NodeRef::new(javascript.arena.id(), file, javascript.source_file);
+            let alias = NodeRef::new(javascript.arena.id(), file, alias);
+            assert_eq!(
+                plan_javascript_source_jsdoc(&javascript.arena, root),
+                Err(JsDocCommentError::InvalidSourceNode(alias)),
+                "corruption case {corruption}"
+            );
         }
     }
 
@@ -3981,6 +4547,189 @@ mod tests {
     }
 
     #[test]
+    fn local_structural_typedefs_resolve_nested_aliases_and_exact_property_shapes() {
+        let javascript = parse_javascript_source_file(concat!(
+            "/** @typedef {1} NS.Value */\n",
+            "/** @typedef {{ readonly id: NS.Value, nested: { value: NS.Value }, label?: string }} NS.Box */\n",
+            "/** @type {NS.Box} */\n",
+            "var box;",
+        ));
+        assert!(
+            javascript.diagnostics.is_empty(),
+            "{:?}",
+            javascript.diagnostics
+        );
+        let root = NodeRef::new(
+            javascript.arena.id(),
+            FileId::new(94),
+            javascript.source_file,
+        );
+        let plan = plan_javascript_source_jsdoc(&javascript.arena, root).unwrap();
+        let [declaration] = plan.declarations() else {
+            panic!("expected one structural typedef declaration")
+        };
+        let annotation = declaration.type_().unwrap();
+        assert_eq!(annotation.type_(), &JsDocType::Named("NS.Box".to_owned()));
+        assert_eq!(annotation.resolved_alias_name(), Some("NS.Box"));
+
+        let parsed = parse_source_file("const marker = 1;");
+        let options = CanonicalCheckerOptions::default();
+        let mut context = context(&parsed, options);
+        let globals = context.global_types().clone();
+        let before = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().symbol_store().symbol_table_len(),
+        );
+        preflight_planned_jsdoc_type(context.store(), &globals, options, annotation).unwrap();
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().symbol_store().symbol_table_len(),
+            ),
+            before
+        );
+
+        let resolved =
+            resolve_planned_jsdoc_type(context.store_mut_for_test(), &globals, options, annotation)
+                .unwrap();
+        assert_eq!(
+            context.type_to_string(resolved).unwrap(),
+            "{ readonly id: 1; nested: { value: 1; }; label?: string; }"
+        );
+
+        let record = context.store().type_payload(resolved).unwrap();
+        assert_eq!(
+            record.object_flags(),
+            ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
+        );
+        assert!(record.symbol().is_none());
+        let TypeData::Object(object) = record.data() else {
+            panic!("expected one structural object type")
+        };
+        let properties = object.structured.properties.as_deref().unwrap();
+        let members = context
+            .store()
+            .symbol_table(object.structured.members.unwrap())
+            .unwrap();
+        assert_eq!(properties.len(), 3);
+        for (symbol, (name, optional, readonly)) in properties.iter().zip([
+            ("id", false, true),
+            ("nested", false, false),
+            ("label", true, false),
+        ]) {
+            let property = context.store().symbol(*symbol).unwrap();
+            assert_eq!(property.name().as_utf8(), Some(name));
+            assert_eq!(
+                property.flags(),
+                SymbolFlags::PROPERTY
+                    | SymbolFlags::TRANSIENT
+                    | if optional {
+                        SymbolFlags::OPTIONAL
+                    } else {
+                        SymbolFlags::NONE
+                    }
+            );
+            assert_eq!(
+                property.check_flags().contains(CheckFlags::READONLY),
+                readonly
+            );
+            assert_eq!(members.get_source(name), Some(*symbol));
+            assert!(
+                context
+                    .store()
+                    .value_symbol_links(*symbol)
+                    .and_then(|links| links.resolved_type)
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn optional_structural_properties_use_the_configured_missing_type() {
+        for exact_optional_property_types in [false, true] {
+            let parsed = parse_source_file("const marker = 1;");
+            let options = CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    exact_optional_property_types,
+                },
+                ..CanonicalCheckerOptions::default()
+            };
+            let mut context = context(&parsed, options);
+            let globals = context.global_types().clone();
+            let comment = type_tag("/** @type {{ value?: number }} */");
+            let annotation = comment.type_tag().unwrap().type_expression().unwrap();
+            let resolved =
+                resolve_jsdoc_type(context.store_mut_for_test(), &globals, options, annotation)
+                    .unwrap();
+            let record = context.store().type_payload(resolved).unwrap();
+            let TypeData::Object(object) = record.data() else {
+                panic!("expected one structural object type")
+            };
+            let [property] = object.structured.properties.as_deref().unwrap() else {
+                panic!("expected one optional property")
+            };
+            let property_type = context
+                .store()
+                .value_symbol_links(*property)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            let TypeData::Union(union) =
+                context.store().type_payload(property_type).unwrap().data()
+            else {
+                panic!("expected the optional property to include its missing type")
+            };
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            assert!(union.union.types.contains(&bootstrap.number_type));
+            assert!(
+                union
+                    .union
+                    .types
+                    .contains(&bootstrap.undefined_or_missing_type)
+            );
+            let expected = if exact_optional_property_types {
+                "{ value?: number; }"
+            } else {
+                "{ value?: number | undefined; }"
+            };
+            assert_eq!(context.type_to_string(resolved).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn unresolved_structural_properties_fail_before_semantic_allocation() {
+        let parsed = parse_source_file("const marker = 1;");
+        let options = CanonicalCheckerOptions::default();
+        let mut context = context(&parsed, options);
+        let globals = context.global_types().clone();
+        let comment = type_tag("/** @type {{ first: 1, nested: { value: Missing } }} */");
+        let annotation = comment.type_tag().unwrap().type_expression().unwrap();
+        let before = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().symbol_store().symbol_table_len(),
+        );
+
+        assert_eq!(
+            resolve_jsdoc_type(context.store_mut_for_test(), &globals, options, annotation),
+            Err(JsDocTypeResolutionError::UnresolvedTypeReference {
+                name: "Missing".to_owned(),
+                range: annotation.range(),
+            })
+        );
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().symbol_store().symbol_table_len(),
+            ),
+            before
+        );
+    }
+
+    #[test]
     fn object_typedef_properties_retain_alias_names_after_canonical_resolution() {
         let javascript = parse_javascript_source_file(concat!(
             "/**\n",
@@ -4082,7 +4831,7 @@ mod tests {
                 "const value = 1;",
             ),
             concat!(
-                "/** @typedef {{ value: number }} Value */\n",
+                "/** @typedef {{ value: Value }} Value */\n",
                 "/** @type {Value} */\n",
                 "const value = 1;",
             ),
@@ -4281,6 +5030,171 @@ mod tests {
                 &JsDocType::Intrinsic(JsDocIntrinsicType::Number)
             );
         }
+    }
+
+    #[test]
+    fn namespaced_callback_aliases_resolve_contextual_arrow_signatures() {
+        let javascript = parse_javascript_source_file(concat!(
+            "/** @callback NS.MyCallback\n",
+            " * @param {string} name\n",
+            " * @returns {void}\n",
+            " */\n",
+            "/** @type {NS.MyCallback} */\n",
+            "const f = (name) => {};",
+        ));
+        assert!(
+            javascript.diagnostics.is_empty(),
+            "{:?}",
+            javascript.diagnostics
+        );
+        let root = NodeRef::new(
+            javascript.arena.id(),
+            FileId::new(98),
+            javascript.source_file,
+        );
+        let plan = plan_javascript_source_jsdoc(&javascript.arena, root).unwrap();
+        assert!(plan.diagnostics().is_empty(), "{:?}", plan.diagnostics());
+        let [declaration] = plan.declarations() else {
+            panic!("expected one callback-annotated arrow declaration")
+        };
+        assert!(declaration.parameters().is_empty());
+        assert!(declaration.return_type().is_none());
+        let [defined] = declaration.callbacks() else {
+            panic!("expected one independently owned callback definition")
+        };
+        let annotation = declaration.type_().unwrap();
+        assert_eq!(
+            annotation.type_(),
+            &JsDocType::Named("NS.MyCallback".to_owned())
+        );
+        assert_eq!(annotation.resolved_alias_name(), Some("NS.MyCallback"));
+        let callback = annotation.resolved_callback().unwrap();
+        assert_eq!(callback, defined);
+
+        let parsed = parse_source_file("const marker = 1;");
+        let options = CanonicalCheckerOptions::default();
+        let mut context = context(&parsed, options);
+        let globals = context.global_types().clone();
+        let before = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().signature_len(),
+        );
+        preflight_planned_jsdoc_type(context.store(), &globals, options, annotation).unwrap();
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().signature_len(),
+            ),
+            before
+        );
+
+        let resolved = resolve_planned_jsdoc_callback_signature(
+            context.store_mut_for_test(),
+            &globals,
+            options,
+            callback,
+            &[],
+        )
+        .unwrap();
+        let [parameter] = resolved.parameters() else {
+            panic!("expected the callback's single typed parameter")
+        };
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        assert_eq!(parameter.name(), "name");
+        assert_eq!(parameter.type_(), Some(bootstrap.string_type));
+        assert_eq!(resolved.return_type(), Some(bootstrap.void_type));
+    }
+
+    #[test]
+    fn callback_aliases_keep_local_typedefs_but_reject_generic_and_imported_signatures() {
+        let javascript = parse_javascript_source_file(concat!(
+            "/** @typedef {string} Input */\n",
+            "/** @callback Handler\n",
+            " * @param {Input} value\n",
+            " * @returns {void}\n",
+            " */\n",
+            "/** @type {Handler} */\n",
+            "const handler = (value) => {};",
+        ));
+        let root = NodeRef::new(
+            javascript.arena.id(),
+            FileId::new(99),
+            javascript.source_file,
+        );
+        let plan = plan_javascript_source_jsdoc(&javascript.arena, root).unwrap();
+        let [declaration] = plan.declarations() else {
+            panic!("expected one callback and its local typedef")
+        };
+        let callback = declaration.type_().unwrap().resolved_callback().unwrap();
+        assert_eq!(
+            callback.parameters()[0]
+                .type_()
+                .unwrap()
+                .resolved_alias_name(),
+            Some("Input")
+        );
+
+        let parsed = parse_source_file("const marker = 1;");
+        let options = CanonicalCheckerOptions::default();
+        let mut context = context(&parsed, options);
+        let globals = context.global_types().clone();
+        let signature = resolve_planned_jsdoc_callback_signature(
+            context.store_mut_for_test(),
+            &globals,
+            options,
+            callback,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            signature.parameters()[0].type_(),
+            Some(context.store().intrinsic_bootstrap().unwrap().string_type)
+        );
+
+        let generic = parse_javascript_source_file(concat!(
+            "/** @template T\n",
+            " * @callback Generic\n",
+            " * @param {T} value\n",
+            " * @returns {T}\n",
+            " */\n",
+            "/** @type {Generic} */\n",
+            "const generic = (value) => {};",
+        ));
+        let root = NodeRef::new(generic.arena.id(), FileId::new(100), generic.source_file);
+        let generic_plan = plan_javascript_source_jsdoc(&generic.arena, root).unwrap();
+        let generic = generic_plan.declarations()[0].type_().unwrap();
+        assert!(generic.resolved_callback().is_none());
+        assert_eq!(
+            preflight_planned_jsdoc_type(context.store(), &globals, options, generic),
+            Err(JsDocTypeResolutionError::UnresolvedTypeReference {
+                name: "Generic".to_owned(),
+                range: generic.range(),
+            })
+        );
+
+        let imported = parse_javascript_source_file(concat!(
+            "/** @callback Imported\n",
+            " * @param {import('./types').Value} value\n",
+            " * @returns {void}\n",
+            " */\n",
+            "/** @type {Imported} */\n",
+            "const imported = (value) => {};",
+        ));
+        let root = NodeRef::new(imported.arena.id(), FileId::new(101), imported.source_file);
+        let imported_plan = plan_javascript_source_jsdoc(&imported.arena, root).unwrap();
+        let imported = imported_plan.declarations()[0].type_().unwrap();
+        let parameter = imported.resolved_callback().unwrap().parameters()[0]
+            .type_()
+            .unwrap();
+        assert_eq!(
+            preflight_planned_jsdoc_type(context.store(), &globals, options, imported),
+            Err(JsDocTypeResolutionError::UnsupportedType {
+                kind: SyntaxKind::ImportType,
+                range: parameter.range(),
+            })
+        );
     }
 
     #[test]

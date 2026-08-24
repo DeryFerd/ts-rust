@@ -4,8 +4,9 @@
 //! and strict `typeof` comparisons: function `START`, initialized local and
 //! authenticated parameter `ASSIGNMENT` nodes, approved `CALL` nodes,
 //! condition edges, unreachable nodes, ordered branch joins, and cyclic loop
-//! labels. Other mutation expressions and switch-clause narrowing remain
-//! typed capability boundaries.
+//! labels. Authenticated declaration-order queries also retain the exact
+//! block-scoped, class, and enum diagnostics. Other mutation expressions and
+//! switch-clause narrowing remain typed capability boundaries.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -15,10 +16,12 @@ use std::{
 use ts_ast::{
     FlowFlags, FlowNode, FlowNodePayload, FlowRef, NodeArena, NodeData, NodeRef, SyntaxKind,
 };
-use ts_binder::{BoundFile, BoundFlowGraph, SemanticSymbolId};
+use ts_binder::{BoundFile, BoundFlowGraph, SemanticSymbolId, SymbolFlags};
+use ts_diagnostics::{Diagnostic, message_by_code};
 
 use super::{
-    CanonicalGlobalTypes, CanonicalTypeMapperStore, TypeId,
+    CanonicalCheckerDiagnostic, CanonicalCheckerRelatedInformation, CanonicalGlobalTypes,
+    CanonicalTypeMapperStore, TypeId,
     bootstrap::{LiteralTypeCacheError, UnionReduction},
     logical_operators::{LogicalBinaryError, TruthinessAssumption, narrow_by_truthiness},
     type_records::{TypeData, TypeRecord},
@@ -206,6 +209,7 @@ pub(super) enum SourceFlowInvariant {
     },
     InvalidParameterAssignment(NodeRef),
     InvalidCall(NodeRef),
+    InvalidDeclarationUse(NodeRef),
     AssignmentAlreadyCompleted(NodeRef),
     MissingCurrentType(SemanticSymbolId),
     TypeofNarrowing(SourceTypeofNarrowingError),
@@ -285,6 +289,271 @@ struct SourceFlowEffects {
 const TRUE_CONDITION_EDGE: u8 = 1 << 0;
 const FALSE_CONDITION_EDGE: u8 = 1 << 1;
 const BOTH_CONDITION_EDGES: u8 = TRUE_CONDITION_EDGE | FALSE_CONDITION_EDGE;
+
+/// Returns the exact upstream diagnostic for an immediate block-scoped value use.
+///
+/// Const enums are exempt unless isolated module checking requires runtime order.
+pub(super) fn source_block_scoped_use_before_declaration(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    usage: NodeRef,
+    symbol: SemanticSymbolId,
+    isolated_modules: bool,
+) -> Result<Option<CanonicalCheckerDiagnostic>, SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidDeclarationUse(usage);
+    if bound.node_arena_id() != arena.id()
+        || bound.node_arena_revision() != arena.revision()
+        || !usage.is_for(arena.id(), bound.file_id())
+        || !bound.contains(usage)
+        || !store.contains_node_ref(usage)
+    {
+        return Err(SourceFlowInvariant::ForeignNode(usage).into());
+    }
+    let usage_record = arena.get(usage.node).ok_or_else(invalid)?;
+    let NodeData::Identifier(usage_name) = &usage_record.data else {
+        return Err(invalid().into());
+    };
+    if usage_record.kind != SyntaxKind::Identifier
+        || usage_record.flags.0 != 0
+        || usage_name.flow_node.is_some()
+        || usage_name.text.is_empty()
+    {
+        return Err(invalid().into());
+    }
+
+    let resolved = store.symbol(symbol).ok_or_else(invalid)?;
+    let symbol = store
+        .get_merged_symbol(resolved.export_symbol().unwrap_or(symbol))
+        .ok_or_else(invalid)?;
+    let record = store.symbol(symbol).ok_or_else(invalid)?;
+    let flags = record.flags();
+    let code = if flags.contains(SymbolFlags::BLOCK_SCOPED_VARIABLE) {
+        2448
+    } else if flags.contains(SymbolFlags::CLASS) {
+        if flags.intersects(
+            SymbolFlags::FUNCTION | SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::ASSIGNMENT,
+        ) {
+            return Ok(None);
+        }
+        2449
+    } else if flags.contains(SymbolFlags::REGULAR_ENUM)
+        || flags.contains(SymbolFlags::CONST_ENUM) && isolated_modules
+    {
+        2450
+    } else {
+        return Ok(None);
+    };
+
+    let declaration = record.value_declaration().ok_or_else(invalid)?;
+    if !declaration.is_for(arena.id(), bound.file_id()) {
+        return Ok(None);
+    }
+    if !bound.contains(declaration)
+        || !store.contains_node_ref(declaration)
+        || bound
+            .symbol(declaration)
+            .and_then(|owner| store.get_merged_symbol(owner))
+            != Some(symbol)
+    {
+        return Err(invalid().into());
+    }
+    let declaration_record = arena.get(declaration.node).ok_or_else(invalid)?;
+    let name = match (&declaration_record.data, code) {
+        (NodeData::VariableDeclaration(declaration), 2448)
+            if declaration_record.kind == SyntaxKind::VariableDeclaration =>
+        {
+            declaration.name
+        }
+        (NodeData::ClassDeclaration(declaration), 2449)
+            if declaration_record.kind == SyntaxKind::ClassDeclaration =>
+        {
+            declaration.name.ok_or_else(invalid)?
+        }
+        (NodeData::EnumDeclaration(declaration), 2450)
+            if declaration_record.kind == SyntaxKind::EnumDeclaration =>
+        {
+            declaration.name
+        }
+        _ => return Err(invalid().into()),
+    };
+    let name = NodeRef::new(declaration.arena, declaration.file, name);
+    let name_record = arena.get(name.node).ok_or_else(invalid)?;
+    let NodeData::Identifier(declaration_name) = &name_record.data else {
+        return Err(invalid().into());
+    };
+    if !bound.contains(name)
+        || !store.contains_node_ref(name)
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.parent != Some(declaration.node)
+        || name_record.flags.0 != 0
+        || declaration_name.flow_node.is_some()
+        || declaration_name.text != usage_name.text
+        || record.name().as_utf8() != Some(declaration_name.text.as_str())
+    {
+        return Err(invalid().into());
+    }
+
+    let scope = bound
+        .block_scope_container(declaration)
+        .ok_or_else(invalid)?;
+    let local = bound
+        .locals(scope)
+        .and_then(|locals| store.symbol_table(locals))
+        .and_then(|locals| locals.get_source(&declaration_name.text))
+        .ok_or_else(invalid)?;
+    let local_record = store.symbol(local).ok_or_else(invalid)?;
+    if store.get_merged_symbol(local_record.export_symbol().unwrap_or(local)) != Some(symbol) {
+        return Err(invalid().into());
+    }
+    if source_declaration_is_ambient(arena, bound, declaration, usage)?
+        || !source_declaration_use_is_immediate(arena, bound, usage, scope)?
+    {
+        return Ok(None);
+    }
+
+    let occurs_before_declaration = usage_record.range.start < declaration_record.range.start;
+    let occurs_in_own_initializer = matches!(
+        &declaration_record.data,
+        NodeData::VariableDeclaration(variable)
+            if variable.initializer.is_some_and(|initializer| {
+                source_node_is_descendant_of(arena, usage, initializer)
+            })
+    );
+    if !occurs_before_declaration && !occurs_in_own_initializer {
+        return Ok(None);
+    }
+
+    Ok(Some(CanonicalCheckerDiagnostic {
+        node: Some(usage),
+        range_override: None,
+        diagnostic: Diagnostic::with_arguments(
+            message_by_code(code).expect("block-scoped diagnostic is in the catalog"),
+            [declaration_name.text.clone()],
+        ),
+        related_information: vec![CanonicalCheckerRelatedInformation {
+            node: Some(name),
+            diagnostic: Diagnostic::with_arguments(
+                message_by_code(2728).expect("declaration-related diagnostic is in the catalog"),
+                [declaration_name.text.clone()],
+            ),
+        }],
+    }))
+}
+
+fn source_declaration_is_ambient(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    declaration: NodeRef,
+    usage: NodeRef,
+) -> Result<bool, SourceFlowError> {
+    if bound
+        .source_facts()
+        .is_some_and(ts_binder::CanonicalSourceFileFacts::is_declaration_file)
+    {
+        return Ok(true);
+    }
+
+    let invalid = || SourceFlowInvariant::InvalidDeclarationUse(usage);
+    let mut current = declaration;
+    let mut visited = HashSet::new();
+    loop {
+        if !visited.insert(current) || !bound.contains(current) {
+            return Err(invalid().into());
+        }
+        let record = arena.get(current.node).ok_or_else(invalid)?;
+        let modifiers = match &record.data {
+            NodeData::ClassDeclaration(declaration) => declaration.modifiers.as_ref(),
+            NodeData::EnumDeclaration(declaration) => declaration.modifiers.as_ref(),
+            NodeData::ModuleDeclaration(declaration) => declaration.modifiers.as_ref(),
+            NodeData::VariableStatement(statement) => statement.modifiers.as_ref(),
+            _ => None,
+        };
+        if let Some(modifiers) = modifiers {
+            for modifier in &modifiers.list.nodes {
+                let modifier = NodeRef::new(current.arena, current.file, *modifier);
+                let modifier_record = arena.get(modifier.node).ok_or_else(invalid)?;
+                if !bound.contains(modifier) || modifier_record.parent != Some(current.node) {
+                    return Err(invalid().into());
+                }
+                if modifier_record.kind == SyntaxKind::DeclareKeyword {
+                    return Ok(true);
+                }
+            }
+        }
+        let Some(parent) = record.parent else {
+            return if current == bound.source_file() {
+                Ok(false)
+            } else {
+                Err(invalid().into())
+            };
+        };
+        current = NodeRef::new(current.arena, current.file, parent);
+    }
+}
+
+fn source_declaration_use_is_immediate(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    usage: NodeRef,
+    scope: NodeRef,
+) -> Result<bool, SourceFlowError> {
+    let invalid = || SourceFlowInvariant::InvalidDeclarationUse(usage);
+    let mut current = usage;
+    let mut visited = HashSet::new();
+    loop {
+        if !visited.insert(current) || !bound.contains(current) {
+            return Err(invalid().into());
+        }
+        if current == scope {
+            return Ok(true);
+        }
+        let record = arena.get(current.node).ok_or_else(invalid)?;
+        if matches!(
+            record.kind,
+            SyntaxKind::FunctionDeclaration
+                | SyntaxKind::FunctionExpression
+                | SyntaxKind::ArrowFunction
+                | SyntaxKind::TypeAliasDeclaration
+                | SyntaxKind::InterfaceDeclaration
+                | SyntaxKind::TypeReference
+                | SyntaxKind::TypeQuery
+                | SyntaxKind::ImportType
+                | SyntaxKind::ExportSpecifier
+        ) {
+            return Ok(false);
+        }
+        if matches!(
+            &record.data,
+            NodeData::ExportAssignment(assignment) if assignment.is_export_equals
+        ) {
+            return Ok(false);
+        }
+        let Some(parent) = record.parent else {
+            return Ok(false);
+        };
+        current = NodeRef::new(current.arena, current.file, parent);
+    }
+}
+
+fn source_node_is_descendant_of(
+    arena: &NodeArena,
+    usage: NodeRef,
+    ancestor: ts_ast::NodeId,
+) -> bool {
+    let mut current = Some(usage.node);
+    let mut visited = HashSet::new();
+    while let Some(node) = current {
+        if !visited.insert(node) {
+            return false;
+        }
+        if node == ancestor {
+            return true;
+        }
+        current = arena.get(node).and_then(|record| record.parent);
+    }
+    false
+}
 
 impl SourceFlowPlan {
     /// Freezes and validates every flow chain that the source executor may
@@ -2101,6 +2370,278 @@ mod tests {
                 SourceFlowInvariant::InvalidParameterAssignment(node)
             )) if node == target
         ));
+    }
+
+    #[test]
+    fn regular_enums_report_exact_use_before_declaration_diagnostics() {
+        let parsed = parse_source_file(concat!(
+            "function regular() { return Regular.A; enum Regular { A } }\n",
+            "function constant() { return Fixed.A; const enum Fixed { A } }\n",
+            "function declared() { enum Ready { A } return Ready.A; }\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(2_404);
+        let context = loop_context(&parsed, file);
+        let bound = context.file(file).unwrap().1.clone();
+
+        let (regular, regular_read, regular_symbol) =
+            declaration_use_nodes(&parsed, &bound, SyntaxKind::EnumDeclaration, "Regular");
+        let diagnostic = source_block_scoped_use_before_declaration(
+            &parsed.arena,
+            &bound,
+            context.store(),
+            regular_read,
+            regular_symbol,
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(diagnostic.node, Some(regular_read));
+        assert_eq!(diagnostic.diagnostic.code(), 2450);
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "Enum 'Regular' used before its declaration.",
+        );
+        let [related] = diagnostic.related_information.as_slice() else {
+            panic!("expected one enum declaration reference")
+        };
+        let NodeData::EnumDeclaration(enumeration) = &parsed.arena.get(regular.node).unwrap().data
+        else {
+            panic!("expected an enum declaration")
+        };
+        assert_eq!(
+            related.node,
+            Some(NodeRef::new(parsed.arena.id(), file, enumeration.name)),
+        );
+        assert_eq!(related.diagnostic.code(), 2728);
+        assert_eq!(
+            related.diagnostic.render().unwrap(),
+            "'Regular' is declared here.",
+        );
+
+        let (_, constant_read, constant_symbol) =
+            declaration_use_nodes(&parsed, &bound, SyntaxKind::EnumDeclaration, "Fixed");
+        assert_eq!(
+            source_block_scoped_use_before_declaration(
+                &parsed.arena,
+                &bound,
+                context.store(),
+                constant_read,
+                constant_symbol,
+                false,
+            ),
+            Ok(None),
+        );
+        let isolated = source_block_scoped_use_before_declaration(
+            &parsed.arena,
+            &bound,
+            context.store(),
+            constant_read,
+            constant_symbol,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(isolated.diagnostic.code(), 2450);
+
+        let (_, declared_read, declared_symbol) =
+            declaration_use_nodes(&parsed, &bound, SyntaxKind::EnumDeclaration, "Ready");
+        assert_eq!(
+            source_block_scoped_use_before_declaration(
+                &parsed.arena,
+                &bound,
+                context.store(),
+                declared_read,
+                declared_symbol,
+                false,
+            ),
+            Ok(None),
+        );
+    }
+
+    #[test]
+    fn block_scoped_variable_and_class_reads_keep_their_distinct_diagnostics() {
+        let parsed = parse_source_file(concat!(
+            "function locals() { ",
+            "{ value; const value = 1; } ",
+            "Model; class Model {} ",
+            "const own = own; ",
+            "}",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(2_405);
+        let context = loop_context(&parsed, file);
+        let bound = context.file(file).unwrap().1.clone();
+
+        for (kind, name, code, message) in [
+            (
+                SyntaxKind::VariableDeclaration,
+                "value",
+                2448,
+                "Block-scoped variable 'value' used before its declaration.",
+            ),
+            (
+                SyntaxKind::ClassDeclaration,
+                "Model",
+                2449,
+                "Class 'Model' used before its declaration.",
+            ),
+            (
+                SyntaxKind::VariableDeclaration,
+                "own",
+                2448,
+                "Block-scoped variable 'own' used before its declaration.",
+            ),
+        ] {
+            let (_, read, symbol) = declaration_use_nodes(&parsed, &bound, kind, name);
+            let diagnostic = source_block_scoped_use_before_declaration(
+                &parsed.arena,
+                &bound,
+                context.store(),
+                read,
+                symbol,
+                false,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(diagnostic.diagnostic.code(), code);
+            assert_eq!(diagnostic.diagnostic.render().unwrap(), message);
+            assert_eq!(diagnostic.related_information[0].diagnostic.code(), 2728);
+        }
+    }
+
+    #[test]
+    fn deferred_and_ambient_reads_do_not_report_declaration_order_errors() {
+        let parsed = parse_source_file(concat!(
+            "function deferred() { ",
+            "function later() { return Delayed.A; } ",
+            "enum Delayed { A } ",
+            "} ",
+            "Ambient.A; declare enum Ambient { A }",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(2_406);
+        let context = loop_context(&parsed, file);
+        let bound = context.file(file).unwrap().1.clone();
+
+        for name in ["Delayed", "Ambient"] {
+            let (_, read, symbol) =
+                declaration_use_nodes(&parsed, &bound, SyntaxKind::EnumDeclaration, name);
+            assert_eq!(
+                source_block_scoped_use_before_declaration(
+                    &parsed.arena,
+                    &bound,
+                    context.store(),
+                    read,
+                    symbol,
+                    false,
+                ),
+                Ok(None),
+                "unexpected declaration-order diagnostic for {name}",
+            );
+        }
+    }
+
+    #[test]
+    fn declaration_order_queries_reject_forged_symbols_and_foreign_nodes() {
+        let parsed = parse_source_file(
+            "function forged() { return Real.A; enum Real { A } enum Other { A } }",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(2_407);
+        let context = loop_context(&parsed, file);
+        let bound = context.file(file).unwrap().1.clone();
+        let (_, read, _) =
+            declaration_use_nodes(&parsed, &bound, SyntaxKind::EnumDeclaration, "Real");
+        let other = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::EnumDeclaration(enumeration) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(name) = &parsed.arena.get(enumeration.name)?.data else {
+                    return None;
+                };
+                (name.text == "Other").then_some(NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .unwrap();
+        let other_symbol = bound.symbol(other).unwrap();
+        assert_eq!(
+            source_block_scoped_use_before_declaration(
+                &parsed.arena,
+                &bound,
+                context.store(),
+                read,
+                other_symbol,
+                false,
+            ),
+            Err(SourceFlowInvariant::InvalidDeclarationUse(read).into()),
+        );
+
+        let foreign = NodeRef::new(parsed.arena.id(), FileId::new(9_999), read.node);
+        assert_eq!(
+            source_block_scoped_use_before_declaration(
+                &parsed.arena,
+                &bound,
+                context.store(),
+                foreign,
+                other_symbol,
+                false,
+            ),
+            Err(SourceFlowInvariant::ForeignNode(foreign).into()),
+        );
+    }
+
+    fn declaration_use_nodes(
+        parsed: &ParseResult,
+        bound: &BoundFile,
+        kind: SyntaxKind,
+        expected_name: &str,
+    ) -> (NodeRef, NodeRef, SemanticSymbolId) {
+        let file = bound.file_id();
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                if record.kind != kind {
+                    return None;
+                }
+                let name = match &record.data {
+                    NodeData::VariableDeclaration(declaration) => declaration.name,
+                    NodeData::ClassDeclaration(declaration) => declaration.name?,
+                    NodeData::EnumDeclaration(declaration) => declaration.name,
+                    _ => return None,
+                };
+                let NodeData::Identifier(name) = &parsed.arena.get(name)?.data else {
+                    return None;
+                };
+                (name.text == expected_name).then_some(NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .unwrap();
+        let read = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::Identifier(name) = &record.data else {
+                    return None;
+                };
+                if name.text != expected_name {
+                    return None;
+                }
+                let parent = parsed.arena.get(record.parent?)?;
+                let runtime_read = match &parent.data {
+                    NodeData::PropertyAccessExpression(access) => access.expression == node,
+                    NodeData::ExpressionStatement(statement) => statement.expression == node,
+                    NodeData::VariableDeclaration(declaration) => {
+                        declaration.initializer == Some(node)
+                    }
+                    _ => false,
+                };
+                runtime_read.then_some(NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .unwrap();
+        (declaration, read, bound.symbol(declaration).unwrap())
     }
 
     fn linear_function_nodes(

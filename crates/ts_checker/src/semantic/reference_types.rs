@@ -24,6 +24,7 @@ use super::{
         InstantiationLimits, InstantiationSession, instantiate_type_with_vector_and_session,
     },
     store::SourceNodeParent,
+    tuple_types::TupleTypeError,
     type_records::{CacheHashKey, TypeCacheState, TypeData, TypeRecord, TypeReferenceData},
     types::{ObjectFlags, TypeFlags},
 };
@@ -362,7 +363,7 @@ fn validate_cached_reference_shell(
     Ok(arguments.to_vec())
 }
 
-fn validate_nongeneric_interface_argument_origin(
+pub(super) fn validate_nongeneric_interface_argument_origin(
     store: &CanonicalTypeMapperStore,
     argument: TypeId,
 ) -> Result<(), DirectGenericReferenceError> {
@@ -520,6 +521,43 @@ fn validate_reference_argument_graph(
     let Some(record) = store.type_payload(reference) else {
         return Ok(());
     };
+    let tuple_target = match record.data() {
+        TypeData::Tuple(_) => Some(reference),
+        TypeData::TypeReference(data) => data.object.target.filter(|target| {
+            matches!(
+                store.type_payload(*target).map(TypeRecord::data),
+                Some(TypeData::Tuple(_))
+            )
+        }),
+        _ => None,
+    };
+    if let Some(target) = tuple_target {
+        let shape = store
+            .canonical_tuple_shape(reference)
+            .map_err(|error| match error {
+                TupleTypeError::InvalidTargetCache(target) => {
+                    DirectGenericReferenceError::InvalidTarget(target)
+                }
+                TupleTypeError::InvalidInstantiationCache { target, instance } => {
+                    DirectGenericReferenceError::InvalidCachedReference {
+                        target,
+                        reference: instance,
+                    }
+                }
+                _ => DirectGenericReferenceError::InvalidCachedReference { target, reference },
+            })?
+            .ok_or(DirectGenericReferenceError::InvalidCachedReference { target, reference })?;
+        active.push(reference);
+        for argument in shape.element_types() {
+            validate_reference_argument_graph(store, *argument, active, validated)?;
+        }
+        let popped = active
+            .pop()
+            .expect("a tuple argument owns one active validation frame");
+        debug_assert_eq!(popped, reference);
+        validated.insert(reference);
+        return Ok(());
+    }
     let constituents = match record.data() {
         TypeData::Union(union) => Some(union.union.types.as_slice()),
         TypeData::Intersection(intersection) => Some(intersection.intersection.types.as_slice()),
@@ -579,8 +617,8 @@ fn validate_reference_argument_graph(
             return Err(error);
         }
         Err(_) => {
-            // Tuple and deferred-reference argument families are opaque at
-            // this direct class/interface boundary.
+            // Deferred-reference argument families remain opaque at this
+            // direct class/interface boundary.
             return Ok(());
         }
     };
@@ -1054,16 +1092,17 @@ fn property_key_type_is_valid(
 mod tests {
     use super::*;
     use crate::semantic::{
-        DeclaredTypeHost, DeclaredTypeLinks, IntrinsicBootstrapOptions, SemanticStore,
-        instantiate::instantiate_type_with_session, mapper::TypeMapper,
-        production::GlobalMergeCompletion, type_records::TypeRecord,
+        CanonicalCheckerContext, CanonicalCheckerOptions, DeclaredTypeHost, DeclaredTypeLinks,
+        IntrinsicBootstrapOptions, SemanticStore, instantiate::instantiate_type_with_session,
+        mapper::TypeMapper, production::GlobalMergeCompletion, signatures::ElementFlags,
+        tuple_types::CanonicalTupleTypeRequest, type_records::TypeRecord,
     };
     use ts_ast::{FileId, NodeData, NodeRef};
     use ts_binder::{
         CanonicalBinder, CanonicalModuleState, CanonicalNameResolverOptions,
         CanonicalSourceFileFacts, CanonicalSourceLanguage, CheckFlags, EscapedName, SymbolData,
     };
-    use ts_parser::parse_source_file;
+    use ts_parser::{ParseResult, parse_source_file};
 
     fn initialized_store() -> CanonicalTypeMapperStore {
         let mut store = SemanticStore::<TypeRecord, TypeMapper>::new();
@@ -1071,6 +1110,32 @@ mod tests {
             .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
             .unwrap();
         store
+    }
+
+    fn tuple_array_context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/reference-tuples.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            [(file, &parsed.arena)].into_iter().collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap()
     }
 
     fn generic_target(
@@ -1450,6 +1515,248 @@ mod tests {
                 "the declared type-parameter vector is the origin identity",
             );
         }
+    }
+
+    #[test]
+    fn generic_references_authenticate_mutable_and_readonly_tuple_literal_arguments() {
+        for (index, readonly) in [false, true].into_iter().enumerate() {
+            let parsed = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let mut context =
+                tuple_array_context(&parsed, FileId::new(9_420 + u32::try_from(index).unwrap()));
+            let global_types = context.global_types().clone();
+            let store = context.store_mut_for_test();
+            let (outer, _) = generic_target(store, "Wrapper", ObjectFlags::INTERFACE, 1);
+            let (string, number) = {
+                let bootstrap = store.intrinsic_bootstrap().unwrap();
+                (bootstrap.string_type, bootstrap.number_type)
+            };
+            let infos = [
+                store
+                    .create_tuple_element_info(ElementFlags::REQUIRED, None)
+                    .unwrap(),
+                store
+                    .create_tuple_element_info(ElementFlags::REQUIRED, None)
+                    .unwrap(),
+            ];
+            let tuple = store
+                .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(
+                    &[string, number],
+                    &infos,
+                    readonly,
+                ))
+                .unwrap();
+            let literal = store
+                .create_array_literal_type(&global_types, tuple)
+                .unwrap();
+            let empty = store
+                .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(&[], &[], readonly))
+                .unwrap();
+            let empty_literal = store
+                .create_array_literal_type(&global_types, empty)
+                .unwrap();
+
+            for argument in [tuple, literal, empty, empty_literal] {
+                let shape = store.canonical_tuple_shape(argument).unwrap().unwrap();
+                assert_eq!(shape.is_readonly(), readonly);
+                let reference = create_direct_generic_reference(
+                    store,
+                    outer,
+                    &[argument],
+                    ObjectFlags::FROM_TYPE_NODE,
+                )
+                .unwrap();
+                assert_eq!(
+                    validate_direct_generic_reference(store, reference),
+                    Ok(DirectGenericReference {
+                        target: outer,
+                        type_arguments: vec![argument],
+                    })
+                );
+                let warm = (
+                    store.type_len(),
+                    store.mapper_len(),
+                    store.symbol_len(),
+                    store.relation_state_snapshot(),
+                );
+                assert_eq!(
+                    create_direct_generic_reference(store, outer, &[argument], ObjectFlags::NONE),
+                    Ok(reference)
+                );
+                assert_eq!(
+                    (
+                        store.type_len(),
+                        store.mapper_len(),
+                        store.symbol_len(),
+                        store.relation_state_snapshot(),
+                    ),
+                    warm
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_tuple_argument_graphs_do_not_publish_outer_references() {
+        for corruption in 0..4 {
+            let parsed = parse_source_file("interface Array<T> {} interface ReadonlyArray<T> {}");
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let mut context = tuple_array_context(
+                &parsed,
+                FileId::new(9_430 + u32::try_from(corruption).unwrap()),
+            );
+            let global_types = context.global_types().clone();
+            let store = context.store_mut_for_test();
+            let (outer, _) = generic_target(store, "Wrapper", ObjectFlags::INTERFACE, 1);
+            let (string, number) = {
+                let bootstrap = store.intrinsic_bootstrap().unwrap();
+                (bootstrap.string_type, bootstrap.number_type)
+            };
+            let info = store
+                .create_tuple_element_info(ElementFlags::REQUIRED, None)
+                .unwrap();
+            let tuple = store
+                .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(
+                    &[string],
+                    &[info],
+                    true,
+                ))
+                .unwrap();
+            let literal = store
+                .create_array_literal_type(&global_types, tuple)
+                .unwrap();
+            let target = store
+                .canonical_tuple_shape(tuple)
+                .unwrap()
+                .unwrap()
+                .target();
+            let (argument, expected) = match corruption {
+                0 => {
+                    let this_type = match store.type_payload(target).unwrap().data() {
+                        TypeData::Tuple(tuple) => tuple.interface.this_type.unwrap(),
+                        _ => unreachable!("tuple references retain tuple targets"),
+                    };
+                    assert!(store.set_resolved_base_constraint(this_type, Some(number)));
+                    (tuple, DirectGenericReferenceError::InvalidTarget(target))
+                }
+                1 => {
+                    assert!(store.set_type_reference_resolution(tuple, None, Some(vec![number])));
+                    (
+                        tuple,
+                        DirectGenericReferenceError::InvalidCachedReference {
+                            target,
+                            reference: tuple,
+                        },
+                    )
+                }
+                2 => {
+                    assert!(store.set_type_reference_resolution(literal, None, Some(vec![number])));
+                    (
+                        literal,
+                        DirectGenericReferenceError::InvalidCachedReference {
+                            target,
+                            reference: literal,
+                        },
+                    )
+                }
+                3 => {
+                    assert_eq!(
+                        store
+                            .derived_types
+                            .array_literal_types
+                            .insert(tuple, number),
+                        Some(literal)
+                    );
+                    (
+                        literal,
+                        DirectGenericReferenceError::InvalidCachedReference {
+                            target,
+                            reference: literal,
+                        },
+                    )
+                }
+                _ => unreachable!("the tuple corruption matrix has four entries"),
+            };
+            let before = (
+                store.type_len(),
+                store.mapper_len(),
+                store.symbol_len(),
+                store.symbol_store().symbol_table_len(),
+                store.relation_state_snapshot(),
+            );
+
+            assert_eq!(
+                create_direct_generic_reference(store, outer, &[argument], ObjectFlags::NONE),
+                Err(expected),
+                "corruption {corruption}",
+            );
+            assert_eq!(
+                (
+                    store.type_len(),
+                    store.mapper_len(),
+                    store.symbol_len(),
+                    store.symbol_store().symbol_table_len(),
+                    store.relation_state_snapshot(),
+                ),
+                before,
+                "corruption {corruption} published an outer reference",
+            );
+        }
+    }
+
+    #[test]
+    fn tuple_arguments_revalidate_nested_generic_reference_caches() {
+        let mut store = initialized_store();
+        let (outer, _) = generic_target(&mut store, "Wrapper", ObjectFlags::INTERFACE, 1);
+        let (inner, parameters) = generic_target(&mut store, "Inner", ObjectFlags::INTERFACE, 1);
+        let (string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let nested =
+            create_direct_generic_reference(&mut store, inner, &[string], ObjectFlags::NONE)
+                .unwrap();
+        let info = store
+            .create_tuple_element_info(ElementFlags::REQUIRED, None)
+            .unwrap();
+        let tuple = store
+            .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(&[nested], &[info], true))
+            .unwrap();
+        let reference =
+            create_direct_generic_reference(&mut store, outer, &[tuple], ObjectFlags::NONE)
+                .unwrap();
+        assert_eq!(
+            validate_direct_generic_reference(&store, reference),
+            Ok(DirectGenericReference {
+                target: outer,
+                type_arguments: vec![tuple],
+            })
+        );
+
+        let mapper = store.new_simple_type_mapper(parameters[0], number).unwrap();
+        assert!(store.set_object_target_and_mapper(nested, Some(inner), Some(mapper)));
+        let before = (
+            store.type_len(),
+            store.mapper_len(),
+            store.symbol_len(),
+            store.relation_state_snapshot(),
+        );
+        assert_eq!(
+            create_direct_generic_reference(&mut store, outer, &[tuple], ObjectFlags::NONE),
+            Err(DirectGenericReferenceError::InvalidCachedReference {
+                target: inner,
+                reference: nested,
+            })
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.mapper_len(),
+                store.symbol_len(),
+                store.relation_state_snapshot(),
+            ),
+            before
+        );
     }
 
     #[test]

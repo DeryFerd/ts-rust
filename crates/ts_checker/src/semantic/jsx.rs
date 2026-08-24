@@ -2837,13 +2837,9 @@ fn check_automatic_jsx_children(
     options: CanonicalCheckerOptions,
     diagnostics: &mut CanonicalCheckerDiagnostics,
 ) -> Result<Option<CheckedJsxChildren>, SourceCheckError> {
-    let [child] = plan.children.as_slice() else {
-        return if plan.children.is_empty() {
-            Ok(None)
-        } else {
-            Err(unsupported(plan.expression, SyntaxKind::JsxElement))
-        };
-    };
+    if plan.children.is_empty() {
+        return Ok(None);
+    }
     match attributes {
         JsxAttributesPlan::Properties(attributes)
             if attributes
@@ -2858,28 +2854,105 @@ fn check_automatic_jsx_children(
         JsxAttributesPlan::Properties(_) => {}
     }
 
-    let (node, type_) = match child {
-        JsxChildPlan::Text { node } => {
-            let string_type = store
-                .intrinsic_bootstrap()
-                .ok_or(SourceCheckError::LiteralCache(
-                    SourceLiteralCacheError::BootstrapUninitialized,
-                ))?
-                .string_type;
-            (*node, string_type)
-        }
-        JsxChildPlan::Expression { wrapper, value } => {
-            let type_ = execute_scalar(store, source, namespace, value, options, diagnostics)?;
-            publish_type_links(store, *wrapper, type_)?;
-            (*wrapper, type_)
-        }
-        JsxChildPlan::Element(element) => {
-            let type_ =
-                execute_jsx_element(store, source, namespace, element, options, diagnostics)?;
-            (element.expression, type_)
-        }
+    let mut first_node = None;
+    let mut child_types = Vec::with_capacity(plan.children.len());
+    for child in &plan.children {
+        let (node, type_) = match child {
+            JsxChildPlan::Text { node } => {
+                let string_type = store
+                    .intrinsic_bootstrap()
+                    .ok_or(SourceCheckError::LiteralCache(
+                        SourceLiteralCacheError::BootstrapUninitialized,
+                    ))?
+                    .string_type;
+                (*node, string_type)
+            }
+            JsxChildPlan::Expression { wrapper, value } => {
+                let type_ = execute_scalar(store, source, namespace, value, options, diagnostics)?;
+                publish_type_links(store, *wrapper, type_)?;
+                (*wrapper, type_)
+            }
+            JsxChildPlan::Element(element) => {
+                let type_ =
+                    execute_jsx_element(store, source, namespace, element, options, diagnostics)?;
+                (element.expression, type_)
+            }
+        };
+        first_node.get_or_insert(node);
+        child_types.push(type_);
+    }
+
+    let node = first_node.expect("a nonempty JSX child plan has a first child");
+    let type_ = if let [type_] = child_types.as_slice() {
+        *type_
+    } else {
+        let mut prepared = store.prepare_type_query_types(&[], &[], &[], 1, 0)?;
+        let element = store.literal_union_type_prepared(&child_types, None, &mut prepared)?;
+        automatic_jsx_children_array_type(store, source.2, element, node)?
     };
     Ok(Some(CheckedJsxChildren { node, type_ }))
+}
+
+fn automatic_jsx_children_array_type(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    element: TypeId,
+    location: NodeRef,
+) -> Result<TypeId, SourceCheckError> {
+    let (globals, fallback) = {
+        let bootstrap = store
+            .intrinsic_bootstrap()
+            .ok_or(SourceCheckError::LiteralCache(
+                SourceLiteralCacheError::BootstrapUninitialized,
+            ))?;
+        (bootstrap.globals, bootstrap.empty_generic_type)
+    };
+    let array = store
+        .symbol_table(globals)
+        .ok_or(SourceCheckError::Property(location))?
+        .get_source("Array");
+    let target = if let Some(array) = array {
+        let array = store
+            .get_merged_symbol(array)
+            .ok_or(SourceCheckError::Property(location))?;
+        let record = store
+            .symbol(array)
+            .ok_or(SourceCheckError::Property(location))?;
+        if record
+            .flags()
+            .intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE)
+        {
+            let declared = store.get_declared_type_of_symbol(host, array)?;
+            let record = store
+                .type_payload(declared)
+                .ok_or(SourceCheckError::Property(location))?;
+            let super::TypeData::Interface(interface) = record.data() else {
+                return Err(SourceCheckError::Property(location));
+            };
+            if interface
+                .all_type_parameters
+                .as_ref()
+                .is_some_and(|parameters| parameters.len() == 2)
+            {
+                declared
+            } else {
+                fallback
+            }
+        } else {
+            fallback
+        }
+    } else {
+        fallback
+    };
+
+    super::global_types::create_type_from_generic_global_type(
+        store,
+        target,
+        element,
+        ObjectFlags::NONE,
+    )
+    .map_err(super::array_types::ArrayTypeError::from)
+    .map_err(SourceCheckError::from)
 }
 
 fn check_jsx_closing_tag(
@@ -8771,6 +8844,218 @@ mod runtime_tests {
                 .type_node_links(reference)
                 .and_then(|links| links.resolved_type),
             Some(any),
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Preserve array identity, child links, and warm-cache checks.
+    fn automatic_runtime_combines_multiple_children_with_the_canonical_array_target() {
+        let source = concat!(
+            "interface Array<T> {}\n",
+            "declare namespace JSX {\n",
+            "  interface Element {}\n",
+            "  interface IntrinsicElements { div: any; span: any; }\n",
+            "}\n",
+            "const view = <div><span>first</span>second</div>;\n",
+        );
+        let parsed = parse_jsx_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(8_133);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/automatic-multiple-children.tsx\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = crate::semantic::CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions {
+                jsx_runtime: CanonicalJsxRuntime::Automatic,
+                ..CanonicalCheckerOptions::default()
+            },
+        )
+        .unwrap();
+        let module = context
+            .store_mut_for_test()
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::VALUE_MODULE,
+                EscapedName::source("\"/jsx/jsx-runtime\""),
+            ))
+            .unwrap();
+
+        context
+            .check_source_file_with_jsx_runtime(
+                file,
+                CanonicalJsxRuntimeEvidence::Automatic {
+                    module_specifier: "/jsx/jsx-runtime",
+                    resolved_module: Some(module),
+                },
+            )
+            .unwrap();
+
+        assert!(context.diagnostics().is_empty());
+        let expression = parsed
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::VariableDeclaration(variable) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(name) = &parsed.arena.get(variable.name)?.data else {
+                    return None;
+                };
+                (name.text == "view").then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    variable.initializer?,
+                ))
+            })
+            .unwrap();
+        let NodeData::JsxElement(outer) = &parsed.arena.get(expression.node).unwrap().data else {
+            unreachable!("the view initializer is the outer div")
+        };
+        let opening = child_ref(expression, outer.opening_element);
+        let NodeData::JsxOpeningElement(opening_data) =
+            &parsed.arena.get(opening.node).unwrap().data
+        else {
+            unreachable!("the outer div has an opening element")
+        };
+        let attributes = child_ref(opening, opening_data.attributes);
+        let attributes_type = context
+            .store()
+            .type_node_links(attributes)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let members = context
+            .store()
+            .type_payload(attributes_type)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.members)
+            .and_then(|members| context.store().symbol_table(members))
+            .unwrap();
+        let children = members.get_source("children").unwrap();
+        let children_type = context
+            .store()
+            .value_symbol_links(children)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let reference = context
+            .store()
+            .canonical_array_reference(context.global_types(), children_type)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reference.base_type, children_type);
+        assert!(!reference.readonly);
+        assert!(!reference.array_literal);
+
+        let super::super::TypeData::Union(union) = context
+            .store()
+            .type_payload(reference.element_type)
+            .unwrap()
+            .data()
+        else {
+            panic!("mixed JSX element and text children need a union element type")
+        };
+        let string_type = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let element_type = context
+            .store()
+            .type_node_links(expression)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        assert_eq!(union.union.types.len(), 2);
+        assert!(union.union.types.contains(&string_type));
+        assert!(union.union.types.contains(&element_type));
+
+        let nested = child_ref(expression, outer.children.nodes[0]);
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(nested)
+                .and_then(|links| links.resolved_type),
+            Some(element_type),
+        );
+        let cold = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().signature_len(),
+            context.store().symbol_store().symbol_table_len(),
+        );
+
+        context.recheck_source_file(file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().signature_len(),
+                context.store().symbol_store().symbol_table_len(),
+            ),
+            cold,
+        );
+    }
+
+    #[test]
+    fn automatic_runtime_multiple_children_use_the_missing_array_library_fallback() {
+        let mut fixture = RuntimeFixture::new(
+            "const view = <div>before<span />after</div>;\n",
+            FileId::new(8_134),
+        );
+        let expression = fixture.expression("view");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        fixture.check(expression, CanonicalJsxRuntime::Automatic, &mut diagnostics);
+
+        let NodeData::JsxElement(element) =
+            &fixture.parsed.arena.get(expression.node).unwrap().data
+        else {
+            unreachable!("the view initializer is the outer div")
+        };
+        let opening = child_ref(expression, element.opening_element);
+        let NodeData::JsxOpeningElement(opening_data) =
+            &fixture.parsed.arena.get(opening.node).unwrap().data
+        else {
+            unreachable!("the outer div has an opening element")
+        };
+        let attributes = child_ref(opening, opening_data.attributes);
+        let attributes_type = fixture
+            .store
+            .type_node_links(attributes)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let members = fixture
+            .store
+            .type_payload(attributes_type)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.members)
+            .and_then(|members| fixture.store.symbol_table(members))
+            .unwrap();
+        let children = members.get_source("children").unwrap();
+
+        assert_eq!(
+            fixture
+                .store
+                .value_symbol_links(children)
+                .and_then(|links| links.resolved_type),
+            Some(
+                fixture
+                    .store
+                    .intrinsic_bootstrap()
+                    .unwrap()
+                    .empty_object_type,
+            ),
         );
     }
 

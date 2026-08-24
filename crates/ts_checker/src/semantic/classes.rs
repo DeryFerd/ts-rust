@@ -13,9 +13,10 @@
 //! additionally admits one direct local nongeneric base whose own completed
 //! graph is in the same supported family; the whole-source adapter consumes
 //! that graph only after seeing the exact direct base plan earlier in source.
-//! Empty zero-argument methods retain their canonical callable identities.
+//! Empty methods retain their canonical callable identities, including one
+//! authenticated `...args: any[]` rest parameter.
 //! Direct classes can also retain one string-to-number index signature.
-//! Definite annotated fields admit one authenticated ambient-function decorator.
+//! Annotated fields admit one authenticated ambient-function decorator.
 //! One direct getter/setter pair can expose an annotated numeric property.
 //! A constructor may retain one string or number parameter. Decorated
 //! parameters remain restricted to one authenticated string parameter.
@@ -24,6 +25,7 @@
 //! upstream error-recovery `any` type for the source diagnostic.
 //! Simple same-file namespaces can merge with a class and contribute numeric
 //! variable exports to its static member table.
+//! A class may extend the literal `null` without acquiring an instance base.
 //! Nonempty executable bodies, general heritage, and non-primitive annotations
 //! remain later class stages.
 
@@ -43,6 +45,7 @@ use super::{
     bootstrap::LiteralTypeCacheError,
     declared::{preflight_class_or_interface_reference, preflight_node, type_list_key},
     links::{TypeNodeLinks, ValueSymbolLinks},
+    reference_types::validate_direct_generic_reference,
     signatures::SignatureFlags,
     source_callables::{StoredSourceCallableValidation, validate_stored_source_callable},
     store::{DirectClassHeritageProvenance, SourceNodeParent},
@@ -102,6 +105,16 @@ struct ClassMethodPlan {
     name: String,
     side: ClassPropertySide,
     return_type_node: Option<NodeRef>,
+    rest_parameter: Option<ClassMethodRestParameterPlan>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ClassMethodRestParameterPlan {
+    declaration: NodeRef,
+    symbol: SemanticSymbolId,
+    type_node: NodeRef,
+    element_type_node: NodeRef,
+    array_type: TypeId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -133,6 +146,12 @@ struct ClassNamespaceExportPlan {
     symbol: SemanticSymbolId,
     name: String,
     literal_text: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClassPropertyDecoratorSignature {
+    RestAny,
+    StandardAnyPair,
 }
 
 enum ClassNamespaceVariablePlan {
@@ -204,6 +223,7 @@ pub(super) struct ClassDeclarationPlan {
     declaration: NodeRef,
     symbol: SemanticSymbolId,
     base: Option<DirectClassBasePlan>,
+    null_base: Option<NullClassBasePlan>,
     implementations: Vec<DirectClassImplementationPlan>,
     constructor: Option<ClassConstructorPlan>,
     accessor: Option<ClassAccessorPlan>,
@@ -267,12 +287,27 @@ pub(super) struct DirectClassBasePlan {
     symbol: SemanticSymbolId,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NullClassBasePlan {
+    clause: NodeRef,
+    node: NodeRef,
+    expression: NodeRef,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct DirectClassImplementationPlan {
     clause: NodeRef,
     node: NodeRef,
     expression: NodeRef,
     symbol: SemanticSymbolId,
+    method: Option<ImplementedClassMethodPlan>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ImplementedClassMethodPlan {
+    symbol: SemanticSymbolId,
+    name: String,
+    array_type: TypeId,
 }
 
 /// The two identities installed by the class shell query.
@@ -554,6 +589,7 @@ fn validate_decorator_function_value(
     store: &CanonicalTypeMapperStore,
     symbol: SemanticSymbolId,
     declaration: NodeRef,
+    shape: ClassPropertyDecoratorSignature,
 ) -> Result<(), ClassError> {
     let value = match store.value_symbol_links(symbol) {
         None => None,
@@ -597,11 +633,27 @@ fn validate_decorator_function_value(
     else {
         return Err(invariant(ClassInvariant::BootstrapUnavailable(declaration)));
     };
+    let expected_signature = match shape {
+        ClassPropertyDecoratorSignature::RestAny => {
+            signature.flags() == SignatureFlags::HAS_REST_PARAMETER
+                && signature.parameters().len() == 1
+                && signature.min_argument_count() == 0
+        }
+        ClassPropertyDecoratorSignature::StandardAnyPair => {
+            signature.flags() == SignatureFlags::NONE
+                && signature.parameters().len() == 2
+                && signature.min_argument_count() == 2
+                && signature.parameters().iter().all(|parameter| {
+                    store
+                        .value_symbol_links(*parameter)
+                        .and_then(|links| links.resolved_type)
+                        == Some(any)
+                })
+        }
+    };
     if provenance.owner_symbol != symbol
         || provenance.declaration != declaration
-        || signature.flags() != SignatureFlags::HAS_REST_PARAMETER
-        || signature.parameters().len() != 1
-        || signature.min_argument_count() != 0
+        || !expected_signature
         || signature.resolved_return_type() != Some(any)
     {
         return Err(invariant(ClassInvariant::InvalidPropertyValueCache(symbol)));
@@ -614,7 +666,7 @@ fn validate_decorator_function_signature(
     host: &DeclaredTypeHost<'_>,
     field: NodeRef,
     declaration: NodeRef,
-) -> Result<(), ClassError> {
+) -> Result<ClassPropertyDecoratorSignature, ClassError> {
     let reject = || unsupported(ClassUnsupported::PropertyModifiers(field));
     let record = preflight_node(store, host, declaration)?;
     let NodeData::FunctionDeclaration(function) = &record.data else {
@@ -640,7 +692,6 @@ fn validate_decorator_function_signature(
         || modifier_record.parent != Some(declaration.node)
         || !matches!(modifier_record.data, NodeData::Token(_))
         || function.parameters.has_trailing_comma
-        || function.parameters.nodes.len() != 1
     {
         return Err(reject());
     }
@@ -657,11 +708,51 @@ fn validate_decorator_function_signature(
         return Err(reject());
     }
 
-    let parameter = NodeRef::new(
-        declaration.arena,
-        declaration.file,
-        function.parameters.nodes[0],
-    );
+    if let [target, context] = function.parameters.nodes.as_slice() {
+        for parameter in [*target, *context] {
+            let parameter = NodeRef::new(declaration.arena, declaration.file, parameter);
+            let parameter_record = preflight_node(store, host, parameter)?;
+            let NodeData::ParameterDeclaration(parameter_data) = &parameter_record.data else {
+                return Err(reject());
+            };
+            let name = NodeRef::new(parameter.arena, parameter.file, parameter_data.name);
+            let name_record = preflight_node(store, host, name)?;
+            let NodeData::Identifier(identifier) = &name_record.data else {
+                return Err(reject());
+            };
+            let Some(type_node) = parameter_data.type_ else {
+                return Err(reject());
+            };
+            let type_node = NodeRef::new(parameter.arena, parameter.file, type_node);
+            let type_record = preflight_node(store, host, type_node)?;
+            if parameter_record.kind != SyntaxKind::Parameter
+                || parameter_record.flags.0 != 0
+                || parameter_record.parent != Some(declaration.node)
+                || parameter_data.dot_dot_dot_token.is_some()
+                || parameter_data.initializer.is_some()
+                || parameter_data.question_token.is_some()
+                || parameter_data.modifiers.is_some()
+                || parameter_data.facts != 0
+                || name_record.kind != SyntaxKind::Identifier
+                || name_record.flags.0 != 0
+                || name_record.parent != Some(parameter.node)
+                || identifier.flow_node.is_some()
+                || identifier.text.is_empty()
+                || type_record.kind != SyntaxKind::AnyKeyword
+                || type_record.flags.0 != 0
+                || type_record.parent != Some(parameter.node)
+                || !matches!(type_record.data, NodeData::KeywordTypeNode(_))
+            {
+                return Err(reject());
+            }
+        }
+        return Ok(ClassPropertyDecoratorSignature::StandardAnyPair);
+    }
+
+    let [parameter] = function.parameters.nodes.as_slice() else {
+        return Err(reject());
+    };
+    let parameter = NodeRef::new(declaration.arena, declaration.file, *parameter);
     let parameter_record = preflight_node(store, host, parameter)?;
     let NodeData::ParameterDeclaration(parameter_data) = &parameter_record.data else {
         return Err(reject());
@@ -705,7 +796,7 @@ fn validate_decorator_function_signature(
     {
         return Err(reject());
     }
-    Ok(())
+    Ok(ClassPropertyDecoratorSignature::RestAny)
 }
 
 fn authenticate_class_property_decorator(
@@ -720,17 +811,21 @@ fn authenticate_class_property_decorator(
     let NodeData::PropertyDeclaration(property) = &field_record.data else {
         return Err(reject());
     };
-    let Some(postfix) = property.postfix_token else {
+    if property.type_.is_none() {
         return Err(reject());
-    };
-    let postfix = NodeRef::new(field.arena, field.file, postfix);
-    let postfix_record = preflight_node(store, host, postfix)?;
-    if property.type_.is_none()
-        || property.initializer.is_some()
-        || postfix_record.kind != SyntaxKind::ExclamationToken
-        || postfix_record.parent != Some(field.node)
-    {
-        return Err(reject());
+    }
+    match (property.postfix_token, property.initializer) {
+        (Some(postfix), None) => {
+            let postfix = NodeRef::new(field.arena, field.file, postfix);
+            let postfix_record = preflight_node(store, host, postfix)?;
+            if postfix_record.kind != SyntaxKind::ExclamationToken
+                || postfix_record.parent != Some(field.node)
+            {
+                return Err(reject());
+            }
+        }
+        (None, Some(_)) => {}
+        _ => return Err(reject()),
     }
 
     let record = preflight_node(store, host, decorator)?;
@@ -804,8 +899,8 @@ fn authenticate_class_property_decorator(
     {
         return Err(invariant(ClassInvariant::InvalidProperty(field)));
     }
-    validate_decorator_function_signature(store, host, field, declaration)?;
-    validate_decorator_function_value(store, symbol, declaration)
+    let shape = validate_decorator_function_signature(store, host, field, declaration)?;
+    validate_decorator_function_value(store, symbol, declaration, shape)
 }
 
 fn class_property_modifiers(
@@ -1451,6 +1546,173 @@ fn plan_constructor(
     })
 }
 
+fn class_method_any_array_type(
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+) -> Result<TypeId, ClassError> {
+    let invalid = || invariant(ClassInvariant::InvalidPropertyTypeCache(declaration));
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or_else(|| invariant(ClassInvariant::BootstrapUnavailable(declaration)))?;
+    let globals = store.symbol_table(bootstrap.globals).ok_or_else(invalid)?;
+    let Some(array) = globals.get_source("Array") else {
+        return Ok(bootstrap.empty_object_type);
+    };
+    let array = store.get_merged_symbol(array).ok_or_else(invalid)?;
+    let target = store
+        .declared_type_links(array)
+        .and_then(|links| links.declared_type)
+        .ok_or_else(invalid)?;
+    let TypeData::Interface(interface) = store.type_payload(target).ok_or_else(invalid)?.data()
+    else {
+        return Err(invalid());
+    };
+    let TypeCacheState::Allocated(instantiations) = &interface.reference.object.instantiations
+    else {
+        return Err(invalid());
+    };
+    let array_type = instantiations
+        .get(&type_list_key(&[bootstrap.any_type]))
+        .copied()
+        .ok_or_else(invalid)?;
+    let reference = validate_direct_generic_reference(store, array_type).map_err(|_| invalid())?;
+    if reference.target != target || reference.type_arguments.as_slice() != [bootstrap.any_type] {
+        return Err(invalid());
+    }
+    Ok(array_type)
+}
+
+fn plan_class_method_rest_parameter(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    method: NodeRef,
+    parameter: NodeRef,
+    parameters: &ts_ast::NodeList,
+) -> Result<ClassMethodRestParameterPlan, ClassError> {
+    let reject = || accessor_member_error(method, SyntaxKind::MethodDeclaration);
+    let record = preflight_node(store, host, parameter)?;
+    let NodeData::ParameterDeclaration(data) = &record.data else {
+        return Err(reject());
+    };
+    let Some(rest) = data.dot_dot_dot_token else {
+        return Err(reject());
+    };
+    let rest = NodeRef::new(parameter.arena, parameter.file, rest);
+    let rest_record = preflight_node(store, host, rest)?;
+    if record.kind != SyntaxKind::Parameter
+        || record.flags.0 != 0
+        || record.parent != Some(method.node)
+        || record.range.start < parameters.range.start
+        || record.range.end > parameters.range.end
+        || data.initializer.is_some()
+        || data.question_token.is_some()
+        || data.symbol.is_some()
+        || data.facts != 0
+        || data.modifiers.is_some()
+        || rest_record.kind != SyntaxKind::DotDotDotToken
+        || rest_record.flags.0 != 0
+        || rest_record.parent != Some(parameter.node)
+        || rest_record.range.start < record.range.start
+        || !matches!(rest_record.data, NodeData::Token(_))
+    {
+        return Err(reject());
+    }
+
+    let name = NodeRef::new(parameter.arena, parameter.file, data.name);
+    let name_record = preflight_node(store, host, name)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(reject());
+    };
+    if name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(parameter.node)
+        || name_record.range.start < rest_record.range.end
+        || name_record.range.end > record.range.end
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+        || identifier.text == "this"
+    {
+        return Err(reject());
+    }
+
+    let Some(type_node) = data.type_ else {
+        return Err(reject());
+    };
+    let type_node = NodeRef::new(parameter.arena, parameter.file, type_node);
+    let type_record = preflight_node(store, host, type_node)?;
+    let NodeData::ArrayTypeNode(array) = &type_record.data else {
+        return Err(reject());
+    };
+    let element_type_node = NodeRef::new(type_node.arena, type_node.file, array.element_type);
+    let element_record = preflight_node(store, host, element_type_node)?;
+    if type_record.kind != SyntaxKind::ArrayType
+        || type_record.flags.0 != 0
+        || type_record.parent != Some(parameter.node)
+        || type_record.range.start < name_record.range.end
+        || type_record.range.end > record.range.end
+        || element_record.kind != SyntaxKind::AnyKeyword
+        || element_record.flags.0 != 0
+        || element_record.parent != Some(type_node.node)
+        || element_record.range.start != type_record.range.start
+        || element_record.range.end > type_record.range.end
+        || !matches!(element_record.data, NodeData::KeywordTypeNode(_))
+    {
+        return Err(reject());
+    }
+
+    let symbol = bound_symbol(store, host, parameter)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(parameter)))?;
+    let symbol_record = store
+        .symbol(symbol)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(parameter)))?;
+    let locals = host
+        .bound_file(method)
+        .and_then(|bound| bound.locals(method))
+        .and_then(|locals| store.symbol_table(locals));
+    if symbol_record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+        || symbol_record.check_flags() != CheckFlags::NONE
+        || symbol_record.name().as_utf8() != Some(identifier.text.as_str())
+        || symbol_record.declarations() != Some(&[parameter])
+        || symbol_record.value_declaration() != Some(parameter)
+        || symbol_record.members().is_some()
+        || symbol_record.exports().is_some()
+        || symbol_record.parent().is_some()
+        || symbol_record.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || locals.is_none_or(|locals| {
+            locals.len() != 1 || locals.get_source(&identifier.text) != Some(symbol)
+        })
+    {
+        return Err(invariant(ClassInvariant::InvalidPropertySymbol(parameter)));
+    }
+
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or_else(|| invariant(ClassInvariant::BootstrapUnavailable(parameter)))?;
+    let any = bootstrap.any_type;
+    let array_type = class_method_any_array_type(store, type_node)?;
+    validate_index_type_cache(store, element_type_node, any)?;
+    validate_index_type_cache(store, type_node, array_type)?;
+    if store.value_symbol_links(symbol).is_some_and(|links| {
+        links != &ValueSymbolLinks::default()
+            && links
+                != &(ValueSymbolLinks {
+                    resolved_type: Some(array_type),
+                    ..ValueSymbolLinks::default()
+                })
+    }) {
+        return Err(invariant(ClassInvariant::InvalidPropertyValueCache(symbol)));
+    }
+
+    Ok(ClassMethodRestParameterPlan {
+        declaration: parameter,
+        symbol,
+        type_node,
+        element_type_node,
+        array_type,
+    })
+}
+
 fn plan_method(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -1480,12 +1742,27 @@ fn plan_method(
             kind: SyntaxKind::MethodDeclaration,
         }));
     }
-    if !method.parameters.nodes.is_empty() || method.parameters.has_trailing_comma {
+    if method.parameters.nodes.len() > 1 || method.parameters.has_trailing_comma {
         return Err(unsupported(ClassUnsupported::Member {
             node: declaration,
             kind: SyntaxKind::MethodDeclaration,
         }));
     }
+    let rest_parameter = method
+        .parameters
+        .nodes
+        .first()
+        .copied()
+        .map(|parameter| {
+            plan_class_method_rest_parameter(
+                store,
+                host,
+                declaration,
+                NodeRef::new(declaration.arena, declaration.file, parameter),
+                &method.parameters,
+            )
+        })
+        .transpose()?;
     let name_node = NodeRef::new(declaration.arena, declaration.file, method.name);
     let name_record = preflight_node(store, host, name_node)?;
     let NodeData::Identifier(identifier) = &name_record.data else {
@@ -1599,6 +1876,7 @@ fn plan_method(
         name: identifier.text.clone(),
         side,
         return_type_node,
+        rest_parameter,
     })
 }
 
@@ -2351,6 +2629,90 @@ fn reject_reserved_static_prototype(
     Ok(())
 }
 
+fn plan_null_class_base(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    clauses: &ts_ast::NodeList,
+) -> Result<Option<NullClassBasePlan>, ClassError> {
+    let [clause] = clauses.nodes.as_slice() else {
+        return Ok(None);
+    };
+    let clause = NodeRef::new(declaration.arena, declaration.file, *clause);
+    let clause_record = preflight_node(store, host, clause)?;
+    let NodeData::HeritageClause(heritage) = &clause_record.data else {
+        return Ok(None);
+    };
+    let [node] = heritage.types.nodes.as_slice() else {
+        return Ok(None);
+    };
+    let node = NodeRef::new(declaration.arena, declaration.file, *node);
+    let node_record = preflight_node(store, host, node)?;
+    let NodeData::ExpressionWithTypeArguments(base) = &node_record.data else {
+        return Ok(None);
+    };
+    let expression = NodeRef::new(declaration.arena, declaration.file, base.expression);
+    let expression_record = preflight_node(store, host, expression)?;
+    if expression_record.kind != SyntaxKind::NullKeyword {
+        return Ok(None);
+    }
+
+    let source_matches = host
+        .source(expression)
+        .and_then(|(arena, _)| arena.source_text())
+        .is_none_or(|source| {
+            source.get(
+                expression_record.range.start.get() as usize
+                    ..expression_record.range.end.get() as usize,
+            ) == Some("null")
+        });
+    if clauses.has_trailing_comma
+        || clause_record.kind != SyntaxKind::HeritageClause
+        || clause_record.flags.0 != 0
+        || clause_record.parent != Some(declaration.node)
+        || heritage.token != SyntaxKind::ExtendsKeyword
+        || heritage.facts != 0
+        || heritage.types.has_trailing_comma
+        || node_record.kind != SyntaxKind::ExpressionWithTypeArguments
+        || node_record.flags.0 != 0
+        || node_record.parent != Some(clause.node)
+        || node_record.range.start < heritage.types.range.start
+        || node_record.range.end > heritage.types.range.end
+        || base.type_arguments.is_some()
+        || base.facts != 0
+        || !matches!(expression_record.data, NodeData::KeywordExpression(_))
+        || expression_record.flags.0 != 0
+        || expression_record.parent != Some(node.node)
+        || expression_record.range.start < node_record.range.start
+        || expression_record.range.end > node_record.range.end
+        || !source_matches
+    {
+        return Err(invariant(ClassInvariant::InvalidHeritage(expression)));
+    }
+
+    let expected = store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| bootstrap.null_widening_type)
+        .ok_or_else(|| invariant(ClassInvariant::BootstrapUnavailable(expression)))?;
+    if store.type_node_links(expression).is_some_and(|links| {
+        links != &TypeNodeLinks::default()
+            && links
+                != &(TypeNodeLinks {
+                    resolved_type: Some(expected),
+                    ..TypeNodeLinks::default()
+                })
+    }) {
+        return Err(invariant(ClassInvariant::InvalidPropertyTypeCache(
+            expression,
+        )));
+    }
+    Ok(Some(NullClassBasePlan {
+        clause,
+        node,
+        expression,
+    }))
+}
+
 fn plan_direct_class_base(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -2448,7 +2810,78 @@ fn plan_direct_class_base(
     })
 }
 
-fn plan_empty_class_implementations(
+fn plan_implemented_interface_method(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    implementation: NodeRef,
+    symbol: SemanticSymbolId,
+) -> Result<ImplementedClassMethodPlan, ClassError> {
+    let reject = || unsupported(ClassUnsupported::Heritage(implementation));
+    let plan = super::object_members::plan_interface(store, host, symbol).map_err(|_| reject())?;
+    let [method] = plan.methods.as_slice() else {
+        return Err(reject());
+    };
+    let [property] = plan.properties.as_slice() else {
+        return Err(reject());
+    };
+    let [parameter] = method.parameters.as_slice() else {
+        return Err(reject());
+    };
+    let return_type = preflight_node(store, host, method.return_type)?;
+    let annotation = preflight_node(store, host, parameter.type_node)?;
+    let NodeData::ArrayTypeNode(array) = &annotation.data else {
+        return Err(reject());
+    };
+    let element = NodeRef::new(
+        parameter.type_node.arena,
+        parameter.type_node.file,
+        array.element_type,
+    );
+    let element_record = preflight_node(store, host, element)?;
+    let any = store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| bootstrap.any_type)
+        .ok_or_else(|| invariant(ClassInvariant::BootstrapUnavailable(implementation)))?;
+    let array_type = class_method_any_array_type(store, parameter.type_node)?;
+    if plan.heritage.is_some()
+        || !plan.spreads.is_empty()
+        || !plan.indexes.is_empty()
+        || !plan.call_signatures.is_empty()
+        || property.symbol != method.symbol
+        || method.flags != SignatureFlags::HAS_REST_PARAMETER
+        || return_type.kind != SyntaxKind::VoidKeyword
+        || !matches!(return_type.data, NodeData::KeywordTypeNode(_))
+        || annotation.kind != SyntaxKind::ArrayType
+        || element_record.kind != SyntaxKind::AnyKeyword
+        || !matches!(element_record.data, NodeData::KeywordTypeNode(_))
+    {
+        return Err(reject());
+    }
+    validate_index_type_cache(store, element, any)?;
+    validate_index_type_cache(store, parameter.type_node, array_type)?;
+    if store
+        .value_symbol_links(parameter.symbol)
+        .is_some_and(|links| {
+            links != &ValueSymbolLinks::default()
+                && links
+                    != &(ValueSymbolLinks {
+                        resolved_type: Some(array_type),
+                        ..ValueSymbolLinks::default()
+                    })
+        })
+    {
+        return Err(invariant(ClassInvariant::InvalidPropertyValueCache(
+            parameter.symbol,
+        )));
+    }
+    Ok(ImplementedClassMethodPlan {
+        symbol: method.symbol,
+        name: property.name.clone(),
+        array_type,
+    })
+}
+
+fn plan_class_implementations(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     declaration: NodeRef,
@@ -2562,11 +2995,20 @@ fn plan_empty_class_implementations(
                     .all(|(name, _)| name == InternalSymbolName::Constructor.as_ref())
             })
         });
+        let implemented_method = if no_instance_members {
+            None
+        } else if target_record.flags() == SymbolFlags::INTERFACE {
+            Some(plan_implemented_interface_method(
+                store, host, expression, symbol,
+            )?)
+        } else {
+            return Err(unsupported(ClassUnsupported::Heritage(expression)));
+        };
         if symbol == owner
             || !target_declaration.is_for(declaration.arena, declaration.file)
             || target_syntax.range.end > declaration_record.range.start
+                && implemented_method.is_none()
             || !valid_target
-            || !no_instance_members
             || implementations
                 .iter()
                 .any(|current: &DirectClassImplementationPlan| current.symbol == symbol)
@@ -2578,6 +3020,7 @@ fn plan_empty_class_implementations(
             node,
             expression,
             symbol,
+            method: implemented_method,
         });
     }
     Ok(implementations)
@@ -3008,9 +3451,10 @@ fn plan_class_declaration(
     if symbol_record.flags() != SymbolFlags::CLASS && class.heritage_clauses.is_some() {
         return Err(unsupported(ClassUnsupported::MergedDeclarations(symbol)));
     }
-    let (base, implementations) = match class.heritage_clauses.as_ref() {
-        None => (None, Vec::new()),
+    let (base, null_base, implementations) = match class.heritage_clauses.as_ref() {
+        None => (None, None, Vec::new()),
         Some(clauses) => {
+            let null_base = plan_null_class_base(store, host, declaration, clauses)?;
             let implements = clauses.nodes.first().is_some_and(|clause| {
                 let clause = NodeRef::new(declaration.arena, declaration.file, *clause);
                 host.node(clause).is_some_and(|record| {
@@ -3020,10 +3464,13 @@ fn plan_class_declaration(
                     )
                 })
             });
-            if implements {
+            if let Some(null_base) = null_base {
+                (None, Some(null_base), Vec::new())
+            } else if implements {
                 (
                     None,
-                    plan_empty_class_implementations(store, host, declaration, symbol, clauses)?,
+                    None,
+                    plan_class_implementations(store, host, declaration, symbol, clauses)?,
                 )
             } else if allow_direct_base {
                 (
@@ -3034,6 +3481,7 @@ fn plan_class_declaration(
                         symbol,
                         clauses,
                     )?),
+                    None,
                     Vec::new(),
                 )
             } else {
@@ -3126,7 +3574,7 @@ fn plan_class_declaration(
             continue;
         }
         if member_record.kind == SyntaxKind::Constructor {
-            if base.is_some() || constructor.is_some() {
+            if base.is_some() || null_base.is_some() || constructor.is_some() {
                 return Err(unsupported(ClassUnsupported::Member {
                     node: member,
                     kind: SyntaxKind::Constructor,
@@ -3232,6 +3680,39 @@ fn plan_class_declaration(
             kind: SyntaxKind::IndexSignature,
         }));
     }
+    for implementation in &implementations {
+        let Some(expected) = implementation.method.as_ref() else {
+            continue;
+        };
+        let Some(method) = instance_methods
+            .iter()
+            .find(|method| method.name == expected.name)
+        else {
+            return Err(unsupported(ClassUnsupported::Heritage(
+                implementation.expression,
+            )));
+        };
+        if method
+            .rest_parameter
+            .is_none_or(|parameter| parameter.array_type != expected.array_type)
+            || store.symbol(expected.symbol).is_none_or(|symbol| {
+                symbol.flags() != SymbolFlags::METHOD
+                    || symbol.name().as_utf8() != Some(expected.name.as_str())
+                    || symbol
+                        .parent()
+                        .and_then(|parent| store.get_merged_symbol(parent))
+                        != Some(implementation.symbol)
+            })
+            || method
+                .return_type_node
+                .and_then(|annotation| host.node(annotation))
+                .is_none_or(|annotation| annotation.kind != SyntaxKind::VoidKeyword)
+        {
+            return Err(unsupported(ClassUnsupported::Heritage(
+                implementation.expression,
+            )));
+        }
+    }
     for property in &instance_properties {
         let Some(name) = property.initializer_parameter_name.as_deref() else {
             continue;
@@ -3287,6 +3768,7 @@ fn plan_class_declaration(
         declaration,
         symbol,
         base,
+        null_base,
         implementations,
         constructor,
         accessor,
@@ -3303,8 +3785,8 @@ fn plan_class_declaration(
     })
 }
 
-/// Produces the exact no-heritage syntax/binder proof used by source checking
-/// and the standalone shell query.
+/// Produces the exact no-object-base syntax/binder proof used by source
+/// checking and the standalone shell query.
 pub(super) fn plan_nongeneric_class(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -3976,7 +4458,13 @@ fn exact_method_callable(
     method: &ClassMethodPlan,
     return_type: TypeId,
 ) -> Option<(TypeId, SignatureId)> {
-    exact_method_value(store, method.symbol, method.declaration, return_type)
+    exact_method_value(
+        store,
+        method.symbol,
+        method.declaration,
+        return_type,
+        method.rest_parameter,
+    )
 }
 
 fn exact_method_value(
@@ -3984,6 +4472,7 @@ fn exact_method_value(
     symbol: SemanticSymbolId,
     declaration: NodeRef,
     return_type: TypeId,
+    rest_parameter: Option<ClassMethodRestParameterPlan>,
 ) -> Option<(TypeId, SignatureId)> {
     let links = store.value_symbol_links(symbol)?;
     let type_ = links.resolved_type?;
@@ -4003,6 +4492,43 @@ fn exact_method_value(
         return None;
     };
     let signature_record = store.signature(*signature)?;
+    let parameters_valid = match rest_parameter {
+        None => {
+            signature_record.flags() == SignatureFlags::NONE
+                && signature_record.parameters().is_empty()
+                && store
+                    .callable_signature_parameter_types(*signature)
+                    .is_none_or(<[TypeId]>::is_empty)
+        }
+        Some(parameter) => {
+            let any = store.intrinsic_bootstrap()?.any_type;
+            signature_record.flags() == SignatureFlags::HAS_REST_PARAMETER
+                && signature_record.parameters() == [parameter.symbol]
+                && store.source_node_kind(parameter.declaration) == Some(SyntaxKind::Parameter)
+                && store.source_node_parent(parameter.declaration)
+                    == Some(SourceNodeParent::Parent(declaration))
+                && store.source_direct_type_annotation(parameter.declaration)
+                    == Some(parameter.type_node)
+                && store.type_node_links(parameter.type_node)
+                    == Some(&TypeNodeLinks {
+                        resolved_type: Some(parameter.array_type),
+                        ..TypeNodeLinks::default()
+                    })
+                && store.type_node_links(parameter.element_type_node)
+                    == Some(&TypeNodeLinks {
+                        resolved_type: Some(any),
+                        ..TypeNodeLinks::default()
+                    })
+                && store.value_symbol_links(parameter.symbol)
+                    == Some(&ValueSymbolLinks {
+                        resolved_type: Some(parameter.array_type),
+                        ..ValueSymbolLinks::default()
+                    })
+                && store
+                    .callable_signature_parameter_types(*signature)
+                    .is_none_or(|cached| cached == [parameter.array_type])
+        }
+    };
     if record.flags() != TypeFlags::OBJECT
         || record.object_flags() != (ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED)
         || record.symbol() != Some(symbol)
@@ -4019,10 +4545,9 @@ fn exact_method_value(
             .structured
             .object_type_without_abstract_construct_signatures
             .is_some()
-        || signature_record.flags() != SignatureFlags::NONE
+        || !parameters_valid
         || signature_record.declaration() != Some(declaration)
         || !signature_record.type_parameters().is_empty()
-        || !signature_record.parameters().is_empty()
         || signature_record.this_parameter().is_some()
         || signature_record.min_argument_count() != 0
         || signature_record.resolved_min_argument_count() != -1
@@ -4061,6 +4586,31 @@ fn validate_method_cache_state(
         return Err(invariant(ClassInvariant::InvalidPropertyTypeCache(
             type_node,
         )));
+    }
+    if let Some(parameter) = method.rest_parameter {
+        let any = store
+            .intrinsic_bootstrap()
+            .map(|bootstrap| bootstrap.any_type)
+            .ok_or_else(|| {
+                invariant(ClassInvariant::BootstrapUnavailable(parameter.declaration))
+            })?;
+        validate_index_type_cache(store, parameter.element_type_node, any)?;
+        validate_index_type_cache(store, parameter.type_node, parameter.array_type)?;
+        if store
+            .value_symbol_links(parameter.symbol)
+            .is_some_and(|links| {
+                links != &ValueSymbolLinks::default()
+                    && links
+                        != &(ValueSymbolLinks {
+                            resolved_type: Some(parameter.array_type),
+                            ..ValueSymbolLinks::default()
+                        })
+            })
+        {
+            return Err(invariant(ClassInvariant::InvalidPropertyValueCache(
+                parameter.symbol,
+            )));
+        }
     }
     let value_links = store.value_symbol_links(method.symbol);
     let signature_links = store.signature_links(method.declaration);
@@ -4480,7 +5030,8 @@ pub(super) fn plan_nongeneric_class_members(
     plan_class_members(store, host, class)
 }
 
-/// Plans either the existing no-base class cut or one exact direct local base.
+/// Plans a class with no object base, including `extends null`, or one exact
+/// direct local base.
 ///
 /// Both the public query and whole-source adapter retain this exact aggregate
 /// plan so the base dependency is proven before either class can publish.
@@ -4495,6 +5046,16 @@ pub(super) fn plan_nongeneric_class_member_query(
     };
     let base_plan = plan_nongeneric_class_members(store, host, base.symbol)?;
     if base_plan.constructor_visibility() == ClassConstructorVisibility::Private
+        || base_plan.class.null_base.is_some()
+        || base_plan
+            .class
+            .methods
+            .iter()
+            .any(|method| method.rest_parameter.is_some())
+        || class
+            .methods
+            .iter()
+            .any(|method| method.rest_parameter.is_some())
         || base_plan
             .class
             .constructor
@@ -6937,6 +7498,28 @@ fn exact_class_index_infos(
     }
 }
 
+fn planned_class_base_constructor(
+    store: &CanonicalTypeMapperStore,
+    plan: &ClassDeclarationPlan,
+) -> Result<TypeId, ClassError> {
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or_else(|| invariant(ClassInvariant::BootstrapUnavailable(plan.declaration)))?;
+    let Some(base) = plan.null_base else {
+        return Ok(bootstrap.undefined_type);
+    };
+    if store.source_node_kind(base.clause) != Some(SyntaxKind::HeritageClause)
+        || store.source_node_parent(base.clause) != Some(SourceNodeParent::Parent(plan.declaration))
+        || store.source_node_kind(base.node) != Some(SyntaxKind::ExpressionWithTypeArguments)
+        || store.source_node_parent(base.node) != Some(SourceNodeParent::Parent(base.clause))
+        || store.source_node_kind(base.expression) != Some(SyntaxKind::NullKeyword)
+        || store.source_node_parent(base.expression) != Some(SourceNodeParent::Parent(base.node))
+    {
+        return Err(invariant(ClassInvariant::InvalidHeritage(base.expression)));
+    }
+    Ok(bootstrap.null_widening_type)
+}
+
 fn completed_class_members(
     store: &CanonicalTypeMapperStore,
     plan: &ClassMemberPlan,
@@ -6950,20 +7533,27 @@ fn completed_class_members(
     {
         return None;
     }
-    let undefined_type = store.intrinsic_bootstrap()?.undefined_type;
+    let base_constructor = planned_class_base_constructor(store, &plan.class).ok()?;
     let instance = exact_instance_identity(store, &plan.class, instance_type)?;
     if store
         .declared_type_links(plan.class.symbol)
         .and_then(|links| links.declared_type)
         != Some(instance_type)
         || !instance.base_types_resolved
-        || instance.resolved_base_constructor_type != Some(undefined_type)
+        || instance.resolved_base_constructor_type != Some(base_constructor)
         || instance.resolved_base_types.is_some()
         || !instance.declared_members_resolved
         || instance.declared_members != plan.class.instance_members
         || instance.declared_call_signatures.is_some()
         || instance.declared_construct_signatures.is_some()
         || !exact_class_index_infos(store, plan, instance.declared_index_infos.as_deref())
+        || plan.class.null_base.is_some_and(|base| {
+            store.type_node_links(base.expression)
+                != Some(&TypeNodeLinks {
+                    resolved_type: Some(base_constructor),
+                    ..TypeNodeLinks::default()
+                })
+        })
     {
         return None;
     }
@@ -7566,14 +8156,7 @@ fn shell_state(
             return Err(invariant(ClassInvariant::InvalidValueCache(plan.symbol)));
         }
     };
-    let Some(undefined_type) = store
-        .intrinsic_bootstrap()
-        .map(|bootstrap| bootstrap.undefined_type)
-    else {
-        return Err(invariant(ClassInvariant::BootstrapUnavailable(
-            plan.declaration,
-        )));
-    };
+    let base_constructor = planned_class_base_constructor(store, plan)?;
     if let Some(instance) = instance {
         let Some(interface) = exact_instance_identity(store, plan, instance) else {
             return Err(invariant(ClassInvariant::InvalidInstanceCache(plan.symbol)));
@@ -7586,9 +8169,9 @@ fn shell_state(
                     || interface.resolved_base_types.is_some()
                     || interface
                         .resolved_base_constructor_type
-                        .is_some_and(|type_| type_ != undefined_type)
+                        .is_some_and(|type_| type_ != base_constructor)
                     || matches!(value, StaticShellState::WarmShell(_))
-                        && interface.resolved_base_constructor_type != Some(undefined_type)
+                        && interface.resolved_base_constructor_type != Some(base_constructor)
                     || interface.declared_members_resolved
                     || interface.declared_members.is_some()
                     || interface.declared_call_signatures.is_some()
@@ -7596,6 +8179,18 @@ fn shell_state(
                     || interface.declared_index_infos.is_some()
                     || interface.reference.object.structured != StructuredTypeData::default())
         {
+            return Err(invariant(ClassInvariant::InvalidInstanceCache(plan.symbol)));
+        }
+        if plan.null_base.is_some_and(|base| {
+            matches!(
+                value,
+                StaticShellState::WarmShell(_) | StaticShellState::WarmMembers(_)
+            ) && store.type_node_links(base.expression)
+                != Some(&TypeNodeLinks {
+                    resolved_type: Some(base_constructor),
+                    ..TypeNodeLinks::default()
+                })
+        }) {
             return Err(invariant(ClassInvariant::InvalidInstanceCache(plan.symbol)));
         }
     } else if !matches!(value, StaticShellState::Cold) {
@@ -7609,8 +8204,8 @@ fn shell_state(
 ///
 /// Cold execution allocates exactly the instance origin, its synthetic `this`
 /// type, and the anonymous static shell. It then forces the no-heritage base
-/// constructor cache to canonical `undefined` before publishing the class
-/// value link, matching pinned `getTypeOfFuncClassEnumModuleWorker`.
+/// constructor cache to canonical `undefined`, or `null` for an authenticated
+/// null heritage clause, before publishing the class value link.
 pub(super) fn execute_nongeneric_class_shells(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -7620,6 +8215,7 @@ pub(super) fn execute_nongeneric_class_shells(
     if current != *plan {
         return Err(invariant(ClassInvariant::InvalidPlan(plan.declaration)));
     }
+    let expected_base_constructor = planned_class_base_constructor(store, plan)?;
     let state = shell_state(store, host, plan)?;
     if let StaticShellState::WarmShell(value_type) | StaticShellState::WarmMembers(value_type) =
         state.value
@@ -7639,7 +8235,13 @@ pub(super) fn execute_nongeneric_class_shells(
     let additional = 1usize
         .checked_add(usize::from(cold_instance) * 2)
         .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.declaration)))?;
-    if !store.try_reserve_types(additional) {
+    let missing_base_type_node = usize::from(
+        plan.null_base
+            .is_some_and(|base| store.type_node_links(base.expression).is_none()),
+    );
+    if !store.try_reserve_types(additional)
+        || !store.try_reserve_type_node_links(missing_base_type_node)
+    {
         return Err(invariant(ClassInvariant::Capacity(plan.declaration)));
     }
 
@@ -7654,10 +8256,6 @@ pub(super) fn execute_nongeneric_class_shells(
         .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(plan.symbol))
         .ok_or_else(|| invariant(ClassInvariant::Publication(plan.declaration)))?;
 
-    let undefined_type = store
-        .intrinsic_bootstrap()
-        .expect("the shell state validated bootstrap")
-        .undefined_type;
     let (base_types_resolved, base_constructor, base_types) = {
         let Some(TypeData::Interface(interface)) = store
             .type_payload(instance_type)
@@ -7673,7 +8271,7 @@ pub(super) fn execute_nongeneric_class_shells(
     };
     if base_types_resolved
         || base_types.is_some()
-        || base_constructor.is_some_and(|type_| type_ != undefined_type)
+        || base_constructor.is_some_and(|type_| type_ != expected_base_constructor)
     {
         return Err(invariant(ClassInvariant::InvalidInstanceCache(plan.symbol)));
     }
@@ -7681,8 +8279,17 @@ pub(super) fn execute_nongeneric_class_shells(
         assert!(store.set_interface_base_resolution(
             instance_type,
             base_types_resolved,
-            Some(undefined_type),
+            Some(expected_base_constructor),
             base_types,
+        ));
+    }
+    if let Some(base) = plan.null_base {
+        assert!(store.set_type_node_links(
+            base.expression,
+            TypeNodeLinks {
+                resolved_type: Some(expected_base_constructor),
+                ..TypeNodeLinks::default()
+            },
         ));
     }
     assert!(store.set_value_symbol_links(
@@ -7773,19 +8380,34 @@ pub(super) fn preflight_nongeneric_class_members(
     validated_nongeneric_class_member_state(store, host, plan).map(drop)
 }
 
+struct PreparedClassMethodSignatures {
+    signatures: Vec<SignatureId>,
+    parameters: Vec<SemanticSymbolId>,
+}
+
 fn prepare_class_method_signatures(
     plan: &ClassMemberPlan,
-) -> Result<Vec<Vec<SignatureId>>, ClassError> {
+) -> Result<Vec<PreparedClassMethodSignatures>, ClassError> {
     let mut signature_lists = Vec::new();
     signature_lists
         .try_reserve_exact(plan.class.methods.len())
         .map_err(|_| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
-    for _ in &plan.class.methods {
+    for method in &plan.class.methods {
         let mut signatures = Vec::new();
         signatures
             .try_reserve_exact(1)
             .map_err(|_| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
-        signature_lists.push(signatures);
+        let mut parameters = Vec::new();
+        parameters
+            .try_reserve_exact(usize::from(method.rest_parameter.is_some()))
+            .map_err(|_| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
+        if let Some(parameter) = method.rest_parameter {
+            parameters.push(parameter.symbol);
+        }
+        signature_lists.push(PreparedClassMethodSignatures {
+            signatures,
+            parameters,
+        });
     }
     Ok(signature_lists)
 }
@@ -7793,15 +8415,19 @@ fn prepare_class_method_signatures(
 fn publish_class_methods(
     store: &mut CanonicalTypeMapperStore,
     plan: &ClassMemberPlan,
-    signature_lists: Vec<Vec<SignatureId>>,
+    signature_lists: Vec<PreparedClassMethodSignatures>,
 ) {
-    for ((method, return_type), mut signatures) in plan
+    for ((method, return_type), prepared) in plan
         .class
         .methods
         .iter()
         .zip(&plan.method_return_types)
         .zip(signature_lists)
     {
+        let PreparedClassMethodSignatures {
+            mut signatures,
+            parameters,
+        } = prepared;
         if exact_method_callable(store, method, *return_type).is_some() {
             if let Some(type_node) = method.return_type_node {
                 assert!(store.set_type_node_links(
@@ -7820,11 +8446,15 @@ fn publish_class_methods(
             .expect("the class transaction reserved the method value identity");
         let signature = store
             .alloc_signature(
-                SignatureFlags::NONE,
+                if method.rest_parameter.is_some() {
+                    SignatureFlags::HAS_REST_PARAMETER
+                } else {
+                    SignatureFlags::NONE
+                },
                 Some(method.declaration),
                 Vec::new(),
                 None,
-                Vec::new(),
+                parameters,
                 Some(*return_type),
                 None,
                 0,
@@ -7837,6 +8467,33 @@ fn publish_class_methods(
                 TypeNodeLinks {
                     resolved_type: Some(*return_type),
                     ..TypeNodeLinks::default()
+                },
+            ));
+        }
+        if let Some(parameter) = method.rest_parameter {
+            let any = store
+                .intrinsic_bootstrap()
+                .expect("the class method plan validated intrinsic bootstrap")
+                .any_type;
+            assert!(store.set_type_node_links(
+                parameter.element_type_node,
+                TypeNodeLinks {
+                    resolved_type: Some(any),
+                    ..TypeNodeLinks::default()
+                },
+            ));
+            assert!(store.set_type_node_links(
+                parameter.type_node,
+                TypeNodeLinks {
+                    resolved_type: Some(parameter.array_type),
+                    ..TypeNodeLinks::default()
+                },
+            ));
+            assert!(store.set_value_symbol_links(
+                parameter.symbol,
+                ValueSymbolLinks {
+                    resolved_type: Some(parameter.array_type),
+                    ..ValueSymbolLinks::default()
                 },
             ));
         }
@@ -8061,6 +8718,7 @@ pub(super) fn execute_nongeneric_class_members(
     if let Some(members) = validated_nongeneric_class_member_state(store, host, plan)? {
         return Ok(members);
     }
+    let base_constructor = planned_class_base_constructor(store, &plan.class)?;
     let shell = shell_state(store, host, &plan.class)?;
     let cold_instance = shell.instance.is_none();
     let cold_value = matches!(shell.value, StaticShellState::Cold);
@@ -8171,6 +8829,14 @@ pub(super) fn execute_nongeneric_class_members(
         .filter_map(|method| method.return_type_node)
         .filter(|type_node| store.type_node_links(*type_node).is_none())
         .count();
+    let missing_method_rest_type_node_links = plan
+        .class
+        .methods
+        .iter()
+        .filter_map(|method| method.rest_parameter)
+        .flat_map(|parameter| [parameter.type_node, parameter.element_type_node])
+        .filter(|type_node| store.type_node_links(*type_node).is_none())
+        .count();
     let missing_index_type_node_links = plan.class.index.map_or(0, |index| {
         [index.key_type_node, index.value_type_node]
             .into_iter()
@@ -8189,11 +8855,18 @@ pub(super) fn execute_nongeneric_class_members(
             .and_then(|constructor| constructor.parameter)
             .is_some_and(|parameter| store.type_node_links(parameter.type_node).is_none()),
     );
+    let missing_base_type_node_links = usize::from(
+        plan.class
+            .null_base
+            .is_some_and(|base| store.type_node_links(base.expression).is_none()),
+    );
     let missing_type_node_links = missing_property_type_node_links
         .checked_add(missing_method_type_node_links)
+        .and_then(|count| count.checked_add(missing_method_rest_type_node_links))
         .and_then(|count| count.checked_add(missing_index_type_node_links))
         .and_then(|count| count.checked_add(missing_accessor_type_node_links))
         .and_then(|count| count.checked_add(missing_constructor_parameter_type_node_links))
+        .and_then(|count| count.checked_add(missing_base_type_node_links))
         .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
     let missing_property_value_links = plan
         .class
@@ -8208,6 +8881,13 @@ pub(super) fn execute_nongeneric_class_members(
         .methods
         .iter()
         .filter(|method| store.value_symbol_links(method.symbol).is_none())
+        .count();
+    let missing_method_rest_value_links = plan
+        .class
+        .methods
+        .iter()
+        .filter_map(|method| method.rest_parameter)
+        .filter(|parameter| store.value_symbol_links(parameter.symbol).is_none())
         .count();
     let missing_accessor_value_links = plan.class.accessor.as_ref().map_or(0, |accessor| {
         [accessor.symbol, accessor.setter_parameter_symbol]
@@ -8245,6 +8925,7 @@ pub(super) fn execute_nongeneric_class_members(
     let missing_value_links = missing_property_value_links
         .checked_add(missing_owner_value_link)
         .and_then(|count| count.checked_add(missing_method_value_links))
+        .and_then(|count| count.checked_add(missing_method_rest_value_links))
         .and_then(|count| count.checked_add(missing_accessor_value_links))
         .and_then(|count| count.checked_add(missing_constructor_parameter_value_links))
         .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
@@ -8371,14 +9052,10 @@ pub(super) fn execute_nongeneric_class_members(
         None,
         (!declared_index_infos.is_empty()).then_some(declared_index_infos),
     ));
-    let undefined_type = store
-        .intrinsic_bootstrap()
-        .expect("the member plan validated intrinsic bootstrap")
-        .undefined_type;
     assert!(store.set_interface_base_resolution(
         shells.instance_type,
         true,
-        Some(undefined_type),
+        Some(base_constructor),
         None,
     ));
     assert!(store.set_structured_type_members(
@@ -9484,7 +10161,7 @@ fn exact_stored_method_return_type(
         return false;
     }
     match store.source_node_kind(previous) {
-        Some(SyntaxKind::Identifier) => store
+        Some(SyntaxKind::Identifier | SyntaxKind::Parameter) => store
             .intrinsic_bootstrap()
             .is_some_and(|bootstrap| return_type == bootstrap.void_type),
         Some(SyntaxKind::VoidKeyword | SyntaxKind::AnyKeyword | SyntaxKind::UndefinedKeyword) => {
@@ -9497,6 +10174,132 @@ fn exact_stored_method_return_type(
         }
         _ => false,
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StoredClassMethodRestParameter {
+    Absent,
+    Present(ClassMethodRestParameterPlan),
+}
+
+fn exact_stored_class_method_rest_parameter(
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    signature: SignatureId,
+) -> Option<StoredClassMethodRestParameter> {
+    let signature_record = store.signature(signature)?;
+    if signature_record.flags() == SignatureFlags::NONE && signature_record.parameters().is_empty()
+    {
+        return Some(StoredClassMethodRestParameter::Absent);
+    }
+    if signature_record.flags() != SignatureFlags::HAS_REST_PARAMETER {
+        return None;
+    }
+    let [symbol] = signature_record.parameters() else {
+        return None;
+    };
+    let symbol = *symbol;
+    let record = store.symbol(symbol)?;
+    let [parameter] = record.declarations()? else {
+        return None;
+    };
+    let parameter = *parameter;
+    let type_node = store.source_direct_type_annotation(parameter)?;
+    let element_index = type_node
+        .node
+        .index()
+        .checked_sub(1)
+        .and_then(|index| u32::try_from(index).ok())?;
+    let element_type_node = NodeRef::new(
+        type_node.arena,
+        type_node.file,
+        ts_ast::NodeId::new(element_index),
+    );
+    let array_type = class_method_any_array_type(store, type_node).ok()?;
+    let any = store.intrinsic_bootstrap()?.any_type;
+    if record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+        || record.check_flags() != CheckFlags::NONE
+        || record.value_declaration() != Some(parameter)
+        || record.members().is_some()
+        || record.exports().is_some()
+        || record.parent().is_some()
+        || record.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || store.source_node_kind(parameter) != Some(SyntaxKind::Parameter)
+        || store.source_node_parent(parameter) != Some(SourceNodeParent::Parent(declaration))
+        || store.source_node_kind(type_node) != Some(SyntaxKind::ArrayType)
+        || store.source_node_parent(type_node) != Some(SourceNodeParent::Parent(parameter))
+        || store.source_node_kind(element_type_node) != Some(SyntaxKind::AnyKeyword)
+        || store.source_node_parent(element_type_node) != Some(SourceNodeParent::Parent(type_node))
+        || store.type_node_links(type_node)
+            != Some(&TypeNodeLinks {
+                resolved_type: Some(array_type),
+                ..TypeNodeLinks::default()
+            })
+        || store.type_node_links(element_type_node)
+            != Some(&TypeNodeLinks {
+                resolved_type: Some(any),
+                ..TypeNodeLinks::default()
+            })
+        || store.value_symbol_links(symbol)
+            != Some(&ValueSymbolLinks {
+                resolved_type: Some(array_type),
+                ..ValueSymbolLinks::default()
+            })
+    {
+        return None;
+    }
+
+    let mut rest = None;
+    let mut name = None;
+    let mut reached_method_name = false;
+    for index in (0..parameter.node.index()).rev() {
+        let node = NodeRef::new(
+            parameter.arena,
+            parameter.file,
+            ts_ast::NodeId::new(u32::try_from(index).ok()?),
+        );
+        let Some(kind) = store.source_node_kind(node) else {
+            continue;
+        };
+        let Some(parent) = store.source_node_parent(node) else {
+            continue;
+        };
+        if parent == SourceNodeParent::Parent(declaration) && kind == SyntaxKind::Identifier {
+            reached_method_name = true;
+            break;
+        }
+        if parent != SourceNodeParent::Parent(parameter) {
+            continue;
+        }
+        match kind {
+            SyntaxKind::DotDotDotToken => {
+                if rest.replace(node).is_some() {
+                    return None;
+                }
+            }
+            SyntaxKind::Identifier => {
+                if name.replace(node).is_some() {
+                    return None;
+                }
+            }
+            SyntaxKind::ArrayType if node == type_node => {}
+            _ => return None,
+        }
+    }
+    if !reached_method_name || rest.is_none() || name.is_none() {
+        return None;
+    }
+
+    Some(StoredClassMethodRestParameter::Present(
+        ClassMethodRestParameterPlan {
+            declaration: parameter,
+            symbol,
+            type_node,
+            element_type_node,
+            array_type,
+        },
+    ))
 }
 
 fn exact_stored_method(
@@ -9515,6 +10318,11 @@ fn exact_stored_method(
     let [signature] = structured.signatures.as_deref()? else {
         return None;
     };
+    let rest_parameter =
+        match exact_stored_class_method_rest_parameter(store, *declaration, *signature)? {
+            StoredClassMethodRestParameter::Absent => None,
+            StoredClassMethodRestParameter::Present(parameter) => Some(parameter),
+        };
     let return_type = store.signature(*signature)?.resolved_return_type()?;
     (record.flags() == SymbolFlags::METHOD
         && record.check_flags() == CheckFlags::NONE
@@ -9528,7 +10336,7 @@ fn exact_stored_method(
         && store.source_node_parent(*declaration)
             == Some(SourceNodeParent::Parent(owner_declaration))
         && exact_stored_method_return_type(store, *declaration, return_type)
-        && exact_method_value(store, method, *declaration, return_type)
+        && exact_method_value(store, method, *declaration, return_type, rest_parameter)
             == Some((method_type, *signature)))
     .then_some(*declaration)
 }
@@ -10145,6 +10953,100 @@ fn property_entries(
         .collect()
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StoredNullClassHeritage {
+    Absent,
+    Present(NodeRef),
+}
+
+fn stored_null_class_heritage(
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+) -> Option<StoredNullClassHeritage> {
+    if store.source_node_kind(declaration) != Some(SyntaxKind::ClassDeclaration) {
+        return None;
+    }
+
+    let mut clause = None;
+    let mut null_expression = None;
+    let mut found_name = false;
+    for index in (0..declaration.node.index()).rev() {
+        let node = NodeRef::new(
+            declaration.arena,
+            declaration.file,
+            ts_ast::NodeId::new(u32::try_from(index).ok()?),
+        );
+        let Some(kind) = store.source_node_kind(node) else {
+            continue;
+        };
+        let Some(parent) = store.source_node_parent(node) else {
+            continue;
+        };
+        if parent == SourceNodeParent::Parent(declaration) {
+            match kind {
+                SyntaxKind::Identifier => {
+                    found_name = true;
+                    break;
+                }
+                SyntaxKind::HeritageClause => {
+                    if clause.replace(node).is_some() {
+                        return None;
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+        if kind != SyntaxKind::NullKeyword {
+            continue;
+        }
+        let SourceNodeParent::Parent(base) = parent else {
+            continue;
+        };
+        if store.source_node_kind(base) != Some(SyntaxKind::ExpressionWithTypeArguments) {
+            continue;
+        }
+        let Some(SourceNodeParent::Parent(heritage)) = store.source_node_parent(base) else {
+            continue;
+        };
+        if store.source_node_kind(heritage) != Some(SyntaxKind::HeritageClause)
+            || store.source_node_parent(heritage) != Some(SourceNodeParent::Parent(declaration))
+        {
+            continue;
+        }
+        if null_expression.replace((node, base, heritage)).is_some() {
+            return None;
+        }
+    }
+    if !found_name {
+        return None;
+    }
+    let Some((expression, base, expected_clause)) = null_expression else {
+        return Some(StoredNullClassHeritage::Absent);
+    };
+    if clause != Some(expected_clause) {
+        return None;
+    }
+
+    let mut base_count = 0usize;
+    for index in expression.node.index()..expected_clause.node.index() {
+        let node = NodeRef::new(
+            declaration.arena,
+            declaration.file,
+            ts_ast::NodeId::new(u32::try_from(index).ok()?),
+        );
+        if store.source_node_parent(node) == Some(SourceNodeParent::Parent(expected_clause)) {
+            if node != base
+                || store.source_node_kind(node) != Some(SyntaxKind::ExpressionWithTypeArguments)
+            {
+                return None;
+            }
+            base_count += 1;
+        }
+    }
+    (base_count == 1).then_some(StoredNullClassHeritage::Present(expression))
+}
+
 fn validate_stored_no_base_class(
     store: &CanonicalTypeMapperStore,
     instance_type: TypeId,
@@ -10156,14 +11058,30 @@ fn validate_stored_no_base_class(
         return None;
     }
     let parts = stored_class_parts(store, instance_type)?;
-    let undefined_type = store.intrinsic_bootstrap()?.undefined_type;
+    let declaration = store.symbol(parts.symbol)?.value_declaration()?;
+    let null_heritage = stored_null_class_heritage(store, declaration)?;
+    let bootstrap = store.intrinsic_bootstrap()?;
+    let base_constructor = match null_heritage {
+        StoredNullClassHeritage::Absent => bootstrap.undefined_type,
+        StoredNullClassHeritage::Present(expression) => {
+            if store.type_node_links(expression)
+                != Some(&TypeNodeLinks {
+                    resolved_type: Some(bootstrap.null_widening_type),
+                    ..TypeNodeLinks::default()
+                })
+            {
+                return None;
+            }
+            bootstrap.null_widening_type
+        }
+    };
     let structured = &parts.instance.reference.object.structured;
     let instance_entries = property_entries(store, &parts.declared_instance_properties)?;
     let static_entries = property_entries(store, &parts.declared_static_properties)?;
     let mut all_static_properties = parts.declared_static_properties.clone();
     all_static_properties.push(parts.prototype);
     if !parts.instance.base_types_resolved
-        || parts.instance.resolved_base_constructor_type != Some(undefined_type)
+        || parts.instance.resolved_base_constructor_type != Some(base_constructor)
         || parts.instance.resolved_base_types.is_some()
         || structured.constrained != ConstrainedTypeData::default()
         || structured.properties.as_deref()
@@ -10284,8 +11202,9 @@ fn validate_stored_derived_class(
     })
 }
 
-/// Validates either an exact completed no-base class or the direct-base graph
-/// branded by [`DirectClassHeritageProvenance`].
+/// Validates an exact completed class with no object base, including
+/// `extends null`, or the direct-base graph branded by
+/// [`DirectClassHeritageProvenance`].
 pub(super) fn validate_class_heritage_members(
     store: &CanonicalTypeMapperStore,
     instance_type: TypeId,
@@ -12105,6 +13024,60 @@ mod tests {
     }
 
     #[test]
+    fn standard_field_decorator_preserves_annotated_numeric_initializer() {
+        let mut fixture = fixture(concat!(
+            "declare function decorate(target: any, context: any): any; ",
+            "class Model { @decorate value: number = 1; }",
+        ));
+        let owner = class_symbol(&fixture, "Model");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
+        let ClassMemberQueryPlan::Direct(class) = &plan else {
+            panic!("a decorated class without heritage retains one direct class plan")
+        };
+        let property = class.class.properties[0].clone();
+
+        let members =
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan).unwrap();
+
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let number = bootstrap.number_type;
+        let regular = bootstrap
+            .cached_number_literal_type(ts_jsnum::from_string("1"))
+            .unwrap();
+        let fresh = fixture.store.fresh_type_of_literal_type(regular).unwrap();
+        assert_eq!(members.declared_instance_properties(), &[property.symbol]);
+        assert_eq!(
+            fixture.store.value_symbol_links(property.symbol),
+            Some(&ValueSymbolLinks {
+                resolved_type: Some(number),
+                ..ValueSymbolLinks::default()
+            })
+        );
+        assert_eq!(
+            fixture.store.type_node_links(property.type_node),
+            Some(&TypeNodeLinks {
+                resolved_type: Some(number),
+                ..TypeNodeLinks::default()
+            })
+        );
+        assert_eq!(
+            fixture
+                .store
+                .type_node_links(property.initializer_node.unwrap()),
+            Some(&TypeNodeLinks {
+                resolved_type: Some(fresh),
+                ..TypeNodeLinks::default()
+            })
+        );
+        assert_eq!(
+            validate_class_heritage_members(&fixture.store, members.shells().instance_type()),
+            ClassHeritageMembersValidation::Valid
+        );
+    }
+
+    #[test]
     fn authenticated_definite_bigint_field_decorator_checks_from_source() {
         let parsed = parse_source_file(concat!(
             "declare function dec(...args: any[]): any; ",
@@ -12142,6 +13115,82 @@ mod tests {
     }
 
     #[test]
+    fn standard_decorated_null_base_class_checks_from_source() {
+        let parsed = parse_source_file(concat!(
+            "declare function dec(target: any, context: any): any; ",
+            "class C extends null { @dec x: number = 1; }",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(304);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/decorated-null-base.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut options = CanonicalCheckerOptions::default();
+        options.intrinsic.strict_null_checks = true;
+        options.strict_property_initialization = true;
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            [(file, &parsed.arena)].into_iter().collect(),
+            options,
+        )
+        .unwrap();
+
+        context.check_source_file(file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ClassDeclaration).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let owner = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        let instance = context
+            .store()
+            .declared_type_links(owner)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let TypeData::Interface(interface) = context.store().type_payload(instance).unwrap().data()
+        else {
+            panic!("the null-base class retains its interface instance")
+        };
+        assert_eq!(
+            interface.resolved_base_constructor_type,
+            Some(
+                context
+                    .store()
+                    .intrinsic_bootstrap()
+                    .unwrap()
+                    .null_widening_type
+            )
+        );
+        assert_eq!(interface.resolved_base_types, None);
+        assert_eq!(
+            validate_class_heritage_members(context.store(), instance),
+            ClassHeritageMembersValidation::Valid
+        );
+    }
+
+    #[test]
     fn unsupported_field_decorators_reject_before_class_publication() {
         for source in [
             "class Model { @missing value!: bigint; }",
@@ -12151,6 +13200,14 @@ mod tests {
             "declare function dec(...args: any[]): any; class Model { @dec value: bigint; }",
             "declare function dec(...args: any[]): any; class Model { @dec() value!: bigint; }",
             "declare function dec(...args: any[]): any; class Model { @dec @dec value!: bigint; }",
+            concat!(
+                "declare function dec(target: any, context: number): any; ",
+                "class Model { @dec value: number = 1; }",
+            ),
+            concat!(
+                "declare function dec(target: any, context: any): number; ",
+                "class Model { @dec value: number = 1; }",
+            ),
         ] {
             let fixture = fixture(source);
             let owner = class_symbol(&fixture, "Model");
@@ -12488,6 +13545,292 @@ mod tests {
     }
 
     #[test]
+    fn forward_rest_method_implements_clause_keeps_distinct_method_owners() {
+        let mut fixture = fixture(concat!(
+            "class Model implements Contract { run(...args: any[]): void {} } ",
+            "interface Contract { run(...values: any[]): void; }",
+        ));
+        let owner = class_symbol(&fixture, "Model");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
+        let ClassMemberQueryPlan::Direct(class) = &plan else {
+            panic!("implements must not install a runtime class base")
+        };
+        let [implementation] = class.class.implementations.as_slice() else {
+            panic!("the class retains exactly one implemented interface")
+        };
+        let required = implementation.method.as_ref().unwrap();
+        let method = class.class.methods[0].clone();
+        let parameter = method.rest_parameter.unwrap();
+        assert_ne!(required.symbol, method.symbol);
+        assert_eq!(required.name, method.name);
+        assert_eq!(required.array_type, parameter.array_type);
+        assert!(
+            fixture
+                .store
+                .declared_type_links(implementation.symbol)
+                .is_none()
+        );
+
+        let members =
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan).unwrap();
+
+        let callable = fixture
+            .store
+            .value_symbol_links(method.symbol)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let signature = fixture
+            .store
+            .signature_links(method.declaration)
+            .and_then(|links| links.resolved_signature.signature())
+            .unwrap();
+        let signature_record = fixture.store.signature(signature).unwrap();
+        assert_eq!(signature_record.flags(), SignatureFlags::HAS_REST_PARAMETER);
+        assert_eq!(signature_record.parameters(), &[parameter.symbol]);
+        assert_eq!(signature_record.min_argument_count(), 0);
+        assert_eq!(
+            signature_record.resolved_return_type(),
+            Some(fixture.store.intrinsic_bootstrap().unwrap().void_type)
+        );
+        assert_eq!(
+            fixture.store.type_node_links(parameter.type_node),
+            Some(&TypeNodeLinks {
+                resolved_type: Some(parameter.array_type),
+                ..TypeNodeLinks::default()
+            })
+        );
+        assert_eq!(
+            fixture.store.type_node_links(parameter.element_type_node),
+            Some(&TypeNodeLinks {
+                resolved_type: Some(fixture.store.intrinsic_bootstrap().unwrap().any_type),
+                ..TypeNodeLinks::default()
+            })
+        );
+        assert_eq!(
+            fixture.store.value_symbol_links(parameter.symbol),
+            Some(&ValueSymbolLinks {
+                resolved_type: Some(parameter.array_type),
+                ..ValueSymbolLinks::default()
+            })
+        );
+        let validation =
+            super::super::callable_sets::validate_stored_callable_set(&fixture.store, callable);
+        let super::super::callable_sets::StoredCallableSetValidation::Valid { projection, .. } =
+            validation
+        else {
+            panic!("the class rest method must retain an authenticated callable set")
+        };
+        let [callable] = projection.call_signatures.as_ref() else {
+            panic!("the class rest method must publish one call signature")
+        };
+        assert!(callable.parameters.is_empty());
+        assert_eq!(callable.rest_parameter, Some(parameter.array_type));
+        assert_eq!(members.base(), None);
+        assert_eq!(
+            validate_class_heritage_members(&fixture.store, members.shells().instance_type()),
+            ClassHeritageMembersValidation::Valid
+        );
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        assert_eq!(
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan),
+            Ok(members)
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm
+        );
+    }
+
+    #[test]
+    fn forward_rest_method_implementation_checks_from_source() {
+        let parsed = parse_source_file(concat!(
+            "interface Derived extends Base { method(...args: any[]): void; } ",
+            "interface Base { method(...args: any[]): void; } ",
+            "class Derived2 implements Base2 { method(...args: any[]): void {} } ",
+            "interface Base2 { method(...args: any[]): void; }",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(305);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/forward-rest-implements.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            [(file, &parsed.arena)].into_iter().collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+
+        context.check_source_file(file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ClassDeclaration).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let owner = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        let method = context
+            .store()
+            .symbol(owner)
+            .and_then(Symbol::members)
+            .and_then(|members| context.store().symbol_table(members))
+            .and_then(|members| members.get_source("method"))
+            .unwrap();
+        let [method_declaration] = context
+            .store()
+            .symbol(method)
+            .unwrap()
+            .declarations()
+            .unwrap()
+        else {
+            panic!("the source class retains one method declaration")
+        };
+        let signature = context
+            .store()
+            .signature_links(*method_declaration)
+            .and_then(|links| links.resolved_signature.signature())
+            .unwrap();
+        let [parameter] = context.store().signature(signature).unwrap().parameters() else {
+            panic!("the source class method retains one rest parameter")
+        };
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(*parameter)
+                .and_then(|links| links.resolved_type),
+            Some(context.global_types().any_array_type)
+        );
+    }
+
+    #[test]
+    fn incompatible_forward_rest_method_implementations_remain_unsupported() {
+        for source in [
+            concat!(
+                "class Model implements Contract { other(...args: any[]): void {} } ",
+                "interface Contract { run(...args: any[]): void; }",
+            ),
+            concat!(
+                "class Model implements Contract { run(...args: any[]): any {} } ",
+                "interface Contract { run(...args: any[]): void; }",
+            ),
+            concat!(
+                "class Model implements Contract { run(): void {} } ",
+                "interface Contract { run(...args: any[]): void; }",
+            ),
+        ] {
+            let fixture = fixture(source);
+            let owner = class_symbol(&fixture, "Model");
+            let bound = &fixture.files[&fixture.file];
+            let host = host(&fixture.parsed.arena, bound);
+            let cold = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            assert!(matches!(
+                plan_nongeneric_class_member_query(&fixture.store, &host, owner),
+                Err(ClassError::Unsupported(ClassUnsupported::Heritage(_)))
+            ));
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                cold
+            );
+            assert!(fixture.store.declared_type_links(owner).is_none());
+            assert!(fixture.store.value_symbol_links(owner).is_none());
+        }
+    }
+
+    #[test]
+    fn poisoned_class_rest_method_caches_reject_without_publication() {
+        for poison_value in [false, true] {
+            let mut fixture = fixture("class Model { run(...args: any[]): void {} }");
+            let owner = class_symbol(&fixture, "Model");
+            let bound = &fixture.files[&fixture.file];
+            let host = host(&fixture.parsed.arena, bound);
+            let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
+            let ClassMemberQueryPlan::Direct(class) = &plan else {
+                panic!("a rest method without heritage retains one direct class plan")
+            };
+            let parameter = class.class.methods[0].rest_parameter.unwrap();
+            let wrong = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+            if poison_value {
+                assert!(fixture.store.set_value_symbol_links(
+                    parameter.symbol,
+                    ValueSymbolLinks {
+                        resolved_type: Some(wrong),
+                        ..ValueSymbolLinks::default()
+                    },
+                ));
+            } else {
+                assert!(fixture.store.set_type_node_links(
+                    parameter.type_node,
+                    TypeNodeLinks {
+                        resolved_type: Some(wrong),
+                        ..TypeNodeLinks::default()
+                    },
+                ));
+            }
+            let poisoned = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            assert!(
+                plan_nongeneric_class_member_query(&fixture.store, &host, owner).is_err(),
+                "poison value: {poison_value}",
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                poisoned
+            );
+            assert!(fixture.store.declared_type_links(owner).is_none());
+            assert!(fixture.store.value_symbol_links(owner).is_none());
+        }
+    }
+
+    #[test]
     fn empty_class_installs_exact_instance_and_value_shells_then_replays_warm() {
         let mut fixture = fixture("class Plain {}");
         let symbol = class_symbol(&fixture, "Plain");
@@ -12585,6 +13928,180 @@ mod tests {
             warm_state
         );
         assert_ne!(fixture.store.checker_link_allocated_lengths(), link_counts);
+    }
+
+    #[test]
+    fn null_base_class_retains_real_base_constructor_and_replays_warm() {
+        let mut fixture = fixture("class Model extends null { value: number = 1; }");
+        let owner = class_symbol(&fixture, "Model");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
+        let ClassMemberQueryPlan::Direct(class) = &plan else {
+            panic!("a null-base class has no inherited object members")
+        };
+        let heritage = class.class.null_base.unwrap();
+        assert!(fixture.store.type_node_links(heritage.expression).is_none());
+        assert_eq!(
+            stored_null_class_heritage(&fixture.store, class.class.declaration),
+            Some(StoredNullClassHeritage::Present(heritage.expression))
+        );
+
+        let members =
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan).unwrap();
+
+        let instance = members.shells().instance_type();
+        let null = fixture
+            .store
+            .intrinsic_bootstrap()
+            .unwrap()
+            .null_widening_type;
+        let TypeData::Interface(interface) = fixture.store.type_payload(instance).unwrap().data()
+        else {
+            panic!("the null-base class retains an interface instance")
+        };
+        assert!(interface.base_types_resolved);
+        assert_eq!(interface.resolved_base_constructor_type, Some(null));
+        assert_eq!(interface.resolved_base_types, None);
+        assert_eq!(members.base(), None);
+        assert_eq!(
+            fixture.store.type_node_links(heritage.expression),
+            Some(&TypeNodeLinks {
+                resolved_type: Some(null),
+                ..TypeNodeLinks::default()
+            })
+        );
+        assert_eq!(
+            validate_class_heritage_members(&fixture.store, instance),
+            ClassHeritageMembersValidation::Valid
+        );
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        assert_eq!(
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan),
+            Ok(members)
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm
+        );
+    }
+
+    #[test]
+    fn null_base_validation_rejects_forged_constructor_identity() {
+        for (source, forge_null) in [
+            ("class Model extends null {}", false),
+            ("class Model {}", true),
+        ] {
+            let mut fixture = fixture(source);
+            let owner = class_symbol(&fixture, "Model");
+            let bound = &fixture.files[&fixture.file];
+            let host = host(&fixture.parsed.arena, bound);
+            let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
+            let members =
+                execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan).unwrap();
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            let forged = if forge_null {
+                bootstrap.null_widening_type
+            } else {
+                bootstrap.undefined_type
+            };
+            let instance = members.shells().instance_type();
+            assert!(fixture.store.set_interface_base_resolution(
+                instance,
+                true,
+                Some(forged),
+                None,
+            ));
+            let poisoned = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            assert_eq!(
+                validate_class_heritage_members(&fixture.store, instance),
+                ClassHeritageMembersValidation::Malformed,
+                "{source}"
+            );
+            assert!(
+                execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan).is_err(),
+                "{source}"
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                poisoned,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn null_base_rejects_explicit_constructors_and_poisoned_expression_types() {
+        let explicit_constructor = fixture("class Model extends null { constructor() {} }");
+        let owner = class_symbol(&explicit_constructor, "Model");
+        let bound = &explicit_constructor.files[&explicit_constructor.file];
+        let explicit_constructor_host = host(&explicit_constructor.parsed.arena, bound);
+        assert!(matches!(
+            plan_nongeneric_class_member_query(
+                &explicit_constructor.store,
+                &explicit_constructor_host,
+                owner,
+            ),
+            Err(ClassError::Unsupported(ClassUnsupported::Member {
+                kind: SyntaxKind::Constructor,
+                ..
+            }))
+        ));
+
+        let mut fixture = fixture("class Model extends null {}");
+        let owner = class_symbol(&fixture, "Model");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let plan = plan_nongeneric_class(&fixture.store, &host, owner).unwrap();
+        let expression = plan.null_base.unwrap().expression;
+        let wrong = fixture.store.intrinsic_bootstrap().unwrap().undefined_type;
+        assert!(fixture.store.set_type_node_links(
+            expression,
+            TypeNodeLinks {
+                resolved_type: Some(wrong),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        let poisoned = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        assert_eq!(
+            plan_nongeneric_class_member_query(&fixture.store, &host, owner),
+            Err(invariant(ClassInvariant::InvalidPropertyTypeCache(
+                expression,
+            )))
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            poisoned
+        );
+        assert!(fixture.store.declared_type_links(owner).is_none());
+        assert!(fixture.store.value_symbol_links(owner).is_none());
     }
 
     #[test]

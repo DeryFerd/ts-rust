@@ -1784,7 +1784,28 @@ impl CanonicalTypeMapperStore {
                     instance: type_,
                 },
             )?;
-            self.validate_canonical_tuple_instance(target, type_, arguments)?;
+            if record.object_flags().contains(ObjectFlags::ARRAY_LITERAL) {
+                let invalid = || TupleTypeError::InvalidInstantiationCache {
+                    target,
+                    instance: type_,
+                };
+                let base = self
+                    .relation_object_instantiation(target, type_list_key(arguments))
+                    .ok_or_else(invalid)?;
+                if base == target {
+                    if tuple.interface.reference.resolved_type_arguments.as_deref()
+                        != Some(arguments)
+                    {
+                        return Err(invalid());
+                    }
+                } else {
+                    self.validate_canonical_tuple_instance(target, base, arguments)?;
+                }
+                self.validate_array_literal_clone(base, type_)
+                    .map_err(|_| invalid())?;
+            } else {
+                self.validate_canonical_tuple_instance(target, type_, arguments)?;
+            }
             arguments
         };
         Ok(Some(TupleShape {
@@ -2637,6 +2658,137 @@ mod tests {
                 false,
             )),
             Err(TupleTypeError::InvalidInstantiationCache { target, instance })
+        );
+    }
+
+    #[test]
+    fn tuple_array_literal_clones_preserve_canonical_shape_and_cache_ownership() {
+        let mut store = initialized();
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let infos = [element_info(&store, ElementFlags::REQUIRED, None)];
+        let base = store
+            .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(&[string], &infos, false))
+            .unwrap();
+        let target = match store.type_payload(base).unwrap().data() {
+            TypeData::TypeReference(reference) => reference.object.target.unwrap(),
+            _ => panic!("nonempty tuple must be a concrete reference"),
+        };
+        let flags = store.type_payload(base).unwrap().object_flags()
+            & !ObjectFlags::MEMBERS_RESOLVED
+            | ObjectFlags::ARRAY_LITERAL
+            | ObjectFlags::CONTAINS_OBJECT_OR_ARRAY_LITERAL;
+        let literal = store.alloc_type_reference(flags, None).unwrap();
+        assert!(store.set_object_target_and_mapper(literal, Some(target), None));
+        assert!(store.set_type_reference_resolution(literal, None, Some(vec![string])));
+        assert_eq!(
+            store
+                .derived_types
+                .array_literal_types
+                .insert(base, literal),
+            None,
+        );
+
+        let before = observable_state(&store);
+        let shape = store.canonical_tuple_shape(literal).unwrap().unwrap();
+        assert_eq!(shape.type_(), literal);
+        assert_eq!(shape.target(), target);
+        assert_eq!(shape.element_types(), &[string]);
+        assert_eq!(shape.element_infos(), &infos);
+        assert_eq!(observable_state(&store), before);
+        assert_eq!(
+            store.create_canonical_tuple_type(CanonicalTupleTypeRequest::new(
+                &[string],
+                &infos,
+                false,
+            )),
+            Ok(base),
+        );
+
+        assert!(store.set_structured_type_members(literal, None, None, None, None, None));
+        let warm = observable_state(&store);
+        assert_eq!(
+            store
+                .canonical_tuple_shape(literal)
+                .unwrap()
+                .unwrap()
+                .type_(),
+            literal,
+        );
+        assert_eq!(observable_state(&store), warm);
+    }
+
+    #[test]
+    fn tuple_array_literal_clones_reject_forged_ownership_flags_and_arguments() {
+        let mut store = initialized();
+        let (string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let infos = [element_info(&store, ElementFlags::REQUIRED, None)];
+        let base = store
+            .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(&[string], &infos, false))
+            .unwrap();
+        let number_base = store
+            .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(&[number], &infos, false))
+            .unwrap();
+        let target = match store.type_payload(base).unwrap().data() {
+            TypeData::TypeReference(reference) => reference.object.target.unwrap(),
+            _ => panic!("nonempty tuple must be a concrete reference"),
+        };
+        let flags = store.type_payload(base).unwrap().object_flags()
+            & !ObjectFlags::MEMBERS_RESOLVED
+            | ObjectFlags::ARRAY_LITERAL
+            | ObjectFlags::CONTAINS_OBJECT_OR_ARRAY_LITERAL;
+        let literal = store.alloc_type_reference(flags, None).unwrap();
+        assert!(store.set_object_target_and_mapper(literal, Some(target), None));
+        assert!(store.set_type_reference_resolution(literal, None, Some(vec![string])));
+
+        let invalid = TupleTypeError::InvalidInstantiationCache {
+            target,
+            instance: literal,
+        };
+        let before = observable_state(&store);
+        assert_eq!(store.canonical_tuple_shape(literal), Err(invalid));
+        assert_eq!(observable_state(&store), before);
+
+        assert_eq!(
+            store
+                .derived_types
+                .array_literal_types
+                .insert(base, literal),
+            None,
+        );
+        assert!(store.set_type_object_flags(
+            literal,
+            flags & !ObjectFlags::CONTAINS_OBJECT_OR_ARRAY_LITERAL,
+        ));
+        let poisoned = observable_state(&store);
+        assert_eq!(store.canonical_tuple_shape(literal), Err(invalid));
+        assert_eq!(observable_state(&store), poisoned);
+
+        assert!(store.set_type_object_flags(literal, flags | ObjectFlags::FROM_TYPE_NODE));
+        let poisoned = observable_state(&store);
+        assert_eq!(store.canonical_tuple_shape(literal), Err(invalid));
+        assert_eq!(observable_state(&store), poisoned);
+
+        assert!(store.set_type_object_flags(literal, flags));
+        assert!(store.set_type_reference_resolution(literal, None, Some(vec![number])));
+        let poisoned = observable_state(&store);
+        assert_eq!(store.canonical_tuple_shape(literal), Err(invalid));
+        assert_eq!(observable_state(&store), poisoned);
+        assert_eq!(
+            store.derived_types.array_literal_types.get(&number_base),
+            None,
+        );
+
+        assert!(store.set_type_reference_resolution(literal, None, Some(vec![string])));
+        assert_eq!(
+            store
+                .canonical_tuple_shape(literal)
+                .unwrap()
+                .unwrap()
+                .type_(),
+            literal,
         );
     }
 

@@ -116,6 +116,25 @@ pub struct JsDocParseResult {
     pub diagnostics: Vec<Diagnostic>,
 }
 
+struct JavaScriptJsDocTypedef {
+    range: TextRange,
+    name_range: TextRange,
+    name: String,
+    type_range: TextRange,
+    closing_brace: TextPos,
+    properties: Vec<JavaScriptJsDocProperty>,
+}
+
+struct JavaScriptJsDocProperty {
+    range: TextRange,
+    name_range: TextRange,
+    name: String,
+    type_range: TextRange,
+    closing_brace: TextPos,
+    optional: bool,
+    quoted: bool,
+}
+
 /// Parse a TypeScript source file into the generated arena-backed AST.
 #[must_use]
 pub fn parse_source_file(source: &str) -> ParseResult {
@@ -369,6 +388,337 @@ pub fn parse_jsdoc_comment(source: &str) -> JsDocParseResult {
         jsdoc,
         diagnostics: scanner.diagnostics().to_vec(),
     }
+}
+
+fn javascript_jsdoc_typedefs(
+    source: &str,
+    trivia_start: usize,
+    statement_start: usize,
+) -> Vec<JavaScriptJsDocTypedef> {
+    let mut comment_ranges = Vec::new();
+    let mut end = statement_start;
+    while let Some(prefix) = source.get(trivia_start..end) {
+        let prefix = prefix.trim_end_matches(char::is_whitespace);
+        if !prefix.ends_with("*/") {
+            break;
+        }
+        let Some(relative_start) = prefix.rfind("/**") else {
+            break;
+        };
+        let start = trivia_start + relative_start;
+        let comment_end = trivia_start + prefix.len();
+        let comment = &source[start..comment_end];
+        if comment.find("*/") != Some(comment.len() - 2) {
+            break;
+        }
+        comment_ranges.push((start, comment_end));
+        end = start;
+    }
+    comment_ranges.reverse();
+
+    let mut typedefs = Vec::new();
+    for (comment_start, comment_end) in comment_ranges {
+        let comment = &source[comment_start..comment_end];
+        if !comment.contains("@typedef") {
+            continue;
+        }
+        let parsed = parse_jsdoc_comment(comment);
+        if !parsed.diagnostics.is_empty() {
+            continue;
+        }
+        let Some(NodeData::JsDoc(jsdoc)) = parsed.arena.get(parsed.jsdoc).map(|node| &node.data)
+        else {
+            continue;
+        };
+        let Some(tags) = &jsdoc.tags else {
+            continue;
+        };
+        for tag in &tags.nodes {
+            let Some(tag_node) = parsed.arena.get(*tag) else {
+                continue;
+            };
+            let NodeData::JsDocUnknownTag(tag) = &tag_node.data else {
+                continue;
+            };
+            let Some(tag_name) = parsed.arena.get(tag.tag_name) else {
+                continue;
+            };
+            let NodeData::Identifier(identifier) = &tag_name.data else {
+                continue;
+            };
+            let Ok(tag_start) = usize::try_from(tag_node.range.start.get()) else {
+                continue;
+            };
+            if identifier.text != "typedef"
+                || !javascript_jsdoc_tag_is_top_level(comment, tag_start)
+            {
+                continue;
+            }
+            let Ok(body_start) = usize::try_from(tag_name.range.end.get()) else {
+                continue;
+            };
+            if let Some(typedef) =
+                javascript_jsdoc_typedef(source, comment_start, comment_end, tag_start, body_start)
+            {
+                typedefs.push(typedef);
+            }
+        }
+    }
+    typedefs
+}
+
+fn javascript_jsdoc_tag_is_top_level(comment: &str, position: usize) -> bool {
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    for byte in comment.as_bytes().get(3..position).unwrap_or_default() {
+        if let Some(current) = quote {
+            if escaped {
+                escaped = false;
+            } else if *byte == b'\\' {
+                escaped = true;
+            } else if *byte == current {
+                quote = None;
+            }
+            continue;
+        }
+        match *byte {
+            b'\'' | b'"' | b'`' if depth > 0 => quote = Some(*byte),
+            b'{' => depth = depth.saturating_add(1),
+            b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    depth == 0
+}
+
+fn javascript_jsdoc_typedef(
+    source: &str,
+    comment_start: usize,
+    comment_end: usize,
+    tag_start: usize,
+    body_start: usize,
+) -> Option<JavaScriptJsDocTypedef> {
+    let content_end = comment_end.checked_sub(2)?;
+    let body_start = comment_start.checked_add(body_start)?;
+    let body = source.get(body_start..content_end)?;
+    let open = body_start.checked_add(body.len().checked_sub(body.trim_start().len())?)?;
+    if source.as_bytes().get(open) != Some(&b'{') {
+        return None;
+    }
+    let close = javascript_jsdoc_matching_brace(source, open, content_end)?;
+    let enclosed = source.get(open.checked_add(1)?..close)?;
+    let trimmed = enclosed.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let type_start = open
+        .checked_add(1)?
+        .checked_add(enclosed.len().checked_sub(enclosed.trim_start().len())?)?;
+    let type_end = type_start.checked_add(trimmed.len())?;
+    let mut validation = Parser::new_with_context(trimmed, LanguageVariant::Standard, false, false);
+    validation.parse_type();
+    if validation.current.kind != SyntaxKind::EndOfFile
+        || !validation.diagnostics.is_empty()
+        || !validation.scanner.diagnostics().is_empty()
+    {
+        return None;
+    }
+
+    let remainder = source.get(close.checked_add(1)?..content_end)?;
+    let name_start = close
+        .checked_add(1)?
+        .checked_add(remainder.len().checked_sub(remainder.trim_start().len())?)?;
+    if name_start >= content_end {
+        return None;
+    }
+    let mut scanner = Scanner::new(source);
+    scanner.reset_pos(name_start);
+    let name = scanner.scan();
+    let name_end = usize::try_from(name.range.end.get()).ok()?;
+    if name.kind != SyntaxKind::Identifier
+        || name_end > content_end
+        || source
+            .get(name_end..content_end)?
+            .trim_start()
+            .starts_with('.')
+    {
+        return None;
+    }
+
+    let properties = if matches!(trimmed, "Object" | "object") {
+        javascript_jsdoc_typedef_properties(source, comment_start, comment_end, tag_start)
+    } else {
+        Vec::new()
+    };
+    let end = properties
+        .last()
+        .and_then(|property| usize::try_from(property.range.end.get()).ok())
+        .unwrap_or(name_end);
+
+    Some(JavaScriptJsDocTypedef {
+        range: text_range(comment_start.checked_add(tag_start)?, end),
+        name_range: name.range,
+        name: token_value(&name),
+        type_range: text_range(type_start, type_end),
+        closing_brace: TextPos::new(u32::try_from(close).ok()?),
+        properties,
+    })
+}
+
+fn javascript_jsdoc_typedef_properties(
+    source: &str,
+    comment_start: usize,
+    comment_end: usize,
+    typedef_start: usize,
+) -> Vec<JavaScriptJsDocProperty> {
+    let Some(comment) = source.get(comment_start..comment_end) else {
+        return Vec::new();
+    };
+    let parsed = parse_jsdoc_comment(comment);
+    let Some(NodeData::JsDoc(jsdoc)) = parsed.arena.get(parsed.jsdoc).map(|node| &node.data) else {
+        return Vec::new();
+    };
+    let Some(tags) = &jsdoc.tags else {
+        return Vec::new();
+    };
+    let mut properties = Vec::new();
+    for id in &tags.nodes {
+        let Some(tag_node) = parsed.arena.get(*id) else {
+            continue;
+        };
+        let Ok(tag_start) = usize::try_from(tag_node.range.start.get()) else {
+            continue;
+        };
+        if tag_start <= typedef_start || !javascript_jsdoc_tag_is_top_level(comment, tag_start) {
+            continue;
+        }
+        let NodeData::JsDocUnknownTag(tag) = &tag_node.data else {
+            continue;
+        };
+        let Some(tag_name) = parsed.arena.get(tag.tag_name) else {
+            continue;
+        };
+        let NodeData::Identifier(identifier) = &tag_name.data else {
+            continue;
+        };
+        if !matches!(identifier.text.as_str(), "property" | "prop") {
+            break;
+        }
+        let Ok(body_start) = usize::try_from(tag_name.range.end.get()) else {
+            continue;
+        };
+        if let Some(property) =
+            javascript_jsdoc_property(source, comment_start, comment_end, tag_start, body_start)
+        {
+            properties.push(property);
+        }
+    }
+    properties
+}
+
+fn javascript_jsdoc_property(
+    source: &str,
+    comment_start: usize,
+    comment_end: usize,
+    tag_start: usize,
+    body_start: usize,
+) -> Option<JavaScriptJsDocProperty> {
+    let content_end = comment_end.checked_sub(2)?;
+    let body_start = comment_start.checked_add(body_start)?;
+    let body = source.get(body_start..content_end)?;
+    let open = body_start.checked_add(body.len().checked_sub(body.trim_start().len())?)?;
+    if source.as_bytes().get(open) != Some(&b'{') {
+        return None;
+    }
+    let close = javascript_jsdoc_matching_brace(source, open, content_end)?;
+    let enclosed = source.get(open.checked_add(1)?..close)?;
+    let type_text = enclosed.trim();
+    if type_text.is_empty() {
+        return None;
+    }
+    let type_start = open
+        .checked_add(1)?
+        .checked_add(enclosed.len().checked_sub(enclosed.trim_start().len())?)?;
+    let type_end = type_start.checked_add(type_text.len())?;
+    let mut validation =
+        Parser::new_with_context(type_text, LanguageVariant::Standard, false, false);
+    validation.parse_type();
+    if validation.current.kind != SyntaxKind::EndOfFile
+        || !validation.diagnostics.is_empty()
+        || !validation.scanner.diagnostics().is_empty()
+    {
+        return None;
+    }
+
+    let remainder = source.get(close.checked_add(1)?..content_end)?;
+    let mut name_start = close
+        .checked_add(1)?
+        .checked_add(remainder.len().checked_sub(remainder.trim_start().len())?)?;
+    let optional = source.as_bytes().get(name_start) == Some(&b'[');
+    if optional {
+        name_start = name_start.checked_add(1)?;
+    }
+    let remainder = source.get(name_start..content_end)?;
+    let relative_end = remainder
+        .find(|character: char| character.is_whitespace() || matches!(character, ']' | '='))
+        .unwrap_or(remainder.len());
+    let name_end = name_start.checked_add(relative_end)?;
+    if name_start == name_end {
+        return None;
+    }
+    let name = source.get(name_start..name_end)?;
+    let end = if optional {
+        name_end
+            .checked_add(source.get(name_end..content_end)?.find(']')?)?
+            .checked_add(1)?
+    } else {
+        name_end
+    };
+    let mut scanner = Scanner::new(name);
+    let first = scanner.scan();
+    let quoted = !(first.kind == SyntaxKind::Identifier || first.kind.is_keyword())
+        || scanner.scan().kind != SyntaxKind::EndOfFile;
+
+    Some(JavaScriptJsDocProperty {
+        range: text_range(comment_start.checked_add(tag_start)?, end),
+        name_range: text_range(name_start, name_end),
+        name: name.to_owned(),
+        type_range: text_range(type_start, type_end),
+        closing_brace: TextPos::new(u32::try_from(close).ok()?),
+        optional,
+        quoted,
+    })
+}
+
+fn javascript_jsdoc_matching_brace(source: &str, open: usize, end: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    for (offset, byte) in source.as_bytes().get(open..end)?.iter().enumerate() {
+        if let Some(current) = quote {
+            if escaped {
+                escaped = false;
+            } else if *byte == b'\\' {
+                escaped = true;
+            } else if *byte == current {
+                quote = None;
+            }
+            continue;
+        }
+        match *byte {
+            b'\'' | b'"' | b'`' => quote = Some(*byte),
+            b'{' => depth = depth.checked_add(1)?,
+            b'}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return open.checked_add(offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -649,6 +999,24 @@ impl<'a> Parser<'a> {
                 continue;
             }
             let before = (self.current.kind, self.current.range);
+            if self.javascript_file
+                && terminator == SyntaxKind::EndOfFile
+                && self
+                    .current
+                    .flags
+                    .contains(ScannerTokenFlags::PRECEDING_JSDOC_COMMENT)
+            {
+                let trivia_start = usize::try_from(self.current.full_start.get()).unwrap_or(0);
+                let statement_start = usize::try_from(self.current.range.start.get()).unwrap_or(0);
+                let typedefs = self.arena.source_text().map_or_else(Vec::new, |source| {
+                    javascript_jsdoc_typedefs(source, trivia_start, statement_start)
+                });
+                for typedef in typedefs {
+                    if let Some(alias) = self.parse_javascript_jsdoc_typedef(typedef) {
+                        statements.push(alias);
+                    }
+                }
+            }
             statements.push(self.parse_statement());
             if before == (self.current.kind, self.current.range) {
                 self.error_current("Parser made no progress while parsing a statement.");
@@ -660,6 +1028,140 @@ impl<'a> Parser<'a> {
             nodes: statements,
             has_trailing_comma: false,
         }
+    }
+
+    fn parse_javascript_jsdoc_typedef(
+        &mut self,
+        typedef: JavaScriptJsDocTypedef,
+    ) -> Option<NodeId> {
+        let type_node = if typedef.properties.is_empty() {
+            self.parse_javascript_jsdoc_type(typedef.type_range, typedef.closing_brace)?
+        } else {
+            self.parse_javascript_jsdoc_object_type(&typedef.properties)?
+        };
+        let name = self.alloc_node(
+            SyntaxKind::Identifier,
+            typedef.name_range,
+            NodeData::Identifier(Box::new(IdentifierData {
+                flow_node: None,
+                text: typedef.name,
+            })),
+            &[],
+        );
+        Some(self.alloc_node_with_flags(
+            SyntaxKind::JsTypeAliasDeclaration,
+            NodeFlags::REPARSED,
+            typedef.range,
+            NodeData::TypeAliasDeclaration(Box::new(TypeAliasDeclarationData {
+                flow_node: None,
+                local_symbol: None,
+                locals: SymbolTable,
+                next_container: None,
+                symbol: None,
+                type_: type_node,
+                type_parameters: None,
+                modifiers: None,
+                name,
+            })),
+            &[name, type_node],
+        ))
+    }
+
+    fn parse_javascript_jsdoc_type(
+        &mut self,
+        type_range: TextRange,
+        closing_brace: TextPos,
+    ) -> Option<NodeId> {
+        let current = self.current.clone();
+        let scanner = self.scanner.mark();
+        let diagnostics = self.diagnostics.len();
+        self.scanner
+            .reset_pos(usize::try_from(type_range.start.get()).ok()?);
+        self.current = self.scanner.scan();
+        let type_node = self.parse_type();
+        let parsed = self.current.kind == SyntaxKind::CloseBraceToken
+            && self.current.range.start == closing_brace
+            && self.node_end(type_node) == type_range.end
+            && self.diagnostics.len() == diagnostics;
+        self.diagnostics.truncate(diagnostics);
+        self.scanner.rewind(scanner);
+        self.current = current;
+        parsed.then_some(type_node)
+    }
+
+    fn parse_javascript_jsdoc_object_type(
+        &mut self,
+        properties: &[JavaScriptJsDocProperty],
+    ) -> Option<NodeId> {
+        let start = properties.first()?.range.start;
+        let end = properties.last()?.range.end;
+        let mut members = Vec::with_capacity(properties.len());
+        for property in properties {
+            let type_node =
+                self.parse_javascript_jsdoc_type(property.type_range, property.closing_brace)?;
+            let name = if property.quoted {
+                self.alloc_node(
+                    SyntaxKind::StringLiteral,
+                    property.name_range,
+                    NodeData::StringLiteral(Box::new(StringLiteralData {
+                        text: property.name.clone(),
+                        token_flags: TokenFlags::default(),
+                    })),
+                    &[],
+                )
+            } else {
+                self.alloc_node(
+                    SyntaxKind::Identifier,
+                    property.name_range,
+                    NodeData::Identifier(Box::new(IdentifierData {
+                        flow_node: None,
+                        text: property.name.clone(),
+                    })),
+                    &[],
+                )
+            };
+            let postfix_token = property.optional.then(|| {
+                self.alloc_node_with_flags(
+                    SyntaxKind::QuestionToken,
+                    NodeFlags::REPARSED,
+                    TextRange::new(property.name_range.end, property.name_range.end),
+                    NodeData::Token(Box::new(TokenData)),
+                    &[],
+                )
+            });
+            let mut children = vec![name];
+            children.extend(postfix_token);
+            children.push(type_node);
+            members.push(self.alloc_node_with_flags(
+                SyntaxKind::PropertyDeclaration,
+                NodeFlags::REPARSED,
+                property.range,
+                NodeData::PropertyDeclaration(Box::new(PropertyDeclarationData {
+                    initializer: None,
+                    postfix_token,
+                    symbol: None,
+                    type_: Some(type_node),
+                    facts: 0,
+                    modifiers: None,
+                    name,
+                })),
+                &children,
+            ));
+        }
+        Some(self.alloc_node_with_flags(
+            SyntaxKind::TypeLiteral,
+            NodeFlags::REPARSED,
+            TextRange::new(start, end),
+            NodeData::TypeLiteralNode(Box::new(TypeLiteralNodeData {
+                members: NodeList {
+                    range: TextRange::new(start, end),
+                    nodes: members.clone(),
+                    has_trailing_comma: false,
+                },
+                symbol: None,
+            })),
+            &members,
+        ))
     }
 
     fn recover_invalid_token_statement(&mut self, terminator: SyntaxKind) {
@@ -17041,6 +17543,182 @@ export as namespace GlobalName;
                 .parent,
             Some(result.jsdoc)
         );
+    }
+
+    #[test]
+    fn javascript_jsdoc_typedefs_create_source_owned_reparsed_aliases() {
+        let source = "/** @typedef {number} Value */\nconst value = 1;";
+        let result = parse_javascript_source_file(source);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let [alias, host] = source_statements(&result) else {
+            panic!("expected a typedef alias followed by its host statement")
+        };
+        let alias_node = result.arena.get(*alias).unwrap();
+        assert_eq!(alias_node.kind, SyntaxKind::JsTypeAliasDeclaration);
+        assert_eq!(alias_node.flags, NodeFlags::REPARSED);
+        assert_eq!(alias_node.parent, Some(result.source_file));
+        assert_eq!(
+            &source[alias_node.range.start.get() as usize..alias_node.range.end.get() as usize],
+            "@typedef {number} Value"
+        );
+        assert_eq!(
+            result.arena.get(*host).unwrap().kind,
+            SyntaxKind::VariableStatement
+        );
+
+        let NodeData::TypeAliasDeclaration(declaration) = &alias_node.data else {
+            panic!("expected a generated type alias payload")
+        };
+        assert_eq!(identifier_text(&result, declaration.name), "Value");
+        assert_eq!(
+            result.arena.get(declaration.name).unwrap().parent,
+            Some(*alias)
+        );
+        let type_node = result.arena.get(declaration.type_).unwrap();
+        assert_eq!(type_node.kind, SyntaxKind::NumberKeyword);
+        assert_eq!(type_node.parent, Some(*alias));
+        assert_eq!(
+            &source[type_node.range.start.get() as usize..type_node.range.end.get() as usize],
+            "number"
+        );
+
+        let mut pending = vec![result.source_file];
+        let mut reached = std::collections::HashSet::new();
+        while let Some(node) = pending.pop() {
+            assert!(reached.insert(node));
+            result
+                .arena
+                .get(node)
+                .unwrap()
+                .for_each_child(|child| pending.push(child));
+        }
+        assert_eq!(reached.len(), result.arena.len());
+    }
+
+    #[test]
+    fn javascript_jsdoc_typedefs_preserve_comment_order_and_complete_type_nodes() {
+        let source = concat!(
+            "/** @typedef {{ a: 1, m: 1 }} Shape */\n",
+            "/** @typedef {import('./types').Shape} Imported */\n",
+            "/** @type {Imported} */\n",
+            "const value = null;",
+        );
+        let result = parse_javascript_source_file(source);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let [shape, imported, host] = source_statements(&result) else {
+            panic!("expected ordered typedef aliases before their host")
+        };
+        for (alias, expected_name, expected_type) in [
+            (*shape, "Shape", SyntaxKind::TypeLiteral),
+            (*imported, "Imported", SyntaxKind::ImportType),
+        ] {
+            let node = result.arena.get(alias).unwrap();
+            let NodeData::TypeAliasDeclaration(declaration) = &node.data else {
+                panic!("expected a typedef alias")
+            };
+            assert_eq!(node.kind, SyntaxKind::JsTypeAliasDeclaration);
+            assert_eq!(identifier_text(&result, declaration.name), expected_name);
+            assert_eq!(
+                result.arena.get(declaration.type_).unwrap().kind,
+                expected_type
+            );
+        }
+        assert_eq!(
+            result.arena.get(*host).unwrap().kind,
+            SyntaxKind::VariableStatement
+        );
+    }
+
+    #[test]
+    fn javascript_jsdoc_object_typedefs_reparse_property_tags_into_members() {
+        let source = concat!(
+            "/**\n",
+            " * @typedef {Object} Props\n",
+            " * @property {string} label\n",
+            " * @property {boolean} [data-name]\n",
+            " */\n",
+            "const value = {};",
+        );
+        let result = parse_javascript_source_file(source);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let [alias, _] = source_statements(&result) else {
+            panic!("expected an object typedef before its host")
+        };
+        let alias_node = result.arena.get(*alias).unwrap();
+        let NodeData::TypeAliasDeclaration(declaration) = &alias_node.data else {
+            panic!("expected a generated object typedef")
+        };
+        let type_node = result.arena.get(declaration.type_).unwrap();
+        let NodeData::TypeLiteralNode(object) = &type_node.data else {
+            panic!("expected a structural object type")
+        };
+        assert_eq!(type_node.parent, Some(*alias));
+        assert_eq!(object.members.nodes.len(), 2);
+        for (member, expected_name, expected_type, optional) in [
+            (
+                object.members.nodes[0],
+                "label",
+                SyntaxKind::StringKeyword,
+                false,
+            ),
+            (
+                object.members.nodes[1],
+                "data-name",
+                SyntaxKind::BooleanKeyword,
+                true,
+            ),
+        ] {
+            let member_node = result.arena.get(member).unwrap();
+            let NodeData::PropertyDeclaration(property) = &member_node.data else {
+                panic!("expected a structural typedef property")
+            };
+            let name = result.arena.get(property.name).unwrap();
+            match &name.data {
+                NodeData::Identifier(identifier) => assert_eq!(identifier.text, expected_name),
+                NodeData::StringLiteral(literal) => assert_eq!(literal.text, expected_name),
+                _ => panic!("expected an identifier or quoted property name"),
+            }
+            assert_eq!(member_node.parent, Some(declaration.type_));
+            assert_eq!(name.parent, Some(member));
+            assert_eq!(
+                result.arena.get(property.type_.unwrap()).unwrap().kind,
+                expected_type
+            );
+            assert_eq!(property.postfix_token.is_some(), optional);
+        }
+        assert!(alias_node.range.end >= type_node.range.end);
+    }
+
+    #[test]
+    fn javascript_jsdoc_typedef_recovery_preserves_unsupported_comment_forms() {
+        for source in [
+            "/** @typedef {number} NS.Value */\nconst value = 1;",
+            "/** @typedef {} Empty */\nconst value = 1;",
+            "/** @typedef {number} */\nconst value = 1;",
+            "/** @type {number} */\nconst value = 1;",
+        ] {
+            let result = parse_javascript_source_file(source);
+            assert!(
+                result.diagnostics.is_empty(),
+                "{source}: {:?}",
+                result.diagnostics
+            );
+            assert_eq!(source_statements(&result).len(), 1, "{source}");
+            assert!(
+                result
+                    .arena
+                    .iter()
+                    .all(|(_, node)| { node.kind != SyntaxKind::JsTypeAliasDeclaration })
+            );
+        }
+
+        let typescript = parse_source_file("/** @typedef {number} Value */\nconst value = 1;");
+        assert!(
+            typescript.diagnostics.is_empty(),
+            "{:?}",
+            typescript.diagnostics
+        );
+        assert_eq!(source_statements(&typescript).len(), 1);
     }
 
     #[test]

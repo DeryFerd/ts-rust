@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 
-use ts_ast::{ModifierList, Node, NodeArena, NodeData, NodeFlags, NodeRef, SyntaxKind};
+use ts_ast::{ModifierList, Node, NodeArena, NodeData, NodeFlags, NodeList, NodeRef, SyntaxKind};
 use ts_binder::{
     BoundFile, CanonicalNameResolutionError, CheckFlags, EscapedName, InternalSymbolName,
     SemanticSymbolId, SymbolFlags, SymbolTableId, canonical_has_syntactic_modifier,
@@ -31,7 +31,8 @@ use super::{
     instantiate::InstantiationSession,
     object_members::{self, PropertyObjectError, PropertyObjectPlan},
     reference_types::validate_direct_generic_reference,
-    source_callables::{self, SourceCallableError},
+    source_callables::{self, SourceCallableError, SourceCallableUnsupported},
+    source_overloads::{self, SourceOverloadError},
     type_nodes::{CanonicalTypeQuery, TypeNodeUnavailable, normalize_numeric_separators},
     types::{ObjectFlags, TypeFlags},
 };
@@ -74,6 +75,20 @@ pub(super) enum SourceNamespaceMemberPlan {
         declaration: NodeRef,
         symbol: SemanticSymbolId,
     },
+    DeferredAmbientFunction {
+        declaration: NodeRef,
+        symbol: SemanticSymbolId,
+        type_parameters: Vec<SemanticSymbolId>,
+        parameters: Vec<SemanticSymbolId>,
+        annotations: Vec<NodeRef>,
+    },
+    DeferredAmbientClass {
+        declaration: NodeRef,
+        symbol: SemanticSymbolId,
+        type_parameters: Vec<SemanticSymbolId>,
+        members: Vec<SemanticSymbolId>,
+        annotations: Vec<NodeRef>,
+    },
     AmbientVariable {
         declaration: NodeRef,
         symbol: SemanticSymbolId,
@@ -87,8 +102,17 @@ pub(super) struct SourceNamespaceGenericInterfacePlan {
     type_parameters: Vec<SemanticSymbolId>,
     properties: Vec<SourceNamespacePropertyPlan>,
     call_signatures: Vec<SemanticSymbolId>,
+    construct_signatures: Vec<SemanticSymbolId>,
+    methods: Vec<SemanticSymbolId>,
     computed_properties: Vec<SourceNamespaceComputedPropertyPlan>,
     base_interfaces: Vec<SemanticSymbolId>,
+    deferred_annotations: Vec<NodeRef>,
+}
+
+impl SourceNamespaceGenericInterfacePlan {
+    pub(super) fn annotation_is_deferred(&self, annotation: NodeRef) -> bool {
+        self.deferred_annotations.contains(&annotation)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -571,12 +595,15 @@ fn plan_generic_interface_parameters(
         type_parameters,
         properties: Vec::new(),
         call_signatures: Vec::new(),
+        construct_signatures: Vec::new(),
+        methods: Vec::new(),
         computed_properties: Vec::new(),
         base_interfaces: Vec::new(),
+        deferred_annotations: Vec::new(),
     })
 }
 
-fn plan_interface_call_signature(
+fn plan_interface_callable_signature(
     arena: &NodeArena,
     bound: &BoundFile,
     store: &CanonicalTypeMapperStore,
@@ -586,16 +613,30 @@ fn plan_interface_call_signature(
 ) -> Result<SemanticSymbolId, SourceCheckError> {
     let invalid = |node, kind| unsupported(node, kind, SourceSyntaxRole::InterfaceDeclaration);
     let record = owned_node(arena, bound, store, declaration)?;
-    let NodeData::CallSignatureDeclaration(signature) = &record.data else {
-        return Err(invalid(declaration, record.kind));
+    let (kind, name, type_parameters, parameters, return_type, invalid_cache) = match &record.data {
+        NodeData::CallSignatureDeclaration(signature) => (
+            SyntaxKind::CallSignature,
+            InternalSymbolName::Call,
+            signature.type_parameters.as_ref(),
+            &signature.parameters,
+            signature.type_,
+            signature.full_signature.is_some()
+                || signature.next_container.is_some()
+                || signature.symbol.is_some(),
+        ),
+        NodeData::ConstructSignatureDeclaration(signature) => (
+            SyntaxKind::ConstructSignature,
+            InternalSymbolName::New,
+            signature.type_parameters.as_ref(),
+            &signature.parameters,
+            signature.type_,
+            signature.full_signature.is_some()
+                || signature.next_container.is_some()
+                || signature.symbol.is_some(),
+        ),
+        _ => return Err(invalid(declaration, record.kind)),
     };
-    if record.kind != SyntaxKind::CallSignature
-        || record.flags.0 != 0
-        || signature.full_signature.is_some()
-        || signature.next_container.is_some()
-        || signature.symbol.is_some()
-        || signature.type_parameters.is_some()
-        || signature.parameters.has_trailing_comma
+    if record.kind != kind || record.flags.0 != 0 || invalid_cache || parameters.has_trailing_comma
     {
         return Err(invalid(declaration, record.kind));
     }
@@ -610,98 +651,186 @@ fn plan_interface_call_signature(
         .and_then(|members| store.symbol_table(members));
     if symbol_record.flags() != SymbolFlags::SIGNATURE
         || symbol_record.check_flags() != CheckFlags::NONE
-        || symbol_record.name() != InternalSymbolName::Call.as_ref()
+        || symbol_record.name() != name.as_ref()
         || symbol_record.value_declaration().is_some()
         || symbol_record.members().is_some()
         || symbol_record.exports().is_some()
         || symbol_record.parent() != Some(owner)
         || symbol_record.export_symbol().is_some()
-        || members.and_then(|members| members.get(InternalSymbolName::Call.as_ref()))
-            != Some(symbol)
+        || members.and_then(|members| members.get(name.as_ref())) != Some(symbol)
     {
         return Err(SourceCheckError::Provenance(
             SourceCheckProvenanceError::MissingDeclarationSymbol(declaration),
         ));
     }
 
-    let locals = bound
-        .locals(declaration)
-        .and_then(|locals| store.symbol_table(locals));
-    if locals.map_or(0, ts_binder::semantic::SymbolTable::len) != signature.parameters.nodes.len() {
-        return Err(invalid(declaration, record.kind));
-    }
-    for parameter_id in &signature.parameters.nodes {
-        let parameter = child(declaration, *parameter_id);
-        let parameter_record = owned_node(arena, bound, store, parameter)?;
-        let NodeData::ParameterDeclaration(data) = &parameter_record.data else {
-            return Err(invalid(parameter, parameter_record.kind));
-        };
-        let name = child(parameter, data.name);
-        let name_record = owned_node(arena, bound, store, name)?;
-        let NodeData::Identifier(identifier) = &name_record.data else {
-            return Err(invalid(name, name_record.kind));
-        };
-        let annotation = data
-            .type_
-            .map(|annotation| child(parameter, annotation))
-            .ok_or_else(|| invalid(parameter, parameter_record.kind))?;
-        let annotation_record = owned_node(arena, bound, store, annotation)?;
-        let parameter_symbol = declaration_symbol(
-            bound,
-            store,
-            parameter,
-            SymbolFlags::FUNCTION_SCOPED_VARIABLE,
-        )?;
-        let owner_record = store
-            .symbol(parameter_symbol)
-            .ok_or(SourceCheckError::Provenance(
-                SourceCheckProvenanceError::MissingDeclarationSymbol(parameter),
-            ))?;
-        if parameter_record.kind != SyntaxKind::Parameter
-            || parameter_record.flags.0 != 0
-            || parameter_record.parent != Some(declaration.node)
-            || data.dot_dot_dot_token.is_some()
-            || data.initializer.is_some()
-            || data.question_token.is_some()
-            || data.symbol.is_some()
-            || data.modifiers.is_some()
-            || data.facts != 0
-            || name_record.kind != SyntaxKind::Identifier
-            || name_record.flags.0 != 0
-            || name_record.parent != Some(parameter.node)
-            || identifier.flow_node.is_some()
-            || identifier.text.is_empty()
-            || annotation_record.parent != Some(parameter.node)
-            || owner_record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
-            || owner_record.check_flags() != CheckFlags::NONE
-            || owner_record.name().as_utf8() != Some(identifier.text.as_str())
-            || owner_record.declarations() != Some(&[parameter])
-            || owner_record.value_declaration() != Some(parameter)
-            || owner_record.members().is_some()
-            || owner_record.exports().is_some()
-            || owner_record.parent().is_some()
-            || owner_record.export_symbol().is_some()
-            || locals.and_then(|locals| locals.get_source(&identifier.text))
-                != Some(parameter_symbol)
-        {
-            return Err(invalid(parameter, parameter_record.kind));
-        }
-        annotations.push(annotation);
-    }
+    plan_interface_signature_annotations(
+        arena,
+        bound,
+        store,
+        declaration,
+        type_parameters,
+        parameters,
+        return_type,
+        annotations,
+    )?;
+    Ok(symbol)
+}
 
-    let return_type = signature
-        .type_
-        .map(|annotation| child(declaration, annotation))
-        .ok_or_else(|| invalid(declaration, record.kind))?;
-    let return_record = owned_node(arena, bound, store, return_type)?;
-    if return_record.parent != Some(declaration.node) {
-        return Err(invalid_parent(
-            return_type,
-            declaration,
-            return_record.parent,
+#[allow(clippy::too_many_arguments)] // Signature annotations retain their bound owner and syntax.
+fn plan_interface_signature_annotations(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    type_parameters: Option<&NodeList>,
+    parameters: &NodeList,
+    return_type: Option<ts_ast::NodeId>,
+    annotations: &mut Vec<NodeRef>,
+) -> Result<(), SourceCheckError> {
+    let invalid = |node, kind| unsupported(node, kind, SourceSyntaxRole::InterfaceDeclaration);
+    let record = owned_node(arena, bound, store, declaration)?;
+    let mut validator = DeferredAmbientFunctionValidator::new(arena, bound, store);
+    validator
+        .signature(declaration, type_parameters, parameters, return_type)
+        .map_err(|error| match error {
+            SourceCheckError::Unsupported(UnsupportedSourceSyntax::Syntax {
+                node, kind, ..
+            }) => invalid(node, kind),
+            error => error,
+        })?;
+
+    if let Some(type_parameters) = type_parameters {
+        for parameter in &type_parameters.nodes {
+            let parameter = child(declaration, *parameter);
+            let NodeData::TypeParameterDeclaration(data) =
+                &owned_node(arena, bound, store, parameter)?.data
+            else {
+                return Err(invalid(parameter, SyntaxKind::TypeParameter));
+            };
+            annotations.extend(
+                [data.constraint, data.default_type]
+                    .into_iter()
+                    .flatten()
+                    .map(|annotation| child(parameter, annotation)),
+            );
+        }
+    }
+    for parameter in &parameters.nodes {
+        let parameter = child(declaration, *parameter);
+        let NodeData::ParameterDeclaration(data) =
+            &owned_node(arena, bound, store, parameter)?.data
+        else {
+            return Err(invalid(parameter, SyntaxKind::Parameter));
+        };
+        annotations.push(child(
+            parameter,
+            data.type_
+                .ok_or_else(|| invalid(parameter, SyntaxKind::Parameter))?,
         ));
     }
-    annotations.push(return_type);
+    annotations.push(child(
+        declaration,
+        return_type.ok_or_else(|| invalid(declaration, record.kind))?,
+    ));
+    Ok(())
+}
+
+fn plan_interface_method_signature(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+    declaration: NodeRef,
+    annotations: &mut Vec<NodeRef>,
+) -> Result<SemanticSymbolId, SourceCheckError> {
+    let invalid = |node, kind| unsupported(node, kind, SourceSyntaxRole::InterfaceDeclaration);
+    let record = owned_node(arena, bound, store, declaration)?;
+    let NodeData::MethodSignatureDeclaration(signature) = &record.data else {
+        return Err(invalid(declaration, record.kind));
+    };
+    if record.kind != SyntaxKind::MethodSignature
+        || record.flags.0 != 0
+        || signature.full_signature.is_some()
+        || signature.next_container.is_some()
+        || signature.symbol.is_some()
+        || signature.modifiers.is_some()
+        || signature.parameters.has_trailing_comma
+    {
+        return Err(invalid(declaration, record.kind));
+    }
+
+    let name = child(declaration, signature.name);
+    let name_record = owned_node(arena, bound, store, name)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(invalid(name, name_record.kind));
+    };
+    if name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(declaration.node)
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+    {
+        return Err(invalid(name, name_record.kind));
+    }
+
+    let optional = if let Some(token) = signature.postfix_token {
+        let token = child(declaration, token);
+        let token_record = owned_node(arena, bound, store, token)?;
+        if token_record.kind != SyntaxKind::QuestionToken
+            || token_record.flags.0 != 0
+            || token_record.parent != Some(declaration.node)
+            || !matches!(token_record.data, NodeData::Token(_))
+        {
+            return Err(invalid(token, token_record.kind));
+        }
+        true
+    } else {
+        false
+    };
+    let flags = SymbolFlags::METHOD
+        | if optional {
+            SymbolFlags::OPTIONAL
+        } else {
+            SymbolFlags::NONE
+        };
+    let symbol = declaration_symbol(bound, store, declaration, SymbolFlags::METHOD)?;
+    let symbol_record = store.symbol(symbol).ok_or(SourceCheckError::Provenance(
+        SourceCheckProvenanceError::MissingDeclarationSymbol(declaration),
+    ))?;
+    let members = store
+        .symbol(owner)
+        .and_then(ts_binder::semantic::Symbol::members)
+        .and_then(|members| store.symbol_table(members));
+    if symbol_record.flags() != flags
+        || symbol_record.check_flags() != CheckFlags::NONE
+        || symbol_record.name().as_utf8() != Some(identifier.text.as_str())
+        || symbol_record
+            .declarations()
+            .is_none_or(|declarations| !declarations.contains(&declaration))
+        || symbol_record.value_declaration().is_none()
+        || symbol_record.members().is_some()
+        || symbol_record.exports().is_some()
+        || symbol_record.parent() != Some(owner)
+        || symbol_record.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || members.and_then(|members| members.get_source(&identifier.text)) != Some(symbol)
+    {
+        return Err(SourceCheckError::Provenance(
+            SourceCheckProvenanceError::MissingDeclarationSymbol(declaration),
+        ));
+    }
+
+    plan_interface_signature_annotations(
+        arena,
+        bound,
+        store,
+        declaration,
+        signature.type_parameters.as_ref(),
+        &signature.parameters,
+        signature.type_,
+        annotations,
+    )?;
     Ok(symbol)
 }
 
@@ -1044,13 +1173,155 @@ fn plan_jsx_record_interface_heritage(
     Ok(annotations)
 }
 
-fn plan_generic_namespace_interface_heritage(
+#[allow(clippy::too_many_lines)] // Qualified heritage must retain lexical namespace ownership.
+fn namespace_interface_heritage_symbol(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    namespace: SemanticSymbolId,
+    name: NodeRef,
+) -> Result<Option<SemanticSymbolId>, SourceCheckError> {
+    let record = owned_node(arena, bound, store, name)?;
+    if record.flags.0 != 0 {
+        return Err(unsupported(
+            name,
+            record.kind,
+            SourceSyntaxRole::InterfaceDeclaration,
+        ));
+    }
+    match &record.data {
+        NodeData::Identifier(identifier)
+            if record.kind == SyntaxKind::Identifier
+                && identifier.flow_node.is_none()
+                && !identifier.text.is_empty() =>
+        {
+            let namespace_export = store
+                .symbol(namespace)
+                .and_then(ts_binder::semantic::Symbol::exports)
+                .and_then(|exports| store.symbol_table(exports))
+                .and_then(|exports| exports.get_source(&identifier.text));
+            let mut local = None;
+            let mut current = Some(name);
+            while let Some(node) = current {
+                local = bound
+                    .locals(node)
+                    .and_then(|locals| store.symbol_table(locals))
+                    .and_then(|locals| locals.get_source(&identifier.text))
+                    .and_then(|symbol| {
+                        store
+                            .symbol(symbol)
+                            .map(|record| record.export_symbol().unwrap_or(symbol))
+                    });
+                if local.is_some() {
+                    break;
+                }
+                current = arena
+                    .get(node.node)
+                    .and_then(|record| record.parent)
+                    .map(|parent| child(node, parent));
+            }
+            Ok(namespace_export
+                .or(local)
+                .or_else(|| {
+                    store
+                        .intrinsic_bootstrap()
+                        .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+                        .and_then(|globals| globals.get_source(&identifier.text))
+                })
+                .and_then(|symbol| store.get_merged_symbol(symbol)))
+        }
+        NodeData::QualifiedName(qualified)
+            if record.kind == SyntaxKind::QualifiedName
+                && qualified.flow_node.is_none()
+                && qualified.facts == 0 =>
+        {
+            let left = child(name, qualified.left);
+            let right = child(name, qualified.right);
+            let left_record = owned_node(arena, bound, store, left)?;
+            let right_record = owned_node(arena, bound, store, right)?;
+            let NodeData::Identifier(identifier) = &right_record.data else {
+                return Err(unsupported(
+                    right,
+                    right_record.kind,
+                    SourceSyntaxRole::InterfaceDeclaration,
+                ));
+            };
+            if left_record.parent != Some(name.node)
+                || right_record.kind != SyntaxKind::Identifier
+                || right_record.flags.0 != 0
+                || right_record.parent != Some(name.node)
+                || identifier.flow_node.is_some()
+                || identifier.text.is_empty()
+            {
+                return Err(unsupported(
+                    name,
+                    record.kind,
+                    SourceSyntaxRole::InterfaceDeclaration,
+                ));
+            }
+            let owner = namespace_interface_heritage_symbol(arena, bound, store, namespace, left)?;
+            Ok(owner
+                .and_then(|owner| store.symbol(owner))
+                .filter(|owner| owner.flags().intersects(SymbolFlags::NAMESPACE))
+                .and_then(ts_binder::semantic::Symbol::exports)
+                .and_then(|exports| store.symbol_table(exports))
+                .and_then(|exports| exports.get_source(&identifier.text))
+                .and_then(|symbol| store.get_merged_symbol(symbol)))
+        }
+        NodeData::PropertyAccessExpression(access)
+            if record.kind == SyntaxKind::PropertyAccessExpression
+                && access.flow_node.is_none()
+                && access.question_dot_token.is_none()
+                && access.facts == 0 =>
+        {
+            let left = child(name, access.expression);
+            let right = child(name, access.name);
+            let left_record = owned_node(arena, bound, store, left)?;
+            let right_record = owned_node(arena, bound, store, right)?;
+            let NodeData::Identifier(identifier) = &right_record.data else {
+                return Err(unsupported(
+                    right,
+                    right_record.kind,
+                    SourceSyntaxRole::InterfaceDeclaration,
+                ));
+            };
+            if left_record.parent != Some(name.node)
+                || right_record.kind != SyntaxKind::Identifier
+                || right_record.flags.0 != 0
+                || right_record.parent != Some(name.node)
+                || identifier.flow_node.is_some()
+                || identifier.text.is_empty()
+            {
+                return Err(unsupported(
+                    name,
+                    record.kind,
+                    SourceSyntaxRole::InterfaceDeclaration,
+                ));
+            }
+            let owner = namespace_interface_heritage_symbol(arena, bound, store, namespace, left)?;
+            Ok(owner
+                .and_then(|owner| store.symbol(owner))
+                .filter(|owner| owner.flags().intersects(SymbolFlags::NAMESPACE))
+                .and_then(ts_binder::semantic::Symbol::exports)
+                .and_then(|exports| store.symbol_table(exports))
+                .and_then(|exports| exports.get_source(&identifier.text))
+                .and_then(|symbol| store.get_merged_symbol(symbol)))
+        }
+        _ => Err(unsupported(
+            name,
+            record.kind,
+            SourceSyntaxRole::InterfaceDeclaration,
+        )),
+    }
+}
+
+fn plan_namespace_interface_heritage(
     arena: &NodeArena,
     bound: &BoundFile,
     store: &CanonicalTypeMapperStore,
     owner: (SemanticSymbolId, NodeRef),
     clauses: &ts_ast::NodeList,
-    generic: &mut SourceNamespaceGenericInterfacePlan,
+    base_interfaces: &mut Vec<SemanticSymbolId>,
 ) -> Result<(), SourceCheckError> {
     let (namespace, declaration) = owner;
     let invalid = |node, kind| unsupported(node, kind, SourceSyntaxRole::InterfaceDeclaration);
@@ -1082,56 +1353,108 @@ fn plan_generic_namespace_interface_heritage(
         };
         let name = child(base, reference.expression);
         let name_record = owned_node(arena, bound, store, name)?;
-        let NodeData::Identifier(identifier) = &name_record.data else {
-            return Err(invalid(name, name_record.kind));
-        };
-        let symbol = store
-            .symbol(namespace)
-            .and_then(ts_binder::semantic::Symbol::exports)
-            .and_then(|exports| store.symbol_table(exports))
-            .and_then(|exports| exports.get_source(&identifier.text))
-            .or_else(|| {
-                store
-                    .intrinsic_bootstrap()
-                    .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
-                    .and_then(|globals| globals.get_source(&identifier.text))
-            })
-            .and_then(|symbol| store.get_merged_symbol(symbol));
+        let symbol = namespace_interface_heritage_symbol(arena, bound, store, namespace, name)?;
         if base_record.kind != SyntaxKind::ExpressionWithTypeArguments
             || base_record.flags.0 != 0
             || base_record.parent != Some(clause.node)
             || reference.facts != 0
-            || name_record.kind != SyntaxKind::Identifier
-            || name_record.flags.0 != 0
             || name_record.parent != Some(base.node)
-            || identifier.flow_node.is_some()
-            || identifier.text.is_empty()
             || symbol
                 .and_then(|symbol| store.symbol(symbol))
-                .is_none_or(|record| !record.flags().contains(SymbolFlags::INTERFACE))
+                .is_none_or(|record| {
+                    !record.flags().intersects(
+                        SymbolFlags::INTERFACE | SymbolFlags::CLASS | SymbolFlags::TYPE_ALIAS,
+                    )
+                })
         {
             return Err(invalid(base, base_record.kind));
         }
         let symbol = symbol.expect("the base symbol was authenticated");
-        if generic.base_interfaces.contains(&symbol) {
+        if base_interfaces.contains(&symbol) {
             return Err(invalid(base, base_record.kind));
         }
-        generic.base_interfaces.push(symbol);
+        base_interfaces.push(symbol);
         if let Some(arguments) = &reference.type_arguments {
             if arguments.has_trailing_comma || arguments.nodes.is_empty() {
                 return Err(invalid(base, base_record.kind));
             }
+            let mut validator = DeferredAmbientFunctionValidator::new(arena, bound, store);
             for argument_id in &arguments.nodes {
                 let argument = child(base, *argument_id);
                 let argument_record = owned_node(arena, bound, store, argument)?;
                 if argument_record.parent != Some(base.node) {
                     return Err(invalid_parent(argument, base, argument_record.parent));
                 }
+                validator.type_node(base, argument)?;
             }
         }
     }
 
     Ok(())
+}
+
+fn merged_namespace_class_interface_members_are_exact(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    symbol: SemanticSymbolId,
+    members: SymbolTableId,
+) -> bool {
+    let Some(owner) = store.symbol(symbol) else {
+        return false;
+    };
+    let Some(declarations) = owner.declarations() else {
+        return false;
+    };
+    let Some(class) = owner.value_declaration() else {
+        return false;
+    };
+    let Some(class_record) = arena.get(class.node) else {
+        return false;
+    };
+    let Some(interface_record) = arena.get(declaration.node) else {
+        return false;
+    };
+    if owner.flags() != SymbolFlags::CLASS | SymbolFlags::INTERFACE
+        || !declarations.contains(&declaration)
+        || !declarations.contains(&class)
+        || class_record.kind != SyntaxKind::ClassDeclaration
+        || class_record.parent != interface_record.parent
+        || bound.symbol(class) != Some(symbol)
+        || owner.members() != Some(members)
+    {
+        return false;
+    }
+
+    store.symbol_table(members).is_some_and(|table| {
+        table.iter().all(|(_, member)| {
+            store.symbol(member).is_some_and(|record| {
+                let flags = record.flags();
+                record.parent() == Some(symbol)
+                    && (flags == SymbolFlags::TYPE_PARAMETER
+                        || flags == SymbolFlags::CONSTRUCTOR
+                        || flags == SymbolFlags::SIGNATURE
+                        || flags == SymbolFlags::METHOD
+                        || flags == SymbolFlags::METHOD | SymbolFlags::OPTIONAL
+                        || flags == SymbolFlags::PROPERTY
+                        || flags == SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL)
+                    && record.declarations().is_some_and(|member_declarations| {
+                        !member_declarations.is_empty()
+                            && member_declarations.iter().all(|member_declaration| {
+                                arena
+                                    .get(member_declaration.node)
+                                    .and_then(|member_record| member_record.parent)
+                                    .is_some_and(|parent| {
+                                        declarations
+                                            .iter()
+                                            .any(|declaration| declaration.node == parent)
+                                    })
+                            })
+                    })
+            })
+        })
+    })
 }
 
 fn plan_interface_member(
@@ -1192,13 +1515,33 @@ fn plan_interface_member(
         .transpose()?;
     if let Some(heritage) = &interface.heritage_clauses {
         if let Some(generic) = generic.as_mut() {
-            plan_generic_namespace_interface_heritage(
+            plan_namespace_interface_heritage(
                 arena,
                 bound,
                 store,
                 (owner, declaration),
                 heritage,
-                generic,
+                &mut generic.base_interfaces,
+            )?;
+        } else if bound
+            .source_facts()
+            .is_some_and(ts_binder::CanonicalSourceFileFacts::is_declaration_file)
+            && !(store
+                .symbol(owner)
+                .and_then(|symbol| symbol.name().as_utf8())
+                == Some("JSX")
+                && arena.get(interface.name).is_some_and(|name| {
+                    matches!(&name.data, NodeData::Identifier(name) if name.text == "IntrinsicElements")
+                }))
+        {
+            let mut bases = Vec::new();
+            plan_namespace_interface_heritage(
+                arena,
+                bound,
+                store,
+                (owner, declaration),
+                heritage,
+                &mut bases,
             )?;
         } else {
             annotations.extend(plan_jsx_record_interface_heritage(
@@ -1227,7 +1570,8 @@ fn plan_interface_member(
             NodeData::CallSignatureDeclaration(_)
                 if member_record.kind == SyntaxKind::CallSignature =>
             {
-                let call = plan_interface_call_signature(
+                let first_annotation = annotations.len();
+                let call = plan_interface_callable_signature(
                     arena,
                     bound,
                     store,
@@ -1235,10 +1579,55 @@ fn plan_interface_member(
                     member,
                     &mut annotations,
                 )?;
-                if let Some(generic) = generic.as_mut()
-                    && !generic.call_signatures.contains(&call)
-                {
-                    generic.call_signatures.push(call);
+                if let Some(generic) = generic.as_mut() {
+                    generic
+                        .deferred_annotations
+                        .extend_from_slice(&annotations[first_annotation..]);
+                    if !generic.call_signatures.contains(&call) {
+                        generic.call_signatures.push(call);
+                    }
+                }
+            }
+            NodeData::ConstructSignatureDeclaration(_)
+                if member_record.kind == SyntaxKind::ConstructSignature =>
+            {
+                let first_annotation = annotations.len();
+                let constructor = plan_interface_callable_signature(
+                    arena,
+                    bound,
+                    store,
+                    symbol,
+                    member,
+                    &mut annotations,
+                )?;
+                if let Some(generic) = generic.as_mut() {
+                    generic
+                        .deferred_annotations
+                        .extend_from_slice(&annotations[first_annotation..]);
+                    if !generic.construct_signatures.contains(&constructor) {
+                        generic.construct_signatures.push(constructor);
+                    }
+                }
+            }
+            NodeData::MethodSignatureDeclaration(_)
+                if member_record.kind == SyntaxKind::MethodSignature =>
+            {
+                let first_annotation = annotations.len();
+                let method = plan_interface_method_signature(
+                    arena,
+                    bound,
+                    store,
+                    symbol,
+                    member,
+                    &mut annotations,
+                )?;
+                if let Some(generic) = generic.as_mut() {
+                    generic
+                        .deferred_annotations
+                        .extend_from_slice(&annotations[first_annotation..]);
+                    if !generic.methods.contains(&method) {
+                        generic.methods.push(method);
+                    }
                 }
             }
             NodeData::PropertyDeclaration(property)
@@ -1358,6 +1747,16 @@ fn plan_interface_member(
             != generic.type_parameters.len()
                 + generic.properties.len()
                 + generic.call_signatures.len()
+                + generic.construct_signatures.len()
+                + generic.methods.len()
+        && !merged_namespace_class_interface_members_are_exact(
+            arena,
+            bound,
+            store,
+            declaration,
+            symbol,
+            generic.members,
+        )
     {
         return Err(SourceCheckError::Provenance(
             SourceCheckProvenanceError::MissingDeclarationSymbol(declaration),
@@ -1419,6 +1818,680 @@ fn namespace_callable_error(declaration: NodeRef, error: SourceCallableError) ->
         SourceCallableError::DeclaredType(error) => SourceCheckError::DeclaredType(error),
         SourceCallableError::LiteralCache(error) => error.into(),
     }
+}
+
+fn namespace_overload_error(declaration: NodeRef, error: SourceOverloadError) -> SourceCheckError {
+    match error {
+        SourceOverloadError::Unsupported(node) => unsupported(
+            node,
+            SyntaxKind::FunctionDeclaration,
+            SourceSyntaxRole::FunctionDeclaration,
+        ),
+        SourceOverloadError::Callable(error) => namespace_callable_error(declaration, error),
+        SourceOverloadError::Literal(error) => error.into(),
+        SourceOverloadError::Invariant(_) => {
+            SourceCheckError::Function(SourceFunctionInvariant::Callable(declaration))
+        }
+    }
+}
+
+struct DeferredAmbientFunctionValidator<'a> {
+    arena: &'a NodeArena,
+    bound: &'a BoundFile,
+    store: &'a CanonicalTypeMapperStore,
+    visited: HashSet<NodeRef>,
+    annotations: Vec<NodeRef>,
+}
+
+struct DeferredAmbientSignatureParameters {
+    type_parameters: Vec<SemanticSymbolId>,
+    parameters: Vec<SemanticSymbolId>,
+    names: HashSet<String>,
+}
+
+impl<'a> DeferredAmbientFunctionValidator<'a> {
+    fn new(
+        arena: &'a NodeArena,
+        bound: &'a BoundFile,
+        store: &'a CanonicalTypeMapperStore,
+    ) -> Self {
+        Self {
+            arena,
+            bound,
+            store,
+            visited: HashSet::new(),
+            annotations: Vec::new(),
+        }
+    }
+
+    fn invalid(node: NodeRef, kind: SyntaxKind) -> SourceCheckError {
+        unsupported(node, kind, SourceSyntaxRole::FunctionDeclaration)
+    }
+
+    fn visit(&mut self, parent: NodeRef, node: NodeRef) -> Result<&'a Node, SourceCheckError> {
+        let record = owned_node(self.arena, self.bound, self.store, node)?;
+        let parent_record = owned_node(self.arena, self.bound, self.store, parent)?;
+        if record.parent != Some(parent.node) {
+            return Err(invalid_parent(node, parent, record.parent));
+        }
+        if record.flags.0 != 0
+            || !record.data.matches_syntax_kind(record.kind)
+            || record.range.start < parent_record.range.start
+            || record.range.end > parent_record.range.end
+        {
+            return Err(Self::invalid(node, record.kind));
+        }
+        if !self.visited.insert(node) {
+            return Err(SourceCheckError::Provenance(
+                SourceCheckProvenanceError::RepeatedNode(node),
+            ));
+        }
+        Ok(record)
+    }
+
+    fn identifier(&mut self, parent: NodeRef, node: NodeRef) -> Result<String, SourceCheckError> {
+        let record = self.visit(parent, node)?;
+        let NodeData::Identifier(identifier) = &record.data else {
+            return Err(Self::invalid(node, record.kind));
+        };
+        if record.kind != SyntaxKind::Identifier
+            || identifier.flow_node.is_some()
+            || identifier.text.is_empty()
+        {
+            return Err(Self::invalid(node, record.kind));
+        }
+        Ok(identifier.text.clone())
+    }
+
+    fn local_symbol(
+        &self,
+        container: NodeRef,
+        declaration: NodeRef,
+        name: &str,
+        flags: SymbolFlags,
+    ) -> Result<SemanticSymbolId, SourceCheckError> {
+        let symbol = declaration_symbol(self.bound, self.store, declaration, flags)?;
+        let record = self
+            .store
+            .symbol(symbol)
+            .ok_or(SourceCheckError::Provenance(
+                SourceCheckProvenanceError::MissingDeclarationSymbol(declaration),
+            ))?;
+        let value_declaration = if flags == SymbolFlags::TYPE_PARAMETER {
+            None
+        } else {
+            Some(declaration)
+        };
+        if self.bound.symbol(declaration) != Some(symbol)
+            || record.flags() != flags
+            || record.check_flags() != CheckFlags::NONE
+            || record.name().as_utf8() != Some(name)
+            || record.declarations() != Some(&[declaration])
+            || record.value_declaration() != value_declaration
+            || record.members().is_some()
+            || record.exports().is_some()
+            || record.parent().is_some()
+            || record.export_symbol().is_some()
+            || self
+                .bound
+                .locals(container)
+                .and_then(|locals| self.store.symbol_table(locals))
+                .and_then(|locals| locals.get_source(name))
+                != Some(symbol)
+        {
+            return Err(SourceCheckError::Provenance(
+                SourceCheckProvenanceError::MissingDeclarationSymbol(declaration),
+            ));
+        }
+        Ok(symbol)
+    }
+
+    fn type_parameter(
+        &mut self,
+        container: NodeRef,
+        parameter: NodeRef,
+        names: &mut HashSet<String>,
+    ) -> Result<(SemanticSymbolId, bool), SourceCheckError> {
+        let record = self.visit(container, parameter)?;
+        let NodeData::TypeParameterDeclaration(data) = &record.data else {
+            return Err(Self::invalid(parameter, record.kind));
+        };
+        if record.kind != SyntaxKind::TypeParameter
+            || data.expression.is_some()
+            || data.symbol.is_some()
+            || data.modifiers.is_some()
+        {
+            return Err(Self::invalid(parameter, record.kind));
+        }
+        let name = self.identifier(parameter, child(parameter, data.name))?;
+        if !names.insert(name.clone()) {
+            return Err(Self::invalid(parameter, record.kind));
+        }
+        let symbol = self.local_symbol(container, parameter, &name, SymbolFlags::TYPE_PARAMETER)?;
+        for annotation in [data.constraint, data.default_type].into_iter().flatten() {
+            let annotation = child(parameter, annotation);
+            self.annotations.push(annotation);
+            self.type_node(parameter, annotation)?;
+        }
+        Ok((symbol, data.default_type.is_some()))
+    }
+
+    fn parameter(
+        &mut self,
+        container: NodeRef,
+        parameter: NodeRef,
+        index: usize,
+        count: usize,
+        optional_seen: &mut bool,
+        names: &mut HashSet<String>,
+    ) -> Result<SemanticSymbolId, SourceCheckError> {
+        let record = self.visit(container, parameter)?;
+        let NodeData::ParameterDeclaration(data) = &record.data else {
+            return Err(Self::invalid(parameter, record.kind));
+        };
+        if record.kind != SyntaxKind::Parameter
+            || data.initializer.is_some()
+            || data.symbol.is_some()
+            || data.modifiers.is_some()
+            || data.facts != 0
+        {
+            return Err(Self::invalid(parameter, record.kind));
+        }
+        let name = self.identifier(parameter, child(parameter, data.name))?;
+        if name == "this" || !names.insert(name.clone()) {
+            return Err(Self::invalid(parameter, record.kind));
+        }
+        let symbol = self.local_symbol(
+            container,
+            parameter,
+            &name,
+            SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+        )?;
+        if let Some(token) = data.dot_dot_dot_token {
+            let token = child(parameter, token);
+            let token_record = self.visit(parameter, token)?;
+            if token_record.kind != SyntaxKind::DotDotDotToken
+                || index + 1 != count
+                || data.question_token.is_some()
+            {
+                return Err(Self::invalid(token, token_record.kind));
+            }
+        }
+        if let Some(token) = data.question_token {
+            let token = child(parameter, token);
+            let token_record = self.visit(parameter, token)?;
+            if token_record.kind != SyntaxKind::QuestionToken {
+                return Err(Self::invalid(token, token_record.kind));
+            }
+            *optional_seen = true;
+        } else if *optional_seen && data.dot_dot_dot_token.is_none() {
+            return Err(Self::invalid(parameter, record.kind));
+        }
+        let annotation = data
+            .type_
+            .map(|annotation| child(parameter, annotation))
+            .ok_or_else(|| Self::invalid(parameter, record.kind))?;
+        self.annotations.push(annotation);
+        self.type_node(parameter, annotation)?;
+        Ok(symbol)
+    }
+
+    fn signature_parameters(
+        &mut self,
+        container: NodeRef,
+        type_parameters: Option<&NodeList>,
+        parameters: &NodeList,
+    ) -> Result<DeferredAmbientSignatureParameters, SourceCheckError> {
+        let record = owned_node(self.arena, self.bound, self.store, container)?;
+        if parameters.has_trailing_comma
+            || parameters.range.start < record.range.start
+            || parameters.range.end > record.range.end
+            || type_parameters.is_some_and(|list| {
+                list.nodes.is_empty()
+                    || list.has_trailing_comma
+                    || list.range.start < record.range.start
+                    || list.range.end > parameters.range.start
+            })
+        {
+            return Err(Self::invalid(container, record.kind));
+        }
+
+        let mut type_parameter_names = HashSet::new();
+        let mut type_parameter_symbols = Vec::new();
+        let mut default_seen = false;
+        for parameter in type_parameters.into_iter().flat_map(|list| &list.nodes) {
+            let (symbol, has_default) = self.type_parameter(
+                container,
+                child(container, *parameter),
+                &mut type_parameter_names,
+            )?;
+            if default_seen && !has_default {
+                return Err(Self::invalid(
+                    child(container, *parameter),
+                    SyntaxKind::TypeParameter,
+                ));
+            }
+            default_seen |= has_default;
+            type_parameter_symbols.push(symbol);
+        }
+
+        let mut parameter_names = HashSet::new();
+        let mut parameter_symbols = Vec::with_capacity(parameters.nodes.len());
+        let mut optional_seen = false;
+        for (index, parameter) in parameters.nodes.iter().enumerate() {
+            parameter_symbols.push(self.parameter(
+                container,
+                child(container, *parameter),
+                index,
+                parameters.nodes.len(),
+                &mut optional_seen,
+                &mut parameter_names,
+            )?);
+        }
+        let expected_locals = type_parameter_symbols.len() + parameter_symbols.len();
+        if self
+            .bound
+            .locals(container)
+            .and_then(|locals| self.store.symbol_table(locals))
+            .map_or(0, ts_binder::semantic::SymbolTable::len)
+            != expected_locals
+        {
+            return Err(Self::invalid(container, record.kind));
+        }
+
+        Ok(DeferredAmbientSignatureParameters {
+            type_parameters: type_parameter_symbols,
+            parameters: parameter_symbols,
+            names: parameter_names,
+        })
+    }
+
+    fn signature(
+        &mut self,
+        container: NodeRef,
+        type_parameters: Option<&NodeList>,
+        parameters: &NodeList,
+        return_type: Option<ts_ast::NodeId>,
+    ) -> Result<(Vec<SemanticSymbolId>, Vec<SemanticSymbolId>), SourceCheckError> {
+        let record = owned_node(self.arena, self.bound, self.store, container)?;
+        let DeferredAmbientSignatureParameters {
+            type_parameters: type_parameter_symbols,
+            parameters: parameter_symbols,
+            names: parameter_names,
+        } = self.signature_parameters(container, type_parameters, parameters)?;
+        let return_type = return_type
+            .map(|return_type| child(container, return_type))
+            .ok_or_else(|| Self::invalid(container, record.kind))?;
+        if let Some(NodeData::TypePredicateNode(predicate)) =
+            self.arena.get(return_type.node).map(|node| &node.data)
+        {
+            let parameter_name = child(return_type, predicate.parameter_name);
+            let Some(NodeData::Identifier(identifier)) =
+                self.arena.get(parameter_name.node).map(|node| &node.data)
+            else {
+                return Err(Self::invalid(return_type, SyntaxKind::TypePredicate));
+            };
+            if predicate.asserts_modifier.is_some()
+                || predicate.type_.is_none()
+                || !parameter_names.contains(&identifier.text)
+            {
+                return Err(Self::invalid(return_type, SyntaxKind::TypePredicate));
+            }
+        }
+        self.annotations.push(return_type);
+        self.type_node(container, return_type)?;
+        Ok((type_parameter_symbols, parameter_symbols))
+    }
+
+    fn signature_owner(
+        &self,
+        node: NodeRef,
+        signature_name: InternalSymbolName,
+    ) -> Result<(), SourceCheckError> {
+        let symbol = declaration_symbol(self.bound, self.store, node, SymbolFlags::TYPE_LITERAL)?;
+        let owner = self
+            .store
+            .symbol(symbol)
+            .ok_or(SourceCheckError::Provenance(
+                SourceCheckProvenanceError::MissingDeclarationSymbol(node),
+            ))?;
+        let members = owner
+            .members()
+            .and_then(|members| self.store.symbol_table(members))
+            .ok_or(SourceCheckError::Provenance(
+                SourceCheckProvenanceError::MissingDeclarationSymbol(node),
+            ))?;
+        let signature = members
+            .get(signature_name.as_ref())
+            .and_then(|signature| self.store.symbol(signature))
+            .ok_or(SourceCheckError::Provenance(
+                SourceCheckProvenanceError::MissingDeclarationSymbol(node),
+            ))?;
+        if self.bound.symbol(node) != Some(symbol)
+            || owner.flags() != SymbolFlags::TYPE_LITERAL
+            || owner.check_flags() != CheckFlags::NONE
+            || owner.name() != InternalSymbolName::Type.as_ref()
+            || owner.declarations() != Some(&[node])
+            || owner.value_declaration().is_some()
+            || owner.exports().is_some()
+            || owner.parent().is_some()
+            || owner.export_symbol().is_some()
+            || members.len() != 1
+            || signature.flags() != SymbolFlags::SIGNATURE
+            || signature.check_flags() != CheckFlags::NONE
+            || signature.name() != signature_name.as_ref()
+            || signature.declarations() != Some(&[node])
+            || signature.value_declaration().is_some()
+            || signature.members().is_some()
+            || signature.exports().is_some()
+            || signature.parent().is_some()
+            || signature.export_symbol().is_some()
+        {
+            return Err(SourceCheckError::Provenance(
+                SourceCheckProvenanceError::MissingDeclarationSymbol(node),
+            ));
+        }
+        Ok(())
+    }
+
+    fn type_literal_member_symbol(
+        &self,
+        container: NodeRef,
+        declaration: NodeRef,
+        name: ts_binder::EscapedNameRef<'_>,
+        flags: SymbolFlags,
+    ) -> Result<SemanticSymbolId, SourceCheckError> {
+        let owner =
+            declaration_symbol(self.bound, self.store, container, SymbolFlags::TYPE_LITERAL)?;
+        let symbol = declaration_symbol(self.bound, self.store, declaration, flags)?;
+        let record = self
+            .store
+            .symbol(symbol)
+            .ok_or(SourceCheckError::Class(declaration))?;
+        if record.flags() != flags
+            || record.check_flags() != CheckFlags::NONE
+                && record.check_flags() != CheckFlags::READONLY
+            || record.name() != name
+            || record.declarations().is_none_or(|declarations| {
+                declarations.is_empty() || !declarations.contains(&declaration)
+            })
+            || record.members().is_some()
+            || record.exports().is_some()
+            || record.parent() != Some(owner)
+            || record.export_symbol().is_some()
+            || self
+                .store
+                .symbol(owner)
+                .and_then(ts_binder::semantic::Symbol::members)
+                .and_then(|members| self.store.symbol_table(members))
+                .and_then(|members| members.get(name))
+                != Some(symbol)
+        {
+            return Err(SourceCheckError::Provenance(
+                SourceCheckProvenanceError::MissingDeclarationSymbol(declaration),
+            ));
+        }
+        Ok(symbol)
+    }
+
+    fn type_node(&mut self, parent: NodeRef, node: NodeRef) -> Result<(), SourceCheckError> {
+        let record = self.visit(parent, node)?;
+        match &record.data {
+            NodeData::Identifier(identifier) => {
+                if record.kind != SyntaxKind::Identifier
+                    || identifier.flow_node.is_some()
+                    || identifier.text.is_empty()
+                {
+                    return Err(Self::invalid(node, record.kind));
+                }
+                return Ok(());
+            }
+            NodeData::ConstructorTypeNode(function) => {
+                if function.full_signature.is_some()
+                    || function.next_container.is_some()
+                    || function.symbol.is_some()
+                    || function.modifiers.is_some()
+                {
+                    return Err(Self::invalid(node, record.kind));
+                }
+                self.signature_owner(node, InternalSymbolName::New)?;
+                self.signature(
+                    node,
+                    function.type_parameters.as_ref(),
+                    &function.parameters,
+                    function.type_,
+                )?;
+                return Ok(());
+            }
+            NodeData::FunctionTypeNode(function) => {
+                if function.full_signature.is_some()
+                    || function.next_container.is_some()
+                    || function.symbol.is_some()
+                    || function.modifiers.is_some()
+                {
+                    return Err(Self::invalid(node, record.kind));
+                }
+                self.signature_owner(node, InternalSymbolName::Call)?;
+                self.signature(
+                    node,
+                    function.type_parameters.as_ref(),
+                    &function.parameters,
+                    function.type_,
+                )?;
+                return Ok(());
+            }
+            NodeData::TypeLiteralNode(literal) => {
+                let symbol =
+                    declaration_symbol(self.bound, self.store, node, SymbolFlags::TYPE_LITERAL)?;
+                let owner = self
+                    .store
+                    .symbol(symbol)
+                    .ok_or(SourceCheckError::Class(node))?;
+                if literal.symbol.is_some()
+                    || literal.members.has_trailing_comma
+                    || owner.flags() != SymbolFlags::TYPE_LITERAL
+                    || owner.check_flags() != CheckFlags::NONE
+                    || owner.name() != InternalSymbolName::Type.as_ref()
+                    || owner.declarations() != Some(&[node])
+                    || owner.value_declaration().is_some()
+                    || owner.exports().is_some()
+                    || owner.parent().is_some()
+                    || owner.export_symbol().is_some()
+                {
+                    return Err(Self::invalid(node, record.kind));
+                }
+                for member in &literal.members.nodes {
+                    self.type_node(node, child(node, *member))?;
+                }
+                return Ok(());
+            }
+            NodeData::PropertyDeclaration(property) => {
+                if record.kind != SyntaxKind::PropertyDeclaration
+                    || property.initializer.is_some()
+                    || property.symbol.is_some()
+                    || property.facts != 0
+                {
+                    return Err(Self::invalid(node, record.kind));
+                }
+                if let Some(modifiers) = &property.modifiers {
+                    if modifiers.flags.0 != 0 || modifiers.list.has_trailing_comma {
+                        return Err(Self::invalid(node, record.kind));
+                    }
+                    for modifier in &modifiers.list.nodes {
+                        let modifier = child(node, *modifier);
+                        if self.visit(node, modifier)?.kind != SyntaxKind::ReadonlyKeyword {
+                            return Err(Self::invalid(modifier, SyntaxKind::ReadonlyKeyword));
+                        }
+                    }
+                }
+                let name = self.identifier(node, child(node, property.name))?;
+                let optional = if let Some(token) = property.postfix_token {
+                    let token = child(node, token);
+                    if self.visit(node, token)?.kind != SyntaxKind::QuestionToken {
+                        return Err(Self::invalid(token, SyntaxKind::QuestionToken));
+                    }
+                    true
+                } else {
+                    false
+                };
+                let flags = SymbolFlags::PROPERTY
+                    | if optional {
+                        SymbolFlags::OPTIONAL
+                    } else {
+                        SymbolFlags::NONE
+                    };
+                self.type_literal_member_symbol(
+                    parent,
+                    node,
+                    EscapedName::source(&name).as_ref(),
+                    flags,
+                )?;
+                let annotation = property
+                    .type_
+                    .map(|annotation| child(node, annotation))
+                    .ok_or_else(|| Self::invalid(node, record.kind))?;
+                self.annotations.push(annotation);
+                self.type_node(node, annotation)?;
+                return Ok(());
+            }
+            NodeData::IndexSignatureDeclaration(signature) => {
+                if record.kind != SyntaxKind::IndexSignature
+                    || signature.full_signature.is_some()
+                    || signature.next_container.is_some()
+                    || signature.symbol.is_some()
+                    || signature.type_parameters.is_some()
+                    || signature.modifiers.is_some()
+                {
+                    return Err(Self::invalid(node, record.kind));
+                }
+                self.type_literal_member_symbol(
+                    parent,
+                    node,
+                    InternalSymbolName::Index.as_ref(),
+                    SymbolFlags::SIGNATURE,
+                )?;
+                self.signature(node, None, &signature.parameters, Some(signature.type_))?;
+                return Ok(());
+            }
+            NodeData::MappedTypeNode(mapped) => {
+                if mapped.next_container.is_some() || mapped.symbol.is_some() {
+                    return Err(Self::invalid(node, record.kind));
+                }
+                if let Some(token) = mapped.readonly_token {
+                    self.type_node(node, child(node, token))?;
+                }
+                self.type_parameter(
+                    node,
+                    child(node, mapped.type_parameter),
+                    &mut HashSet::new(),
+                )?;
+                for nested in [mapped.name_type, mapped.question_token, mapped.type_]
+                    .into_iter()
+                    .flatten()
+                {
+                    self.type_node(node, child(node, nested))?;
+                }
+                if let Some(members) = &mapped.members {
+                    if members.has_trailing_comma {
+                        return Err(Self::invalid(node, record.kind));
+                    }
+                    for member in &members.nodes {
+                        self.type_node(node, child(node, *member))?;
+                    }
+                }
+                return Ok(());
+            }
+            NodeData::TypeReferenceNode(reference) => {
+                if reference.type_arguments.as_ref().is_some_and(|arguments| {
+                    arguments.nodes.is_empty() || arguments.has_trailing_comma
+                }) {
+                    return Err(Self::invalid(node, record.kind));
+                }
+            }
+            _ => {}
+        }
+
+        let type_syntax = record.kind.is_keyword_type()
+            || (record.kind as u16) >= (SyntaxKind::FIRST_TYPE_NODE as u16)
+                && (record.kind as u16) <= (SyntaxKind::LAST_TYPE_NODE as u16)
+            || matches!(
+                record.kind,
+                SyntaxKind::QualifiedName
+                    | SyntaxKind::ComputedPropertyName
+                    | SyntaxKind::PropertySignature
+                    | SyntaxKind::StringLiteral
+                    | SyntaxKind::NumericLiteral
+                    | SyntaxKind::BigIntLiteral
+                    | SyntaxKind::NoSubstitutionTemplateLiteral
+                    | SyntaxKind::TemplateHead
+                    | SyntaxKind::TemplateMiddle
+                    | SyntaxKind::TemplateTail
+                    | SyntaxKind::QuestionToken
+                    | SyntaxKind::DotDotDotToken
+                    | SyntaxKind::ReadonlyKeyword
+                    | SyntaxKind::PlusToken
+                    | SyntaxKind::MinusToken
+                    | SyntaxKind::TrueKeyword
+                    | SyntaxKind::FalseKeyword
+                    | SyntaxKind::NullKeyword
+                    | SyntaxKind::PrefixUnaryExpression
+                    | SyntaxKind::PropertyAccessExpression
+                    | SyntaxKind::ElementAccessExpression
+            );
+        if !type_syntax {
+            return Err(Self::invalid(node, record.kind));
+        }
+        let mut children = Vec::new();
+        record.for_each_child(|nested| children.push(child(node, nested)));
+        for nested in children {
+            self.type_node(node, nested)?;
+        }
+        Ok(())
+    }
+}
+
+fn plan_deferred_ambient_function(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    symbol: SemanticSymbolId,
+) -> Result<SourceNamespaceMemberPlan, SourceCheckError> {
+    let record = owned_node(arena, bound, store, declaration)?;
+    let NodeData::FunctionDeclaration(function) = &record.data else {
+        return Err(unsupported(
+            declaration,
+            record.kind,
+            SourceSyntaxRole::FunctionDeclaration,
+        ));
+    };
+    if store
+        .value_symbol_links(symbol)
+        .is_some_and(|links| links != &ValueSymbolLinks::default())
+        || store.source_callable_type_for_owner(symbol).is_some()
+        || store
+            .source_callable_type_for_declaration(declaration)
+            .is_some()
+    {
+        return Err(SourceCheckError::Function(
+            SourceFunctionInvariant::Callable(declaration),
+        ));
+    }
+
+    let mut validator = DeferredAmbientFunctionValidator::new(arena, bound, store);
+    let (type_parameters, parameters) = validator.signature(
+        declaration,
+        function.type_parameters.as_ref(),
+        &function.parameters,
+        function.type_,
+    )?;
+    Ok(SourceNamespaceMemberPlan::DeferredAmbientFunction {
+        declaration,
+        symbol,
+        type_parameters,
+        parameters,
+        annotations: validator.annotations,
+    })
 }
 
 fn plan_namespace_function(
@@ -1561,10 +2634,16 @@ fn plan_namespace_function(
     let local_record = store.symbol(local).ok_or(SourceCheckError::Provenance(
         SourceCheckProvenanceError::MissingDeclarationSymbol(declaration),
     ))?;
+    let declarations = function_record
+        .declarations()
+        .filter(|declarations| !declarations.is_empty())
+        .ok_or(SourceCheckError::Provenance(
+            SourceCheckProvenanceError::MissingDeclarationSymbol(declaration),
+        ))?;
+    let overloaded = declarations.len() > 1;
     if function_record.flags() != SymbolFlags::FUNCTION
         || function_record.check_flags() != CheckFlags::NONE
-        || function_record.declarations() != Some(&[declaration])
-        || function_record.value_declaration() != Some(declaration)
+        || function_record.value_declaration() != declarations.first().copied()
         || function_record.name().as_utf8() != Some(identifier.text.as_str())
         || function_record.members().is_some()
         || function_record.exports().is_some()
@@ -1573,7 +2652,7 @@ fn plan_namespace_function(
         || store.get_merged_symbol(local) != Some(local)
         || local_record.flags() != SymbolFlags::EXPORT_VALUE
         || local_record.check_flags() != CheckFlags::NONE
-        || local_record.declarations() != Some(&[declaration])
+        || local_record.declarations() != Some(declarations)
         || local_record.value_declaration().is_some()
         || local_record.name().as_utf8() != Some(identifier.text.as_str())
         || local_record.members().is_some()
@@ -1598,13 +2677,127 @@ fn plan_namespace_function(
         ));
     }
     let host = DeclaredTypeHost::new([(arena, bound)]).map_err(DeclaredTypeError::from)?;
+    if overloaded {
+        if !ambient_declaration
+            || declarations.iter().any(|candidate| {
+                let Some(candidate_record) = arena.get(candidate.node) else {
+                    return true;
+                };
+                let NodeData::FunctionDeclaration(candidate_function) = &candidate_record.data
+                else {
+                    return true;
+                };
+                let candidate_name = candidate_function
+                    .name
+                    .and_then(|name| arena.get(name))
+                    .and_then(|name| match &name.data {
+                        NodeData::Identifier(name) => Some(name.text.as_str()),
+                        _ => None,
+                    });
+                !candidate.is_for(declaration.arena, declaration.file)
+                    || candidate_record.kind != SyntaxKind::FunctionDeclaration
+                    || candidate_record.parent != record.parent
+                    || candidate_name != Some(identifier.text.as_str())
+                    || bound.symbol(*candidate) != Some(symbol)
+                    || bound.local_symbol(*candidate) != Some(local)
+            })
+        {
+            return Err(unsupported(
+                declaration,
+                record.kind,
+                SourceSyntaxRole::FunctionDeclaration,
+            ));
+        }
+        let overload = source_overloads::plan_source_namespace_ambient_overload_group(
+            store,
+            &host,
+            (namespace, owner),
+            symbol,
+            declarations,
+        )
+        .map_err(|error| namespace_overload_error(declaration, error))?;
+        let planned = overload
+            .declarations
+            .iter()
+            .find(|planned| planned.declaration == declaration)
+            .ok_or(SourceCheckError::Function(
+                SourceFunctionInvariant::Callable(declaration),
+            ))?;
+        let deferred = plan_deferred_ambient_function(arena, bound, store, declaration, symbol)?;
+        let SourceNamespaceMemberPlan::DeferredAmbientFunction {
+            type_parameters,
+            parameters,
+            annotations,
+            ..
+        } = &deferred
+        else {
+            unreachable!("ambient function validation produces a deferred declaration")
+        };
+        if !type_parameters.iter().copied().eq(planned
+            .type_parameters
+            .iter()
+            .map(|parameter| parameter.symbol))
+            || !parameters
+                .iter()
+                .copied()
+                .eq(planned.parameters.iter().map(|parameter| parameter.symbol))
+            || !annotations.contains(&planned.return_type)
+            || !overload
+                .annotations()
+                .all(|annotation| host.node(annotation).is_some())
+        {
+            return Err(SourceCheckError::Function(
+                SourceFunctionInvariant::Callable(declaration),
+            ));
+        }
+        return Ok(deferred);
+    }
+
+    if ambient_declaration
+        && function.type_parameters.is_some()
+        && (function
+            .type_
+            .and_then(|annotation| arena.get(annotation))
+            .is_some_and(|annotation| annotation.kind == SyntaxKind::TypePredicate)
+            || function.parameters.nodes.iter().any(|parameter| {
+                arena
+                    .get(*parameter)
+                    .and_then(|record| match &record.data {
+                        NodeData::ParameterDeclaration(parameter) => parameter.type_,
+                        _ => None,
+                    })
+                    .and_then(|annotation| arena.get(annotation))
+                    .is_some_and(|annotation| {
+                        matches!(
+                            annotation.kind,
+                            SyntaxKind::ConstructorType | SyntaxKind::FunctionType
+                        )
+                    })
+            }))
+    {
+        return plan_deferred_ambient_function(arena, bound, store, declaration, symbol);
+    }
+
     let array_targets = store
         .source_callable_type_for_owner(symbol)
         .and_then(|type_| store.source_callable_provenance(type_))
         .and_then(|provenance| provenance.array_targets);
-    let callable =
-        source_callables::plan_source_callable(store, &host, declaration, symbol, array_targets)
-            .map_err(|error| namespace_callable_error(declaration, error))?;
+    let callable = match source_callables::plan_source_callable(
+        store,
+        &host,
+        declaration,
+        symbol,
+        array_targets,
+    ) {
+        Ok(callable) => callable,
+        Err(SourceCallableError::Unsupported(
+            SourceCallableUnsupported::GenericSignature(_)
+            | SourceCallableUnsupported::TypePredicate(_),
+        )) if ambient_declaration && function.type_parameters.is_some() => {
+            return plan_deferred_ambient_function(arena, bound, store, declaration, symbol);
+        }
+        Err(error) => return Err(namespace_callable_error(declaration, error)),
+    };
     if callable.owner_parent != Some(owner)
         || callable.export_local != Some(local)
         || callable.body != body
@@ -2866,6 +4059,674 @@ fn plan_namespace_class_heritage(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Class members retain their owner, export side, and flags.
+fn deferred_ambient_class_member_symbol(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    class: (NodeRef, SemanticSymbolId),
+    declaration: NodeRef,
+    name: ts_binder::EscapedNameRef<'_>,
+    flags: SymbolFlags,
+    is_static: bool,
+) -> Result<SemanticSymbolId, SourceCheckError> {
+    let (class_declaration, owner) = class;
+    let symbol = declaration_symbol(bound, store, declaration, flags)?;
+    let record = store
+        .symbol(symbol)
+        .ok_or(SourceCheckError::Class(declaration))?;
+    let owner_record = store
+        .symbol(owner)
+        .ok_or(SourceCheckError::Class(class_declaration))?;
+    let table = if is_static {
+        owner_record.exports()
+    } else {
+        owner_record.members()
+    }
+    .and_then(|table| store.symbol_table(table));
+    let Some(declarations) = record.declarations() else {
+        return Err(SourceCheckError::Class(declaration));
+    };
+    if record.flags() != flags
+        || record.check_flags() != CheckFlags::NONE && record.check_flags() != CheckFlags::READONLY
+        || record.name() != name
+        || declarations.is_empty()
+        || !declarations.contains(&declaration)
+        || declarations.iter().any(|candidate| {
+            !candidate.is_for(class_declaration.arena, class_declaration.file)
+                || arena
+                    .get(candidate.node)
+                    .is_none_or(|candidate| candidate.parent != Some(class_declaration.node))
+                || bound.symbol(*candidate) != Some(symbol)
+        })
+        || flags == SymbolFlags::CONSTRUCTOR && record.value_declaration().is_some()
+        || flags != SymbolFlags::CONSTRUCTOR && record.value_declaration().is_none()
+        || record.members().is_some()
+        || record.exports().is_some()
+        || record.parent() != Some(owner)
+        || record.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || table.and_then(|table| table.get(name)) != Some(symbol)
+    {
+        return Err(SourceCheckError::Provenance(
+            SourceCheckProvenanceError::MissingDeclarationSymbol(declaration),
+        ));
+    }
+    Ok(symbol)
+}
+
+fn deferred_ambient_class_modifiers(
+    validator: &mut DeferredAmbientFunctionValidator<'_>,
+    declaration: NodeRef,
+    modifiers: Option<&ModifierList>,
+) -> Result<(bool, bool), SourceCheckError> {
+    let Some(modifiers) = modifiers else {
+        return Ok((false, false));
+    };
+    if modifiers.flags.0 != 0 || modifiers.list.has_trailing_comma {
+        return Err(SourceCheckError::Class(declaration));
+    }
+    let mut readonly = false;
+    let mut is_static = false;
+    let mut visibility = false;
+    for modifier in &modifiers.list.nodes {
+        let modifier = child(declaration, *modifier);
+        let record = validator.visit(declaration, modifier)?;
+        match record.kind {
+            SyntaxKind::ReadonlyKeyword if !readonly => readonly = true,
+            SyntaxKind::StaticKeyword if !is_static => is_static = true,
+            SyntaxKind::PublicKeyword
+            | SyntaxKind::ProtectedKeyword
+            | SyntaxKind::PrivateKeyword
+                if !visibility =>
+            {
+                visibility = true;
+            }
+            SyntaxKind::AbstractKeyword => {}
+            _ => return Err(SourceCheckError::Class(modifier)),
+        }
+    }
+    Ok((readonly, is_static))
+}
+
+fn deferred_ambient_class_type_parameters(
+    validator: &mut DeferredAmbientFunctionValidator<'_>,
+    declaration: NodeRef,
+    owner: SemanticSymbolId,
+    parameters: Option<&NodeList>,
+) -> Result<Vec<SemanticSymbolId>, SourceCheckError> {
+    let Some(parameters) = parameters else {
+        return Ok(Vec::new());
+    };
+    let class_record = owned_node(
+        validator.arena,
+        validator.bound,
+        validator.store,
+        declaration,
+    )?;
+    if parameters.nodes.is_empty()
+        || parameters.has_trailing_comma
+        || parameters.range.start < class_record.range.start
+        || parameters.range.end > class_record.range.end
+    {
+        return Err(SourceCheckError::Class(declaration));
+    }
+
+    let mut result = Vec::with_capacity(parameters.nodes.len());
+    let mut names = HashSet::with_capacity(parameters.nodes.len());
+    let mut default_seen = false;
+    for parameter in &parameters.nodes {
+        let parameter = child(declaration, *parameter);
+        let record = validator.visit(declaration, parameter)?;
+        let NodeData::TypeParameterDeclaration(data) = &record.data else {
+            return Err(SourceCheckError::Class(parameter));
+        };
+        if record.kind != SyntaxKind::TypeParameter
+            || data.expression.is_some()
+            || data.symbol.is_some()
+            || data.modifiers.is_some()
+            || default_seen && data.default_type.is_none()
+        {
+            return Err(SourceCheckError::Class(parameter));
+        }
+        let name = validator.identifier(parameter, child(parameter, data.name))?;
+        if !names.insert(name.clone()) {
+            return Err(SourceCheckError::Class(parameter));
+        }
+        let symbol = declaration_symbol(
+            validator.bound,
+            validator.store,
+            parameter,
+            SymbolFlags::TYPE_PARAMETER,
+        )?;
+        let symbol_record = validator
+            .store
+            .symbol(symbol)
+            .ok_or(SourceCheckError::Class(parameter))?;
+        let Some(declarations) = symbol_record.declarations() else {
+            return Err(SourceCheckError::Class(parameter));
+        };
+        if symbol_record.flags() != SymbolFlags::TYPE_PARAMETER
+            || symbol_record.check_flags() != CheckFlags::NONE
+            || symbol_record.name().as_utf8() != Some(name.as_str())
+            || !declarations.contains(&parameter)
+            || symbol_record.value_declaration().is_some()
+            || symbol_record.members().is_some()
+            || symbol_record.exports().is_some()
+            || symbol_record.parent() != Some(owner)
+            || symbol_record.export_symbol().is_some()
+            || validator.bound.symbol(parameter) != Some(symbol)
+            || validator
+                .store
+                .symbol(owner)
+                .and_then(ts_binder::semantic::Symbol::members)
+                .and_then(|members| validator.store.symbol_table(members))
+                .and_then(|members| members.get_source(&name))
+                != Some(symbol)
+        {
+            return Err(SourceCheckError::Provenance(
+                SourceCheckProvenanceError::MissingDeclarationSymbol(parameter),
+            ));
+        }
+        for annotation in [data.constraint, data.default_type].into_iter().flatten() {
+            let annotation = child(parameter, annotation);
+            validator.annotations.push(annotation);
+            validator.type_node(parameter, annotation)?;
+        }
+        default_seen |= data.default_type.is_some();
+        result.push(symbol);
+    }
+    Ok(result)
+}
+
+fn deferred_ambient_class_heritage(
+    validator: &mut DeferredAmbientFunctionValidator<'_>,
+    namespace: SemanticSymbolId,
+    declaration: NodeRef,
+    clauses: Option<&NodeList>,
+) -> Result<(), SourceCheckError> {
+    let Some(clauses) = clauses else {
+        return Ok(());
+    };
+    if clauses.nodes.is_empty() || clauses.has_trailing_comma {
+        return Err(SourceCheckError::Class(declaration));
+    }
+    let mut extends_seen = false;
+    let mut implements_seen = false;
+    for clause in &clauses.nodes {
+        let clause = child(declaration, *clause);
+        let record = validator.visit(declaration, clause)?;
+        let NodeData::HeritageClause(heritage) = &record.data else {
+            return Err(SourceCheckError::Class(clause));
+        };
+        if record.kind != SyntaxKind::HeritageClause
+            || heritage.facts != 0
+            || heritage.types.nodes.is_empty()
+            || heritage.types.has_trailing_comma
+            || match heritage.token {
+                SyntaxKind::ExtendsKeyword if !extends_seen => {
+                    extends_seen = true;
+                    heritage.types.nodes.len() != 1
+                }
+                SyntaxKind::ImplementsKeyword if !implements_seen => {
+                    implements_seen = true;
+                    false
+                }
+                _ => true,
+            }
+        {
+            return Err(SourceCheckError::Class(clause));
+        }
+
+        for base in &heritage.types.nodes {
+            let base = child(clause, *base);
+            let base_record = validator.visit(clause, base)?;
+            let NodeData::ExpressionWithTypeArguments(target) = &base_record.data else {
+                return Err(SourceCheckError::Class(base));
+            };
+            if base_record.kind != SyntaxKind::ExpressionWithTypeArguments
+                || target.facts != 0
+                || target.type_arguments.as_ref().is_some_and(|arguments| {
+                    arguments.nodes.is_empty() || arguments.has_trailing_comma
+                })
+            {
+                return Err(SourceCheckError::Class(base));
+            }
+            let expression = child(base, target.expression);
+            let expression_record = owned_node(
+                validator.arena,
+                validator.bound,
+                validator.store,
+                expression,
+            )?;
+            if let NodeData::Identifier(identifier) = &expression_record.data {
+                let symbol = validator
+                    .store
+                    .symbol(namespace)
+                    .and_then(ts_binder::semantic::Symbol::exports)
+                    .and_then(|exports| validator.store.symbol_table(exports))
+                    .and_then(|exports| exports.get_source(&identifier.text))
+                    .or_else(|| {
+                        validator
+                            .store
+                            .intrinsic_bootstrap()
+                            .and_then(|bootstrap| validator.store.symbol_table(bootstrap.globals))
+                            .and_then(|globals| globals.get_source(&identifier.text))
+                    })
+                    .and_then(|symbol| validator.store.get_merged_symbol(symbol));
+                if symbol
+                    .and_then(|symbol| validator.store.symbol(symbol))
+                    .is_none_or(|symbol| {
+                        if heritage.token == SyntaxKind::ExtendsKeyword {
+                            !symbol.flags().contains(SymbolFlags::CLASS)
+                        } else {
+                            !symbol
+                                .flags()
+                                .intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE)
+                        }
+                    })
+                {
+                    return Err(SourceCheckError::Class(expression));
+                }
+            }
+            validator.type_node(base, expression)?;
+            validator.annotations.push(base);
+            if let Some(arguments) = &target.type_arguments {
+                for argument in &arguments.nodes {
+                    let argument = child(base, *argument);
+                    validator.annotations.push(argument);
+                    validator.type_node(base, argument)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)] // Ambient classes retain all member and heritage declarations.
+fn plan_deferred_ambient_class(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    namespace: (NodeRef, SemanticSymbolId),
+    declaration: NodeRef,
+) -> Result<SourceNamespaceMemberPlan, SourceCheckError> {
+    let (namespace_declaration, namespace_symbol) = namespace;
+    let record = owned_node(arena, bound, store, declaration)?;
+    let NodeData::ClassDeclaration(class) = &record.data else {
+        return Err(SourceCheckError::Class(declaration));
+    };
+    let Some(name) = class.name else {
+        return Err(SourceCheckError::Class(declaration));
+    };
+    let name = child(declaration, name);
+    let name_record = owned_node(arena, bound, store, name)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(SourceCheckError::Class(name));
+    };
+    let (_, declared) = modifier_flags(arena, bound, store, declaration, class.modifiers.as_ref())?;
+    let symbol = declaration_symbol(bound, store, declaration, SymbolFlags::CLASS)?;
+    let class_record = store
+        .symbol(symbol)
+        .ok_or(SourceCheckError::Class(declaration))?;
+    let declarations = class_record
+        .declarations()
+        .filter(|declarations| !declarations.is_empty())
+        .ok_or(SourceCheckError::Class(declaration))?;
+    let local = bound
+        .local_symbol(declaration)
+        .ok_or(SourceCheckError::Class(declaration))?;
+    let local_record = store
+        .symbol(local)
+        .ok_or(SourceCheckError::Class(declaration))?;
+    let exports = class_record
+        .exports()
+        .and_then(|exports| store.symbol_table(exports))
+        .ok_or(SourceCheckError::Class(declaration))?;
+    let (prototype, prototype_record) = exports
+        .get_source("prototype")
+        .and_then(|prototype| store.symbol(prototype).map(|record| (prototype, record)))
+        .ok_or(SourceCheckError::Class(declaration))?;
+    let interface_merge = declarations.iter().any(|candidate| {
+        arena
+            .get(candidate.node)
+            .is_some_and(|record| record.kind == SyntaxKind::InterfaceDeclaration)
+    });
+    let expected_flags = SymbolFlags::CLASS
+        | if interface_merge {
+            SymbolFlags::INTERFACE
+        } else {
+            SymbolFlags::NONE
+        };
+    if record.kind != SyntaxKind::ClassDeclaration
+        || record.flags.0 != 0
+        || class.flow_node.is_some()
+        || class.local_symbol.is_some()
+        || class.next_container.is_some()
+        || class.symbol.is_some()
+        || class.facts != 0
+        || class.members.has_trailing_comma
+        || declared
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(declaration.node)
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+        || class_record.flags() != expected_flags
+        || class_record.check_flags() != CheckFlags::NONE
+        || class_record.name().as_utf8() != Some(identifier.text.as_str())
+        || class_record.value_declaration() != Some(declaration)
+        || class_record
+            .parent()
+            .and_then(|parent| store.get_merged_symbol(parent))
+            != Some(namespace_symbol)
+        || class_record.export_symbol().is_some()
+        || store.get_parent_of_symbol(symbol) != Some(namespace_symbol)
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || declarations.iter().any(|candidate| {
+            !candidate.is_for(declaration.arena, declaration.file)
+                || arena.get(candidate.node).is_none_or(|candidate_record| {
+                    candidate_record.parent != record.parent
+                        || !matches!(
+                            candidate_record.kind,
+                            SyntaxKind::ClassDeclaration | SyntaxKind::InterfaceDeclaration
+                        )
+                })
+                || bound.symbol(*candidate) != Some(symbol)
+        })
+        || declarations
+            .iter()
+            .filter(|candidate| {
+                arena
+                    .get(candidate.node)
+                    .is_some_and(|record| record.kind == SyntaxKind::ClassDeclaration)
+            })
+            .count()
+            != 1
+        || local_record.flags() != SymbolFlags::EXPORT_VALUE
+        || local_record.check_flags() != CheckFlags::NONE
+        || local_record.declarations() != Some(declarations)
+        || local_record.value_declaration().is_some()
+        || local_record.name().as_utf8() != Some(identifier.text.as_str())
+        || local_record.members().is_some()
+        || local_record.exports().is_some()
+        || local_record.parent().is_some()
+        || local_record.export_symbol() != Some(symbol)
+        || store.get_merged_symbol(local) != Some(local)
+        || bound
+            .locals(namespace_declaration)
+            .and_then(|locals| store.symbol_table(locals))
+            .and_then(|locals| locals.get_source(&identifier.text))
+            != Some(local)
+        || store
+            .symbol(namespace_symbol)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| store.symbol_table(exports))
+            .and_then(|exports| exports.get_source(&identifier.text))
+            != Some(symbol)
+        || prototype_record.flags() != SymbolFlags::PROPERTY | SymbolFlags::PROTOTYPE
+        || prototype_record.check_flags() != CheckFlags::NONE
+        || prototype_record.declarations().is_some()
+        || prototype_record.value_declaration().is_some()
+        || prototype_record.members().is_some()
+        || prototype_record.exports().is_some()
+        || prototype_record.parent() != Some(symbol)
+        || prototype_record.export_symbol().is_some()
+        || store.get_merged_symbol(prototype) != Some(prototype)
+        || store
+            .value_symbol_links(symbol)
+            .is_some_and(|links| links != &ValueSymbolLinks::default())
+    {
+        return Err(SourceCheckError::Class(declaration));
+    }
+
+    let mut validator = DeferredAmbientFunctionValidator::new(arena, bound, store);
+    let type_parameters = deferred_ambient_class_type_parameters(
+        &mut validator,
+        declaration,
+        symbol,
+        class.type_parameters.as_ref(),
+    )?;
+    deferred_ambient_class_heritage(
+        &mut validator,
+        namespace_symbol,
+        declaration,
+        class.heritage_clauses.as_ref(),
+    )?;
+
+    let mut members = Vec::with_capacity(class.members.nodes.len());
+    for member in &class.members.nodes {
+        let member = child(declaration, *member);
+        let member_record = validator.visit(declaration, member)?;
+        let symbol = match &member_record.data {
+            NodeData::ConstructorDeclaration(constructor)
+                if member_record.kind == SyntaxKind::Constructor =>
+            {
+                if constructor.asterisk_token.is_some()
+                    || constructor.body.is_some()
+                    || constructor.end_flow_node.is_some()
+                    || constructor.full_signature.is_some()
+                    || constructor.next_container.is_some()
+                    || constructor.return_flow_node.is_some()
+                    || constructor.symbol.is_some()
+                    || constructor.type_.is_some()
+                    || constructor.type_parameters.is_some()
+                    || constructor.facts != 0
+                    || constructor.modifiers.is_some()
+                {
+                    return Err(SourceCheckError::Class(member));
+                }
+                let member_symbol = deferred_ambient_class_member_symbol(
+                    arena,
+                    bound,
+                    store,
+                    (declaration, symbol),
+                    member,
+                    InternalSymbolName::Constructor.as_ref(),
+                    SymbolFlags::CONSTRUCTOR,
+                    false,
+                )?;
+                validator.signature_parameters(member, None, &constructor.parameters)?;
+                member_symbol
+            }
+            NodeData::MethodDeclaration(method)
+                if member_record.kind == SyntaxKind::MethodDeclaration =>
+            {
+                if method.asterisk_token.is_some()
+                    || method.body.is_some()
+                    || method.end_flow_node.is_some()
+                    || method.flow_node.is_some()
+                    || method.full_signature.is_some()
+                    || method.next_container.is_some()
+                    || method.symbol.is_some()
+                    || method.facts != 0
+                {
+                    return Err(SourceCheckError::Class(member));
+                }
+                let (readonly, is_static) = deferred_ambient_class_modifiers(
+                    &mut validator,
+                    member,
+                    method.modifiers.as_ref(),
+                )?;
+                if readonly {
+                    return Err(SourceCheckError::Class(member));
+                }
+                let name = validator.identifier(member, child(member, method.name))?;
+                let optional = if let Some(token) = method.postfix_token {
+                    let token = child(member, token);
+                    if validator.visit(member, token)?.kind != SyntaxKind::QuestionToken {
+                        return Err(SourceCheckError::Class(token));
+                    }
+                    true
+                } else {
+                    false
+                };
+                let flags = SymbolFlags::METHOD
+                    | if optional {
+                        SymbolFlags::OPTIONAL
+                    } else {
+                        SymbolFlags::NONE
+                    };
+                let member_symbol = deferred_ambient_class_member_symbol(
+                    arena,
+                    bound,
+                    store,
+                    (declaration, symbol),
+                    member,
+                    EscapedName::source(&name).as_ref(),
+                    flags,
+                    is_static,
+                )?;
+                validator.signature(
+                    member,
+                    method.type_parameters.as_ref(),
+                    &method.parameters,
+                    method.type_,
+                )?;
+                member_symbol
+            }
+            NodeData::PropertyDeclaration(property)
+                if member_record.kind == SyntaxKind::PropertyDeclaration =>
+            {
+                if property.initializer.is_some()
+                    || property.symbol.is_some()
+                    || property.facts != 0
+                {
+                    return Err(SourceCheckError::Class(member));
+                }
+                let (_, is_static) = deferred_ambient_class_modifiers(
+                    &mut validator,
+                    member,
+                    property.modifiers.as_ref(),
+                )?;
+                let name = validator.identifier(member, child(member, property.name))?;
+                let optional = if let Some(token) = property.postfix_token {
+                    let token = child(member, token);
+                    if validator.visit(member, token)?.kind != SyntaxKind::QuestionToken {
+                        return Err(SourceCheckError::Class(token));
+                    }
+                    true
+                } else {
+                    false
+                };
+                let flags = SymbolFlags::PROPERTY
+                    | if optional {
+                        SymbolFlags::OPTIONAL
+                    } else {
+                        SymbolFlags::NONE
+                    };
+                let member_symbol = deferred_ambient_class_member_symbol(
+                    arena,
+                    bound,
+                    store,
+                    (declaration, symbol),
+                    member,
+                    EscapedName::source(&name).as_ref(),
+                    flags,
+                    is_static,
+                )?;
+                let annotation = property
+                    .type_
+                    .map(|annotation| child(member, annotation))
+                    .ok_or(SourceCheckError::Class(member))?;
+                validator.annotations.push(annotation);
+                validator.type_node(member, annotation)?;
+                member_symbol
+            }
+            _ => return Err(SourceCheckError::Class(member)),
+        };
+        members.push(symbol);
+    }
+
+    Ok(SourceNamespaceMemberPlan::DeferredAmbientClass {
+        declaration,
+        symbol,
+        type_parameters,
+        members,
+        annotations: validator.annotations,
+    })
+}
+
+fn classify_ambient_class_error(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    namespace: SemanticSymbolId,
+    declaration: NodeRef,
+    error: SourceCheckError,
+) -> SourceCheckError {
+    if !matches!(error, SourceCheckError::Class(node) if node == declaration) {
+        return error;
+    }
+    let Some(record) = arena.get(declaration.node) else {
+        return error;
+    };
+    let NodeData::ClassDeclaration(class) = &record.data else {
+        return error;
+    };
+    let Some(name) = class.name.and_then(|name| arena.get(name)) else {
+        return error;
+    };
+    let NodeData::Identifier(identifier) = &name.data else {
+        return error;
+    };
+    let Some(symbol) = bound
+        .symbol(declaration)
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+    else {
+        return error;
+    };
+    let Some(owner) = store.symbol(symbol) else {
+        return error;
+    };
+    let Some(local) = bound.local_symbol(declaration) else {
+        return error;
+    };
+    let Some(local_record) = store.symbol(local) else {
+        return error;
+    };
+
+    if record.kind == SyntaxKind::ClassDeclaration
+        && record.flags.0 == 0
+        && name.kind == SyntaxKind::Identifier
+        && name.flags.0 == 0
+        && name.parent == Some(declaration.node)
+        && identifier.flow_node.is_none()
+        && !identifier.text.is_empty()
+        && owner.flags().contains(SymbolFlags::CLASS)
+        && owner.check_flags() == CheckFlags::NONE
+        && owner.name().as_utf8() == Some(identifier.text.as_str())
+        && owner
+            .declarations()
+            .is_some_and(|declarations| declarations.contains(&declaration))
+        && owner.value_declaration() == Some(declaration)
+        && store.get_parent_of_symbol(symbol) == Some(namespace)
+        && local_record.flags().contains(SymbolFlags::EXPORT_VALUE)
+        && local_record
+            .declarations()
+            .is_some_and(|declarations| declarations.contains(&declaration))
+        && local_record
+            .export_symbol()
+            .and_then(|export| store.get_merged_symbol(export))
+            == Some(symbol)
+        && store
+            .symbol(namespace)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| store.symbol_table(exports))
+            .and_then(|exports| exports.get_source(&identifier.text))
+            .and_then(|export| store.get_merged_symbol(export))
+            == Some(symbol)
+    {
+        unsupported(
+            declaration,
+            SyntaxKind::ClassDeclaration,
+            SourceSyntaxRole::Statement,
+        )
+    } else {
+        error
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // Local class ownership includes earlier namespace members.
 fn plan_namespace_class(
     arena: &NodeArena,
@@ -3947,6 +5808,21 @@ fn plan_namespace(
                                 statement,
                             )?);
                         }
+                        SyntaxKind::ClassDeclaration if ambient => {
+                            let class = plan_deferred_ambient_class(
+                                arena,
+                                bound,
+                                store,
+                                (declaration, symbol),
+                                statement,
+                            )
+                            .map_err(|error| {
+                                classify_ambient_class_error(
+                                    arena, bound, store, symbol, statement, error,
+                                )
+                            })?;
+                            members.push(class);
+                        }
                         SyntaxKind::ClassDeclaration if !ambient => {
                             let class = plan_namespace_class(
                                 arena,
@@ -4088,13 +5964,22 @@ fn namespace_annotations<'plan>(
             }
             SourceNamespaceMemberPlan::Interface {
                 annotations: interface_annotations,
+                generic,
                 ..
             } => {
-                annotations.extend(interface_annotations);
+                annotations.extend(interface_annotations.iter().copied().filter(|annotation| {
+                    generic
+                        .as_ref()
+                        .is_none_or(|generic| !generic.annotation_is_deferred(*annotation))
+                }));
                 declarations.push(member);
             }
             SourceNamespaceMemberPlan::EmptyEnum { .. }
-            | SourceNamespaceMemberPlan::Function { .. } => declarations.push(member),
+            | SourceNamespaceMemberPlan::Function { .. }
+            | SourceNamespaceMemberPlan::DeferredAmbientFunction { .. }
+            | SourceNamespaceMemberPlan::DeferredAmbientClass { .. } => {
+                declarations.push(member);
+            }
         }
     }
     diagnostics.extend(plan.diagnostics.iter().copied());
@@ -5132,6 +7017,8 @@ pub(super) fn execute_source_namespace(
                 };
                 if let Some(generic) = generic {
                     if !generic.call_signatures.is_empty()
+                        || !generic.construct_signatures.is_empty()
+                        || !generic.methods.is_empty()
                         || !generic.computed_properties.is_empty()
                         || !generic.base_interfaces.is_empty()
                     {
@@ -5242,6 +7129,8 @@ pub(super) fn execute_source_namespace(
                 }
                 stage_namespace_value(store, &mut values, *declaration, *symbol, callable)?;
             }
+            SourceNamespaceMemberPlan::DeferredAmbientFunction { .. }
+            | SourceNamespaceMemberPlan::DeferredAmbientClass { .. } => {}
         }
     }
 
@@ -5990,6 +7879,302 @@ mod tests {
     }
 
     #[test]
+    fn ambient_react_classes_preserve_merged_interfaces_and_cold_values() {
+        let mut fixture = declaration_fixture(
+            concat!(
+                "declare namespace React { ",
+                "interface Lifecycle<P, S, SS> {} ",
+                "interface Component<P = {}, S = {}, SS = any> ",
+                "extends Lifecycle<P, S, SS> {} ",
+                "class Component<P, S> { ",
+                "constructor(props: P); ",
+                "constructor(props: P, context?: any); ",
+                "setState<K extends keyof S>(",
+                "state: ((previous: S) => K) | K, callback?: () => void",
+                "): void; ",
+                "readonly props: { children?: P }; ",
+                "refs: { [key: string]: P }; ",
+                "} ",
+                "class PureComponent<P = {}, S = {}, SS = any> ",
+                "extends Component<P, S, SS> {} ",
+                "}",
+            ),
+            CanonicalModuleState::Script,
+        );
+        let namespace = plan(&fixture, 0);
+        let [
+            SourceNamespaceMemberPlan::Interface { .. },
+            SourceNamespaceMemberPlan::Interface {
+                symbol: merged_interface,
+                ..
+            },
+            SourceNamespaceMemberPlan::DeferredAmbientClass {
+                declaration: component_declaration,
+                symbol: component,
+                type_parameters: component_parameters,
+                members: component_members,
+                annotations: component_annotations,
+            },
+            SourceNamespaceMemberPlan::DeferredAmbientClass {
+                declaration: pure_declaration,
+                symbol: pure,
+                type_parameters: pure_parameters,
+                members: pure_members,
+                annotations: pure_annotations,
+            },
+        ] = namespace.members.as_slice()
+        else {
+            panic!("React must retain its merged component and generic derived class")
+        };
+        let component_declaration = *component_declaration;
+        let component = *component;
+        let pure_declaration = *pure_declaration;
+        let pure = *pure;
+        assert_eq!(*merged_interface, component);
+        assert_eq!(component_parameters.len(), 2);
+        assert_eq!(component_members.len(), 5);
+        assert_eq!(component_members[0], component_members[1]);
+        assert_eq!(pure_parameters.len(), 3);
+        assert!(pure_members.is_empty());
+        assert!(component_annotations.iter().any(|annotation| {
+            fixture.parsed.arena.get(annotation.node).unwrap().kind == SyntaxKind::FunctionType
+        }));
+        assert!(pure_annotations.iter().any(|annotation| {
+            fixture.parsed.arena.get(annotation.node).unwrap().kind
+                == SyntaxKind::ExpressionWithTypeArguments
+        }));
+        let bound = fixture.context.file(fixture.file).unwrap().1;
+        assert_eq!(bound.symbol(component_declaration), Some(component));
+        assert_eq!(bound.symbol(pure_declaration), Some(pure));
+        assert_eq!(
+            fixture.context.store().symbol(component).unwrap().flags(),
+            SymbolFlags::CLASS | SymbolFlags::INTERFACE,
+        );
+        assert_eq!(
+            fixture.context.store().get_parent_of_symbol(component),
+            Some(namespace.symbol),
+        );
+        assert!(
+            fixture
+                .context
+                .store()
+                .value_symbol_links(component)
+                .is_none()
+        );
+        assert!(fixture.context.store().value_symbol_links(pure).is_none());
+
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        assert!(
+            fixture
+                .context
+                .store()
+                .value_symbol_links(component)
+                .is_none()
+        );
+        assert!(fixture.context.store().value_symbol_links(pure).is_none());
+        assert!(fixture.context.store().declared_type_links(pure).is_none());
+
+        let warm = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn reopened_ambient_namespaces_accept_canonical_class_parents() {
+        let mut fixture = declaration_fixture(
+            concat!(
+                "declare namespace React { interface Marker {} } ",
+                "declare namespace React { class Component<T> { value: T; } }",
+            ),
+            CanonicalModuleState::Script,
+        );
+        let namespace = plan(&fixture, 1);
+        let [SourceNamespaceMemberPlan::DeferredAmbientClass { symbol, .. }] =
+            namespace.members.as_slice()
+        else {
+            panic!("the reopened namespace must retain its ambient class")
+        };
+        assert_eq!(
+            fixture.context.store().get_parent_of_symbol(*symbol),
+            Some(namespace.symbol),
+        );
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+    }
+
+    #[test]
+    fn unsupported_ambient_class_namespace_merges_do_not_become_fatal_invariants() {
+        let fixture = declaration_fixture(
+            concat!(
+                "declare namespace React { ",
+                "class Component<T> {} ",
+                "namespace Component { export interface Marker {} } ",
+                "}",
+            ),
+            CanonicalModuleState::Script,
+        );
+        let namespace = declaration(&fixture, 0);
+        let (arena, bound) = fixture.context.file(fixture.file).unwrap();
+        let before = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+
+        assert!(matches!(
+            plan_source_namespace(arena, bound, fixture.context.store(), namespace),
+            Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Syntax {
+                    kind: SyntaxKind::ClassDeclaration,
+                    role: SourceSyntaxRole::Statement,
+                    ..
+                }
+            ))
+        ));
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+    }
+
+    #[test]
+    fn exported_ambient_generic_classes_stay_unmaterialized() {
+        let mut fixture = declaration_fixture(
+            concat!(
+                "declare module \"react\" { ",
+                "export class Component<P, S> { ",
+                "constructor(props: P); ",
+                "render(): P; ",
+                "readonly state: S; ",
+                "} ",
+                "export class PureComponent<P = {}, S = {}> ",
+                "extends Component<P, S> {} ",
+                "}",
+            ),
+            CanonicalModuleState::Script,
+        );
+        let namespace = plan(&fixture, 0);
+        let [
+            SourceNamespaceMemberPlan::DeferredAmbientClass {
+                declaration,
+                symbol,
+                type_parameters,
+                members,
+                ..
+            },
+            SourceNamespaceMemberPlan::DeferredAmbientClass {
+                symbol: derived, ..
+            },
+        ] = namespace.members.as_slice()
+        else {
+            panic!("exported ambient classes must remain checked declarations")
+        };
+        let declaration = *declaration;
+        let symbol = *symbol;
+        let derived = *derived;
+        assert_eq!(type_parameters.len(), 2);
+        assert_eq!(members.len(), 3);
+        let local = fixture
+            .context
+            .file(fixture.file)
+            .unwrap()
+            .1
+            .local_symbol(declaration)
+            .unwrap();
+        assert_eq!(
+            fixture
+                .context
+                .store()
+                .symbol(local)
+                .unwrap()
+                .export_symbol(),
+            Some(symbol),
+        );
+        let before = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+        for owner in [symbol, derived] {
+            assert!(fixture.context.store().value_symbol_links(owner).is_none());
+            assert!(fixture.context.store().declared_type_links(owner).is_none());
+        }
+
+        let bound = fixture.context.file(fixture.file).unwrap().1;
+        let host = DeclaredTypeHost::new([(&fixture.parsed.arena, bound)]).unwrap();
+        assert!(
+            super::super::classes::plan_nongeneric_class(fixture.context.store(), &host, symbol)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn deferred_ambient_classes_reject_forged_member_identity_before_writes() {
+        let mut fixture = declaration_fixture(
+            concat!(
+                "declare module \"react\" { ",
+                "export class Component<P> { ",
+                "constructor(props: P); ",
+                "render(): P; ",
+                "} ",
+                "}",
+            ),
+            CanonicalModuleState::Script,
+        );
+        let namespace = plan(&fixture, 0);
+        let mut forged = namespace.clone();
+        let SourceNamespaceMemberPlan::DeferredAmbientClass {
+            symbol, members, ..
+        } = &mut forged.members[0]
+        else {
+            panic!("the ambient class must retain its checked members")
+        };
+        members[0] = *symbol;
+        let before = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+
+        assert!(matches!(
+            execute(&mut fixture, &forged),
+            Err(SourceCheckError::Unsupported(_))
+        ));
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+    }
+
+    #[test]
     fn exported_namespace_functions_publish_inferred_void_cold_and_warm() {
         let mut fixture = fixture(
             "export namespace Values { export function read() {} }",
@@ -6187,6 +8372,416 @@ mod tests {
                 "{source}"
             );
         }
+    }
+
+    #[test]
+    fn ambient_generic_constructor_functions_remain_checked_and_unmaterialized() {
+        let mut fixture = declaration_fixture(
+            concat!(
+                "declare module \"prop-types\" { ",
+                "export interface Requireable<T> {} ",
+                "export function instanceOf<T>(",
+                "expectedClass: new (...args: any[]) => T",
+                "): Requireable<T>; ",
+                "}",
+            ),
+            CanonicalModuleState::Script,
+        );
+        let namespace = plan(&fixture, 0);
+        let [
+            SourceNamespaceMemberPlan::Interface { .. },
+            SourceNamespaceMemberPlan::DeferredAmbientFunction {
+                declaration,
+                symbol,
+                type_parameters,
+                parameters,
+                annotations,
+            },
+        ] = namespace.members.as_slice()
+        else {
+            panic!("the constructor function must retain its checked ambient declaration")
+        };
+        let declaration = *declaration;
+        let symbol = *symbol;
+        let type_parameters = type_parameters.clone();
+        let parameters = parameters.clone();
+        let annotations = annotations.clone();
+        let (arena, bound) = fixture.context.file(fixture.file).unwrap();
+        let local = bound.local_symbol(declaration).unwrap();
+
+        assert_eq!(type_parameters.len(), 1);
+        assert_eq!(parameters.len(), 1);
+        assert_eq!(
+            annotations
+                .iter()
+                .map(|annotation| arena.get(annotation.node).unwrap().kind)
+                .collect::<Vec<_>>(),
+            [
+                SyntaxKind::ConstructorType,
+                SyntaxKind::ArrayType,
+                SyntaxKind::TypeReference,
+                SyntaxKind::TypeReference,
+            ],
+        );
+        assert_eq!(
+            fixture.context.store().get_parent_of_symbol(symbol),
+            Some(namespace.symbol),
+        );
+        assert_eq!(
+            fixture
+                .context
+                .store()
+                .symbol(local)
+                .unwrap()
+                .export_symbol(),
+            Some(symbol),
+        );
+        assert!(fixture.context.store().value_symbol_links(symbol).is_none());
+        assert!(
+            fixture
+                .context
+                .store()
+                .source_callable_type_for_owner(symbol)
+                .is_none()
+        );
+
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        assert!(fixture.context.store().value_symbol_links(symbol).is_none());
+        assert!(annotations.iter().all(|annotation| {
+            fixture
+                .context
+                .store()
+                .type_node_links(*annotation)
+                .is_none()
+        }));
+
+        let warm = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+
+        let bound = fixture.context.file(fixture.file).unwrap().1;
+        let host = DeclaredTypeHost::new([(&fixture.parsed.arena, bound)]).unwrap();
+        let callable = source_callables::plan_source_callable(
+            fixture.context.store(),
+            &host,
+            declaration,
+            symbol,
+            None,
+        )
+        .expect("the deferred constructor function retains an authenticated source signature");
+        assert_eq!(callable.type_parameters.len(), 1);
+        assert_eq!(callable.parameters.len(), 1);
+        assert!(fixture.context.store().value_symbol_links(symbol).is_none());
+    }
+
+    #[test]
+    fn ambient_generic_callback_functions_remain_checked_and_unmaterialized() {
+        let mut fixture = declaration_fixture(
+            concat!(
+                "declare namespace React { ",
+                "interface Context<T> {} ",
+                "function createContext<T>(",
+                "defaultValue: T, ",
+                "calculateChangedBits?: (prev: T, next: T) => number",
+                "): Context<T>; ",
+                "}",
+            ),
+            CanonicalModuleState::Script,
+        );
+        let namespace = plan(&fixture, 0);
+        let [
+            SourceNamespaceMemberPlan::Interface { .. },
+            SourceNamespaceMemberPlan::DeferredAmbientFunction {
+                symbol,
+                type_parameters,
+                parameters,
+                annotations,
+                ..
+            },
+        ] = namespace.members.as_slice()
+        else {
+            panic!("the callback function must retain its checked ambient declaration")
+        };
+        let symbol = *symbol;
+        assert_eq!(type_parameters.len(), 1);
+        assert_eq!(parameters.len(), 2);
+        assert!(annotations.iter().any(|annotation| {
+            fixture.parsed.arena.get(annotation.node).unwrap().kind == SyntaxKind::FunctionType
+        }));
+
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        assert!(fixture.context.store().value_symbol_links(symbol).is_none());
+
+        let warm = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn ambient_generic_type_predicates_remain_checked_and_unmaterialized() {
+        let mut fixture = declaration_fixture(
+            concat!(
+                "declare namespace React { ",
+                "interface ReactElement<T> {} ",
+                "function isValidElement<T>(",
+                "value: {} | null | undefined",
+                "): value is ReactElement<T>; ",
+                "}",
+            ),
+            CanonicalModuleState::Script,
+        );
+        let namespace = plan(&fixture, 0);
+        let [
+            SourceNamespaceMemberPlan::Interface { .. },
+            SourceNamespaceMemberPlan::DeferredAmbientFunction {
+                symbol,
+                type_parameters,
+                parameters,
+                annotations,
+                ..
+            },
+        ] = namespace.members.as_slice()
+        else {
+            panic!("the type predicate must retain its checked ambient declaration")
+        };
+        let symbol = *symbol;
+        assert_eq!(type_parameters.len(), 1);
+        assert_eq!(parameters.len(), 1);
+        assert!(annotations.iter().any(|annotation| {
+            fixture.parsed.arena.get(annotation.node).unwrap().kind == SyntaxKind::TypePredicate
+        }));
+
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        assert!(fixture.context.store().value_symbol_links(symbol).is_none());
+
+        let warm = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn ambient_generic_functions_validate_constraints_and_mapped_returns() {
+        let mut fixture = declaration_fixture(
+            concat!(
+                "declare module \"prop-types\" { ",
+                "export interface Validator<T> {} ",
+                "export interface Requireable<T> {} ",
+                "export function objectOf<T extends Validator<any>>(",
+                "type: Validator<T>",
+                "): Requireable<{ [K in keyof any]: T }>; ",
+                "}",
+            ),
+            CanonicalModuleState::Script,
+        );
+        let namespace = plan(&fixture, 0);
+        let [
+            SourceNamespaceMemberPlan::Interface { .. },
+            SourceNamespaceMemberPlan::Interface { .. },
+            SourceNamespaceMemberPlan::DeferredAmbientFunction {
+                declaration,
+                symbol,
+                type_parameters,
+                parameters,
+                annotations,
+            },
+        ] = namespace.members.as_slice()
+        else {
+            panic!("the mapped return must retain its checked generic declaration")
+        };
+        let declaration = *declaration;
+        let symbol = *symbol;
+        let annotations = annotations.clone();
+        let (arena, bound) = fixture.context.file(fixture.file).unwrap();
+
+        assert_eq!(type_parameters.len(), 1);
+        assert_eq!(parameters.len(), 1);
+        assert!(annotations.iter().any(|annotation| {
+            arena.get(annotation.node).unwrap().kind == SyntaxKind::TypeOperator
+        }));
+        let mapped = arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::MappedType).then_some(NodeRef::new(
+                    arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let NodeData::MappedTypeNode(mapped_type) = &arena.get(mapped.node).unwrap().data else {
+            panic!("the return annotation must contain a mapped type")
+        };
+        let mapped_parameter = child(mapped, mapped_type.type_parameter);
+        let mapped_symbol = bound.symbol(mapped_parameter).unwrap();
+        assert_eq!(
+            fixture
+                .context
+                .store()
+                .symbol(mapped_symbol)
+                .unwrap()
+                .flags(),
+            SymbolFlags::TYPE_PARAMETER,
+        );
+
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        assert!(fixture.context.store().value_symbol_links(symbol).is_none());
+        assert!(
+            fixture
+                .context
+                .store()
+                .source_callable_type_for_declaration(declaration)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn ambient_namespace_overloads_retain_binder_order_without_publication() {
+        for source in [
+            concat!(
+                "declare namespace React { ",
+                "function createFactory<T extends object>(value: T): T; ",
+                "function createFactory(value: string): string; ",
+                "function createFactory(...children: string[]): string; ",
+                "}",
+            ),
+            concat!(
+                "declare module \"react\" { ",
+                "export function createFactory<T extends object>(value: T): T; ",
+                "export function createFactory(value: string): string; ",
+                "export function createFactory(...children: string[]): string; ",
+                "}",
+            ),
+        ] {
+            let mut fixture = declaration_fixture(source, CanonicalModuleState::Script);
+            let namespace = plan(&fixture, 0);
+            let mut declarations = Vec::new();
+            let mut owner = None;
+            for (index, member) in namespace.members.iter().enumerate() {
+                let SourceNamespaceMemberPlan::DeferredAmbientFunction {
+                    declaration,
+                    symbol,
+                    type_parameters,
+                    parameters,
+                    ..
+                } = member
+                else {
+                    panic!("every overload must remain an authenticated ambient declaration")
+                };
+                assert_eq!(type_parameters.len(), usize::from(index == 0), "{source}");
+                assert_eq!(parameters.len(), 1, "{source}");
+                declarations.push(*declaration);
+                if let Some(expected) = owner {
+                    assert_eq!(*symbol, expected, "{source}");
+                } else {
+                    owner = Some(*symbol);
+                }
+            }
+            let owner = owner.unwrap();
+            assert_eq!(
+                fixture
+                    .context
+                    .store()
+                    .symbol(owner)
+                    .unwrap()
+                    .declarations(),
+                Some(declarations.as_slice()),
+                "{source}",
+            );
+            let before = (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            );
+
+            assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+            assert_eq!(
+                (
+                    fixture.context.store().type_len(),
+                    fixture.context.store().symbol_len(),
+                    fixture.context.store().checker_link_allocated_lengths(),
+                ),
+                before,
+                "{source}",
+            );
+            assert!(fixture.context.store().value_symbol_links(owner).is_none());
+        }
+    }
+
+    #[test]
+    fn deferred_ambient_functions_reject_forged_parameter_identity_before_writes() {
+        let mut fixture = declaration_fixture(
+            concat!(
+                "declare module \"prop-types\" { ",
+                "export interface Requireable<T> {} ",
+                "export function instanceOf<T>(",
+                "expectedClass: new (...args: any[]) => T",
+                "): Requireable<T>; ",
+                "}",
+            ),
+            CanonicalModuleState::Script,
+        );
+        let namespace = plan(&fixture, 0);
+        let mut forged = namespace.clone();
+        let SourceNamespaceMemberPlan::DeferredAmbientFunction {
+            type_parameters,
+            parameters,
+            ..
+        } = &mut forged.members[1]
+        else {
+            panic!("the constructor function must remain deferred")
+        };
+        parameters[0] = type_parameters[0];
+        let before = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+
+        assert!(matches!(
+            execute(&mut fixture, &forged),
+            Err(SourceCheckError::Unsupported(_))
+        ));
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            before,
+        );
     }
 
     #[test]
@@ -6872,6 +9467,278 @@ mod tests {
     }
 
     #[test]
+    fn generic_interface_call_signatures_accept_optional_callbacks_and_rest() {
+        let mut fixture = declaration_fixture(
+            concat!(
+                "declare namespace React { ",
+                "interface Attributes<T> { value: T; } ",
+                "interface Factory<P, T> { ",
+                "<U extends P>(",
+                "props?: Attributes<T> & P | null, ",
+                "callback?: (value: U) => void, ",
+                "...children: U[]",
+                "): Attributes<U>; ",
+                "} }",
+            ),
+            CanonicalModuleState::Script,
+        );
+        let namespace = plan(&fixture, 0);
+        let [
+            SourceNamespaceMemberPlan::Interface { .. },
+            SourceNamespaceMemberPlan::Interface {
+                symbol,
+                generic: Some(generic),
+                annotations,
+                ..
+            },
+        ] = namespace.members.as_slice()
+        else {
+            panic!("the factory must retain its generic callable interface")
+        };
+        let symbol = *symbol;
+        let call = generic.call_signatures[0];
+        let signature = fixture
+            .context
+            .store()
+            .symbol(call)
+            .and_then(ts_binder::semantic::Symbol::declarations)
+            .and_then(|declarations| declarations.first())
+            .copied()
+            .unwrap();
+        let NodeData::CallSignatureDeclaration(call_signature) =
+            &fixture.parsed.arena.get(signature.node).unwrap().data
+        else {
+            panic!("the factory must retain its call signature")
+        };
+        assert_eq!(
+            call_signature.type_parameters.as_ref().unwrap().nodes.len(),
+            1
+        );
+        assert_eq!(call_signature.parameters.nodes.len(), 3);
+        assert_eq!(annotations.len(), 5);
+
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        let target = fixture
+            .context
+            .store()
+            .declared_type_links(symbol)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let TypeData::Interface(interface) =
+            fixture.context.store().type_payload(target).unwrap().data()
+        else {
+            panic!("the factory must retain its interface type")
+        };
+        assert!(!interface.declared_members_resolved);
+        assert!(fixture.context.store().signature_links(signature).is_none());
+
+        let warm = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn generic_interface_construct_signatures_remain_authenticated_and_lazy() {
+        let mut fixture = declaration_fixture(
+            concat!(
+                "declare namespace React { ",
+                "interface Component<P, S> {} ",
+                "interface ComponentClass<P, S> { ",
+                "new(props: P, context?: any): Component<P, S>; ",
+                "new<T extends P>(props: T, ...children: T[]): Component<T, S>; ",
+                "label?: string; ",
+                "} }",
+            ),
+            CanonicalModuleState::Script,
+        );
+        let namespace = plan(&fixture, 0);
+        let [
+            SourceNamespaceMemberPlan::Interface { .. },
+            SourceNamespaceMemberPlan::Interface {
+                symbol,
+                generic: Some(generic),
+                annotations,
+                ..
+            },
+        ] = namespace.members.as_slice()
+        else {
+            panic!("the component class must retain its construct signatures")
+        };
+        let symbol = *symbol;
+        let constructor = generic.construct_signatures[0];
+        let property = generic.properties[0].symbol;
+        let declarations = fixture
+            .context
+            .store()
+            .symbol(constructor)
+            .and_then(ts_binder::semantic::Symbol::declarations)
+            .unwrap()
+            .to_vec();
+        assert_eq!(generic.construct_signatures.len(), 1);
+        assert_eq!(declarations.len(), 2);
+        assert_eq!(annotations.len(), 8);
+        assert_eq!(
+            fixture.context.store().symbol(constructor).unwrap().name(),
+            InternalSymbolName::New.as_ref(),
+        );
+        assert!(
+            fixture
+                .context
+                .store()
+                .value_symbol_links(property)
+                .is_none()
+        );
+
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        let target = fixture
+            .context
+            .store()
+            .declared_type_links(symbol)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let TypeData::Interface(interface) =
+            fixture.context.store().type_payload(target).unwrap().data()
+        else {
+            panic!("the component class must retain its declared interface type")
+        };
+        assert!(!interface.declared_members_resolved);
+        assert!(
+            fixture
+                .context
+                .store()
+                .value_symbol_links(property)
+                .is_none()
+        );
+        for declaration in declarations {
+            assert!(
+                fixture
+                    .context
+                    .store()
+                    .signature_links(declaration)
+                    .is_none()
+            );
+        }
+
+        let warm = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn generic_namespace_interface_methods_stay_authenticated_and_lazy() {
+        let mut fixture = declaration_fixture(
+            concat!(
+                "declare namespace React { ",
+                "interface Component<P, S> {} ",
+                "interface ClassicComponent<P, S> extends Component<P, S> { ",
+                "replaceState(nextState: S, callback?: () => void): void; ",
+                "isMounted(): boolean; ",
+                "getInitialState?(): S; ",
+                "map<U extends S>(first: U, ...rest: U[]): U; ",
+                "} }",
+            ),
+            CanonicalModuleState::Script,
+        );
+        let namespace = plan(&fixture, 0);
+        let [
+            SourceNamespaceMemberPlan::Interface { .. },
+            SourceNamespaceMemberPlan::Interface {
+                symbol,
+                generic: Some(generic),
+                annotations,
+                ..
+            },
+        ] = namespace.members.as_slice()
+        else {
+            panic!("the classic component must retain its generic method interface")
+        };
+        let symbol = *symbol;
+        let methods = generic.methods.clone();
+        assert_eq!(methods.len(), 4);
+        assert_eq!(annotations.len(), 9);
+        assert_eq!(
+            fixture.context.store().symbol(methods[2]).unwrap().flags(),
+            SymbolFlags::METHOD | SymbolFlags::OPTIONAL,
+        );
+        for method in &methods {
+            assert!(
+                fixture
+                    .context
+                    .store()
+                    .value_symbol_links(*method)
+                    .is_none()
+            );
+        }
+
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        let target = fixture
+            .context
+            .store()
+            .declared_type_links(symbol)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let TypeData::Interface(interface) =
+            fixture.context.store().type_payload(target).unwrap().data()
+        else {
+            panic!("the component must retain its declared interface type")
+        };
+        assert!(!interface.declared_members_resolved);
+        for method in methods {
+            let declaration = fixture
+                .context
+                .store()
+                .symbol(method)
+                .and_then(ts_binder::semantic::Symbol::value_declaration)
+                .unwrap();
+            assert!(fixture.context.store().value_symbol_links(method).is_none());
+            assert!(
+                fixture
+                    .context
+                    .store()
+                    .signature_links(declaration)
+                    .is_none()
+            );
+        }
+
+        let warm = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
     fn generic_callable_namespace_interfaces_keep_declared_members_lazy() {
         let mut fixture = fixture(
             concat!(
@@ -6990,6 +9857,119 @@ mod tests {
             panic!("the derived declaration must retain its interface type")
         };
         assert!(!interface.declared_members_resolved);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep nested base arguments and cold-cache checks together.
+    fn nongeneric_namespace_interfaces_accept_concrete_generic_heritage_lazily() {
+        let mut fixture = declaration_fixture(
+            concat!(
+                "declare namespace React { ",
+                "interface SVGElement {} ",
+                "interface SVGAttributes<T> { value?: T; } ",
+                "interface DOMElement<P, T> { props: P; } ",
+                "interface ReactSVG { path: any; } ",
+                "interface ReactSVGElement ",
+                "extends DOMElement<SVGAttributes<SVGElement>, SVGElement> { ",
+                "type: keyof ReactSVG; ",
+                "} ",
+                "interface ReactPortal extends DOMElement<any, SVGElement> {} ",
+                "interface ReactDOM extends ReactSVG, ReactSVGElement {} ",
+                "}",
+            ),
+            CanonicalModuleState::Script,
+        );
+        let namespace = plan(&fixture, 0);
+        let mut derived = Vec::new();
+        let mut heritage_arguments = Vec::new();
+        for member in &namespace.members {
+            let SourceNamespaceMemberPlan::Interface {
+                declaration,
+                symbol,
+                generic,
+                ..
+            } = member
+            else {
+                panic!("the React fixture must contain only interfaces")
+            };
+            let name = fixture
+                .context
+                .store()
+                .symbol(*symbol)
+                .and_then(|symbol| symbol.name().as_utf8())
+                .unwrap();
+            if !matches!(name, "ReactSVGElement" | "ReactPortal" | "ReactDOM") {
+                continue;
+            }
+            assert!(generic.is_none(), "{name}");
+            derived.push(*symbol);
+            let NodeData::InterfaceDeclaration(interface) =
+                &fixture.parsed.arena.get(declaration.node).unwrap().data
+            else {
+                panic!("the derived symbol must retain its interface declaration")
+            };
+            for clause in &interface.heritage_clauses.as_ref().unwrap().nodes {
+                let clause = child(*declaration, *clause);
+                let NodeData::HeritageClause(heritage) =
+                    &fixture.parsed.arena.get(clause.node).unwrap().data
+                else {
+                    panic!("the derived interface must retain its extends clause")
+                };
+                for base in &heritage.types.nodes {
+                    let base = child(clause, *base);
+                    let NodeData::ExpressionWithTypeArguments(reference) =
+                        &fixture.parsed.arena.get(base.node).unwrap().data
+                    else {
+                        panic!("the extends clause must retain its generic expression")
+                    };
+                    heritage_arguments.extend(
+                        reference
+                            .type_arguments
+                            .iter()
+                            .flat_map(|arguments| &arguments.nodes)
+                            .map(|argument| child(base, *argument)),
+                    );
+                }
+            }
+        }
+        assert_eq!(derived.len(), 3);
+        assert_eq!(heritage_arguments.len(), 4);
+
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        for symbol in derived {
+            let type_ = fixture
+                .context
+                .store()
+                .declared_type_links(symbol)
+                .and_then(|links| links.declared_type)
+                .unwrap();
+            let TypeData::Interface(interface) =
+                fixture.context.store().type_payload(type_).unwrap().data()
+            else {
+                panic!("the derived interface must retain its declared type")
+            };
+            assert!(!interface.declared_members_resolved);
+        }
+        assert!(
+            heritage_arguments
+                .iter()
+                .all(|argument| { fixture.context.store().type_node_links(*argument).is_none() })
+        );
+
+        let warm = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
     }
 
     #[test]

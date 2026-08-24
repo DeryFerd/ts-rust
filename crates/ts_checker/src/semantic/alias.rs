@@ -6,12 +6,13 @@
 //! capability: an unsupported declaration family fails explicitly and never
 //! becomes a cached missing target.
 
-use ts_ast::{FileId, NodeRef};
-use ts_binder::{SemanticStoreId, SemanticSymbolId, SymbolFlags};
+use ts_ast::{FileId, NodeRef, SyntaxKind};
+use ts_binder::{CheckFlags, InternalSymbolName, SemanticStoreId, SemanticSymbolId, SymbolFlags};
 
 use super::{
     AliasSymbolLinks, AliasTargetState, CanonicalSemanticStore, TypeResolutionTarget,
     TypeResolutionTargetError, TypeSystemPropertyName, links::TypeResolutionCheckpoint,
+    store::SourceNodeParent,
 };
 
 const CIRCULAR_DEFINITION_OF_IMPORT_ALIAS: u32 = 2_303;
@@ -433,6 +434,11 @@ where
         if !flags.intersects(SymbolFlags::ALIAS) {
             return Err(CanonicalAliasResolutionError::SymbolIsNotAlias(alias));
         }
+        if flags.contains(SymbolFlags::ALIAS | SymbolFlags::NAMESPACE_MODULE)
+            && !is_promoted_commonjs_export_alias(self.store, alias)
+        {
+            return Err(CanonicalAliasResolutionError::InvalidSymbol(alias));
+        }
         if !self.store.ensure_alias_symbol_links(alias) {
             return Err(CanonicalAliasResolutionError::InvalidAliasLinks(alias));
         }
@@ -444,10 +450,17 @@ where
         alias: SemanticSymbolId,
         target: SemanticSymbolId,
     ) -> Result<SymbolFlags, CanonicalAliasResolutionError> {
-        self.store
+        let flags = self
+            .store
             .symbol(target)
             .map(ts_binder::semantic::Symbol::flags)
-            .ok_or(CanonicalAliasResolutionError::InvalidTarget { alias, target })
+            .ok_or(CanonicalAliasResolutionError::InvalidTarget { alias, target })?;
+        if flags.contains(SymbolFlags::ALIAS | SymbolFlags::NAMESPACE_MODULE)
+            && !is_promoted_commonjs_export_alias(self.store, target)
+        {
+            return Err(CanonicalAliasResolutionError::InvalidTarget { alias, target });
+        }
+        Ok(flags)
     }
 
     fn target_from_host(
@@ -594,9 +607,92 @@ where
     }
 }
 
+/// Recognizes an exact `CommonJS` export assignment with promoted `JSDoc` types.
+pub(super) fn is_promoted_commonjs_export_alias<MapperPayload>(
+    store: &CanonicalSemanticStore<MapperPayload>,
+    alias: SemanticSymbolId,
+) -> bool {
+    let Some(record) = store.symbol(alias) else {
+        return false;
+    };
+    let Some([declaration]) = record.declarations() else {
+        return false;
+    };
+    let declaration = *declaration;
+    let Some(module) = record.parent() else {
+        return false;
+    };
+    let Some(promoted) = record.exports().and_then(|table| store.symbol_table(table)) else {
+        return false;
+    };
+    let Some(SourceNodeParent::Parent(statement)) = store.source_node_parent(declaration) else {
+        return false;
+    };
+    let Some(SourceNodeParent::Parent(source)) = store.source_node_parent(statement) else {
+        return false;
+    };
+    let Some(module_record) = store.symbol(module) else {
+        return false;
+    };
+    let Some(exports) = module_record
+        .exports()
+        .and_then(|table| store.symbol_table(table))
+    else {
+        return false;
+    };
+
+    if record.flags() != SymbolFlags::ALIAS | SymbolFlags::NAMESPACE_MODULE
+        || record.check_flags() != CheckFlags::NONE
+        || record.name() != InternalSymbolName::ExportEquals.as_ref()
+        || record.value_declaration() != Some(declaration)
+        || record.members().is_some()
+        || record.export_symbol().is_some()
+        || store.get_merged_symbol(alias) != Some(alias)
+        || store.source_node_kind(declaration) != Some(SyntaxKind::BinaryExpression)
+        || store.source_node_kind(statement) != Some(SyntaxKind::ExpressionStatement)
+        || store.source_node_kind(source) != Some(SyntaxKind::SourceFile)
+        || store.source_node_parent(source) != Some(SourceNodeParent::Root)
+        || declaration.arena != source.arena
+        || declaration.file != source.file
+        || module_record.flags() != SymbolFlags::VALUE_MODULE
+        || store.get_merged_symbol(module) != Some(module)
+        || !module_record
+            .declarations()
+            .is_some_and(|declarations| declarations.contains(&source))
+        || exports.get(InternalSymbolName::ExportEquals.as_ref()) != Some(alias)
+        || promoted.is_empty()
+        || promoted.iter().any(|(name, symbol)| {
+            name == InternalSymbolName::ExportEquals.as_ref()
+                || exports.get(name) != Some(symbol)
+                || store.symbol(symbol).is_none_or(|record| {
+                    !record
+                        .flags()
+                        .intersects(SymbolFlags::TYPE | SymbolFlags::NAMESPACE)
+                        || store.get_parent_of_symbol(symbol) != Some(module)
+                })
+        })
+    {
+        return false;
+    }
+
+    promoted.iter().any(|(_, symbol)| {
+        let Some(record) = store.symbol(symbol) else {
+            return false;
+        };
+        let Some([declaration]) = record.declarations() else {
+            return false;
+        };
+        record.flags().contains(SymbolFlags::TYPE_ALIAS)
+            && store.source_node_kind(*declaration) == Some(SyntaxKind::JsTypeAliasDeclaration)
+            && store.source_node_parent(*declaration) == Some(SourceNodeParent::Parent(source))
+            && store.get_merged_symbol(symbol) == Some(symbol)
+    })
+}
+
 fn is_non_local_alias(flags: SymbolFlags) -> bool {
     let excludes = SymbolFlags::VALUE | SymbolFlags::TYPE | SymbolFlags::NAMESPACE;
     flags & (SymbolFlags::ALIAS | excludes) == SymbolFlags::ALIAS
+        || flags == SymbolFlags::ALIAS | SymbolFlags::NAMESPACE_MODULE
         || flags.intersects(SymbolFlags::ALIAS) && flags.intersects(SymbolFlags::ASSIGNMENT)
 }
 
@@ -605,8 +701,11 @@ mod tests {
     use std::collections::HashMap;
 
     use ts_ast::{FileId, NodeRef};
-    use ts_binder::{EscapedName, SymbolData};
-    use ts_parser::parse_source_file;
+    use ts_binder::{
+        CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
+        EscapedName, SymbolData,
+    };
+    use ts_parser::{parse_javascript_source_file, parse_source_file};
 
     use super::*;
 
@@ -706,6 +805,82 @@ mod tests {
 
     fn alias_target(store: &TestStore, alias: SemanticSymbolId) -> AliasTargetState {
         store.alias_symbol_links(alias).unwrap().alias_target
+    }
+
+    struct PromotedCommonJsFixture {
+        store: TestStore,
+        module: SemanticSymbolId,
+        assignment: SemanticSymbolId,
+        typedef: SemanticSymbolId,
+        target: SemanticSymbolId,
+    }
+
+    fn promoted_commonjs_fixture() -> PromotedCommonJsFixture {
+        let parsed = parse_javascript_source_file(concat!(
+            "/** @typedef {number} Exported */\n",
+            "const value = 1;\n",
+            "module.exports = value;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(4);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/target.js\""),
+                    CanonicalSourceLanguage::JavaScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_javascript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+
+        let (module, assignment, typedef, target) = {
+            let bound = binder.file(file).unwrap();
+            assert!(bound.source_facts().unwrap().is_common_js_module());
+            let module = bound.symbol(bound.source_file()).unwrap();
+            let exports = binder
+                .symbol_store()
+                .symbol(module)
+                .unwrap()
+                .exports()
+                .unwrap();
+            let exports = binder.symbol_store().symbol_table(exports).unwrap();
+            let assignment = exports
+                .get(InternalSymbolName::ExportEquals.as_ref())
+                .unwrap();
+            let typedef = exports.get_source("Exported").unwrap();
+            let locals = bound.locals(bound.source_file()).unwrap();
+            let target = binder
+                .symbol_store()
+                .symbol_table(locals)
+                .unwrap()
+                .get_source("value")
+                .unwrap();
+            (module, assignment, typedef, target)
+        };
+        let (symbols, _) = binder.finish().try_into_parts().unwrap();
+        let mut store = TestStore::from_symbol_store(symbols);
+        assert!(
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .is_some()
+        );
+        assert!(is_promoted_commonjs_export_alias(&store, assignment));
+
+        PromotedCommonJsFixture {
+            store,
+            module,
+            assignment,
+            typedef,
+            target,
+        }
     }
 
     #[test]
@@ -1257,6 +1432,264 @@ mod tests {
             .unwrap();
         assert_eq!(assignment.target, AliasTargetState::Resolved(value));
         assert_eq!(host.calls(assignment_target), 1);
+    }
+
+    #[test]
+    fn promoted_commonjs_export_aliases_preserve_targets_and_namespace_exports() {
+        let mut fixture = promoted_commonjs_fixture();
+        let imported = alias(&mut fixture.store, "imported");
+        let promoted = fixture
+            .store
+            .symbol(fixture.assignment)
+            .unwrap()
+            .exports()
+            .unwrap();
+        let mut host = SyntheticHost::default();
+        host.insert(
+            imported,
+            CanonicalImmediateAliasTarget::Resolved(fixture.assignment),
+        );
+        host.insert(
+            fixture.assignment,
+            CanonicalImmediateAliasTarget::Resolved(fixture.target),
+        );
+
+        assert_eq!(
+            CanonicalAliasResolver::new(&mut fixture.store, &mut host)
+                .get_immediate_aliased_symbol(imported),
+            Ok(Some(fixture.assignment))
+        );
+        for _ in 0..2 {
+            let resolved = CanonicalAliasResolver::new(&mut fixture.store, &mut host)
+                .resolve_alias(imported)
+                .unwrap();
+            assert_eq!(resolved.target, AliasTargetState::Resolved(fixture.target));
+            assert!(resolved.events.is_empty());
+            assert_eq!(
+                fixture
+                    .store
+                    .symbol_table(promoted)
+                    .unwrap()
+                    .get_source("Exported"),
+                Some(fixture.typedef)
+            );
+        }
+        assert_eq!(
+            fixture.store.alias_symbol_links(imported),
+            Some(&AliasSymbolLinks {
+                immediate_target: Some(fixture.assignment),
+                alias_target: AliasTargetState::Resolved(fixture.target),
+                ..AliasSymbolLinks::default()
+            })
+        );
+        assert_eq!(
+            fixture.store.alias_symbol_links(fixture.assignment),
+            Some(&AliasSymbolLinks {
+                alias_target: AliasTargetState::Resolved(fixture.target),
+                ..AliasSymbolLinks::default()
+            })
+        );
+        assert_eq!(host.calls(imported), 2);
+        assert_eq!(host.calls(fixture.assignment), 1);
+        assert!(fixture.store.type_resolution_is_empty());
+    }
+
+    #[test]
+    fn promoted_commonjs_export_alias_cycles_keep_canonical_events() {
+        let mut fixture = promoted_commonjs_fixture();
+        let imported = alias(&mut fixture.store, "imported");
+        let mut host = SyntheticHost::default();
+        host.insert(
+            imported,
+            CanonicalImmediateAliasTarget::Resolved(fixture.assignment),
+        );
+        host.insert(
+            fixture.assignment,
+            CanonicalImmediateAliasTarget::Resolved(imported),
+        );
+
+        let resolution = CanonicalAliasResolver::new(&mut fixture.store, &mut host)
+            .resolve_alias(imported)
+            .unwrap();
+        assert_eq!(resolution.target, AliasTargetState::Unknown);
+        assert_eq!(
+            resolution.events,
+            [
+                CanonicalAliasResolutionEvent::CircularDefinitionOfImportAlias {
+                    alias: fixture.assignment,
+                },
+                CanonicalAliasResolutionEvent::CircularDefinitionOfImportAlias { alias: imported },
+            ]
+        );
+        assert_eq!(
+            alias_target(&fixture.store, imported),
+            AliasTargetState::Unknown
+        );
+        assert_eq!(
+            alias_target(&fixture.store, fixture.assignment),
+            AliasTargetState::Unknown
+        );
+        assert!(fixture.store.type_resolution_is_empty());
+
+        let cached = CanonicalAliasResolver::new(&mut fixture.store, &mut host)
+            .resolve_alias(imported)
+            .unwrap();
+        assert_eq!(cached.target, AliasTargetState::Unknown);
+        assert!(cached.events.is_empty());
+    }
+
+    #[test]
+    fn forged_promoted_commonjs_export_aliases_fail_without_cache_mutation() {
+        #[derive(Clone, Copy, Debug)]
+        enum Forgery {
+            Parent,
+            AssignmentDeclaration,
+            PromotedExport,
+            TypedefDeclaration,
+            ExtraFlags,
+            MissingValueDeclaration,
+        }
+
+        for forgery in [
+            Forgery::Parent,
+            Forgery::AssignmentDeclaration,
+            Forgery::PromotedExport,
+            Forgery::TypedefDeclaration,
+            Forgery::ExtraFlags,
+            Forgery::MissingValueDeclaration,
+        ] {
+            let mut fixture = promoted_commonjs_fixture();
+            let imported = alias(&mut fixture.store, "imported");
+            let target_declaration = fixture
+                .store
+                .symbol(fixture.target)
+                .unwrap()
+                .value_declaration()
+                .unwrap();
+
+            match forgery {
+                Forgery::Parent => {
+                    let record = fixture.store.symbol(fixture.assignment).unwrap();
+                    let relationships =
+                        (record.members(), record.exports(), record.export_symbol());
+                    assert!(fixture.store.set_symbol_relationships(
+                        fixture.assignment,
+                        relationships.0,
+                        relationships.1,
+                        Some(fixture.typedef),
+                        relationships.2,
+                    ));
+                }
+                Forgery::AssignmentDeclaration => {
+                    assert!(fixture.store.set_symbol_declarations(
+                        fixture.assignment,
+                        Some(vec![target_declaration]),
+                        Some(target_declaration),
+                    ));
+                }
+                Forgery::PromotedExport => {
+                    let promoted = fixture
+                        .store
+                        .symbol(fixture.assignment)
+                        .unwrap()
+                        .exports()
+                        .unwrap();
+                    assert_eq!(
+                        fixture.store.insert_symbol(
+                            promoted,
+                            EscapedName::source("Exported"),
+                            fixture.module,
+                        ),
+                        Some(Some(fixture.typedef))
+                    );
+                }
+                Forgery::TypedefDeclaration => {
+                    assert!(fixture.store.set_symbol_declarations(
+                        fixture.typedef,
+                        Some(vec![target_declaration]),
+                        None,
+                    ));
+                }
+                Forgery::ExtraFlags => {
+                    assert!(fixture.store.set_symbol_flags(
+                        fixture.assignment,
+                        SymbolFlags::ALIAS | SymbolFlags::NAMESPACE_MODULE | SymbolFlags::INTERFACE,
+                        CheckFlags::NONE,
+                    ));
+                }
+                Forgery::MissingValueDeclaration => {
+                    let declaration = fixture
+                        .store
+                        .symbol(fixture.assignment)
+                        .unwrap()
+                        .value_declaration()
+                        .unwrap();
+                    assert!(fixture.store.set_symbol_declarations(
+                        fixture.assignment,
+                        Some(vec![declaration]),
+                        None,
+                    ));
+                }
+            }
+            assert!(
+                !is_promoted_commonjs_export_alias(&fixture.store, fixture.assignment),
+                "{forgery:?}"
+            );
+
+            let mut host = SyntheticHost::default();
+            host.insert(
+                imported,
+                CanonicalImmediateAliasTarget::Resolved(fixture.assignment),
+            );
+            host.insert(
+                fixture.assignment,
+                CanonicalImmediateAliasTarget::Resolved(fixture.target),
+            );
+            let invalid_target = CanonicalAliasResolutionError::InvalidTarget {
+                alias: imported,
+                target: fixture.assignment,
+            };
+            assert_eq!(
+                CanonicalAliasResolver::new(&mut fixture.store, &mut host)
+                    .get_immediate_aliased_symbol(imported),
+                Err(invalid_target),
+                "{forgery:?}"
+            );
+            for _ in 0..2 {
+                assert_eq!(
+                    CanonicalAliasResolver::new(&mut fixture.store, &mut host)
+                        .resolve_alias(imported),
+                    Err(invalid_target),
+                    "{forgery:?}"
+                );
+                assert_eq!(
+                    fixture.store.alias_symbol_links(imported),
+                    Some(&AliasSymbolLinks::default())
+                );
+                assert!(
+                    fixture
+                        .store
+                        .alias_symbol_links(fixture.assignment)
+                        .is_none()
+                );
+                assert!(fixture.store.type_resolution_is_empty());
+            }
+            assert_eq!(
+                CanonicalAliasResolver::new(&mut fixture.store, &mut host)
+                    .resolve_alias(fixture.assignment),
+                Err(CanonicalAliasResolutionError::InvalidSymbol(
+                    fixture.assignment,
+                )),
+                "{forgery:?}"
+            );
+            assert!(
+                fixture
+                    .store
+                    .alias_symbol_links(fixture.assignment)
+                    .is_none()
+            );
+            assert_eq!(host.calls(fixture.assignment), 0);
+        }
     }
 
     #[test]

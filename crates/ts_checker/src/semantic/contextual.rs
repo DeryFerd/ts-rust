@@ -11,7 +11,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use ts_binder::{EscapedName, SemanticSymbolId};
+use ts_ast::NodeRef;
+use ts_binder::{EscapedName, SemanticSymbolId, SymbolFlags};
 
 use super::{
     CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeHost, IndexInfoId,
@@ -32,6 +33,11 @@ enum ExpressionLocation {
     Cached,
     Mutable,
     Readonly,
+}
+
+struct ExpressionPreparationState<'a> {
+    current_flow_types: &'a HashMap<SemanticSymbolId, TypeId>,
+    tuple_contexts: HashMap<NodeRef, TypeId>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -67,6 +73,7 @@ enum LiteralKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ContextualPropertyObject {
     Declared(ResolvedDeclaredPropertyObject),
+    Synthetic(Vec<(EscapedName, TypeId)>),
     FiniteRecord(FiniteRecordMappedProjection),
     BroadRecord(BroadRecordMappedProjection),
 }
@@ -88,6 +95,7 @@ impl ContextualPropertyObject {
                 .iter()
                 .map(|property| property.type_)
                 .collect(),
+            Self::Synthetic(properties) => properties.iter().map(|(_, type_)| *type_).collect(),
             Self::FiniteRecord(object) => object
                 .properties
                 .iter()
@@ -100,6 +108,13 @@ impl ContextualPropertyObject {
     fn get_source(&self, name: &str) -> Option<TypeId> {
         match self {
             Self::Declared(object) => object.get_source(name).map(|property| property.type_),
+            Self::Synthetic(properties) => {
+                let name = EscapedName::source(name);
+                properties
+                    .iter()
+                    .find(|(property, _)| property == &name)
+                    .map(|(_, type_)| *type_)
+            }
             Self::FiniteRecord(object) => {
                 let name = EscapedName::source(name);
                 object
@@ -131,6 +146,7 @@ pub(super) fn prepare_expression_context(
         expression,
         contextual_type,
     )
+    .map(|(prepared, _)| prepared)
 }
 
 /// Prepares a contextual expression with authoritative generic-global identities.
@@ -142,6 +158,26 @@ pub(super) fn prepare_expression_context_with_global_types(
     expression: &PlannedExpression,
     contextual_type: TypeId,
 ) -> Result<PreparedExpression, SourceCheckError> {
+    prepare_expression_context_and_tuple_contexts_with_global_types(
+        store,
+        host,
+        global_types,
+        current_flow_types,
+        expression,
+        contextual_type,
+    )
+    .map(|(prepared, _)| prepared)
+}
+
+/// Retains the contextual tuple type for each array literal in the prepared tree.
+pub(super) fn prepare_expression_context_and_tuple_contexts_with_global_types(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    current_flow_types: &HashMap<SemanticSymbolId, TypeId>,
+    expression: &PlannedExpression,
+    contextual_type: TypeId,
+) -> Result<(PreparedExpression, HashMap<NodeRef, TypeId>), SourceCheckError> {
     prepare_expression_context_worker(
         store,
         host,
@@ -159,7 +195,7 @@ fn prepare_expression_context_worker(
     current_flow_types: &HashMap<SemanticSymbolId, TypeId>,
     expression: &PlannedExpression,
     contextual_type: TypeId,
-) -> Result<PreparedExpression, SourceCheckError> {
+) -> Result<(PreparedExpression, HashMap<NodeRef, TypeId>), SourceCheckError> {
     if matches!(&expression.kind, PlannedExpressionKind::Object { .. }) {
         preflight_contextual_type_graph(
             store,
@@ -170,15 +206,20 @@ fn prepare_expression_context_worker(
             &mut HashSet::new(),
         )?;
     }
-    prepare_expression(
+    let mut state = ExpressionPreparationState {
+        current_flow_types,
+        tuple_contexts: HashMap::new(),
+    };
+    let prepared = prepare_expression(
         store,
         host,
         global_types,
-        current_flow_types,
+        &mut state,
         expression,
         Some(contextual_type),
         ExpressionLocation::Cached,
-    )
+    )?;
+    Ok((prepared, state.tuple_contexts))
 }
 
 /// Prepares a non-contextual expression with authoritative generic-global identities.
@@ -205,11 +246,15 @@ fn prepare_expression_without_context_worker(
     current_flow_types: &HashMap<SemanticSymbolId, TypeId>,
     expression: &PlannedExpression,
 ) -> Result<PreparedExpression, SourceCheckError> {
+    let mut state = ExpressionPreparationState {
+        current_flow_types,
+        tuple_contexts: HashMap::new(),
+    };
     prepare_expression(
         store,
         host,
         global_types,
-        current_flow_types,
+        &mut state,
         expression,
         None,
         ExpressionLocation::Cached,
@@ -333,7 +378,7 @@ fn prepare_expression(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     global_types: Option<&CanonicalGlobalTypes>,
-    current_flow_types: &HashMap<SemanticSymbolId, TypeId>,
+    state: &mut ExpressionPreparationState<'_>,
     expression: &PlannedExpression,
     contextual_type: Option<TypeId>,
     location: ExpressionLocation,
@@ -346,11 +391,11 @@ fn prepare_expression(
             PreparedExpression::Identifier(identifier_treatment(
                 store,
                 global_types,
-                *current_flow_types
-                    .get(&read.value_symbol)
-                    .ok_or(SourceCheckError::Variable(
-                        VariableInvariant::MissingCurrentFlowType(read.value_symbol),
-                    ))?,
+                *state.current_flow_types.get(&read.value_symbol).ok_or(
+                    SourceCheckError::Variable(VariableInvariant::MissingCurrentFlowType(
+                        read.value_symbol,
+                    )),
+                )?,
                 contextual_type,
                 location,
             )?)
@@ -393,7 +438,7 @@ fn prepare_expression(
                 store,
                 host,
                 global_types,
-                current_flow_types,
+                state,
                 inner,
                 contextual_type,
                 location,
@@ -425,6 +470,13 @@ fn prepare_expression(
                 })
                 .transpose()?
                 .flatten();
+            if tuple_context.is_some()
+                && let Some(contextual_type) = contextual_type
+            {
+                state
+                    .tuple_contexts
+                    .insert(expression.node, contextual_type);
+            }
             let mut prepared = Vec::with_capacity(elements.len());
             for (index, element) in elements.iter().enumerate() {
                 let positional_context = tuple_context.as_ref().and_then(|(types, has_rest)| {
@@ -437,7 +489,7 @@ fn prepare_expression(
                     store,
                     host,
                     global_types,
-                    current_flow_types,
+                    state,
                     element,
                     positional_context.or(element_context),
                     ExpressionLocation::Mutable,
@@ -454,7 +506,7 @@ fn prepare_expression(
                 contextual_type,
                 &plan.properties,
                 properties,
-                current_flow_types,
+                state.current_flow_types,
             )?;
             let mut prepared = Vec::with_capacity(properties.len());
             for (property, expression) in plan.properties.iter().zip(properties) {
@@ -463,13 +515,13 @@ fn prepare_expression(
                     &contextual,
                     &property.name,
                     expression,
-                    current_flow_types,
+                    state.current_flow_types,
                 )?;
                 prepared.push(prepare_expression(
                     store,
                     host,
                     global_types,
-                    current_flow_types,
+                    state,
                     expression,
                     property_context,
                     if property.readonly {
@@ -486,7 +538,7 @@ fn prepare_expression(
                 store,
                 host,
                 global_types,
-                current_flow_types,
+                state,
                 &property.receiver,
                 None,
                 ExpressionLocation::Cached,
@@ -634,10 +686,67 @@ fn resolve_contextual_property_object(
             .map(Some)
             .map_err(|error| contextual_mapped_error(contextual_type, error));
     }
+    if let Some(properties) = synthetic_contextual_property_projection(store, contextual_type)? {
+        return Ok(Some(ContextualPropertyObject::Synthetic(properties)));
+    }
     store
         .resolved_declared_property_object(host, contextual_type)
         .map(|object| object.map(ContextualPropertyObject::Declared))
         .map_err(Into::into)
+}
+
+/// Projects declaration-free `JSDoc` properties through the relater's full validation.
+fn synthetic_contextual_property_projection(
+    store: &mut CanonicalTypeMapperStore,
+    contextual_type: TypeId,
+) -> Result<Option<Vec<(EscapedName, TypeId)>>, RelationUnavailable> {
+    let properties = store.type_payload(contextual_type).and_then(|record| {
+        if record.symbol().is_some() {
+            return None;
+        }
+        let TypeData::Object(object) = record.data() else {
+            return None;
+        };
+        let properties = object.structured.properties.as_deref()?;
+        properties
+            .iter()
+            .any(|property| {
+                store
+                    .symbol(*property)
+                    .is_some_and(|record| record.flags().contains(SymbolFlags::TRANSIENT))
+            })
+            .then(|| properties.to_vec())
+    });
+    let Some(properties) = properties else {
+        return Ok(None);
+    };
+
+    let mut projection = Vec::with_capacity(properties.len());
+    for symbol in properties {
+        let name = store
+            .symbol(symbol)
+            .map(|record| record.name().to_owned())
+            .ok_or(RelationUnavailable::InvalidStructuredMembers(
+                contextual_type,
+            ))?;
+        let source_name = name
+            .as_utf8()
+            .ok_or(RelationUnavailable::InvalidStructuredMembers(
+                contextual_type,
+            ))?;
+        let property = store
+            .resolved_own_property(contextual_type, source_name)?
+            .ok_or(RelationUnavailable::InvalidStructuredMembers(
+                contextual_type,
+            ))?;
+        if property.symbol != symbol {
+            return Err(RelationUnavailable::InvalidStructuredMembers(
+                contextual_type,
+            ));
+        }
+        projection.push((name, property.type_));
+    }
+    Ok(Some(projection))
 }
 
 /// Validates an already-published canonical `Record<string, T>` index.
@@ -1093,12 +1202,15 @@ mod tests {
         CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
         CheckFlags, EscapedName, SymbolFlags,
     };
-    use ts_parser::{ParseResult, parse_source_file};
+    use ts_parser::{ParseResult, parse_javascript_source_file, parse_source_file};
 
     use super::*;
     use crate::semantic::{
         CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions,
-        signatures::ElementFlags, tuple_types::CanonicalTupleTypeRequest, types::ObjectFlags,
+        jsdoc::{plan_javascript_source_jsdoc, resolve_planned_jsdoc_type},
+        signatures::ElementFlags,
+        tuple_types::CanonicalTupleTypeRequest,
+        types::ObjectFlags,
     };
 
     fn initialized() -> CanonicalTypeMapperStore {
@@ -1203,6 +1315,174 @@ mod tests {
                     .map(|type_| (node, type_))
             })
             .collect()
+    }
+
+    #[test]
+    fn synthetic_jsdoc_objects_provide_context_and_reject_forged_properties() {
+        let parsed = parse_source_file("const value: { age: number } = { age: 1 };");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(1_068);
+        let mut context = mapped_record_context(&parsed, file);
+        let (_, object) = mapped_record_nodes(&parsed, file);
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new([(&parsed.arena, &bound)]).unwrap();
+        let plan =
+            super::super::object_members::plan_object_literal(context.store(), &host, object)
+                .unwrap();
+        let [age] = plan.properties.as_slice() else {
+            panic!("the source object has one age property")
+        };
+        let expression = PlannedExpression::new(
+            object,
+            PlannedExpressionKind::Object {
+                properties: vec![PlannedExpression::new(
+                    age.type_node,
+                    PlannedExpressionKind::Number {
+                        value: ts_jsnum::Number::new(1.0),
+                        unary_operand: None,
+                    },
+                )],
+                plan,
+            },
+        );
+
+        let javascript = parse_javascript_source_file(concat!(
+            "/** @typedef {{ age: number, label?: string }} Person */\n",
+            "/** @type {Person} */\n",
+            "var person;",
+        ));
+        assert!(
+            javascript.diagnostics.is_empty(),
+            "{:?}",
+            javascript.diagnostics
+        );
+        let source = NodeRef::new(
+            javascript.arena.id(),
+            FileId::new(1_069),
+            javascript.source_file,
+        );
+        let jsdoc = plan_javascript_source_jsdoc(&javascript.arena, source).unwrap();
+        let [declaration] = jsdoc.declarations() else {
+            panic!("the JavaScript fixture has one annotated declaration")
+        };
+        let annotation = declaration.type_().unwrap();
+        let globals = context.global_types().clone();
+        let options = context.options();
+        let target =
+            resolve_planned_jsdoc_type(context.store_mut_for_test(), &globals, options, annotation)
+                .unwrap();
+        let (number, string) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (bootstrap.number_type, bootstrap.string_type)
+        };
+        let store = context.store_mut_for_test();
+        let before = (
+            store.type_len(),
+            store.symbol_len(),
+            store.checker_link_allocated_lengths(),
+            store.relation_state_snapshot(),
+        );
+
+        let projected = resolve_contextual_property_object(store, &host, target)
+            .unwrap()
+            .unwrap();
+        assert_eq!(projected.property_types(), vec![number, string]);
+        assert_eq!(projected.get_source("age"), Some(number));
+        assert_eq!(projected.get_source("label"), Some(string));
+        assert_eq!(projected.get_source("missing"), None);
+        assert_eq!(
+            prepare_expression_context_with_global_types(
+                store,
+                &host,
+                &globals,
+                &HashMap::new(),
+                &expression,
+                target,
+            ),
+            Ok(PreparedExpression::Object(vec![
+                PreparedExpression::Literal(LiteralTreatment::WidenedPrimitive),
+            ])),
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.symbol_len(),
+                store.checker_link_allocated_lengths(),
+                store.relation_state_snapshot(),
+            ),
+            before,
+        );
+        assert!(store.type_node_links(object).is_none());
+
+        let property = match store.type_payload(target).unwrap().data() {
+            TypeData::Object(object) => object.structured.properties.as_ref().unwrap()[0],
+            _ => panic!("a JSDoc structural type must be an anonymous object"),
+        };
+        let original_flags = store.symbol(property).unwrap().flags();
+        let original_checks = store.symbol(property).unwrap().check_flags();
+        let original_links = store.value_symbol_links(property).unwrap().clone();
+
+        for forged_links in [false, true] {
+            if forged_links {
+                let mut poisoned = original_links.clone();
+                poisoned.target = Some(property);
+                assert!(store.set_value_symbol_links(property, poisoned));
+            } else {
+                assert!(store.set_symbol_flags(
+                    property,
+                    original_flags.without(SymbolFlags::TRANSIENT),
+                    original_checks,
+                ));
+            }
+            let poisoned = (
+                store.type_len(),
+                store.symbol_len(),
+                store.checker_link_allocated_lengths(),
+                store.relation_state_snapshot(),
+            );
+
+            assert_eq!(
+                prepare_expression_context_with_global_types(
+                    store,
+                    &host,
+                    &globals,
+                    &HashMap::new(),
+                    &expression,
+                    target,
+                ),
+                Err(SourceCheckError::RelationUnavailable(
+                    RelationUnavailable::InvalidStructuredMembers(target),
+                )),
+            );
+            assert_eq!(
+                (
+                    store.type_len(),
+                    store.symbol_len(),
+                    store.checker_link_allocated_lengths(),
+                    store.relation_state_snapshot(),
+                ),
+                poisoned,
+            );
+            assert!(store.type_node_links(object).is_none());
+
+            if forged_links {
+                assert!(store.set_value_symbol_links(property, original_links.clone()));
+            } else {
+                assert!(store.set_symbol_flags(property, original_flags, original_checks));
+            }
+        }
+
+        assert!(
+            prepare_expression_context_with_global_types(
+                store,
+                &host,
+                &globals,
+                &HashMap::new(),
+                &expression,
+                target,
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -1957,12 +2237,139 @@ mod tests {
             ]),
         );
 
+        let expected = PreparedExpression::Array(vec![
+            PreparedExpression::Literal(LiteralTreatment::Regular),
+            PreparedExpression::Literal(LiteralTreatment::Regular),
+        ]);
+        let (prepared, tuple_contexts) = prepare_expression_context_worker(
+            &mut store,
+            &host,
+            None,
+            &HashMap::new(),
+            &expression,
+            tuple,
+        )
+        .unwrap();
+
+        assert_eq!(prepared, expected);
+        assert_eq!(tuple_contexts, HashMap::from([(root, tuple)]));
         assert_eq!(
             prepare_expression_context(&mut store, &host, &expression, tuple),
-            Ok(PreparedExpression::Array(vec![
-                PreparedExpression::Literal(LiteralTreatment::Regular),
-                PreparedExpression::Literal(LiteralTreatment::Regular),
-            ])),
+            Ok(expected),
+        );
+    }
+
+    #[test]
+    fn contextual_array_retains_tuple_targets_for_each_nested_array_literal() {
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} ",
+            "const value: [number, number][] = [[1, 2], [3, 4]];",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(1_067);
+        let mut context = mapped_record_context(&parsed, file);
+        let (annotation, root) = mapped_record_nodes(&parsed, file);
+        let target = context.get_type_from_type_node(annotation).unwrap();
+        let global_types = context.global_types().clone();
+        let tuple = context
+            .store()
+            .canonical_array_element_type(&global_types, target)
+            .unwrap()
+            .unwrap();
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new([(&parsed.arena, &bound)]).unwrap();
+        let NodeData::ArrayLiteralExpression(outer) = &parsed.arena.get(root.node).unwrap().data
+        else {
+            panic!("the contextual fixture has an outer array literal")
+        };
+        let inner_nodes = outer
+            .elements
+            .nodes
+            .iter()
+            .copied()
+            .map(|node| NodeRef::new(parsed.arena.id(), file, node))
+            .collect::<Vec<_>>();
+        let inner_expressions = inner_nodes
+            .iter()
+            .copied()
+            .map(|node| {
+                let NodeData::ArrayLiteralExpression(inner) =
+                    &parsed.arena.get(node.node).unwrap().data
+                else {
+                    panic!("the contextual fixture contains nested array literals")
+                };
+                let elements = inner
+                    .elements
+                    .nodes
+                    .iter()
+                    .copied()
+                    .map(|element| {
+                        let NodeData::NumericLiteral(literal) =
+                            &parsed.arena.get(element).unwrap().data
+                        else {
+                            panic!("the contextual fixture contains numeric tuple elements")
+                        };
+                        PlannedExpression::new(
+                            NodeRef::new(parsed.arena.id(), file, element),
+                            PlannedExpressionKind::Number {
+                                value: ts_jsnum::Number::new(literal.text.parse().unwrap()),
+                                unary_operand: None,
+                            },
+                        )
+                    })
+                    .collect();
+                PlannedExpression::new(node, PlannedExpressionKind::Array(elements))
+            })
+            .collect();
+        let expression =
+            PlannedExpression::new(root, PlannedExpressionKind::Array(inner_expressions));
+        let store = context.store_mut_for_test();
+        let before = (
+            store.type_len(),
+            store.symbol_len(),
+            store.checker_link_allocated_lengths(),
+            store.relation_state_snapshot(),
+        );
+
+        let (prepared, tuple_contexts) =
+            prepare_expression_context_and_tuple_contexts_with_global_types(
+                store,
+                &host,
+                &global_types,
+                &HashMap::new(),
+                &expression,
+                target,
+            )
+            .unwrap();
+
+        assert_eq!(
+            prepared,
+            PreparedExpression::Array(vec![
+                PreparedExpression::Array(vec![
+                    PreparedExpression::Literal(LiteralTreatment::WidenedPrimitive),
+                    PreparedExpression::Literal(LiteralTreatment::WidenedPrimitive),
+                ]),
+                PreparedExpression::Array(vec![
+                    PreparedExpression::Literal(LiteralTreatment::WidenedPrimitive),
+                    PreparedExpression::Literal(LiteralTreatment::WidenedPrimitive),
+                ]),
+            ]),
+        );
+        assert_eq!(tuple_contexts.len(), inner_nodes.len());
+        assert!(!tuple_contexts.contains_key(&root));
+        assert!(
+            inner_nodes
+                .iter()
+                .all(|node| tuple_contexts.get(node) == Some(&tuple))
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.symbol_len(),
+                store.checker_link_allocated_lengths(),
+                store.relation_state_snapshot(),
+            ),
+            before,
         );
     }
 

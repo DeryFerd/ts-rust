@@ -14,17 +14,18 @@ use super::{
     TypeAliasId, TypeId, TypeMapperId,
     array_types::{ArrayTypeError, CanonicalArrayTargets},
     bootstrap::LiteralTypeCacheError,
+    declared::type_list_key,
     intersection_types::{DeferredIntersectionTypeProjection, IntersectionTypeError},
     mapper::{CanonicalTypeMapperStore, TypeMapperApplication},
     reference_types::{
-        DirectGenericReferenceError, create_direct_generic_reference,
+        DirectGenericReference, DirectGenericReferenceError, create_direct_generic_reference,
         validate_direct_generic_reference,
     },
     template_types::TemplateTypeError,
     type_records::{TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
 };
-use ts_binder::SemanticSymbolId;
+use ts_binder::{SemanticSymbolId, SymbolFlags};
 
 /// Pinned checker limits for one instantiation query.
 ///
@@ -776,6 +777,93 @@ pub(super) fn instantiable_member_type_contains_variables(
     could_contain_installed_type_variables(store, type_, array_targets)
 }
 
+fn authenticated_unique_symbol_identity(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    record: &TypeRecord,
+) -> bool {
+    let TypeData::UniqueEsSymbol(unique) = record.data() else {
+        return false;
+    };
+    let Some(symbol) = record.symbol() else {
+        return false;
+    };
+    let Some(owner) = store.symbol(symbol) else {
+        return false;
+    };
+    let Some(global_id) = store.symbol_store().assigned_global_symbol_id(symbol) else {
+        return false;
+    };
+    let Some(suffix) = unique
+        .name
+        .as_bytes()
+        .strip_prefix(b"\xFE@")
+        .and_then(|name| name.strip_prefix(owner.name().as_bytes()))
+        .and_then(|name| name.strip_prefix(b"@"))
+    else {
+        return false;
+    };
+
+    record.flags() == TypeFlags::UNIQUE_ES_SYMBOL
+        && record.object_flags() == ObjectFlags::NONE
+        && record.alias().is_none()
+        && store.get_merged_symbol(symbol) == Some(symbol)
+        && suffix == global_id.to_string().as_bytes()
+        && store
+            .value_symbol_links(symbol)
+            .and_then(|links| links.resolved_type)
+            == Some(type_)
+}
+
+fn authenticated_global_concat_array_reference(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Option<DirectGenericReference> {
+    if !matches!(
+        store.type_payload(type_)?.data(),
+        TypeData::TypeReference(_)
+    ) {
+        return None;
+    }
+    let reference = validate_direct_generic_reference(store, type_).ok()?;
+    if reference.type_arguments.len() != 1 {
+        return None;
+    }
+    let target = store.type_payload(reference.target)?;
+    let symbol = target.symbol()?;
+    let owner = store.symbol(symbol)?;
+    let global = store
+        .intrinsic_bootstrap()
+        .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+        .and_then(|globals| globals.get_source("ConcatArray"))?;
+    (matches!(target.data(), TypeData::Interface(_))
+        && target.object_flags().contains(ObjectFlags::INTERFACE)
+        && owner.flags().contains(SymbolFlags::INTERFACE)
+        && owner.name().as_utf8() == Some("ConcatArray")
+        && store.get_merged_symbol(symbol) == store.get_merged_symbol(global))
+    .then_some(reference)
+}
+
+fn supported_instantiable_union_constituent(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> bool {
+    match store.type_payload(type_).map(TypeRecord::data) {
+        Some(
+            TypeData::Intrinsic(_)
+            | TypeData::Literal(_)
+            | TypeData::UniqueEsSymbol(_)
+            | TypeData::TypeParameter(_)
+            | TypeData::TemplateLiteral(_)
+            | TypeData::StringMapping(_),
+        ) => true,
+        Some(TypeData::TypeReference(_)) => {
+            authenticated_global_concat_array_reference(store, type_).is_some()
+        }
+        _ => false,
+    }
+}
+
 fn validate_instantiable_member_type_worker(
     store: &CanonicalTypeMapperStore,
     type_: TypeId,
@@ -797,6 +885,13 @@ fn validate_instantiable_member_type_worker(
                 store
                     .validate_union_constituent(type_)
                     .map_err(InstantiationError::Union)
+            }
+        }
+        TypeData::UniqueEsSymbol(_) => {
+            if authenticated_unique_symbol_identity(store, type_, record) {
+                Ok(())
+            } else {
+                Err(InstantiationError::UnsupportedType(type_))
             }
         }
         TypeData::TypeParameter(_) if mapper_parameters.contains(&type_) => Ok(()),
@@ -854,16 +949,7 @@ fn validate_instantiable_member_type_worker(
                 Err(InstantiationError::UnsupportedUnionConstituent(type_))
             } else {
                 data.union.types.iter().try_for_each(|constituent| {
-                    if !matches!(
-                        store.type_payload(*constituent).map(TypeRecord::data),
-                        Some(
-                            TypeData::Intrinsic(_)
-                                | TypeData::Literal(_)
-                                | TypeData::TypeParameter(_)
-                                | TypeData::TemplateLiteral(_)
-                                | TypeData::StringMapping(_)
-                        )
-                    ) {
+                    if !supported_instantiable_union_constituent(store, *constituent) {
                         return Err(InstantiationError::UnsupportedUnionConstituent(
                             *constituent,
                         ));
@@ -958,6 +1044,11 @@ fn instantiated_member_type_matches_worker(
         .ok_or(InstantiationError::InvalidType(template))?;
     let result = match record.data() {
         TypeData::Intrinsic(_) | TypeData::Literal(_) => Ok(template == actual),
+        TypeData::UniqueEsSymbol(_)
+            if authenticated_unique_symbol_identity(store, template, record) =>
+        {
+            Ok(template == actual)
+        }
         TypeData::TypeParameter(_) => Ok(store
             .map_type(mapper, template)
             .ok_or(InstantiationError::InvalidMapper(mapper))?
@@ -1157,6 +1248,44 @@ fn instantiated_member_union_matches(
                     return Ok(false);
                 };
                 substituted
+            }
+            TypeData::TypeReference(_) => {
+                let Some(reference) =
+                    authenticated_global_concat_array_reference(store, *constituent)
+                else {
+                    return Err(InstantiationError::UnsupportedUnionConstituent(
+                        *constituent,
+                    ));
+                };
+                let mut arguments = Vec::with_capacity(reference.type_arguments.len());
+                for argument in &reference.type_arguments {
+                    let Some(instantiated) = cached_instantiated_member_type(
+                        store,
+                        *argument,
+                        mapper,
+                        &mut HashSet::new(),
+                    )?
+                    else {
+                        return Ok(false);
+                    };
+                    arguments.push(instantiated);
+                }
+                if arguments == reference.type_arguments {
+                    *constituent
+                } else {
+                    let Some(cached) = store
+                        .relation_object_instantiation(reference.target, type_list_key(&arguments))
+                    else {
+                        return Ok(false);
+                    };
+                    let Ok(actual) = validate_direct_generic_reference(store, cached) else {
+                        return Ok(false);
+                    };
+                    if actual.target != reference.target || actual.type_arguments != arguments {
+                        return Ok(false);
+                    }
+                    cached
+                }
             }
             _ => *constituent,
         };
@@ -1642,18 +1771,10 @@ fn instantiate_union(
     let mut changed = false;
     let mut contains_type_variable = false;
     for constituent in constituents {
-        let record = store
-            .type_payload(*constituent)
-            .ok_or(InstantiationError::InvalidType(*constituent))?;
-        if !matches!(
-            record.data(),
-            TypeData::Intrinsic(_)
-                | TypeData::Literal(_)
-                | TypeData::UniqueEsSymbol(_)
-                | TypeData::TypeParameter(_)
-                | TypeData::TemplateLiteral(_)
-                | TypeData::StringMapping(_)
-        ) {
+        if store.type_payload(*constituent).is_none() {
+            return Err(InstantiationError::InvalidType(*constituent));
+        }
+        if !supported_instantiable_union_constituent(store, *constituent) {
             return Err(InstantiationError::UnsupportedUnionConstituent(
                 *constituent,
             ));
@@ -1706,9 +1827,12 @@ mod tests {
     use super::*;
     use crate::semantic::{
         DeclaredTypeHost, DeclaredTypeLinks, IntrinsicBootstrapOptions, SemanticStore,
+        ValueSymbolLinks,
         declared::{get_declared_class_interface_or_type_parameter, type_list_key},
         mapper::TypeMapper,
+        signatures::ElementFlags,
         template_types::MAX_TEMPLATE_UNION_SIZE,
+        tuple_types::CanonicalTupleTypeRequest,
         type_records::{LiteralValue, TypeRecord},
         types::ObjectFlags,
     };
@@ -1944,6 +2068,192 @@ mod tests {
 
         assert_eq!(instantiate_type(&mut store, parameter, mapper), Ok(number));
         assert_eq!(instantiate_type(&mut store, string, mapper), Ok(string));
+    }
+
+    #[test]
+    fn authenticated_unique_symbol_members_preserve_identity_and_reject_poisoned_owners() {
+        let mut store = initialized_store();
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let parameter = store.alloc_type_parameter(None).unwrap();
+        let mapper = store.new_simple_type_mapper(parameter, number).unwrap();
+        let owner = store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::BLOCK_SCOPED_VARIABLE,
+                EscapedName::source("key"),
+            ))
+            .unwrap();
+        let unique = store.alloc_unique_es_symbol_type(owner).unwrap();
+        assert!(store.set_value_symbol_links(
+            owner,
+            ValueSymbolLinks {
+                resolved_type: Some(unique),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+
+        assert_eq!(
+            validate_instantiable_member_type(&store, unique, &[parameter], None),
+            Ok(()),
+        );
+        assert_eq!(
+            instantiable_member_type_contains_variables(&store, unique, &[parameter], None),
+            Ok(false),
+        );
+        assert_eq!(instantiate_type(&mut store, unique, mapper), Ok(unique));
+        let before = (store.type_len(), store.mapper_len());
+        assert_eq!(
+            instantiated_member_type_matches(&store, unique, unique, mapper, None),
+            Ok(true),
+        );
+        assert_eq!(
+            instantiated_member_type_matches(&store, unique, number, mapper, None),
+            Ok(false),
+        );
+        assert_eq!((store.type_len(), store.mapper_len()), before);
+
+        assert!(store.set_value_symbol_links(owner, ValueSymbolLinks::default()));
+        assert_eq!(
+            validate_instantiable_member_type(&store, unique, &[parameter], None),
+            Err(InstantiationError::UnsupportedType(unique)),
+        );
+        assert_eq!(
+            instantiated_member_type_matches(&store, unique, unique, mapper, None),
+            Err(InstantiationError::UnsupportedType(unique)),
+        );
+    }
+
+    #[test]
+    fn global_concat_array_unions_instantiate_tuple_arguments_and_replay_warm() {
+        let mut store = initialized_store();
+        let array_targets = canonical_array_targets(&mut store);
+        let concat_target = canonical_array_target(&mut store, "ConcatArray");
+        let concat_symbol = store.type_payload(concat_target).unwrap().symbol().unwrap();
+        assert!(store.set_declared_type_links(
+            concat_symbol,
+            DeclaredTypeLinks {
+                declared_type: Some(concat_target),
+                ..DeclaredTypeLinks::default()
+            },
+        ));
+        let globals = store.intrinsic_bootstrap().unwrap().globals;
+        assert_eq!(
+            store.insert_symbol(globals, EscapedName::source("ConcatArray"), concat_symbol),
+            Some(None),
+        );
+
+        let parameter = store.alloc_type_parameter(None).unwrap();
+        let concat_parameter = create_direct_generic_reference(
+            &mut store,
+            concat_target,
+            &[parameter],
+            ObjectFlags::NONE,
+        )
+        .unwrap();
+        let source_union = store
+            .alloc_union_type(ObjectFlags::NONE, vec![parameter, concat_parameter])
+            .unwrap();
+        let source = store
+            .create_canonical_array_type_with_targets(array_targets, source_union, false)
+            .unwrap();
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let required = store
+            .create_tuple_element_info(ElementFlags::REQUIRED, None)
+            .unwrap();
+        let tuple = store
+            .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(
+                &[number, number],
+                &[required, required],
+                false,
+            ))
+            .unwrap();
+        let mapper = store.new_simple_type_mapper(parameter, tuple).unwrap();
+
+        assert_eq!(
+            validate_instantiable_member_type(&store, source, &[parameter], Some(array_targets)),
+            Ok(()),
+        );
+        assert_eq!(
+            instantiated_member_type_matches(
+                &store,
+                source_union,
+                tuple,
+                mapper,
+                Some(array_targets)
+            ),
+            Ok(false),
+            "warm validation cannot invent an uncached ConcatArray instantiation",
+        );
+
+        let mut session = InstantiationSession::new(InstantiationLimits::default());
+        let instantiated = instantiate_type_with_session(
+            &mut store,
+            source,
+            mapper,
+            Some(array_targets),
+            &mut session,
+        )
+        .unwrap();
+        let actual = store
+            .canonical_array_reference_with_targets(array_targets, instantiated)
+            .unwrap()
+            .unwrap()
+            .element_type;
+        let concat_tuple = store
+            .relation_object_instantiation(concat_target, type_list_key(&[tuple]))
+            .unwrap();
+        let TypeData::Union(union) = store.type_payload(actual).unwrap().data() else {
+            panic!("the specialized overload must retain its anonymous union")
+        };
+        assert_eq!(union.union.types.len(), 2);
+        assert!(union.union.types.contains(&tuple));
+        assert!(union.union.types.contains(&concat_tuple));
+
+        let warm = (store.type_len(), store.mapper_len());
+        assert_eq!(
+            instantiated_member_type_matches(
+                &store,
+                source,
+                instantiated,
+                mapper,
+                Some(array_targets),
+            ),
+            Ok(true),
+        );
+        assert_eq!((store.type_len(), store.mapper_len()), warm);
+    }
+
+    #[test]
+    fn unregistered_generic_union_references_remain_unsupported() {
+        let mut store = initialized_store();
+        let target = canonical_array_target(&mut store, "Pair");
+        let owner = store.type_payload(target).unwrap().symbol().unwrap();
+        assert!(store.set_declared_type_links(
+            owner,
+            DeclaredTypeLinks {
+                declared_type: Some(target),
+                ..DeclaredTypeLinks::default()
+            },
+        ));
+        let parameter = store.alloc_type_parameter(None).unwrap();
+        let reference =
+            create_direct_generic_reference(&mut store, target, &[parameter], ObjectFlags::NONE)
+                .unwrap();
+        let source = store
+            .alloc_union_type(ObjectFlags::NONE, vec![parameter, reference])
+            .unwrap();
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let mapper = store.new_simple_type_mapper(parameter, number).unwrap();
+        let before = (store.type_len(), store.mapper_len());
+
+        assert_eq!(
+            validate_instantiable_member_type(&store, source, &[parameter], None),
+            Err(InstantiationError::UnsupportedUnionConstituent(reference)),
+        );
+        assert_eq!(
+            instantiate_type(&mut store, source, mapper),
+            Err(InstantiationError::UnsupportedUnionConstituent(reference)),
+        );
+        assert_eq!((store.type_len(), store.mapper_len()), before);
     }
 
     #[test]
