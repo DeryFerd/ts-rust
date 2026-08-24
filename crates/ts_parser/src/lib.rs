@@ -5186,28 +5186,8 @@ impl<'a> Parser<'a> {
                 break;
             }
             let specifier_start = self.current.range.start;
-            let is_type_only = self.current.kind == SyntaxKind::TypeKeyword
-                && !matches!(
-                    self.next_token_kind(),
-                    SyntaxKind::AsKeyword | SyntaxKind::CommaToken | SyntaxKind::CloseBraceToken
-                );
-            if is_type_only {
-                self.bump();
-            }
-            let first_kind = self.current.kind;
-            let first = self.parse_module_export_name("Expected an import name.");
-            let (property_name, name) = if self.current.kind == SyntaxKind::AsKeyword {
-                self.bump();
-                (
-                    Some(first),
-                    self.parse_import_binding_identifier("Expected a local import name."),
-                )
-            } else {
-                if !self.token_is_identifier_in_current_context(first_kind) {
-                    self.mark_invalid_import_binding(first, specifier_start);
-                }
-                (None, first)
-            };
+            let (is_type_only, property_name, name) =
+                self.parse_import_or_export_specifier(SyntaxKind::ImportSpecifier);
             let mut specifier_children = vec![name];
             specifier_children.extend(property_name);
             elements.push(self.alloc_node(
@@ -5224,6 +5204,13 @@ impl<'a> Parser<'a> {
                 &specifier_children,
             ));
             if self.current.kind != SyntaxKind::CommaToken {
+                if can_parse_module_export_name(self.current.kind)
+                    && !(self.current.kind == SyntaxKind::FromKeyword
+                        && self.next_token_kind() == SyntaxKind::StringLiteral)
+                {
+                    self.error_current("Expected ','.");
+                    continue;
+                }
                 break;
             }
             self.bump();
@@ -5265,6 +5252,84 @@ impl<'a> Parser<'a> {
             })),
             &elements,
         )
+    }
+
+    /// Matches the pinned parser's contextual `type`/`as` specifier grammar.
+    fn parse_import_or_export_specifier(
+        &mut self,
+        kind: SyntaxKind,
+    ) -> (bool, Option<NodeId>, NodeId) {
+        let import = kind == SyntaxKind::ImportSpecifier;
+        let message = if import {
+            "Expected an import name."
+        } else {
+            "Expected an export name."
+        };
+        let mut name_kind = self.current.kind;
+        let mut name = self.parse_module_export_name(message);
+        let mut property_name = None;
+        let mut is_type_only = false;
+        let mut can_parse_as_keyword = true;
+
+        if matches!(
+            self.arena.get(name).map(|node| &node.data),
+            Some(NodeData::Identifier(identifier)) if identifier.text == "type"
+        ) {
+            if self.current.kind == SyntaxKind::AsKeyword {
+                let first_as = self.parse_identifier_name(message);
+                if self.current.kind == SyntaxKind::AsKeyword {
+                    let second_as = self.parse_identifier_name(message);
+                    if can_parse_module_export_name(self.current.kind) {
+                        is_type_only = true;
+                        property_name = Some(first_as);
+                        name_kind = self.current.kind;
+                        name = self.parse_module_specifier_binding_name(import);
+                    } else {
+                        property_name = Some(name);
+                        name_kind = SyntaxKind::AsKeyword;
+                        name = second_as;
+                    }
+                    can_parse_as_keyword = false;
+                } else if can_parse_module_export_name(self.current.kind) {
+                    property_name = Some(name);
+                    name_kind = self.current.kind;
+                    name = self.parse_module_specifier_binding_name(import);
+                    can_parse_as_keyword = false;
+                } else {
+                    is_type_only = true;
+                    name_kind = SyntaxKind::AsKeyword;
+                    name = first_as;
+                }
+            } else if can_parse_module_export_name(self.current.kind) {
+                is_type_only = true;
+                name_kind = self.current.kind;
+                name = self.parse_module_export_name(message);
+            }
+        }
+
+        if can_parse_as_keyword && self.current.kind == SyntaxKind::AsKeyword {
+            property_name = Some(name);
+            self.bump();
+            name_kind = self.current.kind;
+            name = self.parse_module_specifier_binding_name(import);
+        }
+
+        if import
+            && property_name.is_none()
+            && !self.token_is_identifier_in_current_context(name_kind)
+        {
+            self.mark_invalid_import_binding(name, self.node_start(name));
+        }
+
+        (is_type_only, property_name, name)
+    }
+
+    fn parse_module_specifier_binding_name(&mut self, import: bool) -> NodeId {
+        if import {
+            self.parse_import_binding_identifier("Expected a local import name.")
+        } else {
+            self.parse_module_export_name("Expected an exported name.")
+        }
     }
 
     fn mark_invalid_import_binding(&mut self, name: NodeId, position: TextPos) {
@@ -5558,24 +5623,8 @@ impl<'a> Parser<'a> {
                 break;
             }
             let specifier_start = self.current.range.start;
-            let is_type_only = self.current.kind == SyntaxKind::TypeKeyword
-                && !matches!(
-                    self.next_token_kind(),
-                    SyntaxKind::AsKeyword | SyntaxKind::CommaToken | SyntaxKind::CloseBraceToken
-                );
-            if is_type_only {
-                self.bump();
-            }
-            let first = self.parse_module_export_name("Expected an export name.");
-            let (property_name, name) = if self.current.kind == SyntaxKind::AsKeyword {
-                self.bump();
-                (
-                    Some(first),
-                    self.parse_module_export_name("Expected an exported name."),
-                )
-            } else {
-                (None, first)
-            };
+            let (is_type_only, property_name, name) =
+                self.parse_import_or_export_specifier(SyntaxKind::ExportSpecifier);
             let mut specifier_children = vec![name];
             specifier_children.extend(property_name);
             elements.push(self.alloc_node(
@@ -5592,6 +5641,13 @@ impl<'a> Parser<'a> {
                 &specifier_children,
             ));
             if self.current.kind != SyntaxKind::CommaToken {
+                if can_parse_module_export_name(self.current.kind)
+                    && !(self.current.kind == SyntaxKind::FromKeyword
+                        && self.next_token_kind() == SyntaxKind::StringLiteral)
+                {
+                    self.error_current("Expected ','.");
+                    continue;
+                }
                 break;
             }
             self.bump();
@@ -13492,6 +13548,202 @@ mod tests {
                 (SyntaxKind::Identifier, SyntaxKind::StringLiteral),
                 (SyntaxKind::StringLiteral, SyntaxKind::Identifier),
             ]
+        );
+    }
+
+    #[test]
+    fn contextual_type_and_as_import_specifiers_match_upstream_disambiguation() {
+        for (specifier, expected_type_only, expected_imported, expected_local) in [
+            ("type", false, None, "type"),
+            ("type as", true, None, "as"),
+            ("type as as", false, Some("type"), "as"),
+            ("type as as as", true, Some("as"), "as"),
+            ("type type as as", true, Some("type"), "as"),
+            ("type as type", false, Some("type"), "type"),
+            ("type something", true, None, "something"),
+            ("type something as local", true, Some("something"), "local"),
+            (r#""0n" as local"#, false, Some("0n"), "local"),
+        ] {
+            let source = format!(r#"import {{ {specifier} }} from "./mod";"#);
+            let result = parse_source_file(&source);
+            assert!(
+                result.diagnostics.is_empty(),
+                "{source}: {:?}",
+                result.diagnostics
+            );
+            let declaration = import_declaration(&result, source_statements(&result)[0]);
+            let clause = import_clause(&result, declaration.import_clause.unwrap());
+            let NodeData::NamedImports(imports) = &result
+                .arena
+                .get(clause.named_bindings.unwrap())
+                .unwrap()
+                .data
+            else {
+                panic!("expected named imports for {source}")
+            };
+            let [binding] = imports.elements.nodes.as_slice() else {
+                panic!("expected one import specifier for {source}")
+            };
+            let NodeData::ImportSpecifier(binding) = &result.arena.get(*binding).unwrap().data
+            else {
+                panic!("expected an import specifier for {source}")
+            };
+            let imported =
+                binding
+                    .property_name
+                    .map(|name| match &result.arena.get(name).unwrap().data {
+                        NodeData::Identifier(identifier) => identifier.text.as_str(),
+                        NodeData::StringLiteral(literal) => literal.text.as_str(),
+                        _ => panic!("expected an identifier or string import name for {source}"),
+                    });
+            assert_eq!(binding.is_type_only, expected_type_only, "{source}");
+            assert_eq!(imported, expected_imported, "{source}");
+            assert_eq!(
+                identifier_text(&result, binding.name),
+                expected_local,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn contextual_type_and_as_export_specifiers_match_upstream_disambiguation() {
+        for (specifier, expected_type_only, expected_local, expected_exported) in [
+            ("type", false, None, "type"),
+            ("type as", true, None, "as"),
+            ("type as as", false, Some("type"), "as"),
+            ("type as as as", true, Some("as"), "as"),
+            ("type something", true, None, "something"),
+            ("type type as local", true, Some("type"), "local"),
+            (r#"value as "0n""#, false, Some("value"), "0n"),
+        ] {
+            let source = format!("export {{ {specifier} }};");
+            let result = parse_source_file(&source);
+            assert!(
+                result.diagnostics.is_empty(),
+                "{source}: {:?}",
+                result.diagnostics
+            );
+            let NodeData::ExportDeclaration(declaration) = &result
+                .arena
+                .get(source_statements(&result)[0])
+                .unwrap()
+                .data
+            else {
+                panic!("expected an export declaration for {source}")
+            };
+            let NodeData::NamedExports(exports) = &result
+                .arena
+                .get(declaration.export_clause.unwrap())
+                .unwrap()
+                .data
+            else {
+                panic!("expected named exports for {source}")
+            };
+            let [binding] = exports.elements.nodes.as_slice() else {
+                panic!("expected one export specifier for {source}")
+            };
+            let NodeData::ExportSpecifier(binding) = &result.arena.get(*binding).unwrap().data
+            else {
+                panic!("expected an export specifier for {source}")
+            };
+            let text = |name| match &result.arena.get(name).unwrap().data {
+                NodeData::Identifier(identifier) => identifier.text.as_str(),
+                NodeData::StringLiteral(literal) => literal.text.as_str(),
+                _ => panic!("expected an identifier or string export name for {source}"),
+            };
+            assert_eq!(binding.is_type_only, expected_type_only, "{source}");
+            assert_eq!(binding.property_name.map(text), expected_local, "{source}");
+            assert_eq!(text(binding.name), expected_exported, "{source}");
+        }
+    }
+
+    #[test]
+    fn repeated_contextual_as_recovers_the_missing_module_specifier_comma() {
+        for source in [
+            r#"import { type as as as as } from "./mod";"#,
+            "export { type as as as as };",
+        ] {
+            let result = parse_source_file(source);
+            let diagnostic_start = u32::try_from(source.rfind("as }").unwrap()).unwrap();
+            assert_eq!(
+                result
+                    .diagnostics
+                    .iter()
+                    .map(|diagnostic| (
+                        diagnostic.code,
+                        diagnostic.range.start.get(),
+                        diagnostic.range.end.get(),
+                        diagnostic.message.as_str(),
+                    ))
+                    .collect::<Vec<_>>(),
+                [(
+                    Some(1005),
+                    diagnostic_start,
+                    diagnostic_start + 2,
+                    "',' expected."
+                )],
+                "{source}"
+            );
+
+            let names = result
+                .arena
+                .iter()
+                .filter_map(|(_, node)| match &node.data {
+                    NodeData::ImportSpecifier(specifier) => Some((
+                        specifier.is_type_only,
+                        identifier_text(&result, specifier.name),
+                    )),
+                    NodeData::ExportSpecifier(specifier) => Some((
+                        specifier.is_type_only,
+                        identifier_text(&result, specifier.name),
+                    )),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(names, [(true, "as"), (false, "as")], "{source}");
+        }
+    }
+
+    #[test]
+    fn speculative_javascript_array_conditionals_remain_expressions() {
+        let source = concat!(
+            "const is_morning = new Date().getHours() < 12;\n",
+            "// prettier-ignore\n",
+            "const greeting = ([\n",
+            "  is_morning ? 'good morning' : 'good evening'\n",
+            "]);\n",
+        );
+        let result = parse_javascript_source_file(source);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 2);
+        let (list, _) = variable_list(&result, statements[1]);
+        let declaration = declaration_nodes(&result, list)[0];
+        let NodeData::VariableDeclaration(declaration) =
+            &result.arena.get(declaration).unwrap().data
+        else {
+            panic!("expected the greeting variable declaration")
+        };
+        let NodeData::ParenthesizedExpression(parenthesized) = &result
+            .arena
+            .get(declaration.initializer.unwrap())
+            .unwrap()
+            .data
+        else {
+            panic!("expected the parenthesized greeting array")
+        };
+        let NodeData::ArrayLiteralExpression(array) =
+            &result.arena.get(parenthesized.expression).unwrap().data
+        else {
+            panic!("expected the greeting array")
+        };
+        let [conditional] = array.elements.nodes.as_slice() else {
+            panic!("expected one conditional greeting")
+        };
+        assert_eq!(
+            result.arena.get(*conditional).unwrap().kind,
+            SyntaxKind::ConditionalExpression,
         );
     }
 
