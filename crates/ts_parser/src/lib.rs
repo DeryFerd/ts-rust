@@ -705,7 +705,9 @@ impl<'a> Parser<'a> {
             && self.next_token_preceded_by_line_break();
         let declare_starts_expression = self.current.kind == SyntaxKind::DeclareKeyword
             && match self.next_token_kind() {
-                SyntaxKind::InstanceOfKeyword => true,
+                SyntaxKind::InstanceOfKeyword
+                | SyntaxKind::NoSubstitutionTemplateLiteral
+                | SyntaxKind::TemplateHead => true,
                 SyntaxKind::ModuleKeyword => {
                     self.next_tokens_are(SyntaxKind::ModuleKeyword, SyntaxKind::OpenBraceToken)
                 }
@@ -13612,6 +13614,39 @@ export as namespace GlobalName;
             instanceof.arena.get(binary.operator_token).unwrap().kind,
             SyntaxKind::InstanceOfKeyword
         );
+
+        for (source, expected_template) in [
+            (
+                "declare `value`;",
+                SyntaxKind::NoSubstitutionTemplateLiteral,
+            ),
+            ("declare `value ${0}`;", SyntaxKind::TemplateExpression),
+        ] {
+            let tagged = parse_source_file(source);
+            assert!(
+                tagged.diagnostics.is_empty(),
+                "{source}: {:?}",
+                tagged.diagnostics
+            );
+            let [statement] = source_statements(&tagged) else {
+                panic!("expected one tagged-template statement: {source}");
+            };
+            let NodeData::ExpressionStatement(statement) =
+                &tagged.arena.get(*statement).unwrap().data
+            else {
+                panic!("expected a tagged-template expression statement: {source}");
+            };
+            let NodeData::TaggedTemplateExpression(expression) =
+                &tagged.arena.get(statement.expression).unwrap().data
+            else {
+                panic!("expected a tagged-template expression: {source}");
+            };
+            assert_eq!(identifier_text(&tagged, expression.tag), "declare");
+            assert_eq!(
+                tagged.arena.get(expression.template).unwrap().kind,
+                expected_template
+            );
+        }
 
         let anonymous_module = parse_source_file("declare module {}");
         assert_eq!(
