@@ -1,9 +1,11 @@
-use ts_ast::{FileId, NodeRef, SyntaxKind};
+use ts_ast::{FileId, NodeData, NodeRef, SyntaxKind};
 use ts_binder::{
     CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
-    EscapedName,
+    EscapedName, SemanticSymbolId,
 };
-use ts_checker::semantic::{CanonicalCheckerContext, CanonicalCheckerOptions, TypeData};
+use ts_checker::semantic::{
+    CanonicalCheckerContext, CanonicalCheckerOptions, SourceCheckError, TypeData,
+};
 use ts_parser::{ParseResult, parse_javascript_source_file, parse_source_file};
 
 fn context(
@@ -50,6 +52,64 @@ fn context_with_options(
     CanonicalCheckerContext::new(binder.finish(), vec![(file, &parsed.arena)], options).unwrap()
 }
 
+#[derive(Clone, Copy)]
+struct ExpectedLexicalBlock {
+    name: &'static str,
+    read: NodeRef,
+    declaration_name: NodeRef,
+    symbol: SemanticSymbolId,
+}
+
+fn lexical_block_expectations(
+    parsed: &ParseResult,
+    context: &CanonicalCheckerContext<'_>,
+    file: FileId,
+) -> ([ExpectedLexicalBlock; 2], SemanticSymbolId) {
+    let (_, bound) = context.file(file).unwrap();
+    let NodeData::SourceFile(root) = &parsed.arena.get(parsed.source_file).unwrap().data else {
+        panic!("the fixture must retain its source statements")
+    };
+    let expected = [("c1", 0), ("v1", 2)].map(|(name, index)| {
+        let NodeData::Block(block) = &parsed.arena.get(root.statements.nodes[index]).unwrap().data
+        else {
+            panic!("the fixture must retain both lexical blocks")
+        };
+        let NodeData::ExpressionStatement(read) =
+            &parsed.arena.get(block.statements.nodes[0]).unwrap().data
+        else {
+            panic!("the lexical block must start with its identifier read")
+        };
+        let NodeData::VariableStatement(statement) =
+            &parsed.arena.get(block.statements.nodes[1]).unwrap().data
+        else {
+            panic!("the lexical block must finish with its const declaration")
+        };
+        let NodeData::VariableDeclarationList(list) =
+            &parsed.arena.get(statement.declaration_list).unwrap().data
+        else {
+            panic!("the const statement must retain its declaration list")
+        };
+        let declaration = NodeRef::new(parsed.arena.id(), file, list.declarations.nodes[0]);
+        let NodeData::VariableDeclaration(variable) =
+            &parsed.arena.get(declaration.node).unwrap().data
+        else {
+            panic!("the const statement must retain its declaration")
+        };
+        ExpectedLexicalBlock {
+            name,
+            read: NodeRef::new(parsed.arena.id(), file, read.expression),
+            declaration_name: NodeRef::new(parsed.arena.id(), file, variable.name),
+            symbol: bound.symbol(declaration).unwrap(),
+        }
+    });
+    let outer_symbol = bound
+        .locals(bound.source_file())
+        .and_then(|locals| context.store().symbol_table(locals))
+        .and_then(|locals| locals.get_source("v1"))
+        .unwrap();
+    (expected, outer_symbol)
+}
+
 #[test]
 fn top_level_empty_statements_are_semantic_noops() {
     let parsed = parse_source_file(";const first = 1;; const second = 2;");
@@ -74,6 +134,159 @@ fn top_level_empty_statements_are_semantic_noops() {
         ),
         warm
     );
+}
+
+#[test]
+fn top_level_lexical_blocks_report_forward_const_reads_and_shadow_outer_vars() {
+    let source = concat!(
+        "{\n",
+        "    c1;\n",
+        "    const c1 = 0;\n",
+        "}\n\n",
+        "var v1;\n",
+        "{\n",
+        "    v1;\n",
+        "    const v1 = 0;\n",
+        "}\n",
+    );
+    let parsed = parse_source_file(source);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(8_231);
+    let mut context = context(&parsed, file, CanonicalSourceLanguage::TypeScript);
+
+    let (expected, outer_symbol) = lexical_block_expectations(&parsed, &context, file);
+    assert_ne!(expected[1].symbol, outer_symbol);
+
+    context.check_source_file(file).unwrap();
+
+    let diagnostics = context.diagnostics().as_slice();
+    assert_eq!(diagnostics.len(), expected.len(), "{diagnostics:?}");
+    for (
+        diagnostic,
+        ExpectedLexicalBlock {
+            name,
+            read,
+            declaration_name,
+            symbol,
+        },
+    ) in diagnostics.iter().zip(expected)
+    {
+        assert_eq!(diagnostic.node, Some(read));
+        assert_eq!(diagnostic.diagnostic.code(), 2448);
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            format!("Block-scoped variable '{name}' used before its declaration."),
+        );
+        let [related] = diagnostic.related_information.as_slice() else {
+            panic!("the forward const read must identify its declaration")
+        };
+        assert_eq!(related.node, Some(declaration_name));
+        assert_eq!(related.diagnostic.code(), 2728);
+        assert_eq!(
+            related.diagnostic.render().unwrap(),
+            format!("'{name}' is declared here."),
+        );
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(read)
+                .and_then(|links| links.resolved_symbol),
+            Some(symbol),
+        );
+        let declared_type = context
+            .store()
+            .value_symbol_links(symbol)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        assert_eq!(context.type_to_string(declared_type).unwrap(), "0");
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(read)
+                .and_then(|links| links.resolved_type),
+            Some(declared_type),
+        );
+    }
+    let outer_type = context
+        .store()
+        .value_symbol_links(outer_symbol)
+        .and_then(|links| links.resolved_type)
+        .unwrap();
+    assert_eq!(context.type_to_string(outer_type).unwrap(), "any");
+
+    let warm = (
+        context.store().type_len(),
+        context.store().symbol_len(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
+}
+
+#[test]
+fn unsupported_lexical_blocks_and_implicit_any_shadowing_stay_cold() {
+    for (index, source) in [
+        "{ value; let value = 0; }",
+        "{ value; const value = 0; value; }",
+        "{ value; const other = 0; }",
+        "var value; { other; const other = 0; }",
+        "module; { value; const value = 0; }",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let parsed = parse_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(8_232 + u32::try_from(index).unwrap());
+        let mut context = context(&parsed, file, CanonicalSourceLanguage::TypeScript);
+        let cold = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.diagnostics().clone(),
+        );
+
+        assert!(
+            matches!(
+                context.check_source_file(file),
+                Err(SourceCheckError::Unsupported(_))
+            ),
+            "source: {source}",
+        );
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.diagnostics().clone(),
+            ),
+            cold,
+            "source: {source}",
+        );
+    }
+
+    let parsed = parse_source_file("var value; { value; const value = 0; }");
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(8_237);
+    let mut context = context_with_options(
+        &parsed,
+        file,
+        CanonicalSourceLanguage::TypeScript,
+        CanonicalCheckerOptions {
+            no_implicit_any: true,
+            ..CanonicalCheckerOptions::default()
+        },
+    );
+    assert!(matches!(
+        context.check_source_file(file),
+        Err(SourceCheckError::Unsupported(_))
+    ));
+    assert!(context.diagnostics().is_empty());
 }
 
 #[test]
