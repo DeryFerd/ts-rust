@@ -60,9 +60,9 @@ use super::{
     classes::{
         ClassGrammarDiagnostic, ClassGrammarDiagnosticPlan, ClassMemberPlan, ClassMemberQueryPlan,
         ExportedJsxArrowClassPlan, execute_exported_jsx_arrow_class,
-        execute_nongeneric_class_member_query, plan_class_grammar_diagnostics,
-        plan_exported_jsx_arrow_class, plan_nongeneric_class_member_query,
-        preflight_nongeneric_class_member_query,
+        execute_nongeneric_class_member_query, plan_anonymous_abstract_class_expression_grammar,
+        plan_class_grammar_diagnostics, plan_exported_jsx_arrow_class,
+        plan_nongeneric_class_member_query, preflight_nongeneric_class_member_query,
     },
     contextual::{
         LiteralTreatment, PreparedExpression, prepare_expression_context_with_global_types,
@@ -2271,6 +2271,14 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         }
                         (variable.declaration_list, export_modifier.is_some())
                     };
+                    if let Some(grammar) = self.plan_anonymous_abstract_class_variable_grammar(
+                        statement,
+                        declaration_list,
+                        exported,
+                    )? {
+                        statements.push(PlannedStatement::ClassGrammar(grammar));
+                        continue;
+                    }
                     match self.plan_variable_statement(statement, declaration_list, exported)? {
                         PlannedVariableStatement::Arrow(arrow) => {
                             let index = arrows.len();
@@ -7624,6 +7632,62 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 .source
                 .node_ref()
                 .is_for(self.arena.id(), self.bound.file_id())
+    }
+
+    fn plan_anonymous_abstract_class_variable_grammar(
+        &self,
+        statement: NodeRef,
+        declaration_list: NodeId,
+        exported: bool,
+    ) -> Result<Option<ClassGrammarDiagnosticPlan>, SourceCheckError> {
+        if exported {
+            return Ok(None);
+        }
+
+        let list = self.reference(declaration_list);
+        let list_record = self.node(list)?;
+        let NodeData::VariableDeclarationList(declarations) = &list_record.data else {
+            return Ok(None);
+        };
+        let [declaration] = declarations.declarations.nodes.as_slice() else {
+            return Ok(None);
+        };
+        if list_record.kind != SyntaxKind::VariableDeclarationList
+            || list_record.flags.0 != NODE_FLAG_LET
+            || list_record.parent != Some(statement.node)
+        {
+            return Ok(None);
+        }
+
+        let declaration = self.reference(*declaration);
+        let declaration_record = self.node(declaration)?;
+        let NodeData::VariableDeclaration(variable) = &declaration_record.data else {
+            return Ok(None);
+        };
+        let Some(expression) = variable.initializer.map(|node| self.reference(node)) else {
+            return Ok(None);
+        };
+        if self.node(expression)?.kind != SyntaxKind::ClassExpression {
+            return Ok(None);
+        }
+
+        let Some((store, host)) = self.semantic else {
+            return Ok(None);
+        };
+        let Some(grammar) = plan_anonymous_abstract_class_expression_grammar(
+            store,
+            host,
+            expression,
+            !self.allow_implicit_ambient_any,
+        ) else {
+            return Ok(None);
+        };
+        if grammar.declaration != expression
+            || self.bound.symbol(expression) != Some(grammar.symbol)
+        {
+            return Err(SourceCheckError::Class(expression));
+        }
+        Ok(Some(grammar))
     }
 
     fn plan_variable_statement(
@@ -23996,6 +24060,144 @@ mod tests {
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn anonymous_abstract_class_expression_reports_exact_diagnostics_and_replays_warm() {
+        const SOURCE: &str = "let Foo = class { constructor() { this.bar++; } abstract bar; };";
+
+        for (index, no_implicit_any) in [false, true].into_iter().enumerate() {
+            let source = parsed(SOURCE);
+            let file = FileId::new(8_390 + u32::try_from(index).unwrap());
+            let mut context = context(
+                &[(file, &source)],
+                CanonicalCheckerOptions {
+                    no_implicit_any,
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+            let expression = variable_initializer(&source, file, "Foo");
+            let variable = variable_symbol(&context, &source, file, "Foo");
+            let (_, bound) = context.file(file).unwrap();
+            let owner = bound.symbol(expression).unwrap();
+            let property = context
+                .store()
+                .symbol(owner)
+                .and_then(ts_binder::semantic::Symbol::members)
+                .and_then(|members| context.store().symbol_table(members))
+                .and_then(|members| members.get_source("bar"))
+                .unwrap();
+            let types = context.store().type_len();
+            let signatures = context.store().signature_len();
+
+            assert_ne!(owner, variable);
+            assert_eq!(
+                context.store().symbol(owner).unwrap().name(),
+                InternalSymbolName::Class.as_ref(),
+            );
+
+            context.check_source_file(file).unwrap();
+
+            let expected: &[(u32, &str, &str)] = if no_implicit_any {
+                &[
+                    (
+                        2715,
+                        "bar",
+                        "Abstract property 'bar' in class 'Foo' cannot be accessed in the constructor.",
+                    ),
+                    (
+                        1253,
+                        "abstract",
+                        "Abstract properties can only appear within an abstract class.",
+                    ),
+                    (7008, "bar", "Member 'bar' implicitly has an 'any' type."),
+                ]
+            } else {
+                &[
+                    (
+                        2715,
+                        "bar",
+                        "Abstract property 'bar' in class 'Foo' cannot be accessed in the constructor.",
+                    ),
+                    (
+                        1253,
+                        "abstract",
+                        "Abstract properties can only appear within an abstract class.",
+                    ),
+                ]
+            };
+            let actual = context
+                .diagnostics()
+                .as_slice()
+                .iter()
+                .map(|diagnostic| {
+                    (
+                        diagnostic.diagnostic.code(),
+                        node_text(&source, diagnostic.node.unwrap()),
+                        diagnostic.diagnostic.render().unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let expected = expected
+                .iter()
+                .map(|(code, text, message)| (*code, *text, (*message).to_owned()))
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected);
+
+            let expected_starts = [
+                SOURCE.find("this.bar").unwrap() + "this.".len(),
+                SOURCE.find("abstract").unwrap(),
+                SOURCE.rfind("bar").unwrap(),
+            ];
+            for (diagnostic, start) in context.diagnostics().as_slice().iter().zip(expected_starts)
+            {
+                let range = source
+                    .arena
+                    .get(diagnostic.node.unwrap().node)
+                    .unwrap()
+                    .range;
+                assert_eq!(usize::try_from(range.start.get()).unwrap(), start);
+                assert!(diagnostic.range_override.is_none());
+            }
+
+            assert_eq!(context.store().type_len(), types);
+            assert_eq!(context.store().signature_len(), signatures);
+            assert!(context.store().declared_type_links(owner).is_none());
+            assert!(context.store().value_symbol_links(owner).is_none());
+            assert!(context.store().value_symbol_links(variable).is_none());
+            assert!(context.store().value_symbol_links(property).is_none());
+            assert!(is_type_checked(&context, file));
+
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
+    fn anonymous_abstract_class_expression_rejects_unsupported_shapes_and_later_reads() {
+        for (index, text) in [
+            "let Foo = class Named { constructor() { this.bar++; } abstract bar; };",
+            "var Foo = class { constructor() { this.bar++; } abstract bar; };",
+            "const Foo = class { constructor() { this.bar++; } abstract bar; };",
+            "let Foo = class { constructor() { this.bar++; } abstract bar: number; };",
+            "let Foo = class { constructor() { this.bar++; } abstract bar; }; Foo;",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parsed(text);
+            let file = FileId::new(8_392 + u32::try_from(index).unwrap());
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            let cold = observable_state(&context, file);
+
+            assert!(matches!(
+                context.check_source_file(file),
+                Err(SourceCheckError::Unsupported(_))
+            ));
+            assert_eq!(observable_state(&context, file), cold);
+            assert!(context.diagnostics().is_empty());
+        }
     }
 
     #[test]

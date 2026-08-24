@@ -6041,6 +6041,399 @@ fn plan_circular_ambient_getter_grammar_diagnostic(
     })
 }
 
+fn plan_anonymous_abstract_class_property(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    expression: NodeRef,
+    declaration: NodeRef,
+) -> Option<(NodeRef, NodeRef, SemanticSymbolId)> {
+    let record = preflight_node(store, host, declaration).ok()?;
+    let NodeData::PropertyDeclaration(property) = &record.data else {
+        return None;
+    };
+    let modifiers = property.modifiers.as_ref()?;
+    let [modifier] = modifiers.list.nodes.as_slice() else {
+        return None;
+    };
+    let modifier = NodeRef::new(declaration.arena, declaration.file, *modifier);
+    let modifier_record = preflight_node(store, host, modifier).ok()?;
+    let name = NodeRef::new(declaration.arena, declaration.file, property.name);
+    let name_record = preflight_node(store, host, name).ok()?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return None;
+    };
+    let source = host
+        .source(modifier)
+        .and_then(|(arena, _)| arena.source_text())?;
+    if record.kind != SyntaxKind::PropertyDeclaration
+        || record.flags.0 != 0
+        || record.parent != Some(expression.node)
+        || property.initializer.is_some()
+        || property.postfix_token.is_some()
+        || property.symbol.is_some()
+        || property.type_.is_some()
+        || property.facts != 0
+        || modifiers.flags.0 != 0
+        || modifiers.list.has_trailing_comma
+        || modifiers.list.range.start != record.range.start
+        || modifier_record.kind != SyntaxKind::AbstractKeyword
+        || modifier_record.flags.0 != 0
+        || modifier_record.parent != Some(declaration.node)
+        || !matches!(modifier_record.data, NodeData::Token(_))
+        || modifier_record.range.start != modifiers.list.range.start
+        || modifier_record.range.end > modifiers.list.range.end
+        || source.get(
+            usize::try_from(modifier_record.range.start.get()).ok()?
+                ..usize::try_from(modifier_record.range.end.get()).ok()?,
+        ) != Some("abstract")
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(declaration.node)
+        || name_record.range.start < modifiers.list.range.end
+        || name_record.range.end > record.range.end
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+    {
+        return None;
+    }
+
+    let symbol = bound_symbol(store, host, declaration)?;
+    let property_symbol = store.symbol(symbol)?;
+    if property_symbol.flags() != SymbolFlags::PROPERTY
+        || property_symbol.check_flags() != CheckFlags::NONE
+        || property_symbol.name().as_utf8() != Some(identifier.text.as_str())
+        || property_symbol.declarations() != Some(&[declaration])
+        || property_symbol.value_declaration() != Some(declaration)
+        || property_symbol.members().is_some()
+        || property_symbol.exports().is_some()
+        || property_symbol.parent() != Some(owner)
+        || property_symbol.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || store
+            .symbol(owner)
+            .and_then(Symbol::members)
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get_source(&identifier.text))
+            != Some(symbol)
+    {
+        return None;
+    }
+    Some((name, modifier, symbol))
+}
+
+fn plan_anonymous_abstract_constructor_reference(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    expression: NodeRef,
+    declaration: NodeRef,
+    property_symbol: SemanticSymbolId,
+    property_name: &str,
+) -> Option<NodeRef> {
+    let record = preflight_node(store, host, declaration).ok()?;
+    let NodeData::ConstructorDeclaration(constructor) = &record.data else {
+        return None;
+    };
+    if record.kind != SyntaxKind::Constructor
+        || record.flags.0 != 0
+        || record.parent != Some(expression.node)
+        || constructor.asterisk_token.is_some()
+        || constructor.end_flow_node.is_some()
+        || constructor.full_signature.is_some()
+        || constructor.next_container.is_some()
+        || constructor.return_flow_node.is_some()
+        || constructor.symbol.is_some()
+        || constructor.type_.is_some()
+        || constructor.type_parameters.is_some()
+        || constructor.facts != 0
+        || constructor.modifiers.is_some()
+        || constructor.parameters.has_trailing_comma
+        || !constructor.parameters.nodes.is_empty()
+    {
+        return None;
+    }
+    let symbol = bound_symbol(store, host, declaration)?;
+    let constructor_symbol = store.symbol(symbol)?;
+    if constructor_symbol.flags() != SymbolFlags::CONSTRUCTOR
+        || constructor_symbol.check_flags() != CheckFlags::NONE
+        || constructor_symbol.name() != InternalSymbolName::Constructor.as_ref()
+        || constructor_symbol.declarations() != Some(&[declaration])
+        || constructor_symbol.value_declaration().is_some()
+        || constructor_symbol.members().is_some()
+        || constructor_symbol.exports().is_some()
+        || constructor_symbol.parent() != Some(owner)
+        || constructor_symbol.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || store
+            .symbol(owner)
+            .and_then(Symbol::members)
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get(InternalSymbolName::Constructor.as_ref()))
+            != Some(symbol)
+    {
+        return None;
+    }
+
+    let body = NodeRef::new(declaration.arena, declaration.file, constructor.body?);
+    let body_record = preflight_node(store, host, body).ok()?;
+    let NodeData::Block(block) = &body_record.data else {
+        return None;
+    };
+    let [statement] = block.statements.nodes.as_slice() else {
+        return None;
+    };
+    if body_record.kind != SyntaxKind::Block
+        || body_record.flags.0 != 0
+        || body_record.parent != Some(declaration.node)
+        || body_record.range.start < constructor.parameters.range.end
+        || body_record.range.end != record.range.end
+        || block.flow_node.is_some()
+        || block.next_container.is_some()
+        || block.statements.has_trailing_comma
+        || block.facts != 0
+    {
+        return None;
+    }
+    let statement = NodeRef::new(body.arena, body.file, *statement);
+    let statement_record = preflight_node(store, host, statement).ok()?;
+    let NodeData::ExpressionStatement(statement_data) = &statement_record.data else {
+        return None;
+    };
+    if statement_record.kind != SyntaxKind::ExpressionStatement
+        || statement_record.flags.0 != 0
+        || statement_record.parent != Some(body.node)
+        || statement_data.flow_node.is_some()
+    {
+        return None;
+    }
+    let increment = NodeRef::new(statement.arena, statement.file, statement_data.expression);
+    let increment_record = preflight_node(store, host, increment).ok()?;
+    let NodeData::PostfixUnaryExpression(postfix) = &increment_record.data else {
+        return None;
+    };
+    if increment_record.kind != SyntaxKind::PostfixUnaryExpression
+        || increment_record.flags.0 != 0
+        || increment_record.parent != Some(statement.node)
+        || postfix.operator != SyntaxKind::PlusPlusToken
+    {
+        return None;
+    }
+    let access = NodeRef::new(increment.arena, increment.file, postfix.operand);
+    let access_record = preflight_node(store, host, access).ok()?;
+    let NodeData::PropertyAccessExpression(property) = &access_record.data else {
+        return None;
+    };
+    if access_record.kind != SyntaxKind::PropertyAccessExpression
+        || access_record.flags.0 != 0
+        || access_record.parent != Some(increment.node)
+        || property.flow_node.is_some()
+        || property.question_dot_token.is_some()
+        || property.facts != 0
+    {
+        return None;
+    }
+    let receiver = NodeRef::new(access.arena, access.file, property.expression);
+    let receiver_record = preflight_node(store, host, receiver).ok()?;
+    let NodeData::KeywordExpression(keyword) = &receiver_record.data else {
+        return None;
+    };
+    let reference = NodeRef::new(access.arena, access.file, property.name);
+    let reference_record = preflight_node(store, host, reference).ok()?;
+    let NodeData::Identifier(identifier) = &reference_record.data else {
+        return None;
+    };
+    if receiver_record.kind != SyntaxKind::ThisKeyword
+        || receiver_record.flags.0 != 0
+        || receiver_record.parent != Some(access.node)
+        || keyword.flow_node.is_some()
+        || reference_record.kind != SyntaxKind::Identifier
+        || reference_record.flags.0 != 0
+        || reference_record.parent != Some(access.node)
+        || reference_record.range.start < receiver_record.range.end
+        || identifier.flow_node.is_some()
+        || identifier.text != property_name
+        || store
+            .symbol(owner)
+            .and_then(Symbol::members)
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get_source(&identifier.text))
+            != Some(property_symbol)
+    {
+        return None;
+    }
+    Some(reference)
+}
+
+/// Authenticates the exact diagnostics for one malformed anonymous class expression.
+pub(super) fn plan_anonymous_abstract_class_expression_grammar(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    expression: NodeRef,
+    no_implicit_any: bool,
+) -> Option<ClassGrammarDiagnosticPlan> {
+    let record = preflight_node(store, host, expression).ok()?;
+    let NodeData::ClassExpression(class) = &record.data else {
+        return None;
+    };
+    let [constructor, property] = class.members.nodes.as_slice() else {
+        return None;
+    };
+    if record.kind != SyntaxKind::ClassExpression
+        || record.flags.0 != 0
+        || class.heritage_clauses.is_some()
+        || class.local_symbol.is_some()
+        || class.next_container.is_some()
+        || class.symbol.is_some()
+        || class.type_parameters.is_some()
+        || class.facts != 0
+        || class.modifiers.is_some()
+        || class.name.is_some()
+        || class.members.has_trailing_comma
+        || class.members.range.start < record.range.start
+        || class.members.range.end != record.range.end
+    {
+        return None;
+    }
+
+    let variable = NodeRef::new(expression.arena, expression.file, record.parent?);
+    let variable_record = preflight_node(store, host, variable).ok()?;
+    let NodeData::VariableDeclaration(variable_data) = &variable_record.data else {
+        return None;
+    };
+    if variable_record.kind != SyntaxKind::VariableDeclaration
+        || variable_record.flags.0 != 0
+        || variable_data.exclamation_token.is_some()
+        || variable_data.initializer != Some(expression.node)
+        || variable_data.local_symbol.is_some()
+        || variable_data.symbol.is_some()
+        || variable_data.type_.is_some()
+        || variable_data.facts != 0
+    {
+        return None;
+    }
+    let variable_name = NodeRef::new(variable.arena, variable.file, variable_data.name);
+    let variable_name_record = preflight_node(store, host, variable_name).ok()?;
+    let NodeData::Identifier(class_name) = &variable_name_record.data else {
+        return None;
+    };
+    if variable_name_record.kind != SyntaxKind::Identifier
+        || variable_name_record.flags.0 != 0
+        || variable_name_record.parent != Some(variable.node)
+        || variable_name_record.range.end > record.range.start
+        || class_name.flow_node.is_some()
+        || class_name.text.is_empty()
+    {
+        return None;
+    }
+    let list = NodeRef::new(variable.arena, variable.file, variable_record.parent?);
+    let list_record = preflight_node(store, host, list).ok()?;
+    let NodeData::VariableDeclarationList(declarations) = &list_record.data else {
+        return None;
+    };
+    let [only_variable] = declarations.declarations.nodes.as_slice() else {
+        return None;
+    };
+    if list_record.kind != SyntaxKind::VariableDeclarationList
+        || list_record.flags.0 != NODE_FLAG_LET
+        || *only_variable != variable.node
+        || declarations.declarations.has_trailing_comma
+        || declarations.facts != 0
+    {
+        return None;
+    }
+
+    let variable_symbol = bound_symbol(store, host, variable)?;
+    let variable_owner = store.symbol(variable_symbol)?;
+    if variable_owner.flags() != SymbolFlags::BLOCK_SCOPED_VARIABLE
+        || variable_owner.check_flags() != CheckFlags::NONE
+        || variable_owner.name().as_utf8() != Some(class_name.text.as_str())
+        || variable_owner.declarations() != Some(&[variable])
+        || variable_owner.value_declaration() != Some(variable)
+        || variable_owner.members().is_some()
+        || variable_owner.exports().is_some()
+        || variable_owner.parent().is_some()
+        || variable_owner.export_symbol().is_some()
+        || store.get_merged_symbol(variable_symbol) != Some(variable_symbol)
+    {
+        return None;
+    }
+
+    let symbol = bound_symbol(store, host, expression)?;
+    let owner = store.symbol(symbol)?;
+    let members = owner
+        .members()
+        .and_then(|members| store.symbol_table(members))?;
+    let exports = owner.exports()?;
+    if owner.flags() != SymbolFlags::CLASS
+        || owner.check_flags() != CheckFlags::NONE
+        || owner.name() != InternalSymbolName::Class.as_ref()
+        || owner.declarations() != Some(&[expression])
+        || owner.value_declaration() != Some(expression)
+        || owner.parent().is_some()
+        || owner.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || members.len() != 2
+        || store.symbol_table(exports)?.len() != 1
+        || validate_prototype(store, symbol, exports).is_err()
+    {
+        return None;
+    }
+
+    let constructor = NodeRef::new(expression.arena, expression.file, *constructor);
+    let property = NodeRef::new(expression.arena, expression.file, *property);
+    let (property_name, modifier, property_symbol) =
+        plan_anonymous_abstract_class_property(store, host, symbol, expression, property)?;
+    let property_name_record = preflight_node(store, host, property_name).ok()?;
+    let NodeData::Identifier(property_identifier) = &property_name_record.data else {
+        return None;
+    };
+    let reference = plan_anonymous_abstract_constructor_reference(
+        store,
+        host,
+        symbol,
+        expression,
+        constructor,
+        property_symbol,
+        &property_identifier.text,
+    )?;
+    if preflight_node(store, host, constructor).ok()?.range.end
+        > preflight_node(store, host, property).ok()?.range.start
+    {
+        return None;
+    }
+
+    let mut diagnostics = Vec::new();
+    diagnostics
+        .try_reserve_exact(2 + usize::from(no_implicit_any))
+        .ok()?;
+    diagnostics.push(ClassGrammarDiagnostic {
+        node: reference,
+        range_override: None,
+        code: 2715,
+        arguments: vec![property_identifier.text.clone(), class_name.text.clone()],
+    });
+    diagnostics.push(ClassGrammarDiagnostic {
+        node: modifier,
+        range_override: None,
+        code: 1253,
+        arguments: Vec::new(),
+    });
+    if no_implicit_any {
+        diagnostics.push(ClassGrammarDiagnostic {
+            node: property_name,
+            range_override: None,
+            code: 7008,
+            arguments: vec![property_identifier.text.clone(), String::from("any")],
+        });
+    }
+    Some(ClassGrammarDiagnosticPlan {
+        declaration: expression,
+        symbol,
+        diagnostics,
+    })
+}
+
 /// Authenticates supported class grammar failures without publishing class types.
 pub(super) fn plan_class_grammar_diagnostics(
     store: &CanonicalTypeMapperStore,
@@ -11152,6 +11545,238 @@ mod tests {
         );
         assert!(fixture.store.declared_type_links(owner).is_none());
         assert!(fixture.store.value_symbol_links(owner).is_none());
+    }
+
+    #[test]
+    fn anonymous_abstract_class_expression_preserves_diagnostic_order_and_strictness() {
+        let source = concat!(
+            "let Foo = class {\n",
+            "    constructor() {\n",
+            "        this.bar++;\n",
+            "    }\n",
+            "    abstract bar;\n",
+            "};",
+        );
+        for no_implicit_any in [false, true] {
+            let fixture = fixture(source);
+            let expression = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::ClassExpression).then_some(NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        node,
+                    ))
+                })
+                .expect("the variable initializer is an anonymous class expression");
+            let bound = &fixture.files[&fixture.file];
+            let host = host(&fixture.parsed.arena, bound);
+            let owner = bound.symbol(expression).unwrap();
+            let cold = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            let plan = plan_anonymous_abstract_class_expression_grammar(
+                &fixture.store,
+                &host,
+                expression,
+                no_implicit_any,
+            )
+            .expect("the malformed anonymous class retains its exact checker diagnostics");
+
+            assert_eq!(plan.declaration, expression);
+            assert_eq!(plan.symbol, owner);
+            assert_eq!(
+                plan.diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.code)
+                    .collect::<Vec<_>>(),
+                if no_implicit_any {
+                    vec![2715, 1253, 7008]
+                } else {
+                    vec![2715, 1253]
+                },
+            );
+            assert_eq!(plan.diagnostics[0].arguments, ["bar", "Foo"]);
+            assert!(plan.diagnostics[1].arguments.is_empty());
+            if no_implicit_any {
+                assert_eq!(plan.diagnostics[2].arguments, ["bar", "any"]);
+            }
+            let spans = plan
+                .diagnostics
+                .iter()
+                .map(|diagnostic| {
+                    assert!(diagnostic.range_override.is_none());
+                    let range = fixture
+                        .parsed
+                        .arena
+                        .get(diagnostic.node.node)
+                        .unwrap()
+                        .range;
+                    &source[range.start.get() as usize..range.end.get() as usize]
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                spans,
+                if no_implicit_any {
+                    vec!["bar", "abstract", "bar"]
+                } else {
+                    vec!["bar", "abstract"]
+                },
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                cold,
+            );
+            assert!(fixture.store.declared_type_links(owner).is_none());
+            assert!(fixture.store.value_symbol_links(owner).is_none());
+            assert!(fixture.store.type_node_links(expression).is_none());
+        }
+    }
+
+    #[test]
+    fn anonymous_abstract_class_expression_rejects_unauthenticated_shapes() {
+        for source in [
+            "const Foo = class { constructor() { this.bar++; } abstract bar; };",
+            "let Foo = class Named { constructor() { this.bar++; } abstract bar; };",
+            "let Foo = class { constructor() { this.other++; } abstract bar; };",
+            "let Foo = class { constructor() { this.bar--; } abstract bar; };",
+            "let Foo = class { constructor() { this.bar++; } bar; };",
+            "let Foo = class { constructor() { this.bar++; } abstract bar: number; };",
+        ] {
+            let fixture = fixture(source);
+            let expression = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::ClassExpression).then_some(NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        node,
+                    ))
+                })
+                .expect("the unsupported case retains one class expression");
+            let bound = &fixture.files[&fixture.file];
+            let host = host(&fixture.parsed.arena, bound);
+            let owner = bound.symbol(expression).unwrap();
+            let cold = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            assert!(
+                plan_anonymous_abstract_class_expression_grammar(
+                    &fixture.store,
+                    &host,
+                    expression,
+                    true,
+                )
+                .is_none(),
+                "{source}",
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                cold,
+            );
+            assert!(fixture.store.declared_type_links(owner).is_none());
+            assert!(fixture.store.value_symbol_links(owner).is_none());
+        }
+    }
+
+    #[test]
+    fn anonymous_abstract_class_expression_rejects_forged_binder_symbols() {
+        for poison in 0..3 {
+            let mut fixture =
+                fixture("let Foo = class { constructor() { this.bar++; } abstract bar; };");
+            let expression = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::ClassExpression).then_some(NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        node,
+                    ))
+                })
+                .expect("the fixture retains one anonymous class expression");
+            let bound = &fixture.files[&fixture.file];
+            let owner = bound.symbol(expression).unwrap();
+            let members = fixture
+                .store
+                .symbol(owner)
+                .and_then(Symbol::members)
+                .unwrap();
+            let property = fixture
+                .store
+                .symbol_table(members)
+                .and_then(|members| members.get_source("bar"))
+                .unwrap();
+            let constructor = fixture
+                .store
+                .symbol_table(members)
+                .and_then(|members| members.get(InternalSymbolName::Constructor.as_ref()))
+                .unwrap();
+            match poison {
+                0 => assert!(fixture.store.set_symbol_flags(
+                    owner,
+                    SymbolFlags::CLASS | SymbolFlags::INTERFACE,
+                    CheckFlags::NONE,
+                )),
+                1 => assert!(fixture.store.set_symbol_flags(
+                    property,
+                    SymbolFlags::METHOD,
+                    CheckFlags::NONE,
+                )),
+                2 => assert!(fixture.store.set_symbol_flags(
+                    constructor,
+                    SymbolFlags::METHOD,
+                    CheckFlags::NONE,
+                )),
+                _ => unreachable!("only declared symbol poison cases are visited"),
+            }
+            let host = host(&fixture.parsed.arena, bound);
+            let state = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            assert!(
+                plan_anonymous_abstract_class_expression_grammar(
+                    &fixture.store,
+                    &host,
+                    expression,
+                    true,
+                )
+                .is_none(),
+                "poison case {poison}",
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                state,
+            );
+            assert!(fixture.store.declared_type_links(owner).is_none());
+            assert!(fixture.store.value_symbol_links(owner).is_none());
+        }
     }
 
     #[test]
