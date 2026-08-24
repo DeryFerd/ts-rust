@@ -703,6 +703,7 @@ fn type_node_error_is_unsupported(error: &TypeNodeUnavailable) -> bool {
         | TypeNodeUnavailable::MissingTypeReference(_)
         | TypeNodeUnavailable::ImportAliasTypeReference { .. }
         | TypeNodeUnavailable::ImportAliasCapabilityUnsupported(_)
+        | TypeNodeUnavailable::JsDocImportTypeCapabilityUnsupported(_)
         | TypeNodeUnavailable::UnsupportedReferenceTarget { .. }
         | TypeNodeUnavailable::GenericReferenceUnsupported { .. }
         | TypeNodeUnavailable::GenericAliasConstraintUnsupported { .. }
@@ -722,6 +723,7 @@ fn type_node_error_is_unsupported(error: &TypeNodeUnavailable) -> bool {
         TypeNodeUnavailable::InvalidParenthesizedType(_)
         | TypeNodeUnavailable::InvalidTypeReference(_)
         | TypeNodeUnavailable::InvalidImportAliasTarget { .. }
+        | TypeNodeUnavailable::InvalidJsDocImportTypeTarget { .. }
         | TypeNodeUnavailable::InvalidTypeAliasSymbol(_)
         | TypeNodeUnavailable::MissingTypeAliasDeclaration(_)
         | TypeNodeUnavailable::InvalidTypeAliasDeclaration(_)
