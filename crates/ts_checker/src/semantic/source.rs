@@ -9,7 +9,8 @@
 //! named ESM reexports,
 //! leading direct named ESM value imports, clause-level type-only named ESM
 //! imports in exact direct or union/parenthesized/array top-level variable
-//! annotations,
+//! annotations, comment-only `JSDoc` typedef imports from promoted `CommonJS`
+//! type exports,
 //! annotated top-level function declarations, exact direct non-exported
 //! ambient function declarations (including the existing generic callable
 //! closure), initialized identifier-named top-level variables (optionally
@@ -142,16 +143,17 @@ use super::{
     },
     source_imports::{
         PlannedSourceImportRead, PreparedSourceImportPublication, PreparedSourceImportValue,
-        ResolvedSourceImportBinding, ResolvedSourceTypeImportBinding, SourceImportBindingPlan,
-        SourceImportError, SourceImportPlan, SourceImportUnsupported,
-        SourceNamedReexportBindingPlan, SourceNamedReexportPlan,
-        plan_source_import_identifier_read, plan_source_type_import_reference,
+        ResolvedSourceImportBinding, ResolvedSourceJsDocTypedefImport,
+        ResolvedSourceTypeImportBinding, SourceImportBindingPlan, SourceImportError,
+        SourceImportPlan, SourceImportUnsupported, SourceNamedReexportBindingPlan,
+        SourceNamedReexportPlan, plan_source_import_identifier_read,
+        plan_source_jsdoc_typedef_import, plan_source_type_import_reference,
         plan_top_level_import_equals, plan_top_level_named_reexport,
         plan_top_level_named_type_import, plan_top_level_named_value_import,
         preflight_prepared_source_import_publications, prepare_source_import_value,
         reject_source_type_import_value_use, resolve_source_import_binding,
-        resolve_source_import_namespace_exports, resolve_source_named_reexport_binding,
-        resolve_source_type_import_binding,
+        resolve_source_import_namespace_exports, resolve_source_jsdoc_typedef_import,
+        resolve_source_named_reexport_binding, resolve_source_type_import_binding,
     },
     source_namespaces::{
         SourceNamespaceMemberPlan, SourceNamespacePlan, execute_source_namespace,
@@ -20804,6 +20806,75 @@ pub(super) fn check_source_file(
         options,
     )
     .finish()?;
+    let mut jsdoc_typedef_imports =
+        HashMap::<SemanticSymbolId, ResolvedSourceJsDocTypedefImport>::new();
+    let mut jsdoc_typedef_import_variables = HashMap::<NodeRef, SemanticSymbolId>::new();
+    if let Some(jsdoc) = &javascript_jsdoc {
+        for declaration in jsdoc.declarations() {
+            for typedef in declaration.typedefs() {
+                let Some(local_declaration) = typedef.source_declaration() else {
+                    continue;
+                };
+                let Some(annotation) = typedef.type_() else {
+                    continue;
+                };
+                let JsDocType::Import(imported) = annotation.type_() else {
+                    continue;
+                };
+                if !typedef.template_parameters().is_empty() || !typedef.properties().is_empty() {
+                    return Err(SourceCheckError::Unsupported(
+                        UnsupportedSourceSyntax::JsDoc(declaration.node()),
+                    ));
+                }
+                let plan = plan_source_jsdoc_typedef_import(
+                    arena,
+                    bound,
+                    store,
+                    declaration.node(),
+                    local_declaration,
+                    imported,
+                )
+                .map_err(|error| SourcePlanner::import_plan_error(local_declaration, &error))?;
+                if store
+                    .symbol(plan.local_symbol)
+                    .and_then(|symbol| symbol.name().as_utf8())
+                    != Some(typedef.name())
+                {
+                    return Err(SourceCheckError::Import(local_declaration));
+                }
+                let resolved = resolve_source_jsdoc_typedef_import(store, alias_host, host, plan)
+                    .map_err(|error| {
+                    SourcePlanner::import_plan_error(local_declaration, &error)
+                })?;
+                session.reset_query();
+                CanonicalTypeQuery::new_with_global_types_and_session(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    diagnostics,
+                )?
+                .with_jsdoc_import_type_target(resolved.type_capability())?
+                .preflight_type_from_type_node(plan.import_type)?;
+                if jsdoc_typedef_imports
+                    .insert(plan.local_symbol, resolved)
+                    .is_some()
+                {
+                    return Err(SourceCheckError::Import(local_declaration));
+                }
+                if declaration.type_().is_some_and(|annotation| {
+                    source_variable_owns_jsdoc_annotation(&statements, declaration, annotation)
+                        && matches!(annotation.type_(), JsDocType::Named(name) if name == typedef.name())
+                }) && jsdoc_typedef_import_variables
+                    .insert(plan.host_declaration, plan.local_symbol)
+                    .is_some()
+                {
+                    return Err(SourceCheckError::Import(local_declaration));
+                }
+            }
+        }
+    }
     if let Some(jsdoc) = &javascript_jsdoc {
         for declaration in jsdoc.declarations() {
             let annotations = declaration
@@ -20825,8 +20896,9 @@ pub(super) fn check_source_file(
                 );
             for annotation in annotations {
                 if source_variable_owns_jsdoc_annotation(&statements, declaration, annotation)
-                    && imported_jsdoc_static_import(arena, bound, &value_imports, annotation)
-                        .is_some()
+                    && (jsdoc_typedef_import_variables.contains_key(&declaration.node())
+                        || imported_jsdoc_static_import(arena, bound, &value_imports, annotation)
+                            .is_some())
                 {
                     continue;
                 }
@@ -22132,6 +22204,13 @@ pub(super) fn check_source_file(
                     session,
                     &mut statement_diagnostics,
                 )
+                .and_then(|query| {
+                    if let Some(imported) = jsdoc_typedef_imports.get(&symbol) {
+                        query.with_jsdoc_import_type_target(imported.type_capability())
+                    } else {
+                        Ok(query)
+                    }
+                })
                 .and_then(|mut query| query.get_declared_type_of_symbol(symbol));
                 merge_retry_diagnostics(diagnostics, statement_diagnostics);
                 result?;
@@ -23401,20 +23480,29 @@ pub(super) fn check_source_file(
                                 .jsdoc_type
                                 .as_ref()
                                 .expect("the match guard checked the JSDoc annotation");
-                            let resolved_annotation = imported_javascript_typedef_annotations
-                                .get(&variable.declaration)
-                                .unwrap_or(annotation);
-                            let declared_type = resolve_planned_jsdoc_type(
-                                store,
-                                global_types,
-                                options,
-                                resolved_annotation,
-                            )
-                            .map_err(|_| {
-                                SourceCheckError::Unsupported(UnsupportedSourceSyntax::JsDoc(
-                                    variable.declaration,
-                                ))
-                            })?;
+                            let declared_type = if let Some(alias) =
+                                jsdoc_typedef_import_variables.get(&variable.declaration)
+                            {
+                                store
+                                    .type_alias_links(*alias)
+                                    .and_then(|links| links.declared_type)
+                                    .ok_or(SourceCheckError::Import(variable.declaration))?
+                            } else {
+                                let resolved_annotation = imported_javascript_typedef_annotations
+                                    .get(&variable.declaration)
+                                    .unwrap_or(annotation);
+                                resolve_planned_jsdoc_type(
+                                    store,
+                                    global_types,
+                                    options,
+                                    resolved_annotation,
+                                )
+                                .map_err(|_| {
+                                    SourceCheckError::Unsupported(UnsupportedSourceSyntax::JsDoc(
+                                        variable.declaration,
+                                    ))
+                                })?
+                            };
                             let assignment = check_assignment_to_type(
                                 store,
                                 host,
@@ -23645,15 +23733,29 @@ pub(super) fn check_source_file(
                             None,
                         ) => {
                             let declared_type = if let Some(annotation) = &variable.jsdoc_type {
-                                let annotation = imported_javascript_typedef_annotations
-                                    .get(&variable.declaration)
-                                    .unwrap_or(annotation);
-                                resolve_planned_jsdoc_type(store, global_types, options, annotation)
+                                if let Some(alias) =
+                                    jsdoc_typedef_import_variables.get(&variable.declaration)
+                                {
+                                    store
+                                        .type_alias_links(*alias)
+                                        .and_then(|links| links.declared_type)
+                                        .ok_or(SourceCheckError::Import(variable.declaration))?
+                                } else {
+                                    let annotation = imported_javascript_typedef_annotations
+                                        .get(&variable.declaration)
+                                        .unwrap_or(annotation);
+                                    resolve_planned_jsdoc_type(
+                                        store,
+                                        global_types,
+                                        options,
+                                        annotation,
+                                    )
                                     .map_err(|_| {
                                         SourceCheckError::Unsupported(
                                             UnsupportedSourceSyntax::JsDoc(variable.declaration),
                                         )
                                     })?
+                                }
                             } else {
                                 store
                                     .intrinsic_bootstrap()
@@ -35281,6 +35383,166 @@ mod tests {
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn javascript_comment_only_typedef_imports_use_promoted_commonjs_type_exports() {
+        for (index, (exported_value, imported_type, variable)) in [
+            ("0", "{ a: 1, m: 1 }", "var c;"),
+            ("{}", "{ a: 1, m: 1 }", "var c;"),
+            ("0", "number", "var c = 1;"),
+            ("{}", "number", "var c = 1;"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let target = parse_javascript_source_file(&format!(
+                "/** @typedef {{{imported_type}}} C */\nconst value = {exported_value};\nmodule.exports = value;",
+            ));
+            let imported = parse_javascript_source_file(&format!(
+                "/** @typedef {{import('./target').C}} C */\n/** @type {{C}} */\n{variable}",
+            ));
+            assert!(target.diagnostics.is_empty(), "{:?}", target.diagnostics);
+            assert!(
+                imported.diagnostics.is_empty(),
+                "{:?}",
+                imported.diagnostics
+            );
+            let file_index = 8_370 + u32::try_from(index).unwrap() * 2;
+            let target_file = FileId::new(file_index);
+            let imported_file = FileId::new(file_index + 1);
+            let files = [
+                (target_file, &target, CanonicalModuleState::CommonJs),
+                (imported_file, &imported, CanonicalModuleState::Script),
+            ];
+
+            let mut binder = CanonicalBinder::new();
+            for (file, source, state) in files {
+                binder
+                    .bind_source_file_with_facts(
+                        &source.arena,
+                        source.source_file,
+                        file,
+                        CanonicalSourceFileFacts::new(
+                            EscapedName::source(format!("\"/project/{}.js\"", file.index())),
+                            CanonicalSourceLanguage::JavaScript,
+                            false,
+                            state,
+                        ),
+                    )
+                    .unwrap();
+            }
+            for (file, source, _) in files {
+                binder
+                    .bind_javascript_declaration_slice(&source.arena, file)
+                    .unwrap();
+            }
+            let (import_type, module_specifier, imported_name) = imported
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::ImportTypeNode(import) = &record.data else {
+                        return None;
+                    };
+                    let NodeData::LiteralTypeNode(argument) =
+                        &imported.arena.get(import.argument)?.data
+                    else {
+                        return None;
+                    };
+                    Some((node, argument.literal, import.qualifier?))
+                })
+                .expect("the source-owned JSDoc typedef retains its exact import nodes");
+            let specifier = NodeRef::new(imported.arena.id(), imported_file, module_specifier);
+            let manifest = CanonicalModuleResolutionManifestInput::new([
+                CanonicalModuleResolutionEntry::resolved(
+                    specifier,
+                    CanonicalResolvedModuleInput::new(
+                        target_file,
+                        CanonicalModuleResolutionMode::Esm,
+                        CanonicalModuleResolutionMode::CommonJs,
+                    ),
+                ),
+            ]);
+            let mut context = CanonicalCheckerContext::new_with_module_resolutions(
+                binder.finish(),
+                vec![
+                    (target_file, &target.arena),
+                    (imported_file, &imported.arena),
+                ],
+                CanonicalCheckerOptions::default(),
+                manifest,
+            )
+            .unwrap();
+
+            context.check_source_file(imported_file).unwrap();
+
+            let (_, target_bound) = context.file(target_file).unwrap();
+            let module = target_bound.symbol(target_bound.source_file()).unwrap();
+            let target_symbol = context
+                .store()
+                .symbol(module)
+                .and_then(ts_binder::semantic::Symbol::exports)
+                .and_then(|exports| context.store().symbol_table(exports))
+                .and_then(|exports| exports.get_source("C"))
+                .unwrap();
+            let target_type = context
+                .store()
+                .type_alias_links(target_symbol)
+                .and_then(|links| links.declared_type)
+                .unwrap();
+            let imported_alias = imported
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::JsTypeAliasDeclaration).then_some(NodeRef::new(
+                        imported.arena.id(),
+                        imported_file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let (_, imported_bound) = context.file(imported_file).unwrap();
+            let local_symbol = imported_bound.symbol(imported_alias).unwrap();
+            assert!(context.diagnostics().is_empty());
+            assert_eq!(
+                variable_value_type(&context, &imported, imported_file, "c"),
+                target_type,
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .type_alias_links(local_symbol)
+                    .and_then(|links| links.declared_type),
+                Some(target_type),
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .type_node_links(NodeRef::new(
+                        imported.arena.id(),
+                        imported_file,
+                        import_type,
+                    ))
+                    .and_then(|links| links.resolved_type),
+                Some(target_type),
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .symbol_node_links(NodeRef::new(
+                        imported.arena.id(),
+                        imported_file,
+                        imported_name,
+                    ))
+                    .and_then(|links| links.resolved_symbol),
+                Some(target_symbol),
+            );
+            assert!(context.store().alias_symbol_links(local_symbol).is_none());
+
+            let warm = observable_state(&context, imported_file);
+            context.recheck_source_file(imported_file).unwrap();
+            assert_eq!(observable_state(&context, imported_file), warm);
+        }
     }
 
     #[test]

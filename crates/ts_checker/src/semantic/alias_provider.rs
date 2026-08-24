@@ -1,10 +1,10 @@
 //! Production syntax and module-resolution host for canonical alias targets.
 //!
 //! This host accepts TypeScript namespace imports, explicit default imports,
-//! named imports, named exports, and external import-equals declarations. ESM
-//! and `CommonJS` emit modes retain the same direct module symbols when both
-//! sides agree. Alias recursion and type-only propagation belong to the
-//! canonical alias kernel.
+//! named imports, named exports, external import-equals declarations, and
+//! source-owned `JSDoc` import-type module specifiers. ESM and `CommonJS` emit
+//! modes retain the same direct module symbols when both sides agree. Alias
+//! recursion and type-only propagation belong to the canonical alias kernel.
 
 use std::collections::BTreeMap;
 
@@ -1139,6 +1139,66 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
             ),
             CanonicalModuleResolutionLookup::Resolved(resolved) => Ok(resolved),
         }
+    }
+
+    /// Resolves the exact string argument of a source-owned JSDoc import type.
+    pub(super) fn resolve_jsdoc_import_type_module<MapperPayload>(
+        &self,
+        store: &CanonicalSemanticStore<MapperPayload>,
+        import_type: NodeRef,
+        module_specifier: NodeRef,
+    ) -> Result<(CanonicalResolvedModule, SemanticSymbolId), CanonicalAliasTargetUnavailable> {
+        if store.id() != self.store {
+            return Err(CanonicalAliasTargetUnavailable::ForeignStore {
+                expected: self.store,
+                actual: store.id(),
+            });
+        }
+        let (record, source) = self.checked_node(store, import_type)?;
+        let NodeData::ImportTypeNode(import) = &record.data else {
+            return Err(CanonicalAliasTargetUnavailable::MalformedDeclaration(
+                import_type,
+            ));
+        };
+        let argument = NodeRef::new(import_type.arena, import_type.file, import.argument);
+        let (argument_record, _) = self.checked_node(store, argument)?;
+        let NodeData::LiteralTypeNode(literal) = &argument_record.data else {
+            return Err(CanonicalAliasTargetUnavailable::MalformedDeclaration(
+                import_type,
+            ));
+        };
+        let (specifier, _) = self.checked_node(store, module_specifier)?;
+        let valid_specifier = matches!(
+            &specifier.data,
+            NodeData::StringLiteral(literal) if literal.token_flags.0 == 0
+        );
+        if record.kind != SyntaxKind::ImportType
+            || record.flags.0 != 0
+            || import.attributes.is_some()
+            || import.is_type_of
+            || import.type_arguments.is_some()
+            || argument_record.kind != SyntaxKind::LiteralType
+            || argument_record.flags.0 != 0
+            || argument_record.parent != Some(import_type.node)
+            || literal.literal != module_specifier.node
+            || !module_specifier.is_for(import_type.arena, import_type.file)
+            || specifier.kind != SyntaxKind::StringLiteral
+            || specifier.flags.0 != 0
+            || specifier.parent != Some(argument.node)
+            || !valid_specifier
+            || source
+                .bound
+                .source_facts()
+                .is_none_or(|facts| !facts.is_javascript_file())
+        {
+            return Err(CanonicalAliasTargetUnavailable::MalformedDeclaration(
+                import_type,
+            ));
+        }
+
+        let resolved = self.resolved_module(import_type, module_specifier, store)?;
+        let module = self.direct_source_module(store, import_type, resolved, true)?;
+        Ok((resolved, module))
     }
 
     fn direct_source_module<MapperPayload>(

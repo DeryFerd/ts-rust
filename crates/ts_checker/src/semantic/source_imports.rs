@@ -1,4 +1,4 @@
-//! Exact source planning for TypeScript ESM imports and named reexports.
+//! Exact source planning for ESM imports, JSDoc imports, and named reexports.
 //!
 //! This slice accepts leading, top-level side-effect imports, default imports,
 //! namespace imports, and named imports, including explicit named `default`
@@ -7,7 +7,9 @@
 //! successful alias may traverse named and explicit default reexports before
 //! reaching an authenticated exported declaration in another retained source.
 //! JavaScript `JSDoc` typedef targets retain their exact parser-owned reparsed
-//! flag. Value preparation supports initialized annotated `const` declarations,
+//! flag. Comment-only typedef imports authenticate promoted `CommonJS` type
+//! exports through their exact module-specifier nodes. Value preparation
+//! supports initialized annotated `const` declarations,
 //! authenticated `CommonJS` variables and named assignments, exact
 //! `export declare const` declarations in retained declaration files, and
 //! annotated `FunctionDeclaration`s, and already-published inferred object
@@ -53,8 +55,8 @@ use super::{
     enums,
     instantiate::InstantiationSession,
     jsdoc::{
-        PlannedJsDocType, plan_javascript_source_jsdoc, preflight_planned_jsdoc_type,
-        resolve_planned_jsdoc_type,
+        JsDocImportType, PlannedJsDocType, plan_javascript_source_jsdoc,
+        preflight_planned_jsdoc_type, resolve_planned_jsdoc_type,
     },
     source_callables::{
         SourceCallableError, SourceCallableFamily, SourceCallablePlan, SourceCallableState,
@@ -63,7 +65,9 @@ use super::{
         validate_stored_source_callable,
     },
     store::SourceNodeParent,
-    type_nodes::{CanonicalTypeQuery, CanonicalTypeReferenceAliasTarget},
+    type_nodes::{
+        CanonicalJsDocImportTypeTarget, CanonicalTypeQuery, CanonicalTypeReferenceAliasTarget,
+    },
     type_records::{TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
     variables::{VariableBindingKind, VariablePlanError, plan_top_level_variable},
@@ -95,6 +99,41 @@ pub(super) struct SourceImportPlan {
     pub(super) declaration: NodeRef,
     pub(super) module_specifier: NodeRef,
     pub(super) bindings: Vec<SourceImportBindingPlan>,
+}
+
+/// One parser-owned JavaScript typedef whose body imports a qualified type.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceJsDocTypedefImportPlan {
+    pub(super) host_declaration: NodeRef,
+    pub(super) local_declaration: NodeRef,
+    pub(super) local_symbol: SemanticSymbolId,
+    pub(super) import_type: NodeRef,
+    pub(super) module_specifier: NodeRef,
+    pub(super) imported_name: NodeRef,
+}
+
+/// One JSDoc typedef resolved through an authenticated CommonJS export.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ResolvedSourceJsDocTypedefImport {
+    pub(super) plan: SourceJsDocTypedefImportPlan,
+    pub(super) module_symbol: SemanticSymbolId,
+    pub(super) target_symbol: SemanticSymbolId,
+    pub(super) target_declaration: NodeRef,
+}
+
+impl ResolvedSourceJsDocTypedefImport {
+    pub(super) const fn type_capability(self) -> CanonicalJsDocImportTypeTarget {
+        CanonicalJsDocImportTypeTarget::new(
+            self.plan.local_declaration,
+            self.plan.local_symbol,
+            self.plan.import_type,
+            self.plan.module_specifier,
+            self.plan.imported_name,
+            self.module_symbol,
+            self.target_symbol,
+            self.target_declaration,
+        )
+    }
 }
 
 /// One exact alias binding introduced into a module's export table.
@@ -585,6 +624,239 @@ pub(super) fn plan_top_level_named_type_import(
     declaration: NodeRef,
 ) -> Result<SourceImportPlan, SourceImportError> {
     plan_top_level_named_import(arena, bound, store, declaration, SourceImportPhase::Type)
+}
+
+/// Authenticates the exact parser-owned body of a comment-only typedef import.
+pub(super) fn plan_source_jsdoc_typedef_import(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host_declaration: NodeRef,
+    local_declaration: NodeRef,
+    imported: &JsDocImportType,
+) -> Result<SourceJsDocTypedefImportPlan, SourceImportError> {
+    validate_source_identity(arena, bound, store, bound.source_file())?;
+    let facts = bound.source_facts().ok_or_else(|| {
+        invariant(SourceImportInvariant::MissingSourceFacts(
+            bound.source_file(),
+        ))
+    })?;
+    let host = checked_node(arena, bound, store, host_declaration)?;
+    let declaration = checked_node(arena, bound, store, local_declaration)?;
+    let NodeData::TypeAliasDeclaration(alias) = &declaration.data else {
+        return Err(unsupported(SourceImportUnsupported::Binding(
+            local_declaration,
+        )));
+    };
+    let local_symbol = bound
+        .symbol(local_declaration)
+        .ok_or_else(|| invariant(SourceImportInvariant::MissingAliasSymbol(local_declaration)))?;
+    let local = store
+        .symbol(local_symbol)
+        .ok_or_else(|| invariant(SourceImportInvariant::InvalidAliasSymbol(local_symbol)))?;
+    let local_name = NodeRef::new(local_declaration.arena, local_declaration.file, alias.name);
+    let local_name_record = checked_node(arena, bound, store, local_name)?;
+    let NodeData::Identifier(local_identifier) = &local_name_record.data else {
+        return Err(invariant(SourceImportInvariant::AliasNameMismatch {
+            alias: local_symbol,
+            name: local_name,
+        }));
+    };
+    if !facts.is_javascript_file()
+        || facts.is_declaration_file()
+        || host.kind != SyntaxKind::VariableDeclaration
+        || declaration.kind != SyntaxKind::JsTypeAliasDeclaration
+        || declaration.flags != NodeFlags::REPARSED
+        || declaration.parent != Some(bound.source_file().node)
+        || alias.flow_node.is_some()
+        || alias.local_symbol.is_some()
+        || alias.next_container.is_some()
+        || alias.symbol.is_some()
+        || alias.type_parameters.is_some()
+        || alias.modifiers.is_some()
+        || local_name_record.kind != SyntaxKind::Identifier
+        || local_name_record.flags.0 != 0
+        || local_name_record.parent != Some(local_declaration.node)
+        || local_identifier.flow_node.is_some()
+        || local.flags() != SymbolFlags::TYPE_ALIAS
+        || local.check_flags() != CheckFlags::NONE
+        || local.declarations() != Some(&[local_declaration])
+        || local.value_declaration().is_some()
+        || local.members().is_some()
+        || local.exports().is_some()
+        || local.export_symbol().is_some()
+        || local.name().as_bytes() != local_identifier.text.as_bytes()
+        || store.get_merged_symbol(local_symbol) != Some(local_symbol)
+    {
+        return Err(unsupported(SourceImportUnsupported::Binding(
+            local_declaration,
+        )));
+    }
+
+    let import_type = NodeRef::new(local_declaration.arena, local_declaration.file, alias.type_);
+    let import_record = checked_node(arena, bound, store, import_type)?;
+    let NodeData::ImportTypeNode(import) = &import_record.data else {
+        return Err(unsupported(SourceImportUnsupported::TypeReference(
+            import_type,
+        )));
+    };
+    let argument = NodeRef::new(import_type.arena, import_type.file, import.argument);
+    let argument_record = checked_node(arena, bound, store, argument)?;
+    let NodeData::LiteralTypeNode(literal_type) = &argument_record.data else {
+        return Err(unsupported(SourceImportUnsupported::TypeReference(
+            import_type,
+        )));
+    };
+    let module_specifier = NodeRef::new(argument.arena, argument.file, literal_type.literal);
+    let specifier_record = checked_node(arena, bound, store, module_specifier)?;
+    let NodeData::StringLiteral(specifier) = &specifier_record.data else {
+        return Err(unsupported(SourceImportUnsupported::TypeReference(
+            import_type,
+        )));
+    };
+    let Some(imported_name) = import.qualifier else {
+        return Err(unsupported(SourceImportUnsupported::TypeReference(
+            import_type,
+        )));
+    };
+    let imported_name = NodeRef::new(import_type.arena, import_type.file, imported_name);
+    let qualifier_record = checked_node(arena, bound, store, imported_name)?;
+    let NodeData::Identifier(qualifier) = &qualifier_record.data else {
+        return Err(unsupported(SourceImportUnsupported::TypeReference(
+            imported_name,
+        )));
+    };
+    if import_record.kind != SyntaxKind::ImportType
+        || import_record.flags.0 != 0
+        || import_record.parent != Some(local_declaration.node)
+        || import.attributes.is_some()
+        || import.is_type_of
+        || import.type_arguments.is_some()
+        || argument_record.kind != SyntaxKind::LiteralType
+        || argument_record.flags.0 != 0
+        || argument_record.parent != Some(import_type.node)
+        || specifier_record.kind != SyntaxKind::StringLiteral
+        || specifier_record.flags.0 != 0
+        || specifier_record.parent != Some(argument.node)
+        || specifier.token_flags.0 != 0
+        || specifier.text != imported.specifier()
+        || qualifier_record.kind != SyntaxKind::Identifier
+        || qualifier_record.flags.0 != 0
+        || qualifier_record.parent != Some(import_type.node)
+        || qualifier.flow_node.is_some()
+        || qualifier.text.is_empty()
+        || imported.qualifier() != Some(qualifier.text.as_str())
+        || imported.is_type_of()
+        || !imported.type_arguments().is_empty()
+        || store
+            .symbol_node_links(imported_name)
+            .and_then(|links| links.resolved_symbol)
+            .is_some_and(|symbol| store.symbol(symbol).is_none())
+    {
+        return Err(unsupported(SourceImportUnsupported::TypeReference(
+            import_type,
+        )));
+    }
+
+    Ok(SourceJsDocTypedefImportPlan {
+        host_declaration,
+        local_declaration,
+        local_symbol,
+        import_type,
+        module_specifier,
+        imported_name,
+    })
+}
+
+/// Resolves a comment-only typedef through the exact promoted CommonJS export.
+pub(super) fn resolve_source_jsdoc_typedef_import(
+    store: &CanonicalTypeMapperStore,
+    alias_host: &ProductionAliasTargetHost<'_, '_, '_>,
+    declared_host: &DeclaredTypeHost<'_>,
+    plan: SourceJsDocTypedefImportPlan,
+) -> Result<ResolvedSourceJsDocTypedefImport, SourceImportError> {
+    let (resolved, module_symbol) = alias_host
+        .resolve_jsdoc_import_type_module(store, plan.import_type, plan.module_specifier)
+        .map_err(|reason| {
+            SourceImportError::Alias(CanonicalAliasResolutionError::TargetUnavailable {
+                alias: plan.local_symbol,
+                reason,
+            })
+        })?;
+    let module = store
+        .symbol(module_symbol)
+        .ok_or_else(|| invariant(SourceImportInvariant::InvalidTargetSymbol(module_symbol)))?;
+    let exports = module
+        .exports()
+        .and_then(|exports| store.symbol_table(exports))
+        .ok_or_else(|| invariant(SourceImportInvariant::InvalidTargetSymbol(module_symbol)))?;
+    let promoted_symbol = exports
+        .get(InternalSymbolName::ExportEquals.as_ref())
+        .ok_or_else(|| {
+            unsupported(SourceImportUnsupported::TargetTypeNotExported(
+                plan.import_type,
+            ))
+        })?;
+    if !super::alias::is_promoted_commonjs_export_alias(store, promoted_symbol) {
+        return Err(invariant(SourceImportInvariant::InvalidTargetSymbol(
+            promoted_symbol,
+        )));
+    }
+    let qualifier = declared_host
+        .node(plan.imported_name)
+        .and_then(|record| match &record.data {
+            NodeData::Identifier(identifier) => Some(identifier.text.as_str()),
+            _ => None,
+        })
+        .ok_or_else(|| invariant(SourceImportInvariant::InvalidNode(plan.imported_name)))?;
+    let target_symbol = exports.get_source(qualifier).ok_or_else(|| {
+        unsupported(SourceImportUnsupported::TargetTypeNotExported(
+            plan.import_type,
+        ))
+    })?;
+    let promoted_target = store
+        .symbol(promoted_symbol)
+        .and_then(ts_binder::semantic::Symbol::exports)
+        .and_then(|exports| store.symbol_table(exports))
+        .and_then(|exports| exports.get_source(qualifier));
+    if promoted_target != Some(target_symbol)
+        || store.get_parent_of_symbol(target_symbol) != Some(module_symbol)
+        || store.get_merged_symbol(target_symbol) != Some(target_symbol)
+        || store
+            .symbol_node_links(plan.imported_name)
+            .and_then(|links| links.resolved_symbol)
+            .is_some_and(|cached| cached != target_symbol)
+    {
+        return Err(invariant(SourceImportInvariant::InvalidTargetSymbol(
+            target_symbol,
+        )));
+    }
+
+    let target_declaration =
+        plan_direct_exported_type_target(store, declared_host, plan.local_symbol, target_symbol)?;
+    let target = store
+        .symbol(target_symbol)
+        .ok_or_else(|| invariant(SourceImportInvariant::InvalidTargetSymbol(target_symbol)))?;
+    let target_facts = declared_host
+        .bound_file(target_declaration)
+        .and_then(BoundFile::source_facts);
+    if target.flags() != SymbolFlags::TYPE_ALIAS
+        || target_declaration.file != resolved.target_file()
+        || target_declaration.file == plan.local_declaration.file
+        || target_facts
+            .is_none_or(|facts| !facts.is_javascript_file() || !facts.is_common_js_module())
+    {
+        return Err(unsupported(SourceImportUnsupported::TargetTypeDeclaration(
+            target_declaration,
+        )));
+    }
+
+    Ok(ResolvedSourceJsDocTypedefImport {
+        plan,
+        module_symbol,
+        target_symbol,
+        target_declaration,
+    })
 }
 
 /// Proves a top-level `import name = require("module")` or local namespace alias.
@@ -6329,10 +6601,13 @@ mod tests {
     use super::*;
     use crate::semantic::{
         AliasSymbolLinks, CanonicalTypeFormatFlags, IntrinsicBootstrapOptions, SymbolNodeLinks,
+        TypeAliasLinks,
+        alias::CanonicalAliasTargetUnavailable,
         bootstrap::UnionReduction,
         formatter::type_to_string_with_host_global_types_and_flags,
         global_types::initialize_global_library_types,
         instantiate::InstantiationLimits,
+        jsdoc::JsDocType,
         module_resolution::{
             CanonicalModuleResolutionEntry, CanonicalModuleResolutionManifest,
             CanonicalModuleResolutionManifestInput, CanonicalModuleResolutionMode,
@@ -6359,6 +6634,13 @@ mod tests {
         manifest: CanonicalModuleResolutionManifest,
         global_types: CanonicalGlobalTypes,
         store: CanonicalTypeMapperStore,
+    }
+
+    #[derive(Clone, Copy)]
+    enum JsDocImportManifestState {
+        Resolved,
+        Unresolved,
+        Absent,
     }
 
     impl Fixture {
@@ -6784,6 +7066,228 @@ mod tests {
             global_types,
             store,
         }
+    }
+
+    fn javascript_jsdoc_commonjs_fixture(
+        importer: &str,
+        target: &str,
+        resolution: JsDocImportManifestState,
+    ) -> Fixture {
+        let importer_file = FileId::new(972);
+        let target_file = FileId::new(973);
+        let files = vec![
+            FixtureFile {
+                file: importer_file,
+                parsed: parse_javascript_source_file(importer),
+            },
+            FixtureFile {
+                file: target_file,
+                parsed: parse_javascript_source_file(target),
+            },
+        ];
+        for file in &files {
+            assert!(
+                file.parsed.diagnostics.is_empty(),
+                "{:?}",
+                file.parsed.diagnostics
+            );
+        }
+
+        let mut binder = CanonicalBinder::new();
+        for (file, state) in files
+            .iter()
+            .zip([CanonicalModuleState::Script, CanonicalModuleState::CommonJs])
+        {
+            binder
+                .bind_source_file_with_facts(
+                    &file.parsed.arena,
+                    file.parsed.source_file,
+                    file.file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(format!("\"/project/{}.js\"", file.file.index())),
+                        CanonicalSourceLanguage::JavaScript,
+                        false,
+                        state,
+                    ),
+                )
+                .unwrap();
+        }
+        for file in &files {
+            binder
+                .bind_javascript_declaration_slice(&file.parsed.arena, file.file)
+                .unwrap();
+        }
+        let (symbols, bound) = binder.finish().try_into_parts().unwrap();
+        let import_type = files[0]
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(_, record)| match &record.data {
+                NodeData::ImportTypeNode(import) => Some(import.argument),
+                _ => None,
+            })
+            .expect("the importer contains one JSDoc import type");
+        let NodeData::LiteralTypeNode(argument) =
+            &files[0].parsed.arena.get(import_type).unwrap().data
+        else {
+            panic!("the JSDoc import must use a literal module argument")
+        };
+        let specifier = NodeRef::new(files[0].parsed.arena.id(), importer_file, argument.literal);
+        let entries = match resolution {
+            JsDocImportManifestState::Resolved => {
+                vec![CanonicalModuleResolutionEntry::resolved(
+                    specifier,
+                    CanonicalResolvedModuleInput::new(
+                        target_file,
+                        CanonicalModuleResolutionMode::Esm,
+                        CanonicalModuleResolutionMode::CommonJs,
+                    ),
+                )]
+            }
+            JsDocImportManifestState::Unresolved => {
+                vec![CanonicalModuleResolutionEntry::unresolved(specifier)]
+            }
+            JsDocImportManifestState::Absent => Vec::new(),
+        };
+        let manifest = validate_module_resolution_manifest(
+            CanonicalModuleResolutionManifestInput::new(entries),
+            &symbols,
+            files.iter().map(|file| {
+                (
+                    file.file,
+                    &file.parsed.arena,
+                    bound.get(&file.file).unwrap(),
+                )
+            }),
+        )
+        .unwrap();
+        let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
+        for file in &files {
+            assert!(
+                store
+                    .register_source_file(&file.parsed.arena, file.parsed.source_file, file.file)
+                    .is_some()
+            );
+        }
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        let globals = store.intrinsic_bootstrap().unwrap().globals;
+        let importer_bound = bound.get(&importer_file).unwrap();
+        if let Some(locals) = importer_bound.locals(importer_bound.source_file()) {
+            let symbols = store
+                .symbol_table(locals)
+                .unwrap()
+                .iter()
+                .map(|(_, symbol)| symbol)
+                .collect::<Vec<_>>();
+            for symbol in symbols {
+                store.merge_global_symbol(globals, symbol).unwrap();
+            }
+        }
+        let sources = || {
+            files.iter().map(|file| {
+                (
+                    &file.parsed.arena,
+                    bound.get(&file.file).expect("fixture bound every file"),
+                )
+            })
+        };
+        let declared_host = DeclaredTypeHost::new_after_global_merge(
+            sources(),
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let global_types =
+            initialize_global_library_types(&mut store, &declared_host, globals, false).unwrap();
+        Fixture {
+            files,
+            bound,
+            manifest,
+            global_types,
+            store,
+        }
+    }
+
+    fn plan_jsdoc_typedef_import(fixture: &Fixture) -> SourceJsDocTypedefImportPlan {
+        let file = &fixture.files[0];
+        let bound = fixture.bound.get(&file.file).unwrap();
+        let jsdoc = plan_javascript_source_jsdoc(&file.parsed.arena, bound.source_file()).unwrap();
+        let (declaration, typedef) = jsdoc
+            .declarations()
+            .iter()
+            .find_map(|declaration| {
+                declaration
+                    .typedefs()
+                    .iter()
+                    .find(|typedef| typedef.source_declaration().is_some())
+                    .map(|typedef| (declaration, typedef))
+            })
+            .expect("the importer has one source-owned JSDoc typedef");
+        let JsDocType::Import(imported) = typedef.type_().unwrap().type_() else {
+            panic!("the source-owned JSDoc typedef must import a type")
+        };
+        plan_source_jsdoc_typedef_import(
+            &file.parsed.arena,
+            bound,
+            &fixture.store,
+            declaration.node(),
+            typedef.source_declaration().unwrap(),
+            imported,
+        )
+        .unwrap()
+    }
+
+    fn resolve_jsdoc_typedef_import(
+        fixture: &Fixture,
+        plan: SourceJsDocTypedefImportPlan,
+    ) -> Result<ResolvedSourceJsDocTypedefImport, SourceImportError> {
+        let sources = || {
+            fixture
+                .files
+                .iter()
+                .map(|file| (&file.parsed.arena, fixture.bound.get(&file.file).unwrap()))
+        };
+        let declared_host = DeclaredTypeHost::new_after_global_merge(
+            sources(),
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let alias_host =
+            ProductionAliasTargetHost::new(&fixture.store, sources(), &fixture.manifest).unwrap();
+        resolve_source_jsdoc_typedef_import(&fixture.store, &alias_host, &declared_host, plan)
+    }
+
+    fn query_jsdoc_typedef_import(
+        fixture: &mut Fixture,
+        resolved: ResolvedSourceJsDocTypedefImport,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let Fixture {
+            files,
+            bound,
+            global_types,
+            store,
+            ..
+        } = fixture;
+        let declared_host = DeclaredTypeHost::new_after_global_merge(
+            files.iter().map(|file| {
+                (
+                    &file.parsed.arena,
+                    bound.get(&file.file).expect("fixture bound every file"),
+                )
+            }),
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        CanonicalTypeQuery::new_with_global_types(
+            store,
+            &declared_host,
+            global_types,
+            CanonicalCheckerOptions::default(),
+            &mut CanonicalCheckerDiagnostics::default(),
+        )?
+        .with_jsdoc_import_type_target(resolved.type_capability())?
+        .get_declared_type_of_symbol(resolved.plan.local_symbol)
     }
 
     fn resolve_all(
@@ -10040,6 +10544,351 @@ mod tests {
             resolved,
         );
         assert_eq!(store_state(&fixture.store), warm);
+    }
+
+    #[test]
+    fn comment_only_commonjs_jsdoc_typedef_imports_preserve_canonical_identity() {
+        for exported_value in ["0", "{}"] {
+            let mut fixture = javascript_jsdoc_commonjs_fixture(
+                concat!(
+                    "/** @typedef {import('./target').C} C */\n",
+                    "/** @type {C} */\n",
+                    "var c;",
+                ),
+                &format!(
+                    "/** @typedef {{{{ a: 1, m: 1 }}}} C */\nconst value = {exported_value};\nmodule.exports = value;",
+                ),
+                JsDocImportManifestState::Resolved,
+            );
+            let before = store_state(&fixture.store);
+            let plan = plan_jsdoc_typedef_import(&fixture);
+            let resolved = resolve_jsdoc_typedef_import(&fixture, plan).unwrap();
+            let target = direct_export(&fixture, 1, "C");
+            assert_eq!(resolved.target_symbol, target);
+            assert_eq!(store_state(&fixture.store), before);
+            assert!(
+                fixture
+                    .store
+                    .alias_symbol_links(plan.local_symbol)
+                    .is_none()
+            );
+            assert!(
+                fixture
+                    .store
+                    .value_symbol_links(plan.local_symbol)
+                    .is_none()
+            );
+            assert!(matches!(
+                query_declared_type(&mut fixture, plan.local_symbol),
+                Err(DeclaredTypeError::TypeNodeUnavailable(
+                    super::super::type_nodes::TypeNodeUnavailable::JsDocImportTypeCapabilityUnsupported(node)
+                )) if node == plan.import_type
+            ));
+
+            let imported = query_jsdoc_typedef_import(&mut fixture, resolved).unwrap();
+            assert_eq!(query_declared_type(&mut fixture, target).unwrap(), imported);
+            assert_eq!(
+                fixture
+                    .store
+                    .type_alias_links(plan.local_symbol)
+                    .and_then(|links| links.declared_type),
+                Some(imported),
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .type_node_links(plan.import_type)
+                    .and_then(|links| links.resolved_type),
+                Some(imported),
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .symbol_node_links(plan.imported_name)
+                    .and_then(|links| links.resolved_symbol),
+                Some(target),
+            );
+            assert!(
+                fixture
+                    .store
+                    .alias_symbol_links(plan.local_symbol)
+                    .is_none()
+            );
+
+            let warm = store_state(&fixture.store);
+            assert_eq!(
+                query_jsdoc_typedef_import(&mut fixture, resolved).unwrap(),
+                imported,
+            );
+            assert_eq!(store_state(&fixture.store), warm);
+        }
+    }
+
+    #[test]
+    fn comment_only_jsdoc_imports_require_the_exact_resolved_manifest_node() {
+        for state in [
+            JsDocImportManifestState::Absent,
+            JsDocImportManifestState::Unresolved,
+        ] {
+            let fixture = javascript_jsdoc_commonjs_fixture(
+                "/** @typedef {import('./target').C} C */\nvar c;",
+                "/** @typedef {number} C */\nconst value = 0;\nmodule.exports = value;",
+                state,
+            );
+            let plan = plan_jsdoc_typedef_import(&fixture);
+            let before = store_state(&fixture.store);
+            let expected = match state {
+                JsDocImportManifestState::Absent => {
+                    CanonicalAliasTargetUnavailable::ModuleResolutionEntryAbsent(
+                        plan.module_specifier,
+                    )
+                }
+                JsDocImportManifestState::Unresolved => {
+                    CanonicalAliasTargetUnavailable::ModuleResolutionUnresolved(
+                        plan.module_specifier,
+                    )
+                }
+                JsDocImportManifestState::Resolved => unreachable!(),
+            };
+            assert_eq!(
+                resolve_jsdoc_typedef_import(&fixture, plan),
+                Err(SourceImportError::Alias(
+                    CanonicalAliasResolutionError::TargetUnavailable {
+                        alias: plan.local_symbol,
+                        reason: expected,
+                    }
+                )),
+            );
+            assert_eq!(store_state(&fixture.store), before);
+            assert!(
+                fixture
+                    .store
+                    .alias_symbol_links(plan.local_symbol)
+                    .is_none()
+            );
+        }
+
+        let fixture = javascript_jsdoc_commonjs_fixture(
+            "/** @typedef {import('./target').C} C */\nvar c;",
+            "/** @typedef {number} C */\nconst value = 0;\nmodule.exports = value;",
+            JsDocImportManifestState::Resolved,
+        );
+        let mut plan = plan_jsdoc_typedef_import(&fixture);
+        plan.module_specifier = plan.imported_name;
+        assert_eq!(
+            resolve_jsdoc_typedef_import(&fixture, plan),
+            Err(SourceImportError::Alias(
+                CanonicalAliasResolutionError::TargetUnavailable {
+                    alias: plan.local_symbol,
+                    reason: CanonicalAliasTargetUnavailable::MalformedDeclaration(plan.import_type,),
+                }
+            )),
+        );
+
+        let mut unavailable = javascript_jsdoc_commonjs_fixture(
+            "/** @typedef {import('./target').C} C */\nvar c;",
+            "/** @typedef {number} C */\nconst value = 0;\nmodule.exports = value;",
+            JsDocImportManifestState::Resolved,
+        );
+        let plan = plan_jsdoc_typedef_import(&unavailable);
+        unavailable.manifest = CanonicalModuleResolutionManifest::unavailable();
+        assert_eq!(
+            resolve_jsdoc_typedef_import(&unavailable, plan),
+            Err(SourceImportError::Alias(
+                CanonicalAliasResolutionError::TargetUnavailable {
+                    alias: plan.local_symbol,
+                    reason: CanonicalAliasTargetUnavailable::ModuleResolutionCapabilityUnavailable(
+                        plan.module_specifier,
+                    ),
+                }
+            )),
+        );
+    }
+
+    #[test]
+    fn comment_only_jsdoc_imports_reject_missing_qualifiers_and_forged_promoted_exports() {
+        let missing = javascript_jsdoc_commonjs_fixture(
+            "/** @typedef {import('./target').Missing} C */\nvar c;",
+            "/** @typedef {number} C */\nconst value = 0;\nmodule.exports = value;",
+            JsDocImportManifestState::Resolved,
+        );
+        let missing_plan = plan_jsdoc_typedef_import(&missing);
+        assert_eq!(
+            resolve_jsdoc_typedef_import(&missing, missing_plan),
+            Err(SourceImportError::Unsupported(
+                SourceImportUnsupported::TargetTypeNotExported(missing_plan.import_type)
+            )),
+        );
+
+        let mut forged = javascript_jsdoc_commonjs_fixture(
+            "/** @typedef {import('./target').C} C */\nvar c;",
+            "/** @typedef {number} C */\nconst value = 0;\nmodule.exports = value;",
+            JsDocImportManifestState::Resolved,
+        );
+        let plan = plan_jsdoc_typedef_import(&forged);
+        let bound = forged.bound.get(&forged.files[1].file).unwrap();
+        let module = bound.symbol(bound.source_file()).unwrap();
+        let promoted = forged
+            .store
+            .symbol(module)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| forged.store.symbol_table(exports))
+            .and_then(|exports| exports.get(InternalSymbolName::ExportEquals.as_ref()))
+            .unwrap();
+        assert!(
+            forged
+                .store
+                .set_symbol_relationships(promoted, None, None, Some(module), None)
+        );
+        assert_eq!(
+            resolve_jsdoc_typedef_import(&forged, plan),
+            Err(SourceImportError::Invariant(
+                SourceImportInvariant::InvalidTargetSymbol(promoted)
+            )),
+        );
+    }
+
+    #[test]
+    fn comment_only_jsdoc_imports_reject_typeof_generic_and_qualified_shapes() {
+        for expression in [
+            "typeof import('./target').C",
+            "import('./target').C<number>",
+            "import('./target').Nested.C",
+        ] {
+            let fixture = javascript_jsdoc_commonjs_fixture(
+                &format!("/** @typedef {{{expression}}} C */\nvar c;"),
+                "/** @typedef {number} C */\nconst value = 0;\nmodule.exports = value;",
+                JsDocImportManifestState::Resolved,
+            );
+            let file = &fixture.files[0];
+            let bound = fixture.bound.get(&file.file).unwrap();
+            let jsdoc =
+                plan_javascript_source_jsdoc(&file.parsed.arena, bound.source_file()).unwrap();
+            let declaration = jsdoc.declarations().first().unwrap();
+            let typedef = declaration.typedefs().first().unwrap();
+            let JsDocType::Import(imported) = typedef.type_().unwrap().type_() else {
+                panic!("the malformed shape still projects as a JSDoc import")
+            };
+
+            assert!(matches!(
+                plan_source_jsdoc_typedef_import(
+                    &file.parsed.arena,
+                    bound,
+                    &fixture.store,
+                    declaration.node(),
+                    typedef.source_declaration().unwrap(),
+                    imported,
+                ),
+                Err(SourceImportError::Unsupported(
+                    SourceImportUnsupported::TypeReference(_)
+                )),
+                "unsupported JSDoc import expression: {expression}",
+            ));
+        }
+    }
+
+    #[test]
+    fn comment_only_jsdoc_imports_reject_foreign_targets_and_poisoned_caches() {
+        for poisoned in 0..4 {
+            let mut fixture = javascript_jsdoc_commonjs_fixture(
+                "/** @typedef {import('./target').C} C */\nvar c;",
+                "/** @typedef {number} C */\nconst value = 0;\nmodule.exports = value;",
+                JsDocImportManifestState::Resolved,
+            );
+            let plan = plan_jsdoc_typedef_import(&fixture);
+            let mut resolved = resolve_jsdoc_typedef_import(&fixture, plan).unwrap();
+            let wrong = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+            match poisoned {
+                0 => resolved.target_declaration = plan.local_declaration,
+                1 => assert!(fixture.store.set_type_alias_links(
+                    plan.local_symbol,
+                    TypeAliasLinks {
+                        declared_type: Some(wrong),
+                        ..TypeAliasLinks::default()
+                    },
+                )),
+                2 => assert!(fixture.store.set_type_node_links(
+                    plan.import_type,
+                    TypeNodeLinks {
+                        resolved_type: Some(wrong),
+                        ..TypeNodeLinks::default()
+                    },
+                )),
+                3 => assert!(fixture.store.set_symbol_node_links(
+                    plan.imported_name,
+                    SymbolNodeLinks {
+                        resolved_symbol: Some(plan.local_symbol),
+                    },
+                )),
+                _ => unreachable!(),
+            }
+
+            assert!(matches!(
+                query_jsdoc_typedef_import(&mut fixture, resolved),
+                Err(DeclaredTypeError::TypeNodeUnavailable(
+                    super::super::type_nodes::TypeNodeUnavailable::InvalidJsDocImportTypeTarget {
+                        node,
+                        alias,
+                        target,
+                    }
+                )) if node == plan.import_type
+                    && alias == plan.local_symbol
+                    && target == resolved.target_symbol,
+            ));
+            assert!(
+                fixture
+                    .store
+                    .alias_symbol_links(plan.local_symbol)
+                    .is_none()
+            );
+            assert!(
+                fixture
+                    .store
+                    .value_symbol_links(plan.local_symbol)
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn comment_only_jsdoc_imports_recheck_warm_import_node_identity() {
+        let mut fixture = javascript_jsdoc_commonjs_fixture(
+            "/** @typedef {import('./target').C} C */\nvar c;",
+            "/** @typedef {number} C */\nconst value = 0;\nmodule.exports = value;",
+            JsDocImportManifestState::Resolved,
+        );
+        let plan = plan_jsdoc_typedef_import(&fixture);
+        let resolved = resolve_jsdoc_typedef_import(&fixture, plan).unwrap();
+        let imported = query_jsdoc_typedef_import(&mut fixture, resolved).unwrap();
+        let wrong = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        assert_ne!(imported, wrong);
+        assert!(fixture.store.set_type_node_links(
+            plan.import_type,
+            TypeNodeLinks {
+                resolved_type: Some(wrong),
+                ..TypeNodeLinks::default()
+            },
+        ));
+
+        assert!(matches!(
+            query_jsdoc_typedef_import(&mut fixture, resolved),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                super::super::type_nodes::TypeNodeUnavailable::InvalidJsDocImportTypeTarget {
+                    node,
+                    alias,
+                    target,
+                }
+            )) if node == plan.import_type
+                && alias == plan.local_symbol
+                && target == resolved.target_symbol,
+        ));
+        assert_eq!(
+            fixture
+                .store
+                .type_alias_links(plan.local_symbol)
+                .and_then(|links| links.declared_type),
+            Some(imported),
+        );
     }
 
     #[test]

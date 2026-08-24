@@ -122,6 +122,216 @@ impl CanonicalTypeReferenceAliasTarget {
     }
 }
 
+/// Immutable proof for one parser-owned JSDoc import and its CommonJS target.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct CanonicalJsDocImportTypeTarget {
+    local_declaration: NodeRef,
+    local_symbol: SemanticSymbolId,
+    import_type: NodeRef,
+    module_specifier: NodeRef,
+    imported_name: NodeRef,
+    module_symbol: SemanticSymbolId,
+    target_symbol: SemanticSymbolId,
+    target_declaration: NodeRef,
+}
+
+impl CanonicalJsDocImportTypeTarget {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) const fn new(
+        local_declaration: NodeRef,
+        local_symbol: SemanticSymbolId,
+        import_type: NodeRef,
+        module_specifier: NodeRef,
+        imported_name: NodeRef,
+        module_symbol: SemanticSymbolId,
+        target_symbol: SemanticSymbolId,
+        target_declaration: NodeRef,
+    ) -> Self {
+        Self {
+            local_declaration,
+            local_symbol,
+            import_type,
+            module_specifier,
+            imported_name,
+            module_symbol,
+            target_symbol,
+            target_declaration,
+        }
+    }
+}
+
+fn validate_jsdoc_import_type_target(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    capability: CanonicalJsDocImportTypeTarget,
+) -> Result<(), DeclaredTypeError> {
+    let invalid = || {
+        type_node_unavailable(TypeNodeUnavailable::InvalidJsDocImportTypeTarget {
+            node: capability.import_type,
+            alias: capability.local_symbol,
+            target: capability.target_symbol,
+        })
+    };
+    let local = store.symbol(capability.local_symbol).ok_or_else(&invalid)?;
+    let local_declaration = authenticated_type_alias_declaration(
+        store,
+        host,
+        capability.local_declaration,
+        capability.local_symbol,
+    )?
+    .ok_or_else(&invalid)?;
+    let local_bound = host
+        .bound_file(capability.local_declaration)
+        .ok_or_else(&invalid)?;
+    let local_facts = local_bound.source_facts().ok_or_else(&invalid)?;
+    let import_record = preflight_node(store, host, capability.import_type)?;
+    let NodeData::ImportTypeNode(import) = &import_record.data else {
+        return Err(invalid());
+    };
+    let argument = NodeRef::new(
+        capability.import_type.arena,
+        capability.import_type.file,
+        import.argument,
+    );
+    let argument_record = preflight_node(store, host, argument)?;
+    let NodeData::LiteralTypeNode(literal) = &argument_record.data else {
+        return Err(invalid());
+    };
+    let specifier_record = preflight_node(store, host, capability.module_specifier)?;
+    let NodeData::StringLiteral(specifier) = &specifier_record.data else {
+        return Err(invalid());
+    };
+    let qualifier_record = preflight_node(store, host, capability.imported_name)?;
+    let NodeData::Identifier(qualifier) = &qualifier_record.data else {
+        return Err(invalid());
+    };
+    let target = store
+        .symbol(capability.target_symbol)
+        .ok_or_else(&invalid)?;
+    let target_bound = host
+        .bound_file(capability.target_declaration)
+        .ok_or_else(&invalid)?;
+    let target_facts = target_bound.source_facts().ok_or_else(&invalid)?;
+    let target_declaration = authenticated_type_alias_declaration(
+        store,
+        host,
+        capability.target_declaration,
+        capability.target_symbol,
+    )?
+    .ok_or_else(&invalid)?;
+    let module = store
+        .symbol(capability.module_symbol)
+        .ok_or_else(&invalid)?;
+    let exports = module
+        .exports()
+        .and_then(|exports| store.symbol_table(exports))
+        .ok_or_else(&invalid)?;
+    let promoted = exports
+        .get(InternalSymbolName::ExportEquals.as_ref())
+        .ok_or_else(&invalid)?;
+    let promoted_target = store
+        .symbol(promoted)
+        .and_then(ts_binder::semantic::Symbol::exports)
+        .and_then(|exports| store.symbol_table(exports))
+        .and_then(|exports| exports.get_source(&qualifier.text));
+
+    if !local_facts.is_javascript_file()
+        || local_facts.is_declaration_file()
+        || local.flags() != SymbolFlags::TYPE_ALIAS
+        || local.declarations() != Some(&[capability.local_declaration])
+        || store.get_merged_symbol(capability.local_symbol) != Some(capability.local_symbol)
+        || local_declaration.type_ != capability.import_type.node
+        || !capability.import_type.is_for(
+            capability.local_declaration.arena,
+            capability.local_declaration.file,
+        )
+        || import_record.kind != SyntaxKind::ImportType
+        || import_record.flags.0 != 0
+        || import_record.parent != Some(capability.local_declaration.node)
+        || import.attributes.is_some()
+        || import.is_type_of
+        || import.type_arguments.is_some()
+        || import.qualifier != Some(capability.imported_name.node)
+        || argument_record.kind != SyntaxKind::LiteralType
+        || argument_record.flags.0 != 0
+        || argument_record.parent != Some(capability.import_type.node)
+        || literal.literal != capability.module_specifier.node
+        || !capability
+            .module_specifier
+            .is_for(capability.import_type.arena, capability.import_type.file)
+        || specifier_record.kind != SyntaxKind::StringLiteral
+        || specifier_record.flags.0 != 0
+        || specifier_record.parent != Some(argument.node)
+        || specifier.token_flags.0 != 0
+        || !capability
+            .imported_name
+            .is_for(capability.import_type.arena, capability.import_type.file)
+        || qualifier_record.kind != SyntaxKind::Identifier
+        || qualifier_record.flags.0 != 0
+        || qualifier_record.parent != Some(capability.import_type.node)
+        || qualifier.flow_node.is_some()
+        || qualifier.text.is_empty()
+        || target.flags() != SymbolFlags::TYPE_ALIAS
+        || target.declarations() != Some(&[capability.target_declaration])
+        || target.name().as_bytes() != qualifier.text.as_bytes()
+        || target_declaration.type_parameters.is_some()
+        || !target_facts.is_javascript_file()
+        || !target_facts.is_common_js_module()
+        || capability.target_declaration.file == capability.local_declaration.file
+        || target_bound
+            .symbol(target_bound.source_file())
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            != Some(capability.module_symbol)
+        || store.get_parent_of_symbol(capability.target_symbol) != Some(capability.module_symbol)
+        || store.get_merged_symbol(capability.target_symbol) != Some(capability.target_symbol)
+        || exports.get_source(&qualifier.text) != Some(capability.target_symbol)
+        || !super::alias::is_promoted_commonjs_export_alias(store, promoted)
+        || promoted_target != Some(capability.target_symbol)
+        || store
+            .symbol_node_links(capability.import_type)
+            .is_some_and(|links| links.resolved_symbol.is_some())
+        || store
+            .symbol_node_links(capability.imported_name)
+            .and_then(|links| links.resolved_symbol)
+            .is_some_and(|cached| cached != capability.target_symbol)
+        || store
+            .type_node_links(capability.import_type)
+            .is_some_and(|links| links.outer_type_parameters.is_some())
+        || store
+            .type_alias_links(capability.local_symbol)
+            .is_some_and(|links| {
+                links.type_parameters.is_some()
+                    || links.instantiations.is_some()
+                    || links.is_constructor_declared_property
+            })
+    {
+        return Err(invalid());
+    }
+
+    let target_type = store
+        .type_alias_links(capability.target_symbol)
+        .and_then(|links| links.declared_type);
+    let local_type = store
+        .type_alias_links(capability.local_symbol)
+        .and_then(|links| links.declared_type);
+    let imported_type = store
+        .type_node_links(capability.import_type)
+        .and_then(|links| links.resolved_type);
+    if local_type.is_some_and(|cached| target_type != Some(cached))
+        || imported_type.is_some_and(|cached| target_type != Some(cached))
+        || local_type.is_some_and(|cached| {
+            imported_type != Some(cached)
+                || store
+                    .symbol_node_links(capability.imported_name)
+                    .and_then(|links| links.resolved_symbol)
+                    != Some(capability.target_symbol)
+        })
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
 fn authenticated_default_import_interface_return(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -247,7 +457,13 @@ pub enum TypeNodeUnavailable {
         alias: SemanticSymbolId,
         target: SemanticSymbolId,
     },
+    InvalidJsDocImportTypeTarget {
+        node: NodeRef,
+        alias: SemanticSymbolId,
+        target: SemanticSymbolId,
+    },
     ImportAliasCapabilityUnsupported(NodeRef),
+    JsDocImportTypeCapabilityUnsupported(NodeRef),
     UnsupportedReferenceTarget {
         node: NodeRef,
         symbol: SemanticSymbolId,
@@ -449,6 +665,7 @@ struct TypeQueryPlan {
         BTreeMap<SemanticSymbolId, DefaultLibraryMappedUtilityPlan>,
     recursive_mapped_aliases: BTreeMap<SemanticSymbolId, NodeRef>,
     references: BTreeMap<NodeRef, PlannedTypeReference>,
+    jsdoc_imports: BTreeMap<NodeRef, CanonicalJsDocImportTypeTarget>,
     recovered_missing_references: BTreeMap<NodeRef, NodeRef>,
     type_queries: BTreeMap<NodeRef, PlannedValueTypeQuery>,
     literals: BTreeMap<NodeRef, PlannedLiteralType>,
@@ -648,6 +865,7 @@ enum CachedTypeAliasRhs {
     DirectUnion,
     DirectIntersection(NodeRef),
     TypeReference(NodeRef),
+    JsDocImport(NodeRef),
     TypeLiteral(NodeRef),
     FunctionType(NodeRef),
     IndexedAccess(NodeRef),
@@ -1289,6 +1507,7 @@ struct TypeQueryPlanner<'store, 'host, 'arena, 'aliases> {
     array_targets: Option<CanonicalArrayTargets>,
     strict_builtin_iterator_return: bool,
     type_reference_alias_targets: &'aliases HashMap<NodeRef, CanonicalTypeReferenceAliasTarget>,
+    jsdoc_import_type_target: Option<CanonicalJsDocImportTypeTarget>,
     plan: TypeQueryPlan,
     planning_defaults: HashSet<(SemanticSymbolId, NodeRef)>,
     planning_interfaces: HashSet<SemanticSymbolId>,
@@ -1314,6 +1533,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             array_targets,
             strict_builtin_iterator_return,
             type_reference_alias_targets,
+            jsdoc_import_type_target: None,
             plan: TypeQueryPlan::default(),
             planning_defaults: HashSet::new(),
             planning_interfaces: HashSet::new(),
@@ -1322,6 +1542,14 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             function_indirection_depth: 0,
             intersection_planning_depth: 0,
         }
+    }
+
+    fn with_jsdoc_import_type_target(
+        mut self,
+        target: Option<CanonicalJsDocImportTypeTarget>,
+    ) -> Self {
+        self.jsdoc_import_type_target = target;
+        self
     }
 
     fn finish(self) -> TypeQueryPlan {
@@ -1525,6 +1753,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             SyntaxKind::TypeReference => {
                 self.plan_type_reference(node, alias_owner, union_constituent)
             }
+            SyntaxKind::ImportType => {
+                self.plan_jsdoc_import_type(node, alias_owner, union_constituent)
+            }
             SyntaxKind::ExpressionWithTypeArguments
                 if alias_owner.is_none() && !union_constituent =>
             {
@@ -1559,6 +1790,41 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 self.validate_cached_union_result(cached, None)
                     .map_err(type_construction_error)?;
             }
+        }
+        Ok(())
+    }
+
+    fn plan_jsdoc_import_type(
+        &mut self,
+        node: NodeRef,
+        alias_owner: Option<SemanticSymbolId>,
+        union_constituent: bool,
+    ) -> Result<(), DeclaredTypeError> {
+        let Some(target) = self.jsdoc_import_type_target else {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::JsDocImportTypeCapabilityUnsupported(node),
+            ));
+        };
+        if union_constituent
+            || target.import_type != node
+            || alias_owner != Some(target.local_symbol)
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::JsDocImportTypeCapabilityUnsupported(node),
+            ));
+        }
+        validate_jsdoc_import_type_target(self.store, self.host, target)?;
+        self.plan_type_alias(target.target_symbol, false)?;
+        if let Some(existing) = self.plan.jsdoc_imports.insert(node, target)
+            && existing != target
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidJsDocImportTypeTarget {
+                    node,
+                    alias: target.local_symbol,
+                    target: target.target_symbol,
+                },
+            ));
         }
         Ok(())
     }
@@ -4124,6 +4390,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                         CachedTypeAliasRhs::DirectIntersection(type_node)
                     }
                     SyntaxKind::TypeReference => CachedTypeAliasRhs::TypeReference(type_node),
+                    SyntaxKind::ImportType => CachedTypeAliasRhs::JsDocImport(type_node),
                     SyntaxKind::TypeLiteral => CachedTypeAliasRhs::TypeLiteral(type_node),
                     SyntaxKind::FunctionType => CachedTypeAliasRhs::FunctionType(type_node),
                     SyntaxKind::IndexedAccessType => CachedTypeAliasRhs::IndexedAccess(type_node),
@@ -4176,6 +4443,15 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let declared_data = self.store.type_payload(declared_type).map(TypeRecord::data);
         let remains_union = matches!(declared_data, Some(TypeData::Union(_)));
         let canonical_enum_owner = enums::canonical_enum_type_owner(self.store, declared_type);
+        let imported_commonjs_jsdoc_property_alias =
+            self.jsdoc_import_type_target.is_some_and(|capability| {
+                capability.local_symbol == root_symbol
+                    && validate_jsdoc_import_type_target(self.store, self.host, capability).is_ok()
+                    && self.authenticated_commonjs_jsdoc_property_alias(
+                        capability.target_symbol,
+                        declared_type,
+                    )
+            });
         let commonjs_jsdoc_property_alias = matches!(declared_data, Some(TypeData::Object(_)))
             && self
                 .store
@@ -4208,10 +4484,10 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             match self.validate_cached_array_capability(declared_type) {
                 Err(LiteralTypeCacheError::InvalidCachedUnion(type_))
                     if type_ == declared_type
-                        && self.authenticated_commonjs_jsdoc_property_alias(
+                        && (self.authenticated_commonjs_jsdoc_property_alias(
                             root_symbol,
                             declared_type,
-                        ) =>
+                        ) || imported_commonjs_jsdoc_property_alias) =>
                 {
                     None
                 }
@@ -4555,6 +4831,50 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                             TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
                         ));
                     }
+                    return Ok(());
+                }
+                CachedTypeAliasRhs::JsDocImport(import_type) => {
+                    let Some(capability) = self.jsdoc_import_type_target else {
+                        return Err(type_node_unavailable(
+                            TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
+                        ));
+                    };
+                    validate_jsdoc_import_type_target(self.store, self.host, capability)?;
+                    let target = cached_type_alias(
+                        self.store,
+                        self.host,
+                        capability.target_symbol,
+                        self.strict_builtin_iterator_return,
+                    )?
+                    .ok_or_else(|| {
+                        type_node_unavailable(TypeNodeUnavailable::InvalidCachedTypeAlias(
+                            root_symbol,
+                        ))
+                    })?;
+                    if !missing_generic_metadata.is_empty()
+                        || capability.local_symbol != symbol
+                        || capability.import_type != import_type
+                        || target.declared_type != declared_type
+                        || self
+                            .store
+                            .type_node_links(import_type)
+                            .and_then(|links| links.resolved_type)
+                            != Some(declared_type)
+                        || self
+                            .store
+                            .symbol_node_links(capability.imported_name)
+                            .and_then(|links| links.resolved_symbol)
+                            != Some(capability.target_symbol)
+                    {
+                        return Err(type_node_unavailable(
+                            TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
+                        ));
+                    }
+                    self.validate_cached_type_alias_identity(
+                        capability.target_symbol,
+                        target,
+                        union_constituent,
+                    )?;
                     return Ok(());
                 }
                 CachedTypeAliasRhs::TypeReference(reference) => {
@@ -10331,10 +10651,20 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 Ok(()) => false,
                 Err(LiteralTypeCacheError::InvalidCachedUnion(type_))
                     if type_ == cached.declared_type
-                        && self.authenticated_commonjs_jsdoc_property_alias(
+                        && (self.authenticated_commonjs_jsdoc_property_alias(
                             symbol,
                             cached.declared_type,
-                        ) =>
+                        ) || self.jsdoc_import_type_target.is_some_and(|capability| {
+                            capability.local_symbol == symbol
+                                && validate_jsdoc_import_type_target(
+                                    self.store, self.host, capability,
+                                )
+                                .is_ok()
+                                && self.authenticated_commonjs_jsdoc_property_alias(
+                                    capability.target_symbol,
+                                    cached.declared_type,
+                                )
+                        })) =>
                 {
                     false
                 }
@@ -10545,6 +10875,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             || self.direct_tuple_type_rhs(type_node)?
             || preflight_node(self.store, self.host, type_node)?.kind == SyntaxKind::ConditionalType
             || preflight_node(self.store, self.host, type_node)?.kind == SyntaxKind::MappedType
+            || preflight_node(self.store, self.host, type_node)?.kind == SyntaxKind::ImportType
             || self.type_node_contains_builtin_array_reference(type_node, &mut HashSet::new())?
         {
             self.plan_type_node_in_context(type_node, Some(symbol), union_constituent)?;
@@ -10927,6 +11258,7 @@ pub(super) struct CanonicalTypeQuery<'store, 'host, 'arena, 'diagnostics> {
     global_types: Option<CanonicalGlobalTypes>,
     options: CanonicalTypeQueryOptions,
     type_reference_alias_targets: HashMap<NodeRef, CanonicalTypeReferenceAliasTarget>,
+    jsdoc_import_type_target: Option<CanonicalJsDocImportTypeTarget>,
     diagnostics: &'diagnostics mut CanonicalCheckerDiagnostics,
     resolving_property_interfaces: HashSet<SemanticSymbolId>,
     resolving_instantiated_signatures: HashSet<SignatureId>,
@@ -10967,6 +11299,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             options,
             diagnostics,
             type_reference_alias_targets: HashMap::new(),
+            jsdoc_import_type_target: None,
             resolving_property_interfaces: HashSet::new(),
             resolving_instantiated_signatures: HashSet::new(),
             pending_function_parameters: Vec::new(),
@@ -11085,6 +11418,25 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 ));
             }
         }
+        Ok(self)
+    }
+
+    /// Adds one manifest-authenticated CommonJS JSDoc typedef import target.
+    pub(super) fn with_jsdoc_import_type_target(
+        mut self,
+        target: CanonicalJsDocImportTypeTarget,
+    ) -> Result<Self, DeclaredTypeError> {
+        if !self.type_reference_alias_targets.is_empty()
+            || self
+                .jsdoc_import_type_target
+                .is_some_and(|existing| existing != target)
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::JsDocImportTypeCapabilityUnsupported(target.import_type),
+            ));
+        }
+        validate_jsdoc_import_type_target(self.store, self.host, target)?;
+        self.jsdoc_import_type_target = Some(target);
         Ok(self)
     }
 
@@ -11367,7 +11719,8 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 .map(CanonicalArrayTargets::from_global_types),
             self.options.strict_builtin_iterator_return,
             &self.type_reference_alias_targets,
-        );
+        )
+        .with_jsdoc_import_type_target(self.jsdoc_import_type_target);
         let direct_alias = planner.direct_type_alias_owner(node)?;
         if direct_alias.is_some() && !self.type_reference_alias_targets.is_empty() {
             self.reject_type_reference_alias_capabilities()?;
@@ -11402,7 +11755,8 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 .map(CanonicalArrayTargets::from_global_types),
             self.options.strict_builtin_iterator_return,
             &self.type_reference_alias_targets,
-        );
+        )
+        .with_jsdoc_import_type_target(self.jsdoc_import_type_target);
         let direct_alias = planner.direct_type_alias_owner(node)?;
         if direct_alias.is_some() && !self.type_reference_alias_targets.is_empty() {
             self.reject_type_reference_alias_capabilities()?;
@@ -11421,7 +11775,11 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     .is_some()
             })
         });
-        let result = match direct_function_alias {
+        let direct_import_alias = direct_alias.filter(|alias| {
+            self.jsdoc_import_type_target
+                .is_some_and(|target| target.local_symbol == *alias && target.import_type == node)
+        });
+        let result = match direct_function_alias.or(direct_import_alias) {
             Some(alias) => self.execute_declared_type(alias, &plan, &mut prepared),
             None => self.execute_type_node(node, &plan, &mut prepared),
         };
@@ -12180,6 +12538,14 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         symbol: SemanticSymbolId,
     ) -> Result<TypeId, DeclaredTypeError> {
         self.reject_type_reference_alias_capabilities()?;
+        if let Some(target) = self.jsdoc_import_type_target {
+            if target.local_symbol != symbol {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::JsDocImportTypeCapabilityUnsupported(target.import_type),
+                ));
+            }
+            validate_jsdoc_import_type_target(self.store, self.host, target)?;
+        }
         if !self.pending_function_parameters.is_empty() {
             return Err(type_node_unavailable(
                 TypeNodeUnavailable::InvalidCachedTypeAlias(symbol),
@@ -12201,7 +12567,8 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 .map(CanonicalArrayTargets::from_global_types),
             self.options.strict_builtin_iterator_return,
             &self.type_reference_alias_targets,
-        );
+        )
+        .with_jsdoc_import_type_target(self.jsdoc_import_type_target);
         if !flags
             .intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE | SymbolFlags::TYPE_PARAMETER)
             && flags.contains(SymbolFlags::TYPE_ALIAS)
@@ -12353,6 +12720,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .and_then(|count| count.checked_add(plan.recovered_indexed_accesses.len()))
             .and_then(|count| count.checked_add(plan.keyofs.len()))
             .and_then(|count| count.checked_add(plan.references.len()))
+            .and_then(|count| count.checked_add(plan.jsdoc_imports.len()))
             .and_then(|count| count.checked_add(plan.recovered_missing_references.len()))
             .and_then(|count| count.checked_add(plan.type_queries.len()))
             .and_then(|count| count.checked_add(plan.infer_parameters.len()))
@@ -12383,6 +12751,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .chain(plan.recovered_indexed_accesses.keys())
             .chain(plan.keyofs.keys())
             .chain(plan.references.keys())
+            .chain(plan.jsdoc_imports.keys())
             .chain(plan.recovered_missing_references.keys())
             .chain(plan.type_queries.keys())
             .chain(plan.infer_parameters.keys())
@@ -12634,11 +13003,19 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .checked_add(interface_index_infos)
             .ok_or_else(|| Self::literal_cache_error(LiteralTypeCacheError::Capacity))?;
         let type_node_links = self.missing_planned_type_node_links(plan)?;
-        let symbol_node_links = plan
+        let query_symbol_node_links = plan
             .type_queries
             .values()
             .filter(|query| self.store.symbol_node_links(query.name).is_none())
             .count();
+        let imported_symbol_node_links = plan
+            .jsdoc_imports
+            .values()
+            .filter(|target| self.store.symbol_node_links(target.imported_name).is_none())
+            .count();
+        let symbol_node_links = query_symbol_node_links
+            .checked_add(imported_symbol_node_links)
+            .ok_or_else(|| Self::literal_cache_error(LiteralTypeCacheError::Capacity))?;
         if !self.store.try_reserve_index_infos(index_infos)
             || !self.store.try_reserve_types(additional_types)
             || !self.store.try_reserve_symbol_node_links(symbol_node_links)
@@ -13289,6 +13666,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             SyntaxKind::TypeReference | SyntaxKind::ExpressionWithTypeArguments => {
                 self.execute_type_reference(node, plan, prepared)
             }
+            SyntaxKind::ImportType => self.execute_jsdoc_import_type(node, plan, prepared),
             SyntaxKind::TypeQuery => self.execute_value_type_query(node, plan, prepared),
             SyntaxKind::UnionType => self.execute_union_type(node, plan, prepared),
             SyntaxKind::IntersectionType => self.execute_intersection_type(node, plan, prepared),
@@ -13299,6 +13677,79 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 TypeNodeUnavailable::UnsupportedSyntax { node, kind },
             )),
         }
+    }
+
+    fn execute_jsdoc_import_type(
+        &mut self,
+        node: NodeRef,
+        plan: &TypeQueryPlan,
+        prepared: &mut PreparedTypeQueryTypes,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let target = plan.jsdoc_imports.get(&node).copied().ok_or_else(|| {
+            type_node_unavailable(TypeNodeUnavailable::JsDocImportTypeCapabilityUnsupported(
+                node,
+            ))
+        })?;
+        validate_jsdoc_import_type_target(self.store, self.host, target)?;
+        let resolved = self.execute_declared_type(target.target_symbol, plan, prepared)?;
+        let cached_type = self
+            .store
+            .type_node_links(node)
+            .and_then(|links| links.resolved_type);
+        let cached_symbol = self
+            .store
+            .symbol_node_links(target.imported_name)
+            .and_then(|links| links.resolved_symbol);
+        if cached_type.is_some_and(|cached| cached != resolved)
+            || cached_symbol.is_some_and(|cached| cached != target.target_symbol)
+            || cached_type.is_some() != cached_symbol.is_some()
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidJsDocImportTypeTarget {
+                    node,
+                    alias: target.local_symbol,
+                    target: target.target_symbol,
+                },
+            ));
+        }
+        if cached_type.is_some() {
+            return Ok(resolved);
+        }
+
+        let mut symbol_links = self
+            .store
+            .symbol_node_links(target.imported_name)
+            .cloned()
+            .unwrap_or_default();
+        symbol_links.resolved_symbol = Some(target.target_symbol);
+        if !self
+            .store
+            .set_symbol_node_links(target.imported_name, symbol_links)
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidJsDocImportTypeTarget {
+                    node,
+                    alias: target.local_symbol,
+                    target: target.target_symbol,
+                },
+            ));
+        }
+        let mut type_links = self
+            .store
+            .type_node_links(node)
+            .cloned()
+            .unwrap_or_default();
+        type_links.resolved_type = Some(resolved);
+        if !self.store.set_type_node_links(node, type_links) {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidJsDocImportTypeTarget {
+                    node,
+                    alias: target.local_symbol,
+                    target: target.target_symbol,
+                },
+            ));
+        }
+        Ok(resolved)
     }
 
     fn execute_infer_type(
