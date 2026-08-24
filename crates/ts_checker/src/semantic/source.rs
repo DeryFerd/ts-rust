@@ -38703,6 +38703,59 @@ mod tests {
     }
 
     #[test]
+    fn reopened_interface_properties_and_accessor_pairs_check_in_both_source_orders() {
+        let source = parsed(concat!(
+            "interface EntityMetadata1 { ",
+            "get tableName(): string; set tableName(name: string); ",
+            "} interface EntityMetadata1 { tableName: string; } ",
+            "interface EntityMetadata2 { tableName: string; } ",
+            "interface EntityMetadata2 { ",
+            "get tableName(): string; set tableName(name: string); ",
+            "}",
+        ));
+        let file = FileId::new(8_684);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        for name in ["EntityMetadata1", "EntityMetadata2"] {
+            let owner = global_symbol(&context, name);
+            let property = context
+                .store()
+                .symbol(owner)
+                .and_then(ts_binder::semantic::Symbol::members)
+                .and_then(|members| context.store().symbol_table(members))
+                .and_then(|members| members.get_source("tableName"))
+                .unwrap();
+            assert_eq!(
+                context.store().symbol(property).unwrap().flags(),
+                SymbolFlags::PROPERTY | SymbolFlags::GET_ACCESSOR | SymbolFlags::SET_ACCESSOR,
+            );
+            assert_eq!(
+                context.store().value_symbol_links(property),
+                Some(&ValueSymbolLinks {
+                    resolved_type: Some(string),
+                    ..ValueSymbolLinks::default()
+                }),
+            );
+            assert!(
+                context
+                    .store()
+                    .declared_type_links(owner)
+                    .and_then(|links| links.declared_type)
+                    .is_some()
+            );
+        }
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, file));
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
     fn simple_interfaces_and_nested_object_literals_check_and_reuse_warm_identity() {
         let source = parsed(concat!(
             "interface Leaf { value: string } ",

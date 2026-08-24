@@ -92,6 +92,39 @@ const fn source_property_check_flags(readonly: bool) -> CheckFlags {
     }
 }
 
+fn valid_declared_property_check_flags(
+    store: &CanonicalTypeMapperStore,
+    property: &PlannedProperty,
+) -> bool {
+    store.symbol(property.symbol).is_some_and(|record| {
+        if record.flags().intersects(SymbolFlags::ACCESSOR) {
+            record.check_flags() == CheckFlags::NONE
+        } else {
+            record.check_flags() == source_property_check_flags(property.readonly)
+        }
+    })
+}
+
+fn expected_declared_property_links(
+    store: &CanonicalTypeMapperStore,
+    plan: &PropertyObjectPlan,
+    property: &PlannedProperty,
+    read_type: TypeId,
+) -> Option<ValueSymbolLinks> {
+    let write_type = match plan.accessor_write_type_node(property.symbol) {
+        Some(annotation) => {
+            let write_type = cached_planned_type_identity(store, annotation)?;
+            (write_type != read_type).then_some(write_type)
+        }
+        None => None,
+    };
+    Some(ValueSymbolLinks {
+        resolved_type: Some(read_type),
+        write_type,
+        ..ValueSymbolLinks::default()
+    })
+}
+
 /// One exact source-declared index signature admitted by the first A11 cut.
 ///
 /// The bound `__index` symbol is a signature-container member. It is not the
@@ -129,6 +162,16 @@ pub(super) struct PlannedInterfaceMethod {
     pub return_type: NodeRef,
     pub flags: SignatureFlags,
     minimum_argument_count: usize,
+}
+
+/// One binder-owned getter or setter contributing to an interface property.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct PlannedInterfaceAccessor {
+    pub declaration: NodeRef,
+    pub symbol: SemanticSymbolId,
+    pub name_node: NodeRef,
+    pub type_node: NodeRef,
+    pub parameter: Option<PlannedCallParameter>,
 }
 
 /// One nongeneric call or construct signature in source order.
@@ -241,6 +284,7 @@ pub(super) struct PropertyObjectPlan {
     pub members: Option<SymbolTableId>,
     pub properties: Vec<PlannedProperty>,
     pub methods: Vec<PlannedInterfaceMethod>,
+    pub accessors: Vec<PlannedInterfaceAccessor>,
     pub spreads: Vec<PlannedObjectSpread>,
     pub indexes: Vec<PlannedIndexSignature>,
     pub call_signatures: Vec<PlannedCallSignature>,
@@ -255,6 +299,13 @@ impl PropertyObjectPlan {
 
     pub(super) fn spread_expression_nodes(&self) -> impl ExactSizeIterator<Item = NodeRef> + '_ {
         self.spreads.iter().map(|spread| spread.expression)
+    }
+
+    pub(super) fn accessor_write_type_node(&self, symbol: SemanticSymbolId) -> Option<NodeRef> {
+        self.accessors
+            .iter()
+            .find(|accessor| accessor.symbol == symbol && accessor.parameter.is_some())
+            .map(|accessor| accessor.type_node)
     }
 
     pub(super) fn index_type_nodes(
@@ -282,6 +333,7 @@ impl PropertyObjectPlan {
                     .map(|parameter| parameter.type_node)
                     .chain(std::iter::once(method.return_type))
             }))
+            .chain(self.accessors.iter().map(|accessor| accessor.type_node))
     }
 
     pub(super) fn heritage_base_symbols(
@@ -4069,6 +4121,7 @@ fn plan_members(
         members,
         properties: Vec::new(),
         methods: Vec::new(),
+        accessors: Vec::new(),
         spreads: Vec::new(),
         indexes: Vec::new(),
         call_signatures: Vec::new(),
@@ -4141,6 +4194,7 @@ fn plan_members(
     let mut planned_symbol_declarations = HashMap::<SemanticSymbolId, Vec<NodeRef>>::new();
     let mut properties = Vec::with_capacity(member_count);
     let mut methods = Vec::new();
+    let mut accessors = Vec::new();
     let mut spreads = Vec::new();
     let mut indexes = Vec::with_capacity(1);
     let mut call_signatures = Vec::with_capacity(member_count);
@@ -4168,6 +4222,8 @@ fn plan_members(
                 SyntaxKind::PropertyDeclaration
                     | SyntaxKind::PropertySignature
                     | SyntaxKind::MethodSignature
+                    | SyntaxKind::GetAccessor
+                    | SyntaxKind::SetAccessor
                     | SyntaxKind::IndexSignature
                     | SyntaxKind::CallSignature
                     | SyntaxKind::ConstructSignature
@@ -4237,6 +4293,112 @@ fn plan_members(
                 });
             }
             indexes.push(index);
+            continue;
+        }
+
+        if matches!(
+            member_record.kind,
+            SyntaxKind::GetAccessor | SyntaxKind::SetAccessor
+        ) {
+            if kind != PropertyObjectKind::Interface
+                || policy == TypeLiteralMemberPolicy::GenericInterface
+            {
+                return Err(PropertyObjectError::UnsupportedMember {
+                    node: member,
+                    kind: member_record.kind,
+                });
+            }
+            let accessor = plan_interface_accessor(store, host, member_owner, symbol, member)?;
+            let accessor_symbol = store
+                .symbol(accessor.symbol)
+                .ok_or_else(|| invalid_plan(&provisional))?;
+            let property_name = accessor_symbol
+                .name()
+                .as_utf8()
+                .ok_or_else(|| invalid_plan(&provisional))?
+                .to_owned();
+            if table.and_then(|table| table.get_source(&property_name)) != Some(accessor.symbol) {
+                return Err(invalid_plan(&provisional));
+            }
+            planned_symbol_declarations
+                .entry(accessor.symbol)
+                .or_default()
+                .push(member);
+            let getter = member_record.kind == SyntaxKind::GetAccessor;
+            if seen_symbols.insert(accessor.symbol) {
+                if !seen_names.insert(property_name.clone()) {
+                    return Err(invalid_plan(&provisional));
+                }
+                properties.push(PlannedProperty {
+                    declaration: member,
+                    symbol: accessor.symbol,
+                    name_node: accessor.name_node,
+                    type_node: accessor.type_node,
+                    optional: accessor_symbol.flags().contains(SymbolFlags::OPTIONAL),
+                    readonly: getter
+                        && !accessor_symbol.flags().contains(SymbolFlags::SET_ACCESSOR)
+                        && !accessor_symbol.flags().contains(SymbolFlags::PROPERTY),
+                    name: property_name,
+                });
+            } else {
+                let Some(property) = properties
+                    .iter_mut()
+                    .find(|property| property.symbol == accessor.symbol)
+                else {
+                    return Err(invalid_plan(&provisional));
+                };
+                if store
+                    .symbol(property.symbol)
+                    .is_some_and(|symbol| symbol.flags().contains(SymbolFlags::METHOD))
+                {
+                    return Err(invalid_plan(&provisional));
+                }
+                if getter {
+                    let previous_getter =
+                        accessors.iter().any(|previous: &PlannedInterfaceAccessor| {
+                            previous.symbol == accessor.symbol && previous.parameter.is_none()
+                        });
+                    let previous_property = planned_symbol_declarations
+                        .get(&accessor.symbol)
+                        .is_some_and(|declarations| {
+                            declarations.iter().any(|declaration| {
+                                matches!(
+                                    store.source_node_kind(*declaration),
+                                    Some(
+                                        SyntaxKind::PropertyDeclaration
+                                            | SyntaxKind::PropertySignature
+                                    )
+                                )
+                            })
+                        });
+                    if previous_getter
+                        || previous_property
+                            && !equivalent_merged_property_annotations(
+                                store,
+                                host,
+                                property.type_node,
+                                accessor.type_node,
+                            )
+                    {
+                        return Err(PropertyObjectError::UnsupportedMember {
+                            node: member,
+                            kind: member_record.kind,
+                        });
+                    }
+                    property.type_node = accessor.type_node;
+                } else {
+                    if accessors.iter().any(|previous: &PlannedInterfaceAccessor| {
+                        previous.symbol == accessor.symbol && previous.parameter.is_some()
+                    }) {
+                        return Err(PropertyObjectError::UnsupportedMember {
+                            node: member,
+                            kind: member_record.kind,
+                        });
+                    }
+                    property.readonly = false;
+                }
+            }
+            accessors.push(accessor);
             continue;
         }
 
@@ -4501,6 +4663,11 @@ fn plan_members(
                 SymbolFlags::OPTIONAL
             } else {
                 SymbolFlags::NONE
+            }
+            | if kind == PropertyObjectKind::Interface {
+                property_record.flags() & SymbolFlags::ACCESSOR
+            } else {
+                SymbolFlags::NONE
             };
         let expected_check_flags = source_property_check_flags(readonly);
         let symbol_declarations = property_record.declarations().unwrap_or_default();
@@ -4532,11 +4699,39 @@ fn plan_members(
             .push(member);
         if !seen_symbols.insert(property_symbol) {
             let Some(existing) = properties
-                .iter()
-                .find(|planned: &&PlannedProperty| planned.symbol == property_symbol)
+                .iter_mut()
+                .find(|planned| planned.symbol == property_symbol)
             else {
                 return Err(invalid_plan(&provisional));
             };
+            if property_record.flags().intersects(SymbolFlags::ACCESSOR) {
+                let getter = accessors.iter().find(|accessor| {
+                    accessor.symbol == property_symbol && accessor.parameter.is_none()
+                });
+                if kind != PropertyObjectKind::Interface
+                    || existing.name != property_name
+                    || existing.optional != optional
+                    || getter.is_some_and(|accessor| {
+                        !equivalent_merged_property_annotations(
+                            store,
+                            host,
+                            accessor.type_node,
+                            type_node,
+                        )
+                    })
+                {
+                    return Err(PropertyObjectError::UnsupportedMember {
+                        node: member,
+                        kind: member_record.kind,
+                    });
+                }
+                if getter.is_none() {
+                    existing.type_node = type_node;
+                }
+                existing.readonly =
+                    readonly && !property_record.flags().contains(SymbolFlags::SET_ACCESSOR);
+                continue;
+            }
             if kind != PropertyObjectKind::Interface
                 || existing.name != property_name
                 || existing.optional != optional
@@ -4705,6 +4900,7 @@ fn plan_members(
     Ok(PropertyObjectPlan {
         properties,
         methods,
+        accessors,
         spreads,
         indexes,
         call_signatures,
@@ -4747,6 +4943,224 @@ fn equivalent_merged_property_annotations(
     let second_text = second_source
         .get(second_record.range.start.get() as usize..second_record.range.end.get() as usize);
     first_text.is_some() && first_text == second_text
+}
+
+fn plan_interface_accessor(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: NodeRef,
+    owner_symbol: SemanticSymbolId,
+    declaration: NodeRef,
+) -> Result<PlannedInterfaceAccessor, PropertyObjectError> {
+    let record = preflight_node(store, host, declaration).map_err(|_| {
+        PropertyObjectError::InvalidInterface {
+            declaration: owner,
+            symbol: owner_symbol,
+        }
+    })?;
+    let unsupported = || PropertyObjectError::UnsupportedMember {
+        node: declaration,
+        kind: record.kind,
+    };
+    let (name_id, parameters, annotation, getter, valid_payload) = match &record.data {
+        NodeData::GetAccessorDeclaration(accessor) if record.kind == SyntaxKind::GetAccessor => (
+            accessor.name,
+            &accessor.parameters,
+            accessor.type_,
+            true,
+            accessor.asterisk_token.is_none()
+                && accessor.body.is_none()
+                && accessor.end_flow_node.is_none()
+                && accessor.flow_node.is_none()
+                && accessor.full_signature.is_none()
+                && accessor.next_container.is_none()
+                && accessor.postfix_token.is_none()
+                && accessor.symbol.is_none()
+                && accessor.type_parameters.is_none()
+                && accessor.facts == 0
+                && accessor.modifiers.is_none(),
+        ),
+        NodeData::SetAccessorDeclaration(accessor) if record.kind == SyntaxKind::SetAccessor => (
+            accessor.name,
+            &accessor.parameters,
+            accessor.type_,
+            false,
+            accessor.asterisk_token.is_none()
+                && accessor.body.is_none()
+                && accessor.end_flow_node.is_none()
+                && accessor.flow_node.is_none()
+                && accessor.full_signature.is_none()
+                && accessor.next_container.is_none()
+                && accessor.postfix_token.is_none()
+                && accessor.symbol.is_none()
+                && accessor.type_parameters.is_none()
+                && accessor.facts == 0
+                && accessor.modifiers.is_none(),
+        ),
+        _ => return Err(unsupported()),
+    };
+    if record.flags.0 != 0
+        || record.parent != Some(owner.node)
+        || !valid_payload
+        || parameters.has_trailing_comma
+        || parameters.range.start < record.range.start
+        || parameters.range.end > record.range.end
+        || getter && (!parameters.nodes.is_empty() || annotation.is_none())
+        || !getter && (parameters.nodes.len() != 1 || annotation.is_some())
+    {
+        return Err(unsupported());
+    }
+
+    let name = NodeRef::new(declaration.arena, declaration.file, name_id);
+    let name_record = preflight_node(store, host, name).map_err(|_| unsupported())?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(unsupported());
+    };
+    if name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(declaration.node)
+        || name_record.range.start < record.range.start
+        || name_record.range.end > parameters.range.start
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+    {
+        return Err(unsupported());
+    }
+
+    let bound = host.bound_file(declaration).ok_or_else(unsupported)?;
+    let raw_symbol = bound.symbol(declaration).ok_or_else(unsupported)?;
+    let symbol = store
+        .get_merged_symbol(raw_symbol)
+        .ok_or_else(unsupported)?;
+    let accessor = store.symbol(symbol).ok_or_else(unsupported)?;
+    let declarations = accessor.declarations().ok_or_else(unsupported)?;
+    let expected_accessor = if getter {
+        SymbolFlags::GET_ACCESSOR
+    } else {
+        SymbolFlags::SET_ACCESSOR
+    };
+    let allowed_flags = SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL | SymbolFlags::ACCESSOR;
+    if symbol != raw_symbol
+        || !host.symbol_matches(store, declaration, symbol)
+        || !accessor.flags().contains(expected_accessor)
+        || accessor.flags().without(allowed_flags) != SymbolFlags::NONE
+        || accessor.flags().contains(SymbolFlags::OPTIONAL)
+            && !accessor.flags().contains(SymbolFlags::PROPERTY)
+        || accessor.check_flags() != CheckFlags::NONE
+        || accessor.name().as_utf8() != Some(identifier.text.as_str())
+        || !declarations.contains(&declaration)
+        || accessor.value_declaration() != declarations.first().copied()
+        || accessor.members().is_some()
+        || accessor.exports().is_some()
+        || accessor.export_symbol().is_some()
+        || accessor
+            .parent()
+            .and_then(|parent| store.get_merged_symbol(parent))
+            != Some(owner_symbol)
+    {
+        return Err(unsupported());
+    }
+
+    let locals = bound
+        .locals(declaration)
+        .and_then(|locals| store.symbol_table(locals));
+    let (type_node, parameter) = if getter {
+        if locals.is_some_and(|locals| !locals.is_empty()) {
+            return Err(unsupported());
+        }
+        let annotation = NodeRef::new(
+            declaration.arena,
+            declaration.file,
+            annotation.expect("getter annotations were checked"),
+        );
+        let annotation_record =
+            preflight_node(store, host, annotation).map_err(|_| unsupported())?;
+        if annotation_record.flags.0 != 0
+            || annotation_record.parent != Some(declaration.node)
+            || annotation_record.range.start < parameters.range.end
+            || annotation_record.range.end > record.range.end
+        {
+            return Err(unsupported());
+        }
+        (annotation, None)
+    } else {
+        let parameter = NodeRef::new(declaration.arena, declaration.file, parameters.nodes[0]);
+        let parameter_record = preflight_node(store, host, parameter).map_err(|_| unsupported())?;
+        let NodeData::ParameterDeclaration(data) = &parameter_record.data else {
+            return Err(unsupported());
+        };
+        let parameter_name = NodeRef::new(parameter.arena, parameter.file, data.name);
+        let parameter_name_record =
+            preflight_node(store, host, parameter_name).map_err(|_| unsupported())?;
+        let NodeData::Identifier(parameter_identifier) = &parameter_name_record.data else {
+            return Err(unsupported());
+        };
+        let annotation = data
+            .type_
+            .map(|annotation| NodeRef::new(parameter.arena, parameter.file, annotation))
+            .ok_or_else(unsupported)?;
+        let annotation_record =
+            preflight_node(store, host, annotation).map_err(|_| unsupported())?;
+        let parameter_symbol = bound
+            .symbol(parameter)
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            .ok_or_else(unsupported)?;
+        let parameter_owner = store.symbol(parameter_symbol).ok_or_else(unsupported)?;
+        if parameter_record.kind != SyntaxKind::Parameter
+            || parameter_record.flags.0 != 0
+            || parameter_record.parent != Some(declaration.node)
+            || parameter_record.range.start < parameters.range.start
+            || parameter_record.range.end > parameters.range.end
+            || data.dot_dot_dot_token.is_some()
+            || data.initializer.is_some()
+            || data.question_token.is_some()
+            || data.symbol.is_some()
+            || data.modifiers.is_some()
+            || data.facts != 0
+            || parameter_name_record.kind != SyntaxKind::Identifier
+            || parameter_name_record.flags.0 != 0
+            || parameter_name_record.parent != Some(parameter.node)
+            || parameter_identifier.flow_node.is_some()
+            || parameter_identifier.text.is_empty()
+            || parameter_identifier.text == "this"
+            || annotation_record.flags.0 != 0
+            || annotation_record.parent != Some(parameter.node)
+            || annotation_record.range.start < parameter_name_record.range.end
+            || annotation_record.range.end > parameter_record.range.end
+            || parameter_owner.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+            || parameter_owner.check_flags() != CheckFlags::NONE
+            || parameter_owner.name().as_utf8() != Some(parameter_identifier.text.as_str())
+            || parameter_owner.declarations() != Some(&[parameter])
+            || parameter_owner.value_declaration() != Some(parameter)
+            || parameter_owner.members().is_some()
+            || parameter_owner.exports().is_some()
+            || parameter_owner.parent().is_some()
+            || parameter_owner.export_symbol().is_some()
+            || locals.is_none_or(|locals| {
+                locals.len() != 1 || locals.get(parameter_owner.name()) != Some(parameter_symbol)
+            })
+            || store.get_merged_symbol(parameter_symbol) != Some(parameter_symbol)
+        {
+            return Err(unsupported());
+        }
+        (
+            annotation,
+            Some(PlannedCallParameter {
+                symbol: parameter_symbol,
+                type_node: annotation,
+                identity_node: annotation,
+                null_literal_identity: false,
+            }),
+        )
+    };
+
+    Ok(PlannedInterfaceAccessor {
+        declaration,
+        symbol,
+        name_node: name,
+        type_node,
+        parameter,
+    })
 }
 
 fn plan_interface_method(
@@ -5811,13 +6225,9 @@ pub(super) fn prepare_direct_interface_declared_properties(
             .iter()
             .zip(property_types)
             .all(|(property, type_)| {
-                store.symbol(property.symbol).is_some_and(|record| {
-                    record.check_flags() == source_property_check_flags(property.readonly)
-                }) && store.value_symbol_links(property.symbol)
-                    == Some(&ValueSymbolLinks {
-                        resolved_type: Some(*type_),
-                        ..ValueSymbolLinks::default()
-                    })
+                valid_declared_property_check_flags(store, property)
+                    && expected_declared_property_links(store, plan, property, *type_).as_ref()
+                        == store.value_symbol_links(property.symbol)
             });
     if record.object_flags() == ObjectFlags::INTERFACE | ObjectFlags::MEMBERS_RESOLVED
         && interface.declared_members_resolved
@@ -5859,17 +6269,35 @@ pub(super) fn publish_prepared_direct_interface_declared_properties(
             );
             continue;
         }
+        let accessor = store
+            .symbol(property.symbol)
+            .is_some_and(|symbol| symbol.flags().intersects(SymbolFlags::ACCESSOR));
+        if !accessor {
+            assert!(
+                store.set_source_property_readonly(property.symbol, property.readonly),
+                "the direct-interface plan validated a bound source property"
+            );
+        }
         assert!(
-            store.set_source_property_readonly(property.symbol, property.readonly),
-            "the direct-interface plan validated a bound source property"
+            store.set_value_symbol_links(
+                property.symbol,
+                expected_declared_property_links(store, plan, property, *property_type)
+                    .expect("the direct-interface plan validated its accessor write annotation"),
+            )
         );
-        assert!(store.set_value_symbol_links(
-            property.symbol,
-            ValueSymbolLinks {
-                resolved_type: Some(*property_type),
-                ..ValueSymbolLinks::default()
-            },
-        ));
+    }
+    for accessor in &plan.accessors {
+        if let Some(parameter) = accessor.parameter {
+            let type_ = cached_planned_type_identity(store, parameter.type_node)
+                .expect("the direct-interface plan resolved its setter annotation");
+            assert!(store.set_value_symbol_links(
+                parameter.symbol,
+                ValueSymbolLinks {
+                    resolved_type: Some(type_),
+                    ..ValueSymbolLinks::default()
+                },
+            ));
+        }
     }
     assert!(store.set_interface_declared_members(type_, true, plan.members, None, None, None));
 }
@@ -6377,7 +6805,7 @@ fn classify_declared_owner_members(
     let Some(table) = store.symbol_table(members) else {
         return DeclaredOwnerMemberDomain::Malformed;
     };
-    let allowed_flags = SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL;
+    let allowed_flags = SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL | SymbolFlags::ACCESSOR;
     let unsupported_flags = SymbolFlags::METHOD
         | SymbolFlags::SIGNATURE
         | SymbolFlags::ACCESSOR
@@ -6387,10 +6815,45 @@ fn classify_declared_owner_members(
         let Some(property) = store.symbol(property) else {
             return DeclaredOwnerMemberDomain::Malformed;
         };
-        if property.flags().contains(SymbolFlags::PROPERTY)
+        if (property.flags().contains(SymbolFlags::PROPERTY)
+            || property.flags().intersects(SymbolFlags::ACCESSOR))
             && property.flags().without(allowed_flags) == SymbolFlags::NONE
         {
             let declarations = property.declarations().unwrap_or_default();
+            if property.flags().intersects(SymbolFlags::ACCESSOR) {
+                let mut getters = 0usize;
+                let mut setters = 0usize;
+                let mut properties = 0usize;
+                let mut unique = HashSet::with_capacity(declarations.len());
+                if !owner_record.flags().contains(SymbolFlags::INTERFACE)
+                    || declarations.is_empty()
+                    || !declarations.iter().all(|declaration| {
+                        if !unique.insert(*declaration) {
+                            return false;
+                        }
+                        match store.source_node_kind(*declaration) {
+                            Some(SyntaxKind::GetAccessor) => getters += 1,
+                            Some(SyntaxKind::SetAccessor) => setters += 1,
+                            Some(
+                                SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature,
+                            ) => {
+                                properties += 1;
+                            }
+                            _ => return false,
+                        }
+                        true
+                    })
+                    || getters > 1
+                    || setters > 1
+                    || property.flags().contains(SymbolFlags::GET_ACCESSOR) != (getters == 1)
+                    || property.flags().contains(SymbolFlags::SET_ACCESSOR) != (setters == 1)
+                    || property.flags().contains(SymbolFlags::PROPERTY) != (properties != 0)
+                    || property.flags().contains(SymbolFlags::OPTIONAL) && properties == 0
+                {
+                    return DeclaredOwnerMemberDomain::Malformed;
+                }
+                continue;
+            }
             match declarations {
                 [declaration]
                     if matches!(
@@ -6864,10 +7327,13 @@ fn validate_declared_property_members(
             return false;
         };
         let position = (owner_index, declaration);
-        let allowed_flags = SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL;
-        if !property_record.flags().contains(SymbolFlags::PROPERTY)
+        let accessor = property_record.flags().intersects(SymbolFlags::ACCESSOR);
+        let allowed_flags = SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL | SymbolFlags::ACCESSOR;
+        if !property_record.flags().contains(SymbolFlags::PROPERTY) && !accessor
             || property_record.flags().without(allowed_flags) != SymbolFlags::NONE
             || property_record.check_flags().bits() & !CheckFlags::READONLY.bits() != 0
+            || accessor && property_record.check_flags() != CheckFlags::NONE
+            || accessor && !owner_record.flags().contains(SymbolFlags::INTERFACE)
             || property_record.name().is_reserved_member_name()
             || property_record.name().is_private_identifier()
             || property_record.name().is_late_bound()
@@ -6893,7 +7359,12 @@ fn validate_declared_property_members(
                 && *declaration < parent
                 && matches!(
                     store.source_node_kind(*declaration),
-                    Some(SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature)
+                    Some(
+                        SyntaxKind::PropertyDeclaration
+                            | SyntaxKind::PropertySignature
+                            | SyntaxKind::GetAccessor
+                            | SyntaxKind::SetAccessor
+                    )
                 )
                 && seen_declarations.insert(*declaration)
         }) {
@@ -6908,7 +7379,14 @@ fn validate_declared_property_members(
         if links
             != &(ValueSymbolLinks {
                 resolved_type: Some(property_type),
+                write_type: links.write_type,
                 ..ValueSymbolLinks::default()
+            })
+            || links.write_type.is_some_and(|write_type| {
+                !accessor
+                    || !property_record.flags().contains(SymbolFlags::SET_ACCESSOR)
+                    || write_type == property_type
+                    || store.type_payload(write_type).is_none()
             })
             || store.type_payload(property_type).is_none()
         {
@@ -7425,6 +7903,22 @@ fn unresolved_property_links(store: &CanonicalTypeMapperStore, plan: &PropertyOb
                     }),
             };
         }
+        if record.flags().intersects(SymbolFlags::ACCESSOR) {
+            return record.check_flags() == CheckFlags::NONE
+                && store
+                    .value_symbol_links(property.symbol)
+                    .is_none_or(|links| links == &ValueSymbolLinks::default())
+                && plan
+                    .accessors
+                    .iter()
+                    .filter(|accessor| accessor.symbol == property.symbol)
+                    .filter_map(|accessor| accessor.parameter)
+                    .all(|parameter| {
+                        store
+                            .value_symbol_links(parameter.symbol)
+                            .is_none_or(|links| links == &ValueSymbolLinks::default())
+                    });
+        }
         let expected = source_property_check_flags(property.readonly);
         (record.check_flags() == CheckFlags::NONE || record.check_flags() == expected)
             && store
@@ -7450,18 +7944,30 @@ fn resolved_property_links(store: &CanonicalTypeMapperStore, plan: &PropertyObje
         if record.flags().contains(SymbolFlags::METHOD) {
             return resolved_interface_method_value(store, plan, property.symbol).is_some();
         }
-        record.check_flags() == source_property_check_flags(property.readonly)
+        valid_declared_property_check_flags(store, property)
             && store
                 .value_symbol_links(property.symbol)
                 .is_some_and(|links| {
-                    let expected = ValueSymbolLinks {
-                        resolved_type: links.resolved_type,
-                        ..ValueSymbolLinks::default()
-                    };
-                    links == &expected
-                        && links
-                            .resolved_type
-                            .is_some_and(|type_| store.type_payload(type_).is_some())
+                    links.resolved_type.is_some_and(|type_| {
+                        store.type_payload(type_).is_some()
+                            && expected_declared_property_links(store, plan, property, type_)
+                                .as_ref()
+                                == Some(links)
+                    })
+                })
+            && plan
+                .accessors
+                .iter()
+                .filter(|accessor| accessor.symbol == property.symbol)
+                .filter_map(|accessor| accessor.parameter)
+                .all(|parameter| {
+                    cached_planned_type_identity(store, parameter.type_node).is_some_and(|type_| {
+                        store.value_symbol_links(parameter.symbol)
+                            == Some(&ValueSymbolLinks {
+                                resolved_type: Some(type_),
+                                ..ValueSymbolLinks::default()
+                            })
+                    })
                 })
     }) && resolved_call_signature_ids(store, plan).is_some() != plan.call_signatures.is_empty()
 }
@@ -8063,12 +8569,9 @@ pub(super) fn validate_resolved_property_types(
                 .iter()
                 .zip(property_types)
                 .all(|(property, type_)| {
-                    store.symbol(property.symbol).is_some_and(|record| {
-                        record.check_flags() == source_property_check_flags(property.readonly)
-                    }) && store
-                        .value_symbol_links(property.symbol)
-                        .and_then(|links| links.resolved_type)
-                        == Some(*type_)
+                    valid_declared_property_check_flags(store, property)
+                        && expected_declared_property_links(store, plan, property, *type_).as_ref()
+                            == store.value_symbol_links(property.symbol)
                 })
     };
     if !valid {
@@ -8196,12 +8699,21 @@ pub(super) fn publish_declared_members(
             .iter()
             .zip(property_types)
             .any(|(property, property_type)| {
-                store
-                    .symbol(property.symbol)
-                    .is_some_and(|symbol| symbol.flags().contains(SymbolFlags::METHOD))
-                    && resolved_interface_method_value(store, plan, property.symbol)
-                        != Some(*property_type)
+                expected_declared_property_links(store, plan, property, *property_type).is_none()
+                    || store
+                        .symbol(property.symbol)
+                        .is_some_and(|symbol| symbol.flags().contains(SymbolFlags::METHOD))
+                        && resolved_interface_method_value(store, plan, property.symbol)
+                            != Some(*property_type)
             })
+        || plan.accessors.iter().any(|accessor| {
+            cached_planned_type_identity(store, accessor.type_node).is_none()
+                || accessor.parameter.is_some_and(|parameter| {
+                    store
+                        .value_symbol_links(parameter.symbol)
+                        .is_some_and(|links| links != &ValueSymbolLinks::default())
+                })
+        })
         || index_types.iter().any(|(key_type, value_type)| {
             store.type_payload(*key_type).is_none() || store.type_payload(*value_type).is_none()
         })
@@ -8234,8 +8746,15 @@ pub(super) fn publish_declared_members(
     if !valid_indexes {
         return Err(invalid_cache(plan, type_));
     }
+    let missing_accessor_links = plan
+        .accessors
+        .iter()
+        .filter_map(|accessor| accessor.parameter)
+        .filter(|parameter| store.value_symbol_links(parameter.symbol).is_none())
+        .count();
     if !store.try_reserve_index_infos(plan.indexes.len())
         || !store.try_reserve_signatures(plan.call_signatures.len())
+        || !store.try_reserve_value_symbol_links(missing_accessor_links)
         || !store.try_reserve_function_signature_return_annotations(plan.call_signatures.len())
         || !store.try_reserve_callable_signature_parameter_types(plan.call_signatures.len())
         || !store.try_reserve_declared_call_set_provenance(
@@ -8355,15 +8874,31 @@ pub(super) fn publish_declared_members(
             );
             continue;
         }
-        assert!(
-            store.set_source_property_readonly(property.symbol, property.readonly),
-            "the declared-member plan validated a bound source property"
-        );
-        let links = ValueSymbolLinks {
-            resolved_type: Some(*property_type),
-            ..ValueSymbolLinks::default()
-        };
+        if !store
+            .symbol(property.symbol)
+            .is_some_and(|symbol| symbol.flags().intersects(SymbolFlags::ACCESSOR))
+        {
+            assert!(
+                store.set_source_property_readonly(property.symbol, property.readonly),
+                "the declared-member plan validated a bound source property"
+            );
+        }
+        let links = expected_declared_property_links(store, plan, property, *property_type)
+            .expect("the declared-member plan validated its accessor write annotation");
         assert!(store.set_value_symbol_links(property.symbol, links));
+    }
+    for accessor in &plan.accessors {
+        if let Some(parameter) = accessor.parameter {
+            let type_ = cached_planned_type_identity(store, parameter.type_node)
+                .expect("the declared-member plan resolved its setter annotation");
+            assert!(store.set_value_symbol_links(
+                parameter.symbol,
+                ValueSymbolLinks {
+                    resolved_type: Some(type_),
+                    ..ValueSymbolLinks::default()
+                },
+            ));
+        }
     }
     match plan.kind {
         PropertyObjectKind::TypeLiteral => {
@@ -11754,6 +12289,215 @@ mod generic_publication_tests {
             StoredDeclaredCallSetValidation::Valid(vec![string, string, string]),
         );
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn interface_accessors_and_properties_share_one_binder_symbol_in_both_merge_orders() {
+        for (index, source) in [
+            concat!(
+                "interface Shape { get value(): string; set value(next: string); } ",
+                "interface Shape { value: string; }",
+            ),
+            concat!(
+                "interface Shape { value: string; } ",
+                "interface Shape { get value(): string; set value(next: string); }",
+            ),
+            concat!(
+                "interface Shape { set value(next: string); get value(): string; } ",
+                "interface Shape { value: string; }",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture = interface_fixture(source, 3_860 + u32::try_from(index).unwrap());
+            let host = host(&fixture.parsed, &fixture.bound);
+            let before = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.symbol_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            let plan = plan_interface(&fixture.store, &host, fixture.symbol).unwrap();
+
+            let [property] = plan.properties.as_slice() else {
+                panic!("merged accessor declarations retain exactly one property")
+            };
+            assert_eq!(property.name, "value");
+            assert!(!property.optional);
+            assert!(!property.readonly);
+            assert!(plan.accessor_write_type_node(property.symbol).is_some());
+            let [first, second] = plan.accessors.as_slice() else {
+                panic!("both accessor declarations must remain in source order")
+            };
+            let (getter, setter) = if first.parameter.is_none() {
+                (first, second)
+            } else {
+                (second, first)
+            };
+            assert_eq!(getter.symbol, property.symbol);
+            assert_eq!(setter.symbol, property.symbol);
+            assert!(getter.parameter.is_none());
+            assert!(setter.parameter.is_some());
+            assert_eq!(
+                fixture.store.symbol(property.symbol).unwrap().flags(),
+                SymbolFlags::PROPERTY | SymbolFlags::GET_ACCESSOR | SymbolFlags::SET_ACCESSOR,
+            );
+            let expected_declarations =
+                plan.declarations
+                    .iter()
+                    .flat_map(|declaration| {
+                        let NodeData::InterfaceDeclaration(interface) =
+                            &fixture.parsed.arena.get(declaration.node).unwrap().data
+                        else {
+                            panic!("merged owners must remain interface declarations")
+                        };
+                        interface.members.nodes.iter().map(move |node| {
+                            NodeRef::new(declaration.arena, declaration.file, *node)
+                        })
+                    })
+                    .collect::<Vec<_>>();
+            assert_eq!(
+                fixture
+                    .store
+                    .symbol(property.symbol)
+                    .unwrap()
+                    .declarations(),
+                Some(expected_declarations.as_slice()),
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.symbol_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+        }
+    }
+
+    #[test]
+    fn interface_getters_and_setters_preserve_direction_and_parameter_symbols() {
+        let fixture = interface_fixture(
+            concat!(
+                "interface Shape { ",
+                "get read(): string; ",
+                "set write(value: number); ",
+                "get separate(): string; ",
+                "set separate(value: string | number); ",
+                "}",
+            ),
+            3_862,
+        );
+        let host = host(&fixture.parsed, &fixture.bound);
+
+        let plan = plan_interface(&fixture.store, &host, fixture.symbol).unwrap();
+
+        assert_eq!(
+            plan.properties
+                .iter()
+                .map(|property| property.name.as_str())
+                .collect::<Vec<_>>(),
+            ["read", "write", "separate"],
+        );
+        assert!(plan.properties[0].readonly);
+        assert!(
+            plan.accessor_write_type_node(plan.properties[0].symbol)
+                .is_none()
+        );
+        assert!(!plan.properties[1].readonly);
+        assert_eq!(
+            plan.accessor_write_type_node(plan.properties[1].symbol),
+            Some(plan.properties[1].type_node),
+        );
+        assert!(!plan.properties[2].readonly);
+        assert_eq!(
+            fixture.store.source_node_kind(
+                plan.accessor_write_type_node(plan.properties[2].symbol)
+                    .unwrap(),
+            ),
+            Some(SyntaxKind::UnionType),
+        );
+        let setter = plan
+            .accessors
+            .iter()
+            .find(|accessor| {
+                accessor.symbol == plan.properties[2].symbol && accessor.parameter.is_some()
+            })
+            .unwrap();
+        let parameter = setter.parameter.unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .symbol(parameter.symbol)
+                .and_then(|symbol| symbol.name().as_utf8()),
+            Some("value"),
+        );
+        assert_eq!(
+            parameter.type_node,
+            plan.accessor_write_type_node(plan.properties[2].symbol)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn merged_optional_accessor_properties_preserve_the_optional_binder_flag() {
+        let fixture = interface_fixture(
+            concat!(
+                "interface Shape { get value(): string; set value(next: string); } ",
+                "interface Shape { value?: string; }",
+            ),
+            3_863,
+        );
+        let host = host(&fixture.parsed, &fixture.bound);
+
+        let plan = plan_interface(&fixture.store, &host, fixture.symbol).unwrap();
+
+        let [property] = plan.properties.as_slice() else {
+            panic!("one optional property merges with its accessor pair")
+        };
+        assert!(property.optional);
+        assert_eq!(
+            fixture.store.symbol(property.symbol).unwrap().flags(),
+            SymbolFlags::PROPERTY
+                | SymbolFlags::OPTIONAL
+                | SymbolFlags::GET_ACCESSOR
+                | SymbolFlags::SET_ACCESSOR,
+        );
+    }
+
+    #[test]
+    fn duplicate_interface_accessors_keep_binder_diagnostics_and_fail_before_publication() {
+        for (index, source) in [
+            "interface Shape { get value(): string; get value(): string; }",
+            "interface Shape { set value(left: string); set value(right: string); }",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture = interface_fixture(source, 3_864 + u32::try_from(index).unwrap());
+            let host = host(&fixture.parsed, &fixture.bound);
+            let before = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+                fixture.bound.diagnostics().len(),
+            );
+
+            assert!(plan_interface(&fixture.store, &host, fixture.symbol).is_err());
+            assert!(!fixture.bound.diagnostics().is_empty());
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                    fixture.bound.diagnostics().len(),
+                ),
+                before,
+            );
+        }
     }
 
     #[test]

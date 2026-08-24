@@ -14144,6 +14144,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             for property in interface.property_type_nodes() {
                 types.push(self.execute_type_node(property, plan, prepared)?);
             }
+            for accessor in &interface.accessors {
+                self.execute_type_node(accessor.type_node, plan, prepared)?;
+            }
             let mut index_types = Vec::with_capacity(interface.indexes.len());
             for (key_node, value_node) in interface.index_type_nodes() {
                 let key_type = self.execute_type_node(key_node, plan, prepared)?;
@@ -30368,6 +30371,367 @@ mod tests {
             warm,
         );
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn merged_interface_accessors_publish_one_property_in_both_declaration_orders() {
+        for source in [
+            concat!(
+                "interface Metadata { ",
+                "get tableName(): string; set tableName(name: string); ",
+                "} interface Metadata { tableName: string; }",
+            ),
+            concat!(
+                "interface Metadata { tableName: string; } ",
+                "interface Metadata { ",
+                "get tableName(): string; set tableName(name: string); ",
+                "}",
+            ),
+            concat!(
+                "interface Metadata { ",
+                "set tableName(name: string); get tableName(): string; ",
+                "} interface Metadata { tableName: string; }",
+            ),
+        ] {
+            let mut fixture = fixture(source);
+            let owner =
+                canonical_fixture_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Metadata");
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+            let interface = query_declared(
+                &mut fixture,
+                owner,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap();
+            let property = fixture
+                .store
+                .symbol(owner)
+                .and_then(ts_binder::semantic::Symbol::members)
+                .and_then(|members| fixture.store.symbol_table(members))
+                .and_then(|members| members.get_source("tableName"))
+                .unwrap();
+            let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+            assert_eq!(
+                fixture.store.symbol(property).unwrap().flags(),
+                SymbolFlags::PROPERTY | SymbolFlags::GET_ACCESSOR | SymbolFlags::SET_ACCESSOR,
+            );
+            assert_eq!(
+                fixture.store.value_symbol_links(property),
+                Some(&ValueSymbolLinks {
+                    resolved_type: Some(string),
+                    ..ValueSymbolLinks::default()
+                }),
+            );
+            let TypeData::Interface(record) = fixture.store.type_payload(interface).unwrap().data()
+            else {
+                panic!("reopened declarations retain one interface identity")
+            };
+            assert_eq!(
+                record.reference.object.structured.properties.as_deref(),
+                Some([property].as_slice()),
+            );
+            assert_eq!(
+                object_members::validate_resolved_declared_property_object(
+                    &fixture.store,
+                    interface
+                ),
+                object_members::DeclaredPropertyObjectValidation::Valid(
+                    object_members::DeclaredPropertyObjectProof::Interface,
+                ),
+            );
+
+            let warm = store_state(&fixture.store);
+            assert_eq!(
+                query_declared(
+                    &mut fixture,
+                    owner,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                ),
+                Ok(interface),
+            );
+            assert_eq!(store_state(&fixture.store), warm);
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn standalone_interface_getters_and_setters_publish_directional_property_types() {
+        let mut fixture = fixture(concat!(
+            "interface Shape { ",
+            "get readable(): string; ",
+            "set writable(value: number); ",
+            "}",
+        ));
+        let owner = canonical_fixture_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Shape");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let interface = query_declared(
+            &mut fixture,
+            owner,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let members = fixture
+            .store
+            .symbol(owner)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| fixture.store.symbol_table(members))
+            .unwrap();
+        let readable = members.get_source("readable").unwrap();
+        let writable = members.get_source("writable").unwrap();
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        assert_eq!(
+            fixture.store.symbol(readable).unwrap().flags(),
+            SymbolFlags::GET_ACCESSOR
+        );
+        assert_eq!(
+            fixture.store.symbol(writable).unwrap().flags(),
+            SymbolFlags::SET_ACCESSOR
+        );
+        assert_eq!(
+            fixture
+                .store
+                .value_symbol_links(readable)
+                .and_then(|links| links.resolved_type),
+            Some(bootstrap.string_type),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .value_symbol_links(writable)
+                .and_then(|links| links.resolved_type),
+            Some(bootstrap.number_type),
+        );
+        assert_eq!(
+            object_members::validate_resolved_declared_property_object(&fixture.store, interface),
+            object_members::DeclaredPropertyObjectValidation::Valid(
+                object_members::DeclaredPropertyObjectProof::Interface,
+            ),
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn interface_accessor_pairs_keep_distinct_read_and_write_type_identities() {
+        let mut fixture = fixture(concat!(
+            "interface Shape { ",
+            "get value(): string; ",
+            "set value(next: string | number); ",
+            "}",
+        ));
+        let owner = canonical_fixture_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Shape");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let interface = query_declared(
+            &mut fixture,
+            owner,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let property = fixture
+            .store
+            .symbol(owner)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| fixture.store.symbol_table(members))
+            .and_then(|members| members.get_source("value"))
+            .unwrap();
+        let links = fixture.store.value_symbol_links(property).unwrap();
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        assert_eq!(links.resolved_type, Some(bootstrap.string_type));
+        let write_type = links
+            .write_type
+            .expect("setter types retain their write identity");
+        let TypeData::Union(write) = fixture.store.type_payload(write_type).unwrap().data() else {
+            panic!("the distinct setter annotation remains a canonical union")
+        };
+        assert!(write.union.types.contains(&bootstrap.string_type));
+        assert!(write.union.types.contains(&bootstrap.number_type));
+        let setter = fixture
+            .store
+            .symbol(property)
+            .unwrap()
+            .declarations()
+            .unwrap()
+            .iter()
+            .copied()
+            .find(|declaration| {
+                fixture.store.source_node_kind(*declaration) == Some(SyntaxKind::SetAccessor)
+            })
+            .unwrap();
+        let NodeData::SetAccessorDeclaration(data) =
+            &fixture.parsed.arena.get(setter.node).unwrap().data
+        else {
+            panic!("the accessor pair must retain its setter declaration")
+        };
+        let parameter = NodeRef::new(setter.arena, setter.file, data.parameters.nodes[0]);
+        let parameter = fixture
+            .files
+            .get(&fixture.file)
+            .unwrap()
+            .symbol(parameter)
+            .unwrap();
+        assert_eq!(
+            fixture.store.value_symbol_links(parameter),
+            Some(&ValueSymbolLinks {
+                resolved_type: Some(write_type),
+                ..ValueSymbolLinks::default()
+            }),
+        );
+
+        let warm = store_state(&fixture.store);
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                owner,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(interface),
+        );
+        assert_eq!(store_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn merged_optional_interface_accessors_keep_their_optional_property_flag() {
+        let mut fixture = fixture_with_intrinsic(
+            concat!(
+                "interface Shape { get value(): string; set value(next: string); } ",
+                "interface Shape { value?: string; }",
+            ),
+            IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                exact_optional_property_types: true,
+            },
+        );
+        let owner = canonical_fixture_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Shape");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        query_declared(
+            &mut fixture,
+            owner,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let property = fixture
+            .store
+            .symbol(owner)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| fixture.store.symbol_table(members))
+            .and_then(|members| members.get_source("value"))
+            .unwrap();
+        assert!(
+            fixture
+                .store
+                .symbol(property)
+                .unwrap()
+                .flags()
+                .contains(SymbolFlags::OPTIONAL)
+        );
+        assert_eq!(
+            fixture
+                .store
+                .value_symbol_links(property)
+                .and_then(|links| links.resolved_type),
+            Some(fixture.store.intrinsic_bootstrap().unwrap().string_type),
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn interface_accessor_warm_queries_reject_forged_read_write_and_parameter_caches() {
+        let source = concat!(
+            "interface Shape { ",
+            "get value(): string; set value(next: string | number); ",
+            "}",
+        );
+        for corruption in 0..3 {
+            let mut fixture = fixture(source);
+            let owner =
+                canonical_fixture_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Shape");
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            query_declared(
+                &mut fixture,
+                owner,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap();
+            let property = fixture
+                .store
+                .symbol(owner)
+                .and_then(ts_binder::semantic::Symbol::members)
+                .and_then(|members| fixture.store.symbol_table(members))
+                .and_then(|members| members.get_source("value"))
+                .unwrap();
+            let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+            match corruption {
+                0 => {
+                    let mut links = fixture.store.value_symbol_links(property).unwrap().clone();
+                    links.resolved_type = Some(number);
+                    assert!(fixture.store.set_value_symbol_links(property, links));
+                }
+                1 => {
+                    let mut links = fixture.store.value_symbol_links(property).unwrap().clone();
+                    links.write_type = None;
+                    assert!(fixture.store.set_value_symbol_links(property, links));
+                }
+                2 => {
+                    let setter = fixture
+                        .store
+                        .symbol(property)
+                        .unwrap()
+                        .declarations()
+                        .unwrap()
+                        .iter()
+                        .copied()
+                        .find(|declaration| {
+                            fixture.store.source_node_kind(*declaration)
+                                == Some(SyntaxKind::SetAccessor)
+                        })
+                        .unwrap();
+                    let NodeData::SetAccessorDeclaration(setter_data) =
+                        &fixture.parsed.arena.get(setter.node).unwrap().data
+                    else {
+                        panic!("the merged accessor retains one setter")
+                    };
+                    let parameter =
+                        NodeRef::new(setter.arena, setter.file, setter_data.parameters.nodes[0]);
+                    let parameter = fixture
+                        .files
+                        .get(&fixture.file)
+                        .unwrap()
+                        .symbol(parameter)
+                        .unwrap();
+                    assert!(fixture.store.set_value_symbol_links(
+                        parameter,
+                        ValueSymbolLinks {
+                            resolved_type: Some(number),
+                            ..ValueSymbolLinks::default()
+                        },
+                    ));
+                }
+                _ => unreachable!("corruption cases are bounded"),
+            }
+            let before = store_state(&fixture.store);
+            assert!(
+                query_declared(
+                    &mut fixture,
+                    owner,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                )
+                .is_err(),
+                "corruption case {corruption}",
+            );
+            assert_eq!(store_state(&fixture.store), before);
+        }
     }
 
     #[test]
