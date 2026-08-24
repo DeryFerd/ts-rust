@@ -872,6 +872,15 @@ fn plan_top_level_named_import(
             .symbol(clause)
             .ok_or_else(|| invariant(SourceImportInvariant::MissingAliasSymbol(clause)))?;
         if phase == SourceImportPhase::Value {
+            if default_import_alias_is_exported_type_local(
+                bound,
+                store,
+                alias_symbol,
+                clause,
+                &local_text,
+            ) {
+                return Err(unsupported(SourceImportUnsupported::MergedAlias(clause)));
+            }
             validate_alias_symbol(store, alias_symbol, clause, local_name, &local_text)?;
             preflight_alias_value_links(store, alias_symbol)?;
         }
@@ -2549,6 +2558,72 @@ fn exact_identifier(
         return Err(unsupported(unsupported_reason));
     }
     Ok(identifier.text.clone())
+}
+
+fn default_import_alias_is_exported_type_local(
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    alias: SemanticSymbolId,
+    declaration: NodeRef,
+    name: &str,
+) -> bool {
+    let Some(record) = store.symbol(alias) else {
+        return false;
+    };
+    let Some([import, type_declaration]) = record.declarations() else {
+        return false;
+    };
+    let Some(export) = record.export_symbol() else {
+        return false;
+    };
+    let Some(export_record) = store.symbol(export) else {
+        return false;
+    };
+    let source = bound.source_file();
+    let Some(module) = bound.symbol(source) else {
+        return false;
+    };
+    let Some(module_record) = store.symbol(module) else {
+        return false;
+    };
+
+    *import == declaration
+        && declaration.is_for(source.arena, source.file)
+        && type_declaration.is_for(source.arena, source.file)
+        && store.source_node_kind(declaration) == Some(SyntaxKind::ImportClause)
+        && store.source_node_kind(*type_declaration) == Some(SyntaxKind::TypeAliasDeclaration)
+        && store.source_node_parent(*type_declaration) == Some(SourceNodeParent::Parent(source))
+        && store.source_node_is_exported(*type_declaration) == Some(true)
+        && bound.symbol(declaration) == Some(alias)
+        && bound.local_symbol(*type_declaration) == Some(alias)
+        && bound.symbol(*type_declaration) == Some(export)
+        && record.flags() == SymbolFlags::ALIAS
+        && record.check_flags() == CheckFlags::NONE
+        && record.name().as_bytes() == name.as_bytes()
+        && record.value_declaration().is_none()
+        && record.members().is_none()
+        && record.exports().is_none()
+        && record.parent().is_none()
+        && store.get_merged_symbol(alias) == Some(alias)
+        && export_record.flags() == SymbolFlags::TYPE_ALIAS
+        && export_record.check_flags() == CheckFlags::NONE
+        && export_record.name().as_bytes() == name.as_bytes()
+        && export_record.declarations() == Some(&[*type_declaration])
+        && export_record.value_declaration().is_none()
+        && export_record.members().is_none()
+        && export_record.exports().is_none()
+        && export_record.parent() == Some(module)
+        && export_record.export_symbol().is_none()
+        && store.get_merged_symbol(export) == Some(export)
+        && module_record.flags().intersects(SymbolFlags::MODULE)
+        && module_record
+            .declarations()
+            .is_some_and(|declarations| declarations.contains(&source))
+        && module_record
+            .exports()
+            .and_then(|exports| store.symbol_table(exports))
+            .and_then(|exports| exports.get_source(name))
+            == Some(export)
 }
 
 fn validate_alias_symbol(
@@ -5817,6 +5892,172 @@ mod tests {
             assert!(plan.bindings.is_empty());
             assert_eq!(plan.module_specifier.file, fixture.files[0].file);
             assert_eq!(store_state(&fixture.store), before);
+        }
+    }
+
+    #[test]
+    fn default_import_reused_by_an_exported_type_is_an_authenticated_boundary() {
+        let fixture = fixture(
+            &[
+                r#"import test from "./target"; export type test = string;"#,
+                "export type test = number;",
+            ],
+            &[Route {
+                source: 0,
+                specifier: 0,
+                target: Some(1),
+            }],
+        );
+        let file = &fixture.files[0];
+        let bound = fixture.bound.get(&file.file).unwrap();
+        let declaration = file
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ImportDeclaration).then_some(NodeRef::new(
+                    file.parsed.arena.id(),
+                    file.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let NodeData::ImportDeclaration(import) =
+            &file.parsed.arena.get(declaration.node).unwrap().data
+        else {
+            panic!("expected the default import")
+        };
+        let clause = NodeRef::new(
+            file.parsed.arena.id(),
+            file.file,
+            import.import_clause.unwrap(),
+        );
+        let alias = bound.symbol(clause).unwrap();
+        let export = direct_export(&fixture, 0, "test");
+        assert_eq!(
+            fixture.store.symbol(alias).unwrap().export_symbol(),
+            Some(export)
+        );
+        let before = store_state(&fixture.store);
+
+        for _ in 0..2 {
+            assert_eq!(
+                plan_top_level_named_value_import(
+                    &file.parsed.arena,
+                    bound,
+                    &fixture.store,
+                    declaration,
+                ),
+                Err(SourceImportError::Unsupported(
+                    SourceImportUnsupported::MergedAlias(clause),
+                )),
+            );
+            assert_eq!(store_state(&fixture.store), before);
+        }
+        assert!(fixture.store.alias_symbol_links(alias).is_none());
+        assert!(fixture.store.value_symbol_links(alias).is_none());
+    }
+
+    #[test]
+    fn forged_default_import_type_exports_remain_invariant_failures() {
+        #[derive(Clone, Copy, Debug)]
+        enum Forgery {
+            ForeignExport,
+            WrongExportFlags,
+            WrongExportParent,
+            WrongAliasFlags,
+        }
+
+        for forgery in [
+            Forgery::ForeignExport,
+            Forgery::WrongExportFlags,
+            Forgery::WrongExportParent,
+            Forgery::WrongAliasFlags,
+        ] {
+            let mut fixture = fixture(
+                &[
+                    r#"import test from "./target"; export type test = string;"#,
+                    "export type test = number;",
+                ],
+                &[Route {
+                    source: 0,
+                    specifier: 0,
+                    target: Some(1),
+                }],
+            );
+            let file = &fixture.files[0];
+            let bound = fixture.bound.get(&file.file).unwrap();
+            let declaration = file
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::ImportDeclaration).then_some(NodeRef::new(
+                        file.parsed.arena.id(),
+                        file.file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let NodeData::ImportDeclaration(import) =
+                &file.parsed.arena.get(declaration.node).unwrap().data
+            else {
+                panic!("expected the default import")
+            };
+            let clause = NodeRef::new(
+                file.parsed.arena.id(),
+                file.file,
+                import.import_clause.unwrap(),
+            );
+            let alias = bound.symbol(clause).unwrap();
+            let export = direct_export(&fixture, 0, "test");
+            let foreign = direct_export(&fixture, 1, "test");
+            let foreign_bound = fixture.bound.get(&fixture.files[1].file).unwrap();
+            let foreign_module = foreign_bound.symbol(foreign_bound.source_file()).unwrap();
+
+            match forgery {
+                Forgery::ForeignExport => assert!(fixture.store.set_symbol_relationships(
+                    alias,
+                    None,
+                    None,
+                    None,
+                    Some(foreign),
+                )),
+                Forgery::WrongExportFlags => assert!(fixture.store.set_symbol_flags(
+                    export,
+                    SymbolFlags::INTERFACE,
+                    CheckFlags::NONE,
+                )),
+                Forgery::WrongExportParent => assert!(fixture.store.set_symbol_relationships(
+                    export,
+                    None,
+                    None,
+                    Some(foreign_module),
+                    None,
+                )),
+                Forgery::WrongAliasFlags => assert!(fixture.store.set_symbol_flags(
+                    alias,
+                    SymbolFlags::PROPERTY,
+                    CheckFlags::NONE,
+                )),
+            }
+
+            let before = store_state(&fixture.store);
+            for _ in 0..2 {
+                assert_eq!(
+                    plan_top_level_named_value_import(
+                        &file.parsed.arena,
+                        bound,
+                        &fixture.store,
+                        declaration,
+                    ),
+                    Err(SourceImportError::Invariant(
+                        SourceImportInvariant::InvalidAliasSymbol(alias),
+                    )),
+                    "{forgery:?}",
+                );
+                assert_eq!(store_state(&fixture.store), before);
+            }
         }
     }
 
