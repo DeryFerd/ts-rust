@@ -4145,7 +4145,7 @@ fn validate_owner_name_and_export_route(
                     && (view.modifiers.is_none()
                         || body_mode.is_ambient()
                         || view.is_async(store, declaration)) => {}
-                Some(local) if view.modifiers.is_some() => {
+                Some(local) if view.modifiers.is_some() || body_mode.is_ambient() => {
                     let parent = owner.parent().ok_or_else(|| {
                         invariant(SourceCallableInvariant::InvalidExportRoute(declaration))
                     })?;

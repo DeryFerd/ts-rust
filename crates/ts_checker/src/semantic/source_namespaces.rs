@@ -1521,7 +1521,7 @@ fn plan_namespace_function(
         body
     };
     if ambient != ambient_declaration
-        || !exported
+        || !(exported || ambient_declaration)
         || declared
         || record.kind != SyntaxKind::FunctionDeclaration
         || record.flags.0 != 0
@@ -6187,6 +6187,72 @@ mod tests {
                 "{source}"
             );
         }
+    }
+
+    #[test]
+    fn ambient_namespace_functions_are_implicitly_exported() {
+        let mut fixture = declaration_fixture(
+            "declare module \"lib\" { function read(value: string): string; }",
+            CanonicalModuleState::Script,
+        );
+        let namespace = plan(&fixture, 0);
+        let [SourceNamespaceMemberPlan::Function {
+            declaration,
+            symbol,
+        }] = namespace.members.as_slice()
+        else {
+            panic!("the ambient namespace must retain its implicitly exported function")
+        };
+        let declaration = *declaration;
+        let symbol = *symbol;
+        let local = fixture
+            .context
+            .file(fixture.file)
+            .unwrap()
+            .1
+            .local_symbol(declaration)
+            .unwrap();
+
+        assert_eq!(
+            fixture.context.store().get_parent_of_symbol(symbol),
+            Some(namespace.symbol),
+        );
+        assert_eq!(
+            fixture.context.store().symbol(local).unwrap().export_symbol(),
+            Some(symbol),
+        );
+
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+
+        let callable = fixture
+            .context
+            .store()
+            .value_symbol_links(symbol)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let signature = fixture
+            .context
+            .store()
+            .source_callable_provenance(callable)
+            .and_then(|provenance| fixture.context.store().signature(provenance.signature))
+            .unwrap();
+        assert_eq!(signature.parameters().len(), 1);
+        assert!(signature.type_parameters().is_empty());
+
+        let warm = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
     }
 
     #[test]
