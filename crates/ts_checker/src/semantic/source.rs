@@ -29162,7 +29162,7 @@ mod tests {
     fn constructor_factory_field_initialization_reports_exact_related_property() {
         let source = parsed(concat!(
             "class Base {}\n",
-            "declare const BaseFactory: new() => Base & { c: string };\n",
+            "declare const BaseFactory: any;\n",
             "class Derived extends BaseFactory {\n",
             "    a = this.b;\n",
             "    b = 'abc';\n",

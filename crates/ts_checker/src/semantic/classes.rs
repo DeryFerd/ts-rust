@@ -7334,7 +7334,7 @@ fn resolve_factory_heritage_symbol(
     store.get_merged_symbol(resolved)
 }
 
-fn plan_intersection_constructor_factory(
+fn plan_constructor_factory_heritage(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     declaration: NodeRef,
@@ -7466,6 +7466,12 @@ fn plan_intersection_constructor_factory(
 
     let annotation = NodeRef::new(variable.arena, variable.file, variable_data.type_?);
     let annotation_record = preflight_node(store, host, annotation).ok()?;
+    if annotation_record.kind == SyntaxKind::AnyKeyword {
+        return (annotation_record.flags.0 == 0
+            && annotation_record.parent == Some(variable.node)
+            && matches!(annotation_record.data, NodeData::KeywordTypeNode(_)))
+        .then_some(());
+    }
     let NodeData::ConstructorTypeNode(constructor) = &annotation_record.data else {
         return None;
     };
@@ -7567,7 +7573,7 @@ fn plan_factory_derived_property_initialization(
     members: &ts_ast::NodeList,
     clauses: &ts_ast::NodeList,
 ) -> Option<ClassGrammarDiagnostic> {
-    plan_intersection_constructor_factory(store, host, declaration, clauses)?;
+    plan_constructor_factory_heritage(store, host, declaration, clauses)?;
     let [first, second] = members.nodes.as_slice() else {
         return None;
     };
@@ -13168,6 +13174,28 @@ mod tests {
             ),
             before,
         );
+        assert!(fixture.store.declared_type_links(owner).is_none());
+        assert!(fixture.store.value_symbol_links(owner).is_none());
+    }
+
+    #[test]
+    fn any_typed_factory_heritage_authenticates_later_instance_property_reads() {
+        let fixture = fixture(concat!(
+            "declare const Factory: any; ",
+            "class Derived extends Factory { first = this.second; second = 'ready'; }",
+        ));
+        let owner = class_symbol(&fixture, "Derived");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+
+        let grammar = plan_class_grammar_diagnostics(&fixture.store, &host, owner)
+            .expect("an any-typed base keeps the same later-property diagnostic");
+
+        let [diagnostic] = grammar.diagnostics.as_slice() else {
+            panic!("the field read must retain exactly one initialization diagnostic")
+        };
+        assert_eq!(diagnostic.code, 2729);
+        assert_eq!(diagnostic.arguments, ["second"]);
         assert!(fixture.store.declared_type_links(owner).is_none());
         assert!(fixture.store.value_symbol_links(owner).is_none());
     }
