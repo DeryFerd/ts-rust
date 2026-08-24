@@ -2,7 +2,8 @@
 //!
 //! This module deliberately supports only unmodified type aliases and simple
 //! interfaces, top-level nongeneric classes with primitive annotated fields
-//! and at most one exact direct preceding local nongeneric base,
+//! and at most one exact direct preceding local nongeneric base, empty exported
+//! classes,
 //! exact construction of preceding admitted classes and declared constructors
 //! inside top-level values, assignments, property receivers, and statements,
 //! top-level literal enums, empty external-module markers, exact
@@ -14,7 +15,8 @@
 //! annotated top-level function declarations, exact direct non-exported
 //! ambient function declarations (including the existing generic callable
 //! closure), initialized identifier-named top-level variables (optionally
-//! exported), annotated uninitialized non-exported mutable top-level variables,
+//! exported), immutable `using` and `await using` resource declarations,
+//! annotated uninitialized non-exported mutable top-level variables,
 //! exact top-level lexical blocks containing a forward read of one numeric const,
 //! top-level `for...in` loops with one lexical binding and expression statements,
 //! top-level `for...of` loops with one const binding and one direct call,
@@ -42,7 +44,7 @@ use std::collections::{HashMap, HashSet};
 use ts_ast::{FileId, ModifierList, Node, NodeArena, NodeData, NodeId, NodeRef, SyntaxKind};
 use ts_binder::{
     BoundFile, CanonicalNameResolver, CanonicalResolutionLocation, CheckFlags, SemanticSymbolId,
-    SymbolFlags,
+    SymbolFlags, SymbolTableId,
 };
 use ts_core::TextRange;
 use ts_diagnostics::{Diagnostic, message_by_code};
@@ -63,11 +65,12 @@ use super::{
         StoredSingleCallableValidation, ValidatedSingleCallable, validate_stored_single_callable,
     },
     classes::{
-        ClassGrammarDiagnostic, ClassGrammarDiagnosticPlan, ClassMemberPlan, ClassMemberQueryPlan,
-        ExportedJsxArrowClassPlan, execute_exported_jsx_arrow_class,
-        execute_nongeneric_class_member_query, plan_anonymous_abstract_class_expression_grammar,
-        plan_class_grammar_diagnostics, plan_exported_jsx_arrow_class,
-        plan_nongeneric_class_member_query, preflight_nongeneric_class_member_query,
+        ClassGrammarDiagnostic, ClassGrammarDiagnosticPlan, ClassHeritageMembersValidation,
+        ClassMemberPlan, ClassMemberQueryPlan, ExportedJsxArrowClassPlan,
+        execute_exported_jsx_arrow_class, execute_nongeneric_class_member_query,
+        plan_anonymous_abstract_class_expression_grammar, plan_class_grammar_diagnostics,
+        plan_exported_jsx_arrow_class, plan_nongeneric_class_member_query,
+        preflight_nongeneric_class_member_query, validate_class_heritage_members,
     },
     contextual::{
         LiteralTreatment, PreparedExpression,
@@ -75,6 +78,7 @@ use super::{
         prepare_expression_context_with_global_types,
         prepare_expression_without_context_with_global_types,
     },
+    declared::preflight_class_or_interface_reference,
     diagnostics::missing_name_diagnostic_code,
     formatter::{
         CanonicalTypeFormatFlags,
@@ -103,7 +107,7 @@ use super::{
         PrimitiveBigIntExponentiationTarget, PrimitiveBinaryError, PrimitiveBinaryRecovery,
         PrimitiveBinaryRequest, PrimitiveBinaryUnsupported, check_primitive_binary,
     },
-    signatures::ElementFlags,
+    signatures::{ElementFlags, SignatureFlags},
     source_arrows::{
         ResolvedSourceContextualArrowPlan, SourceArrowBodyPlan, SourceArrowError,
         SourceArrowInvariant, SourceArrowPlan, SourceArrowUnsupported, SourceContextualArrowError,
@@ -229,6 +233,8 @@ use super::{
 const NODE_FLAG_JSDOC: u32 = 1 << 22;
 const NODE_FLAG_LET: u32 = 1 << 0;
 const NODE_FLAG_CONST: u32 = 1 << 1;
+const NODE_FLAG_USING: u32 = 1 << 2;
+const NODE_FLAG_AWAIT_USING: u32 = NODE_FLAG_CONST | NODE_FLAG_USING;
 const NODE_FLAG_HAS_ERROR: u32 = 1 << 15;
 const NODE_FLAG_PARSER_RECOVERY: u32 = NODE_FLAG_HAS_ERROR | (1 << 17);
 const ES2022_SCRIPT_TARGET: u8 = 9;
@@ -1309,6 +1315,7 @@ enum PlannedStatement {
     GlobalArrayPropertyAugmentation(GlobalArrayPropertyAugmentationPlan),
     Namespace(Box<SourceNamespacePlan>),
     Class(ClassMemberQueryPlan),
+    ExportedEmptyClass(PlannedExportedEmptyClass),
     ExportedJsxArrowClass(Box<PlannedExportedJsxArrowClass>),
     ClassGrammar(ClassGrammarDiagnosticPlan),
     ClassAssignmentGrammar(PlannedClassAssignmentGrammar),
@@ -1380,6 +1387,15 @@ struct PlannedDefaultObjectExport {
 struct PlannedExportedJsxArrowClass {
     class: ExportedJsxArrowClassPlan,
     callable: SourceCallablePlan,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PlannedExportedEmptyClass {
+    declaration: NodeRef,
+    symbol: SemanticSymbolId,
+    export_local: SemanticSymbolId,
+    static_members: SymbolTableId,
+    prototype: SemanticSymbolId,
 }
 
 #[derive(Debug)]
@@ -2294,6 +2310,14 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                                 .ok_or(SourceCheckError::Provenance(
                                     SourceCheckProvenanceError::MissingDeclarationSymbol(statement),
                                 ))?;
+                        if class.members.nodes.is_empty() {
+                            let empty = self.plan_exported_empty_class(statement, symbol)?;
+                            if !self.planned_classes.insert(empty.symbol) {
+                                return Err(SourceCheckError::Class(statement));
+                            }
+                            statements.push(PlannedStatement::ExportedEmptyClass(empty));
+                            continue;
+                        }
                         let class = plan_exported_jsx_arrow_class(store, host, symbol).ok_or(
                             SourceCheckError::Unsupported(UnsupportedSourceSyntax::Class(
                                 statement,
@@ -8465,6 +8489,165 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }))
     }
 
+    fn plan_exported_empty_class(
+        &self,
+        declaration: NodeRef,
+        symbol: SemanticSymbolId,
+    ) -> Result<PlannedExportedEmptyClass, SourceCheckError> {
+        let unsupported =
+            || SourceCheckError::Unsupported(UnsupportedSourceSyntax::Class(declaration));
+        let Some((store, host)) = self.semantic else {
+            return Err(unsupported());
+        };
+        let record = self.node(declaration)?;
+        let NodeData::ClassDeclaration(class) = &record.data else {
+            return Err(unsupported());
+        };
+        let name = class
+            .name
+            .map(|name| self.reference(name))
+            .ok_or_else(unsupported)?;
+        let name_record = self.node(name)?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Err(unsupported());
+        };
+        let owner = store.symbol(symbol).ok_or_else(unsupported)?;
+        let module = self
+            .bound
+            .symbol(self.source.node_ref())
+            .ok_or_else(unsupported)?;
+        let module_record = store.symbol(module).ok_or_else(unsupported)?;
+        let export_local = self
+            .bound
+            .local_symbol(declaration)
+            .ok_or_else(unsupported)?;
+        let local = store.symbol(export_local).ok_or_else(unsupported)?;
+        let static_members = owner.exports().ok_or_else(unsupported)?;
+        let static_table = store.symbol_table(static_members).ok_or_else(unsupported)?;
+        let prototype = static_table
+            .get_source("prototype")
+            .ok_or_else(unsupported)?;
+        let prototype_record = store.symbol(prototype).ok_or_else(unsupported)?;
+
+        if record.kind != SyntaxKind::ClassDeclaration
+            || record.flags.0 != 0
+            || record.parent != Some(self.source.node_ref().node)
+            || class.flow_node.is_some()
+            || class.local_symbol.is_some()
+            || class.symbol.is_some()
+            || class.next_container.is_some()
+            || class.facts != 0
+            || class.type_parameters.is_some()
+            || class.heritage_clauses.is_some()
+            || class.members.has_trailing_comma
+            || !class.members.nodes.is_empty()
+            || class.members.range.start < record.range.start
+            || class.members.range.end != record.range.end
+            || name_record.kind != SyntaxKind::Identifier
+            || name_record.flags.0 != 0
+            || name_record.parent != Some(declaration.node)
+            || identifier.flow_node.is_some()
+            || identifier.text.is_empty()
+            || owner.flags() != SymbolFlags::CLASS
+            || owner.check_flags() != CheckFlags::NONE
+            || owner.name().as_utf8() != Some(identifier.text.as_str())
+            || owner.declarations() != Some(&[declaration])
+            || owner.value_declaration() != Some(declaration)
+            || owner.members().is_some()
+            || owner.parent() != Some(module)
+            || owner.export_symbol().is_some()
+            || store.get_merged_symbol(symbol) != Some(symbol)
+            || module_record.flags() != SymbolFlags::VALUE_MODULE
+            || module_record
+                .exports()
+                .and_then(|exports| store.symbol_table(exports))
+                .and_then(|exports| exports.get_source(&identifier.text))
+                != Some(symbol)
+            || self
+                .bound
+                .locals(self.source.node_ref())
+                .and_then(|locals| store.symbol_table(locals))
+                .and_then(|locals| locals.get_source(&identifier.text))
+                != Some(export_local)
+            || export_local == symbol
+            || local.flags() != SymbolFlags::EXPORT_VALUE
+            || local.check_flags() != CheckFlags::NONE
+            || local.name().as_utf8() != Some(identifier.text.as_str())
+            || local.declarations() != Some(&[declaration])
+            || local.value_declaration().is_some()
+            || local.members().is_some()
+            || local.exports().is_some()
+            || local.parent().is_some()
+            || local.export_symbol() != Some(symbol)
+            || store.get_merged_symbol(export_local) != Some(export_local)
+            || static_table.len() != 1
+            || prototype_record.flags() != (SymbolFlags::PROPERTY | SymbolFlags::PROTOTYPE)
+            || prototype_record.check_flags() != CheckFlags::NONE
+            || prototype_record.name().as_utf8() != Some("prototype")
+            || prototype_record.declarations().is_some()
+            || prototype_record.value_declaration().is_some()
+            || prototype_record.members().is_some()
+            || prototype_record.exports().is_some()
+            || prototype_record.parent() != Some(symbol)
+            || prototype_record.export_symbol().is_some()
+            || store.get_merged_symbol(prototype) != Some(prototype)
+        {
+            return Err(unsupported());
+        }
+
+        let value = match store.value_symbol_links(symbol) {
+            None => None,
+            Some(links) if links == &ValueSymbolLinks::default() => None,
+            Some(links) => {
+                let value = links.resolved_type.ok_or_else(unsupported)?;
+                if links
+                    != &(ValueSymbolLinks {
+                        resolved_type: Some(value),
+                        ..ValueSymbolLinks::default()
+                    })
+                {
+                    return Err(unsupported());
+                }
+                Some(value)
+            }
+        };
+        if let Some(value) = value {
+            let instance = store
+                .declared_type_links(symbol)
+                .and_then(|links| links.declared_type)
+                .ok_or_else(unsupported)?;
+            if validate_class_heritage_members(store, instance)
+                != ClassHeritageMembersValidation::Valid
+                || store.type_payload(value).and_then(TypeRecord::symbol) != Some(symbol)
+            {
+                return Err(unsupported());
+            }
+        }
+        if store.value_symbol_links(export_local).is_some_and(|links| {
+            links != &ValueSymbolLinks::default()
+                && value.is_none_or(|value| {
+                    links
+                        != &(ValueSymbolLinks {
+                            resolved_type: Some(value),
+                            ..ValueSymbolLinks::default()
+                        })
+                })
+        }) {
+            return Err(unsupported());
+        }
+        if preflight_class_or_interface_reference(store, host, symbol, SymbolFlags::CLASS)? != 0 {
+            return Err(unsupported());
+        }
+
+        Ok(PlannedExportedEmptyClass {
+            declaration,
+            symbol,
+            export_local,
+            static_members,
+            prototype,
+        })
+    }
+
     fn plan_external_module_marker(
         &self,
         statement: NodeRef,
@@ -9984,7 +10167,10 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         };
         if kind != SyntaxKind::VariableDeclarationList
             || parent != Some(statement.node)
-            || !matches!(flags, 0 | NODE_FLAG_LET | NODE_FLAG_CONST)
+            || !matches!(
+                flags,
+                0 | NODE_FLAG_LET | NODE_FLAG_CONST | NODE_FLAG_USING | NODE_FLAG_AWAIT_USING
+            )
             || declaration_range != range
             || trailing_comma
             || facts != 0
@@ -10000,8 +10186,13 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             0 => VariableBindingKind::Var,
             NODE_FLAG_LET => VariableBindingKind::Let,
             NODE_FLAG_CONST => VariableBindingKind::Const,
+            NODE_FLAG_USING => VariableBindingKind::Using,
+            NODE_FLAG_AWAIT_USING => VariableBindingKind::AwaitUsing,
             _ => unreachable!("the declaration-list flag gate accepted one exact binding kind"),
         };
+        if binding.is_using() && exported {
+            return Err(self.unsupported(list, kind, SourceSyntaxRole::VariableDeclarationList));
+        }
 
         if let [declaration] = declarations.as_slice() {
             let declaration = self.reference(*declaration);
@@ -10057,6 +10248,13 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 }
                 match self.node(self.reference(variable.name))?.kind {
                     SyntaxKind::ObjectBindingPattern => {
+                        if binding.is_using() {
+                            return Err(self.unsupported(
+                                declaration,
+                                SyntaxKind::VariableDeclaration,
+                                SourceSyntaxRole::VariableDeclaration,
+                            ));
+                        }
                         let pattern = self.node(self.reference(variable.name))?;
                         let NodeData::BindingPattern(data) = &pattern.data else {
                             return Err(SourceCheckError::Variable(
@@ -10091,6 +10289,13 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         };
                     }
                     SyntaxKind::ArrayBindingPattern => {
+                        if binding.is_using() {
+                            return Err(self.unsupported(
+                                declaration,
+                                SyntaxKind::VariableDeclaration,
+                                SourceSyntaxRole::VariableDeclaration,
+                            ));
+                        }
                         let planned = self.plan_array_variable_declaration(
                             list,
                             declaration,
@@ -22823,6 +23028,130 @@ fn authenticated_named_export_variable(
     Some(declaration)
 }
 
+/// Publishes the exact instance, value, and constructor for an empty exported class.
+fn execute_exported_empty_class(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    class: PlannedExportedEmptyClass,
+) -> Result<TypeId, SourceCheckError> {
+    let invalid = || SourceCheckError::Class(class.declaration);
+    let instance = store
+        .declared_type_links(class.symbol)
+        .and_then(|links| links.declared_type);
+    let value = match store.value_symbol_links(class.symbol) {
+        None => None,
+        Some(links) if links == &ValueSymbolLinks::default() => None,
+        Some(links) => {
+            let value = links.resolved_type.ok_or_else(invalid)?;
+            if links
+                != &(ValueSymbolLinks {
+                    resolved_type: Some(value),
+                    ..ValueSymbolLinks::default()
+                })
+            {
+                return Err(invalid());
+            }
+            Some(value)
+        }
+    };
+    if let Some(value) = value {
+        let instance = instance.ok_or_else(invalid)?;
+        if validate_class_heritage_members(store, instance) != ClassHeritageMembersValidation::Valid
+        {
+            return Err(invalid());
+        }
+        return Ok(value);
+    }
+    if let Some(instance) = instance {
+        let record = store.type_payload(instance).ok_or_else(invalid)?;
+        let TypeData::Interface(interface) = record.data() else {
+            return Err(invalid());
+        };
+        if record.object_flags() != (ObjectFlags::CLASS | ObjectFlags::REFERENCE)
+            || record.symbol() != Some(class.symbol)
+            || interface.base_types_resolved
+            || interface.resolved_base_constructor_type.is_some()
+            || interface.resolved_base_types.is_some()
+            || interface.declared_members_resolved
+            || interface.declared_members.is_some()
+            || interface.declared_call_signatures.is_some()
+            || interface.declared_construct_signatures.is_some()
+            || interface.declared_index_infos.is_some()
+        {
+            return Err(invalid());
+        }
+    }
+
+    let missing_declared = usize::from(store.declared_type_links(class.symbol).is_none());
+    let missing_values = usize::from(store.value_symbol_links(class.symbol).is_none())
+        + usize::from(store.value_symbol_links(class.export_local).is_none());
+    let additional_types = 1 + usize::from(instance.is_none()) * 2;
+    let mut static_properties = Vec::new();
+    static_properties
+        .try_reserve_exact(1)
+        .map_err(|_| invalid())?;
+    static_properties.push(class.prototype);
+    let mut constructors = Vec::new();
+    constructors.try_reserve_exact(1).map_err(|_| invalid())?;
+    if !store.try_reserve_types(additional_types)
+        || !store.try_reserve_signatures(1)
+        || !store.try_reserve_declared_type_links(missing_declared)
+        || !store.try_reserve_value_symbol_links(missing_values)
+    {
+        return Err(invalid());
+    }
+
+    let instance_type = store.get_declared_type_of_symbol(host, class.symbol)?;
+    if instance.is_some_and(|cached| cached != instance_type) {
+        return Err(invalid());
+    }
+    let value_type = store
+        .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(class.symbol))
+        .ok_or_else(invalid)?;
+    let undefined = store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| bootstrap.undefined_type)
+        .ok_or_else(invalid)?;
+    let constructor = store
+        .alloc_signature(
+            SignatureFlags::CONSTRUCT,
+            None,
+            Vec::new(),
+            None,
+            Vec::new(),
+            Some(instance_type),
+            None,
+            0,
+        )
+        .ok_or_else(invalid)?;
+    constructors.push(constructor);
+
+    if !store.set_value_symbol_links(
+        class.symbol,
+        ValueSymbolLinks {
+            resolved_type: Some(value_type),
+            ..ValueSymbolLinks::default()
+        },
+    ) || !store.set_interface_declared_members(instance_type, true, None, None, None, None)
+        || !store.set_interface_base_resolution(instance_type, true, Some(undefined), None)
+        || !store.set_structured_type_members(instance_type, None, None, None, None, None)
+        || !store.set_structured_type_members(
+            value_type,
+            Some(class.static_members),
+            Some(static_properties),
+            None,
+            Some(constructors),
+            None,
+        )
+        || validate_class_heritage_members(store, instance_type)
+            != ClassHeritageMembersValidation::Valid
+    {
+        return Err(invalid());
+    }
+
+    Ok(value_type)
+}
+
 /// Checks one already-retained source into context-owned private staging.
 #[allow(clippy::too_many_arguments)] // Mirrors the context-owned source execution boundary.
 pub(super) fn check_source_file(
@@ -24843,6 +25172,22 @@ pub(super) fn check_source_file(
                     })
                 })?;
             }
+            PlannedStatement::ExportedEmptyClass(class) => {
+                let value_type = execute_exported_empty_class(store, host, class)?;
+                stage_value_type(
+                    store,
+                    &mut staged_value_types,
+                    &mut value_order,
+                    class.export_local,
+                    value_type,
+                )?;
+                if current_flow_types
+                    .insert(class.symbol, value_type)
+                    .is_some()
+                {
+                    return Err(SourceCheckError::Class(class.declaration));
+                }
+            }
             PlannedStatement::ExportedJsxArrowClass(class) => {
                 let materialized = materialize_checked_source_callable(
                     store,
@@ -26229,6 +26574,33 @@ pub(super) fn check_source_file(
                             ));
                         }
                     };
+                    if variable.binding.is_using()
+                        && let PlannedVariableInitializer::Expression(initializer) =
+                            &variable.initializer
+                        && store
+                            .type_node_links(initializer.node)
+                            .and_then(|links| links.resolved_type)
+                            .and_then(|type_| store.type_payload(type_))
+                            .is_some_and(|type_| {
+                                type_.flags().intersects(
+                                    TypeFlags::STRING_LIKE
+                                        | TypeFlags::NUMBER_LIKE
+                                        | TypeFlags::BIG_INT_LIKE
+                                        | TypeFlags::BOOLEAN_LIKE
+                                        | TypeFlags::ES_SYMBOL_LIKE,
+                                )
+                            })
+                    {
+                        issue_node_diagnostic(
+                            diagnostics,
+                            initializer.node,
+                            if variable.binding == VariableBindingKind::AwaitUsing {
+                                2851
+                            } else {
+                                2850
+                            },
+                        )?;
+                    }
                     if let Some(previous) = top_level_declared_types.get(&variable.symbol).copied()
                     {
                         let first_declaration = store
@@ -29530,6 +29902,197 @@ mod tests {
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn using_declarations_preserve_hoisted_empty_class_exports_in_source_order() {
+        let source = parsed(concat!(
+            "using x = null; ",
+            "export class C01 {} ",
+            "export class C02 {} ",
+            "export class C03 {} ",
+            "export class C04 {} ",
+            "export class C05 {} ",
+            "export class C06 {} ",
+            "export class C07 {} ",
+            "export class C08 {} ",
+            "export class C09 {} ",
+            "export class C10 {} ",
+            "export class C11 {} ",
+            "export class C12 {}",
+        ));
+        let file = FileId::new(9_420);
+        let mut context = context_with_module_state(
+            &[(file, &source)],
+            CanonicalModuleState::External,
+            CanonicalCheckerOptions::default(),
+        );
+        let resource = variable_symbol(&context, &source, file, "x");
+        let (_, bound) = context.file(file).unwrap();
+        let module = bound.symbol(bound.source_file()).unwrap();
+        let exports = context
+            .store()
+            .symbol(module)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| context.store().symbol_table(exports))
+            .unwrap();
+        let NodeData::SourceFile(statements) = &source.arena.get(source.source_file).unwrap().data
+        else {
+            panic!("expected a module source")
+        };
+        let classes = statements
+            .statements
+            .nodes
+            .iter()
+            .filter_map(|node| {
+                let record = source.arena.get(*node)?;
+                let NodeData::ClassDeclaration(class) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(name) = &source.arena.get(class.name?)?.data else {
+                    return None;
+                };
+                let declaration = NodeRef::new(source.arena.id(), file, *node);
+                Some((
+                    name.text.clone(),
+                    bound.symbol(declaration)?,
+                    bound.local_symbol(declaration)?,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let expected = (1..=12)
+            .map(|index| format!("C{index:02}"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            classes
+                .iter()
+                .map(|(name, _, _)| name.clone())
+                .collect::<Vec<_>>(),
+            expected,
+        );
+        assert_eq!(exports.len(), expected.len());
+        assert!(exports.get_source("x").is_none());
+        for (name, symbol, _) in &classes {
+            assert_eq!(exports.get_source(name), Some(*symbol));
+        }
+
+        context.check_source_file(file).unwrap();
+
+        assert_eq!(
+            context.store().symbol(resource).unwrap().flags(),
+            SymbolFlags::BLOCK_SCOPED_VARIABLE,
+        );
+        assert!(
+            context
+                .store()
+                .value_symbol_links(resource)
+                .and_then(|links| links.resolved_type)
+                .is_some()
+        );
+        for (_, symbol, export_local) in classes {
+            let value = context
+                .store()
+                .value_symbol_links(symbol)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            let instance = context
+                .store()
+                .declared_type_links(symbol)
+                .and_then(|links| links.declared_type)
+                .unwrap();
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(export_local)
+                    .and_then(|links| links.resolved_type),
+                Some(value),
+            );
+            assert_eq!(
+                validate_class_heritage_members(context.store(), instance),
+                ClassHeritageMembersValidation::Valid,
+            );
+        }
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn using_declarations_preserve_nulls_and_report_primitive_disposal_diagnostics() {
+        for (index, (text, expected_diagnostic)) in [
+            ("using nullable = null; using invalid = 1;", 2850),
+            (
+                "await using nullable = null; await using invalid = 1;",
+                2851,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parsed(text);
+            let file = FileId::new(9_421 + u32::try_from(index).unwrap());
+            let mut context = context_with_module_state(
+                &[(file, &source)],
+                CanonicalModuleState::External,
+                CanonicalCheckerOptions {
+                    intrinsic: IntrinsicBootstrapOptions {
+                        strict_null_checks: true,
+                        ..IntrinsicBootstrapOptions::default()
+                    },
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+
+            context.check_source_file(file).unwrap();
+
+            let [diagnostic] = context.diagnostics().as_slice() else {
+                panic!("expected one disposal diagnostic for {text}")
+            };
+            assert_eq!(diagnostic.diagnostic.code(), expected_diagnostic);
+            assert_eq!(node_text(&source, diagnostic.node.unwrap()), "1");
+            assert_eq!(
+                context
+                    .type_to_string(variable_value_type(&context, &source, file, "nullable"))
+                    .unwrap(),
+                "null",
+            );
+            assert_eq!(
+                context
+                    .type_to_string(variable_value_type(&context, &source, file, "invalid"))
+                    .unwrap(),
+                "1",
+            );
+
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
+    fn using_declarations_require_initialized_identifier_bindings_before_publication() {
+        for (index, text) in ["using resource;", "using { resource } = {};"]
+            .into_iter()
+            .enumerate()
+        {
+            let source = parsed(text);
+            let file = FileId::new(9_423 + u32::try_from(index).unwrap());
+            let mut context = context_with_module_state(
+                &[(file, &source)],
+                CanonicalModuleState::External,
+                CanonicalCheckerOptions::default(),
+            );
+            let cold = observable_state(&context, file);
+
+            assert!(matches!(
+                context.check_source_file(file),
+                Err(SourceCheckError::Unsupported(_))
+            ));
+            assert_eq!(observable_state(&context, file), cold);
+            assert!(context.diagnostics().is_empty());
+        }
     }
 
     #[test]

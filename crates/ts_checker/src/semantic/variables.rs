@@ -23,17 +23,35 @@ pub(super) enum VariableBindingKind {
     Var,
     Let,
     Const,
+    Using,
+    AwaitUsing,
 }
 
 impl VariableBindingKind {
     pub(super) const fn is_const(self) -> bool {
-        matches!(self, Self::Const)
+        matches!(self, Self::Const | Self::Using | Self::AwaitUsing)
+    }
+
+    pub(super) const fn is_using(self) -> bool {
+        matches!(self, Self::Using | Self::AwaitUsing)
+    }
+
+    const fn declaration_flags(self) -> u32 {
+        match self {
+            Self::Var => 0,
+            Self::Let => 1,
+            Self::Const => 1 << 1,
+            Self::Using => 1 << 2,
+            Self::AwaitUsing => (1 << 1) | (1 << 2),
+        }
     }
 
     const fn symbol_flags(self) -> SymbolFlags {
         match self {
             Self::Var => SymbolFlags::FUNCTION_SCOPED_VARIABLE,
-            Self::Let | Self::Const => SymbolFlags::BLOCK_SCOPED_VARIABLE,
+            Self::Let | Self::Const | Self::Using | Self::AwaitUsing => {
+                SymbolFlags::BLOCK_SCOPED_VARIABLE
+            }
         }
     }
 }
@@ -400,11 +418,7 @@ pub(super) fn plan_top_level_computed_binding_element(
     let NodeData::VariableDeclarationList(list_data) = &list_record.data else {
         return Err(VariableInvariant::InvalidBindingPattern(list).into());
     };
-    let expected_flags = match binding {
-        VariableBindingKind::Var => 0,
-        VariableBindingKind::Let => 1,
-        VariableBindingKind::Const => 1 << 1,
-    };
+    let expected_flags = binding.declaration_flags();
     if list_record.kind != SyntaxKind::VariableDeclarationList
         || list_record.flags.0 != expected_flags
         || list_data
@@ -594,11 +608,7 @@ pub(super) fn plan_top_level_object_binding_elements(
     let NodeData::VariableDeclarationList(list_data) = &list_record.data else {
         return Err(VariableInvariant::InvalidBindingPattern(list).into());
     };
-    let expected_flags = match binding {
-        VariableBindingKind::Var => 0,
-        VariableBindingKind::Let => 1,
-        VariableBindingKind::Const => 1 << 1,
-    };
+    let expected_flags = binding.declaration_flags();
     if list_record.kind != SyntaxKind::VariableDeclarationList
         || list_record.flags.0 != expected_flags
         || list_data
@@ -801,11 +811,7 @@ pub(super) fn plan_top_level_array_binding_element(
     let NodeData::VariableDeclarationList(list_data) = &list_record.data else {
         return Err(VariableInvariant::InvalidBindingPattern(list).into());
     };
-    let expected_flags = match binding {
-        VariableBindingKind::Var => 0,
-        VariableBindingKind::Let => 1,
-        VariableBindingKind::Const => 1 << 1,
-    };
+    let expected_flags = binding.declaration_flags();
     if list_record.kind != SyntaxKind::VariableDeclarationList
         || list_record.flags.0 != expected_flags
         || list_data
@@ -1868,6 +1874,70 @@ mod tests {
                 ))
             })
             .expect("fixture contains a binding-pattern declaration")
+    }
+
+    #[test]
+    fn using_bindings_preserve_immutable_block_scoped_symbol_identity() {
+        for (index, (source, binding, expected_flags)) in [
+            ("using resource = null;", VariableBindingKind::Using, 1 << 2),
+            (
+                "await using resource = null;",
+                VariableBindingKind::AwaitUsing,
+                (1 << 1) | (1 << 2),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture = binding_fixture(source, 9_410 + u32::try_from(index).unwrap());
+            let declaration = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::VariableDeclaration).then_some(NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        node,
+                    ))
+                })
+                .expect("the resource declaration retains its variable node");
+            let NodeData::VariableDeclaration(variable) =
+                &fixture.parsed.arena.get(declaration.node).unwrap().data
+            else {
+                panic!("expected an identifier-named resource declaration")
+            };
+            let name = NodeRef::new(fixture.parsed.arena.id(), fixture.file, variable.name);
+            let list = fixture
+                .parsed
+                .arena
+                .get(declaration.node)
+                .and_then(|record| record.parent)
+                .and_then(|parent| fixture.parsed.arena.get(parent))
+                .unwrap();
+            let symbol = fixture.bound.symbol(declaration).unwrap();
+
+            assert_eq!(list.flags.0, expected_flags);
+            assert!(binding.is_const());
+            assert!(binding.is_using());
+            assert_eq!(
+                fixture.store.symbol(symbol).unwrap().flags(),
+                SymbolFlags::BLOCK_SCOPED_VARIABLE,
+            );
+            assert_eq!(
+                plan_top_level_variable(
+                    &fixture.bound,
+                    &fixture.store,
+                    declaration,
+                    name,
+                    "resource",
+                    binding,
+                    false,
+                ),
+                Ok(symbol),
+            );
+            assert!(fixture.store.value_symbol_links(symbol).is_none());
+        }
     }
 
     #[test]
