@@ -1720,6 +1720,116 @@ fn namespace_generic_annotation_requires_deferral(
     Ok(false)
 }
 
+/// Proves that a nested, type-only namespace and interface share one binder symbol.
+pub(super) fn authenticated_merged_namespace_interface(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+) -> Option<NodeRef> {
+    let record = store.symbol(symbol)?;
+    let declarations = record.declarations()?;
+    let owner = store.get_parent_of_symbol(symbol)?;
+    let owner_record = store.symbol(owner)?;
+    let exports = record
+        .exports()
+        .and_then(|exports| store.symbol_table(exports))?;
+    let allowed = SymbolFlags::INTERFACE | SymbolFlags::NAMESPACE_MODULE | SymbolFlags::TRANSIENT;
+    if !record
+        .flags()
+        .contains(SymbolFlags::INTERFACE | SymbolFlags::NAMESPACE_MODULE)
+        || record.flags().without(allowed) != SymbolFlags::NONE
+        || record.check_flags() != CheckFlags::NONE
+        || record.value_declaration().is_some()
+        || record.members().is_none()
+        || record.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || !owner_record.flags().intersects(SymbolFlags::MODULE)
+        || owner_record
+            .exports()
+            .and_then(|exports| store.symbol_table(exports))
+            .and_then(|exports| exports.get(record.name()))
+            .and_then(|export| store.get_merged_symbol(export))
+            != Some(symbol)
+        || exports.iter().any(|(_, export)| {
+            store
+                .get_merged_symbol(export)
+                .and_then(|export| store.symbol(export).map(|record| (export, record)))
+                .is_none_or(|(export, record)| {
+                    !record
+                        .flags()
+                        .intersects(SymbolFlags::TYPE | SymbolFlags::NAMESPACE)
+                        || record.flags().intersects(SymbolFlags::VALUE)
+                        || store.get_parent_of_symbol(export) != Some(symbol)
+                })
+        })
+    {
+        return None;
+    }
+
+    let mut interface = None;
+    let mut has_namespace = false;
+    let mut seen = HashSet::with_capacity(declarations.len());
+    for declaration in declarations {
+        let declaration = *declaration;
+        let (arena, bound) = host.source(declaration)?;
+        let node = host.node(declaration)?;
+        if !seen.insert(declaration) || !host.symbol_matches(store, declaration, symbol) {
+            return None;
+        }
+
+        let block = child(declaration, node.parent?);
+        let block_record = host.node(block)?;
+        let NodeData::ModuleBlock(body) = &block_record.data else {
+            return None;
+        };
+        let parent = child(block, block_record.parent?);
+        if block_record.kind != SyntaxKind::ModuleBlock
+            || !body.statements.nodes.contains(&declaration.node)
+            || !host.symbol_matches(store, parent, owner)
+            || !bound.contains(declaration)
+            || arena.id() != declaration.arena
+        {
+            return None;
+        }
+
+        match &node.data {
+            NodeData::InterfaceDeclaration(data)
+                if node.kind == SyntaxKind::InterfaceDeclaration
+                    && data.type_parameters.is_none()
+                    && data.heritage_clauses.is_none()
+                    && host
+                        .node(child(declaration, data.name))
+                        .is_some_and(|name| {
+                            matches!(
+                                &name.data,
+                                NodeData::Identifier(name)
+                                    if record.name().as_utf8() == Some(name.text.as_str())
+                            )
+                        }) =>
+            {
+                interface.get_or_insert(declaration);
+            }
+            NodeData::ModuleDeclaration(data)
+                if node.kind == SyntaxKind::ModuleDeclaration
+                    && data.keyword == SyntaxKind::NamespaceKeyword
+                    && host
+                        .node(child(declaration, data.name))
+                        .is_some_and(|name| {
+                            matches!(
+                                &name.data,
+                                NodeData::Identifier(name)
+                                    if record.name().as_utf8() == Some(name.text.as_str())
+                            )
+                        }) =>
+            {
+                has_namespace = true;
+            }
+            _ => return None,
+        }
+    }
+    interface.filter(|_| has_namespace)
+}
+
 fn plan_interface_member(
     arena: &NodeArena,
     bound: &BoundFile,
@@ -11413,6 +11523,100 @@ mod tests {
         );
 
         assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+    }
+
+    #[test]
+    fn nested_type_only_namespace_interface_merges_keep_one_declared_identity() {
+        let mut fixture = declaration_fixture(
+            concat!(
+                "declare module 'foo' { ",
+                "namespace B { export interface A {} } ",
+                "interface B { bar(name: string): B.A; } ",
+                "export = B; ",
+                "}",
+            ),
+            CanonicalModuleState::Script,
+        );
+        let namespace = plan(&fixture, 0);
+        let [
+            SourceNamespaceMemberPlan::Namespace(nested),
+            SourceNamespaceMemberPlan::Interface {
+                declaration,
+                symbol,
+                ..
+            },
+        ] = namespace.members.as_slice()
+        else {
+            panic!("the ambient module must retain its merged namespace and interface")
+        };
+        let declaration = *declaration;
+        let symbol = *symbol;
+        assert_eq!(nested.symbol, symbol);
+        let record = fixture.context.store().symbol(symbol).unwrap();
+        assert!(
+            record
+                .flags()
+                .contains(SymbolFlags::INTERFACE | SymbolFlags::NAMESPACE_MODULE)
+        );
+        assert!(!record.flags().intersects(SymbolFlags::VALUE));
+        let [
+            SourceNamespaceMemberPlan::Interface {
+                symbol: exported, ..
+            },
+        ] = nested.members.as_slice()
+        else {
+            panic!("the merged namespace must retain its exported interface")
+        };
+        let exported = *exported;
+        let bound = fixture.context.file(fixture.file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&fixture.parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(fixture.context.options().name_resolution),
+        )
+        .unwrap();
+        assert_eq!(
+            authenticated_merged_namespace_interface(fixture.context.store(), &host, symbol),
+            Some(declaration)
+        );
+
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        let target = fixture
+            .context
+            .store()
+            .declared_type_links(symbol)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let TypeData::Interface(interface) =
+            fixture.context.store().type_payload(target).unwrap().data()
+        else {
+            panic!("the merged namespace must keep its original interface identity")
+        };
+        assert!(!interface.declared_members_resolved);
+        assert_eq!(
+            fixture
+                .context
+                .store()
+                .symbol(symbol)
+                .and_then(ts_binder::semantic::Symbol::exports)
+                .and_then(|exports| fixture.context.store().symbol_table(exports))
+                .and_then(|exports| exports.get_source("A")),
+            Some(exported)
+        );
+
+        let warm = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
     }
 
     #[test]
