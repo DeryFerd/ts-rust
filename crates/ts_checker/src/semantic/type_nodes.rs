@@ -16884,9 +16884,14 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 &instantiated,
                 UnionReduction::Literal,
             ),
-            None => self
-                .store
-                .expression_union_type(&instantiated, UnionReduction::Literal),
+            None => {
+                let mut prepared = self
+                    .store
+                    .prepare_type_query_types(&[], &[], &[], 1, 0)
+                    .map_err(Self::literal_cache_error)?;
+                self.store
+                    .literal_union_type_prepared(&instantiated, None, &mut prepared)
+            }
         };
         result.map_err(Self::literal_cache_error)
     }

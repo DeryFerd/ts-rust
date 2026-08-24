@@ -10770,20 +10770,22 @@ mod tests {
                 panic!("the malformed shape still projects as a JSDoc import")
             };
 
-            assert!(matches!(
-                plan_source_jsdoc_typedef_import(
-                    &file.parsed.arena,
-                    bound,
-                    &fixture.store,
-                    declaration.node(),
-                    typedef.source_declaration().unwrap(),
-                    imported,
+            assert!(
+                matches!(
+                    plan_source_jsdoc_typedef_import(
+                        &file.parsed.arena,
+                        bound,
+                        &fixture.store,
+                        declaration.node(),
+                        typedef.source_declaration().unwrap(),
+                        imported,
+                    ),
+                    Err(SourceImportError::Unsupported(
+                        SourceImportUnsupported::TypeReference(_)
+                    )),
                 ),
-                Err(SourceImportError::Unsupported(
-                    SourceImportUnsupported::TypeReference(_)
-                )),
                 "unsupported JSDoc import expression: {expression}",
-            ));
+            );
         }
     }
 
