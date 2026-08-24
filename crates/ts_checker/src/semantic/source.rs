@@ -555,6 +555,7 @@ pub(super) struct PlannedExpression {
     pub(super) kind: PlannedExpressionKind,
     array_spreads: Vec<(usize, NodeRef)>,
     object_spreads: Vec<PlannedExpression>,
+    non_null_assertion: bool,
     used_before_assignment: bool,
 }
 
@@ -565,6 +566,7 @@ impl PlannedExpression {
             kind,
             array_spreads: Vec::new(),
             object_spreads: Vec::new(),
+            non_null_assertion: false,
             used_before_assignment: false,
         }
     }
@@ -576,7 +578,9 @@ impl PlannedExpression {
 
     pub(super) fn unparenthesized(&self) -> &Self {
         let mut expression = self;
-        while let PlannedExpressionKind::Parenthesized(inner) = &expression.kind {
+        while !expression.non_null_assertion
+            && let PlannedExpressionKind::Parenthesized(inner) = &expression.kind
+        {
             expression = inner;
         }
         expression
@@ -2809,6 +2813,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             | SyntaxKind::StringLiteral
                             | SyntaxKind::PropertyAccessExpression
                             | SyntaxKind::NewExpression
+                            | SyntaxKind::ParenthesizedExpression
+                            | SyntaxKind::NonNullExpression
                     ) {
                         let expression = self.plan_expression(expression)?;
                         statements.push(PlannedStatement::ExpressionValue(expression));
@@ -12283,6 +12289,44 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     PlannedExpressionKind::Parenthesized(Box::new(self.plan_expression(inner)?)),
                 ))
             }
+            SyntaxKind::NonNullExpression => {
+                let (inner_id, range) = {
+                    let node = self.node(expression)?;
+                    let NodeData::NonNullExpression(non_null) = &node.data else {
+                        return Err(self.unsupported(
+                            expression,
+                            node.kind,
+                            SourceSyntaxRole::VariableInitializer,
+                        ));
+                    };
+                    if node.flags.0 != 0 {
+                        return Err(self.unsupported(
+                            expression,
+                            node.kind,
+                            SourceSyntaxRole::VariableInitializer,
+                        ));
+                    }
+                    (non_null.expression, node.range)
+                };
+                let inner = self.reference(inner_id);
+                let inner_record = self.node(inner)?;
+                if inner_record.parent != Some(expression.node)
+                    || inner_record.range.start != range.start
+                    || inner_record.range.end >= range.end
+                {
+                    return Err(self.unsupported(
+                        inner,
+                        inner_record.kind,
+                        SourceSyntaxRole::VariableInitializer,
+                    ));
+                }
+                let mut planned = PlannedExpression::new(
+                    expression,
+                    PlannedExpressionKind::Parenthesized(Box::new(self.plan_expression(inner)?)),
+                );
+                planned.non_null_assertion = true;
+                Ok(planned)
+            }
             SyntaxKind::BinaryExpression => self.plan_binary(expression),
             SyntaxKind::ConditionalExpression => self.plan_conditional(expression),
             SyntaxKind::PrefixUnaryExpression => self.plan_prefix_unary(expression),
@@ -15242,16 +15286,23 @@ where
         (
             PlannedExpressionKind::Parenthesized(inner),
             PreparedExpression::Parenthesized(prepared),
-        ) => execute_expression_types(
-            store,
-            global_types,
-            current_flow_types,
-            tuple_contexts,
-            inner,
-            prepared,
-            property_diagnostics,
-            check_nested_expression,
-        ),
+        ) => {
+            let checked = execute_expression_types(
+                store,
+                global_types,
+                current_flow_types,
+                tuple_contexts,
+                inner,
+                prepared,
+                property_diagnostics,
+                check_nested_expression,
+            )?;
+            if expression.non_null_assertion {
+                narrow_non_null_expression_types(store, global_types, checked)
+            } else {
+                Ok(checked)
+            }
+        }
         (PlannedExpressionKind::Array(elements), PreparedExpression::Array(prepared_elements)) => {
             debug_assert_eq!(elements.len(), prepared_elements.len());
             let global_types = global_types.ok_or(SourceCheckError::Unsupported(
@@ -15527,6 +15578,85 @@ fn checked_literal_types(
     let raw = store.fresh_type_of_literal_type(regular)?;
     let result = prepared_literal_type(store, regular, widened, treatment)?;
     Ok(CheckedExpressionTypes::leaf(raw, result))
+}
+
+fn narrow_non_null_expression_types(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    checked: CheckedExpressionTypes,
+) -> Result<CheckedExpressionTypes, SourceCheckError> {
+    let raw = non_null_expression_type(store, global_types, checked.raw)?;
+    let result = if checked.result == checked.raw {
+        raw
+    } else {
+        non_null_expression_type(store, global_types, checked.result)?
+    };
+    Ok(CheckedExpressionTypes {
+        raw,
+        result,
+        ..checked
+    })
+}
+
+fn non_null_expression_type(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    type_: TypeId,
+) -> Result<TypeId, SourceCheckError> {
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(SourceCheckError::LiteralCache(
+            SourceLiteralCacheError::BootstrapUninitialized,
+        ))?;
+    if !bootstrap.options.strict_null_checks {
+        return Ok(type_);
+    }
+    let never = bootstrap.never_type;
+    let unknown_empty_object = bootstrap.unknown_empty_object_type;
+    let record = store
+        .type_payload(type_)
+        .ok_or(RelationUnavailable::Type(type_))?;
+    if record.flags().intersects(TypeFlags::UNKNOWN) {
+        return Ok(unknown_empty_object);
+    }
+    if record
+        .flags()
+        .intersects(TypeFlags::NULLABLE | TypeFlags::VOID)
+    {
+        return Ok(never);
+    }
+    let TypeData::Union(union) = record.data() else {
+        return Ok(type_);
+    };
+    let mut retained = Vec::with_capacity(union.union.types.len());
+    for constituent in &union.union.types {
+        let flags = store
+            .type_payload(*constituent)
+            .map(TypeRecord::flags)
+            .ok_or(RelationUnavailable::Type(*constituent))?;
+        if !flags.intersects(TypeFlags::NULLABLE | TypeFlags::VOID) {
+            retained.push(*constituent);
+        }
+    }
+    if retained.len() == union.union.types.len() {
+        return Ok(type_);
+    }
+    match retained.as_slice() {
+        [] => Ok(never),
+        [only] => Ok(*only),
+        _ => match global_types {
+            Some(global_types) => store
+                .expression_union_type_with_global_types(
+                    global_types,
+                    &retained,
+                    UnionReduction::Literal,
+                )
+                .map_err(Into::into),
+            None => {
+                super::instantiate::canonical_anonymous_union(store, &retained).map_err(Into::into)
+            }
+        },
+    }
 }
 
 fn prepared_literal_type(
@@ -16992,7 +17122,7 @@ fn check_expression_type(
             ))
         }
         PlannedExpressionKind::Parenthesized(inner) => {
-            let types = check_expression_type(
+            let checked = check_expression_type(
                 store,
                 host,
                 global_types,
@@ -17006,6 +17136,11 @@ fn check_expression_type(
                 contextual_type,
                 deferred,
             )?;
+            let types = if expression.non_null_assertion {
+                narrow_non_null_expression_types(store, Some(global_types), checked)?
+            } else {
+                checked
+            };
             publish_expression_type(store, expression.node, types.raw)?;
             Ok(types)
         }
@@ -35151,6 +35286,158 @@ mod tests {
     }
 
     #[test]
+    fn non_null_assertions_remove_nullable_union_members_and_preserve_wrappers() {
+        let source = parsed(concat!(
+            "declare let maybe: string | null | undefined; ",
+            "let value: string = maybe!; ",
+            "value = ((maybe)!);",
+        ));
+        let file = FileId::new(9_748);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        let wrappers = source
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::NonNullExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(wrappers.len(), 2);
+
+        context.check_source_file(file).unwrap();
+
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let nullable = variable_value_type(&context, &source, file, "maybe");
+        let TypeData::Union(union) = context.store().type_payload(nullable).unwrap().data() else {
+            panic!("the ambient source must retain its nullable union")
+        };
+        assert!(union.union.types.contains(&bootstrap.string_type));
+        assert!(union.union.types.contains(&bootstrap.null_type));
+        assert!(union.union.types.contains(&bootstrap.undefined_type));
+        for wrapper in wrappers {
+            assert_eq!(resolved_node_type(&context, wrapper), bootstrap.string_type);
+            let NodeData::NonNullExpression(data) = &source.arena.get(wrapper.node).unwrap().data
+            else {
+                panic!("the wrapper must retain its non-null operand")
+            };
+            let operand = NodeRef::new(source.arena.id(), file, data.expression);
+            assert_eq!(resolved_node_type(&context, operand), nullable);
+        }
+        let (_, assignment) = assignment_parts(&source, file, 0);
+        assert_eq!(
+            resolved_node_type(&context, assignment),
+            bootstrap.string_type
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn null_non_null_assertions_follow_strict_null_checks_without_diagnostics() {
+        for (index, strict_null_checks) in [false, true].into_iter().enumerate() {
+            let source = parsed("let value: string = null!; value = (null!);");
+            let file = FileId::new(9_749 + u32::try_from(index).unwrap());
+            let mut context = context(
+                &[(file, &source)],
+                CanonicalCheckerOptions {
+                    intrinsic: IntrinsicBootstrapOptions {
+                        strict_null_checks,
+                        ..IntrinsicBootstrapOptions::default()
+                    },
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+
+            context.check_source_file(file).unwrap();
+
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            let expected = if strict_null_checks {
+                bootstrap.never_type
+            } else {
+                bootstrap.null_widening_type
+            };
+            for (node, record) in source.arena.iter() {
+                if record.kind == SyntaxKind::NonNullExpression {
+                    assert_eq!(
+                        resolved_node_type(&context, NodeRef::new(source.arena.id(), file, node)),
+                        expected,
+                    );
+                }
+            }
+            assert!(context.diagnostics().is_empty());
+
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
+    fn non_null_property_receivers_use_their_non_nullable_object_identity() {
+        let source = parsed(concat!(
+            "interface Box { value: string; } ",
+            "declare let maybe: Box | undefined; ",
+            "const result: string = maybe!.value;",
+        ));
+        let file = FileId::new(9_751);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        let wrapper = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::NonNullExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+
+        context.check_source_file(file).unwrap();
+
+        let owner = global_symbol(&context, "Box");
+        let expected = context
+            .store()
+            .declared_type_links(owner)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        assert_eq!(resolved_node_type(&context, wrapper), expected);
+        assert_eq!(
+            variable_value_type(&context, &source, file, "result"),
+            context.store().intrinsic_bootstrap().unwrap().string_type,
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
     fn assertion_context_and_deferred_comparison_match_contextual_typing_18() {
         let source = parsed("var foo: {id:number;} = <{id:number;}>({ }); foo = {id: 5};");
         let file = FileId::new(114);
@@ -40827,6 +41114,44 @@ mod tests {
                 .collect::<Vec<_>>(),
             [2304, 1105]
         );
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn parenthesized_assertion_identifier_and_call_statements_publish_each_wrapper() {
+        let source = parsed(concat!(
+            "declare const value: any; ",
+            "declare function read(input: number): number; ",
+            "(<any>{ value: 1 }); ",
+            "(((value))); ",
+            "(read(1));",
+        ));
+        let file = FileId::new(9_752);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let any = context.store().intrinsic_bootstrap().unwrap().any_type;
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let mut wrappers = 0;
+        for (node, record) in source.arena.iter() {
+            if record.kind != SyntaxKind::ParenthesizedExpression {
+                continue;
+            }
+            wrappers += 1;
+            let reference = NodeRef::new(source.arena.id(), file, node);
+            let expected = if node_text(&source, reference).contains("read(1)") {
+                number
+            } else {
+                any
+            };
+            assert_eq!(resolved_node_type(&context, reference), expected);
+        }
+        assert_eq!(wrappers, 5);
+        assert!(context.diagnostics().is_empty());
+
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
