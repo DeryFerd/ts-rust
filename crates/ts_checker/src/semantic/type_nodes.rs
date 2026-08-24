@@ -1896,6 +1896,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 .get(&alias)
                 .is_some_and(|alias| !alias.type_parameters.is_empty())
             && recursive_alias.is_none()
+            && !self.is_homomorphic_generic_mapped_alias(alias, mapped)?
         {
             self.validate_record_mapped_alias_plan(alias, mapped)?;
         }
@@ -1919,6 +1920,72 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             self.plan_type_node_in_context(name_type, None, false)?;
         }
         Ok(())
+    }
+
+    fn is_homomorphic_generic_mapped_alias(
+        &self,
+        alias: SemanticSymbolId,
+        mapped: MappedTypeDeclarationPlan,
+    ) -> Result<bool, DeclaredTypeError> {
+        let Some(metadata) = self.plan.aliases.get(&alias) else {
+            return Ok(false);
+        };
+        let [parameter] = metadata.type_parameters.as_slice() else {
+            return Ok(false);
+        };
+        let Some(template) = mapped.template() else {
+            return Ok(false);
+        };
+        let template_record = preflight_node(self.store, self.host, template)?;
+        let NodeData::TypeReferenceNode(template_reference) = &template_record.data else {
+            return Ok(false);
+        };
+        let Some(arguments) = template_reference.type_arguments.as_ref() else {
+            return Ok(false);
+        };
+        let [argument] = arguments.nodes.as_slice() else {
+            return Ok(false);
+        };
+        let argument = NodeRef::new(template.arena, template.file, *argument);
+        let argument_record = preflight_node(self.store, self.host, argument)?;
+        let NodeData::IndexedAccessTypeNode(indexed) = &argument_record.data else {
+            return Ok(false);
+        };
+        let indexed_object = NodeRef::new(argument.arena, argument.file, indexed.object_type);
+        let indexed_key = NodeRef::new(argument.arena, argument.file, indexed.index_type);
+        if parameter.constraint.is_some()
+            || parameter.default_type.is_some()
+            || mapped.name_type().is_some()
+            || template_record.kind != SyntaxKind::TypeReference
+            || template_record.parent != Some(mapped.node().node)
+            || arguments.has_trailing_comma
+            || argument_record.kind != SyntaxKind::IndexedAccessType
+            || argument_record.parent != Some(template.node)
+            || preflight_node(self.store, self.host, indexed_object)?.parent != Some(argument.node)
+            || preflight_node(self.store, self.host, indexed_key)?.parent != Some(argument.node)
+            || self.resolve_uncached_type_reference_symbol(indexed_object)? != parameter.symbol
+            || self.resolve_uncached_type_reference_symbol(indexed_key)?
+                != mapped.type_parameter_symbol()
+        {
+            return Ok(false);
+        }
+
+        let constraint = preflight_node(self.store, self.host, mapped.constraint())?;
+        let NodeData::TypeOperatorNode(operator) = &constraint.data else {
+            return Ok(false);
+        };
+        if constraint.kind != SyntaxKind::TypeOperator
+            || operator.operator != SyntaxKind::KeyOfKeyword
+        {
+            return Ok(false);
+        }
+        let target = NodeRef::new(
+            mapped.constraint().arena,
+            mapped.constraint().file,
+            operator.type_,
+        );
+        Ok(mapped.modifiers_source() == Some(target)
+            && self.resolve_uncached_type_reference_symbol(target)? == parameter.symbol)
     }
 
     fn plan_recursive_mapped_template(
@@ -2023,6 +2090,32 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         type_parameter: SemanticSymbolId,
     ) -> Result<(), DeclaredTypeError> {
         let record = preflight_node(self.store, self.host, node)?;
+        if let NodeData::ConditionalTypeNode(conditional) = &record.data {
+            let check = NodeRef::new(node.arena, node.file, conditional.check_type);
+            if record.kind != SyntaxKind::ConditionalType
+                || preflight_node(self.store, self.host, check)?.parent != Some(node.node)
+            {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidIndexedAccessType(node),
+                ));
+            }
+            self.plan_mapped_template_type(check, type_parameter)?;
+            return self.plan_type_node_in_context(node, None, false);
+        }
+        if let NodeData::TypeReferenceNode(reference) = &record.data
+            && let Some(arguments) = reference.type_arguments.as_ref()
+        {
+            for argument in &arguments.nodes {
+                let argument = NodeRef::new(node.arena, node.file, *argument);
+                if preflight_node(self.store, self.host, argument)?.parent != Some(node.node) {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidIndexedAccessType(argument),
+                    ));
+                }
+                self.plan_mapped_template_type(argument, type_parameter)?;
+            }
+            return self.plan_type_node_in_context(node, None, false);
+        }
         let NodeData::IndexedAccessTypeNode(indexed) = &record.data else {
             return self.plan_type_node_in_context(node, None, false);
         };
@@ -2745,6 +2838,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 .get(&alias)
                 .is_some_and(|plan| !plan.type_parameters.is_empty())
         {
+            if self.try_plan_generic_mapped_indexed_alias(node, alias)? {
+                return Ok(());
+            }
             return Err(type_node_unavailable(
                 TypeNodeUnavailable::GenericReferenceUnsupported {
                     node,
@@ -2769,6 +2865,80 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         self.plan.indexed_accesses.insert(node, planned.clone());
         self.plan_type_node_in_context(planned.object(), None, false)?;
         self.plan_type_node_in_context(planned.index(), None, false)
+    }
+
+    fn try_plan_generic_mapped_indexed_alias(
+        &mut self,
+        node: NodeRef,
+        alias: SemanticSymbolId,
+    ) -> Result<bool, DeclaredTypeError> {
+        let Some(metadata) = self.plan.aliases.get(&alias) else {
+            return Ok(false);
+        };
+        let [parameter] = metadata.type_parameters.as_slice() else {
+            return Ok(false);
+        };
+        let parameter = parameter.symbol;
+        let record = preflight_node(self.store, self.host, node)?;
+        let NodeData::IndexedAccessTypeNode(indexed) = &record.data else {
+            return Ok(false);
+        };
+        let object = NodeRef::new(node.arena, node.file, indexed.object_type);
+        let index = NodeRef::new(node.arena, node.file, indexed.index_type);
+        let object_record = preflight_node(self.store, self.host, object)?;
+        let index_record = preflight_node(self.store, self.host, index)?;
+        if record.kind != SyntaxKind::IndexedAccessType
+            || object_record.kind != SyntaxKind::MappedType
+            || object_record.parent != Some(node.node)
+            || index_record.kind != SyntaxKind::TypeOperator
+            || index_record.parent != Some(node.node)
+        {
+            return Ok(false);
+        }
+        let NodeData::TypeOperatorNode(index_operator) = &index_record.data else {
+            return Ok(false);
+        };
+        if index_operator.operator != SyntaxKind::KeyOfKeyword {
+            return Ok(false);
+        }
+        let index_target = NodeRef::new(index.arena, index.file, index_operator.type_);
+        let mapped = plan_mapped_type_declaration(self.store, self.host, object)
+            .map_err(|error| mapped_type_error(error, object))?;
+        let mapped_constraint = preflight_node(self.store, self.host, mapped.constraint())?;
+        let NodeData::TypeOperatorNode(mapped_operator) = &mapped_constraint.data else {
+            return Ok(false);
+        };
+        if mapped_constraint.kind != SyntaxKind::TypeOperator
+            || mapped_operator.operator != SyntaxKind::KeyOfKeyword
+            || mapped.template().is_none()
+            || mapped.name_type().is_some()
+        {
+            return Ok(false);
+        }
+        let mapped_target = NodeRef::new(
+            mapped.constraint().arena,
+            mapped.constraint().file,
+            mapped_operator.type_,
+        );
+        if mapped.modifiers_source() != Some(mapped_target)
+            || preflight_node(self.store, self.host, index_target)?.parent != Some(index.node)
+            || self.resolve_uncached_type_reference_symbol(index_target)? != parameter
+            || self.resolve_uncached_type_reference_symbol(mapped_target)? != parameter
+        {
+            return Ok(false);
+        }
+
+        self.plan_type_node_in_context(object, None, false)?;
+        self.plan_type_node_in_context(index, None, false)?;
+        let planned = PlannedMappedIndexedAccess { object, index };
+        if let Some(existing) = self.plan.mapped_indexed_accesses.insert(node, planned)
+            && existing != planned
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidIndexedAccessType(node),
+            ));
+        }
+        Ok(true)
     }
 
     fn try_plan_recovered_indexed_access_type(
@@ -18438,6 +18608,180 @@ mod tests {
                 .get(&type_list_key(parameters)),
             Some(&declared)
         );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn generic_mapped_indexed_aliases_preserve_their_deferred_identity() {
+        let mut fixture =
+            fixture("type RequiredKeys<Value> = { [Key in keyof Value]: Key }[keyof Value];");
+        let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "RequiredKeys");
+        let (indexed, mapped, key) = indexed_access_parts(&fixture, "RequiredKeys");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let resolved = query_declared(
+            &mut fixture,
+            alias,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+
+        let TypeData::IndexedAccess(access) = fixture.store.type_payload(resolved).unwrap().data()
+        else {
+            panic!("the generic mapped lookup must retain its deferred indexed-access identity")
+        };
+        assert!(matches!(
+            fixture
+                .store
+                .type_payload(access.object_type)
+                .map(TypeRecord::data),
+            Some(TypeData::Mapped(_))
+        ));
+        assert!(matches!(
+            fixture
+                .store
+                .type_payload(access.index_type)
+                .map(TypeRecord::data),
+            Some(TypeData::Index(_))
+        ));
+        assert_eq!(
+            fixture
+                .store
+                .type_node_links(indexed)
+                .and_then(|links| links.resolved_type),
+            Some(resolved),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .type_node_links(mapped)
+                .and_then(|links| links.resolved_type),
+            Some(access.object_type),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .type_node_links(key)
+                .and_then(|links| links.resolved_type),
+            Some(access.index_type),
+        );
+        let links = fixture.store.type_alias_links(alias).unwrap();
+        let parameters = links.type_parameters.as_deref().unwrap();
+        assert_eq!(parameters.len(), 1);
+        assert_eq!(
+            links
+                .instantiations
+                .as_ref()
+                .unwrap()
+                .get(&type_list_key(parameters)),
+            Some(&resolved),
+        );
+        let warm = store_state(&fixture.store);
+
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(resolved),
+        );
+        assert_eq!(store_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn generic_mapped_indexed_aliases_support_conditional_parameter_lookups() {
+        let mut fixture = fixture(concat!(
+            "interface Validator<Value> {} ",
+            "type IsOptional<Value> = Value extends undefined ? true : false; ",
+            "type RequiredKeys<Value> = { ",
+            "[Key in keyof Value]: Value[Key] extends Validator<infer Item> ",
+            "? IsOptional<Item> extends true ? never : Key : never ",
+            "}[keyof Value];",
+        ));
+        let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "RequiredKeys");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let resolved = query_declared(
+            &mut fixture,
+            alias,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            fixture.store.type_payload(resolved).map(TypeRecord::data),
+            Some(TypeData::IndexedAccess(_))
+        ));
+        let warm = store_state(&fixture.store);
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(resolved),
+        );
+        assert_eq!(store_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn homomorphic_generic_mapped_aliases_support_nested_parameter_lookups() {
+        let mut fixture = fixture(concat!(
+            "interface Validator<Value> {} ",
+            "type InferType<Value> = Value extends Validator<infer Item> ? Item : never; ",
+            "type InferPropsInner<Value> = { ",
+            "[Key in keyof Value]: InferType<Value[Key]> ",
+            "};",
+        ));
+        let alias = named_symbol(
+            &fixture,
+            SyntaxKind::TypeAliasDeclaration,
+            "InferPropsInner",
+        );
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let resolved = query_declared(
+            &mut fixture,
+            alias,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            fixture.store.type_payload(resolved).map(TypeRecord::data),
+            Some(TypeData::Mapped(_))
+        ));
+        let links = fixture.store.type_alias_links(alias).unwrap();
+        let parameters = links.type_parameters.as_deref().unwrap();
+        assert_eq!(parameters.len(), 1);
+        assert_eq!(
+            links
+                .instantiations
+                .as_ref()
+                .unwrap()
+                .get(&type_list_key(parameters)),
+            Some(&resolved),
+        );
+        let warm = store_state(&fixture.store);
+
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(resolved),
+        );
+        assert_eq!(store_state(&fixture.store), warm);
         assert!(diagnostics.is_empty());
     }
 
