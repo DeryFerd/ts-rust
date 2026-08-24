@@ -16,6 +16,7 @@
 //! closure), initialized identifier-named top-level variables (optionally
 //! exported), annotated uninitialized non-exported mutable top-level variables,
 //! exact top-level lexical blocks containing a forward read of one numeric const,
+//! top-level `for...of` loops with one const binding and one direct call,
 //! ordinary direct identifier calls, bounded annotated arrow call arguments,
 //! strict top-level call expression statements, exhaustive grouped literal
 //! switch returns, atomic
@@ -76,6 +77,7 @@ use super::{
     formatter::{
         CanonicalTypeFormatFlags,
         get_type_names_for_assignability_error_with_host_global_types_and_flags,
+        type_to_string_with_host_global_types_and_flags,
     },
     instantiate::InstantiationSession,
     jsdoc::{
@@ -181,16 +183,16 @@ use super::{
     source_statements::{
         SourceConditionalEnumFunctionStatementsSyntax, SourceControlIfSyntax,
         SourceControlLoopKind, SourceControlLoopSyntax, SourceFallthroughBranchSyntax,
-        SourceFunctionStatementsError, SourceFunctionStatementsInvariant,
-        SourceFunctionStatementsSyntax, SourceJoinedFunctionStatementsError,
-        SourceJoinedFunctionStatementsInvariant, SourceJoinedFunctionStatementsSyntax,
-        SourceLinearFunctionStatementSyntax, SourceLinearFunctionStatementsSyntax,
-        SourceLocalDeclarationSyntax, SourceReturnBranchSyntax,
-        SourceSwitchFunctionStatementsSyntax, SourceTypeofConditionSyntax,
-        SourceTypeofSwitchFunctionStatementsSyntax,
+        SourceForOfStatementSyntax, SourceFunctionStatementsError,
+        SourceFunctionStatementsInvariant, SourceFunctionStatementsSyntax,
+        SourceJoinedFunctionStatementsError, SourceJoinedFunctionStatementsInvariant,
+        SourceJoinedFunctionStatementsSyntax, SourceLinearFunctionStatementSyntax,
+        SourceLinearFunctionStatementsSyntax, SourceLocalDeclarationSyntax,
+        SourceReturnBranchSyntax, SourceSwitchFunctionStatementsSyntax,
+        SourceTypeofConditionSyntax, SourceTypeofSwitchFunctionStatementsSyntax,
         plan_source_conditional_enum_function_statements_syntax, plan_source_control_if_syntax,
-        plan_source_control_loop_syntax, plan_source_function_statements_syntax,
-        plan_source_joined_function_statements_syntax,
+        plan_source_control_loop_syntax, plan_source_for_of_statement_syntax,
+        plan_source_function_statements_syntax, plan_source_joined_function_statements_syntax,
         plan_source_linear_function_statements_syntax,
         plan_source_switch_function_statements_syntax,
         plan_source_typeof_switch_function_statements_syntax, source_control_branch_is_empty,
@@ -1172,6 +1174,13 @@ struct PlannedTopLevelLoop {
     invalid_break: Option<NodeRef>,
 }
 
+#[derive(Clone, Debug)]
+struct PlannedTopLevelForOf {
+    syntax: SourceForOfStatementSyntax,
+    iterable: PlannedExpression,
+    body: PlannedExpression,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct PlannedCatchObjectRest {
     name: NodeRef,
@@ -1251,6 +1260,7 @@ enum PlannedStatement {
     NamespaceAssignment(PlannedNamespaceAssignment),
     ControlIf(Box<PlannedTopLevelIf>),
     ControlLoop(Box<PlannedTopLevelLoop>),
+    ForOf(Box<PlannedTopLevelForOf>),
     CatchObjectRest(PlannedCatchObjectRest),
     Break(NodeRef),
     ExpressionValue(PlannedExpression),
@@ -1858,6 +1868,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 SyntaxKind::WhileStatement | SyntaxKind::LabeledStatement => {
                     statements.push(PlannedStatement::ControlLoop(Box::new(
                         self.plan_top_level_while(statement)?,
+                    )));
+                }
+                SyntaxKind::ForOfStatement => {
+                    statements.push(PlannedStatement::ForOf(Box::new(
+                        self.plan_top_level_for_of(statement)?,
                     )));
                 }
                 SyntaxKind::BreakStatement => {
@@ -3057,6 +3072,76 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         self.prior_variables = prior_variables;
         self.readable_variables = readable_variables;
         result
+    }
+
+    fn plan_top_level_for_of(
+        &mut self,
+        statement: NodeRef,
+    ) -> Result<PlannedTopLevelForOf, SourceCheckError> {
+        let Some((store, _)) = self.semantic else {
+            return Err(self.unsupported(
+                statement,
+                SyntaxKind::ForOfStatement,
+                SourceSyntaxRole::Statement,
+            ));
+        };
+        let syntax = plan_source_for_of_statement_syntax(self.arena, self.bound, store, statement)
+            .map_err(|error| match error {
+                SourceFunctionStatementsError::Unsupported(_) => self.unsupported(
+                    statement,
+                    SyntaxKind::ForOfStatement,
+                    SourceSyntaxRole::Statement,
+                ),
+                SourceFunctionStatementsError::Variable(error) => Self::variable_plan_error(error),
+                SourceFunctionStatementsError::Invariant(_) => {
+                    SourceCheckError::Function(SourceFunctionInvariant::Callable(statement))
+                }
+            })?;
+        let iterable = self.plan_expression(syntax.control.iterable.ok_or(
+            SourceCheckError::Function(SourceFunctionInvariant::Callable(statement)),
+        )?)?;
+
+        let prior_variables = self.prior_variables.clone();
+        let readable_variables = self.readable_variables.clone();
+        let result = (|| {
+            if !self.prior_variables.insert(syntax.symbol)
+                || !self.readable_variables.insert(syntax.symbol)
+            {
+                return Err(SourceCheckError::Variable(
+                    VariableInvariant::InvalidSymbolShape(syntax.symbol),
+                ));
+            }
+
+            let body = self.plan_expression(syntax.call)?;
+            let PlannedExpressionKind::Call(call) = &body.kind else {
+                return Err(SourceCheckError::Call(syntax.call));
+            };
+            let [argument] = call.arguments.as_slice() else {
+                return Err(SourceCheckError::Call(syntax.call));
+            };
+            if !matches!(call.callee.kind, PlannedExpressionKind::Identifier(_))
+                || !matches!(
+                    &argument.kind,
+                    PlannedExpressionKind::Identifier(read)
+                        if read.kind == PlannedIdentifierReadKind::Variable
+                            && read.resolved_symbol == syntax.symbol
+                            && read.value_symbol == syntax.symbol
+                )
+            {
+                return Err(SourceCheckError::Variable(
+                    VariableInvariant::InvalidSymbolShape(syntax.symbol),
+                ));
+            }
+            Ok(body)
+        })();
+        self.prior_variables = prior_variables;
+        self.readable_variables = readable_variables;
+
+        Ok(PlannedTopLevelForOf {
+            syntax,
+            iterable,
+            body: result?,
+        })
     }
 
     fn uninitialized_variable_has_lexical_shadow(
@@ -24870,6 +24955,102 @@ pub(super) fn check_source_file(
                     issue_node_diagnostic(diagnostics, statement, 1116)?;
                 }
             }
+            PlannedStatement::ForOf(iteration) => {
+                let iterable = check_expression_type(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    &current_flow_types,
+                    &preflighted_type_import_value_uses,
+                    &iteration.iterable,
+                    None,
+                    &mut deferred,
+                )?;
+                let bootstrap =
+                    store
+                        .intrinsic_bootstrap()
+                        .ok_or(SourceCheckError::LiteralCache(
+                            SourceLiteralCacheError::BootstrapUninitialized,
+                        ))?;
+                let string_type = bootstrap.string_type;
+                let error_type = bootstrap.error_type;
+                let any_type = bootstrap.any_type;
+                let iteration_type = if let Some(element) =
+                    store.canonical_array_element_type(global_types, iterable.result)?
+                {
+                    element
+                } else if store
+                    .type_payload(iterable.result)
+                    .ok_or(RelationUnavailable::Type(iterable.result))?
+                    .flags()
+                    .intersects(TypeFlags::STRING_LIKE)
+                {
+                    string_type
+                } else if iterable.result == any_type || iterable.result == error_type {
+                    iterable.result
+                } else {
+                    let mut flags = CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT;
+                    if options.no_error_truncation {
+                        flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
+                    }
+                    let operand = type_to_string_with_host_global_types_and_flags(
+                        store,
+                        host,
+                        global_types,
+                        iterable.result,
+                        flags,
+                    )?;
+                    merge_retry_diagnostic(
+                        diagnostics,
+                        CanonicalCheckerDiagnostic {
+                            node: Some(iteration.iterable.node),
+                            range_override: None,
+                            diagnostic: Diagnostic::with_arguments(
+                                message_by_code(2495)
+                                    .ok_or(SourceCheckError::MissingDiagnostic(2495))?,
+                                [operand],
+                            ),
+                            related_information: Vec::new(),
+                        },
+                    );
+                    error_type
+                };
+
+                let mut loop_flow_types = current_flow_types.clone();
+                if loop_flow_types
+                    .insert(iteration.syntax.symbol, iteration_type)
+                    .is_some()
+                {
+                    return Err(SourceCheckError::Variable(
+                        VariableInvariant::DuplicateCurrentFlowType(iteration.syntax.symbol),
+                    ));
+                }
+                check_expression_type(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    &loop_flow_types,
+                    &preflighted_type_import_value_uses,
+                    &iteration.body,
+                    None,
+                    &mut deferred,
+                )?;
+                stage_value_type(
+                    store,
+                    &mut staged_value_types,
+                    &mut value_order,
+                    iteration.syntax.symbol,
+                    iteration_type,
+                )?;
+            }
             PlannedStatement::Break(statement) => {
                 issue_node_diagnostic(diagnostics, statement, 1105)?;
             }
@@ -26090,6 +26271,312 @@ mod tests {
                 .source_callable_type_for_owner(owner)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn for_of_fixture_checks_arrays_strings_and_exact_es5_operand_diagnostics() {
+        let library = parsed("interface Array<T> {}");
+        let text = concat!(
+            "declare function log(message?: any): void;\n\n",
+            "for (const x of [1, 2, 3]) {\n",
+            "    log(x);\n",
+            "}\n\n",
+            "declare const aString: string;\n",
+            "for (const x of aString) {\n",
+            "    log(x);\n",
+            "}\n\n",
+            "declare const aNumber: number;\n",
+            "for (const x of aNumber) {\n",
+            "    log(x);\n",
+            "}\n\n",
+            "declare const anObject: { foo: string };\n",
+            "for (const x of anObject) {\n",
+            "    log(x);\n",
+            "}\n",
+        );
+        let source = parsed(text);
+        let library_file = FileId::new(8_430);
+        let file = FileId::new(8_431);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions::default(),
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 2);
+        for (diagnostic, (operand, expected_type)) in diagnostics
+            .iter()
+            .zip([("aNumber", "number"), ("anObject", "{ foo: string; }")])
+        {
+            assert_eq!(diagnostic.diagnostic.code(), 2495);
+            assert_eq!(diagnostic.diagnostic.arguments, [expected_type]);
+            assert_eq!(
+                diagnostic.diagnostic.render().unwrap(),
+                format!("Type '{expected_type}' is not an array type or a string type."),
+            );
+            let node = diagnostic.node.unwrap();
+            assert_eq!(node_text(&source, node), operand);
+            let range = source.arena.get(node.node).unwrap().range;
+            let expected_start = text.match_indices(operand).nth(1).unwrap().0;
+            assert_eq!(range.start.get(), u32::try_from(expected_start).unwrap());
+            assert_eq!(
+                range.end.get(),
+                u32::try_from(expected_start + operand.len()).unwrap(),
+            );
+        }
+
+        let mut iteration_symbols = {
+            let (_, bound) = context.file(file).unwrap();
+            source
+                .arena
+                .iter()
+                .filter_map(|(node, record)| {
+                    let NodeData::ForInOrOfStatement(iteration) = &record.data else {
+                        return None;
+                    };
+                    if record.kind != SyntaxKind::ForOfStatement {
+                        return None;
+                    }
+                    let NodeData::VariableDeclarationList(bindings) =
+                        &source.arena.get(iteration.initializer)?.data
+                    else {
+                        return None;
+                    };
+                    let declaration = NodeRef::new(
+                        source.arena.id(),
+                        file,
+                        *bindings.declarations.nodes.first()?,
+                    );
+                    Some((
+                        NodeRef::new(source.arena.id(), file, node),
+                        bound.symbol(declaration)?,
+                    ))
+                })
+                .collect::<Vec<_>>()
+        };
+        iteration_symbols
+            .sort_unstable_by_key(|(node, _)| source.arena.get(node.node).unwrap().range.start);
+        assert_eq!(iteration_symbols.len(), 4);
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        for ((_, symbol), expected) in iteration_symbols.iter().zip([
+            bootstrap.number_type,
+            bootstrap.string_type,
+            bootstrap.error_type,
+            bootstrap.error_type,
+        ]) {
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(*symbol)
+                    .and_then(|links| links.resolved_type),
+                Some(expected),
+            );
+        }
+        assert_eq!(
+            iteration_symbols
+                .iter()
+                .map(|(_, symbol)| *symbol)
+                .collect::<HashSet<_>>()
+                .len(),
+            4,
+        );
+
+        let mut reads = identifier_expressions(&source, file, "x");
+        reads.sort_unstable_by_key(|node| source.arena.get(node.node).unwrap().range.start);
+        assert_eq!(reads.len(), 4);
+        for (read, (_, symbol)) in reads.iter().zip(&iteration_symbols) {
+            assert_eq!(
+                context
+                    .store()
+                    .symbol_node_links(*read)
+                    .and_then(|links| links.resolved_symbol),
+                Some(*symbol),
+            );
+        }
+        let calls = source
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::CallExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 4);
+        for call in calls {
+            assert_eq!(resolved_node_type(&context, call), bootstrap.void_type);
+            assert!(
+                context
+                    .store()
+                    .signature_links(call)
+                    .and_then(|links| links.resolved_signature.signature())
+                    .is_some(),
+            );
+        }
+        assert!(is_type_checked(&context, file));
+
+        let warm = observable_state(&context, file);
+        mark_source_unchecked(&mut context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn for_of_body_calls_check_array_and_string_iteration_argument_types() {
+        let library = parsed("interface Array<T> {}");
+        let source = parsed(concat!(
+            "declare function expectText(value: string): void; ",
+            "declare function expectNumber(value: number): void; ",
+            "for (const numberItem of [1, 2]) { expectText(numberItem); } ",
+            "for (const textItem of 'value') { expectNumber(textItem); }",
+        ));
+        let library_file = FileId::new(8_432);
+        let file = FileId::new(8_433);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions::default(),
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 2);
+        for (diagnostic, (name, actual, expected)) in diagnostics.iter().zip([
+            ("numberItem", "number", "string"),
+            ("textItem", "string", "number"),
+        ]) {
+            assert_eq!(diagnostic.diagnostic.code(), 2345);
+            assert_eq!(diagnostic.diagnostic.arguments, [actual, expected]);
+            assert_eq!(node_text(&source, diagnostic.node.unwrap()), name);
+            assert_eq!(
+                diagnostic.diagnostic.render().unwrap(),
+                format!(
+                    "Argument of type '{actual}' is not assignable to parameter of type '{expected}'.",
+                ),
+            );
+        }
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        assert_eq!(
+            variable_value_type(&context, &source, file, "numberItem"),
+            bootstrap.number_type,
+        );
+        assert_eq!(
+            variable_value_type(&context, &source, file, "textItem"),
+            bootstrap.string_type,
+        );
+
+        let warm = observable_state(&context, file);
+        mark_source_unchecked(&mut context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn for_of_bindings_shadow_without_escaping_into_top_level_flow() {
+        let library = parsed("interface Array<T> {}");
+        let source = parsed(concat!(
+            "declare function log(value: any): void; ",
+            "const item = 0; ",
+            "for (const item of [1]) { log(item); } ",
+            "for (const item of 'text') { log(item); } ",
+            "log(item);",
+        ));
+        let library_file = FileId::new(8_434);
+        let file = FileId::new(8_435);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions::default(),
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let top_level = variable_symbol(&context, &source, file, "item");
+        let top_level_type = variable_value_type(&context, &source, file, "item");
+        let mut reads = identifier_expressions(&source, file, "item");
+        reads.sort_unstable_by_key(|node| source.arena.get(node.node).unwrap().range.start);
+        let [number_read, string_read, trailing_read] = reads.as_slice() else {
+            panic!("expected one read in each loop and one top-level read")
+        };
+        let number_symbol = context
+            .store()
+            .symbol_node_links(*number_read)
+            .and_then(|links| links.resolved_symbol)
+            .unwrap();
+        let string_symbol = context
+            .store()
+            .symbol_node_links(*string_read)
+            .and_then(|links| links.resolved_symbol)
+            .unwrap();
+        assert_ne!(number_symbol, string_symbol);
+        assert_ne!(number_symbol, top_level);
+        assert_ne!(string_symbol, top_level);
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        assert_eq!(
+            resolved_node_type(&context, *number_read),
+            bootstrap.number_type
+        );
+        assert_eq!(
+            resolved_node_type(&context, *string_read),
+            bootstrap.string_type
+        );
+        assert_eq!(resolved_node_type(&context, *trailing_read), top_level_type);
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(*trailing_read)
+                .and_then(|links| links.resolved_symbol),
+            Some(top_level),
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        mark_source_unchecked(&mut context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn malformed_for_of_loops_fail_before_source_state_publication() {
+        for (index, iteration) in [
+            "for (let item of [ready]) { log(item); }",
+            "for (const item: number of [ready]) { log(item); }",
+            "for (const item of [ready]) log(item);",
+            "for (const item of [ready]) { log(ready); }",
+            "for (const item of [ready]) { log(item); log(item); }",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let text =
+                format!("declare function log(value: any): void; const ready = 1; {iteration}",);
+            let source = parsed(&text);
+            let file = FileId::new(8_436 + u32::try_from(index).unwrap());
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            let ready = variable_symbol(&context, &source, file, "ready");
+            let cold = observable_state(&context, file);
+
+            assert!(
+                matches!(
+                    context.check_source_file(file),
+                    Err(SourceCheckError::Unsupported(
+                        UnsupportedSourceSyntax::Syntax {
+                            kind: SyntaxKind::ForOfStatement,
+                            role: SourceSyntaxRole::Statement,
+                            ..
+                        }
+                    )),
+                ),
+                "unexpectedly admitted malformed for-of loop: {iteration}",
+            );
+            assert_eq!(observable_state(&context, file), cold);
+            assert!(context.store().value_symbol_links(ready).is_none());
+            assert!(context.diagnostics().is_empty());
+            assert!(!is_type_checked(&context, file));
+        }
     }
 
     #[test]
