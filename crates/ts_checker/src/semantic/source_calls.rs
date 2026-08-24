@@ -47,11 +47,12 @@ use super::{
         excess_object_argument_diagnostic, missing_mapped_index_signature_details,
     },
     source::{
-        PlannedExpression, PlannedExpressionKind, SourceCheckError, UnsupportedSourceSyntax,
-        logical_binary_operator_text, merge_retry_diagnostic, merge_retry_diagnostics,
-        primitive_binary_operator_text,
+        PlannedExpression, PlannedExpressionKind, PlannedIdentifierReadKind, SourceCheckError,
+        UnsupportedSourceSyntax, logical_binary_operator_text, merge_retry_diagnostic,
+        merge_retry_diagnostics, primitive_binary_operator_text,
     },
     source_callables::{StoredSourceCallableValidation, validate_stored_source_callable},
+    source_imports::synthetic_source_import_origin,
     type_nodes::CanonicalTypeQuery,
     type_records::{TypeData, TypeRecord},
     types::TypeFlags,
@@ -2744,6 +2745,14 @@ fn recover_non_callable_source_call(
         return Err(SourceCheckError::Call(plan.node));
     }
     let diagnostic = if report_diagnostic {
+        let namespace_import = match &plan.callee.unparenthesized().kind {
+            PlannedExpressionKind::Identifier(read)
+                if read.kind == PlannedIdentifierReadKind::Import =>
+            {
+                synthetic_source_import_origin(store, read.value_symbol, callee_type)
+            }
+            _ => None,
+        };
         let apparent_type = if flags.intersects(TypeFlags::NUMBER_LIKE) {
             "Number".to_owned()
         } else if flags.intersects(TypeFlags::STRING_LIKE) {
@@ -2754,6 +2763,8 @@ fn recover_non_callable_source_call(
             "BigInt".to_owned()
         } else if flags.intersects(TypeFlags::ES_SYMBOL | TypeFlags::UNIQUE_ES_SYMBOL) {
             "Symbol".to_owned()
+        } else if namespace_import.is_some() {
+            "{ default: () => void; }".to_owned()
         } else {
             type_to_string_with_host_global_types_and_flags(
                 store,
@@ -2769,6 +2780,17 @@ fn recover_non_callable_source_call(
         )
         .render()
         .expect("TS2757 has one formatting argument");
+        let mut related_information = missing_semicolon_related_information(host, plan)?
+            .into_iter()
+            .collect::<Vec<_>>();
+        if let Some(import) = namespace_import {
+            related_information.push(CanonicalCheckerRelatedInformation {
+                node: Some(import),
+                diagnostic: Diagnostic::new(
+                    message_by_code(7038).ok_or(SourceCheckError::MissingDiagnostic(7038))?,
+                ),
+            });
+        }
         Some(CanonicalCheckerDiagnostic {
             node: Some(plan.callee_diagnostic_node),
             range_override: None,
@@ -2776,9 +2798,7 @@ fn recover_non_callable_source_call(
                 message_by_code(2349).ok_or(SourceCheckError::MissingDiagnostic(2349))?,
             )
             .with_details([format!("  {detail}")]),
-            related_information: missing_semicolon_related_information(host, plan)?
-                .into_iter()
-                .collect(),
+            related_information,
         })
     } else if return_type != error_type
         && plan
@@ -6317,6 +6337,171 @@ mod tests {
             ),
             counts
         );
+    }
+
+    #[test]
+    fn namespace_import_of_merged_ambient_callable_reports_exact_ts2349_and_ts7038() {
+        let importer = parsed("import * as foo from \"./foo\";\nfoo()\n");
+        let declaration = parsed(concat!(
+            "declare function foo(): void;\n",
+            "declare namespace foo {}\n",
+            "export = foo;\n",
+        ));
+        let importer_file = FileId::new(4_470);
+        let declaration_file = FileId::new(4_471);
+        let mut context = imported_context_with_target_facts(
+            &importer,
+            importer_file,
+            &declaration,
+            declaration_file,
+            true,
+            CanonicalModuleResolutionMode::Esm,
+            CanonicalCheckerOptions::default(),
+        );
+        let call = calls(&importer, importer_file)[0];
+        let NodeData::CallExpression(call_data) = &importer.arena.get(call.node).unwrap().data
+        else {
+            panic!("expected the namespace import call")
+        };
+        let callee = NodeRef::new(importer.arena.id(), importer_file, call_data.expression);
+        let import = importer
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ImportDeclaration).then_some(NodeRef::new(
+                    importer.arena.id(),
+                    importer_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let function = first_function_symbol(&declaration, &context, declaration_file);
+
+        context.check_source_file(declaration_file).unwrap();
+        context.check_source_file(importer_file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected one namespace import call diagnostic")
+        };
+        assert_eq!(diagnostic.node, Some(callee));
+        assert_eq!(diagnostic.diagnostic.code(), 2349);
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "This expression is not callable.\n  Type '{ default: () => void; }' has no call signatures."
+        );
+        let [related] = diagnostic.related_information.as_slice() else {
+            panic!("expected the namespace import related diagnostic")
+        };
+        assert_eq!(related.node, Some(import));
+        assert_eq!(related.diagnostic.code(), 7038);
+        assert_eq!(
+            related.diagnostic.render().unwrap(),
+            "Type originates at this import. A namespace-style import cannot be called or constructed, and will cause a failure at runtime. Consider using a default import or import require here instead."
+        );
+        let callable = context
+            .store()
+            .source_callable_type_for_owner(function)
+            .unwrap();
+        let signature = context
+            .store()
+            .source_callable_provenance(callable)
+            .map(|provenance| provenance.signature)
+            .and_then(|signature| context.store().signature(signature))
+            .unwrap();
+        assert!(signature.parameters().is_empty());
+        assert_eq!(
+            signature.resolved_return_type(),
+            Some(context.store().intrinsic_bootstrap().unwrap().void_type)
+        );
+        let (_, bound) = context.file(importer_file).unwrap();
+        let binding = importer
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::NamespaceImport).then_some(NodeRef::new(
+                    importer.arena.id(),
+                    importer_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let alias = bound.symbol(binding).unwrap();
+        let namespace = context
+            .store()
+            .value_symbol_links(alias)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let structured = context
+            .store()
+            .type_payload(namespace)
+            .and_then(|record| record.data().structured())
+            .unwrap();
+        assert_eq!(structured.call_signature_count, 0);
+        assert!(structured.signatures.is_none());
+        let warm = (
+            context.store().symbol_len(),
+            context.store().symbol_store().symbol_table_len(),
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.diagnostics().as_slice().to_vec(),
+        );
+
+        context.recheck_source_file(importer_file).unwrap();
+
+        assert_eq!(
+            (
+                context.store().symbol_len(),
+                context.store().symbol_store().symbol_table_len(),
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.diagnostics().as_slice().to_vec(),
+            ),
+            warm
+        );
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(function)
+                .and_then(|links| links.resolved_type),
+            Some(callable)
+        );
+    }
+
+    #[test]
+    fn namespace_import_of_merged_ambient_callable_supports_commonjs_resolution() {
+        let importer = parsed("import * as foo from \"./foo\";\nfoo()\n");
+        let declaration = parsed(concat!(
+            "declare function foo(): void;\n",
+            "declare namespace foo {}\n",
+            "export = foo;\n",
+        ));
+        let importer_file = FileId::new(4_472);
+        let declaration_file = FileId::new(4_473);
+        let mut context = imported_context_with_target_facts(
+            &importer,
+            importer_file,
+            &declaration,
+            declaration_file,
+            true,
+            CanonicalModuleResolutionMode::CommonJs,
+            CanonicalCheckerOptions::default(),
+        );
+
+        context.check_source_file(declaration_file).unwrap();
+        context.check_source_file(importer_file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected one CommonJS namespace import call diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2349);
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "This expression is not callable.\n  Type '{ default: () => void; }' has no call signatures."
+        );
+        let [related] = diagnostic.related_information.as_slice() else {
+            panic!("the namespace import must retain its originating import")
+        };
+        assert_eq!(related.diagnostic.code(), 7038);
     }
 
     #[test]

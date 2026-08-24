@@ -266,6 +266,17 @@ struct AuthenticatedSourceImportExportedObject {
     export_equals: bool,
 }
 
+#[derive(Clone, Copy)]
+struct AuthenticatedSyntheticImportNamespace {
+    function: NodeRef,
+    namespace: NodeRef,
+    assignment: SemanticSymbolId,
+    original: SemanticSymbolId,
+    default: SemanticSymbolId,
+    module: SemanticSymbolId,
+    originating_import: NodeRef,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct CommonJsNamedExportAssignment {
     expression: NodeRef,
@@ -1672,6 +1683,14 @@ pub(super) fn resolve_source_import_namespace_exports(
     alias_host: &mut ProductionAliasTargetHost<'_, '_, '_>,
     resolved: &ResolvedSourceImportBinding,
 ) -> Result<(), SourceImportError> {
+    if store.export_type_links(resolved.target_symbol).is_some() {
+        authenticate_synthetic_import_namespace_identity(
+            store,
+            resolved.binding.alias_symbol,
+            resolved.target_symbol,
+        )?;
+        return Ok(());
+    }
     let module = store.symbol(resolved.target_symbol).ok_or_else(|| {
         invariant(SourceImportInvariant::InvalidTargetSymbol(
             resolved.target_symbol,
@@ -3662,6 +3681,9 @@ fn plan_direct_imported_module_namespace(
     let record = store
         .symbol(module)
         .ok_or_else(|| invariant(SourceImportInvariant::InvalidTargetSymbol(module)))?;
+    if store.export_type_links(module).is_some() {
+        return plan_synthetic_import_namespace(store, host, global_types, alias, module);
+    }
     let Some([declaration]) = record.declarations() else {
         return Err(unsupported(SourceImportUnsupported::TargetSymbol {
             alias,
@@ -3770,6 +3792,474 @@ fn plan_direct_imported_module_namespace(
     Ok(PlannedSourceImportValueTarget::ModuleNamespace {
         declaration,
         members,
+    })
+}
+
+fn authenticate_synthetic_import_namespace_identity(
+    store: &CanonicalTypeMapperStore,
+    alias: SemanticSymbolId,
+    synthetic: SemanticSymbolId,
+) -> Result<AuthenticatedSyntheticImportNamespace, SourceImportError> {
+    let invalid = || invariant(SourceImportInvariant::InvalidTargetLinks(synthetic));
+    let record = store.symbol(synthetic).ok_or_else(invalid)?;
+    let links = store.export_type_links(synthetic).ok_or_else(invalid)?;
+    let original = links.target.ok_or_else(invalid)?;
+    let originating_import = links.originating_import.ok_or_else(invalid)?;
+    let owner = store.symbol(original).ok_or_else(invalid)?;
+    let Some([function, namespace]) = owner.declarations() else {
+        return Err(invalid());
+    };
+    let function = *function;
+    let namespace = *namespace;
+    let exports = record
+        .exports()
+        .and_then(|exports| store.symbol_table(exports))
+        .ok_or_else(invalid)?;
+    let default = exports
+        .get(InternalSymbolName::Default.as_ref())
+        .ok_or_else(invalid)?;
+    let default_record = store.symbol(default).ok_or_else(invalid)?;
+    let module = default_record.parent().ok_or_else(invalid)?;
+    let module_record = store.symbol(module).ok_or_else(invalid)?;
+    let module_exports = module_record
+        .exports()
+        .and_then(|exports| store.symbol_table(exports))
+        .ok_or_else(invalid)?;
+    let assignment = module_exports
+        .get(InternalSymbolName::ExportEquals.as_ref())
+        .ok_or_else(invalid)?;
+    let alias_record = store.symbol(alias).ok_or_else(invalid)?;
+    let Some([binding]) = alias_record.declarations() else {
+        return Err(invalid());
+    };
+    let binding = *binding;
+    let Some(SourceNodeParent::Parent(clause)) = store.source_node_parent(binding) else {
+        return Err(invalid());
+    };
+
+    if record.flags() != SymbolFlags::FUNCTION | SymbolFlags::NAMESPACE_MODULE
+        || record.check_flags() != CheckFlags::NONE
+        || record.name() != owner.name()
+        || record.declarations() != owner.declarations()
+        || record.value_declaration() != Some(function)
+        || record.members().is_some()
+        || record.parent() != owner.parent()
+        || record.export_symbol().is_some()
+        || store.get_merged_symbol(synthetic) != Some(synthetic)
+        || owner.flags() != SymbolFlags::FUNCTION | SymbolFlags::NAMESPACE_MODULE
+        || owner.check_flags() != CheckFlags::NONE
+        || owner.value_declaration() != Some(function)
+        || owner.members().is_some()
+        || owner.exports().is_some()
+        || owner.parent().is_some()
+        || owner.export_symbol().is_some()
+        || store.get_merged_symbol(original) != Some(original)
+        || exports.len() != 1
+        || default_record.flags() != SymbolFlags::ALIAS
+        || default_record.check_flags() != CheckFlags::NONE
+        || default_record.name() != InternalSymbolName::Default.as_ref()
+        || default_record.declarations().is_some()
+        || default_record.value_declaration().is_some()
+        || default_record.members().is_some()
+        || default_record.exports().is_some()
+        || default_record.export_symbol().is_some()
+        || store.get_merged_symbol(default) != Some(default)
+        || store.alias_symbol_links(default)
+            != Some(&super::AliasSymbolLinks {
+                immediate_target: Some(original),
+                alias_target: AliasTargetState::Resolved(original),
+                ..super::AliasSymbolLinks::default()
+            })
+        || module_record.flags() != SymbolFlags::VALUE_MODULE
+        || module_record.check_flags() != CheckFlags::NONE
+        || module_exports.len() != 1
+        || store.get_merged_symbol(module) != Some(module)
+        || store.source_node_kind(binding) != Some(SyntaxKind::NamespaceImport)
+        || store.source_node_kind(clause) != Some(SyntaxKind::ImportClause)
+        || store.source_node_parent(clause) != Some(SourceNodeParent::Parent(originating_import))
+        || store.source_node_kind(originating_import) != Some(SyntaxKind::ImportDeclaration)
+        || alias_record.flags() != SymbolFlags::ALIAS
+        || alias_record.name() != owner.name()
+        || store.alias_symbol_links(alias).is_none_or(|alias_links| {
+            alias_links.immediate_target != Some(synthetic)
+                || alias_links.alias_target != AliasTargetState::Resolved(synthetic)
+                || alias_links.type_only_declaration.is_some()
+        })
+    {
+        return Err(invalid());
+    }
+
+    let assignment_record = store.symbol(assignment).ok_or_else(invalid)?;
+    let Some([assignment_declaration]) = assignment_record.declarations() else {
+        return Err(invalid());
+    };
+    if assignment_record.flags() != SymbolFlags::ALIAS
+        || assignment_record.check_flags() != CheckFlags::NONE
+        || assignment_record.name() != InternalSymbolName::ExportEquals.as_ref()
+        || assignment_record.value_declaration() != Some(*assignment_declaration)
+        || assignment_record.members().is_some()
+        || assignment_record.exports().is_some()
+        || assignment_record.parent() != Some(module)
+        || assignment_record.export_symbol().is_some()
+        || store.get_merged_symbol(assignment) != Some(assignment)
+        || store.source_node_kind(*assignment_declaration) != Some(SyntaxKind::ExportAssignment)
+        || store
+            .alias_symbol_links(assignment)
+            .is_some_and(|assignment_links| {
+                assignment_links.type_only_declaration.is_some()
+                    || assignment_links
+                        .immediate_target
+                        .is_some_and(|target| target != original)
+                    || assignment_links.alias_target == AliasTargetState::Unknown
+                    || assignment_links
+                        .alias_target
+                        .symbol()
+                        .is_some_and(|target| target != original)
+            })
+    {
+        return Err(invalid());
+    }
+
+    Ok(AuthenticatedSyntheticImportNamespace {
+        function,
+        namespace,
+        assignment,
+        original,
+        default,
+        module,
+        originating_import,
+    })
+}
+
+pub(super) fn synthetic_source_import_origin(
+    store: &CanonicalTypeMapperStore,
+    alias: SemanticSymbolId,
+    type_: TypeId,
+) -> Option<NodeRef> {
+    let synthetic = store.alias_symbol_links(alias)?.alias_target.symbol()?;
+    let authenticated =
+        authenticate_synthetic_import_namespace_identity(store, alias, synthetic).ok()?;
+    let record = store.type_payload(type_)?;
+    let structured = record.data().structured()?;
+    let [property] = structured.properties.as_deref()? else {
+        return None;
+    };
+    let property = *property;
+    let members = structured
+        .members
+        .and_then(|members| store.symbol_table(members))?;
+    let callable = store.source_callable_type_for_owner(authenticated.original)?;
+    let callable_provenance = store.source_callable_provenance(callable)?;
+    let signature = store.signature(callable_provenance.signature)?;
+    let void = store.intrinsic_bootstrap()?.void_type;
+    if record.flags() != TypeFlags::OBJECT
+        || record.object_flags() != ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
+        || record.symbol().is_some()
+        || structured.call_signature_count != 0
+        || structured.signatures.is_some()
+        || structured.index_infos.is_some()
+        || members.len() != 1
+        || members.get(InternalSymbolName::Default.as_ref()) != Some(property)
+        || store.symbol(property).is_none_or(|symbol| {
+            symbol.flags() != SymbolFlags::PROPERTY
+                || symbol.check_flags() != CheckFlags::NONE
+                || symbol.name() != InternalSymbolName::Default.as_ref()
+                || symbol.declarations().is_some()
+                || symbol.value_declaration().is_some()
+                || symbol.members().is_some()
+                || symbol.exports().is_some()
+                || symbol.parent().is_some()
+                || symbol.export_symbol().is_some()
+        })
+        || store.value_symbol_links(property)
+            != Some(&ValueSymbolLinks {
+                resolved_type: Some(callable),
+                ..ValueSymbolLinks::default()
+            })
+        || callable_provenance.family != SourceCallableFamily::FunctionDeclaration
+        || callable_provenance.declaration != authenticated.function
+        || callable_provenance.owner_symbol != authenticated.original
+        || !signature.parameters().is_empty()
+        || signature.resolved_return_type() != Some(void)
+        || !matches!(
+            validate_stored_source_callable(store, callable),
+            StoredSourceCallableValidation::Valid(_)
+        )
+    {
+        return None;
+    }
+    Some(authenticated.originating_import)
+}
+
+fn plan_synthetic_import_namespace(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    alias: SemanticSymbolId,
+    synthetic: SemanticSymbolId,
+) -> Result<PlannedSourceImportValueTarget, SourceImportError> {
+    let authenticated = authenticate_synthetic_import_namespace_identity(store, alias, synthetic)?;
+    let invalid = || invariant(SourceImportInvariant::InvalidTargetLinks(synthetic));
+    let (arena, bound) = host.source(authenticated.function).ok_or_else(invalid)?;
+    let facts = bound.source_facts().ok_or_else(invalid)?;
+    let function = checked_node(arena, bound, store, authenticated.function)?;
+    let NodeData::FunctionDeclaration(function_data) = &function.data else {
+        return Err(invalid());
+    };
+    let namespace = checked_node(arena, bound, store, authenticated.namespace)?;
+    let NodeData::ModuleDeclaration(namespace_data) = &namespace.data else {
+        return Err(invalid());
+    };
+    let namespace_body = namespace_data
+        .body
+        .map(|node| {
+            NodeRef::new(
+                authenticated.namespace.arena,
+                authenticated.namespace.file,
+                node,
+            )
+        })
+        .ok_or_else(invalid)?;
+    let block = checked_node(arena, bound, store, namespace_body)?;
+    let NodeData::ModuleBlock(block_data) = &block.data else {
+        return Err(invalid());
+    };
+    let source = checked_node(arena, bound, store, bound.source_file())?;
+    let NodeData::SourceFile(source_data) = &source.data else {
+        return Err(invalid());
+    };
+    let assignment_declaration = store
+        .symbol(authenticated.assignment)
+        .and_then(ts_binder::semantic::Symbol::value_declaration)
+        .ok_or_else(invalid)?;
+    let assignment = checked_node(arena, bound, store, assignment_declaration)?;
+    let NodeData::ExportAssignment(assignment_data) = &assignment.data else {
+        return Err(invalid());
+    };
+    let expression = NodeRef::new(
+        assignment_declaration.arena,
+        assignment_declaration.file,
+        assignment_data.expression,
+    );
+    let expression_record = checked_node(arena, bound, store, expression)?;
+    let NodeData::Identifier(expression_name) = &expression_record.data else {
+        return Err(invalid());
+    };
+    let function_name = function_data
+        .name
+        .map(|node| {
+            NodeRef::new(
+                authenticated.function.arena,
+                authenticated.function.file,
+                node,
+            )
+        })
+        .ok_or_else(invalid)?;
+    let function_name_text = exact_identifier(
+        arena,
+        bound,
+        store,
+        function_name,
+        authenticated.function,
+        SourceImportUnsupported::TargetDeclaration(function_name),
+    )?;
+    let namespace_name = NodeRef::new(
+        authenticated.namespace.arena,
+        authenticated.namespace.file,
+        namespace_data.name,
+    );
+    let namespace_name_text = exact_identifier(
+        arena,
+        bound,
+        store,
+        namespace_name,
+        authenticated.namespace,
+        SourceImportUnsupported::TargetDeclaration(namespace_name),
+    )?;
+    let return_type = function_data
+        .type_
+        .map(|node| {
+            NodeRef::new(
+                authenticated.function.arena,
+                authenticated.function.file,
+                node,
+            )
+        })
+        .ok_or_else(invalid)?;
+    let return_record = checked_node(arena, bound, store, return_type)?;
+    if !facts.is_declaration_file()
+        || !facts.is_external_module()
+        || facts.is_javascript_file()
+        || source_data.statements.nodes.as_slice()
+            != [
+                authenticated.function.node,
+                authenticated.namespace.node,
+                assignment_declaration.node,
+            ]
+        || bound.symbol(bound.source_file()) != Some(authenticated.module)
+        || bound.symbol(authenticated.function) != Some(authenticated.original)
+        || bound.symbol(authenticated.namespace) != Some(authenticated.original)
+        || bound.symbol(assignment_declaration) != Some(authenticated.assignment)
+        || function.kind != SyntaxKind::FunctionDeclaration
+        || function.parent != Some(bound.source_file().node)
+        || function.flags.0 != 0
+        || function_data.asterisk_token.is_some()
+        || function_data.body.is_some()
+        || !function_data.parameters.nodes.is_empty()
+        || function_data.parameters.has_trailing_comma
+        || function_data.type_parameters.is_some()
+        || function_data.facts != 0
+        || !has_exact_modifier_sequence(
+            arena,
+            bound,
+            store,
+            authenticated.function,
+            function_data.modifiers.as_ref(),
+            &[(SyntaxKind::DeclareKeyword, "declare")],
+        )?
+        || return_record.kind != SyntaxKind::VoidKeyword
+        || return_record.parent != Some(authenticated.function.node)
+        || return_record.flags.0 != 0
+        || !matches!(return_record.data, NodeData::KeywordTypeNode(_))
+        || namespace.kind != SyntaxKind::ModuleDeclaration
+        || namespace.parent != Some(bound.source_file().node)
+        || namespace.flags.0 != 0
+        || namespace_data.keyword != SyntaxKind::NamespaceKeyword
+        || !has_exact_modifier_sequence(
+            arena,
+            bound,
+            store,
+            authenticated.namespace,
+            namespace_data.modifiers.as_ref(),
+            &[(SyntaxKind::DeclareKeyword, "declare")],
+        )?
+        || block.kind != SyntaxKind::ModuleBlock
+        || block.parent != Some(authenticated.namespace.node)
+        || block.flags.0 != 0
+        || block_data.flow_node.is_some()
+        || !block_data.statements.nodes.is_empty()
+        || block_data.statements.has_trailing_comma
+        || block_data.facts != 0
+        || assignment.kind != SyntaxKind::ExportAssignment
+        || assignment.parent != Some(bound.source_file().node)
+        || assignment.flags.0 != 0
+        || !assignment_data.is_export_equals
+        || assignment_data.flow_node.is_some()
+        || assignment_data.modifiers.is_some()
+        || assignment_data.symbol.is_some()
+        || assignment_data.type_.is_some()
+        || assignment_data.facts != 0
+        || expression_record.kind != SyntaxKind::Identifier
+        || expression_record.parent != Some(assignment_declaration.node)
+        || expression_record.flags.0 != 0
+        || expression_name.flow_node.is_some()
+        || expression_name.text != function_name_text
+        || namespace_name_text != function_name_text
+        || store
+            .symbol(authenticated.original)
+            .and_then(|owner| owner.name().as_utf8())
+            != Some(function_name_text.as_str())
+    {
+        return Err(invalid());
+    }
+
+    let (import_arena, import_bound) = host
+        .source(authenticated.originating_import)
+        .ok_or_else(invalid)?;
+    let import = checked_node(
+        import_arena,
+        import_bound,
+        store,
+        authenticated.originating_import,
+    )?;
+    let NodeData::ImportDeclaration(import_data) = &import.data else {
+        return Err(invalid());
+    };
+    let clause = import_data
+        .import_clause
+        .map(|node| {
+            NodeRef::new(
+                authenticated.originating_import.arena,
+                authenticated.originating_import.file,
+                node,
+            )
+        })
+        .ok_or_else(invalid)?;
+    let clause_record = checked_node(import_arena, import_bound, store, clause)?;
+    let NodeData::ImportClause(clause_data) = &clause_record.data else {
+        return Err(invalid());
+    };
+    let binding = clause_data
+        .named_bindings
+        .map(|node| NodeRef::new(clause.arena, clause.file, node))
+        .ok_or_else(invalid)?;
+    let binding_record = checked_node(import_arena, import_bound, store, binding)?;
+    let NodeData::NamespaceImport(binding_data) = &binding_record.data else {
+        return Err(invalid());
+    };
+    let imported_name = NodeRef::new(binding.arena, binding.file, binding_data.name);
+    let imported_name_text = exact_identifier(
+        import_arena,
+        import_bound,
+        store,
+        imported_name,
+        binding,
+        SourceImportUnsupported::TargetDeclaration(imported_name),
+    )?;
+    if import.kind != SyntaxKind::ImportDeclaration
+        || import.parent != Some(import_bound.source_file().node)
+        || import.flags.0 != 0
+        || import_data.attributes.is_some()
+        || import_data.flow_node.is_some()
+        || import_data.modifiers.is_some()
+        || import_data.symbol.is_some()
+        || import_data.facts != 0
+        || clause_record.kind != SyntaxKind::ImportClause
+        || clause_record.parent != Some(authenticated.originating_import.node)
+        || clause_record.flags.0 != 0
+        || clause_data.name.is_some()
+        || clause_data.phase_modifier.is_some()
+        || clause_data.local_symbol.is_some()
+        || clause_data.symbol.is_some()
+        || clause_data.facts != 0
+        || binding_record.kind != SyntaxKind::NamespaceImport
+        || binding_record.parent != Some(clause.node)
+        || binding_record.flags.0 != 0
+        || binding_data.local_symbol.is_some()
+        || binding_data.symbol.is_some()
+        || import_bound.symbol(binding) != Some(alias)
+        || imported_name_text != function_name_text
+    {
+        return Err(invalid());
+    }
+
+    preflight_import_target_value_links(store, synthetic)?;
+    preflight_import_target_value_links(store, authenticated.original)?;
+    let callable = plan_source_callable(
+        store,
+        host,
+        authenticated.function,
+        authenticated.original,
+        Some(CanonicalArrayTargets::from_global_types(global_types)),
+    )?;
+    if callable.family != SourceCallableFamily::FunctionDeclaration
+        || callable.declaration != authenticated.function
+        || callable.owner_symbol != authenticated.original
+        || !callable.parameters.is_empty()
+        || !callable.type_parameters.is_empty()
+        || callable.return_type.type_node() != Some(return_type)
+    {
+        return Err(invalid());
+    }
+
+    Ok(PlannedSourceImportValueTarget::ModuleNamespace {
+        declaration: authenticated.function,
+        members: vec![PlannedSourceImportModuleMember {
+            name: EscapedName::internal(InternalSymbolName::Default),
+            symbol: authenticated.default,
+            value_symbol: authenticated.original,
+            target: PlannedSourceImportValueTarget::AnnotatedFunction(Box::new(callable)),
+        }],
     })
 }
 
@@ -5528,6 +6018,7 @@ fn validate_prepared_import_value(
         PreparedSourceImportTarget::ModuleNamespace { properties } => {
             valid_prepared_imported_namespace(
                 store,
+                Some(prepared.binding.alias_symbol),
                 prepared.target_symbol,
                 prepared.target_declaration,
                 prepared.type_,
@@ -5558,6 +6049,7 @@ fn validate_prepared_import_value(
 
 fn valid_prepared_imported_namespace(
     store: &CanonicalTypeMapperStore,
+    import_alias: Option<SemanticSymbolId>,
     module: SemanticSymbolId,
     declaration: NodeRef,
     type_: TypeId,
@@ -5583,12 +6075,30 @@ fn valid_prepared_imported_namespace(
         .and_then(|members| store.symbol_table(members));
     let owner =
         (store.source_node_kind(declaration) == Some(SyntaxKind::SourceFile)).then_some(module);
+    let synthetic = if store.export_type_links(module).is_some() {
+        let Some(alias) = import_alias else {
+            return false;
+        };
+        let Ok(authenticated) =
+            authenticate_synthetic_import_namespace_identity(store, alias, module)
+        else {
+            return false;
+        };
+        if authenticated.function != declaration {
+            return false;
+        }
+        Some(authenticated)
+    } else {
+        None
+    };
     target.flags().intersects(SymbolFlags::MODULE)
         && target.flags().intersects(SymbolFlags::VALUE)
-        && target.declarations() == Some(&[declaration])
+        && (synthetic.is_some() || target.declarations() == Some(&[declaration]))
         && exports.is_some()
         && record.symbol() == owner
         && record.object_flags() == ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
+        && structured.call_signature_count == 0
+        && structured.signatures.is_none()
         && symbols.len() == properties.len()
         && members.map_or(0, ts_binder::semantic::SymbolTable::len) == properties.len()
         && properties.iter().all(|property| {
@@ -5632,15 +6142,22 @@ fn valid_prepared_imported_namespace(
                             .is_ok_and(|links| links == namespace.links)
                             && valid_prepared_imported_namespace(
                                 store,
+                                None,
                                 property.value_symbol,
                                 namespace.declaration,
                                 property.type_,
                                 &namespace.properties,
                             )
                     }
-                    None => store
-                        .symbol(property.value_symbol)
-                        .is_some_and(|value| !value.flags().intersects(SymbolFlags::MODULE)),
+                    None => {
+                        synthetic.is_some_and(|authenticated| {
+                            property.name.as_ref() == InternalSymbolName::Default.as_ref()
+                                && property.target_symbol == authenticated.default
+                                && property.value_symbol == authenticated.original
+                        }) || store
+                            .symbol(property.value_symbol)
+                            .is_some_and(|value| !value.flags().intersects(SymbolFlags::MODULE))
+                    }
                 }
         })
 }
@@ -7217,6 +7734,202 @@ mod tests {
         );
         assert!(foreign.store.alias_symbol_links(alias).is_none());
         assert!(foreign.store.value_symbol_links(alias).is_none());
+    }
+
+    #[test]
+    fn namespace_import_wraps_merged_ambient_callable_without_changing_its_value() {
+        let mut fixture = fixture_with_declaration_files(
+            &[
+                r#"import * as foo from "./foo"; const imported = foo;"#,
+                concat!(
+                    "declare function foo(): void; ",
+                    "declare namespace foo {} ",
+                    "export = foo;",
+                ),
+            ],
+            &[Route {
+                source: 0,
+                specifier: 0,
+                target: Some(1),
+            }],
+            &[1],
+        );
+        let plan = fixture.plan_import(0, 0);
+        let node = identifier_initializer(&fixture, 0, "foo");
+        let bound = fixture.bound.get(&fixture.files[0].file).unwrap();
+        let read = plan_source_import_identifier_read(
+            &fixture.files[0].parsed.arena,
+            bound,
+            &fixture.store,
+            &plan.bindings[0],
+            node,
+            "foo",
+            plan.bindings[0].alias_symbol,
+        )
+        .unwrap();
+        let resolved = resolve_all(&mut fixture, &plan.bindings).unwrap();
+        let target_bound = fixture.bound.get(&fixture.files[1].file).unwrap();
+        let original = fixture
+            .store
+            .symbol_table(target_bound.locals(target_bound.source_file()).unwrap())
+            .unwrap()
+            .get_source("foo")
+            .unwrap();
+        assert_ne!(resolved[0].target_symbol, original);
+        assert!(fixture.store.value_symbol_links(original).is_none());
+        resolve_namespace_exports(&mut fixture, &resolved[0]).unwrap();
+
+        let prepared = prepare_one(&mut fixture, &resolved[0], &read).unwrap();
+
+        let PreparedSourceImportTarget::ModuleNamespace { properties } = &prepared.target else {
+            panic!("expected a synthetic module namespace")
+        };
+        let [property] = properties.as_slice() else {
+            panic!("expected exactly one synthetic default property")
+        };
+        let callable = fixture
+            .store
+            .source_callable_type_for_owner(original)
+            .unwrap();
+        assert_eq!(property.value_symbol, original);
+        assert_eq!(property.name.as_ref(), InternalSymbolName::Default.as_ref());
+        assert_eq!(property.type_, callable);
+        assert_eq!(
+            fixture
+                .store
+                .value_symbol_links(original)
+                .and_then(|links| links.resolved_type),
+            Some(callable)
+        );
+        assert!(matches!(
+            validate_stored_source_callable(&fixture.store, callable),
+            StoredSourceCallableValidation::Valid(_)
+        ));
+        let namespace = fixture.store.type_payload(prepared.type_).unwrap();
+        let structured = namespace.data().structured().unwrap();
+        assert!(namespace.symbol().is_none());
+        assert_eq!(structured.call_signature_count, 0);
+        assert!(structured.signatures.is_none());
+        assert_eq!(
+            structured.properties.as_deref(),
+            Some(&[property.symbol][..])
+        );
+        let signature = fixture
+            .store
+            .source_callable_provenance(callable)
+            .map(|provenance| provenance.signature)
+            .and_then(|signature| fixture.store.signature(signature))
+            .unwrap();
+        assert!(signature.parameters().is_empty());
+        assert_eq!(
+            signature.resolved_return_type(),
+            Some(fixture.store.intrinsic_bootstrap().unwrap().void_type)
+        );
+        assert!(
+            fixture
+                .store
+                .value_symbol_links(plan.bindings[0].alias_symbol)
+                .is_none()
+        );
+
+        publish_for_test(&mut fixture.store, std::slice::from_ref(&prepared));
+        let published = store_state(&fixture.store);
+        assert_eq!(
+            prepare_one(&mut fixture, &resolved[0], &read).unwrap(),
+            prepared
+        );
+        assert_eq!(store_state(&fixture.store), published);
+        assert_eq!(
+            fixture
+                .store
+                .value_symbol_links(original)
+                .and_then(|links| links.resolved_type),
+            Some(callable)
+        );
+    }
+
+    #[test]
+    fn synthetic_namespace_import_rejects_poisoned_target_and_module_links() {
+        for poison_target in [true, false] {
+            let mut fixture = fixture_with_declaration_files(
+                &[
+                    r#"import * as foo from "./foo"; const imported = foo;"#,
+                    concat!(
+                        "declare function foo(): void; ",
+                        "declare namespace foo {} ",
+                        "export = foo;",
+                    ),
+                ],
+                &[Route {
+                    source: 0,
+                    specifier: 0,
+                    target: Some(1),
+                }],
+                &[1],
+            );
+            let plan = fixture.plan_import(0, 0);
+            let node = identifier_initializer(&fixture, 0, "foo");
+            let bound = fixture.bound.get(&fixture.files[0].file).unwrap();
+            let read = plan_source_import_identifier_read(
+                &fixture.files[0].parsed.arena,
+                bound,
+                &fixture.store,
+                &plan.bindings[0],
+                node,
+                "foo",
+                plan.bindings[0].alias_symbol,
+            )
+            .unwrap();
+            let resolved = resolve_all(&mut fixture, &plan.bindings).unwrap();
+            let synthetic = resolved[0].target_symbol;
+            let importer_module = fixture
+                .bound
+                .get(&fixture.files[0].file)
+                .and_then(|bound| bound.symbol(bound.source_file()))
+                .unwrap();
+            if poison_target {
+                let mut links = fixture.store.export_type_links(synthetic).unwrap().clone();
+                links.target = Some(importer_module);
+                assert!(fixture.store.set_export_type_links(synthetic, links));
+            } else {
+                let default = fixture
+                    .store
+                    .symbol(synthetic)
+                    .and_then(ts_binder::semantic::Symbol::exports)
+                    .and_then(|exports| fixture.store.symbol_table(exports))
+                    .and_then(|exports| exports.get(InternalSymbolName::Default.as_ref()))
+                    .unwrap();
+                assert!(fixture.store.set_symbol_relationships(
+                    default,
+                    None,
+                    None,
+                    Some(importer_module),
+                    None,
+                ));
+            }
+            let before = store_state(&fixture.store);
+
+            assert!(matches!(
+                resolve_namespace_exports(&mut fixture, &resolved[0]),
+                Err(SourceImportError::Invariant(
+                    SourceImportInvariant::InvalidTargetLinks(target)
+                )) if target == synthetic
+            ));
+            assert!(matches!(
+                prepare_one(&mut fixture, &resolved[0], &read),
+                Err(SourceImportError::Invariant(
+                    SourceImportInvariant::InvalidTargetLinks(target)
+                )) if target == synthetic
+            ));
+            assert_eq!(store_state(&fixture.store), before);
+            assert!(fixture.store.value_symbol_links(synthetic).is_none());
+            assert!(
+                fixture
+                    .store
+                    .value_symbol_links(plan.bindings[0].alias_symbol)
+                    .is_none()
+            );
+        }
     }
 
     #[test]
