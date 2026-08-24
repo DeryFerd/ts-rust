@@ -800,6 +800,113 @@ fn source_function_owner_exports_are_valid(
     has_value_export
 }
 
+/// Validates retained arrow expando ownership without borrowing source arenas.
+pub(super) fn source_arrow_owner_expando_exports_are_valid(
+    store: &CanonicalTypeMapperStore,
+    owner_symbol: SemanticSymbolId,
+    declaration: NodeRef,
+) -> bool {
+    let Some(owner) = store.symbol(owner_symbol) else {
+        return false;
+    };
+    let Some(exports) = owner.exports() else {
+        return true;
+    };
+    let Some(SourceNodeParent::Parent(variable)) = store.source_node_parent(declaration) else {
+        return false;
+    };
+    let Some(SourceNodeParent::Parent(list)) = store.source_node_parent(variable) else {
+        return false;
+    };
+    let Some(SourceNodeParent::Parent(variable_statement)) = store.source_node_parent(list) else {
+        return false;
+    };
+    let Some(SourceNodeParent::Parent(source)) = store.source_node_parent(variable_statement)
+    else {
+        return false;
+    };
+    let Some(exports) = store.symbol_table(exports) else {
+        return false;
+    };
+    if exports.is_empty()
+        || store.source_node_kind(declaration) != Some(SyntaxKind::ArrowFunction)
+        || store.source_node_kind(variable) != Some(SyntaxKind::VariableDeclaration)
+        || store.source_node_kind(list) != Some(SyntaxKind::VariableDeclarationList)
+        || store.source_node_kind(variable_statement) != Some(SyntaxKind::VariableStatement)
+        || store.source_node_kind(source) != Some(SyntaxKind::SourceFile)
+    {
+        return false;
+    }
+
+    exports.iter().all(|(name, symbol)| {
+        let Some(property) = store.symbol(symbol) else {
+            return false;
+        };
+        let Some([assignment]) = property.declarations() else {
+            return false;
+        };
+        let assignment = *assignment;
+        let Some(SourceNodeParent::Parent(statement)) = store.source_node_parent(assignment) else {
+            return false;
+        };
+        property.flags() == SymbolFlags::PROPERTY | SymbolFlags::ASSIGNMENT
+            && property.check_flags() == CheckFlags::NONE
+            && property.name() == name
+            && property.value_declaration() == Some(assignment)
+            && property.members().is_none()
+            && property.exports().is_none()
+            && property.parent() == Some(owner_symbol)
+            && property.export_symbol().is_none()
+            && store.get_merged_symbol(symbol) == Some(symbol)
+            && assignment.is_for(declaration.arena, declaration.file)
+            && store.source_node_kind(assignment) == Some(SyntaxKind::BinaryExpression)
+            && store.source_node_kind(statement) == Some(SyntaxKind::ExpressionStatement)
+            && store.source_node_parent(statement) == Some(SourceNodeParent::Parent(source))
+    })
+}
+
+fn bound_source_arrow_owner_expando_exports_are_valid(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    owner_symbol: SemanticSymbolId,
+) -> bool {
+    if !source_arrow_owner_expando_exports_are_valid(store, owner_symbol, declaration) {
+        return false;
+    }
+    let Some(owner) = store.symbol(owner_symbol) else {
+        return false;
+    };
+    let Some(exports) = owner.exports() else {
+        return true;
+    };
+    let Some((arena, bound)) = host.source(declaration) else {
+        return false;
+    };
+    let Some(exports) = store.symbol_table(exports) else {
+        return false;
+    };
+
+    exports.iter().all(|(_, property)| {
+        let Some(assignment) = store
+            .symbol(property)
+            .and_then(ts_binder::semantic::Symbol::value_declaration)
+        else {
+            return false;
+        };
+        let Some(SourceNodeParent::Parent(statement)) = store.source_node_parent(assignment) else {
+            return false;
+        };
+        matches!(
+            super::assignment::plan_arrow_expando_assignment(arena, bound, store, statement),
+            Ok(Some(plan))
+                if plan.owner_symbol == owner_symbol
+                    && plan.property_symbol == property
+                    && plan.expression == assignment
+        )
+    })
+}
+
 fn source_function_namespace_contains_declaration(
     store: &CanonicalTypeMapperStore,
     namespaces: &[NodeRef],
@@ -1730,7 +1837,12 @@ fn plan_source_callable_with_owner_shape(
         body_mode,
         &view,
     )?;
-    if !source_function_owner_exports_are_valid(store, owner_symbol, owner) {
+    let exports_valid = if view.family == SourceCallableFamily::ArrowFunction {
+        bound_source_arrow_owner_expando_exports_are_valid(store, host, declaration, owner_symbol)
+    } else {
+        source_function_owner_exports_are_valid(store, owner_symbol, owner)
+    };
+    if !exports_valid {
         return Err(SourceCallableError::Unsupported(
             SourceCallableUnsupported::ExpandoProperties(declaration),
         ));
@@ -5317,7 +5429,11 @@ fn valid_source_callable_plan_owner(
                 && owner.name() == InternalSymbolName::Function.as_ref()
                 && owner.declarations() == Some(&[plan.declaration])
                 && owner.value_declaration() == Some(plan.declaration)
-                && owner.exports().is_none()
+                && source_arrow_owner_expando_exports_are_valid(
+                    store,
+                    plan.owner_symbol,
+                    plan.declaration,
+                )
                 && plan.owner_parent.is_none()
                 && plan.export_local.is_none()
         }
@@ -7481,7 +7597,8 @@ pub(super) fn validate_stored_source_callable(
         || family == SourceCallableFamily::ArrowFunction
             && (owner.flags() != SymbolFlags::FUNCTION
                 || owner.declarations() != Some(&[declaration])
-                || owner.exports().is_some())
+                || !source_arrow_owner_expando_exports_are_valid(store, owner_symbol, declaration)
+                || contextual.is_some() && owner.exports().is_some())
         || family == SourceCallableFamily::FunctionDeclaration
             && !valid_source_function_owner_shape(store, owner_symbol, declaration)
         || owner.check_flags() != CheckFlags::NONE

@@ -9,6 +9,8 @@
 //! before admission.
 //! Separate `CommonJS` routes admit binder-authenticated assignments to
 //! `module.exports` and static named assignments on `exports` or `module.exports`.
+//! Direct arrow expandos retain their binder-owned property declaration and
+//! authenticate the preceding source `const` before admission.
 //! Name lookup follows the pinned lexical resolver and checker export/merge routing.
 //! Valid syntax outside that closure is a typed unsupported result; malformed AST,
 //! binder, or semantic-store provenance is an invariant failure.
@@ -45,6 +47,18 @@ pub(super) struct CommonJsAssignmentPlan {
     pub(super) left: NodeRef,
     pub(super) right: NodeRef,
     pub(super) target_symbol: SemanticSymbolId,
+}
+
+/// One binder-authenticated property assignment on a preceding source arrow.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ArrowExpandoAssignmentPlan {
+    pub(super) expression: NodeRef,
+    pub(super) left: NodeRef,
+    pub(super) right: NodeRef,
+    pub(super) receiver: NodeRef,
+    pub(super) variable_symbol: SemanticSymbolId,
+    pub(super) owner_symbol: SemanticSymbolId,
+    pub(super) property_symbol: SemanticSymbolId,
 }
 
 /// The syntactic position at which the assignment slice ended.
@@ -289,6 +303,21 @@ pub(super) fn plan_commonjs_named_assignment(
     .plan_named(statement)
 }
 
+/// Authenticates `arrow.property = value` against its original binder symbols.
+pub(super) fn plan_arrow_expando_assignment(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    statement: NodeRef,
+) -> Result<Option<ArrowExpandoAssignmentPlan>, AssignmentPlanError> {
+    CommonJsAssignmentPlanner {
+        arena,
+        bound,
+        store,
+    }
+    .plan_arrow_expando(statement)
+}
+
 /// Plans one assignment with source-minted capabilities for exact mutable
 /// ambient declarations. Membership is not sufficient by itself: the target
 /// must still prove the direct `declare var`/`declare let` AST and binder shape.
@@ -361,6 +390,262 @@ pub(super) fn plan_simple_assignment_with_all_source_targets(
 }
 
 impl CommonJsAssignmentPlanner<'_> {
+    #[allow(clippy::too_many_lines)] // Authenticate the assignment, arrow, and source const.
+    fn plan_arrow_expando(
+        &self,
+        statement: NodeRef,
+    ) -> Result<Option<ArrowExpandoAssignmentPlan>, AssignmentPlanError> {
+        self.preflight_program()?;
+        if self
+            .bound
+            .source_facts()
+            .is_none_or(|facts| facts.is_javascript_file() || facts.is_declaration_file())
+        {
+            return Ok(None);
+        }
+
+        let statement_node = self.node(statement)?;
+        let NodeData::ExpressionStatement(statement_data) = &statement_node.data else {
+            return Ok(None);
+        };
+        if statement_node.flags.0 != 0 || statement_data.flow_node.is_some() {
+            return Err(AssignmentInvariant::InvalidStatementShape(statement).into());
+        }
+        if statement_node.parent != Some(self.bound.source_file().node) {
+            return Err(AssignmentPlanError::Unsupported(
+                AssignmentUnsupported::NestedTarget(statement),
+            ));
+        }
+
+        let expression = self.reference(statement_data.expression);
+        self.require_parent(expression, Some(statement.node))?;
+        let expression_node = self.node(expression)?;
+        let NodeData::BinaryExpression(binary) = &expression_node.data else {
+            return Ok(None);
+        };
+        if expression_node.flags.0 != 0
+            || binary.symbol.is_some()
+            || binary.type_.is_some()
+            || binary.facts != 0
+            || binary.modifiers.is_some()
+        {
+            return Err(AssignmentPlanError::Unsupported(
+                AssignmentUnsupported::NonOrdinaryAssignment(expression),
+            ));
+        }
+
+        let operator = self.reference(binary.operator_token);
+        self.require_parent(operator, Some(expression.node))?;
+        let operator_node = self.node(operator)?;
+        if !matches!(operator_node.data, NodeData::Token(_)) || operator_node.flags.0 != 0 {
+            return Err(AssignmentInvariant::InvalidOperatorToken(operator).into());
+        }
+        if operator_node.kind != SyntaxKind::EqualsToken {
+            return Ok(None);
+        }
+
+        let left = self.reference(binary.left);
+        let right = self.reference(binary.right);
+        self.require_parent(left, Some(expression.node))?;
+        self.require_parent(right, Some(expression.node))?;
+        let left_node = self.node(left)?;
+        let NodeData::PropertyAccessExpression(access) = &left_node.data else {
+            return Ok(None);
+        };
+        if left_node.flags.0 != 0
+            || access.flow_node.is_some()
+            || access.question_dot_token.is_some()
+            || access.facts != 0
+        {
+            return Err(AssignmentPlanError::Unsupported(
+                AssignmentUnsupported::Syntax {
+                    node: left,
+                    kind: left_node.kind,
+                    role: AssignmentSyntaxRole::LeftHandSide,
+                },
+            ));
+        }
+
+        let receiver = self.reference(access.expression);
+        let name = self.reference(access.name);
+        self.require_parent(receiver, Some(left.node))?;
+        self.require_parent(name, Some(left.node))?;
+        let receiver_node = self.node(receiver)?;
+        let NodeData::Identifier(receiver_name) = &receiver_node.data else {
+            return Ok(None);
+        };
+        if receiver_node.flags.0 != 0
+            || receiver_name.flow_node.is_some()
+            || receiver_name.text.is_empty()
+        {
+            return Err(AssignmentInvariant::InvalidIdentifierShape(receiver).into());
+        }
+        let name_node = self.node(name)?;
+        let NodeData::Identifier(property_name) = &name_node.data else {
+            return Ok(None);
+        };
+        if name_node.flags.0 != 0
+            || property_name.flow_node.is_some()
+            || property_name.text.is_empty()
+        {
+            return Err(AssignmentInvariant::InvalidIdentifierShape(name).into());
+        }
+
+        let Some(property_symbol) = self.bound.symbol(expression) else {
+            return Ok(None);
+        };
+        let property = self
+            .store
+            .symbol(property_symbol)
+            .ok_or(AssignmentInvariant::InvalidSymbol(property_symbol))?;
+        let Some(owner_symbol) = property.parent() else {
+            return Ok(None);
+        };
+        let owner = self
+            .store
+            .symbol(owner_symbol)
+            .ok_or(AssignmentInvariant::InvalidSymbol(owner_symbol))?;
+        let Some(arrow) = owner.value_declaration() else {
+            return Ok(None);
+        };
+        if self.store.source_node_kind(arrow) != Some(SyntaxKind::ArrowFunction) {
+            return Ok(None);
+        }
+
+        if property.flags() != SymbolFlags::PROPERTY | SymbolFlags::ASSIGNMENT
+            || property.check_flags() != CheckFlags::NONE
+            || property.name().as_bytes() != property_name.text.as_bytes()
+            || property.members().is_some()
+            || property.exports().is_some()
+            || property.export_symbol().is_some()
+            || self.store.get_merged_symbol(property_symbol) != Some(property_symbol)
+        {
+            return Err(AssignmentInvariant::InvalidSymbolShape(property_symbol).into());
+        }
+        let declarations = property
+            .declarations()
+            .ok_or(AssignmentInvariant::MissingDeclarations(property_symbol))?;
+        let [declaration] = declarations else {
+            return Err(AssignmentPlanError::Unsupported(
+                AssignmentUnsupported::NonUniqueTarget {
+                    node: left,
+                    symbol: property_symbol,
+                    declaration_count: declarations.len(),
+                },
+            ));
+        };
+        if *declaration != expression {
+            return Err(AssignmentInvariant::DeclarationSymbolMismatch {
+                declaration: *declaration,
+                expected: property_symbol,
+                actual: self
+                    .bound
+                    .symbol(*declaration)
+                    .ok_or(AssignmentInvariant::MissingDeclarationSymbol(*declaration))?,
+            }
+            .into());
+        }
+        if property.value_declaration() != Some(expression) {
+            return Err(AssignmentInvariant::ValueDeclarationMismatch {
+                symbol: property_symbol,
+                declaration: expression,
+                value_declaration: property.value_declaration(),
+            }
+            .into());
+        }
+
+        if owner.flags() != SymbolFlags::FUNCTION
+            || owner.check_flags() != CheckFlags::NONE
+            || owner.name() != InternalSymbolName::Function.as_ref()
+            || owner.declarations() != Some(&[arrow])
+            || owner.members().is_some()
+            || owner.parent().is_some()
+            || owner.export_symbol().is_some()
+            || self.store.get_merged_symbol(owner_symbol) != Some(owner_symbol)
+            || self.bound.symbol(arrow) != Some(owner_symbol)
+            || !super::source_callables::source_arrow_owner_expando_exports_are_valid(
+                self.store,
+                owner_symbol,
+                arrow,
+            )
+            || owner
+                .exports()
+                .and_then(|exports| self.store.symbol_table(exports))
+                .and_then(|exports| exports.get_source(&property_name.text))
+                != Some(property_symbol)
+        {
+            return Err(AssignmentInvariant::InvalidSymbolShape(owner_symbol).into());
+        }
+
+        self.validate_local_identifier(receiver, &receiver_name.text)?;
+        let variable_symbol = self
+            .bound
+            .locals(self.bound.source_file())
+            .and_then(|locals| self.store.symbol_table(locals))
+            .and_then(|locals| locals.get_source(&receiver_name.text))
+            .ok_or(AssignmentInvariant::MissingDeclarationSymbol(receiver))?;
+        let variable = self
+            .store
+            .symbol(variable_symbol)
+            .ok_or(AssignmentInvariant::InvalidSymbol(variable_symbol))?;
+        let variable_declaration = variable
+            .value_declaration()
+            .ok_or(AssignmentInvariant::MissingDeclarations(variable_symbol))?;
+        let variable_node = self.node(variable_declaration)?;
+        let NodeData::VariableDeclaration(variable_data) = &variable_node.data else {
+            return Err(AssignmentInvariant::InvalidSymbolShape(variable_symbol).into());
+        };
+        if variable.flags() != SymbolFlags::BLOCK_SCOPED_VARIABLE
+            || variable_data.type_.is_some()
+            || variable_data.initializer != Some(arrow.node)
+            || self.node(arrow)?.parent != Some(variable_declaration.node)
+        {
+            return Err(AssignmentPlanError::Unsupported(
+                AssignmentUnsupported::NonOrdinaryVariable(variable_declaration),
+            ));
+        }
+
+        let list = variable_node
+            .parent
+            .map(|node| self.reference(node))
+            .ok_or(AssignmentInvariant::InvalidDeclarationList(
+                variable_declaration,
+            ))?;
+        let list_node = self.node(list)?;
+        let NodeData::VariableDeclarationList(list_data) = &list_node.data else {
+            return Err(AssignmentInvariant::InvalidDeclarationList(list).into());
+        };
+        if list_node.flags.0 != NODE_FLAG_CONST
+            || list_data.declarations.nodes.as_slice() != [variable_declaration.node]
+        {
+            return Err(AssignmentPlanError::Unsupported(
+                AssignmentUnsupported::NonOrdinaryVariable(variable_declaration),
+            ));
+        }
+        let variable_statement = list_node
+            .parent
+            .map(|node| self.reference(node))
+            .ok_or(AssignmentInvariant::InvalidVariableStatement(list))?;
+        if self.node(variable_statement)?.range.end > statement_node.range.start {
+            return Err(AssignmentPlanError::Unsupported(
+                AssignmentUnsupported::TargetNotPrior {
+                    node: receiver,
+                    symbol: variable_symbol,
+                },
+            ));
+        }
+
+        Ok(Some(ArrowExpandoAssignmentPlan {
+            expression,
+            left,
+            right,
+            receiver,
+            variable_symbol,
+            owner_symbol,
+            property_symbol,
+        }))
+    }
+
     fn plan_named(
         &self,
         statement: NodeRef,
@@ -2659,6 +2944,18 @@ mod tests {
                 self.expression_statement(index),
             )
         }
+
+        fn arrow_expando_plan(
+            &self,
+            index: usize,
+        ) -> Result<Option<ArrowExpandoAssignmentPlan>, AssignmentPlanError> {
+            plan_arrow_expando_assignment(
+                &self.parsed.arena,
+                &self.bound,
+                &self.store,
+                self.expression_statement(index),
+            )
+        }
     }
 
     fn source_facts(file: FileId) -> CanonicalSourceFileFacts {
@@ -2775,6 +3072,124 @@ mod tests {
             })
         );
         assert_eq!(observable_state(&fixture.store), before);
+    }
+
+    #[test]
+    fn plans_exact_arrow_expando_without_semantic_writes() {
+        let fixture = Fixture::new("const foo = () => {}; foo.bar = 42; export {};");
+        let statement = fixture.expression_statement(0);
+        let (expression, left, right) = assignment_parts(&fixture.parsed, statement);
+        let NodeData::PropertyAccessExpression(access) =
+            &fixture.parsed.arena.get(left.node).unwrap().data
+        else {
+            panic!("expected foo.bar property access")
+        };
+        let receiver = NodeRef::new(fixture.parsed.arena.id(), fixture.file, access.expression);
+        let declaration = fixture.variable_declaration("foo");
+        let NodeData::VariableDeclaration(variable) =
+            &fixture.parsed.arena.get(declaration.node).unwrap().data
+        else {
+            panic!("expected foo variable declaration")
+        };
+        let arrow = NodeRef::new(
+            fixture.parsed.arena.id(),
+            fixture.file,
+            variable.initializer.unwrap(),
+        );
+        let before = observable_state(&fixture.store);
+
+        assert_eq!(
+            fixture.arrow_expando_plan(0),
+            Ok(Some(ArrowExpandoAssignmentPlan {
+                expression,
+                left,
+                right,
+                receiver,
+                variable_symbol: fixture.bound.symbol(declaration).unwrap(),
+                owner_symbol: fixture.bound.symbol(arrow).unwrap(),
+                property_symbol: fixture.bound.symbol(expression).unwrap(),
+            })),
+        );
+        assert_eq!(observable_state(&fixture.store), before);
+    }
+
+    #[test]
+    fn arrow_expandos_reject_invalid_property_flags_and_receiver_cache() {
+        let mut invalid_property = Fixture::new("const foo = () => {}; foo.bar = 42; export {};");
+        let statement = invalid_property.expression_statement(0);
+        let (expression, _, _) = assignment_parts(&invalid_property.parsed, statement);
+        let property = invalid_property.bound.symbol(expression).unwrap();
+        assert!(invalid_property.store.set_symbol_flags(
+            property,
+            SymbolFlags::PROPERTY,
+            CheckFlags::NONE,
+        ));
+        assert_eq!(
+            invalid_property.arrow_expando_plan(0),
+            Err(AssignmentPlanError::Invariant(
+                AssignmentInvariant::InvalidSymbolShape(property),
+            )),
+        );
+
+        let mut poisoned_receiver = Fixture::new("const foo = () => {}; foo.bar = 42; export {};");
+        let statement = poisoned_receiver.expression_statement(0);
+        let (expression, left, _) = assignment_parts(&poisoned_receiver.parsed, statement);
+        let NodeData::PropertyAccessExpression(access) =
+            &poisoned_receiver.parsed.arena.get(left.node).unwrap().data
+        else {
+            panic!("expected foo.bar property access")
+        };
+        let receiver = NodeRef::new(
+            poisoned_receiver.parsed.arena.id(),
+            poisoned_receiver.file,
+            access.expression,
+        );
+        let variable = poisoned_receiver.source_local("foo");
+        let owner = poisoned_receiver
+            .bound
+            .symbol(expression)
+            .and_then(|property| poisoned_receiver.store.symbol(property))
+            .and_then(ts_binder::semantic::Symbol::parent)
+            .unwrap();
+        assert!(poisoned_receiver.store.set_symbol_node_links(
+            receiver,
+            SymbolNodeLinks {
+                resolved_symbol: Some(owner),
+            },
+        ));
+        assert_eq!(
+            poisoned_receiver.arrow_expando_plan(0),
+            Err(AssignmentPlanError::Invariant(
+                AssignmentInvariant::ResolvedSymbolMismatch {
+                    node: receiver,
+                    expected: variable,
+                    actual: owner,
+                },
+            )),
+        );
+    }
+
+    #[test]
+    fn arrow_expandos_require_the_source_const_to_appear_first() {
+        let fixture = Fixture::new("foo.bar = 42; const foo = () => {}; export {};");
+        let statement = fixture.expression_statement(0);
+        let (_, left, _) = assignment_parts(&fixture.parsed, statement);
+        let NodeData::PropertyAccessExpression(access) =
+            &fixture.parsed.arena.get(left.node).unwrap().data
+        else {
+            panic!("expected foo.bar property access")
+        };
+        let receiver = NodeRef::new(fixture.parsed.arena.id(), fixture.file, access.expression);
+
+        assert_eq!(
+            fixture.arrow_expando_plan(0),
+            Err(AssignmentPlanError::Unsupported(
+                AssignmentUnsupported::TargetNotPrior {
+                    node: receiver,
+                    symbol: fixture.source_local("foo"),
+                },
+            )),
+        );
     }
 
     #[test]

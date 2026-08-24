@@ -3521,7 +3521,7 @@ mod tests {
     }
 
     #[test]
-    fn classifies_bound_expando_properties_as_deferred_source_semantics() {
+    fn admits_bound_direct_expandos_but_rejects_contextual_expandos() {
         let direct = Fixture::new("const foo = () => {}; foo.bar = 42; export {};");
         let direct_declaration = direct.declarations()[0];
         let NodeData::VariableDeclaration(direct_variable) = &direct
@@ -3547,18 +3547,46 @@ mod tests {
                 .exports()
                 .is_some()
         );
-        assert!(matches!(
-            direct.plan(0),
-            Err(SourceArrowError::Unsupported(
-                SourceArrowUnsupported::Callable(SourceCallableUnsupported::ExpandoProperties(_))
-            ))
-        ));
+        let direct_plan = direct.plan(0).unwrap();
+        assert_eq!(direct_plan.callable.declaration, direct_arrow);
+        assert_eq!(direct_plan.callable.owner_symbol, direct_owner);
         assert!(
             direct
                 .store
                 .source_callable_type_for_owner(direct_owner)
                 .is_none()
         );
+
+        let mut malformed = Fixture::new("const foo = () => {}; foo.bar = 42; export {};");
+        let assignment = malformed
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::BinaryExpression).then_some(NodeRef::new(
+                    malformed.parsed.arena.id(),
+                    malformed.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let property = malformed.bound.symbol(assignment).unwrap();
+        let record = malformed.store.symbol(property).unwrap();
+        let (members, exports, export_symbol) =
+            (record.members(), record.exports(), record.export_symbol());
+        assert!(malformed.store.set_symbol_relationships(
+            property,
+            members,
+            exports,
+            None,
+            export_symbol,
+        ));
+        assert!(matches!(
+            malformed.plan(0),
+            Err(SourceArrowError::Unsupported(
+                SourceArrowUnsupported::Callable(SourceCallableUnsupported::ExpandoProperties(_))
+            ))
+        ));
 
         let contextual = Fixture::new("const foo: () => void = () => {}; foo.bar = 42; export {};");
         assert!(matches!(

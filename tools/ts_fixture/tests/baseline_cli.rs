@@ -165,19 +165,15 @@ fn canonical_scorecard_retains_capabilities_then_continues_to_exact_case() {
     );
     assert_eq!(output.status.code(), Some(1));
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(
-        stdout.contains(
-            "MISMATCH testdata/tests/cases/compiler/functionExpandoPropertyDeclaration.ts"
-        )
-    );
-    assert!(stdout.contains("unsupported_details=2"));
+    assert!(stdout.contains("MISMATCH testdata/tests/cases/compiler/spreadElementUnsupported.ts"));
+    assert!(stdout.contains("unsupported_details=1"));
     assert!(stdout.contains("fatal_invariants=0"));
     let scorecard: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(scorecard_path).unwrap()).unwrap();
     assert_eq!(scorecard["schemaVersion"], 5);
     assert_eq!(scorecard["summary"]["executedVariants"], 3);
-    assert_eq!(scorecard["summary"]["exactMatches"], 1, "{scorecard:#}");
-    assert_eq!(scorecard["summary"]["unsupportedDetails"], 2);
+    assert_eq!(scorecard["summary"]["exactMatches"], 2, "{scorecard:#}");
+    assert_eq!(scorecard["summary"]["unsupportedDetails"], 1);
     assert_eq!(scorecard["summary"]["fatalInvariants"], 0);
 
     let variants = scorecard["variants"].as_array().unwrap();
@@ -186,13 +182,9 @@ fn canonical_scorecard_retains_capabilities_then_continues_to_exact_case() {
         variants[0]["case"],
         "testdata/tests/cases/compiler/functionExpandoPropertyDeclaration.ts"
     );
-    assert_eq!(variants[0]["status"], "unsupported_detail");
-    assert_eq!(variants[0]["outcomeClass"], "checker_capability");
-    assert_eq!(
-        variants[0]["frontierBlocker"]["outcomeClass"],
-        "checker_capability"
-    );
-    assert_eq!(variants[0]["frontierBlocker"]["code"], "E00.SOURCE_SYNTAX");
+    assert_eq!(variants[0]["status"], "exact_match");
+    assert_eq!(variants[0]["outcomeClass"], "exact");
+    assert_eq!(variants[0]["frontierBlocker"], serde_json::Value::Null);
     assert_eq!(
         variants[1]["case"],
         "testdata/tests/cases/compiler/spreadElementUnsupported.ts"
