@@ -165,7 +165,8 @@ use super::{
     },
     source_namespaces::{
         SourceNamespaceMemberPlan, SourceNamespacePlan, execute_source_namespace,
-        plan_source_namespace,
+        merge_source_ambient_module_exports, plan_source_namespace,
+        resolve_source_namespace_external_imports,
     },
     source_new::{
         SourceDefaultNewPlan, SourceNewError, SourceNewInvariant, SourceNewUnsupported,
@@ -22484,6 +22485,11 @@ pub(super) fn check_source_file(
         options,
     )
     .finish()?;
+    for statement in &statements {
+        if let PlannedStatement::Namespace(namespace) = statement {
+            resolve_source_namespace_external_imports(store, alias_host, namespace)?;
+        }
+    }
     let mut jsdoc_typedef_imports =
         HashMap::<SemanticSymbolId, ResolvedSourceJsDocTypedefImport>::new();
     let mut jsdoc_typedef_import_variables = HashMap::<NodeRef, SemanticSymbolId>::new();
@@ -24223,6 +24229,7 @@ pub(super) fn check_source_file(
                     diagnostics,
                     &namespace,
                 )?;
+                merge_source_ambient_module_exports(store, host, diagnostics, &namespace)?;
                 for read in ambient_namespace_reads
                     .iter()
                     .filter(|read| read.same_file && read.namespace == namespace.symbol)
