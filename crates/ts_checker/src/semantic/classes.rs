@@ -28,6 +28,8 @@
 //! A class may extend the literal `null` without acquiring an instance base.
 //! An authenticated class/interface merge with `extends null` and `super()`
 //! retains its exact static-side and constructor diagnostics without publication.
+//! Constructor-factory inheritance retains exact later-field initialization
+//! diagnostics without replacing binder-owned property symbols.
 //! Nonempty executable bodies, general heritage, and non-primitive annotations
 //! remain later class stages.
 
@@ -62,6 +64,7 @@ use super::{
 const NODE_FLAG_JSDOC: u32 = 1 << 22;
 const NODE_FLAG_HAS_ERROR: u32 = 1 << 15;
 const NODE_FLAG_LET: u32 = 1 << 0;
+const NODE_FLAG_CONST: u32 = 1 << 1;
 const PROTOTYPE_NAME: &str = "prototype";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -7308,6 +7311,380 @@ fn plan_merged_null_base_class_grammar_diagnostics(
     })
 }
 
+fn resolve_factory_heritage_symbol(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    reference: NodeRef,
+    name: &str,
+    meaning: SymbolFlags,
+) -> Option<SemanticSymbolId> {
+    let (arena, bound) = host.source(reference)?;
+    let mut callbacks = host.name_resolver_host(store).ok()?;
+    let resolved = CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut callbacks)
+        .ok()?
+        .resolve(
+            Some(CanonicalResolutionLocation::Bound(reference)),
+            name,
+            meaning,
+            None,
+            false,
+            false,
+        )
+        .ok()??;
+    store.get_merged_symbol(resolved)
+}
+
+fn plan_intersection_constructor_factory(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    clauses: &ts_ast::NodeList,
+) -> Option<()> {
+    let [clause] = clauses.nodes.as_slice() else {
+        return None;
+    };
+    let clause = NodeRef::new(declaration.arena, declaration.file, *clause);
+    let clause_record = preflight_node(store, host, clause).ok()?;
+    let NodeData::HeritageClause(heritage) = &clause_record.data else {
+        return None;
+    };
+    let [base] = heritage.types.nodes.as_slice() else {
+        return None;
+    };
+    let base = NodeRef::new(clause.arena, clause.file, *base);
+    let base_record = preflight_node(store, host, base).ok()?;
+    let NodeData::ExpressionWithTypeArguments(expression) = &base_record.data else {
+        return None;
+    };
+    let factory_name = NodeRef::new(base.arena, base.file, expression.expression);
+    let factory_name_record = preflight_node(store, host, factory_name).ok()?;
+    let NodeData::Identifier(factory_identifier) = &factory_name_record.data else {
+        return None;
+    };
+    if clauses.has_trailing_comma
+        || clause_record.kind != SyntaxKind::HeritageClause
+        || clause_record.flags.0 != 0
+        || clause_record.parent != Some(declaration.node)
+        || heritage.token != SyntaxKind::ExtendsKeyword
+        || heritage.facts != 0
+        || heritage.types.has_trailing_comma
+        || base_record.kind != SyntaxKind::ExpressionWithTypeArguments
+        || base_record.flags.0 != 0
+        || base_record.parent != Some(clause.node)
+        || expression.type_arguments.is_some()
+        || expression.facts != 0
+        || factory_name_record.kind != SyntaxKind::Identifier
+        || factory_name_record.flags.0 != 0
+        || factory_name_record.parent != Some(base.node)
+        || factory_identifier.flow_node.is_some()
+        || factory_identifier.text.is_empty()
+    {
+        return None;
+    }
+
+    let factory = resolve_factory_heritage_symbol(
+        store,
+        host,
+        factory_name,
+        &factory_identifier.text,
+        SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE,
+    )?;
+    let owner = store.symbol(factory)?;
+    let [variable] = owner.declarations()? else {
+        return None;
+    };
+    let variable = *variable;
+    let variable_record = preflight_node(store, host, variable).ok()?;
+    let NodeData::VariableDeclaration(variable_data) = &variable_record.data else {
+        return None;
+    };
+    let variable_name = NodeRef::new(variable.arena, variable.file, variable_data.name);
+    let variable_name_record = preflight_node(store, host, variable_name).ok()?;
+    let NodeData::Identifier(variable_identifier) = &variable_name_record.data else {
+        return None;
+    };
+    let list = NodeRef::new(variable.arena, variable.file, variable_record.parent?);
+    let list_record = preflight_node(store, host, list).ok()?;
+    let NodeData::VariableDeclarationList(declarations) = &list_record.data else {
+        return None;
+    };
+    let statement = NodeRef::new(list.arena, list.file, list_record.parent?);
+    let statement_record = preflight_node(store, host, statement).ok()?;
+    let NodeData::VariableStatement(variable_statement) = &statement_record.data else {
+        return None;
+    };
+    let modifiers = variable_statement.modifiers.as_ref()?;
+    let [modifier] = modifiers.list.nodes.as_slice() else {
+        return None;
+    };
+    let modifier = NodeRef::new(statement.arena, statement.file, *modifier);
+    let modifier_record = preflight_node(store, host, modifier).ok()?;
+    if !variable.is_for(declaration.arena, declaration.file)
+        || owner.flags() != SymbolFlags::BLOCK_SCOPED_VARIABLE
+        || owner.check_flags() != CheckFlags::NONE
+        || owner.name().as_utf8() != Some(factory_identifier.text.as_str())
+        || owner.value_declaration() != Some(variable)
+        || owner.members().is_some()
+        || owner.exports().is_some()
+        || owner.parent().is_some()
+        || owner.export_symbol().is_some()
+        || variable_record.kind != SyntaxKind::VariableDeclaration
+        || variable_record.flags.0 != 0
+        || variable_data.initializer.is_some()
+        || variable_data.exclamation_token.is_some()
+        || variable_data.local_symbol.is_some()
+        || variable_data.symbol.is_some()
+        || variable_data.facts != 0
+        || bound_symbol(store, host, variable) != Some(factory)
+        || variable_name_record.kind != SyntaxKind::Identifier
+        || variable_name_record.flags.0 != 0
+        || variable_name_record.parent != Some(variable.node)
+        || variable_identifier.flow_node.is_some()
+        || variable_identifier.text != factory_identifier.text
+        || list_record.kind != SyntaxKind::VariableDeclarationList
+        || list_record.flags.0 != NODE_FLAG_CONST
+        || list_record.parent != Some(statement.node)
+        || declarations.declarations.nodes.as_slice() != [variable.node]
+        || declarations.declarations.has_trailing_comma
+        || declarations.facts != 0
+        || statement_record.kind != SyntaxKind::VariableStatement
+        || statement_record.flags.0 != 0
+        || statement_record.parent != host.node(declaration)?.parent
+        || statement_record.range.end > host.node(declaration)?.range.start
+        || variable_statement.declaration_list != list.node
+        || variable_statement.flow_node.is_some()
+        || variable_statement.facts != 0
+        || modifiers.flags.0 != 0
+        || modifiers.list.has_trailing_comma
+        || modifier_record.kind != SyntaxKind::DeclareKeyword
+        || modifier_record.flags.0 != 0
+        || modifier_record.parent != Some(statement.node)
+        || !matches!(modifier_record.data, NodeData::Token(_))
+    {
+        return None;
+    }
+
+    let annotation = NodeRef::new(variable.arena, variable.file, variable_data.type_?);
+    let annotation_record = preflight_node(store, host, annotation).ok()?;
+    let NodeData::ConstructorTypeNode(constructor) = &annotation_record.data else {
+        return None;
+    };
+    let result = NodeRef::new(annotation.arena, annotation.file, constructor.type_?);
+    let result_record = preflight_node(store, host, result).ok()?;
+    let NodeData::IntersectionTypeNode(intersection) = &result_record.data else {
+        return None;
+    };
+    let [class_reference, additional] = intersection.types.nodes.as_slice() else {
+        return None;
+    };
+    if annotation_record.kind != SyntaxKind::ConstructorType
+        || annotation_record.flags.0 != 0
+        || annotation_record.parent != Some(variable.node)
+        || constructor.full_signature.is_some()
+        || constructor.next_container.is_some()
+        || constructor.symbol.is_some()
+        || constructor.type_parameters.is_some()
+        || constructor.modifiers.is_some()
+        || !constructor.parameters.nodes.is_empty()
+        || constructor.parameters.has_trailing_comma
+        || result_record.kind != SyntaxKind::IntersectionType
+        || result_record.flags.0 != 0
+        || result_record.parent != Some(annotation.node)
+        || intersection.types.has_trailing_comma
+    {
+        return None;
+    }
+
+    let class_reference = NodeRef::new(result.arena, result.file, *class_reference);
+    let class_reference_record = preflight_node(store, host, class_reference).ok()?;
+    let NodeData::TypeReferenceNode(reference) = &class_reference_record.data else {
+        return None;
+    };
+    let class_name = NodeRef::new(
+        class_reference.arena,
+        class_reference.file,
+        reference.type_name,
+    );
+    let class_name_record = preflight_node(store, host, class_name).ok()?;
+    let NodeData::Identifier(class_identifier) = &class_name_record.data else {
+        return None;
+    };
+    let base_class = resolve_factory_heritage_symbol(
+        store,
+        host,
+        class_name,
+        &class_identifier.text,
+        SymbolFlags::TYPE,
+    )?;
+    let base_owner = store.symbol(base_class)?;
+    let [base_declaration] = base_owner.declarations()? else {
+        return None;
+    };
+    if class_reference_record.kind != SyntaxKind::TypeReference
+        || class_reference_record.flags.0 != 0
+        || class_reference_record.parent != Some(result.node)
+        || reference.type_arguments.is_some()
+        || class_name_record.kind != SyntaxKind::Identifier
+        || class_name_record.flags.0 != 0
+        || class_name_record.parent != Some(class_reference.node)
+        || class_identifier.flow_node.is_some()
+        || base_owner.flags() != SymbolFlags::CLASS
+        || base_owner.name().as_utf8() != Some(class_identifier.text.as_str())
+        || host.node(*base_declaration)?.range.end > statement_record.range.start
+    {
+        return None;
+    }
+
+    let additional = NodeRef::new(result.arena, result.file, *additional);
+    let additional_record = preflight_node(store, host, additional).ok()?;
+    let additional_plan =
+        super::object_members::plan_type_literal(store, host, additional, None).ok()?;
+    let [property] = additional_plan.properties.as_slice() else {
+        return None;
+    };
+    let property_type = preflight_node(store, host, property.type_node).ok()?;
+    if additional_record.kind != SyntaxKind::TypeLiteral
+        || additional_record.flags.0 != 0
+        || additional_record.parent != Some(result.node)
+        || !additional_plan.methods.is_empty()
+        || !additional_plan.spreads.is_empty()
+        || !additional_plan.indexes.is_empty()
+        || !additional_plan.call_signatures.is_empty()
+        || property_type.kind != SyntaxKind::StringKeyword
+        || property_type.flags.0 != 0
+        || !matches!(property_type.data, NodeData::KeywordTypeNode(_))
+    {
+        return None;
+    }
+    Some(())
+}
+
+fn plan_factory_derived_property_initialization(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    symbol: SemanticSymbolId,
+    members: &ts_ast::NodeList,
+    clauses: &ts_ast::NodeList,
+) -> Option<ClassGrammarDiagnostic> {
+    plan_intersection_constructor_factory(store, host, declaration, clauses)?;
+    let [first, second] = members.nodes.as_slice() else {
+        return None;
+    };
+    let first = NodeRef::new(declaration.arena, declaration.file, *first);
+    let second = NodeRef::new(declaration.arena, declaration.file, *second);
+    let first_record = preflight_node(store, host, first).ok()?;
+    let second_record = preflight_node(store, host, second).ok()?;
+    let (NodeData::PropertyDeclaration(initial), NodeData::PropertyDeclaration(later)) =
+        (&first_record.data, &second_record.data)
+    else {
+        return None;
+    };
+    let (first_name, first_text) = accessor_name(store, host, first, initial.name).ok()?;
+    let (second_name, second_text) = accessor_name(store, host, second, later.name).ok()?;
+    let first_symbol = bound_symbol(store, host, first)?;
+    let second_symbol = bound_symbol(store, host, second)?;
+    let owner = store.symbol(symbol)?;
+    let table = owner
+        .members()
+        .and_then(|members| store.symbol_table(members))?;
+    if first_record.kind != SyntaxKind::PropertyDeclaration
+        || first_record.flags.0 != 0
+        || first_record.parent != Some(declaration.node)
+        || initial.postfix_token.is_some()
+        || initial.symbol.is_some()
+        || initial.type_.is_some()
+        || initial.modifiers.is_some()
+        || initial.facts != 0
+        || second_record.kind != SyntaxKind::PropertyDeclaration
+        || second_record.flags.0 != 0
+        || second_record.parent != Some(declaration.node)
+        || second_record.range.start < first_record.range.end
+        || later.postfix_token.is_some()
+        || later.symbol.is_some()
+        || later.type_.is_some()
+        || later.modifiers.is_some()
+        || later.facts != 0
+        || first_text == second_text
+        || table.len() != 2
+        || table.get_source(&first_text) != Some(first_symbol)
+        || table.get_source(&second_text) != Some(second_symbol)
+    {
+        return None;
+    }
+    for (field, name, field_symbol) in [
+        (first, first_name, first_symbol),
+        (second, second_name, second_symbol),
+    ] {
+        let record = store.symbol(field_symbol)?;
+        let name_record = preflight_node(store, host, name).ok()?;
+        if record.flags() != SymbolFlags::PROPERTY
+            || record.check_flags() != CheckFlags::NONE
+            || record.declarations() != Some(&[field])
+            || record.value_declaration() != Some(field)
+            || record.members().is_some()
+            || record.exports().is_some()
+            || record.parent() != Some(symbol)
+            || record.export_symbol().is_some()
+            || store.get_merged_symbol(field_symbol) != Some(field_symbol)
+            || name_record.parent != Some(field.node)
+        {
+            return None;
+        }
+    }
+
+    let initializer = NodeRef::new(first.arena, first.file, initial.initializer?);
+    let initializer_record = preflight_node(store, host, initializer).ok()?;
+    let NodeData::PropertyAccessExpression(access) = &initializer_record.data else {
+        return None;
+    };
+    let receiver = NodeRef::new(initializer.arena, initializer.file, access.expression);
+    let receiver_record = preflight_node(store, host, receiver).ok()?;
+    let NodeData::KeywordExpression(keyword) = &receiver_record.data else {
+        return None;
+    };
+    let reference = NodeRef::new(initializer.arena, initializer.file, access.name);
+    let reference_record = preflight_node(store, host, reference).ok()?;
+    let NodeData::Identifier(identifier) = &reference_record.data else {
+        return None;
+    };
+    let later_initializer = NodeRef::new(second.arena, second.file, later.initializer?);
+    let later_initializer_record = preflight_node(store, host, later_initializer).ok()?;
+    let NodeData::StringLiteral(literal) = &later_initializer_record.data else {
+        return None;
+    };
+    if initializer_record.kind != SyntaxKind::PropertyAccessExpression
+        || initializer_record.flags.0 != 0
+        || initializer_record.parent != Some(first.node)
+        || access.flow_node.is_some()
+        || access.question_dot_token.is_some()
+        || access.facts != 0
+        || receiver_record.kind != SyntaxKind::ThisKeyword
+        || receiver_record.flags.0 != 0
+        || receiver_record.parent != Some(initializer.node)
+        || keyword.flow_node.is_some()
+        || reference_record.kind != SyntaxKind::Identifier
+        || reference_record.flags.0 != 0
+        || reference_record.parent != Some(initializer.node)
+        || reference_record.range.start < receiver_record.range.end
+        || identifier.flow_node.is_some()
+        || identifier.text != second_text
+        || later_initializer_record.kind != SyntaxKind::StringLiteral
+        || later_initializer_record.flags.0 != 0
+        || later_initializer_record.parent != Some(second.node)
+        || literal.token_flags.0 != 0
+    {
+        return None;
+    }
+
+    Some(ClassGrammarDiagnostic {
+        node: reference,
+        range_override: None,
+        code: 2729,
+        arguments: vec![second_text],
+    })
+}
+
 /// Authenticates supported class grammar failures without publishing class types.
 pub(super) fn plan_class_grammar_diagnostics(
     store: &CanonicalTypeMapperStore,
@@ -7426,6 +7803,23 @@ pub(super) fn plan_class_grammar_diagnostics(
             NodeRef::new(declaration.arena, declaration.file, *getter),
         )?);
     } else if let Some(clauses) = class.heritage_clauses.as_ref() {
+        if let Some(diagnostic) = plan_factory_derived_property_initialization(
+            store,
+            host,
+            declaration,
+            symbol,
+            &class.members,
+            clauses,
+        ) {
+            if export_table.len() != 1 {
+                return None;
+            }
+            return Some(ClassGrammarDiagnosticPlan {
+                declaration,
+                symbol,
+                diagnostics: vec![diagnostic],
+            });
+        }
         if !class.members.nodes.is_empty() || owner.members().is_some() || export_table.len() != 1 {
             return None;
         }
@@ -12729,6 +13123,87 @@ mod tests {
                     fixture.store.checker_link_allocated_lengths(),
                 ),
                 cold
+            );
+            assert!(fixture.store.declared_type_links(owner).is_none());
+            assert!(fixture.store.value_symbol_links(owner).is_none());
+        }
+    }
+
+    #[test]
+    fn constructor_factory_heritage_authenticates_later_instance_property_reads() {
+        let fixture = fixture(concat!(
+            "class Base {} ",
+            "declare const Factory: new() => Base & { marker: string }; ",
+            "class Derived extends Factory { first = this.second; second = 'ready'; }",
+        ));
+        let owner = class_symbol(&fixture, "Derived");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        let grammar = plan_class_grammar_diagnostics(&fixture.store, &host, owner)
+            .expect("factory inheritance must preserve the real property initialization error");
+
+        let [diagnostic] = grammar.diagnostics.as_slice() else {
+            panic!("one later property read requires one initialization diagnostic")
+        };
+        assert_eq!(diagnostic.code, 2729);
+        assert_eq!(diagnostic.arguments, ["second"]);
+        assert!(diagnostic.range_override.is_none());
+        let NodeData::Identifier(reference) =
+            &fixture.parsed.arena.get(diagnostic.node.node).unwrap().data
+        else {
+            panic!("the diagnostic must cover the referenced property name")
+        };
+        assert_eq!(reference.text, "second");
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+        assert!(fixture.store.declared_type_links(owner).is_none());
+        assert!(fixture.store.value_symbol_links(owner).is_none());
+    }
+
+    #[test]
+    fn constructor_factory_heritage_rejects_unrelated_initializers_and_factories() {
+        for source in [
+            concat!(
+                "class Base {} ",
+                "declare const Factory: new(value: string) => Base & { marker: string }; ",
+                "class Derived extends Factory { first = this.second; second = 'ready'; }",
+            ),
+            concat!(
+                "class Base {} ",
+                "declare const Factory: new() => Base; ",
+                "class Derived extends Factory { first = this.second; second = 'ready'; }",
+            ),
+            concat!(
+                "class Base {} ",
+                "declare const Factory: new() => Base & { marker: string }; ",
+                "class Derived extends Factory { first = this.missing; second = 'ready'; }",
+            ),
+            concat!(
+                "class Base {} ",
+                "declare const Factory: new() => Base & { marker: string }; ",
+                "class Derived extends Factory { first = this.second; second = 1; }",
+            ),
+        ] {
+            let fixture = fixture(source);
+            let owner = class_symbol(&fixture, "Derived");
+            let bound = &fixture.files[&fixture.file];
+            let host = host(&fixture.parsed.arena, bound);
+
+            assert!(
+                plan_class_grammar_diagnostics(&fixture.store, &host, owner).is_none(),
+                "{source}",
             );
             assert!(fixture.store.declared_type_links(owner).is_none());
             assert!(fixture.store.value_symbol_links(owner).is_none());

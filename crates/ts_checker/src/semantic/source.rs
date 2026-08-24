@@ -23174,6 +23174,38 @@ pub(super) fn check_source_file(
             }
             PlannedStatement::ClassGrammar(class) => {
                 for diagnostic in class.diagnostics {
+                    let related_information = if diagnostic.code == 2729 {
+                        let name = diagnostic
+                            .arguments
+                            .first()
+                            .ok_or(SourceCheckError::Class(class.declaration))?;
+                        let property = store
+                            .symbol(class.symbol)
+                            .and_then(ts_binder::semantic::Symbol::members)
+                            .and_then(|members| store.symbol_table(members))
+                            .and_then(|members| members.get_source(name))
+                            .and_then(|symbol| store.symbol(symbol))
+                            .and_then(ts_binder::semantic::Symbol::value_declaration)
+                            .ok_or(SourceCheckError::Class(class.declaration))?;
+                        let property_record =
+                            host.node(property).ok_or(SourceCheckError::Provenance(
+                                SourceCheckProvenanceError::MissingNode(property),
+                            ))?;
+                        let NodeData::PropertyDeclaration(field) = &property_record.data else {
+                            return Err(SourceCheckError::Class(class.declaration));
+                        };
+                        let declaration = NodeRef::new(property.arena, property.file, field.name);
+                        vec![CanonicalCheckerRelatedInformation {
+                            node: Some(declaration),
+                            diagnostic: Diagnostic::with_arguments(
+                                message_by_code(2728)
+                                    .ok_or(SourceCheckError::MissingDiagnostic(2728))?,
+                                [name.clone()],
+                            ),
+                        }]
+                    } else {
+                        Vec::new()
+                    };
                     let message = message_by_code(diagnostic.code)
                         .ok_or(SourceCheckError::MissingDiagnostic(diagnostic.code))?;
                     let diagnostic_value = if diagnostic.arguments.is_empty() {
@@ -23187,7 +23219,7 @@ pub(super) fn check_source_file(
                             node: Some(diagnostic.node),
                             range_override: diagnostic.range_override,
                             diagnostic: diagnostic_value,
-                            related_information: Vec::new(),
+                            related_information,
                         },
                     );
                 }
@@ -28577,6 +28609,54 @@ mod tests {
             );
         }
         assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, file));
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn constructor_factory_field_initialization_reports_exact_related_property() {
+        let source = parsed(concat!(
+            "class Base {}\n",
+            "declare const BaseFactory: new() => Base & { c: string };\n",
+            "class Derived extends BaseFactory {\n",
+            "    a = this.b;\n",
+            "    b = 'abc';\n",
+            "}\n",
+        ));
+        let file = FileId::new(8_590);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                no_implicit_any: true,
+                strict_property_initialization: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        let derived = global_symbol(&context, "Derived");
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("the later property reference must retain one initialization diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2729);
+        assert_eq!(diagnostic.diagnostic.arguments, ["b"]);
+        assert_eq!(node_text(&source, diagnostic.node.unwrap()), "b");
+        let [related] = diagnostic.related_information.as_slice() else {
+            panic!("the diagnostic must retain the later property declaration")
+        };
+        assert_eq!(related.diagnostic.code(), 2728);
+        assert_eq!(related.diagnostic.arguments, ["b"]);
+        assert_eq!(node_text(&source, related.node.unwrap()), "b");
+        assert!(context.store().declared_type_links(derived).is_none());
+        assert!(context.store().value_symbol_links(derived).is_none());
         assert!(is_type_checked(&context, file));
 
         let warm = observable_state(&context, file);
