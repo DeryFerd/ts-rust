@@ -7631,85 +7631,192 @@ fn canonical_static_module_specifiers(
         ));
     };
     let mut specifiers = Vec::new();
-    for statement in &file.statements.nodes {
-        let Some(node) = source.parse.arena.get(*statement) else {
+    let mut pending = file
+        .statements
+        .nodes
+        .iter()
+        .rev()
+        .map(|statement| (*statement, source.parse.source_file, false))
+        .collect::<Vec<_>>();
+    let mut visited = HashSet::new();
+    while let Some((statement, parent, inside_ambient_module)) = pending.pop() {
+        let Some(node) = source.parse.arena.get(statement) else {
             return Err(CanonicalProgramCheckError::InvalidModuleSourceFile(
                 source_ref,
             ));
         };
+        if node.parent != Some(parent) || !visited.insert(statement) {
+            return Err(CanonicalProgramCheckError::InvalidModuleSourceFile(
+                source_ref,
+            ));
+        }
+        if canonical_ambient_module_statements(
+            source,
+            statement,
+            inside_ambient_module,
+            &mut pending,
+        )? {
+            continue;
+        }
         if node.kind == SyntaxKind::JsTypeAliasDeclaration {
-            canonical_jsdoc_typedef_module_specifiers(source, *statement, &mut specifiers)?;
+            if !inside_ambient_module {
+                canonical_jsdoc_typedef_module_specifiers(source, statement, &mut specifiers)?;
+            }
             continue;
         }
-        let (specifier, attributes, type_only, syntax_mode) = match &node.data {
-            NodeData::ImportDeclaration(import) => (
-                Some(import.module_specifier),
-                import.attributes,
-                import
-                    .import_clause
-                    .and_then(|clause| source.parse.arena.get(clause))
-                    .is_some_and(|clause| {
-                        matches!(
-                            &clause.data,
-                            NodeData::ImportClause(clause)
-                                if clause.phase_modifier == Some(SyntaxKind::TypeKeyword)
-                        )
-                    }),
-                None,
-            ),
-            NodeData::ExportDeclaration(export) => (
-                export.module_specifier,
-                export.attributes,
-                export.is_type_only,
-                None,
-            ),
-            NodeData::ImportEqualsDeclaration(import) => {
-                let Some(NodeData::ExternalModuleReference(reference)) = source
-                    .parse
-                    .arena
-                    .get(import.module_reference)
-                    .map(|node| &node.data)
-                else {
-                    continue;
-                };
-                (
-                    Some(reference.expression),
-                    None,
-                    import.is_type_only,
-                    Some(CanonicalModuleResolutionMode::CommonJs),
-                )
-            }
-            _ => continue,
-        };
-        let Some(specifier) = specifier else {
-            continue;
-        };
-        let specifier = NodeRef::new(source.parse.arena.id(), source.id, specifier);
-        let Some(specifier_node) = source.parse.arena.get(specifier.node) else {
-            return Err(CanonicalProgramCheckError::InvalidModuleSpecifier(
-                specifier,
-            ));
-        };
-        match (specifier_node.kind, &specifier_node.data) {
-            (SyntaxKind::StringLiteral, NodeData::StringLiteral(_)) => {}
-            (SyntaxKind::StringLiteral, _) | (_, NodeData::StringLiteral(_)) => {
-                return Err(CanonicalProgramCheckError::InvalidModuleSpecifier(
-                    specifier,
-                ));
-            }
-            _ => continue,
+        if let Some(specifier) = canonical_static_module_specifier(source, node)? {
+            specifiers.push(specifier);
         }
-        let requested_mode =
-            canonical_resolution_mode_override(source, attributes, type_only, specifier)?
-                .or(syntax_mode);
-        let Some((text, _)) = string_literal(&source.parse.arena, specifier.node) else {
-            return Err(CanonicalProgramCheckError::InvalidModuleSpecifier(
-                specifier,
-            ));
-        };
-        specifiers.push((specifier, text, requested_mode));
     }
     Ok(specifiers)
+}
+
+fn canonical_ambient_module_statements(
+    source: &SourceFile,
+    statement: NodeId,
+    inside_ambient_module: bool,
+    pending: &mut Vec<(NodeId, NodeId, bool)>,
+) -> Result<bool, CanonicalProgramCheckError> {
+    let source_ref = NodeRef::new(source.parse.arena.id(), source.id, source.parse.source_file);
+    let Some(node) = source.parse.arena.get(statement) else {
+        return Err(CanonicalProgramCheckError::InvalidModuleSourceFile(
+            source_ref,
+        ));
+    };
+    let NodeData::ModuleDeclaration(module) = &node.data else {
+        return Ok(false);
+    };
+    if node.kind != SyntaxKind::ModuleDeclaration {
+        return Err(CanonicalProgramCheckError::InvalidModuleSourceFile(
+            source_ref,
+        ));
+    }
+    let Some(name) = source.parse.arena.get(module.name) else {
+        return Err(CanonicalProgramCheckError::InvalidModuleSourceFile(
+            source_ref,
+        ));
+    };
+    if name.parent != Some(statement) {
+        return Err(CanonicalProgramCheckError::InvalidModuleSourceFile(
+            source_ref,
+        ));
+    }
+    if !inside_ambient_module
+        && !(name.kind == SyntaxKind::StringLiteral
+            && matches!(name.data, NodeData::StringLiteral(_)))
+    {
+        return Ok(true);
+    }
+    let Some(body) = module.body else {
+        return Ok(true);
+    };
+    let Some(body_node) = source.parse.arena.get(body) else {
+        return Err(CanonicalProgramCheckError::InvalidModuleSourceFile(
+            source_ref,
+        ));
+    };
+    if body_node.parent != Some(statement) {
+        return Err(CanonicalProgramCheckError::InvalidModuleSourceFile(
+            source_ref,
+        ));
+    }
+    match &body_node.data {
+        NodeData::ModuleBlock(block) if body_node.kind == SyntaxKind::ModuleBlock => {
+            pending.extend(
+                block
+                    .statements
+                    .nodes
+                    .iter()
+                    .rev()
+                    .map(|nested| (*nested, body, true)),
+            );
+        }
+        NodeData::ModuleDeclaration(_) if body_node.kind == SyntaxKind::ModuleDeclaration => {
+            pending.push((body, statement, true));
+        }
+        _ => {
+            return Err(CanonicalProgramCheckError::InvalidModuleSourceFile(
+                source_ref,
+            ));
+        }
+    }
+    Ok(true)
+}
+
+fn canonical_static_module_specifier(
+    source: &SourceFile,
+    node: &Node,
+) -> Result<
+    Option<(NodeRef, String, Option<CanonicalModuleResolutionMode>)>,
+    CanonicalProgramCheckError,
+> {
+    let (specifier, attributes, type_only, syntax_mode) = match &node.data {
+        NodeData::ImportDeclaration(import) => (
+            Some(import.module_specifier),
+            import.attributes,
+            import
+                .import_clause
+                .and_then(|clause| source.parse.arena.get(clause))
+                .is_some_and(|clause| {
+                    matches!(
+                        &clause.data,
+                        NodeData::ImportClause(clause)
+                            if clause.phase_modifier == Some(SyntaxKind::TypeKeyword)
+                    )
+                }),
+            None,
+        ),
+        NodeData::ExportDeclaration(export) => (
+            export.module_specifier,
+            export.attributes,
+            export.is_type_only,
+            None,
+        ),
+        NodeData::ImportEqualsDeclaration(import) => {
+            let Some(NodeData::ExternalModuleReference(reference)) = source
+                .parse
+                .arena
+                .get(import.module_reference)
+                .map(|node| &node.data)
+            else {
+                return Ok(None);
+            };
+            (
+                Some(reference.expression),
+                None,
+                import.is_type_only,
+                Some(CanonicalModuleResolutionMode::CommonJs),
+            )
+        }
+        _ => return Ok(None),
+    };
+    let Some(specifier) = specifier else {
+        return Ok(None);
+    };
+    let specifier = NodeRef::new(source.parse.arena.id(), source.id, specifier);
+    let Some(specifier_node) = source.parse.arena.get(specifier.node) else {
+        return Err(CanonicalProgramCheckError::InvalidModuleSpecifier(
+            specifier,
+        ));
+    };
+    match (specifier_node.kind, &specifier_node.data) {
+        (SyntaxKind::StringLiteral, NodeData::StringLiteral(_)) => {}
+        (SyntaxKind::StringLiteral, _) | (_, NodeData::StringLiteral(_)) => {
+            return Err(CanonicalProgramCheckError::InvalidModuleSpecifier(
+                specifier,
+            ));
+        }
+        _ => return Ok(None),
+    }
+    let requested_mode =
+        canonical_resolution_mode_override(source, attributes, type_only, specifier)?
+            .or(syntax_mode);
+    let Some((text, _)) = string_literal(&source.parse.arena, specifier.node) else {
+        return Err(CanonicalProgramCheckError::InvalidModuleSpecifier(
+            specifier,
+        ));
+    };
+    Ok(Some((specifier, text, requested_mode)))
 }
 
 fn canonical_jsdoc_typedef_module_specifiers(
@@ -9273,6 +9380,156 @@ mod tests {
             })
             .count();
         assert_eq!(all_target_literals, 5);
+    }
+
+    #[test]
+    fn canonical_module_manifest_resolves_nested_ambient_imports_in_source_order() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/modules.d.ts",
+            concat!(
+                "declare module 'target' { export interface Value {} }\n",
+                "declare module 'source' {\n",
+                "  import { Value as first } from 'target';\n",
+                "  namespace Nested { import second = require('target'); }\n",
+                "  import { Missing } from 'missing';\n",
+                "}\n",
+            ),
+        )
+        .unwrap();
+
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["modules.d.ts".to_owned()],
+            plain_esm_bundler_options(),
+        );
+        let source = program.source_file("/project/modules.d.ts").unwrap();
+        let manifest = program.canonical_module_resolution_manifest().unwrap();
+        let entries = manifest.entries();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(
+            entries
+                .iter()
+                .map(
+                    |entry| match &program.node(entry.specifier()).unwrap().data {
+                        NodeData::StringLiteral(literal) => literal.text.as_str(),
+                        other => panic!("unexpected ambient module specifier {other:?}"),
+                    }
+                )
+                .collect::<Vec<_>>(),
+            ["target", "target", "missing"],
+        );
+        assert_ne!(entries[0].specifier(), entries[1].specifier());
+        for (entry, expected_mode) in entries[..2].iter().zip([
+            CanonicalModuleResolutionMode::Esm,
+            CanonicalModuleResolutionMode::CommonJs,
+        ]) {
+            let CanonicalModuleResolutionInput::Resolved(resolution) = entry.resolution() else {
+                panic!("expected the same-file ambient target to resolve")
+            };
+            assert_eq!(resolution.target_file(), source.id);
+            assert_eq!(resolution.usage_mode(), expected_mode);
+        }
+        assert_eq!(
+            entries[2].resolution(),
+            CanonicalModuleResolutionInput::Unresolved,
+        );
+    }
+
+    #[test]
+    fn canonical_module_manifest_interleaves_ambient_and_top_level_imports() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/first.ts", "export const first = 1;")
+            .unwrap();
+        fs.write_file("/project/target.ts", "export interface Value {}")
+            .unwrap();
+        fs.write_file("/project/middle.ts", "export const middle = 1;")
+            .unwrap();
+        fs.write_file("/project/last.ts", "export const last = 1;")
+            .unwrap();
+        fs.write_file(
+            "/project/input.ts",
+            concat!(
+                "import { first } from './first';\n",
+                "declare module 'wrapper' {\n",
+                "  import type { Value } from './target' ",
+                "with { 'resolution-mode': 'require' };\n",
+                "  export { middle } from './middle';\n",
+                "}\n",
+                "export { last } from './last';\n",
+            ),
+        )
+        .unwrap();
+
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["input.ts".to_owned()],
+            plain_esm_bundler_options(),
+        );
+        let manifest = program.canonical_module_resolution_manifest().unwrap();
+        let entries = manifest.entries();
+        assert_eq!(entries.len(), 4);
+        for (entry, (expected_text, expected_mode)) in entries.iter().zip([
+            ("./first", CanonicalModuleResolutionMode::Esm),
+            ("./target", CanonicalModuleResolutionMode::CommonJs),
+            ("./middle", CanonicalModuleResolutionMode::Esm),
+            ("./last", CanonicalModuleResolutionMode::Esm),
+        ]) {
+            let NodeData::StringLiteral(literal) = &program.node(entry.specifier()).unwrap().data
+            else {
+                panic!("expected a source-owned static module specifier")
+            };
+            assert_eq!(literal.text, expected_text);
+            let CanonicalModuleResolutionInput::Resolved(resolution) = entry.resolution() else {
+                panic!("expected {expected_text} to resolve")
+            };
+            assert_eq!(resolution.usage_mode(), expected_mode);
+            let expected_path = format!("/project/{}.ts", &expected_text[2..]);
+            assert_eq!(
+                resolution.target_file(),
+                program.source_file(&expected_path).unwrap().id,
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_module_manifest_rejects_invalid_nested_ambient_parent_links() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/modules.d.ts",
+            "declare module 'source' { import { Value } from 'target'; }",
+        )
+        .unwrap();
+        let mut program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["modules.d.ts".to_owned()],
+            plain_esm_bundler_options(),
+        );
+        let index = program
+            .source_file("/project/modules.d.ts")
+            .unwrap()
+            .id
+            .index();
+        let source = &mut program.source_files[index];
+        let import = source
+            .parse
+            .arena
+            .iter()
+            .find_map(|(id, node)| {
+                matches!(node.data, NodeData::ImportDeclaration(_)).then_some(id)
+            })
+            .unwrap();
+        source.parse.arena.get_mut(import).unwrap().parent = Some(source.parse.source_file);
+        let expected =
+            ts_ast::NodeRef::new(source.parse.arena.id(), source.id, source.parse.source_file);
+
+        assert!(matches!(
+            program.canonical_module_resolution_manifest(),
+            Err(CanonicalProgramCheckError::InvalidModuleSourceFile(actual)) if actual == expected
+        ));
     }
 
     #[test]
