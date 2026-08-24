@@ -364,6 +364,14 @@ struct DefaultLibraryNonNullablePlan {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PropTypesInferPropsPlan {
+    parameter: SemanticSymbolId,
+    intersection: NodeRef,
+    required: NodeRef,
+    optional: NodeRef,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PlannedTypeParameter {
     declaration: NodeRef,
     symbol: SemanticSymbolId,
@@ -420,6 +428,7 @@ struct TypeQueryPlan {
     aliases: BTreeMap<SemanticSymbolId, TypeAliasPlan>,
     react_detailed_html_props_aliases: BTreeMap<SemanticSymbolId, ReactDetailedHtmlPropsPlan>,
     default_library_non_nullable_aliases: BTreeMap<SemanticSymbolId, DefaultLibraryNonNullablePlan>,
+    prop_types_infer_props_aliases: BTreeMap<SemanticSymbolId, PropTypesInferPropsPlan>,
     recursive_mapped_aliases: BTreeMap<SemanticSymbolId, NodeRef>,
     references: BTreeMap<NodeRef, PlannedTypeReference>,
     recovered_missing_references: BTreeMap<NodeRef, NodeRef>,
@@ -3494,8 +3503,16 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 .copied()
                 .filter(|planned| planned.intersection == node)
         });
+        let infer_props_alias = alias_symbol.and_then(|alias| {
+            self.plan
+                .prop_types_infer_props_aliases
+                .get(&alias)
+                .copied()
+                .filter(|planned| planned.intersection == node)
+        });
         if react_alias.is_none()
             && non_nullable_alias.is_none()
+            && infer_props_alias.is_none()
             && alias_symbol.is_some_and(|alias| {
                 self.plan
                     .aliases
@@ -3574,6 +3591,12 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     TypeNodeUnavailable::UnsupportedIntersectionConstituent(node),
                 ));
             }
+        } else if let Some(infer_props_alias) = infer_props_alias {
+            if types.as_slice() != [infer_props_alias.required, infer_props_alias.optional] {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::UnsupportedIntersectionConstituent(node),
+                ));
+            }
         } else {
             let mut validating = HashSet::new();
             for constituent in &types {
@@ -3585,11 +3608,13 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 TypeNodeUnavailable::ImportAliasCapabilityUnsupported(node),
             ));
         }
-        let derived_alias = if react_alias.is_some() || non_nullable_alias.is_some() {
-            alias_symbol
-        } else {
-            self.direct_union_alias(node)?
-        };
+        let derived_alias =
+            if react_alias.is_some() || non_nullable_alias.is_some() || infer_props_alias.is_some()
+            {
+                alias_symbol
+            } else {
+                self.direct_union_alias(node)?
+            };
         if alias_symbol.is_some() && derived_alias != alias_symbol {
             return Err(type_node_unavailable(
                 TypeNodeUnavailable::InvalidIntersectionType(node),
@@ -4247,7 +4272,11 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                             let authenticated_intersection = self
                                 .authenticated_react_detailed_html_props_alias(symbol)
                                 .map(|alias| alias.intersection)
-                                .or_else(|| non_nullable_alias.map(|alias| alias.intersection));
+                                .or_else(|| non_nullable_alias.map(|alias| alias.intersection))
+                                .or_else(|| {
+                                    self.authenticated_prop_types_infer_props_alias(symbol)
+                                        .map(|alias| alias.intersection)
+                                });
                             let Some(authenticated_intersection) = authenticated_intersection
                             else {
                                 return Err(type_node_unavailable(
@@ -6641,6 +6670,362 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             .and_then(|globals| globals.get_source(name))
             .and_then(|global| self.store.get_merged_symbol(global))
             == Some(symbol)
+    }
+
+    fn is_default_library_prop_types_utility_alias(
+        &self,
+        alias: SemanticSymbolId,
+        name: &str,
+        parameter_count: usize,
+    ) -> bool {
+        if !self.global_symbol_has_name(alias, name) {
+            return false;
+        }
+        let Some(owner) = self.store.symbol(alias) else {
+            return false;
+        };
+        let Some([declaration]) = owner.declarations() else {
+            return false;
+        };
+        let Some(bound) = self.host.bound_file(*declaration) else {
+            return false;
+        };
+        let Some(facts) = bound.source_facts() else {
+            return false;
+        };
+        let Ok(record) = preflight_node(self.store, self.host, *declaration) else {
+            return false;
+        };
+        let NodeData::TypeAliasDeclaration(data) = &record.data else {
+            return false;
+        };
+        let Some(parameters) = data.type_parameters.as_ref() else {
+            return false;
+        };
+        owner.flags() == SymbolFlags::TYPE_ALIAS
+            && owner.check_flags() == CheckFlags::NONE
+            && owner.name().as_utf8() == Some(name)
+            && owner.parent().is_none()
+            && owner.value_declaration().is_none()
+            && owner.exports().is_none()
+            && owner.export_symbol().is_none()
+            && self.store.get_merged_symbol(alias) == Some(alias)
+            && facts.is_default_library()
+            && facts.is_declaration_file()
+            && !facts.is_external_or_common_js_module()
+            && record.kind == SyntaxKind::TypeAliasDeclaration
+            && record.flags.0 == 0
+            && record.parent == Some(bound.source_file().node)
+            && self.host.symbol_matches(self.store, *declaration, alias)
+            && parameters.nodes.len() == parameter_count
+            && !parameters.has_trailing_comma
+    }
+
+    fn prop_types_infer_props_reference(
+        &self,
+        node: NodeRef,
+        parent: NodeRef,
+        name: &str,
+        symbol: SemanticSymbolId,
+        argument_count: usize,
+    ) -> Option<Vec<NodeRef>> {
+        let record = preflight_node(self.store, self.host, node).ok()?;
+        let NodeData::TypeReferenceNode(reference) = &record.data else {
+            return None;
+        };
+        let identifier = NodeRef::new(node.arena, node.file, reference.type_name);
+        let arguments = self.type_reference_argument_nodes(node).ok()?;
+        (record.kind == SyntaxKind::TypeReference
+            && record.flags.0 == 0
+            && record.parent == Some(parent.node)
+            && arguments.len() == argument_count
+            && self.react_detailed_html_props_identifier(identifier, node, name)
+            && self
+                .resolve_uncached_type_reference_symbol(node)
+                .ok()
+                .and_then(|resolved| self.store.get_merged_symbol(resolved))
+                == Some(symbol)
+            && self
+                .store
+                .symbol_node_links(node)
+                .and_then(|links| links.resolved_symbol)
+                .is_none_or(|cached| self.store.get_merged_symbol(cached) == Some(symbol)))
+        .then_some(arguments)
+    }
+
+    #[allow(clippy::too_many_lines)] // Ambient ownership and both nested mapped operands form one proof.
+    fn authenticated_prop_types_infer_props_alias(
+        &self,
+        alias: SemanticSymbolId,
+    ) -> Option<PropTypesInferPropsPlan> {
+        let owner = self.store.symbol(alias)?;
+        let [declaration] = owner.declarations()? else {
+            return None;
+        };
+        let declaration = *declaration;
+        let bound = self.host.bound_file(declaration)?;
+        let facts = bound.source_facts()?;
+        let declaration_record = preflight_node(self.store, self.host, declaration).ok()?;
+        let NodeData::TypeAliasDeclaration(data) = &declaration_record.data else {
+            return None;
+        };
+        let name = NodeRef::new(declaration.arena, declaration.file, data.name);
+        let block = NodeRef::new(
+            declaration.arena,
+            declaration.file,
+            declaration_record.parent?,
+        );
+        let block_record = preflight_node(self.store, self.host, block).ok()?;
+        let NodeData::ModuleBlock(block_data) = &block_record.data else {
+            return None;
+        };
+        let module = NodeRef::new(block.arena, block.file, block_record.parent?);
+        let module_record = preflight_node(self.store, self.host, module).ok()?;
+        let NodeData::ModuleDeclaration(module_data) = &module_record.data else {
+            return None;
+        };
+        let module_name = NodeRef::new(module.arena, module.file, module_data.name);
+        let module_name_record = preflight_node(self.store, self.host, module_name).ok()?;
+        let NodeData::StringLiteral(module_literal) = &module_name_record.data else {
+            return None;
+        };
+        let module_symbol = bound
+            .symbol(module)
+            .and_then(|symbol| self.store.get_merged_symbol(symbol))?;
+        let module_owner = self.store.symbol(module_symbol)?;
+        let exports = module_owner
+            .exports()
+            .and_then(|exports| self.store.symbol_table(exports))?;
+        if owner.flags() != SymbolFlags::TYPE_ALIAS
+            || owner.check_flags() != CheckFlags::NONE
+            || owner.name().as_utf8() != Some("InferProps")
+            || owner.value_declaration().is_some()
+            || owner.exports().is_some()
+            || owner.export_symbol().is_some()
+            || self.store.get_merged_symbol(alias) != Some(alias)
+            || self.store.get_parent_of_symbol(alias) != Some(module_symbol)
+            || !facts.is_declaration_file()
+            || facts.is_default_library()
+            || facts.is_javascript_file()
+            || facts.is_external_or_common_js_module()
+            || declaration_record.kind != SyntaxKind::TypeAliasDeclaration
+            || declaration_record.flags.0 != 0
+            || !self.host.symbol_matches(self.store, declaration, alias)
+            || !self.react_detailed_html_props_identifier(name, declaration, "InferProps")
+            || object_members::declared_type_declaration_parent(
+                self.store,
+                self.host,
+                declaration,
+                alias,
+                name,
+                data.modifiers.as_ref(),
+            ) != Ok(Some(module_symbol))
+            || block_record.kind != SyntaxKind::ModuleBlock
+            || !block_data.statements.nodes.contains(&declaration.node)
+            || module_record.kind != SyntaxKind::ModuleDeclaration
+            || module_record.parent != Some(bound.source_file().node)
+            || module_data.keyword != SyntaxKind::ModuleKeyword
+            || module_data.body != Some(block.node)
+            || module_name_record.kind != SyntaxKind::StringLiteral
+            || module_name_record.parent != Some(module.node)
+            || module_literal.text != "prop-types"
+            || !module_owner.flags().intersects(SymbolFlags::MODULE)
+            || self.store.get_merged_symbol(module_symbol) != Some(module_symbol)
+            || !self.host.symbol_matches(self.store, module, module_symbol)
+            || exports
+                .get_source("InferProps")
+                .and_then(|export| self.store.get_merged_symbol(export))
+                != Some(alias)
+        {
+            return None;
+        }
+
+        let parameters = data.type_parameters.as_ref()?;
+        let [parameter_id] = parameters.nodes.as_slice() else {
+            return None;
+        };
+        let parameter = NodeRef::new(declaration.arena, declaration.file, *parameter_id);
+        let parameter_record = preflight_node(self.store, self.host, parameter).ok()?;
+        let NodeData::TypeParameterDeclaration(parameter_data) = &parameter_record.data else {
+            return None;
+        };
+        let parameter_name = NodeRef::new(parameter.arena, parameter.file, parameter_data.name);
+        let parameter_symbol = bound
+            .symbol(parameter)
+            .and_then(|symbol| self.store.get_merged_symbol(symbol))?;
+        let parameter_owner = self.store.symbol(parameter_symbol)?;
+        let locals = bound
+            .locals(declaration)
+            .and_then(|locals| self.store.symbol_table(locals))?;
+        if parameters.has_trailing_comma
+            || parameter_record.kind != SyntaxKind::TypeParameter
+            || parameter_record.flags.0 != 0
+            || parameter_record.parent != Some(declaration.node)
+            || parameter_data.constraint.is_some()
+            || parameter_data.default_type.is_some()
+            || parameter_data.expression.is_some()
+            || parameter_data.modifiers.is_some()
+            || parameter_owner.flags() != SymbolFlags::TYPE_PARAMETER
+            || parameter_owner.name().as_utf8() != Some("V")
+            || parameter_owner.declarations() != Some(&[parameter])
+            || locals.get_source("V") != Some(parameter_symbol)
+            || !self
+                .host
+                .symbol_matches(self.store, parameter, parameter_symbol)
+            || !self.react_detailed_html_props_identifier(parameter_name, parameter, "V")
+        {
+            return None;
+        }
+
+        let module_alias = |name: &str| {
+            let symbol = exports
+                .get_source(name)
+                .and_then(|export| self.store.get_merged_symbol(export))?;
+            let owner = self.store.symbol(symbol)?;
+            (owner.flags() == SymbolFlags::TYPE_ALIAS
+                && owner.check_flags() == CheckFlags::NONE
+                && owner.name().as_utf8() == Some(name)
+                && self.store.get_parent_of_symbol(symbol) == Some(module_symbol))
+            .then_some(symbol)
+        };
+        let infer_props_inner = module_alias("InferPropsInner")?;
+        let required_keys = module_alias("RequiredKeys")?;
+        let optional_keys = module_alias("OptionalKeys")?;
+        let globals = self
+            .store
+            .intrinsic_bootstrap()
+            .and_then(|bootstrap| self.store.symbol_table(bootstrap.globals))?;
+        let pick = globals
+            .get_source("Pick")
+            .and_then(|symbol| self.store.get_merged_symbol(symbol))?;
+        let partial = globals
+            .get_source("Partial")
+            .and_then(|symbol| self.store.get_merged_symbol(symbol))?;
+        if !self.is_default_library_prop_types_utility_alias(pick, "Pick", 2)
+            || !self.is_default_library_prop_types_utility_alias(partial, "Partial", 1)
+        {
+            return None;
+        }
+
+        let intersection = NodeRef::new(declaration.arena, declaration.file, data.type_);
+        let intersection_record = preflight_node(self.store, self.host, intersection).ok()?;
+        let NodeData::IntersectionTypeNode(body) = &intersection_record.data else {
+            return None;
+        };
+        let [required_id, optional_id] = body.types.nodes.as_slice() else {
+            return None;
+        };
+        let required = NodeRef::new(intersection.arena, intersection.file, *required_id);
+        let optional = NodeRef::new(intersection.arena, intersection.file, *optional_id);
+        if intersection_record.kind != SyntaxKind::IntersectionType
+            || intersection_record.flags.0 != 0
+            || intersection_record.parent != Some(declaration.node)
+            || body.types.has_trailing_comma
+            || body.types.range != intersection_record.range
+        {
+            return None;
+        }
+
+        let required_arguments = self.prop_types_infer_props_reference(
+            required,
+            intersection,
+            "InferPropsInner",
+            infer_props_inner,
+            1,
+        )?;
+        let [required_pick] = required_arguments.as_slice() else {
+            return None;
+        };
+        let required_pick_arguments =
+            self.prop_types_infer_props_reference(*required_pick, required, "Pick", pick, 2)?;
+        let [required_value, required_keys_reference] = required_pick_arguments.as_slice() else {
+            return None;
+        };
+        if !self.react_detailed_html_props_parameter_reference(
+            *required_value,
+            *required_pick,
+            "V",
+            parameter_symbol,
+        ) {
+            return None;
+        }
+        let required_key_arguments = self.prop_types_infer_props_reference(
+            *required_keys_reference,
+            *required_pick,
+            "RequiredKeys",
+            required_keys,
+            1,
+        )?;
+        let [required_key_value] = required_key_arguments.as_slice() else {
+            return None;
+        };
+        if !self.react_detailed_html_props_parameter_reference(
+            *required_key_value,
+            *required_keys_reference,
+            "V",
+            parameter_symbol,
+        ) {
+            return None;
+        }
+
+        let partial_arguments =
+            self.prop_types_infer_props_reference(optional, intersection, "Partial", partial, 1)?;
+        let [optional_inner] = partial_arguments.as_slice() else {
+            return None;
+        };
+        let optional_arguments = self.prop_types_infer_props_reference(
+            *optional_inner,
+            optional,
+            "InferPropsInner",
+            infer_props_inner,
+            1,
+        )?;
+        let [optional_pick] = optional_arguments.as_slice() else {
+            return None;
+        };
+        let optional_pick_arguments = self.prop_types_infer_props_reference(
+            *optional_pick,
+            *optional_inner,
+            "Pick",
+            pick,
+            2,
+        )?;
+        let [optional_value, optional_keys_reference] = optional_pick_arguments.as_slice() else {
+            return None;
+        };
+        if !self.react_detailed_html_props_parameter_reference(
+            *optional_value,
+            *optional_pick,
+            "V",
+            parameter_symbol,
+        ) {
+            return None;
+        }
+        let optional_key_arguments = self.prop_types_infer_props_reference(
+            *optional_keys_reference,
+            *optional_pick,
+            "OptionalKeys",
+            optional_keys,
+            1,
+        )?;
+        let [optional_key_value] = optional_key_arguments.as_slice() else {
+            return None;
+        };
+        if !self.react_detailed_html_props_parameter_reference(
+            *optional_key_value,
+            *optional_keys_reference,
+            "V",
+            parameter_symbol,
+        ) {
+            return None;
+        }
+
+        Some(PropTypesInferPropsPlan {
+            parameter: parameter_symbol,
+            intersection,
+            required,
+            optional,
+        })
     }
 
     fn authenticated_default_library_non_nullable_alias(
@@ -9740,6 +10125,11 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             self.plan
                 .default_library_non_nullable_aliases
                 .insert(symbol, non_nullable_alias);
+        }
+        if let Some(infer_props_alias) = self.authenticated_prop_types_infer_props_alias(symbol) {
+            self.plan
+                .prop_types_infer_props_aliases
+                .insert(symbol, infer_props_alias);
         }
         if let Some(cached) = cached
             && let Some(alias) = self
@@ -13871,7 +14261,11 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 || plan
                     .default_library_non_nullable_aliases
                     .get(&alias)
-                    .is_some_and(|non_nullable_alias| non_nullable_alias.intersection == node))
+                    .is_some_and(|non_nullable_alias| non_nullable_alias.intersection == node)
+                || plan
+                    .prop_types_infer_props_aliases
+                    .get(&alias)
+                    .is_some_and(|infer_props_alias| infer_props_alias.intersection == node))
         {
             let metadata = plan.aliases.get(&alias).ok_or_else(|| {
                 type_node_unavailable(TypeNodeUnavailable::MissingGenericAliasMetadata(alias))
@@ -14780,6 +15174,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             || plan
                 .default_library_non_nullable_aliases
                 .contains_key(&symbol)
+            || plan.prop_types_infer_props_aliases.contains_key(&symbol)
             || self
                 .store
                 .type_payload(declared_type)
@@ -15591,6 +15986,92 @@ mod tests {
         source_file: FileId,
         files: BTreeMap<FileId, BoundFile>,
         store: CanonicalTypeMapperStore,
+    }
+
+    struct PropTypesInferPropsFixture {
+        library: ParseResult,
+        declarations: ParseResult,
+        library_file: FileId,
+        declaration_file: FileId,
+        files: BTreeMap<FileId, BoundFile>,
+        store: CanonicalTypeMapperStore,
+    }
+
+    fn prop_types_infer_props_fixture(
+        module_name: &str,
+        intersection: &str,
+        default_library: bool,
+    ) -> PropTypesInferPropsFixture {
+        let library = parse_source_file("type Pick<T, K> = T; type Partial<T> = T;");
+        let declarations = parse_source_file(&format!(
+            concat!(
+                "declare module \"{}\" {{ ",
+                "export type RequiredKeys<V> = V; ",
+                "export type OptionalKeys<V> = V; ",
+                "export type InferPropsInner<V> = V; ",
+                "export type InferProps<V> = {}; ",
+                "}}",
+            ),
+            module_name, intersection,
+        ));
+        let library_file = FileId::new(8_690);
+        let declaration_file = FileId::new(8_691);
+        let mut binder = CanonicalBinder::new();
+        for (parsed, file, is_default_library) in [
+            (&library, library_file, default_library),
+            (&declarations, declaration_file, false),
+        ] {
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new_with_default_library(
+                        EscapedName::source(format!("\"/prop-types-{}.d.ts\"", file.index())),
+                        CanonicalSourceLanguage::TypeScript,
+                        true,
+                        is_default_library,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let (symbols, files) = binder.finish().try_into_parts().unwrap();
+        let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
+        for (parsed, file) in [(&library, library_file), (&declarations, declaration_file)] {
+            assert!(
+                store
+                    .register_source_file(&parsed.arena, parsed.source_file, file)
+                    .is_some()
+            );
+        }
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        let globals = store.intrinsic_bootstrap().unwrap().globals;
+        for bound in files.values() {
+            let symbols = store
+                .symbol_table(bound.locals(bound.source_file()).unwrap())
+                .unwrap()
+                .iter()
+                .map(|(_, symbol)| symbol)
+                .collect::<Vec<_>>();
+            for symbol in symbols {
+                store.merge_global_symbol(globals, symbol).unwrap();
+            }
+        }
+        PropTypesInferPropsFixture {
+            library,
+            declarations,
+            library_file,
+            declaration_file,
+            files,
+            store,
+        }
     }
 
     fn default_library_interface_context<'arena>(
@@ -19103,6 +19584,185 @@ mod tests {
                 ))
             ));
             assert_eq!(store_state(&fixture.store), before);
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn prop_types_infer_props_accepts_only_its_authenticated_generic_intersection() {
+        let PropTypesInferPropsFixture {
+            library,
+            declarations,
+            library_file,
+            declaration_file,
+            files,
+            mut store,
+        } = prop_types_infer_props_fixture(
+            "prop-types",
+            concat!(
+                "InferPropsInner<Pick<V, RequiredKeys<V>>> ",
+                "& Partial<InferPropsInner<Pick<V, OptionalKeys<V>>>>",
+            ),
+            true,
+        );
+        let bound = files.get(&declaration_file).unwrap();
+        let declaration = declarations
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+                    return None;
+                };
+                (identifier_text(&declarations.arena, alias.name) == Some("InferProps")).then_some(
+                    NodeRef::new(declarations.arena.id(), declaration_file, node),
+                )
+            })
+            .unwrap();
+        let alias = bound.symbol(declaration).unwrap();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&library.arena, files.get(&library_file).unwrap()),
+                (&declarations.arena, bound),
+            ],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let aliases = HashMap::new();
+        let proof = TypeQueryPlanner::new(&store, &host, None, None, false, &aliases)
+            .authenticated_prop_types_infer_props_alias(alias)
+            .unwrap();
+        assert_eq!(
+            store
+                .symbol(proof.parameter)
+                .and_then(|parameter| parameter.name().as_utf8()),
+            Some("V"),
+        );
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let resolved = CanonicalTypeQuery::new(
+            &mut store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_declared_type_of_symbol(alias)
+        .unwrap();
+        let parameter = store
+            .type_alias_links(alias)
+            .and_then(|links| links.type_parameters.as_deref())
+            .and_then(|parameters| parameters.first())
+            .copied()
+            .unwrap();
+        assert_eq!(resolved, parameter);
+        let warm = store_state(&store);
+        assert_eq!(
+            CanonicalTypeQuery::new(
+                &mut store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_declared_type_of_symbol(alias),
+            Ok(resolved),
+        );
+        assert_eq!(store_state(&store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn prop_types_infer_props_rejects_other_modules_operands_and_utility_owners() {
+        for (module_name, intersection, default_library) in [
+            (
+                "lookalike",
+                concat!(
+                    "InferPropsInner<Pick<V, RequiredKeys<V>>> ",
+                    "& Partial<InferPropsInner<Pick<V, OptionalKeys<V>>>>",
+                ),
+                true,
+            ),
+            (
+                "prop-types",
+                concat!(
+                    "Partial<InferPropsInner<Pick<V, OptionalKeys<V>>>> ",
+                    "& InferPropsInner<Pick<V, RequiredKeys<V>>>",
+                ),
+                true,
+            ),
+            (
+                "prop-types",
+                concat!(
+                    "InferPropsInner<Pick<V, OptionalKeys<V>>> ",
+                    "& Partial<InferPropsInner<Pick<V, OptionalKeys<V>>>>",
+                ),
+                true,
+            ),
+            (
+                "prop-types",
+                concat!(
+                    "InferPropsInner<Pick<V, RequiredKeys<V>>> ",
+                    "& Partial<InferPropsInner<Pick<V, OptionalKeys<V>>>>",
+                ),
+                false,
+            ),
+        ] {
+            let PropTypesInferPropsFixture {
+                library,
+                declarations,
+                library_file,
+                declaration_file,
+                files,
+                mut store,
+            } = prop_types_infer_props_fixture(module_name, intersection, default_library);
+            let bound = files.get(&declaration_file).unwrap();
+            let declaration = declarations
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+                        return None;
+                    };
+                    (identifier_text(&declarations.arena, alias.name) == Some("InferProps"))
+                        .then_some(NodeRef::new(
+                            declarations.arena.id(),
+                            declaration_file,
+                            node,
+                        ))
+                })
+                .unwrap();
+            let alias = bound.symbol(declaration).unwrap();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [
+                    (&library.arena, files.get(&library_file).unwrap()),
+                    (&declarations.arena, bound),
+                ],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            let aliases = HashMap::new();
+            assert!(
+                TypeQueryPlanner::new(&store, &host, None, None, false, &aliases)
+                    .authenticated_prop_types_infer_props_alias(alias)
+                    .is_none(),
+                "module={module_name}, default_library={default_library}",
+            );
+            let before = store_state(&store);
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            assert!(matches!(
+                CanonicalTypeQuery::new(
+                    &mut store,
+                    &host,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_declared_type_of_symbol(alias),
+                Err(DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::UnsupportedIntersectionConstituent(_)
+                )),
+            ));
+            assert_eq!(store_state(&store), before);
             assert!(diagnostics.is_empty());
         }
     }
