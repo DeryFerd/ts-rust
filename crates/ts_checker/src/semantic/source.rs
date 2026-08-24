@@ -199,10 +199,11 @@ use super::{
     types::{ObjectFlags, TypeFlags},
     variables::{
         PlannedArrayBindingElement, PlannedComputedBindingElement,
-        PlannedIdentifierRead as PlannedVariableRead, VariableBindingKind, VariablePlanError,
-        plan_declared_value_identifier_read, plan_identifier_read,
-        plan_recovered_anonymous_module_identifier_read, plan_recovered_anonymous_module_variable,
-        plan_top_level_array_binding_element, plan_top_level_computed_binding_element,
+        PlannedIdentifierRead as PlannedVariableRead, PlannedObjectBindingElement,
+        VariableBindingKind, VariablePlanError, plan_declared_value_identifier_read,
+        plan_identifier_read, plan_recovered_anonymous_module_identifier_read,
+        plan_recovered_anonymous_module_variable, plan_top_level_array_binding_element,
+        plan_top_level_computed_binding_element, plan_top_level_object_binding_elements,
         plan_top_level_variable,
     },
 };
@@ -800,6 +801,13 @@ struct PlannedArrayVariable {
 }
 
 #[derive(Clone, Debug)]
+struct PlannedObjectVariable {
+    elements: Vec<PlannedObjectBindingElement>,
+    binding: VariableBindingKind,
+    initializer: PlannedExpression,
+}
+
+#[derive(Clone, Debug)]
 #[allow(clippy::large_enum_variant)] // Keeps ordinary variable expressions inline.
 enum PlannedVariableInitializer {
     Expression(PlannedExpression),
@@ -1201,6 +1209,7 @@ enum PlannedStatement {
     RecoveredAnonymousVariables(Vec<PlannedVariable>),
     ComputedVariable(Box<PlannedComputedVariable>),
     ArrayVariable(Box<PlannedArrayVariable>),
+    ObjectVariable(Box<PlannedObjectVariable>),
     Assignment(PlannedAssignment),
     CommonJsAssignment(PlannedCommonJsAssignment),
     NamespaceAssignment(PlannedNamespaceAssignment),
@@ -1276,6 +1285,7 @@ enum PlannedVariableStatement {
     Variables(Vec<PlannedVariable>),
     Computed(Box<PlannedComputedVariable>),
     Array(Box<PlannedArrayVariable>),
+    Object(Box<PlannedObjectVariable>),
 }
 
 struct SourcePlanner<'arena, 'semantic, 'sources> {
@@ -2510,6 +2520,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         }
                         PlannedVariableStatement::Array(variable) => {
                             statements.push(PlannedStatement::ArrayVariable(variable));
+                        }
+                        PlannedVariableStatement::Object(variable) => {
+                            statements.push(PlannedStatement::ObjectVariable(variable));
                         }
                     }
                 }
@@ -7571,6 +7584,25 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                                 && declaration.range.end <= statement_node.range.start
                         })
                 });
+            let is_prior_object_binding = self.prior_variables.contains(&local_symbol)
+                && self.readable_variables.contains(&local_symbol)
+                && local_record.flags().intersects(
+                    SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::BLOCK_SCOPED_VARIABLE,
+                )
+                && local_record.declarations().is_some_and(|declarations| {
+                    matches!(declarations, [declaration] if {
+                        declaration.is_for(self.arena.id(), self.bound.file_id())
+                            && self.node(*declaration).is_ok_and(|element| {
+                                element.kind == SyntaxKind::BindingElement
+                                    && element.range.end <= statement_node.range.start
+                                    && element.parent.and_then(|parent| self.arena.get(parent))
+                                        .is_some_and(|pattern| {
+                                            pattern.kind == SyntaxKind::ObjectBindingPattern
+                                        })
+                            })
+                            && self.bound.symbol(*declaration) == Some(local_symbol)
+                    })
+                });
             let is_prior_type_alias = export.is_type_only
                 && local_record.flags() == SymbolFlags::TYPE_ALIAS
                 && local_record.declarations().is_some_and(|declarations| {
@@ -7590,7 +7622,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     && !is_prior_enum
                     && !is_prior_function
                     && !is_prior_namespace
-                    && !is_prior_named_value_import)
+                    && !is_prior_named_value_import
+                    && !is_prior_object_binding)
             {
                 return Err(self.unsupported(
                     clause,
@@ -8774,13 +8807,38 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             if let NodeData::VariableDeclaration(variable) = &record.data {
                 match self.node(self.reference(variable.name))?.kind {
                     SyntaxKind::ObjectBindingPattern => {
-                        let planned = self.plan_computed_variable_declaration(
-                            list,
-                            declaration,
-                            binding,
-                            exported,
-                        )?;
-                        return Ok(PlannedVariableStatement::Computed(Box::new(planned)));
+                        let pattern = self.node(self.reference(variable.name))?;
+                        let NodeData::BindingPattern(data) = &pattern.data else {
+                            return Err(SourceCheckError::Variable(
+                                VariableInvariant::InvalidBindingPattern(declaration),
+                            ));
+                        };
+                        let computed = matches!(data.elements.nodes.as_slice(), [element] if self
+                            .arena
+                            .get(*element)
+                            .and_then(|element| match &element.data {
+                                NodeData::BindingElement(element) => element.property_name,
+                                _ => None,
+                            })
+                            .and_then(|name| self.arena.get(name))
+                            .is_some_and(|name| name.kind == SyntaxKind::ComputedPropertyName));
+                        return if computed {
+                            self.plan_computed_variable_declaration(
+                                list,
+                                declaration,
+                                binding,
+                                exported,
+                            )
+                            .map(|planned| PlannedVariableStatement::Computed(Box::new(planned)))
+                        } else {
+                            self.plan_object_variable_declaration(
+                                list,
+                                declaration,
+                                binding,
+                                exported,
+                            )
+                            .map(|planned| PlannedVariableStatement::Object(Box::new(planned)))
+                        };
                     }
                     SyntaxKind::ArrayBindingPattern => {
                         let planned = self.plan_array_variable_declaration(
@@ -8873,6 +8931,90 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             )?);
         }
         Ok(PlannedVariableStatement::Variables(variables))
+    }
+
+    fn plan_object_variable_declaration(
+        &mut self,
+        list: NodeRef,
+        declaration: NodeRef,
+        binding: VariableBindingKind,
+        exported: bool,
+    ) -> Result<PlannedObjectVariable, SourceCheckError> {
+        let (initializer, type_node) = {
+            let record = self.node(declaration)?;
+            let NodeData::VariableDeclaration(variable) = &record.data else {
+                return Err(self.unsupported(
+                    declaration,
+                    record.kind,
+                    SourceSyntaxRole::VariableDeclaration,
+                ));
+            };
+            if record.kind != SyntaxKind::VariableDeclaration || record.parent != Some(list.node) {
+                return Err(self.unsupported(
+                    declaration,
+                    record.kind,
+                    SourceSyntaxRole::VariableDeclaration,
+                ));
+            }
+            (
+                variable.initializer.map(|node| self.reference(node)),
+                variable.type_.map(|node| self.reference(node)),
+            )
+        };
+        if let Some(type_node) = type_node {
+            return Err(self.unsupported(
+                type_node,
+                self.node(type_node)?.kind,
+                SourceSyntaxRole::VariableType,
+            ));
+        }
+        let initializer = initializer.ok_or(SourceCheckError::Unsupported(
+            UnsupportedSourceSyntax::MissingVariableInitializer(declaration),
+        ))?;
+        if self.node(initializer)?.parent != Some(declaration.node) {
+            return Err(self.unsupported(
+                initializer,
+                self.node(initializer)?.kind,
+                SourceSyntaxRole::VariableInitializer,
+            ));
+        }
+        let Some((store, _)) = self.semantic else {
+            return Err(self.unsupported(
+                declaration,
+                SyntaxKind::VariableDeclaration,
+                SourceSyntaxRole::VariableDeclaration,
+            ));
+        };
+        let elements = plan_top_level_object_binding_elements(
+            self.arena,
+            self.bound,
+            store,
+            declaration,
+            binding,
+            exported,
+        )
+        .map_err(Self::variable_plan_error)?;
+        let initializer = self.plan_expression(initializer)?;
+        for element in &elements {
+            if self.node(element.name)?.parent != Some(element.element.node) {
+                return Err(SourceCheckError::Variable(
+                    VariableInvariant::InvalidBindingPattern(element.name),
+                ));
+            }
+            if !self.prior_variables.insert(element.symbol)
+                || !self.readable_variables.insert(element.symbol)
+                || !binding.is_const() && !self.assignable_mutable_variables.insert(element.symbol)
+            {
+                return Err(SourceCheckError::Variable(
+                    VariableInvariant::InvalidSymbolShape(element.symbol),
+                ));
+            }
+        }
+        Ok(PlannedObjectVariable {
+            elements,
+            binding,
+            initializer,
+        })
     }
 
     fn plan_array_variable_declaration(
@@ -23007,6 +23149,96 @@ pub(super) fn check_source_file(
                     }
                 }
             }
+            PlannedStatement::ObjectVariable(variable) => {
+                let initializer = check_expression_type(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    &current_flow_types,
+                    &preflighted_type_import_value_uses,
+                    &variable.initializer,
+                    None,
+                    &mut deferred,
+                )?;
+                for element in &variable.elements {
+                    let type_ = if let Some(property) =
+                        store.resolved_own_property(initializer.result, &element.property_name)?
+                    {
+                        if property.optional && options.intrinsic.strict_null_checks {
+                            let undefined = store
+                                .intrinsic_bootstrap()
+                                .ok_or(SourceCheckError::LiteralCache(
+                                    SourceLiteralCacheError::BootstrapUninitialized,
+                                ))?
+                                .undefined_or_missing_type;
+                            store.expression_union_type_with_global_types(
+                                global_types,
+                                &[property.type_, undefined],
+                                UnionReduction::Literal,
+                            )?
+                        } else {
+                            property.type_
+                        }
+                    } else {
+                        let receiver =
+                            super::formatter::type_to_string_with_host_global_types_and_flags(
+                                store,
+                                host,
+                                global_types,
+                                initializer.result,
+                                CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+                            )?;
+                        merge_retry_diagnostic(
+                            diagnostics,
+                            CanonicalCheckerDiagnostic {
+                                node: Some(element.property),
+                                range_override: None,
+                                diagnostic: Diagnostic::with_arguments(
+                                    message_by_code(2339)
+                                        .ok_or(SourceCheckError::MissingDiagnostic(2339))?,
+                                    [element.property_name.clone(), receiver],
+                                ),
+                                related_information: Vec::new(),
+                            },
+                        );
+                        store
+                            .intrinsic_bootstrap()
+                            .ok_or(SourceCheckError::LiteralCache(
+                                SourceLiteralCacheError::BootstrapUninitialized,
+                            ))?
+                            .error_type
+                    };
+                    stage_value_type(
+                        store,
+                        &mut staged_value_types,
+                        &mut value_order,
+                        element.symbol,
+                        type_,
+                    )?;
+                    if top_level_declared_types
+                        .insert(element.symbol, type_)
+                        .is_some()
+                    {
+                        return Err(SourceCheckError::Variable(
+                            VariableInvariant::DuplicateStagedValueType(element.symbol),
+                        ));
+                    }
+                    if !variable.binding.is_const() && !mutable_variables.insert(element.symbol) {
+                        return Err(SourceCheckError::Variable(
+                            VariableInvariant::DuplicateCurrentFlowType(element.symbol),
+                        ));
+                    }
+                    if current_flow_types.insert(element.symbol, type_).is_some() {
+                        return Err(SourceCheckError::Variable(
+                            VariableInvariant::DuplicateCurrentFlowType(element.symbol),
+                        ));
+                    }
+                }
+            }
             PlannedStatement::ArrayVariable(variable) => {
                 let initializer = check_expression_type(
                     store,
@@ -24181,6 +24413,35 @@ mod tests {
             .value_symbol_links(symbol)
             .and_then(|links| links.resolved_type)
             .unwrap_or_else(|| panic!("missing value type for {expected}"))
+    }
+
+    fn object_binding_value_type(
+        context: &CanonicalCheckerContext<'_>,
+        parsed: &ParseResult,
+        file: FileId,
+        expected: &str,
+    ) -> TypeId {
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::BindingElement(element) = &record.data else {
+                    return None;
+                };
+                let name = parsed.arena.get(element.name?)?;
+                let NodeData::Identifier(identifier) = &name.data else {
+                    return None;
+                };
+                (identifier.text == expected).then_some(NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .unwrap_or_else(|| panic!("missing object binding {expected}"));
+        let (_, bound) = context.file(file).unwrap();
+        let symbol = bound.symbol(declaration).unwrap();
+        context
+            .store()
+            .value_symbol_links(symbol)
+            .and_then(|links| links.resolved_type)
+            .unwrap_or_else(|| panic!("missing value type for object binding {expected}"))
     }
 
     fn variable_initializer(parsed: &ParseResult, file: FileId, expected: &str) -> NodeRef {
@@ -30711,7 +30972,7 @@ mod tests {
             expected_text
         );
         assert_eq!(
-            variable_value_type(&context, &source, file, "count"),
+            object_binding_value_type(&context, &source, file, "count"),
             expected_count
         );
         assert_eq!(
@@ -36189,6 +36450,117 @@ mod tests {
             context.recheck_source_file(file).unwrap();
             assert_eq!(observable_state(&context, file), warm);
         }
+    }
+
+    #[test]
+    fn object_bindings_preserve_shorthand_renames_and_binding_symbol_types() {
+        let source = parsed(concat!(
+            "const input = { count: 1, label: 'ready' }; ",
+            "const { count, label: renamed, } = input; ",
+            "const observed = renamed;",
+        ));
+        let file = FileId::new(8_540);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        assert_eq!(
+            variable_value_type(&context, &source, file, "count"),
+            bootstrap.number_type,
+        );
+        assert_eq!(
+            object_binding_value_type(&context, &source, file, "renamed"),
+            bootstrap.string_type,
+        );
+        assert_eq!(
+            variable_value_type(&context, &source, file, "observed"),
+            bootstrap.string_type,
+        );
+        assert!(context.diagnostics().is_empty());
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn object_bindings_report_missing_properties_at_the_binding_name() {
+        let source = parsed("const input = { known: 1 }; const { missing } = input;");
+        let file = FileId::new(8_541);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected exactly one missing object binding property")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2339);
+        assert_eq!(node_text(&source, diagnostic.node.unwrap()), "missing");
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn object_bindings_preserve_optional_property_undefined_under_strict_null_checks() {
+        let source = parsed(concat!(
+            "interface Input { value?: string; } ",
+            "declare var input: Input; ",
+            "const { value } = input;",
+        ));
+        let file = FileId::new(8_544);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let value = object_binding_value_type(&context, &source, file, "value");
+        assert_eq!(context.type_to_string(value).unwrap(), "string | undefined");
+        assert!(context.diagnostics().is_empty());
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn imported_object_bindings_reexport_their_binder_owned_local_symbols() {
+        let provider = parsed("export const re = { foo: 'ready' };");
+        let consumer = parsed(concat!(
+            "import { re } from './provider'; ",
+            "const { foo } = re; ",
+            "export { foo };",
+        ));
+        let provider_file = FileId::new(8_542);
+        let consumer_file = FileId::new(8_543);
+        let files = [(provider_file, &provider), (consumer_file, &consumer)];
+        let mut context = external_context_with_import_routes(
+            &files,
+            &[SourceImportRoute {
+                source: 1,
+                specifier: 0,
+                target: 0,
+            }],
+        );
+
+        context.check_source_file(provider_file).unwrap();
+        context.check_source_file(consumer_file).unwrap();
+
+        assert_eq!(
+            object_binding_value_type(&context, &consumer, consumer_file, "foo"),
+            context.store().intrinsic_bootstrap().unwrap().string_type,
+        );
+        assert!(context.diagnostics().is_empty());
+        let warm = observable_state(&context, consumer_file);
+        context.recheck_source_file(consumer_file).unwrap();
+        assert_eq!(observable_state(&context, consumer_file), warm);
     }
 
     #[test]
