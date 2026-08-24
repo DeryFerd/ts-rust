@@ -1,8 +1,9 @@
 //! Read-only symbol planning for the dependency-closed top-level variable slice.
 //!
 //! The source checker owns expression execution and type publication. This module
-//! proves the binder/resolver route for one ordinary top-level variable or one
-//! read of an already-planned variable without mutating checker state.
+//! proves the binder/resolver route for one ordinary top-level variable, one
+//! already-planned local read, or one authenticated ambient global from another
+//! script declaration file without mutating checker state.
 
 use std::collections::HashSet;
 
@@ -44,6 +45,13 @@ pub(super) struct PlannedIdentifierRead {
     pub(super) resolved_symbol: SemanticSymbolId,
     /// The value/export symbol whose `resolvedType` owns the expression type.
     pub(super) value_symbol: SemanticSymbolId,
+}
+
+/// One authenticated global read backed by another script declaration file.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PlannedCrossFileGlobalRead {
+    pub(super) type_node: NodeRef,
+    pub(super) read: PlannedIdentifierRead,
 }
 
 /// One computed object binding whose symbol belongs to the binding element.
@@ -966,6 +974,208 @@ pub(super) fn plan_identifier_read(
         name,
         false,
     )
+}
+
+/// Authenticates an explicitly annotated ambient declaration in the global scope.
+pub(super) fn plan_cross_file_global_identifier_read(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+    name: &str,
+    declaration: NodeRef,
+) -> Result<PlannedCrossFileGlobalRead, VariablePlanError> {
+    let unsupported = || {
+        VariablePlanError::Unsupported(VariableUnsupported::CrossFileDeclaration {
+            node,
+            declaration,
+        })
+    };
+    if declaration.is_for(node.arena, node.file) {
+        return Err(unsupported());
+    }
+    let (declaration_arena, declaration_bound) =
+        host.source(declaration).ok_or_else(unsupported)?;
+    let facts = declaration_bound.source_facts().ok_or_else(unsupported)?;
+    if !facts.is_declaration_file()
+        || facts.is_javascript_file()
+        || facts.is_external_or_common_js_module()
+    {
+        return Err(unsupported());
+    }
+
+    let routed = resolve_cross_file_global_value_symbol(arena, bound, store, host, node, name)?
+        .ok_or_else(unsupported)?;
+
+    let record = store
+        .symbol(routed.target)
+        .ok_or(VariableInvariant::InvalidSymbol(routed.target))?;
+    let binding = variable_binding_flags(record.flags()).ok_or_else(unsupported)?;
+    if !host.symbol_matches(store, declaration, routed.target) {
+        return Err(VariableInvariant::InvalidSymbolShape(routed.target).into());
+    }
+    let (name_node, type_node) = authenticated_cross_file_global_declaration(
+        store,
+        declaration_arena,
+        declaration_bound,
+        declaration,
+        routed.target,
+        name,
+    )?
+    .ok_or_else(unsupported)?;
+    validate_variable_target(
+        declaration_bound,
+        store,
+        declaration,
+        name_node,
+        name,
+        routed.target,
+        binding,
+        false,
+    )?;
+    validate_target_parent(declaration_bound, store, routed.target, false)?;
+    validate_value_links(store, routed.target)?;
+    if store.symbol_node_links(node).is_some_and(|links| {
+        links
+            .resolved_symbol
+            .is_some_and(|cached| cached != routed.resolved)
+    }) {
+        return Err(VariableInvariant::InvalidSymbolNodeCache {
+            node,
+            cached: store
+                .symbol_node_links(node)
+                .and_then(|links| links.resolved_symbol),
+            expected: routed.resolved,
+        }
+        .into());
+    }
+
+    Ok(PlannedCrossFileGlobalRead {
+        type_node,
+        read: PlannedIdentifierRead {
+            resolved_symbol: routed.resolved,
+            value_symbol: routed.target,
+        },
+    })
+}
+
+fn resolve_cross_file_global_value_symbol(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+    name: &str,
+) -> Result<Option<RoutedValueSymbol>, VariablePlanError> {
+    let mut callback_host = host
+        .name_resolver_host(store)
+        .map_err(VariablePlanError::DeclaredType)?;
+    let mut resolver =
+        CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut callback_host)
+            .map_err(|error| name_resolution_error(node, error))?;
+    let Some(resolved) = resolver
+        .resolve(
+            Some(CanonicalResolutionLocation::Bound(node)),
+            name,
+            SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE,
+            None,
+            false,
+            false,
+        )
+        .map_err(|error| name_resolution_error(node, error))?
+    else {
+        return Ok(None);
+    };
+    let routed = route_value_symbol(store, node, resolved)?;
+    let global = store
+        .intrinsic_bootstrap()
+        .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+        .and_then(|globals| globals.get_source(name))
+        .and_then(|symbol| store.get_merged_symbol(symbol));
+    Ok((routed.export_local.is_none() && global == Some(routed.target)).then_some(routed))
+}
+
+fn authenticated_cross_file_global_declaration(
+    store: &CanonicalTypeMapperStore,
+    arena: &NodeArena,
+    bound: &BoundFile,
+    declaration: NodeRef,
+    symbol: SemanticSymbolId,
+    name: &str,
+) -> Result<Option<(NodeRef, NodeRef)>, VariableInvariant> {
+    let invalid = || VariableInvariant::InvalidSymbolShape(symbol);
+    let declaration_record = arena.get(declaration.node).ok_or_else(invalid)?;
+    let NodeData::VariableDeclaration(variable) = &declaration_record.data else {
+        return Ok(None);
+    };
+    let name_node = NodeRef::new(declaration.arena, declaration.file, variable.name);
+    let name_record = arena.get(name_node.node).ok_or_else(invalid)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Ok(None);
+    };
+    let Some(type_node) = variable
+        .type_
+        .map(|type_| NodeRef::new(declaration.arena, declaration.file, type_))
+    else {
+        return Ok(None);
+    };
+    let annotation = arena.get(type_node.node).ok_or_else(invalid)?;
+    let Some(SourceNodeParent::Parent(list)) = store.source_node_parent(declaration) else {
+        return Err(invalid());
+    };
+    let Some(SourceNodeParent::Parent(statement)) = store.source_node_parent(list) else {
+        return Err(invalid());
+    };
+    let Some(SourceNodeParent::Parent(source)) = store.source_node_parent(statement) else {
+        return Err(invalid());
+    };
+    let list_record = arena.get(list.node).ok_or_else(invalid)?;
+    let NodeData::VariableDeclarationList(list_data) = &list_record.data else {
+        return Err(invalid());
+    };
+    let statement_record = arena.get(statement.node).ok_or_else(invalid)?;
+    let NodeData::VariableStatement(statement_data) = &statement_record.data else {
+        return Err(invalid());
+    };
+    if declaration_record.kind != SyntaxKind::VariableDeclaration
+        || declaration_record.flags.0 != 0
+        || variable.initializer.is_some()
+        || variable.exclamation_token.is_some()
+        || variable.local_symbol.is_some()
+        || variable.symbol.is_some()
+        || variable.facts != 0
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(declaration.node)
+        || identifier.flow_node.is_some()
+        || identifier.text != name
+        || annotation.parent != Some(declaration.node)
+        || store.source_node_parent(type_node) != Some(SourceNodeParent::Parent(declaration))
+        || list_record.kind != SyntaxKind::VariableDeclarationList
+        || list_data.facts != 0
+        || !list_data.declarations.nodes.contains(&declaration.node)
+        || statement_record.kind != SyntaxKind::VariableStatement
+        || statement_data.declaration_list != list.node
+        || statement_data.flow_node.is_some()
+        || statement_data.facts != 0
+        || source != bound.source_file()
+        || bound.container(declaration) != Some(source)
+        || bound.local_symbol(declaration).is_some()
+        || bound
+            .symbol(declaration)
+            .and_then(|candidate| store.get_merged_symbol(candidate))
+            != Some(symbol)
+        || bound
+            .locals(source)
+            .and_then(|locals| store.symbol_table(locals))
+            .and_then(|locals| locals.get_source(name))
+            .and_then(|candidate| store.get_merged_symbol(candidate))
+            != Some(symbol)
+    {
+        return Err(invalid());
+    }
+    Ok(Some((name_node, type_node)))
 }
 
 /// Resolves an authenticated recovered anonymous-module `var` redeclaration.

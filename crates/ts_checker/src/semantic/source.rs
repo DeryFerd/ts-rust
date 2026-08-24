@@ -205,13 +205,14 @@ use super::{
     type_records::{LiteralValue, TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
     variables::{
-        PlannedArrayBindingElement, PlannedComputedBindingElement,
+        PlannedArrayBindingElement, PlannedComputedBindingElement, PlannedCrossFileGlobalRead,
         PlannedIdentifierRead as PlannedVariableRead, PlannedObjectBindingElement,
-        VariableBindingKind, VariablePlanError, plan_declared_value_identifier_read,
-        plan_identifier_read, plan_recovered_anonymous_module_identifier_read,
-        plan_recovered_anonymous_module_variable, plan_redeclared_top_level_variable,
-        plan_top_level_array_binding_element, plan_top_level_computed_binding_element,
-        plan_top_level_object_binding_elements, plan_top_level_variable,
+        VariableBindingKind, VariablePlanError, plan_cross_file_global_identifier_read,
+        plan_declared_value_identifier_read, plan_identifier_read,
+        plan_recovered_anonymous_module_identifier_read, plan_recovered_anonymous_module_variable,
+        plan_redeclared_top_level_variable, plan_top_level_array_binding_element,
+        plan_top_level_computed_binding_element, plan_top_level_object_binding_elements,
+        plan_top_level_variable,
     },
 };
 
@@ -1331,6 +1332,7 @@ struct SourceCheckPlan {
     type_import_references: Vec<PlannedSourceTypeImportReference>,
     type_import_value_uses: Vec<PlannedSourceTypeImportValueUse>,
     ambient_variables: Vec<PlannedAmbientVariable>,
+    cross_file_global_reads: Vec<PlannedCrossFileGlobalRead>,
     ambient_namespace_reads: Vec<PlannedAmbientNamespaceRead>,
     overloads: Vec<SourceOverloadPlan>,
     functions: Vec<PlannedFunction>,
@@ -1375,6 +1377,7 @@ struct SourcePlanner<'arena, 'semantic, 'sources> {
     import_reads: Vec<PlannedSourceImportRead>,
     type_import_references: Vec<PlannedSourceTypeImportReference>,
     type_import_value_uses: Vec<PlannedSourceTypeImportValueUse>,
+    cross_file_global_reads: Vec<PlannedCrossFileGlobalRead>,
     ambient_namespace_reads: Vec<PlannedAmbientNamespaceRead>,
     semantic: Option<(
         &'semantic CanonicalTypeMapperStore,
@@ -1420,6 +1423,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             import_reads: Vec::new(),
             type_import_references: Vec::new(),
             type_import_value_uses: Vec::new(),
+            cross_file_global_reads: Vec::new(),
             ambient_namespace_reads: Vec::new(),
             semantic: None,
             array_targets: None,
@@ -1466,6 +1470,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             import_reads: Vec::new(),
             type_import_references: Vec::new(),
             type_import_value_uses: Vec::new(),
+            cross_file_global_reads: Vec::new(),
             ambient_namespace_reads: Vec::new(),
             semantic: Some((store, host)),
             array_targets: None,
@@ -2925,6 +2930,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             type_import_references: self.type_import_references,
             type_import_value_uses: self.type_import_value_uses,
             ambient_variables,
+            cross_file_global_reads: self.cross_file_global_reads,
             ambient_namespace_reads: self.ambient_namespace_reads,
             overloads,
             functions,
@@ -10809,6 +10815,24 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 let kind = match variable_read {
                     Ok(read) => {
                         PlannedExpressionKind::Identifier(PlannedIdentifierRead::variable(read))
+                    }
+                    Err(VariablePlanError::Unsupported(
+                        VariableUnsupported::CrossFileDeclaration { node, declaration },
+                    )) if node == expression => {
+                        let read = plan_cross_file_global_identifier_read(
+                            self.arena,
+                            self.bound,
+                            store,
+                            host,
+                            expression,
+                            &name,
+                            declaration,
+                        )
+                        .map_err(Self::variable_plan_error)?;
+                        self.cross_file_global_reads.push(read);
+                        PlannedExpressionKind::Identifier(PlannedIdentifierRead::variable(
+                            read.read,
+                        ))
                     }
                     Err(VariablePlanError::Unsupported(
                         VariableUnsupported::NonUniqueDeclaration { node, symbol, .. },
@@ -21256,6 +21280,7 @@ pub(super) fn check_source_file(
         type_import_references,
         type_import_value_uses,
         ambient_variables,
+        cross_file_global_reads,
         ambient_namespace_reads,
         overloads,
         mut functions,
@@ -21841,6 +21866,22 @@ pub(super) fn check_source_file(
         )?
         .preflight_type_from_type_node(type_node)?;
     }
+    let mut preflighted_cross_file_globals = HashSet::new();
+    for read in &cross_file_global_reads {
+        if !preflighted_cross_file_globals.insert(read.read.value_symbol) {
+            continue;
+        }
+        session.reset_query();
+        CanonicalTypeQuery::new_with_global_types_and_session(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            &mut type_import_preflight_diagnostics,
+        )?
+        .preflight_type_from_type_node(read.type_node)?;
+    }
     for statement in &statements {
         match statement {
             PlannedStatement::GenericInterface(interface) => {
@@ -22129,6 +22170,56 @@ pub(super) fn check_source_file(
             ));
         }
         current_flow_types.insert(symbol, global_types.global_this_value_type);
+    }
+
+    for read in &cross_file_global_reads {
+        if current_flow_types.contains_key(&read.read.value_symbol) {
+            continue;
+        }
+        session.reset_query();
+        let mut annotation_diagnostics = CanonicalCheckerDiagnostics::default();
+        let declared_type = CanonicalTypeQuery::new_with_global_types_and_session(
+            store,
+            host,
+            global_types,
+            options,
+            session,
+            &mut annotation_diagnostics,
+        )?
+        .get_type_from_type_node(read.type_node);
+        merge_retry_diagnostics(diagnostics, annotation_diagnostics);
+        let declared_type = declared_type?;
+        let cached = store
+            .value_symbol_links(read.read.value_symbol)
+            .and_then(|links| links.resolved_type);
+        if let Some(cached) = cached
+            && cached != declared_type
+        {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::CachedValueTypeMismatch {
+                    symbol: read.read.value_symbol,
+                    cached,
+                    expected: declared_type,
+                },
+            ));
+        }
+        if cached.is_none() {
+            stage_value_type(
+                store,
+                &mut staged_value_types,
+                &mut value_order,
+                read.read.value_symbol,
+                declared_type,
+            )?;
+        }
+        if current_flow_types
+            .insert(read.read.value_symbol, declared_type)
+            .is_some()
+        {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::DuplicateCurrentFlowType(read.read.value_symbol),
+            ));
+        }
     }
 
     for read in &ambient_namespace_reads {
@@ -25904,6 +25995,55 @@ mod tests {
             .bind_typescript_declaration_slice(&source.arena, file)
             .unwrap();
         CanonicalCheckerContext::new(binder.finish(), vec![(file, &source.arena)], options).unwrap()
+    }
+
+    fn context_with_cross_file_global<'arena>(
+        declaration_file: FileId,
+        declaration: &'arena ParseResult,
+        source_file: FileId,
+        source: &'arena ParseResult,
+        declaration_module_state: CanonicalModuleState,
+        source_module_state: CanonicalModuleState,
+        is_default_library: bool,
+    ) -> CanonicalCheckerContext<'arena> {
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &declaration.arena,
+                declaration.source_file,
+                declaration_file,
+                CanonicalSourceFileFacts::new_with_default_library(
+                    EscapedName::source(format!("\"/project/{}.d.ts\"", declaration_file.index())),
+                    CanonicalSourceLanguage::TypeScript,
+                    true,
+                    is_default_library,
+                    declaration_module_state,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_source_file_with_facts(
+                &source.arena,
+                source.source_file,
+                source_file,
+                source_facts_with_module_state(source_file, source_module_state),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&declaration.arena, declaration_file)
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&source.arena, source_file)
+            .unwrap();
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![
+                (declaration_file, &declaration.arena),
+                (source_file, &source.arena),
+            ],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap()
     }
 
     fn javascript_context(
@@ -30376,6 +30516,169 @@ mod tests {
         );
         assert_eq!(observable_state(&context, file), before);
         assert!(!is_type_checked(&context, file));
+    }
+
+    #[test]
+    fn cross_file_ambient_globals_preserve_value_identity_cold_and_warm() {
+        for (index, (declaration_text, source_text, name, module_state, default_library)) in [
+            (
+                "declare const shared: number;",
+                "export const observed = shared;",
+                "shared",
+                CanonicalModuleState::External,
+                false,
+            ),
+            (
+                concat!(
+                    "interface Object {} ",
+                    "interface ObjectConstructor {} ",
+                    "declare var Object: ObjectConstructor;",
+                ),
+                "const first = Object; const second = Object;",
+                "Object",
+                CanonicalModuleState::Script,
+                true,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let declaration = parsed(declaration_text);
+            let source = parsed(source_text);
+            let declaration_file = FileId::new(9_470 + u32::try_from(index).unwrap() * 2);
+            let file = FileId::new(declaration_file.index() + 1);
+            let mut context = context_with_cross_file_global(
+                declaration_file,
+                &declaration,
+                file,
+                &source,
+                CanonicalModuleState::Script,
+                module_state,
+                default_library,
+            );
+            let symbol = variable_symbol(&context, &declaration, declaration_file, name);
+            assert!(
+                context
+                    .store()
+                    .value_symbol_links(symbol)
+                    .and_then(|links| links.resolved_type)
+                    .is_none()
+            );
+
+            context.check_source_file(file).unwrap();
+
+            let expected = if name == "shared" {
+                context.store().intrinsic_bootstrap().unwrap().number_type
+            } else {
+                let constructor = context
+                    .store()
+                    .intrinsic_bootstrap()
+                    .and_then(|bootstrap| context.store().symbol_table(bootstrap.globals))
+                    .and_then(|globals| globals.get_source("ObjectConstructor"))
+                    .unwrap();
+                context.get_declared_type_of_symbol(constructor).unwrap()
+            };
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(symbol)
+                    .and_then(|links| links.resolved_type),
+                Some(expected),
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .type_node_links(variable_type_node(&declaration, declaration_file, name))
+                    .and_then(|links| links.resolved_type),
+                Some(expected),
+            );
+            for read in identifier_expressions(&source, file, name) {
+                assert_eq!(
+                    context
+                        .store()
+                        .symbol_node_links(read)
+                        .and_then(|links| links.resolved_symbol),
+                    Some(symbol),
+                );
+                assert_eq!(resolved_node_type(&context, read), expected);
+            }
+            assert!(!is_type_checked(&context, declaration_file));
+            assert!(context.diagnostics().is_empty());
+
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
+    fn cross_file_ambient_globals_reject_poisoned_value_links_before_publication() {
+        let declaration = parsed("declare const shared: number;");
+        let source = parsed("const observed = shared;");
+        let declaration_file = FileId::new(9_474);
+        let file = FileId::new(9_475);
+        let mut context = context_with_cross_file_global(
+            declaration_file,
+            &declaration,
+            file,
+            &source,
+            CanonicalModuleState::Script,
+            CanonicalModuleState::Script,
+            false,
+        );
+        let symbol = variable_symbol(&context, &declaration, declaration_file, "shared");
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert!(context.store_mut_for_test().set_value_symbol_links(
+            symbol,
+            ValueSymbolLinks {
+                write_type: Some(number),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        let before = observable_state(&context, file);
+
+        assert_eq!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidValueLinks(symbol),
+            )),
+        );
+        assert_eq!(observable_state(&context, file), before);
+        assert!(
+            context
+                .store()
+                .symbol_node_links(variable_initializer(&source, file, "observed"))
+                .is_none()
+        );
+        assert!(!is_type_checked(&context, file));
+    }
+
+    #[test]
+    fn cross_file_module_variables_do_not_enter_the_global_scope() {
+        let declaration = parsed("export declare const hidden: number;");
+        let source = parsed("const observed = hidden;");
+        let declaration_file = FileId::new(9_476);
+        let file = FileId::new(9_477);
+        let mut context = context_with_cross_file_global(
+            declaration_file,
+            &declaration,
+            file,
+            &source,
+            CanonicalModuleState::External,
+            CanonicalModuleState::Script,
+            false,
+        );
+        let hidden = variable_symbol(&context, &declaration, declaration_file, "hidden");
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("a declaration-file module member must remain unavailable globally")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2304);
+        assert_eq!(node_text(&source, diagnostic.node.unwrap()), "hidden");
+        assert!(context.store().value_symbol_links(hidden).is_none());
+        assert!(!is_type_checked(&context, declaration_file));
     }
 
     #[test]
