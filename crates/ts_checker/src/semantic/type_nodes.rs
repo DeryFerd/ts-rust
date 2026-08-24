@@ -1648,9 +1648,14 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                         TypeNodeUnavailable::InvalidUnionType(node),
                     ));
                 }
+                let replay_bivariant_generic_union = derived_alias
+                    .map(|alias| self.is_authenticated_bivariant_generic_union_alias(node, alias))
+                    .transpose()?
+                    .unwrap_or(false);
                 match self.validate_cached_union_result(cached, alias_owner.or(derived_alias)) {
                     Ok(())
-                        if self.type_reference_alias_targets.is_empty()
+                        if !replay_bivariant_generic_union
+                            && self.type_reference_alias_targets.is_empty()
                             && !self.type_node_contains_import_alias_reference(
                                 node,
                                 &mut HashSet::new(),
@@ -11048,6 +11053,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             || self.direct_type_literal_rhs(type_node)?
             || self.direct_function_type_rhs(type_node)?
             || self.direct_indexed_access_rhs(type_node)?
+            || self.is_authenticated_bivariant_generic_union_alias(type_node, symbol)?
             || self.direct_keyof_rhs(type_node)?
             || self.direct_tuple_type_rhs(type_node)?
             || preflight_node(self.store, self.host, type_node)?.kind == SyntaxKind::ConditionalType
