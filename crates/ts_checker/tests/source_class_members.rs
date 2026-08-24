@@ -783,9 +783,7 @@ fn exported_class_is_unsupported_before_export_symbol_planning() {
 }
 
 #[test]
-fn anonymous_class_declaration_is_unsupported_before_class_planning() {
-    // This is the pinned smoke regression. The parser currently also retains
-    // TS1003, but the bound anonymous declaration still reaches source checking.
+fn anonymous_decorated_class_reports_grammar_without_publishing_class_types() {
     let parsed = parse_source_file("class {\n  @x\n  m() {}\n};");
     let file = FileId::new(0);
     let declaration = parsed
@@ -808,12 +806,7 @@ fn anonymous_class_declaration_is_unsupported_before_class_planning() {
         context.store().relation_state_snapshot(),
     );
 
-    assert_eq!(
-        context.check_source_file(file),
-        Err(SourceCheckError::Unsupported(
-            UnsupportedSourceSyntax::Class(declaration)
-        ))
-    );
+    context.check_source_file(file).unwrap();
     assert_eq!(
         (
             context.store().type_len(),
@@ -824,13 +817,29 @@ fn anonymous_class_declaration_is_unsupported_before_class_planning() {
         ),
         before
     );
+    let diagnostics = context.diagnostics().as_slice();
+    assert_eq!(diagnostics.len(), 2);
+    assert_eq!(diagnostics[0].diagnostic.code(), 1211);
+    assert_eq!(diagnostics[0].node, Some(declaration));
+    assert_eq!(
+        diagnostics[0].diagnostic.render().unwrap(),
+        "A class declaration without the 'default' modifier must have a name.",
+    );
+    assert_eq!(diagnostics[1].diagnostic.code(), 2304);
+    assert_eq!(
+        diagnostics[1].diagnostic.render().unwrap(),
+        "Cannot find name 'x'.",
+    );
     assert!(
         context
             .source_file(file)
             .and_then(|source| context.store().source_file_links(source))
-            .is_none_or(|links| !links.type_checked)
+            .is_some_and(|links| links.type_checked)
     );
-    assert!(context.diagnostics().is_empty());
+
+    let warm = context.diagnostics().clone();
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(context.diagnostics(), &warm);
 }
 
 #[test]

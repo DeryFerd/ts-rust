@@ -58,7 +58,7 @@ use super::{
         StoredSingleCallableValidation, ValidatedSingleCallable, validate_stored_single_callable,
     },
     classes::{
-        ClassGrammarDiagnosticPlan, ClassMemberPlan, ClassMemberQueryPlan,
+        ClassGrammarDiagnostic, ClassGrammarDiagnosticPlan, ClassMemberPlan, ClassMemberQueryPlan,
         ExportedJsxArrowClassPlan, execute_exported_jsx_arrow_class,
         execute_nongeneric_class_member_query, plan_class_grammar_diagnostics,
         plan_exported_jsx_arrow_class, plan_nongeneric_class_member_query,
@@ -1794,6 +1794,12 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         ));
                     };
                     let Some(name) = class.name else {
+                        if let Some(grammar) =
+                            self.plan_anonymous_decorated_class_grammar(statement)?
+                        {
+                            statements.push(PlannedStatement::ClassGrammar(grammar));
+                            continue;
+                        }
                         return Err(SourceCheckError::Unsupported(
                             UnsupportedSourceSyntax::Class(statement),
                         ));
@@ -5858,6 +5864,201 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             }
             type_node = inner;
         }
+    }
+
+    fn plan_anonymous_decorated_class_grammar(
+        &self,
+        declaration: NodeRef,
+    ) -> Result<Option<ClassGrammarDiagnosticPlan>, SourceCheckError> {
+        let Some((store, host)) = self.semantic else {
+            return Ok(None);
+        };
+        let record = self.node(declaration)?;
+        let NodeData::ClassDeclaration(class) = &record.data else {
+            return Ok(None);
+        };
+        let [method] = class.members.nodes.as_slice() else {
+            return Ok(None);
+        };
+        let method = self.reference(*method);
+        let method_record = self.node(method)?;
+        let NodeData::MethodDeclaration(method_data) = &method_record.data else {
+            return Ok(None);
+        };
+        let Some(modifiers) = method_data.modifiers.as_ref() else {
+            return Ok(None);
+        };
+        let [decorator] = modifiers.list.nodes.as_slice() else {
+            return Ok(None);
+        };
+        let decorator = self.reference(*decorator);
+        let decorator_record = self.node(decorator)?;
+        let NodeData::Decorator(decorator_data) = &decorator_record.data else {
+            return Ok(None);
+        };
+        let expression = self.reference(decorator_data.expression);
+        let expression_record = self.node(expression)?;
+        let NodeData::Identifier(identifier) = &expression_record.data else {
+            return Ok(None);
+        };
+        let method_name = self.reference(method_data.name);
+        let method_name_record = self.node(method_name)?;
+        let NodeData::Identifier(method_identifier) = &method_name_record.data else {
+            return Ok(None);
+        };
+        let Some(body) = method_data.body.map(|node| self.reference(node)) else {
+            return Ok(None);
+        };
+        let body_record = self.node(body)?;
+        let NodeData::Block(body_data) = &body_record.data else {
+            return Ok(None);
+        };
+        let Some(symbol) = self.bound.symbol(declaration) else {
+            return Ok(None);
+        };
+        let Some(owner) = store.symbol(symbol) else {
+            return Ok(None);
+        };
+        let Some(method_symbol) = self.bound.symbol(method) else {
+            return Ok(None);
+        };
+        let Some(method_owner) = store.symbol(method_symbol) else {
+            return Ok(None);
+        };
+        if record.kind != SyntaxKind::ClassDeclaration
+            || record.flags.0 != 0
+            || record.parent != Some(self.source.node_ref().node)
+            || class.name.is_some()
+            || class.modifiers.is_some()
+            || class.heritage_clauses.is_some()
+            || class.type_parameters.is_some()
+            || class.flow_node.is_some()
+            || class.local_symbol.is_some()
+            || class.symbol.is_some()
+            || class.next_container.is_some()
+            || class.facts != 0
+            || class.members.has_trailing_comma
+            || owner.flags() != SymbolFlags::CLASS
+            || owner.check_flags() != CheckFlags::NONE
+            || owner.name() != ts_binder::InternalSymbolName::Missing.as_ref()
+            || owner.declarations() != Some(&[declaration])
+            || owner.value_declaration() != Some(declaration)
+            || owner.parent().is_some()
+            || owner.export_symbol().is_some()
+            || store.get_merged_symbol(symbol) != Some(symbol)
+            || method_record.kind != SyntaxKind::MethodDeclaration
+            || method_record.flags.0 != 0
+            || method_record.parent != Some(declaration.node)
+            || method_data.asterisk_token.is_some()
+            || method_data.end_flow_node.is_some()
+            || method_data.flow_node.is_some()
+            || method_data.full_signature.is_some()
+            || method_data.next_container.is_some()
+            || method_data.postfix_token.is_some()
+            || method_data.symbol.is_some()
+            || method_data.type_.is_some()
+            || method_data.type_parameters.is_some()
+            || method_data.facts != 0
+            || !method_data.parameters.nodes.is_empty()
+            || method_data.parameters.has_trailing_comma
+            || method_owner.flags() != SymbolFlags::METHOD
+            || method_owner.check_flags() != CheckFlags::NONE
+            || method_owner.declarations() != Some(&[method])
+            || method_owner.value_declaration() != Some(method)
+            || method_owner.parent() != Some(symbol)
+            || method_owner.export_symbol().is_some()
+            || store.get_merged_symbol(method_symbol) != Some(method_symbol)
+            || owner
+                .members()
+                .and_then(|members| store.symbol_table(members))
+                .and_then(|members| members.get_source(&method_identifier.text))
+                != Some(method_symbol)
+            || method_name_record.kind != SyntaxKind::Identifier
+            || method_name_record.flags.0 != 0
+            || method_name_record.parent != Some(method.node)
+            || method_identifier.flow_node.is_some()
+            || method_identifier.text.is_empty()
+            || modifiers.flags.0 != 0
+            || modifiers.list.has_trailing_comma
+            || decorator_record.kind != SyntaxKind::Decorator
+            || decorator_record.flags.0 != 0
+            || decorator_record.parent != Some(method.node)
+            || decorator_data.facts != 0
+            || expression_record.kind != SyntaxKind::Identifier
+            || expression_record.flags.0 != 0
+            || expression_record.parent != Some(decorator.node)
+            || identifier.flow_node.is_some()
+            || identifier.text.is_empty()
+            || body_record.kind != SyntaxKind::Block
+            || body_record.flags.0 != 0
+            || body_record.parent != Some(method.node)
+            || body_data.flow_node.is_some()
+            || body_data.next_container.is_some()
+            || !body_data.statements.nodes.is_empty()
+            || body_data.statements.has_trailing_comma
+            || body_data.facts != 0
+        {
+            return Ok(None);
+        }
+
+        let mut callback_host = host.name_resolver_host(store)?;
+        let resolved = CanonicalNameResolver::new(
+            self.arena,
+            self.bound,
+            store.symbol_store(),
+            &mut callback_host,
+        )
+        .map_err(DeclaredTypeError::from)?
+        .resolve(
+            Some(CanonicalResolutionLocation::Bound(expression)),
+            &identifier.text,
+            SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE,
+            None,
+            false,
+            false,
+        )
+        .map_err(DeclaredTypeError::from)?;
+        if resolved.is_some() {
+            return Ok(None);
+        }
+
+        let start = usize::try_from(record.range.start.get())
+            .map_err(|_| SourceCheckError::Class(declaration))?;
+        let end = start
+            .checked_add("class".len())
+            .ok_or(SourceCheckError::Class(declaration))?;
+        if self
+            .arena
+            .source_text()
+            .and_then(|source| source.get(start..end))
+            != Some("class")
+        {
+            return Ok(None);
+        }
+        let keyword_end = ts_core::TextPos::new(
+            u32::try_from(end).map_err(|_| SourceCheckError::Class(declaration))?,
+        );
+        Ok(Some(ClassGrammarDiagnosticPlan {
+            declaration,
+            symbol,
+            diagnostics: vec![
+                ClassGrammarDiagnostic {
+                    node: declaration,
+                    range_override: Some(CanonicalCheckerDiagnosticRange::new(
+                        declaration,
+                        TextRange::new(record.range.start, keyword_end),
+                    )),
+                    code: 1211,
+                    arguments: Vec::new(),
+                },
+                ClassGrammarDiagnostic {
+                    node: expression,
+                    range_override: None,
+                    code: 2304,
+                    arguments: vec![identifier.text.clone()],
+                },
+            ],
+        }))
     }
 
     fn plan_external_module_marker(
@@ -22477,6 +22678,83 @@ mod tests {
         mark_source_unchecked(&mut context, file);
         context.check_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn anonymous_decorated_class_reports_exact_grammar_and_missing_name_diagnostics() {
+        let source = parsed("class {\n  @x\n  m() {}\n};");
+        let file = FileId::new(8_367);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let declaration = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ClassDeclaration).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let decorator = source
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::Decorator(decorator) = &record.data else {
+                    return None;
+                };
+                Some(NodeRef::new(source.arena.id(), file, decorator.expression))
+            })
+            .unwrap();
+        let (_, bound) = context.file(file).unwrap();
+        let owner = bound.symbol(declaration).unwrap();
+
+        context.check_source_file(file).unwrap();
+
+        let [class, missing] = context.diagnostics().as_slice() else {
+            panic!("expected the anonymous class and missing decorator diagnostics")
+        };
+        assert_eq!(class.node, Some(declaration));
+        assert_eq!(class.diagnostic.code(), 1211);
+        assert_eq!(
+            class.range_override.unwrap().range(),
+            TextRange::new(ts_core::TextPos::new(0), ts_core::TextPos::new(5)),
+        );
+        assert_eq!(missing.node, Some(decorator));
+        assert_eq!(missing.diagnostic.code(), 2304);
+        assert_eq!(missing.diagnostic.arguments, ["x"]);
+        assert!(context.store().declared_type_links(owner).is_none());
+        assert!(context.store().value_symbol_links(owner).is_none());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn anonymous_class_grammar_rejects_resolved_decorators_and_nonempty_methods() {
+        for (index, text) in [
+            "const x = 1; class { @x m() {} };",
+            "class { @x m() { return 1; } };",
+            "class { m() {} };",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parsed(text);
+            let file = FileId::new(8_368 + u32::try_from(index).unwrap());
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            let cold = observable_state(&context, file);
+
+            assert!(matches!(
+                context.check_source_file(file),
+                Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Class(_)
+                ))
+            ));
+            assert_eq!(observable_state(&context, file), cold);
+            assert!(context.diagnostics().is_empty());
+        }
     }
 
     #[test]
