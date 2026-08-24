@@ -3,9 +3,9 @@
 //! This module follows the pinned JSX checker for global `JSX` namespaces,
 //! named or indexed intrinsic tags, and fixed or inferred function components.
 //! It writes only to the existing semantic graph. Inline object-literal and
-//! identifier spreads reuse canonical object publication. Other spreads,
-//! dotted component names, contextual child expressions, and factory imports
-//! remain explicit source-capability boundaries.
+//! identifier spreads reuse canonical object publication. Dotted component
+//! names retain authenticated namespace exports. Other spreads, broader
+//! contextual child expressions, and factory imports remain explicit boundaries.
 
 use std::collections::HashSet;
 
@@ -36,7 +36,7 @@ use super::{
     instantiated_members::{demand_instantiated_property_type, resolve_members_with_array_targets},
     mapped_types::MappedTypeModifiers,
     production::{CanonicalJsxRuntime, CanonicalJsxRuntimeEvidence},
-    reference_types::validate_direct_generic_reference,
+    reference_types::{create_direct_generic_reference, validate_direct_generic_reference},
     signatures::SignatureFlags,
     source::merge_retry_diagnostic,
     source_calls::resolve_jsx_generic_component_signature,
@@ -70,6 +70,15 @@ struct JsxTagPlan {
     node: NodeRef,
     name: String,
     intrinsic: bool,
+    namespace_member: Option<JsxNamespaceMemberPlan>,
+}
+
+#[derive(Clone, Debug)]
+struct JsxNamespaceMemberPlan {
+    namespace: SemanticSymbolId,
+    namespace_node: NodeRef,
+    member: SemanticSymbolId,
+    member_node: NodeRef,
 }
 
 #[derive(Clone, Debug)]
@@ -146,7 +155,7 @@ enum JsxScalarPlan {
         name_node: NodeRef,
         name: String,
     },
-    AnyAssertion {
+    TypeAssertion {
         node: NodeRef,
         type_node: NodeRef,
         value: Box<Self>,
@@ -210,6 +219,7 @@ struct CheckedJsxChildren {
     node: NodeRef,
     type_: TypeId,
     name: Option<SemanticSymbolId>,
+    individual_errors: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -792,6 +802,7 @@ fn plan_jsx_tag(
                 node,
                 name: identifier.text.clone(),
                 intrinsic: is_intrinsic_name(&identifier.text),
+                namespace_member: None,
             })
         }
         NodeData::JsxNamespacedName(namespaced)
@@ -817,6 +828,79 @@ fn plan_jsx_tag(
                 node,
                 name: format!("{}:{}", namespace_name.text, local_name.text),
                 intrinsic: true,
+                namespace_member: None,
+            })
+        }
+        NodeData::PropertyAccessExpression(access)
+            if record.kind == SyntaxKind::PropertyAccessExpression
+                && access.question_dot_token.is_none()
+                && access.flow_node.is_none()
+                && access.facts == 0 =>
+        {
+            let namespace_node = child_ref(node, access.expression);
+            let member_node = child_ref(node, access.name);
+            let namespace_record = jsx_node(arena, bound, store, namespace_node)?;
+            let member_record = jsx_node(arena, bound, store, member_node)?;
+            let (NodeData::Identifier(namespace_name), NodeData::Identifier(member_name)) =
+                (&namespace_record.data, &member_record.data)
+            else {
+                return Err(unsupported(node, record.kind));
+            };
+            if namespace_record.kind != SyntaxKind::Identifier
+                || namespace_record.flags.0 != 0
+                || namespace_record.parent != Some(node.node)
+                || namespace_name.flow_node.is_some()
+                || namespace_name.text.is_empty()
+                || member_record.kind != SyntaxKind::Identifier
+                || member_record.flags.0 != 0
+                || member_record.parent != Some(node.node)
+                || member_name.flow_node.is_some()
+                || member_name.text.is_empty()
+            {
+                return Err(unsupported(node, record.kind));
+            }
+            let namespace = resolve_scoped_jsx_namespace_symbol(
+                store,
+                arena,
+                bound,
+                namespace_node,
+                &namespace_name.text,
+            )?
+            .ok_or_else(|| unsupported(namespace_node, namespace_record.kind))?;
+            let owner = store
+                .symbol(namespace)
+                .ok_or(SourceCheckError::Property(namespace_node))?;
+            let member = owner
+                .exports()
+                .and_then(|exports| store.symbol_table(exports))
+                .and_then(|exports| exports.get_source(&member_name.text))
+                .and_then(|member| store.get_merged_symbol(member))
+                .ok_or_else(|| unsupported(member_node, member_record.kind))?;
+            let value = store
+                .symbol(member)
+                .ok_or(SourceCheckError::Property(member_node))?;
+            if !owner.flags().intersects(SymbolFlags::MODULE)
+                || !value.flags().intersects(SymbolFlags::VALUE)
+                || value.check_flags() != CheckFlags::NONE
+                || value.name().as_utf8() != Some(member_name.text.as_str())
+                || store.get_parent_of_symbol(member) != Some(namespace)
+                || value.value_declaration().is_none()
+                || value
+                    .declarations()
+                    .is_none_or(|declarations| declarations.is_empty())
+            {
+                return Err(SourceCheckError::Property(member_node));
+            }
+            Ok(JsxTagPlan {
+                node,
+                name: format!("{}.{}", namespace_name.text, member_name.text),
+                intrinsic: false,
+                namespace_member: Some(JsxNamespaceMemberPlan {
+                    namespace,
+                    namespace_node,
+                    member,
+                    member_node,
+                }),
             })
         }
         _ => Err(unsupported(node, record.kind)),
@@ -1262,13 +1346,15 @@ fn plan_scalar(
         NodeData::AsExpression(assertion) if record.kind == SyntaxKind::AsExpression => {
             let type_node = child_ref(node, assertion.type_);
             let type_record = jsx_node(arena, bound, store, type_node)?;
-            if type_record.kind != SyntaxKind::AnyKeyword
-                || !matches!(&type_record.data, NodeData::KeywordTypeNode(_))
+            if !matches!(
+                type_record.kind,
+                SyntaxKind::AnyKeyword | SyntaxKind::UnknownKeyword
+            ) || !matches!(&type_record.data, NodeData::KeywordTypeNode(_))
                 || type_record.parent != Some(node.node)
             {
                 return Err(unsupported(type_node, type_record.kind));
             }
-            Ok(JsxScalarPlan::AnyAssertion {
+            Ok(JsxScalarPlan::TypeAssertion {
                 node,
                 type_node,
                 value: Box::new(plan_scalar(
@@ -1858,7 +1944,7 @@ fn collect_jsx_scalar_intrinsic_names(scalar: &JsxScalarPlan, names: &mut HashSe
         JsxScalarPlan::Property { receiver, .. } => {
             collect_jsx_scalar_intrinsic_names(receiver, names);
         }
-        JsxScalarPlan::AnyAssertion { value, .. } | JsxScalarPlan::Parenthesized { value, .. } => {
+        JsxScalarPlan::TypeAssertion { value, .. } | JsxScalarPlan::Parenthesized { value, .. } => {
             collect_jsx_scalar_intrinsic_names(value, names);
         }
         JsxScalarPlan::Conditional {
@@ -2889,6 +2975,16 @@ fn execute_jsx_element(
                     ..JsxElementLinks::default()
                 },
             )?;
+            if options.jsx_runtime == CanonicalJsxRuntime::Classic && !plan.children.is_empty() {
+                children_checked = check_react_jsx_fragment_children(
+                    store,
+                    source,
+                    namespace,
+                    plan,
+                    options,
+                    diagnostics,
+                )?;
+            }
         }
         JsxElementPlanKind::Element {
             tag,
@@ -2940,15 +3036,7 @@ fn execute_jsx_element(
                     )?;
                 }
                 if let Some(closing) = closing {
-                    check_jsx_closing_tag(
-                        store,
-                        arena,
-                        bound,
-                        namespace,
-                        closing,
-                        options,
-                        diagnostics,
-                    )?;
+                    check_jsx_closing_tag(store, source, namespace, closing, options, diagnostics)?;
                 }
                 (intrinsic.attributes_type, signature)
             } else {
@@ -2974,15 +3062,7 @@ fn execute_jsx_element(
                     },
                 )?;
                 if let Some(closing) = closing {
-                    check_jsx_closing_tag(
-                        store,
-                        arena,
-                        bound,
-                        namespace,
-                        closing,
-                        options,
-                        diagnostics,
-                    )?;
+                    check_jsx_closing_tag(store, source, namespace, closing, options, diagnostics)?;
                 }
                 (attributes_type, signature)
             };
@@ -2998,6 +3078,7 @@ fn execute_jsx_element(
                     namespace,
                     plan,
                     attributes,
+                    expected_attributes,
                     options,
                     diagnostics,
                 )?
@@ -3142,6 +3223,216 @@ fn check_jsx_element_type_constraint(
     Ok(())
 }
 
+fn check_react_jsx_fragment_children(
+    store: &mut CanonicalTypeMapperStore,
+    source: (
+        &NodeArena,
+        &BoundFile,
+        &DeclaredTypeHost<'_>,
+        Option<&CanonicalGlobalTypes>,
+    ),
+    namespace: &JsxNamespace,
+    plan: &JsxElementPlan,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+) -> Result<bool, SourceCheckError> {
+    let (arena, bound, host, _) = source;
+    let source_file = super::SourceFileRef::new(store.id(), bound.source_file());
+    let factory = store
+        .source_file_links(source_file)
+        .map(|links| links.local_jsx_fragment_namespace.as_str())
+        .filter(|factory| !factory.is_empty())
+        .unwrap_or("React");
+    let Some(owner) =
+        resolve_scoped_jsx_namespace_symbol(store, arena, bound, plan.opening, factory)?
+    else {
+        return Ok(false);
+    };
+    let Some(owner_record) = store.symbol(owner) else {
+        return Err(SourceCheckError::Property(plan.opening));
+    };
+    if !owner_record.flags().intersects(SymbolFlags::MODULE) {
+        return Ok(false);
+    }
+    let Some(fragment) = owner_record
+        .exports()
+        .and_then(|exports| store.symbol_table(exports))
+        .and_then(|exports| exports.get_source("Fragment"))
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+    else {
+        return Ok(false);
+    };
+    let record = store
+        .symbol(fragment)
+        .ok_or(SourceCheckError::Property(plan.opening))?;
+    if !record.flags().intersects(SymbolFlags::VALUE)
+        || record.check_flags() != CheckFlags::NONE
+        || record.name().as_utf8() != Some("Fragment")
+        || store.get_parent_of_symbol(fragment) != Some(owner)
+        || record.value_declaration().is_none()
+    {
+        return Err(SourceCheckError::Property(plan.opening));
+    }
+    let member = JsxNamespaceMemberPlan {
+        namespace: owner,
+        namespace_node: plan.opening,
+        member: fragment,
+        member_node: plan.opening,
+    };
+    let component =
+        resolve_namespace_component_type(store, host, &member, plan.opening, options, diagnostics)?;
+    let attributes = match validate_stored_callable_set(store, component) {
+        StoredCallableSetValidation::Valid { projection, .. }
+            if projection.construct_signatures.is_empty()
+                && projection.call_signatures.len() == 1 =>
+        {
+            let callable = &projection.call_signatures[0];
+            let [attributes] = callable.parameters.as_slice() else {
+                return Err(SourceCheckError::Call(plan.opening));
+            };
+            *attributes
+        }
+        StoredCallableSetValidation::NotCallable => {
+            authenticated_fragment_component_attributes(store, host, fragment, plan.opening)?
+        }
+        StoredCallableSetValidation::Pending { .. }
+        | StoredCallableSetValidation::Malformed { .. }
+        | StoredCallableSetValidation::Valid { .. } => {
+            return Err(SourceCheckError::Call(plan.opening));
+        }
+    };
+    let signature = intrinsic_signature(store, plan.opening, attributes, namespace.element_type)?;
+    publish_signature_links(store, plan.opening, signature)?;
+    let empty = JsxAttributesPlan::Properties(Vec::new());
+    let Some(children) = check_jsx_implicit_children(
+        store,
+        source,
+        namespace,
+        plan,
+        &empty,
+        attributes,
+        options,
+        diagnostics,
+    )?
+    else {
+        return Ok(false);
+    };
+    let property_name = checked_jsx_children_name(store, children)?.to_owned();
+    let Some(expected) = resolve_expected_jsx_child_type(
+        store,
+        host,
+        attributes,
+        &property_name,
+        plan.opening,
+        options,
+        diagnostics,
+    )?
+    else {
+        return Ok(true);
+    };
+    if children.individual_errors || store.is_type_assignable_to(children.type_, expected)? {
+        return Ok(true);
+    }
+
+    let actual = format_attribute_object(store, host, &[], Some(children))?;
+    let expected_object = type_to_string_with_host_and_flags(
+        store,
+        host,
+        attributes,
+        CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+    )?;
+    let display = get_type_names_for_assignability_error(store, children.type_, expected)?;
+    let property_detail = Diagnostic::with_arguments(
+        message_by_code(2326).ok_or(SourceCheckError::MissingDiagnostic(2326))?,
+        [property_name],
+    )
+    .render()
+    .map_err(|_| SourceCheckError::MissingDiagnostic(2326))?;
+    let value_detail = Diagnostic::with_arguments(
+        message_by_code(2322).ok_or(SourceCheckError::MissingDiagnostic(2322))?,
+        [display.source, display.target],
+    )
+    .render()
+    .map_err(|_| SourceCheckError::MissingDiagnostic(2322))?;
+    merge_retry_diagnostic(
+        diagnostics,
+        CanonicalCheckerDiagnostic {
+            node: Some(plan.opening),
+            range_override: None,
+            diagnostic: Diagnostic::with_arguments(
+                message_by_code(2322).ok_or(SourceCheckError::MissingDiagnostic(2322))?,
+                [actual, expected_object],
+            )
+            .with_details([
+                format!("  {property_detail}"),
+                format!("    {value_detail}"),
+            ]),
+            related_information: Vec::new(),
+        },
+    );
+    Ok(true)
+}
+
+fn resolve_expected_jsx_child_type(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    expected: TypeId,
+    name: &str,
+    location: NodeRef,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+) -> Result<Option<TypeId>, SourceCheckError> {
+    let record = store
+        .type_payload(expected)
+        .ok_or(SourceCheckError::Property(location))?;
+    if record.flags().intersects(TypeFlags::ANY_OR_UNKNOWN) {
+        return Ok(None);
+    }
+    if let Some(property) = record
+        .data()
+        .structured()
+        .and_then(|structured| structured.members)
+        .and_then(|members| store.symbol_table(members))
+        .and_then(|members| members.get_source(name))
+        && let Some(type_) = store
+            .value_symbol_links(property)
+            .and_then(|links| links.resolved_type)
+    {
+        return Ok(Some(type_));
+    }
+
+    if name != "children" {
+        return Ok(None);
+    }
+    let Some(attributes) = deferred_react_class_attributes_base(store, host, expected, location)?
+    else {
+        return Ok(None);
+    };
+    let namespace = store
+        .get_parent_of_symbol(attributes)
+        .ok_or(SourceCheckError::Property(location))?;
+    let react_node = store
+        .symbol(namespace)
+        .and_then(ts_binder::semantic::Symbol::exports)
+        .and_then(|exports| store.symbol_table(exports))
+        .and_then(|exports| exports.get_source("ReactNode"))
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .ok_or(SourceCheckError::Property(location))?;
+    let alias = store
+        .symbol(react_node)
+        .ok_or(SourceCheckError::Property(location))?;
+    if !alias.flags().contains(SymbolFlags::TYPE_ALIAS)
+        || store.get_parent_of_symbol(react_node) != Some(namespace)
+    {
+        return Err(SourceCheckError::Property(location));
+    }
+    CanonicalTypeQuery::new(store, host, options, diagnostics)?
+        .get_declared_type_of_symbol(react_node)
+        .map(Some)
+        .map_err(Into::into)
+}
+
+#[allow(clippy::too_many_arguments)] // Contextual children retain their owner and expected props.
 fn check_jsx_implicit_children(
     store: &mut CanonicalTypeMapperStore,
     source: (
@@ -3153,6 +3444,7 @@ fn check_jsx_implicit_children(
     namespace: &JsxNamespace,
     plan: &JsxElementPlan,
     attributes: &JsxAttributesPlan,
+    expected_attributes: TypeId,
     options: CanonicalCheckerOptions,
     diagnostics: &mut CanonicalCheckerDiagnostics,
 ) -> Result<Option<CheckedJsxChildren>, SourceCheckError> {
@@ -3193,6 +3485,20 @@ fn check_jsx_implicit_children(
 
     let mut first_node = None;
     let mut child_types = Vec::with_capacity(plan.children.len());
+    let expected_child = if plan.children.len() > 1 {
+        resolve_expected_jsx_child_type(
+            store,
+            source.2,
+            expected_attributes,
+            &property_name,
+            plan.opening,
+            options,
+            diagnostics,
+        )?
+    } else {
+        None
+    };
+    let mut individual_errors = false;
     for child in &plan.children {
         let (node, type_) = match child {
             JsxChildPlan::Text { node } => {
@@ -3216,6 +3522,13 @@ fn check_jsx_implicit_children(
             }
         };
         first_node.get_or_insert(node);
+        if let Some(expected) = expected_child
+            && !store.is_type_assignable_to(type_, expected)?
+        {
+            let display = get_type_names_for_assignability_error(store, type_, expected)?;
+            add_diagnostic(diagnostics, node, 2322, [display.source, display.target])?;
+            individual_errors = true;
+        }
         child_types.push(type_);
     }
 
@@ -3227,7 +3540,12 @@ fn check_jsx_implicit_children(
         let element = store.literal_union_type_prepared(&child_types, None, &mut prepared)?;
         automatic_jsx_children_array_type(store, source.2, element, node)?
     };
-    Ok(Some(CheckedJsxChildren { node, type_, name }))
+    Ok(Some(CheckedJsxChildren {
+        node,
+        type_,
+        name,
+        individual_errors,
+    }))
 }
 
 fn automatic_jsx_children_array_type(
@@ -3294,13 +3612,13 @@ fn automatic_jsx_children_array_type(
 
 fn check_jsx_closing_tag(
     store: &mut CanonicalTypeMapperStore,
-    arena: &NodeArena,
-    bound: &BoundFile,
+    source: (&NodeArena, &BoundFile, &DeclaredTypeHost<'_>),
     namespace: &JsxNamespace,
     closing: &JsxClosingPlan,
     options: CanonicalCheckerOptions,
     diagnostics: &mut CanonicalCheckerDiagnostics,
 ) -> Result<(), SourceCheckError> {
+    let (arena, bound, host) = source;
     if closing.tag.intrinsic {
         let intrinsic = resolve_intrinsic_tag(
             store,
@@ -3328,6 +3646,19 @@ fn check_jsx_closing_tag(
                 ..JsxElementLinks::default()
             },
         );
+    }
+
+    if let Some(member) = &closing.tag.namespace_member {
+        let component = resolve_namespace_component_type(
+            store,
+            host,
+            member,
+            closing.tag.node,
+            options,
+            diagnostics,
+        )?;
+        publish_namespace_component_tag_links(store, member, &closing.tag, component)?;
+        return Ok(());
     }
 
     let Some(symbol) = resolve_source_value_symbol(store, bound, &closing.tag.name) else {
@@ -3745,20 +4076,28 @@ fn resolve_component_tag(
     diagnostics: &mut CanonicalCheckerDiagnostics,
 ) -> Result<(TypeId, SignatureId), SourceCheckError> {
     let (arena, bound, host, global_types) = source;
-    let Some(symbol) = resolve_source_value_symbol(store, bound, &tag.name) else {
-        add_missing_component_diagnostic(store, bound, tag.node, &tag.name, diagnostics)?;
-        let unknown_signature = store
-            .intrinsic_bootstrap()
-            .ok_or(SourceCheckError::LiteralCache(
-                SourceLiteralCacheError::BootstrapUninitialized,
-            ))?
-            .unknown_signature;
-        publish_type_links(store, tag.node, namespace.error_type)?;
-        return Ok((namespace.error_type, unknown_signature));
+    let (symbol, component) = if let Some(member) = &tag.namespace_member {
+        let component =
+            resolve_namespace_component_type(store, host, member, tag.node, options, diagnostics)?;
+        publish_namespace_component_tag_links(store, member, tag, component)?;
+        (member.member, component)
+    } else {
+        let Some(symbol) = resolve_source_value_symbol(store, bound, &tag.name) else {
+            add_missing_component_diagnostic(store, bound, tag.node, &tag.name, diagnostics)?;
+            let unknown_signature = store
+                .intrinsic_bootstrap()
+                .ok_or(SourceCheckError::LiteralCache(
+                    SourceLiteralCacheError::BootstrapUninitialized,
+                ))?
+                .unknown_signature;
+            publish_type_links(store, tag.node, namespace.error_type)?;
+            return Ok((namespace.error_type, unknown_signature));
+        };
+        let component = jsx_component_value_type(store, arena, bound, symbol, tag.node)?;
+        publish_symbol_links(store, tag.node, symbol)?;
+        publish_type_links(store, tag.node, component)?;
+        (symbol, component)
     };
-    let component = jsx_component_value_type(store, arena, bound, symbol, tag.node)?;
-    publish_symbol_links(store, tag.node, symbol)?;
-    publish_type_links(store, tag.node, component)?;
     if component == namespace.any_type || component == namespace.error_type {
         let any_signature = store
             .intrinsic_bootstrap()
@@ -3775,6 +4114,19 @@ fn resolve_component_tag(
                 && projection.call_signatures.len() == 1 =>
         {
             projection.call_signatures[0].clone()
+        }
+        StoredCallableSetValidation::NotCallable
+            if tag.namespace_member.is_some()
+                && store
+                    .symbol(symbol)
+                    .and_then(|record| record.name().as_utf8())
+                    == Some("Fragment") =>
+        {
+            let attributes =
+                authenticated_fragment_component_attributes(store, host, symbol, tag.node)?;
+            let signature =
+                intrinsic_signature(store, opening, attributes, namespace.element_type)?;
+            return Ok((attributes, signature));
         }
         StoredCallableSetValidation::NotCallable => {
             add_diagnostic(diagnostics, tag.node, 2604, [tag.name.as_str()])?;
@@ -3852,6 +4204,264 @@ fn resolve_component_tag(
             .empty_object_type
     });
     Ok((attributes_type, callable.signature))
+}
+
+fn resolve_namespace_component_type(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    member: &JsxNamespaceMemberPlan,
+    location: NodeRef,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+) -> Result<TypeId, SourceCheckError> {
+    if let Some(links) = store.value_symbol_links(member.member)
+        && links != &ValueSymbolLinks::default()
+    {
+        let type_ = links
+            .resolved_type
+            .filter(|type_| store.type_payload(*type_).is_some())
+            .ok_or(SourceCheckError::Property(location))?;
+        if links
+            != &(ValueSymbolLinks {
+                resolved_type: Some(type_),
+                ..ValueSymbolLinks::default()
+            })
+        {
+            return Err(SourceCheckError::Property(location));
+        }
+        return Ok(type_);
+    }
+
+    let record = store
+        .symbol(member.member)
+        .ok_or(SourceCheckError::Property(location))?;
+    let declaration = record
+        .value_declaration()
+        .ok_or(SourceCheckError::Property(location))?;
+    let declaration_record = host
+        .node(declaration)
+        .ok_or(SourceCheckError::Property(declaration))?;
+    let NodeData::VariableDeclaration(variable) = &declaration_record.data else {
+        return Err(SourceCheckError::Property(declaration));
+    };
+    if declaration_record.kind != SyntaxKind::VariableDeclaration
+        || declaration_record.flags.0 != 0
+        || variable.initializer.is_some()
+        || variable.exclamation_token.is_some()
+        || variable.local_symbol.is_some()
+        || variable.symbol.is_some()
+        || variable.facts != 0
+        || !host.symbol_matches(store, declaration, member.member)
+        || store.get_parent_of_symbol(member.member) != Some(member.namespace)
+    {
+        return Err(SourceCheckError::Property(declaration));
+    }
+    let annotation = variable
+        .type_
+        .map(|annotation| child_ref(declaration, annotation))
+        .ok_or(SourceCheckError::Property(declaration))?;
+    let annotation_record = host
+        .node(annotation)
+        .ok_or(SourceCheckError::Property(annotation))?;
+    if annotation_record.parent != Some(declaration.node) || annotation_record.flags.0 != 0 {
+        return Err(SourceCheckError::Property(annotation));
+    }
+
+    let type_ = if let NodeData::TypeReferenceNode(reference) = &annotation_record.data
+        && record.name().as_utf8() == Some("Fragment")
+    {
+        let name = child_ref(annotation, reference.type_name);
+        let name_record = host.node(name).ok_or(SourceCheckError::Property(name))?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Err(SourceCheckError::Property(name));
+        };
+        let arguments = reference
+            .type_arguments
+            .as_ref()
+            .ok_or(SourceCheckError::Property(annotation))?;
+        let [attributes] = arguments.nodes.as_slice() else {
+            return Err(SourceCheckError::Property(annotation));
+        };
+        let attributes = child_ref(annotation, *attributes);
+        let attributes_record = host
+            .node(attributes)
+            .ok_or(SourceCheckError::Property(attributes))?;
+        let component = store
+            .symbol(member.namespace)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| store.symbol_table(exports))
+            .and_then(|exports| exports.get_source("ExoticComponent"))
+            .and_then(|component| store.get_merged_symbol(component))
+            .ok_or(SourceCheckError::Property(annotation))?;
+        let component_record = store
+            .symbol(component)
+            .ok_or(SourceCheckError::Property(annotation))?;
+        let call = component_record
+            .members()
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get(InternalSymbolName::Call.as_ref()))
+            .and_then(|call| store.get_merged_symbol(call))
+            .ok_or(SourceCheckError::Property(annotation))?;
+        let call_record = store
+            .symbol(call)
+            .ok_or(SourceCheckError::Property(annotation))?;
+        if annotation_record.kind != SyntaxKind::TypeReference
+            || arguments.has_trailing_comma
+            || name_record.kind != SyntaxKind::Identifier
+            || name_record.flags.0 != 0
+            || name_record.parent != Some(annotation.node)
+            || identifier.flow_node.is_some()
+            || identifier.text != "ExoticComponent"
+            || attributes_record.parent != Some(annotation.node)
+            || !component_record.flags().contains(SymbolFlags::INTERFACE)
+            || component_record
+                .flags()
+                .without(SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT)
+                != SymbolFlags::NONE
+            || component_record.check_flags() != CheckFlags::NONE
+            || store.get_parent_of_symbol(component) != Some(member.namespace)
+            || call_record.flags() != SymbolFlags::SIGNATURE
+            || call_record.check_flags() != CheckFlags::NONE
+            || store.get_parent_of_symbol(call) != Some(component)
+        {
+            return Err(SourceCheckError::Property(annotation));
+        }
+        let attributes = CanonicalTypeQuery::new(store, host, options, diagnostics)?
+            .get_type_from_type_node(attributes)?;
+        let target = store.get_declared_type_of_symbol(host, component)?;
+        create_direct_generic_reference(store, target, &[attributes], ObjectFlags::FROM_TYPE_NODE)
+            .map_err(|_| SourceCheckError::Property(annotation))?
+    } else {
+        CanonicalTypeQuery::new(store, host, options, diagnostics)?
+            .get_type_from_type_node(annotation)?
+    };
+    publish_type_links(store, annotation, type_)?;
+    publish_attribute_value_links(store, member.member, type_, declaration)?;
+    Ok(type_)
+}
+
+fn authenticated_fragment_component_attributes(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+    location: NodeRef,
+) -> Result<TypeId, SourceCheckError> {
+    let component = store
+        .value_symbol_links(symbol)
+        .and_then(|links| links.resolved_type)
+        .ok_or(SourceCheckError::Property(location))?;
+    let reference = validate_direct_generic_reference(store, component)
+        .map_err(|_| SourceCheckError::Property(location))?;
+    let [attributes] = reference.type_arguments.as_slice() else {
+        return Err(SourceCheckError::Property(location));
+    };
+    let target = store
+        .type_payload(reference.target)
+        .and_then(super::type_records::TypeRecord::symbol)
+        .ok_or(SourceCheckError::Property(location))?;
+    if store
+        .symbol(target)
+        .and_then(|record| record.name().as_utf8())
+        != Some("ExoticComponent")
+        || store
+            .symbol(symbol)
+            .and_then(|record| record.name().as_utf8())
+            != Some("Fragment")
+        || host
+            .node(
+                store
+                    .symbol(symbol)
+                    .and_then(ts_binder::semantic::Symbol::value_declaration)
+                    .ok_or(SourceCheckError::Property(location))?,
+            )
+            .is_none()
+    {
+        return Err(SourceCheckError::Property(location));
+    }
+    Ok(*attributes)
+}
+
+fn publish_namespace_component_tag_links(
+    store: &mut CanonicalTypeMapperStore,
+    member: &JsxNamespaceMemberPlan,
+    tag: &JsxTagPlan,
+    component: TypeId,
+) -> Result<(), SourceCheckError> {
+    let namespace = jsx_namespace_value_type(store, member.namespace, member.namespace_node)?;
+    publish_symbol_links(store, member.namespace_node, member.namespace)?;
+    publish_type_links(store, member.namespace_node, namespace)?;
+    publish_symbol_links(store, member.member_node, member.member)?;
+    publish_type_links(store, member.member_node, component)?;
+    publish_symbol_links(store, tag.node, member.member)?;
+    publish_type_links(store, tag.node, component)
+}
+
+fn jsx_namespace_value_type(
+    store: &mut CanonicalTypeMapperStore,
+    namespace: SemanticSymbolId,
+    location: NodeRef,
+) -> Result<TypeId, SourceCheckError> {
+    let owner = store
+        .symbol(namespace)
+        .ok_or(SourceCheckError::Property(location))?;
+    let exports = owner
+        .exports()
+        .ok_or(SourceCheckError::Property(location))?;
+    let properties = store
+        .symbol_table(exports)
+        .ok_or(SourceCheckError::Property(location))?
+        .iter()
+        .filter_map(|(_, symbol)| {
+            store
+                .symbol(symbol)
+                .filter(|record| record.flags().intersects(SymbolFlags::VALUE))
+                .map(|_| symbol)
+        })
+        .collect::<Vec<_>>();
+    if let Some(links) = store.value_symbol_links(namespace)
+        && links != &ValueSymbolLinks::default()
+    {
+        let type_ = links
+            .resolved_type
+            .ok_or(SourceCheckError::Property(location))?;
+        let record = store
+            .type_payload(type_)
+            .ok_or(SourceCheckError::Property(location))?;
+        let structured = record
+            .data()
+            .structured()
+            .ok_or(SourceCheckError::Property(location))?;
+        if links
+            != &(ValueSymbolLinks {
+                resolved_type: Some(type_),
+                ..ValueSymbolLinks::default()
+            })
+            || record.symbol() != Some(namespace)
+            || structured.members != Some(exports)
+            || structured.properties.as_deref() != Some(properties.as_slice())
+        {
+            return Err(SourceCheckError::Property(location));
+        }
+        return Ok(type_);
+    }
+    if !store.try_reserve_types(1) || !store.try_reserve_value_symbol_links(1) {
+        return Err(SourceCheckError::Property(location));
+    }
+    let type_ = store
+        .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(namespace))
+        .ok_or(SourceCheckError::Property(location))?;
+    if !store.set_structured_type_members(type_, Some(exports), Some(properties), None, None, None)
+        || !store.set_value_symbol_links(
+            namespace,
+            ValueSymbolLinks {
+                resolved_type: Some(type_),
+                ..ValueSymbolLinks::default()
+            },
+        )
+    {
+        return Err(SourceCheckError::Property(location));
+    }
+    Ok(type_)
 }
 
 fn jsx_component_value_type(
@@ -4079,6 +4689,45 @@ fn resolve_scoped_jsx_value_symbol(
             .map(|parent| child_ref(node, parent));
     }
     resolve_source_value_symbol(store, bound, name)
+}
+
+fn resolve_scoped_jsx_namespace_symbol(
+    store: &CanonicalTypeMapperStore,
+    arena: &NodeArena,
+    bound: &BoundFile,
+    location: NodeRef,
+    name: &str,
+) -> Result<Option<SemanticSymbolId>, SourceCheckError> {
+    let mut current = Some(location);
+    let mut found = None;
+    while let Some(node) = current {
+        found = bound
+            .locals(node)
+            .and_then(|locals| store.symbol_table(locals))
+            .and_then(|locals| locals.get_source(name));
+        if found.is_some() {
+            break;
+        }
+        current = arena
+            .get(node.node)
+            .and_then(|record| record.parent)
+            .map(|parent| child_ref(node, parent));
+    }
+    let Some(symbol) = found.or_else(|| {
+        store
+            .intrinsic_bootstrap()
+            .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+            .and_then(|globals| globals.get_source(name))
+    }) else {
+        return Ok(None);
+    };
+    let symbol = resolve_local_jsx_namespace_alias(store, symbol, location)?;
+    let record = store
+        .symbol(symbol)
+        .ok_or(SourceCheckError::Property(location))?;
+    Ok((record.flags().intersects(SymbolFlags::MODULE)
+        && record.flags().intersects(SymbolFlags::VALUE))
+    .then_some(symbol))
 }
 
 fn check_jsx_attributes(
@@ -4517,20 +5166,24 @@ fn execute_scalar(
                 (*node, namespace.error_type)
             }
         }
-        JsxScalarPlan::AnyAssertion {
+        JsxScalarPlan::TypeAssertion {
             node,
             type_node,
             value,
         } => {
             execute_scalar(store, source, namespace, value, options, diagnostics)?;
-            let any = store
+            let bootstrap = store
                 .intrinsic_bootstrap()
                 .ok_or(SourceCheckError::LiteralCache(
                     SourceLiteralCacheError::BootstrapUninitialized,
-                ))?
-                .any_type;
-            publish_type_links(store, *type_node, any)?;
-            (*node, any)
+                ))?;
+            let asserted = match jsx_node(arena, bound, store, *type_node)?.kind {
+                SyntaxKind::AnyKeyword => bootstrap.any_type,
+                SyntaxKind::UnknownKeyword => bootstrap.unknown_type,
+                kind => return Err(unsupported(*type_node, kind)),
+            };
+            publish_type_links(store, *type_node, asserted)?;
+            (*node, asserted)
         }
         JsxScalarPlan::Parenthesized { node, value } => {
             let type_ = execute_scalar(store, source, namespace, value, options, diagnostics)?;
@@ -4853,21 +5506,61 @@ fn check_attribute_assignability(
             .as_deref()
             .expect("checked JSX children retain their property name");
         present.insert(name);
-        if let Some(expected_type) = expected_members
-            .and_then(|members| store.symbol_table(members))
-            .and_then(|members| members.get_source(name))
-            .and_then(|symbol| store.value_symbol_links(symbol))
-            .and_then(|links| links.resolved_type)
+        if !children.individual_errors
+            && let Some(expected_type) = resolve_expected_jsx_child_type(
+                store,
+                host,
+                expected,
+                name,
+                opening,
+                options,
+                diagnostics,
+            )?
             && !store.is_type_assignable_to(children.type_, expected_type)?
         {
             let display =
                 get_type_names_for_assignability_error(store, children.type_, expected_type)?;
-            add_diagnostic(
+            let explicit_fragment = tag.namespace_member.as_ref().is_some_and(|member| {
+                store
+                    .symbol(member.member)
+                    .and_then(|record| record.name().as_utf8())
+                    == Some("Fragment")
+            });
+            let node = if explicit_fragment
+                && let Some(NodeData::JsxExpression(expression)) =
+                    host.node(children.node).map(|record| &record.data)
+                && let Some(value) = expression.expression
+            {
+                child_ref(children.node, value)
+            } else {
+                children.node
+            };
+            let related_information = if explicit_fragment
+                && matches!(
+                    validate_stored_callable_set(store, children.type_),
+                    StoredCallableSetValidation::Valid { .. }
+                ) {
+                vec![CanonicalCheckerRelatedInformation {
+                    node: Some(node),
+                    diagnostic: Diagnostic::new(
+                        message_by_code(6212).ok_or(SourceCheckError::MissingDiagnostic(6212))?,
+                    ),
+                }]
+            } else {
+                Vec::new()
+            };
+            merge_retry_diagnostic(
                 diagnostics,
-                children.node,
-                2322,
-                [display.source, display.target],
-            )?;
+                CanonicalCheckerDiagnostic {
+                    node: Some(node),
+                    range_override: None,
+                    diagnostic: Diagnostic::with_arguments(
+                        message_by_code(2322).ok_or(SourceCheckError::MissingDiagnostic(2322))?,
+                        [display.source, display.target],
+                    ),
+                    related_information,
+                },
+            );
         }
     }
 
@@ -6023,6 +6716,360 @@ mod runtime_tests {
                 )
                 .unwrap();
         }
+    }
+
+    struct ReactFragmentFixture {
+        parsed: &'static ParseResult,
+        file: FileId,
+        context: crate::semantic::CanonicalCheckerContext<'static>,
+    }
+
+    impl ReactFragmentFixture {
+        fn new(source: &str, file: FileId, runtime: CanonicalJsxRuntime) -> Self {
+            let library: &'static ParseResult = Box::leak(Box::new(parse_source_file(concat!(
+                "declare namespace React { ",
+                "interface ReactElement { marker: string; } ",
+                "type ReactNode = ReactElement | string | number | boolean | null | undefined; ",
+                "interface ExoticComponent<P = {}> { (props: P): JSX.Element; } ",
+                "const Fragment: ExoticComponent<{ children?: ReactNode; }>; ",
+                "} ",
+                "declare namespace JSX { ",
+                "interface Element extends React.ReactElement {} ",
+                "interface ElementChildrenAttribute { children: {}; } ",
+                "interface IntrinsicElements { ",
+                "main: { children?: React.ReactNode; }; div: {}; span: {}; ",
+                "} }",
+            ))));
+            let parsed: &'static ParseResult = Box::leak(Box::new(parse_jsx_source_file(source)));
+            assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let library_file = FileId::new(u32::try_from(file.index()).unwrap() + 1_000);
+            let mut binder = CanonicalBinder::new();
+            for (parsed, current, declaration) in
+                [(library, library_file, true), (parsed, file, false)]
+            {
+                binder
+                    .bind_source_file_with_facts(
+                        &parsed.arena,
+                        parsed.source_file,
+                        current,
+                        CanonicalSourceFileFacts::new(
+                            EscapedName::source(format!(
+                                "\"/project/react-fragment-{}.tsx\"",
+                                current.index(),
+                            )),
+                            CanonicalSourceLanguage::TypeScript,
+                            declaration,
+                            CanonicalModuleState::Script,
+                        ),
+                    )
+                    .unwrap();
+                binder
+                    .bind_typescript_declaration_slice(&parsed.arena, current)
+                    .unwrap();
+            }
+            let mut options = CanonicalCheckerOptions {
+                jsx_runtime: runtime,
+                ..CanonicalCheckerOptions::default()
+            };
+            options.intrinsic.strict_null_checks = true;
+            let context = crate::semantic::CanonicalCheckerContext::new(
+                binder.finish(),
+                vec![(library_file, &library.arena), (file, &parsed.arena)],
+                options,
+            )
+            .unwrap();
+            Self {
+                parsed,
+                file,
+                context,
+            }
+        }
+
+        fn text(&self, node: NodeRef) -> &str {
+            let range = self.parsed.arena.get(node.node).unwrap().range;
+            self.parsed
+                .arena
+                .source_text()
+                .unwrap()
+                .get(range.start.get() as usize..range.end.get() as usize)
+                .unwrap()
+        }
+    }
+
+    #[test]
+    fn jsx_unknown_assertion_children_keep_exact_ts2322_and_warm_identity() {
+        for (index, runtime) in [CanonicalJsxRuntime::Classic, CanonicalJsxRuntime::Preserve]
+            .into_iter()
+            .enumerate()
+        {
+            let mut fixture = ReactFragmentFixture::new(
+                "const view = (<main>{(<div />) as unknown}<span /></main>);",
+                FileId::new(8_190 + u32::try_from(index).unwrap()),
+                runtime,
+            );
+
+            fixture.context.check_source_file(fixture.file).unwrap();
+
+            let [diagnostic] = fixture.context.diagnostics().as_slice() else {
+                panic!("the unknown JSX child must produce exactly one diagnostic")
+            };
+            assert_eq!(diagnostic.diagnostic.code(), 2322);
+            assert_eq!(
+                diagnostic.diagnostic.render().unwrap(),
+                "Type 'unknown' is not assignable to type 'ReactNode'.",
+            );
+            assert_eq!(
+                fixture.text(diagnostic.node.unwrap()),
+                "{(<div />) as unknown}",
+            );
+            let unknown = fixture
+                .context
+                .store()
+                .intrinsic_bootstrap()
+                .unwrap()
+                .unknown_type;
+            for (node, record) in fixture.parsed.arena.iter() {
+                if matches!(
+                    record.kind,
+                    SyntaxKind::AsExpression | SyntaxKind::UnknownKeyword
+                ) {
+                    let node = NodeRef::new(fixture.parsed.arena.id(), fixture.file, node);
+                    assert_eq!(
+                        fixture
+                            .context
+                            .store()
+                            .type_node_links(node)
+                            .and_then(|links| links.resolved_type),
+                        Some(unknown),
+                    );
+                }
+            }
+            let warm = (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().signature_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+                fixture.context.diagnostics().as_slice().to_vec(),
+            );
+            fixture.context.recheck_source_file(fixture.file).unwrap();
+            assert_eq!(
+                (
+                    fixture.context.store().type_len(),
+                    fixture.context.store().symbol_len(),
+                    fixture.context.store().signature_len(),
+                    fixture.context.store().checker_link_allocated_lengths(),
+                    fixture.context.diagnostics().as_slice().to_vec(),
+                ),
+                warm,
+            );
+        }
+    }
+
+    #[test]
+    fn classic_react_fragments_preserve_shorthand_and_member_child_diagnostics() {
+        let mut fixture = ReactFragmentFixture::new(
+            concat!(
+                "const test = () => \"ready\"; ",
+                "const shorthand = <>{test}</>; ",
+                "const explicit = <React.Fragment>{test}</React.Fragment>;",
+            ),
+            FileId::new(8_192),
+            CanonicalJsxRuntime::Classic,
+        );
+
+        fixture.context.check_source_file(fixture.file).unwrap();
+
+        let [shorthand, explicit] = fixture.context.diagnostics().as_slice() else {
+            panic!("both React fragment forms must reject the callable child")
+        };
+        assert_eq!(shorthand.diagnostic.code(), 2322);
+        assert_eq!(fixture.text(shorthand.node.unwrap()), "<>");
+        assert_eq!(
+            shorthand.diagnostic.render().unwrap(),
+            concat!(
+                "Type '{ children: () => string; }' is not assignable to type ",
+                "'{ children?: ReactNode; }'.\n",
+                "  Types of property 'children' are incompatible.\n",
+                "    Type '() => string' is not assignable to type 'ReactNode'.",
+            ),
+        );
+        assert!(shorthand.related_information.is_empty());
+        assert_eq!(explicit.diagnostic.code(), 2322);
+        assert_eq!(fixture.text(explicit.node.unwrap()), "test");
+        assert_eq!(
+            explicit.diagnostic.render().unwrap(),
+            "Type '() => string' is not assignable to type 'ReactNode'.",
+        );
+        let [related] = explicit.related_information.as_slice() else {
+            panic!("the explicit fragment must suggest calling its child")
+        };
+        assert_eq!(related.diagnostic.code(), 6212);
+        assert_eq!(fixture.text(related.node.unwrap()), "test");
+
+        let globals = fixture
+            .context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .globals;
+        let namespace = fixture
+            .context
+            .store()
+            .symbol_table(globals)
+            .and_then(|globals| globals.get_source("React"))
+            .unwrap();
+        let fragment = fixture
+            .context
+            .store()
+            .symbol(namespace)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| fixture.context.store().symbol_table(exports))
+            .and_then(|exports| exports.get_source("Fragment"))
+            .unwrap();
+        for (node, record) in fixture.parsed.arena.iter() {
+            if record.kind != SyntaxKind::PropertyAccessExpression {
+                continue;
+            }
+            let access = NodeRef::new(fixture.parsed.arena.id(), fixture.file, node);
+            let NodeData::PropertyAccessExpression(property) = &record.data else {
+                unreachable!("the fragment tag must retain its namespace member")
+            };
+            let receiver = child_ref(access, property.expression);
+            let member = child_ref(access, property.name);
+            assert_eq!(
+                fixture
+                    .context
+                    .store()
+                    .symbol_node_links(receiver)
+                    .and_then(|links| links.resolved_symbol),
+                Some(namespace),
+            );
+            for node in [access, member] {
+                assert_eq!(
+                    fixture
+                        .context
+                        .store()
+                        .symbol_node_links(node)
+                        .and_then(|links| links.resolved_symbol),
+                    Some(fragment),
+                );
+            }
+        }
+        let warm = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().signature_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+            fixture.context.diagnostics().as_slice().to_vec(),
+        );
+        fixture.context.recheck_source_file(fixture.file).unwrap();
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().signature_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+                fixture.context.diagnostics().as_slice().to_vec(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn preserve_runtime_does_not_resolve_the_shorthand_fragment_factory() {
+        let mut fixture = ReactFragmentFixture::new(
+            concat!(
+                "const test = () => \"ready\"; ",
+                "const shorthand = <>{test}</>;",
+            ),
+            FileId::new(8_193),
+            CanonicalJsxRuntime::Preserve,
+        );
+
+        fixture.context.check_source_file(fixture.file).unwrap();
+
+        assert!(fixture.context.diagnostics().is_empty());
+        let globals = fixture
+            .context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .globals;
+        let namespace = fixture
+            .context
+            .store()
+            .symbol_table(globals)
+            .and_then(|globals| globals.get_source("React"))
+            .unwrap();
+        let fragment = fixture
+            .context
+            .store()
+            .symbol(namespace)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| fixture.context.store().symbol_table(exports))
+            .and_then(|exports| exports.get_source("Fragment"))
+            .unwrap();
+        assert!(
+            fixture
+                .context
+                .store()
+                .value_symbol_links(fragment)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn react_fragment_member_tags_reject_forged_namespace_ownership() {
+        let mut fixture = ReactFragmentFixture::new(
+            "const explicit = <React.Fragment />;",
+            FileId::new(8_194),
+            CanonicalJsxRuntime::Classic,
+        );
+        let globals = fixture
+            .context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .globals;
+        let namespace = fixture
+            .context
+            .store()
+            .symbol_table(globals)
+            .and_then(|globals| globals.get_source("React"))
+            .unwrap();
+        let fragment = fixture
+            .context
+            .store()
+            .symbol(namespace)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| fixture.context.store().symbol_table(exports))
+            .and_then(|exports| exports.get_source("Fragment"))
+            .unwrap();
+        assert!(
+            fixture
+                .context
+                .store_mut_for_test()
+                .set_symbol_relationships(fragment, None, None, None, None,)
+        );
+        let before = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+
+        assert!(matches!(
+            fixture.context.check_source_file(fixture.file),
+            Err(SourceCheckError::Property(_))
+        ));
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            before,
+        );
     }
 
     #[test]
