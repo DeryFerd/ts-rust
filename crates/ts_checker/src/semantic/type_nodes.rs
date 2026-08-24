@@ -590,6 +590,22 @@ struct PropTypesInferPropsPlan {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PropTypesKeyAliasKind {
+    Required,
+    Optional,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PropTypesKeyAliasPlan {
+    kind: PropTypesKeyAliasKind,
+    module: SemanticSymbolId,
+    parameter: SemanticSymbolId,
+    body: NodeRef,
+    required_alias: Option<SemanticSymbolId>,
+    exclude_alias: Option<SemanticSymbolId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DefaultLibraryMappedUtilityKind {
     Partial,
     Pick,
@@ -663,6 +679,7 @@ struct TypeQueryPlan {
     react_detailed_html_props_aliases: BTreeMap<SemanticSymbolId, ReactDetailedHtmlPropsPlan>,
     default_library_non_nullable_aliases: BTreeMap<SemanticSymbolId, DefaultLibraryNonNullablePlan>,
     prop_types_infer_props_aliases: BTreeMap<SemanticSymbolId, PropTypesInferPropsPlan>,
+    prop_types_key_aliases: BTreeMap<SemanticSymbolId, PropTypesKeyAliasPlan>,
     default_library_mapped_utility_aliases:
         BTreeMap<SemanticSymbolId, DefaultLibraryMappedUtilityPlan>,
     recursive_mapped_aliases: BTreeMap<SemanticSymbolId, NodeRef>,
@@ -798,6 +815,52 @@ fn valid_record_mapped_alias_identity(
         .is_some_and(|alias| {
             alias.symbol() == Some(symbol) && alias.type_arguments() == Some(arguments)
         })
+}
+
+fn valid_prop_types_optional_keys_instantiation(
+    store: &CanonicalTypeMapperStore,
+    proof: PropTypesKeyAliasPlan,
+    declared: TypeId,
+    source: TypeId,
+    actual: TypeId,
+) -> bool {
+    let Some(TypeData::Conditional(original)) = store.type_payload(declared).map(TypeRecord::data)
+    else {
+        return false;
+    };
+    let Some(TypeData::Conditional(result)) = store.type_payload(actual).map(TypeRecord::data)
+    else {
+        return false;
+    };
+    let Ok(keys) = plan_nongeneric_keyof_type(store, source) else {
+        return false;
+    };
+    let Ok(Some(keys)) = cached_nongeneric_keyof_type(store, &keys) else {
+        return false;
+    };
+    let Some(required) = proof.required_alias else {
+        return false;
+    };
+    let Some(links) = store.type_alias_links(required) else {
+        return false;
+    };
+    let Some(required_declared) = links.declared_type else {
+        return false;
+    };
+    let Some(parameters) = links.type_parameters.as_deref() else {
+        return false;
+    };
+    original.root == result.root
+        && result.check_type == keys
+        && store
+            .validate_prop_types_required_keys_instantiation(
+                required,
+                required_declared,
+                parameters,
+                &[source],
+                result.extends_type,
+            )
+            .is_ok()
 }
 
 fn validate_supported_mapped_alias_instantiation(
@@ -5340,6 +5403,57 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                                     declared_type,
                                 )?;
                             }
+                            if let Some(key_alias) =
+                                self.authenticated_prop_types_key_alias(canonical)
+                            {
+                                let parameters = self
+                                    .store
+                                    .type_alias_links(canonical)
+                                    .and_then(|links| links.type_parameters.as_deref())
+                                    .ok_or_else(|| {
+                                        type_node_unavailable(
+                                            TypeNodeUnavailable::InvalidCachedTypeAlias(
+                                                root_symbol,
+                                            ),
+                                        )
+                                    })?;
+                                let arguments = self
+                                    .type_reference_argument_nodes(reference)?
+                                    .into_iter()
+                                    .map(|argument| {
+                                        self.cached_type_node_identity(root_symbol, argument)
+                                    })
+                                    .collect::<Result<Vec<_>, _>>()?;
+                                let valid = match key_alias.kind {
+                                    PropTypesKeyAliasKind::Required => self
+                                        .store
+                                        .validate_prop_types_required_keys_instantiation(
+                                            canonical,
+                                            target_cached.declared_type,
+                                            parameters,
+                                            &arguments,
+                                            declared_type,
+                                        )
+                                        .is_ok(),
+                                    PropTypesKeyAliasKind::Optional => {
+                                        arguments.first().copied().is_some_and(|source| {
+                                            arguments.len() == 1
+                                                && valid_prop_types_optional_keys_instantiation(
+                                                    self.store,
+                                                    key_alias,
+                                                    target_cached.declared_type,
+                                                    source,
+                                                    declared_type,
+                                                )
+                                        })
+                                    }
+                                };
+                                if !valid {
+                                    return Err(type_node_unavailable(
+                                        TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
+                                    ));
+                                }
+                            }
                             if matches!(
                                 self.store
                                     .type_payload(target_cached.declared_type)
@@ -6902,6 +7016,19 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                             ))
                         })?
                         .type_node;
+                    if preflight_node(self.store, self.host, alias_type)?.kind
+                        == SyntaxKind::IndexedAccessType
+                        && self
+                            .store
+                            .symbol(symbol)
+                            .and_then(|owner| owner.name().as_utf8())
+                            == Some("RequiredKeys")
+                        && !self.plan.prop_types_key_aliases.contains_key(&symbol)
+                    {
+                        return Err(type_node_unavailable(
+                            TypeNodeUnavailable::GenericReferenceUnsupported { node, symbol },
+                        ));
+                    }
                     self.validate_planned_direct_alias_node(
                         symbol,
                         alias_type,
@@ -7320,6 +7447,436 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 .and_then(|links| links.resolved_symbol)
                 .is_none_or(|cached| self.store.get_merged_symbol(cached) == Some(symbol)))
         .then_some(arguments)
+    }
+
+    #[allow(clippy::too_many_lines)] // Module, export, parameter, and alias body form one proof.
+    fn authenticated_prop_types_key_alias(
+        &self,
+        alias: SemanticSymbolId,
+    ) -> Option<PropTypesKeyAliasPlan> {
+        let owner = self.store.symbol(alias)?;
+        let (kind, expected_name) = match owner.name().as_utf8()? {
+            "RequiredKeys" => (PropTypesKeyAliasKind::Required, "RequiredKeys"),
+            "OptionalKeys" => (PropTypesKeyAliasKind::Optional, "OptionalKeys"),
+            _ => return None,
+        };
+        let [declaration] = owner.declarations()? else {
+            return None;
+        };
+        let declaration = *declaration;
+        let bound = self.host.bound_file(declaration)?;
+        let facts = bound.source_facts()?;
+        let declaration_record = preflight_node(self.store, self.host, declaration).ok()?;
+        let NodeData::TypeAliasDeclaration(data) = &declaration_record.data else {
+            return None;
+        };
+        let name = NodeRef::new(declaration.arena, declaration.file, data.name);
+        let block = NodeRef::new(
+            declaration.arena,
+            declaration.file,
+            declaration_record.parent?,
+        );
+        let block_record = preflight_node(self.store, self.host, block).ok()?;
+        let NodeData::ModuleBlock(block_data) = &block_record.data else {
+            return None;
+        };
+        let module = NodeRef::new(block.arena, block.file, block_record.parent?);
+        let module_record = preflight_node(self.store, self.host, module).ok()?;
+        let NodeData::ModuleDeclaration(module_data) = &module_record.data else {
+            return None;
+        };
+        let module_name = NodeRef::new(module.arena, module.file, module_data.name);
+        let module_name_record = preflight_node(self.store, self.host, module_name).ok()?;
+        let NodeData::StringLiteral(module_literal) = &module_name_record.data else {
+            return None;
+        };
+        let module_symbol = bound
+            .symbol(module)
+            .and_then(|symbol| self.store.get_merged_symbol(symbol))?;
+        let module_owner = self.store.symbol(module_symbol)?;
+        let exports = module_owner
+            .exports()
+            .and_then(|exports| self.store.symbol_table(exports))?;
+        if owner.flags() != SymbolFlags::TYPE_ALIAS
+            || owner.check_flags() != CheckFlags::NONE
+            || owner.name().as_utf8() != Some(expected_name)
+            || owner.value_declaration().is_some()
+            || owner.exports().is_some()
+            || owner.export_symbol().is_some()
+            || self.store.get_merged_symbol(alias) != Some(alias)
+            || self.store.get_parent_of_symbol(alias) != Some(module_symbol)
+            || !facts.is_declaration_file()
+            || facts.is_default_library()
+            || facts.is_javascript_file()
+            || facts.is_external_or_common_js_module()
+            || declaration_record.kind != SyntaxKind::TypeAliasDeclaration
+            || declaration_record.flags.0 != 0
+            || !self.host.symbol_matches(self.store, declaration, alias)
+            || !self.react_detailed_html_props_identifier(name, declaration, expected_name)
+            || object_members::declared_type_declaration_parent(
+                self.store,
+                self.host,
+                declaration,
+                alias,
+                name,
+                data.modifiers.as_ref(),
+            ) != Ok(Some(module_symbol))
+            || block_record.kind != SyntaxKind::ModuleBlock
+            || !block_data.statements.nodes.contains(&declaration.node)
+            || module_record.kind != SyntaxKind::ModuleDeclaration
+            || module_record.parent != Some(bound.source_file().node)
+            || module_data.keyword != SyntaxKind::ModuleKeyword
+            || module_data.body != Some(block.node)
+            || module_name_record.kind != SyntaxKind::StringLiteral
+            || module_name_record.parent != Some(module.node)
+            || module_literal.text != "prop-types"
+            || !module_owner.flags().intersects(SymbolFlags::MODULE)
+            || self.store.get_merged_symbol(module_symbol) != Some(module_symbol)
+            || !self.host.symbol_matches(self.store, module, module_symbol)
+            || exports
+                .get_source(expected_name)
+                .and_then(|export| self.store.get_merged_symbol(export))
+                != Some(alias)
+        {
+            return None;
+        }
+
+        let parameters = data.type_parameters.as_ref()?;
+        let [parameter_id] = parameters.nodes.as_slice() else {
+            return None;
+        };
+        let parameter = NodeRef::new(declaration.arena, declaration.file, *parameter_id);
+        let parameter_record = preflight_node(self.store, self.host, parameter).ok()?;
+        let NodeData::TypeParameterDeclaration(parameter_data) = &parameter_record.data else {
+            return None;
+        };
+        let parameter_name = NodeRef::new(parameter.arena, parameter.file, parameter_data.name);
+        let parameter_symbol = bound
+            .symbol(parameter)
+            .and_then(|symbol| self.store.get_merged_symbol(symbol))?;
+        let parameter_owner = self.store.symbol(parameter_symbol)?;
+        let locals = bound
+            .locals(declaration)
+            .and_then(|locals| self.store.symbol_table(locals))?;
+        if parameters.has_trailing_comma
+            || parameter_record.kind != SyntaxKind::TypeParameter
+            || parameter_record.flags.0 != 0
+            || parameter_record.parent != Some(declaration.node)
+            || parameter_data.constraint.is_some()
+            || parameter_data.default_type.is_some()
+            || parameter_data.expression.is_some()
+            || parameter_data.modifiers.is_some()
+            || parameter_owner.flags() != SymbolFlags::TYPE_PARAMETER
+            || parameter_owner.check_flags() != CheckFlags::NONE
+            || parameter_owner.name().as_utf8() != Some("V")
+            || parameter_owner.declarations() != Some(&[parameter])
+            || locals.get_source("V") != Some(parameter_symbol)
+            || !self
+                .host
+                .symbol_matches(self.store, parameter, parameter_symbol)
+            || !self.react_detailed_html_props_identifier(parameter_name, parameter, "V")
+        {
+            return None;
+        }
+
+        let body = NodeRef::new(declaration.arena, declaration.file, data.type_);
+        let body_record = preflight_node(self.store, self.host, body).ok()?;
+        let (required_alias, exclude_alias) = match kind {
+            PropTypesKeyAliasKind::Required => {
+                let NodeData::IndexedAccessTypeNode(indexed) = &body_record.data else {
+                    return None;
+                };
+                let mapped_node = NodeRef::new(body.arena, body.file, indexed.object_type);
+                let key_node = NodeRef::new(body.arena, body.file, indexed.index_type);
+                let key_record = preflight_node(self.store, self.host, key_node).ok()?;
+                let NodeData::TypeOperatorNode(key_operator) = &key_record.data else {
+                    return None;
+                };
+                let key_target = NodeRef::new(key_node.arena, key_node.file, key_operator.type_);
+                let mapped =
+                    plan_mapped_type_declaration(self.store, self.host, mapped_node).ok()?;
+                let constraint = mapped.constraint();
+                let constraint_record = preflight_node(self.store, self.host, constraint).ok()?;
+                let NodeData::TypeOperatorNode(constraint_operator) = &constraint_record.data
+                else {
+                    return None;
+                };
+                let constraint_target =
+                    NodeRef::new(constraint.arena, constraint.file, constraint_operator.type_);
+                let mapped_parameter = mapped.type_parameter_symbol();
+                if body_record.kind != SyntaxKind::IndexedAccessType
+                    || body_record.parent != Some(declaration.node)
+                    || key_record.kind != SyntaxKind::TypeOperator
+                    || key_record.parent != Some(body.node)
+                    || key_operator.operator != SyntaxKind::KeyOfKeyword
+                    || constraint_record.kind != SyntaxKind::TypeOperator
+                    || constraint_operator.operator != SyntaxKind::KeyOfKeyword
+                    || mapped.modifiers() != MappedTypeModifiers::NONE
+                    || mapped.name_type().is_some()
+                    || mapped.modifiers_source() != Some(constraint_target)
+                    || self
+                        .store
+                        .symbol(mapped_parameter)
+                        .and_then(|parameter| parameter.name().as_utf8())
+                        != Some("K")
+                    || !self.react_detailed_html_props_parameter_reference(
+                        key_target,
+                        key_node,
+                        "V",
+                        parameter_symbol,
+                    )
+                    || !self.react_detailed_html_props_parameter_reference(
+                        constraint_target,
+                        constraint,
+                        "V",
+                        parameter_symbol,
+                    )
+                    || !self.authenticated_prop_types_required_key_template(
+                        module_symbol,
+                        mapped,
+                        parameter_symbol,
+                    )
+                {
+                    return None;
+                }
+                (None, None)
+            }
+            PropTypesKeyAliasKind::Optional => {
+                let required = exports
+                    .get_source("RequiredKeys")
+                    .and_then(|symbol| self.store.get_merged_symbol(symbol))?;
+                let exclude = self
+                    .store
+                    .intrinsic_bootstrap()
+                    .and_then(|bootstrap| self.store.symbol_table(bootstrap.globals))
+                    .and_then(|globals| globals.get_source("Exclude"))
+                    .and_then(|symbol| self.store.get_merged_symbol(symbol))?;
+                if !self.is_default_library_prop_types_utility_alias(exclude, "Exclude", 2)
+                    || self
+                        .authenticated_prop_types_key_alias(required)
+                        .is_none_or(|proof| {
+                            proof.kind != PropTypesKeyAliasKind::Required
+                                || proof.module != module_symbol
+                        })
+                {
+                    return None;
+                }
+                let arguments = self.prop_types_infer_props_reference(
+                    body,
+                    declaration,
+                    "Exclude",
+                    exclude,
+                    2,
+                )?;
+                let [keys, required_reference] = arguments.as_slice() else {
+                    return None;
+                };
+                let keys_record = preflight_node(self.store, self.host, *keys).ok()?;
+                let NodeData::TypeOperatorNode(operator) = &keys_record.data else {
+                    return None;
+                };
+                let target = NodeRef::new(keys.arena, keys.file, operator.type_);
+                let required_arguments = self.prop_types_infer_props_reference(
+                    *required_reference,
+                    body,
+                    "RequiredKeys",
+                    required,
+                    1,
+                )?;
+                let [required_value] = required_arguments.as_slice() else {
+                    return None;
+                };
+                if keys_record.kind != SyntaxKind::TypeOperator
+                    || keys_record.parent != Some(body.node)
+                    || operator.operator != SyntaxKind::KeyOfKeyword
+                    || !self.react_detailed_html_props_parameter_reference(
+                        target,
+                        *keys,
+                        "V",
+                        parameter_symbol,
+                    )
+                    || !self.react_detailed_html_props_parameter_reference(
+                        *required_value,
+                        *required_reference,
+                        "V",
+                        parameter_symbol,
+                    )
+                {
+                    return None;
+                }
+                (Some(required), Some(exclude))
+            }
+        };
+
+        Some(PropTypesKeyAliasPlan {
+            kind,
+            module: module_symbol,
+            parameter: parameter_symbol,
+            body,
+            required_alias,
+            exclude_alias,
+        })
+    }
+
+    fn authenticated_prop_types_required_key_template(
+        &self,
+        module: SemanticSymbolId,
+        mapped: MappedTypeDeclarationPlan,
+        source_parameter: SemanticSymbolId,
+    ) -> bool {
+        let Some(template) = mapped.template() else {
+            return false;
+        };
+        let Ok(template_record) = preflight_node(self.store, self.host, template) else {
+            return false;
+        };
+        let NodeData::ConditionalTypeNode(outer) = &template_record.data else {
+            return false;
+        };
+        let check = NodeRef::new(template.arena, template.file, outer.check_type);
+        let Ok(check_record) = preflight_node(self.store, self.host, check) else {
+            return false;
+        };
+        let NodeData::IndexedAccessTypeNode(indexed) = &check_record.data else {
+            return false;
+        };
+        let object = NodeRef::new(check.arena, check.file, indexed.object_type);
+        let key = NodeRef::new(check.arena, check.file, indexed.index_type);
+        let extends = NodeRef::new(template.arena, template.file, outer.extends_type);
+        let when_true = NodeRef::new(template.arena, template.file, outer.true_type);
+        let when_false = NodeRef::new(template.arena, template.file, outer.false_type);
+        let Some(exports) = self
+            .store
+            .symbol(module)
+            .and_then(|module| module.exports())
+            .and_then(|exports| self.store.symbol_table(exports))
+        else {
+            return false;
+        };
+        let Some(validator) = exports
+            .get_source("Validator")
+            .and_then(|symbol| self.store.get_merged_symbol(symbol))
+        else {
+            return false;
+        };
+        let Some(is_optional) = exports
+            .get_source("IsOptional")
+            .and_then(|symbol| self.store.get_merged_symbol(symbol))
+        else {
+            return false;
+        };
+        let Some(infer_arguments) =
+            self.prop_types_infer_props_reference(extends, template, "Validator", validator, 1)
+        else {
+            return false;
+        };
+        let [infer] = infer_arguments.as_slice() else {
+            return false;
+        };
+        let Ok(infer_record) = preflight_node(self.store, self.host, *infer) else {
+            return false;
+        };
+        let NodeData::InferTypeNode(inferred) = &infer_record.data else {
+            return false;
+        };
+        let inferred_parameter = NodeRef::new(infer.arena, infer.file, inferred.type_parameter);
+        let Some(inferred_symbol) = self
+            .host
+            .bound_file(inferred_parameter)
+            .and_then(|bound| bound.symbol(inferred_parameter))
+            .and_then(|symbol| self.store.get_merged_symbol(symbol))
+        else {
+            return false;
+        };
+        let Ok(inner_record) = preflight_node(self.store, self.host, when_true) else {
+            return false;
+        };
+        let NodeData::ConditionalTypeNode(inner) = &inner_record.data else {
+            return false;
+        };
+        let inner_check = NodeRef::new(when_true.arena, when_true.file, inner.check_type);
+        let inner_extends = NodeRef::new(when_true.arena, when_true.file, inner.extends_type);
+        let inner_true = NodeRef::new(when_true.arena, when_true.file, inner.true_type);
+        let inner_false = NodeRef::new(when_true.arena, when_true.file, inner.false_type);
+        let Some(optional_arguments) = self.prop_types_infer_props_reference(
+            inner_check,
+            when_true,
+            "IsOptional",
+            is_optional,
+            1,
+        ) else {
+            return false;
+        };
+        let [optional_argument] = optional_arguments.as_slice() else {
+            return false;
+        };
+        let Ok(inner_extends_record) = preflight_node(self.store, self.host, inner_extends) else {
+            return false;
+        };
+        let NodeData::LiteralTypeNode(literal) = &inner_extends_record.data else {
+            return false;
+        };
+        let literal = NodeRef::new(inner_extends.arena, inner_extends.file, literal.literal);
+
+        template_record.kind == SyntaxKind::ConditionalType
+            && template_record.parent == Some(mapped.node().node)
+            && check_record.kind == SyntaxKind::IndexedAccessType
+            && check_record.parent == Some(template.node)
+            && self.react_detailed_html_props_parameter_reference(
+                object,
+                check,
+                "V",
+                source_parameter,
+            )
+            && self.react_detailed_html_props_parameter_reference(
+                key,
+                check,
+                "K",
+                mapped.type_parameter_symbol(),
+            )
+            && self
+                .store
+                .symbol(validator)
+                .is_some_and(|owner| owner.flags().contains(SymbolFlags::INTERFACE))
+            && self.store.get_parent_of_symbol(validator) == Some(module)
+            && self
+                .store
+                .symbol(is_optional)
+                .is_some_and(|owner| owner.flags() == SymbolFlags::TYPE_ALIAS)
+            && self.store.get_parent_of_symbol(is_optional) == Some(module)
+            && infer_record.kind == SyntaxKind::InferType
+            && infer_record.parent == Some(extends.node)
+            && self.store.symbol(inferred_symbol).is_some_and(|owner| {
+                owner.flags() == SymbolFlags::TYPE_PARAMETER && owner.name().as_utf8() == Some("T")
+            })
+            && inner_record.kind == SyntaxKind::ConditionalType
+            && inner_record.parent == Some(template.node)
+            && inner_extends_record.kind == SyntaxKind::LiteralType
+            && inner_extends_record.parent == Some(when_true.node)
+            && self
+                .host
+                .node(literal)
+                .is_some_and(|node| node.kind == SyntaxKind::TrueKeyword)
+            && self
+                .host
+                .node(inner_true)
+                .is_some_and(|node| node.kind == SyntaxKind::NeverKeyword)
+            && self
+                .host
+                .node(when_false)
+                .is_some_and(|node| node.kind == SyntaxKind::NeverKeyword)
+            && self.react_detailed_html_props_parameter_reference(
+                *optional_argument,
+                inner_check,
+                "T",
+                inferred_symbol,
+            )
+            && self.react_detailed_html_props_parameter_reference(
+                inner_false,
+                when_true,
+                "K",
+                mapped.type_parameter_symbol(),
+            )
     }
 
     #[allow(clippy::too_many_lines)] // Ambient ownership and both nested mapped operands form one proof.
@@ -10997,6 +11554,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             self.plan
                 .prop_types_infer_props_aliases
                 .insert(symbol, infer_props_alias);
+        }
+        if let Some(key_alias) = self.authenticated_prop_types_key_alias(symbol) {
+            self.plan.prop_types_key_aliases.insert(symbol, key_alias);
         }
         if let Some(utility) = self.authenticated_default_library_mapped_utility_alias(symbol) {
             self.plan
@@ -16009,6 +16569,18 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 .get(&symbol)
                 .copied(),
         )?;
+        if let Some(key_alias) = plan.prop_types_key_aliases.get(&symbol).copied() {
+            return self.execute_prop_types_key_alias_instantiation(
+                symbol,
+                declared_type,
+                &type_parameters,
+                &type_arguments,
+                key,
+                key_alias,
+                plan,
+                prepared,
+            );
+        }
         if self.alias_type_contains_literal_method(declared_type)
             && let Some(cached) = links
                 .instantiations
@@ -16312,6 +16884,245 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             ));
         }
         Ok(instantiation)
+    }
+
+    #[allow(clippy::too_many_arguments)] // Alias identity, owner proof, and execution plan must stay coupled.
+    fn execute_prop_types_key_alias_instantiation(
+        &mut self,
+        alias: SemanticSymbolId,
+        declared_type: TypeId,
+        type_parameters: &[TypeId],
+        type_arguments: &[TypeId],
+        key: CacheHashKey,
+        proof: PropTypesKeyAliasPlan,
+        plan: &TypeQueryPlan,
+        prepared: &mut PreparedTypeQueryTypes,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let invalid = || {
+            type_node_unavailable(TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(
+                alias,
+            ))
+        };
+        let links = self
+            .store
+            .type_alias_links(alias)
+            .cloned()
+            .ok_or_else(&invalid)?;
+        if links.declared_type != Some(declared_type)
+            || links.type_parameters.as_deref() != Some(type_parameters)
+            || type_arguments.len() != 1
+            || type_parameters
+                .first()
+                .copied()
+                .and_then(|parameter| cached_ordinary_type_parameter_owner(self.store, parameter))
+                != Some(proof.parameter)
+            || self
+                .store
+                .type_node_links(proof.body)
+                .and_then(|links| links.resolved_type)
+                != Some(declared_type)
+        {
+            return Err(invalid());
+        }
+        if let Some(cached) = links
+            .instantiations
+            .as_ref()
+            .and_then(|instantiations| instantiations.get(&key))
+            .copied()
+        {
+            if proof.kind == PropTypesKeyAliasKind::Required
+                && self
+                    .store
+                    .validate_prop_types_required_keys_instantiation(
+                        alias,
+                        declared_type,
+                        type_parameters,
+                        type_arguments,
+                        cached,
+                    )
+                    .is_err()
+                || proof.kind == PropTypesKeyAliasKind::Optional
+                    && !valid_prop_types_optional_keys_instantiation(
+                        self.store,
+                        proof,
+                        declared_type,
+                        type_arguments[0],
+                        cached,
+                    )
+            {
+                return Err(invalid());
+            }
+            return Ok(cached);
+        }
+
+        let mut updated = links.clone();
+        updated
+            .instantiations
+            .as_mut()
+            .ok_or_else(&invalid)?
+            .try_reserve(1)
+            .map_err(|_| type_node_unavailable(TypeNodeUnavailable::LiteralTypeCapacity))?;
+        let resolved = match proof.kind {
+            PropTypesKeyAliasKind::Required => self
+                .store
+                .instantiate_prop_types_required_keys_alias(
+                    alias,
+                    declared_type,
+                    type_parameters,
+                    type_arguments,
+                )
+                .map_err(|_| {
+                    type_node_unavailable(
+                        TypeNodeUnavailable::GenericAliasInstantiationUnsupported {
+                            alias,
+                            declared_type,
+                        },
+                    )
+                })?,
+            PropTypesKeyAliasKind::Optional => self.instantiate_prop_types_optional_keys_alias(
+                alias,
+                declared_type,
+                proof,
+                type_arguments[0],
+                plan,
+                prepared,
+            )?,
+        };
+        if updated
+            .instantiations
+            .as_mut()
+            .ok_or_else(&invalid)?
+            .insert(key, resolved)
+            .is_some()
+            || !self.store.set_type_alias_links(alias, updated)
+        {
+            return Err(invalid());
+        }
+        Ok(resolved)
+    }
+
+    fn instantiate_prop_types_optional_keys_alias(
+        &mut self,
+        alias: SemanticSymbolId,
+        declared: TypeId,
+        proof: PropTypesKeyAliasPlan,
+        source: TypeId,
+        plan: &TypeQueryPlan,
+        prepared: &mut PreparedTypeQueryTypes,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let invalid = || {
+            type_node_unavailable(TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(
+                alias,
+            ))
+        };
+        let required = proof.required_alias.ok_or_else(&invalid)?;
+        let exclude = proof.exclude_alias.ok_or_else(&invalid)?;
+        let required_links = self
+            .store
+            .type_alias_links(required)
+            .cloned()
+            .ok_or_else(&invalid)?;
+        let required_declared = required_links.declared_type.ok_or_else(&invalid)?;
+        let required_parameters = required_links
+            .type_parameters
+            .clone()
+            .ok_or_else(&invalid)?;
+        let required_key = self.type_alias_instantiation_key(&[source], None)?;
+        let required_type = if let Some(cached) = required_links
+            .instantiations
+            .as_ref()
+            .and_then(|instantiations| instantiations.get(&required_key))
+            .copied()
+        {
+            self.store
+                .validate_prop_types_required_keys_instantiation(
+                    required,
+                    required_declared,
+                    &required_parameters,
+                    &[source],
+                    cached,
+                )
+                .map_err(|_| invalid())?;
+            cached
+        } else {
+            let mut updated = required_links.clone();
+            updated
+                .instantiations
+                .as_mut()
+                .ok_or_else(&invalid)?
+                .try_reserve(1)
+                .map_err(|_| type_node_unavailable(TypeNodeUnavailable::LiteralTypeCapacity))?;
+            let instantiated = self
+                .store
+                .instantiate_prop_types_required_keys_alias(
+                    required,
+                    required_declared,
+                    &required_parameters,
+                    &[source],
+                )
+                .map_err(|_| invalid())?;
+            if updated
+                .instantiations
+                .as_mut()
+                .ok_or_else(&invalid)?
+                .insert(required_key, instantiated)
+                .is_some()
+                || !self.store.set_type_alias_links(required, updated)
+            {
+                return Err(invalid());
+            }
+            instantiated
+        };
+        let key_plan = plan_nongeneric_keyof_type(self.store, source).map_err(|_| invalid())?;
+        let keys = resolve_nongeneric_keyof_type(self.store, &key_plan).map_err(|_| invalid())?;
+        let Some(TypeData::Conditional(conditional)) =
+            self.store.type_payload(declared).map(TypeRecord::data)
+        else {
+            return Err(invalid());
+        };
+        let root = self
+            .store
+            .conditional_root(conditional.root)
+            .ok_or_else(&invalid)?;
+        let root_node = root.node();
+        let root_parameters = root.outer_type_parameters().unwrap_or_default();
+        let exclude_parameters = self
+            .store
+            .type_alias_links(exclude)
+            .and_then(|links| links.type_parameters.as_deref())
+            .ok_or_else(&invalid)?;
+        if root_parameters != exclude_parameters || root_parameters.len() != 2 {
+            return Err(invalid());
+        }
+        let conditional_plan = plan
+            .conditionals
+            .get(&root_node)
+            .cloned()
+            .ok_or_else(&invalid)?;
+        let branches = self.resolve_conditional_branches(
+            &conditional_plan,
+            ConditionalBranchDemand::Both,
+            plan,
+            prepared,
+        )?;
+        get_conditional_type_instantiation(
+            self.store,
+            ConditionalTypeInstantiation {
+                conditional_type: declared,
+                type_arguments: &[keys, required_type],
+                branches,
+                alias: None,
+                for_constraint: false,
+            },
+            self.global_types.as_ref(),
+            self.instantiation_session.as_deref_mut(),
+        )
+        .map_err(|_| {
+            type_node_unavailable(TypeNodeUnavailable::GenericAliasInstantiationUnsupported {
+                alias,
+                declared_type: declared,
+            })
+        })
     }
 
     fn check_generic_alias_type_argument_constraints(
@@ -17513,6 +18324,36 @@ mod tests {
             ),
             module_name, intersection,
         ));
+        prop_types_declaration_fixture(library, declarations, default_library)
+    }
+
+    fn prop_types_key_alias_fixture(
+        module_name: &str,
+        required: &str,
+        optional: &str,
+    ) -> PropTypesInferPropsFixture {
+        let library = parse_source_file("type Exclude<T, U> = T extends U ? never : T;");
+        let declarations = parse_source_file(&format!(
+            concat!(
+                "declare module \"{}\" {{ ",
+                "export interface Validator<T> {{}} ",
+                "export type IsOptional<T> = T extends undefined ? true : false; ",
+                "export type RequiredKeys<V> = {}; ",
+                "export type OptionalKeys<V> = {}; ",
+                "export type RequiredForward<V> = RequiredKeys<V>; ",
+                "export type OptionalForward<V> = OptionalKeys<V>; ",
+                "}}",
+            ),
+            module_name, required, optional,
+        ));
+        prop_types_declaration_fixture(library, declarations, true)
+    }
+
+    fn prop_types_declaration_fixture(
+        library: ParseResult,
+        declarations: ParseResult,
+        default_library: bool,
+    ) -> PropTypesInferPropsFixture {
         let library_file = FileId::new(8_690);
         let declaration_file = FileId::new(8_691);
         let mut binder = CanonicalBinder::new();
@@ -21264,6 +22105,389 @@ mod tests {
             assert_eq!(store_state(&store), before);
             assert!(diagnostics.is_empty());
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Both related aliases share one authenticated ambient module.
+    fn prop_types_key_aliases_rebind_mapped_conditionals_and_reuse_warm_caches() {
+        let PropTypesInferPropsFixture {
+            library,
+            declarations,
+            library_file,
+            declaration_file,
+            files,
+            mut store,
+        } = prop_types_key_alias_fixture(
+            "prop-types",
+            concat!(
+                "{ [K in keyof V]: V[K] extends Validator<infer T> ",
+                "? IsOptional<T> extends true ? never : K : never }[keyof V]",
+            ),
+            "Exclude<keyof V, RequiredKeys<V>>",
+        );
+        let bound = files.get(&declaration_file).unwrap();
+        let find_alias = |name: &str| {
+            declarations
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+                        return None;
+                    };
+                    (identifier_text(&declarations.arena, alias.name) == Some(name)).then(|| {
+                        bound
+                            .symbol(NodeRef::new(
+                                declarations.arena.id(),
+                                declaration_file,
+                                node,
+                            ))
+                            .unwrap()
+                    })
+                })
+                .unwrap()
+        };
+        let required = find_alias("RequiredKeys");
+        let optional = find_alias("OptionalKeys");
+        let required_forward = find_alias("RequiredForward");
+        let optional_forward = find_alias("OptionalForward");
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&library.arena, files.get(&library_file).unwrap()),
+                (&declarations.arena, bound),
+            ],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let aliases = HashMap::new();
+        let planner = TypeQueryPlanner::new(&store, &host, None, None, false, &aliases);
+        assert_eq!(
+            planner
+                .authenticated_prop_types_key_alias(required)
+                .map(|proof| proof.kind),
+            Some(PropTypesKeyAliasKind::Required),
+        );
+        assert_eq!(
+            planner
+                .authenticated_prop_types_key_alias(optional)
+                .map(|proof| proof.kind),
+            Some(PropTypesKeyAliasKind::Optional),
+        );
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let required_result = CanonicalTypeQuery::new(
+            &mut store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_declared_type_of_symbol(required_forward)
+        .unwrap();
+        let required_parameter = store
+            .type_alias_links(required_forward)
+            .and_then(|links| links.type_parameters.as_deref())
+            .and_then(|parameters| parameters.first())
+            .copied()
+            .unwrap();
+        let required_links = store.type_alias_links(required).unwrap();
+        assert_eq!(
+            store.validate_prop_types_required_keys_instantiation(
+                required,
+                required_links.declared_type.unwrap(),
+                required_links.type_parameters.as_deref().unwrap(),
+                &[required_parameter],
+                required_result,
+            ),
+            Ok(()),
+        );
+        let TypeData::IndexedAccess(required_index) =
+            store.type_payload(required_result).unwrap().data()
+        else {
+            panic!("RequiredKeys must preserve its mapped indexed identity")
+        };
+        let TypeData::Index(keys) = store
+            .type_payload(required_index.index_type)
+            .unwrap()
+            .data()
+        else {
+            panic!("RequiredKeys must retain keyof its forwarded source")
+        };
+        assert_eq!(keys.target, required_parameter);
+
+        let optional_result = CanonicalTypeQuery::new(
+            &mut store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_declared_type_of_symbol(optional_forward)
+        .unwrap();
+        let optional_parameter = store
+            .type_alias_links(optional_forward)
+            .and_then(|links| links.type_parameters.as_deref())
+            .and_then(|parameters| parameters.first())
+            .copied()
+            .unwrap();
+        let TypeData::Conditional(optional_condition) =
+            store.type_payload(optional_result).unwrap().data()
+        else {
+            panic!("OptionalKeys must preserve its deferred Exclude conditional")
+        };
+        let TypeData::Index(optional_keys) = store
+            .type_payload(optional_condition.check_type)
+            .unwrap()
+            .data()
+        else {
+            panic!("OptionalKeys must retain keyof its forwarded source")
+        };
+        assert_eq!(optional_keys.target, optional_parameter);
+        assert!(matches!(
+            store
+                .type_payload(optional_condition.extends_type)
+                .map(TypeRecord::data),
+            Some(TypeData::IndexedAccess(_)),
+        ));
+
+        let warm = store_state(&store);
+        for (alias, expected) in [
+            (required_forward, required_result),
+            (optional_forward, optional_result),
+        ] {
+            assert_eq!(
+                CanonicalTypeQuery::new(
+                    &mut store,
+                    &host,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_declared_type_of_symbol(alias),
+                Ok(expected),
+            );
+            assert_eq!(store_state(&store), warm);
+        }
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn prop_types_key_aliases_reject_other_modules_and_changed_conditional_branches() {
+        let valid_required = concat!(
+            "{ [K in keyof V]: V[K] extends Validator<infer T> ",
+            "? IsOptional<T> extends true ? never : K : never }[keyof V]",
+        );
+        for (module, required) in [
+            ("lookalike", valid_required),
+            (
+                "prop-types",
+                concat!(
+                    "{ [K in keyof V]: V[K] extends Validator<infer T> ",
+                    "? IsOptional<T> extends true ? K : never : never }[keyof V]",
+                ),
+            ),
+        ] {
+            let PropTypesInferPropsFixture {
+                library,
+                declarations,
+                library_file,
+                declaration_file,
+                files,
+                mut store,
+            } = prop_types_key_alias_fixture(module, required, "Exclude<keyof V, RequiredKeys<V>>");
+            let bound = files.get(&declaration_file).unwrap();
+            let alias = declarations
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+                        return None;
+                    };
+                    (identifier_text(&declarations.arena, alias.name) == Some("RequiredKeys")).then(
+                        || {
+                            bound
+                                .symbol(NodeRef::new(
+                                    declarations.arena.id(),
+                                    declaration_file,
+                                    node,
+                                ))
+                                .unwrap()
+                        },
+                    )
+                })
+                .unwrap();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [
+                    (&library.arena, files.get(&library_file).unwrap()),
+                    (&declarations.arena, bound),
+                ],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            let aliases = HashMap::new();
+            assert!(
+                TypeQueryPlanner::new(&store, &host, None, None, false, &aliases)
+                    .authenticated_prop_types_key_alias(alias)
+                    .is_none(),
+                "module: {module}",
+            );
+
+            let forward = declarations
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+                        return None;
+                    };
+                    (identifier_text(&declarations.arena, alias.name) == Some("RequiredForward"))
+                        .then(|| {
+                            bound
+                                .symbol(NodeRef::new(
+                                    declarations.arena.id(),
+                                    declaration_file,
+                                    node,
+                                ))
+                                .unwrap()
+                        })
+                })
+                .unwrap();
+            let before = store_state(&store);
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            assert!(
+                CanonicalTypeQuery::new(
+                    &mut store,
+                    &host,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_declared_type_of_symbol(forward)
+                .is_err(),
+            );
+            assert_eq!(store_state(&store), before);
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn poisoned_prop_types_required_key_mapper_fails_before_warm_query_writes() {
+        let PropTypesInferPropsFixture {
+            library,
+            declarations,
+            library_file,
+            declaration_file,
+            files,
+            mut store,
+        } = prop_types_key_alias_fixture(
+            "prop-types",
+            concat!(
+                "{ [K in keyof V]: V[K] extends Validator<infer T> ",
+                "? IsOptional<T> extends true ? never : K : never }[keyof V]",
+            ),
+            "Exclude<keyof V, RequiredKeys<V>>",
+        );
+        let bound = files.get(&declaration_file).unwrap();
+        let alias = declarations
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+                    return None;
+                };
+                (identifier_text(&declarations.arena, alias.name) == Some("RequiredForward")).then(
+                    || {
+                        bound
+                            .symbol(NodeRef::new(
+                                declarations.arena.id(),
+                                declaration_file,
+                                node,
+                            ))
+                            .unwrap()
+                    },
+                )
+            })
+            .unwrap();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&library.arena, files.get(&library_file).unwrap()),
+                (&declarations.arena, bound),
+            ],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let resolved = CanonicalTypeQuery::new(
+            &mut store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_declared_type_of_symbol(alias)
+        .unwrap();
+        let parameter = match store.type_payload(resolved).unwrap().data() {
+            TypeData::IndexedAccess(indexed) => {
+                match store.type_payload(indexed.object_type).unwrap().data() {
+                    TypeData::Mapped(mapped) => mapped.type_parameter.unwrap(),
+                    _ => unreachable!(),
+                }
+            }
+            _ => unreachable!(),
+        };
+        let (constraint, target, mapper, default_type) =
+            match store.type_payload(parameter).unwrap().data() {
+                TypeData::TypeParameter(parameter) => (
+                    parameter.constraint,
+                    parameter.target,
+                    parameter.mapper,
+                    parameter.resolved_default_type,
+                ),
+                _ => unreachable!(),
+            };
+        assert!(mapper.is_some());
+        assert!(store.set_type_parameter_resolution(
+            parameter,
+            constraint,
+            target,
+            None,
+            default_type,
+        ));
+        let poisoned = store_state(&store);
+
+        for _ in 0..2 {
+            assert_eq!(
+                CanonicalTypeQuery::new(
+                    &mut store,
+                    &host,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_declared_type_of_symbol(alias),
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidCachedTypeAlias(alias),
+                )),
+            );
+            assert_eq!(store_state(&store), poisoned);
+        }
+        assert!(store.set_type_parameter_resolution(
+            parameter,
+            constraint,
+            target,
+            mapper,
+            default_type,
+        ));
+        assert_eq!(
+            CanonicalTypeQuery::new(
+                &mut store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_declared_type_of_symbol(alias),
+            Ok(resolved),
+        );
+        assert!(diagnostics.is_empty());
     }
 
     #[test]
