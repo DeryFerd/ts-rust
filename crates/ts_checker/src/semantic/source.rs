@@ -8046,6 +8046,13 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         .then(|| target_declarations.first().copied())
                         .flatten()
                 })
+                .or_else(|| {
+                    (target.flags() == SymbolFlags::ALIAS
+                        && self.value_import_bindings.contains_key(&target_symbol)
+                        && target_declarations.len() == 1)
+                        .then(|| target_declarations.first().copied())
+                        .flatten()
+                })
         } else {
             match target_declarations {
                 [declaration] => Some(*declaration),
@@ -8072,6 +8079,45 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         && binding.declaration == target_declaration
                         && target_record.kind == SyntaxKind::ImportSpecifier
                         && target_record.range.end <= declaration_start
+                });
+        let export_equals_import_alias = export_equals
+            && target.flags() == SymbolFlags::ALIAS
+            && target.check_flags() == CheckFlags::NONE
+            && target.name().as_utf8() == Some(identifier.text.as_str())
+            && target.value_declaration().is_none()
+            && target.members().is_none()
+            && target.exports().is_none()
+            && target.parent().is_none()
+            && target.export_symbol().is_none()
+            && target_declarations == &[target_declaration]
+            && self
+                .value_import_bindings
+                .get(&target_symbol)
+                .is_some_and(|binding| {
+                    binding.alias_symbol == target_symbol
+                        && binding.local_text == identifier.text
+                        && binding.declaration == target_declaration
+                        && target_declaration.is_for(declaration.arena, declaration.file)
+                        && matches!(
+                            target_record.kind,
+                            SyntaxKind::ImportClause
+                                | SyntaxKind::NamespaceImport
+                                | SyntaxKind::ImportSpecifier
+                                | SyntaxKind::ImportEqualsDeclaration
+                        )
+                        && target_record.range.end <= declaration_start
+                        && self.bound.symbol(target_declaration) == Some(target_symbol)
+                        && self.bound.local_symbol(target_declaration).is_none()
+                        && store.alias_symbol_links(target_symbol).is_none_or(|links| {
+                            links.type_only_declaration.is_none()
+                                && links
+                                    .immediate_target
+                                    .is_none_or(|immediate| store.symbol(immediate).is_some())
+                                && links
+                                    .alias_target
+                                    .symbol()
+                                    .is_none_or(|resolved| store.symbol(resolved).is_some())
+                        })
                 });
         let export_equals_callable = export_equals
             && target.flags().contains(SymbolFlags::FUNCTION)
@@ -8149,6 +8195,33 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         .and_then(|candidate| store.get_merged_symbol(candidate))
                         == Some(target_symbol)
             });
+        let export_equals_class = export_equals
+            && target.flags().contains(SymbolFlags::CLASS)
+            && target
+                .flags()
+                .without(SymbolFlags::CLASS | SymbolFlags::MODULE)
+                == SymbolFlags::NONE
+            && target.check_flags() == CheckFlags::NONE
+            && target.name().as_utf8() == Some(identifier.text.as_str())
+            && target.parent().is_none()
+            && target.export_symbol().is_none()
+            && self.planned_classes.contains(&target_symbol)
+            && target_record.kind == SyntaxKind::ClassDeclaration
+            && target_declarations.iter().all(|candidate| {
+                candidate.is_for(declaration.arena, declaration.file)
+                    && self.arena.get(candidate.node).is_some_and(|record| {
+                        matches!(
+                            record.kind,
+                            SyntaxKind::ClassDeclaration | SyntaxKind::ModuleDeclaration
+                        ) && record.parent == Some(self.source.node_ref().node)
+                            && record.range.end <= declaration_start
+                    })
+                    && self
+                        .bound
+                        .symbol(*candidate)
+                        .and_then(|candidate| store.get_merged_symbol(candidate))
+                        == Some(target_symbol)
+            });
         let export_equals_namespace = export_equals
             && target.flags().intersects(SymbolFlags::MODULE)
             && target.flags().without(SymbolFlags::MODULE) == SymbolFlags::NONE
@@ -8158,15 +8231,14 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             && target.parent().is_none()
             && target.export_symbol().is_none()
             && target_record.kind == SyntaxKind::ModuleDeclaration
-            && self
-                .bound
-                .source_facts()
-                .is_some_and(ts_binder::CanonicalSourceFileFacts::is_declaration_file)
             && target_declarations.iter().all(|candidate| {
                 candidate.is_for(declaration.arena, declaration.file)
                     && self.arena.get(candidate.node).is_some_and(|record| {
                         record.kind == SyntaxKind::ModuleDeclaration
                             && record.parent == Some(self.source.node_ref().node)
+                            && (self.bound.source_facts().is_some_and(
+                                ts_binder::CanonicalSourceFileFacts::is_declaration_file,
+                            ) || record.range.end <= declaration_start)
                     })
                     && self
                         .bound
@@ -8184,11 +8256,14 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 )
                 && target_record.kind == SyntaxKind::EnumDeclaration
             || imported_enum_alias
+            || export_equals_import_alias
             || export_equals_callable
             || export_equals_variable
+            || export_equals_class
             || export_equals_namespace;
         if !supported_target
             || !imported_enum_alias
+                && !export_equals_import_alias
                 && !export_equals_variable
                 && target_record.parent != Some(self.source.node_ref().node)
             || !export_equals_namespace && target_record.range.end > declaration_start
@@ -8247,6 +8322,12 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             store
                                 .symbol(resolved)
                                 .is_none_or(|target| target.flags() != SymbolFlags::CONST_ENUM)
+                        } else if export_equals_import_alias {
+                            store.symbol(resolved).is_none_or(|target| {
+                                !target
+                                    .flags()
+                                    .intersects(SymbolFlags::VALUE | SymbolFlags::NAMESPACE)
+                            })
                         } else {
                             resolved != target_symbol
                         }
@@ -21206,14 +21287,24 @@ pub(super) fn check_source_file(
         let Some(final_target) = resolved.target.symbol() else {
             return Err(SourceCheckError::Import(export.declaration));
         };
-        let imported_enum_alias = store
+        let imported_alias = store
             .symbol(export.target_symbol)
             .is_some_and(|target| target.flags() == SymbolFlags::ALIAS);
+        let export_equals_import_alias = imported_alias
+            && store.symbol(export.alias_symbol).is_some_and(|alias| {
+                alias.name() == ts_binder::InternalSymbolName::ExportEquals.as_ref()
+            });
         if immediate != Some(export.target_symbol)
-            || if imported_enum_alias {
-                !store
-                    .symbol(final_target)
-                    .is_some_and(|target| target.flags() == SymbolFlags::CONST_ENUM)
+            || if imported_alias {
+                store.symbol(final_target).is_none_or(|target| {
+                    if export_equals_import_alias {
+                        !target
+                            .flags()
+                            .intersects(SymbolFlags::VALUE | SymbolFlags::NAMESPACE)
+                    } else {
+                        target.flags() != SymbolFlags::CONST_ENUM
+                    }
+                })
             } else {
                 final_target != export.target_symbol
             }
@@ -33483,6 +33574,132 @@ mod tests {
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn export_equals_classes_and_runtime_namespaces_preserve_binder_identity() {
+        for (index, (text, expected_kind)) in [
+            (
+                "class Selected {} export = Selected;",
+                SyntaxKind::ClassDeclaration,
+            ),
+            (
+                "namespace Selected { export var value = 1; } export = Selected;",
+                SyntaxKind::ModuleDeclaration,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parsed(text);
+            let file = FileId::new(8_970 + u32::try_from(index).unwrap());
+            let mut context = context_with_module_state(
+                &[(file, &source)],
+                CanonicalModuleState::External,
+                CanonicalCheckerOptions {
+                    emit_common_js: true,
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+            let declaration = source
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == expected_kind).then_some(NodeRef::new(
+                        source.arena.id(),
+                        file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let assignment = source
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::ExportAssignment).then_some(NodeRef::new(
+                        source.arena.id(),
+                        file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let (_, bound) = context.file(file).unwrap();
+            let target = bound.symbol(declaration).unwrap();
+            let alias = bound.symbol(assignment).unwrap();
+
+            context.check_source_file(file).unwrap();
+
+            assert_eq!(
+                context
+                    .store()
+                    .alias_symbol_links(alias)
+                    .map(|links| (links.immediate_target, links.alias_target)),
+                Some((Some(target), AliasTargetState::Resolved(target))),
+            );
+            assert!(context.diagnostics().is_empty());
+
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
+    fn export_equals_import_aliases_preserve_their_cross_file_target() {
+        let forwarded = parsed(concat!(
+            "import { value as selected } from './target'; ",
+            "export = selected;",
+        ));
+        let target = parsed("export const value: number = 1;");
+        let forwarded_file = FileId::new(8_972);
+        let target_file = FileId::new(8_973);
+        let files = [(forwarded_file, &forwarded), (target_file, &target)];
+        let mut context = external_context_with_import_routes(
+            &files,
+            &[SourceImportRoute {
+                source: 0,
+                specifier: 0,
+                target: 1,
+            }],
+        );
+        let assignment = forwarded
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ExportAssignment).then_some(NodeRef::new(
+                    forwarded.arena.id(),
+                    forwarded_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let imported = source_import_alias_symbol(&context, &forwarded, forwarded_file, "selected");
+        let (_, forwarded_bound) = context.file(forwarded_file).unwrap();
+        let exported = forwarded_bound.symbol(assignment).unwrap();
+        let value = variable_symbol(&context, &target, target_file, "value");
+
+        context.check_source_file(forwarded_file).unwrap();
+
+        assert_eq!(
+            context
+                .store()
+                .alias_symbol_links(exported)
+                .map(|links| (links.immediate_target, links.alias_target)),
+            Some((Some(imported), AliasTargetState::Resolved(value))),
+        );
+        assert_eq!(
+            context
+                .store()
+                .alias_symbol_links(imported)
+                .map(|links| links.alias_target),
+            Some(AliasTargetState::Resolved(value)),
+        );
+        assert!(!is_type_checked(&context, target_file));
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, forwarded_file);
+        context.recheck_source_file(forwarded_file).unwrap();
+        assert_eq!(observable_state(&context, forwarded_file), warm);
     }
 
     #[test]

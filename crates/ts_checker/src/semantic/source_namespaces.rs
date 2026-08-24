@@ -6166,7 +6166,6 @@ fn plan_ambient_export_assignment(
     };
     if record.kind != SyntaxKind::ExportAssignment
         || record.flags.0 != 0
-        || !export.is_export_equals
         || export.flow_node.is_some()
         || export.symbol.is_some()
         || export.type_.is_some()
@@ -6188,11 +6187,16 @@ fn plan_ambient_export_assignment(
     let alias = store
         .symbol(symbol)
         .ok_or(SourceCheckError::Import(declaration))?;
+    let expected_name = if export.is_export_equals {
+        InternalSymbolName::ExportEquals.as_ref()
+    } else {
+        InternalSymbolName::Default.as_ref()
+    };
     if alias.flags() != SymbolFlags::ALIAS
         || alias.check_flags() != CheckFlags::NONE
-        || alias.name() != InternalSymbolName::ExportEquals.as_ref()
+        || alias.name() != expected_name
         || alias.declarations() != Some(&[declaration])
-        || alias.value_declaration() != Some(declaration)
+        || alias.value_declaration() != export.is_export_equals.then_some(declaration)
         || alias.members().is_some()
         || alias.exports().is_some()
         || alias.export_symbol().is_some()
@@ -6201,7 +6205,7 @@ fn plan_ambient_export_assignment(
             .symbol(owner)
             .and_then(ts_binder::semantic::Symbol::exports)
             .and_then(|exports| store.symbol_table(exports))
-            .and_then(|exports| exports.get(InternalSymbolName::ExportEquals.as_ref()))
+            .and_then(|exports| exports.get(expected_name))
             != Some(symbol)
     {
         return Err(SourceCheckError::Import(declaration));
@@ -12228,6 +12232,60 @@ mod tests {
                 .alias_symbol_links(alias)
                 .map(|links| links.alias_target),
             Some(AliasTargetState::Resolved(target)),
+        );
+    }
+
+    #[test]
+    fn ambient_module_default_export_assignments_preserve_interface_aliases() {
+        let mut fixture = declaration_fixture(
+            concat!(
+                "declare module 'library' { ",
+                "interface Model { value: string; } ",
+                "export default Model; ",
+                "}",
+            ),
+            CanonicalModuleState::Script,
+        );
+        let namespace = plan(&fixture, 0);
+        let [export] = namespace.imports.as_slice() else {
+            panic!("the ambient module must retain its default-export alias")
+        };
+        let alias = export.symbol;
+        let [SourceNamespaceMemberPlan::Interface { symbol: target, .. }] =
+            namespace.members.as_slice()
+        else {
+            panic!("the ambient module must retain its exported interface")
+        };
+        let target = *target;
+        let record = fixture.context.store().symbol(alias).unwrap();
+        assert_eq!(record.name(), InternalSymbolName::Default.as_ref());
+        assert_eq!(record.value_declaration(), None);
+
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+
+        assert_eq!(
+            fixture
+                .context
+                .store()
+                .alias_symbol_links(alias)
+                .map(|links| (links.immediate_target, links.alias_target)),
+            Some((Some(target), AliasTargetState::Resolved(target))),
+        );
+        assert!(fixture.context.store().value_symbol_links(alias).is_none());
+
+        let warm = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
         );
     }
 
