@@ -1130,6 +1130,18 @@ struct PlannedArrowExpandoAssignment {
 }
 
 #[derive(Clone, Debug)]
+struct PlannedObjectExpandoAssignment {
+    expression: NodeRef,
+    left: NodeRef,
+    receiver: PlannedExpression,
+    index: Option<PlannedExpression>,
+    variable_symbol: SemanticSymbolId,
+    owner_symbol: SemanticSymbolId,
+    property_symbol: SemanticSymbolId,
+    right: PlannedExpression,
+}
+
+#[derive(Clone, Debug)]
 struct PlannedNamespaceAssignment {
     expression: NodeRef,
     left: NodeRef,
@@ -1265,6 +1277,7 @@ enum PlannedStatement {
     Assignment(PlannedAssignment),
     CommonJsAssignment(PlannedCommonJsAssignment),
     ArrowExpandoAssignment(PlannedArrowExpandoAssignment),
+    ObjectExpandoAssignment(PlannedObjectExpandoAssignment),
     NamespaceAssignment(PlannedNamespaceAssignment),
     ControlIf(Box<PlannedTopLevelIf>),
     ControlLoop(Box<PlannedTopLevelLoop>),
@@ -2745,6 +2758,44 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                                 target_symbol: assignment.target_symbol,
                                 right,
                                 named,
+                            },
+                        ));
+                        continue;
+                    }
+                    if let Some(assignment) =
+                        super::assignment::plan_javascript_object_expando_assignment(
+                            self.arena, self.bound, store, statement,
+                        )
+                        .map_err(Self::assignment_plan_error)?
+                    {
+                        if !self.prior_variables.contains(&assignment.variable_symbol) {
+                            return Err(SourceCheckError::Unsupported(
+                                UnsupportedSourceSyntax::Assignment(
+                                    AssignmentUnsupported::TargetNotPrior {
+                                        node: assignment.receiver,
+                                        symbol: assignment.variable_symbol,
+                                    },
+                                ),
+                            ));
+                        }
+                        let receiver = self.plan_expression(assignment.receiver)?;
+                        let index = assignment
+                            .index
+                            .map(|index| self.plan_expression(index))
+                            .transpose()?;
+                        self.primitive_binary_position_roots
+                            .insert(assignment.right);
+                        let right = self.plan_expression(assignment.right)?;
+                        statements.push(PlannedStatement::ObjectExpandoAssignment(
+                            PlannedObjectExpandoAssignment {
+                                expression: assignment.expression,
+                                left: assignment.left,
+                                receiver,
+                                index,
+                                variable_symbol: assignment.variable_symbol,
+                                owner_symbol: assignment.owner_symbol,
+                                property_symbol: assignment.property_symbol,
+                                right,
                             },
                         ));
                         continue;
@@ -25028,6 +25079,126 @@ pub(super) fn check_source_file(
                 publish_expression_type(store, assignment.left, property_type)?;
                 publish_expression_type(store, assignment.expression, value.result)?;
             }
+            PlannedStatement::ObjectExpandoAssignment(assignment) => {
+                let property = store.symbol(assignment.property_symbol).ok_or(
+                    SourceCheckError::Assignment(AssignmentInvariant::InvalidSymbol(
+                        assignment.property_symbol,
+                    )),
+                )?;
+                if bound.symbol(assignment.expression) != Some(assignment.property_symbol)
+                    || property.flags() != SymbolFlags::PROPERTY | SymbolFlags::ASSIGNMENT
+                    || property.parent() != Some(assignment.owner_symbol)
+                    || property.declarations() != Some(&[assignment.expression])
+                    || property.value_declaration() != Some(assignment.expression)
+                {
+                    return Err(SourceCheckError::Assignment(
+                        AssignmentInvariant::InvalidSymbolShape(assignment.property_symbol),
+                    ));
+                }
+
+                let receiver = check_expression_type(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    &current_flow_types,
+                    &preflighted_type_import_value_uses,
+                    &assignment.receiver,
+                    None,
+                    &mut deferred,
+                )?;
+                let object =
+                    store
+                        .type_payload(receiver.result)
+                        .ok_or(SourceCheckError::Assignment(
+                            AssignmentInvariant::InvalidSymbolShape(assignment.owner_symbol),
+                        ))?;
+                let TypeData::Object(object_data) = object.data() else {
+                    return Err(SourceCheckError::Assignment(
+                        AssignmentInvariant::InvalidSymbolShape(assignment.owner_symbol),
+                    ));
+                };
+                if current_flow_types.get(&assignment.variable_symbol) != Some(&receiver.result)
+                    || object.symbol() != Some(assignment.owner_symbol)
+                    || object.object_flags()
+                        != ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
+                    || object_data.structured.members
+                        != store
+                            .symbol(assignment.owner_symbol)
+                            .and_then(ts_binder::semantic::Symbol::exports)
+                    || object_data
+                        .structured
+                        .properties
+                        .as_deref()
+                        .is_none_or(|properties| !properties.contains(&assignment.property_symbol))
+                {
+                    return Err(SourceCheckError::Assignment(
+                        AssignmentInvariant::InvalidSymbolShape(assignment.owner_symbol),
+                    ));
+                }
+
+                if let Some(index) = &assignment.index {
+                    let checked = check_expression_type(
+                        store,
+                        host,
+                        global_types,
+                        source,
+                        options,
+                        session,
+                        diagnostics,
+                        &current_flow_types,
+                        &preflighted_type_import_value_uses,
+                        index,
+                        None,
+                        &mut deferred,
+                    )?;
+                    let property = store.symbol(assignment.property_symbol).ok_or(
+                        SourceCheckError::Assignment(AssignmentInvariant::InvalidSymbol(
+                            assignment.property_symbol,
+                        )),
+                    )?;
+                    if !matches!(
+                        store.type_payload(checked.result).map(TypeRecord::data),
+                        Some(TypeData::Literal(literal))
+                            if matches!(&literal.value, LiteralValue::String(name)
+                                if property.name().as_utf8() == Some(name.as_str()))
+                    ) {
+                        return Err(SourceCheckError::Element(index.node));
+                    }
+                }
+
+                let value = check_expression_type(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    &current_flow_types,
+                    &preflighted_type_import_value_uses,
+                    &assignment.right,
+                    None,
+                    &mut deferred,
+                )?;
+                let widened_literal = widened_fresh_literal_type(store, value.result)?;
+                let property_type =
+                    store.get_widened_type_with_global_types(widened_literal, global_types)?;
+                preflight_source_expression_cache(store, assignment.left, property_type)?;
+                preflight_source_expression_cache(store, assignment.expression, value.result)?;
+                stage_value_type(
+                    store,
+                    &mut staged_value_types,
+                    &mut value_order,
+                    assignment.property_symbol,
+                    property_type,
+                )?;
+                publish_expression_type(store, assignment.left, property_type)?;
+                publish_expression_type(store, assignment.expression, value.result)?;
+            }
             PlannedStatement::NamespaceAssignment(assignment) => {
                 if store
                     .symbol(assignment.target_symbol)
@@ -39541,6 +39712,133 @@ mod tests {
             resolved_node_type(&context, expression),
             resolved_node_type(&context, right),
         );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn javascript_object_element_expandos_publish_real_properties_and_replay_warm() {
+        let source = parse_javascript_source_file(concat!(
+            "var object = {}; ",
+            "object['if'] = 1; ",
+            "object['else'] = 1;",
+        ));
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let file = FileId::new(8_440);
+        let mut context = javascript_context(file, &source, CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let initializer = variable_initializer(&source, file, "object");
+        let object_type = variable_value_type(&context, &source, file, "object");
+        let (_, bound) = context.file(file).unwrap();
+        let owner = bound.symbol(initializer).unwrap();
+        let owner_record = context.store().symbol(owner).unwrap();
+        let exports = owner_record.exports().unwrap();
+        let object = context.store().type_payload(object_type).unwrap();
+        let TypeData::Object(object_data) = object.data() else {
+            panic!("expected the binder-owned JavaScript expando object type")
+        };
+        assert_eq!(object.symbol(), Some(owner));
+        assert_eq!(
+            object.object_flags(),
+            ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED,
+        );
+        assert_eq!(object_data.structured.members, Some(exports));
+        assert_eq!(resolved_node_type(&context, initializer), object_type);
+
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        for (index, name) in ["if", "else"].into_iter().enumerate() {
+            let (left, right) = assignment_parts(&source, file, index);
+            let expression = NodeRef::new(
+                source.arena.id(),
+                file,
+                source.arena.get(left.node).unwrap().parent.unwrap(),
+            );
+            let property = bound.symbol(expression).unwrap();
+            assert_eq!(
+                context
+                    .store()
+                    .symbol_table(exports)
+                    .and_then(|exports| exports.get_source(name)),
+                Some(property),
+            );
+            assert_eq!(
+                context.store().symbol(property).unwrap().flags(),
+                SymbolFlags::PROPERTY | SymbolFlags::ASSIGNMENT,
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(property)
+                    .and_then(|links| links.resolved_type),
+                Some(number),
+            );
+            assert_eq!(resolved_node_type(&context, left), number);
+            assert_eq!(
+                resolved_node_type(&context, expression),
+                resolved_node_type(&context, right),
+            );
+            let NodeData::ElementAccessExpression(access) =
+                &source.arena.get(left.node).unwrap().data
+            else {
+                panic!("expected a static JavaScript expando element assignment")
+            };
+            let receiver = NodeRef::new(source.arena.id(), file, access.expression);
+            let index = NodeRef::new(source.arena.id(), file, access.argument_expression);
+            assert_eq!(resolved_node_type(&context, receiver), object_type);
+            assert_eq!(
+                context
+                    .type_to_string(resolved_node_type(&context, index))
+                    .unwrap(),
+                format!("\"{name}\"")
+            );
+        }
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn javascript_object_expando_element_reads_use_the_binder_property() {
+        let source = parse_javascript_source_file(concat!(
+            "var object = {}; ",
+            "object['ready'] = 1; ",
+            "const copied = object['ready'];",
+        ));
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let file = FileId::new(8_441);
+        let mut context = javascript_context(file, &source, CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(
+            variable_value_type(&context, &source, file, "copied"),
+            number,
+        );
+        let read = variable_initializer(&source, file, "copied");
+        let (_, bound) = context.file(file).unwrap();
+        let (left, _) = assignment_parts(&source, file, 0);
+        let assignment = NodeRef::new(
+            source.arena.id(),
+            file,
+            source.arena.get(left.node).unwrap().parent.unwrap(),
+        );
+        let property = bound.symbol(assignment).unwrap();
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(read)
+                .and_then(|links| links.resolved_symbol),
+            Some(property),
+        );
+        assert_eq!(resolved_node_type(&context, read), number);
         assert!(context.diagnostics().is_empty());
 
         let warm = observable_state(&context, file);

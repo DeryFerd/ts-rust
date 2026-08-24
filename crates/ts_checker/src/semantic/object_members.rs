@@ -834,10 +834,12 @@ pub(super) fn plan_object_literal(
         || symbol_record.declarations() != Some(&[node])
         || symbol_record.value_declaration() != Some(node)
         || symbol_record.parent().is_some()
-        || symbol_record.exports().is_some()
         || symbol_record.export_symbol().is_some()
     {
         return Err(PropertyObjectError::InvalidObjectLiteral(node));
+    }
+    if let Some(exports) = symbol_record.exports() {
+        return plan_javascript_expando_object_literal(store, host, node, symbol, exports);
     }
     for member in &object.properties.nodes {
         let member = NodeRef::new(node.arena, node.file, *member);
@@ -888,6 +890,93 @@ pub(super) fn plan_object_literal(
         }
     }
     Ok(plan)
+}
+
+fn plan_javascript_expando_object_literal(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+    owner: SemanticSymbolId,
+    exports: SymbolTableId,
+) -> Result<PropertyObjectPlan, PropertyObjectError> {
+    let invalid = || PropertyObjectError::InvalidObjectLiteral(node);
+    let (arena, bound) = host.source(node).ok_or_else(invalid)?;
+    if bound
+        .source_facts()
+        .is_none_or(|facts| !facts.is_javascript_file() || facts.is_declaration_file())
+        || bound.symbol(node) != Some(owner)
+        || store
+            .symbol(owner)
+            .is_none_or(|symbol| symbol.members().is_some())
+    {
+        return Err(invalid());
+    }
+    let object = host.node(node).ok_or_else(invalid)?;
+    let NodeData::ObjectLiteralExpression(object) = &object.data else {
+        return Err(invalid());
+    };
+    if !object.properties.nodes.is_empty() {
+        return Err(invalid());
+    }
+    let table = store.symbol_table(exports).ok_or_else(invalid)?;
+    if table.is_empty() {
+        return Err(invalid());
+    }
+
+    let mut properties = Vec::with_capacity(table.len());
+    for (name, property) in table.iter() {
+        let record = store.symbol(property).ok_or_else(invalid)?;
+        let Some([declaration]) = record.declarations() else {
+            return Err(invalid());
+        };
+        let declaration = *declaration;
+        let statement = host
+            .node(declaration)
+            .and_then(|declaration| declaration.parent)
+            .map(|statement| NodeRef::new(node.arena, node.file, statement))
+            .ok_or_else(invalid)?;
+        let assignment = super::assignment::plan_javascript_object_expando_assignment(
+            arena, bound, store, statement,
+        )
+        .map_err(|_| invalid())?
+        .ok_or_else(invalid)?;
+        if assignment.expression != declaration
+            || assignment.owner_symbol != owner
+            || assignment.property_symbol != property
+            || record.name() != name
+        {
+            return Err(invalid());
+        }
+        let name = name.as_utf8().ok_or_else(invalid)?.to_owned();
+        properties.push(PlannedProperty {
+            declaration,
+            symbol: property,
+            name_node: assignment.name,
+            type_node: assignment.right,
+            optional: false,
+            readonly: false,
+            name,
+        });
+    }
+    properties.sort_by_key(|property| {
+        host.node(property.declaration)
+            .map(|declaration| declaration.range.start)
+    });
+
+    Ok(PropertyObjectPlan {
+        kind: PropertyObjectKind::ObjectLiteral,
+        node,
+        declarations: vec![node],
+        symbol: owner,
+        members: Some(exports),
+        properties,
+        methods: Vec::new(),
+        spreads: Vec::new(),
+        indexes: Vec::new(),
+        call_signatures: Vec::new(),
+        alias_symbol: None,
+        heritage: None,
+    })
 }
 
 fn object_literal_has_const_assertion(
@@ -5263,6 +5352,9 @@ pub(super) fn object_literal_state(
     plan: &PropertyObjectPlan,
 ) -> Result<Option<PropertyObjectState>, PropertyObjectError> {
     debug_assert_eq!(plan.kind, PropertyObjectKind::ObjectLiteral);
+    if is_javascript_expando_object_plan(store, plan) {
+        return javascript_expando_object_state(store, plan);
+    }
     let Some(links) = store.type_node_links(plan.node) else {
         if unresolved_property_links(store, plan) {
             return Ok(None);
@@ -5294,6 +5386,85 @@ pub(super) fn object_literal_state(
         Some(state @ PropertyObjectState::Resolved(_)) => Ok(Some(state)),
         _ => Err(invalid_cache(plan, type_)),
     }
+}
+
+pub(super) fn is_javascript_expando_object_plan(
+    store: &CanonicalTypeMapperStore,
+    plan: &PropertyObjectPlan,
+) -> bool {
+    plan.kind == PropertyObjectKind::ObjectLiteral
+        && plan.members.is_some()
+        && store.symbol(plan.symbol).is_some_and(|owner| {
+            owner.flags() == SymbolFlags::OBJECT_LITERAL
+                && owner.members().is_none()
+                && owner.exports() == plan.members
+        })
+}
+
+fn javascript_expando_object_state(
+    store: &CanonicalTypeMapperStore,
+    plan: &PropertyObjectPlan,
+) -> Result<Option<PropertyObjectState>, PropertyObjectError> {
+    let Some(links) = store.type_node_links(plan.node) else {
+        return if plan.properties.iter().all(|property| {
+            store
+                .value_symbol_links(property.symbol)
+                .is_none_or(|links| links == &ValueSymbolLinks::default())
+        }) {
+            Ok(None)
+        } else {
+            Err(PropertyObjectError::InvalidObjectLiteral(plan.node))
+        };
+    };
+    let Some(type_) = links.resolved_type else {
+        return Err(PropertyObjectError::InvalidObjectLiteral(plan.node));
+    };
+    if links.outer_type_parameters.is_some() {
+        return Err(invalid_cache(plan, type_));
+    }
+    let record = store
+        .type_payload(type_)
+        .ok_or_else(|| invalid_cache(plan, type_))?;
+    let TypeData::Object(object) = record.data() else {
+        return Err(invalid_cache(plan, type_));
+    };
+    let properties = object.structured.properties.as_deref().unwrap_or_default();
+    if record.flags() != TypeFlags::OBJECT
+        || record.object_flags() != ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
+        || record.symbol() != Some(plan.symbol)
+        || record.alias().is_some()
+        || object.target.is_some()
+        || object.mapper.is_some()
+        || object.instantiations != TypeCacheState::Unallocated
+        || object.structured.members != plan.members
+        || properties.len() != plan.properties.len()
+        || object.structured.signatures.is_some()
+        || object.structured.call_signature_count != 0
+        || object.structured.index_infos.is_some()
+        || plan
+            .properties
+            .iter()
+            .zip(properties)
+            .any(|(planned, actual)| {
+                planned.symbol != *actual
+                    || store
+                        .value_symbol_links(planned.symbol)
+                        .is_none_or(|links| {
+                            links.resolved_type.is_none()
+                                || links
+                                    != &(ValueSymbolLinks {
+                                        resolved_type: links.resolved_type,
+                                        ..ValueSymbolLinks::default()
+                                    })
+                                || links
+                                    .resolved_type
+                                    .is_some_and(|type_| store.type_payload(type_).is_none())
+                        })
+            })
+    {
+        return Err(invalid_cache(plan, type_));
+    }
+    Ok(Some(PropertyObjectState::Resolved(type_)))
 }
 
 pub(super) fn ensure_type_literal_shell(
@@ -8334,6 +8505,9 @@ pub(super) fn publish_object_literal(
     property_types: &[TypeId],
 ) -> Result<TypeId, PropertyObjectError> {
     debug_assert_eq!(plan.kind, PropertyObjectKind::ObjectLiteral);
+    if is_javascript_expando_object_plan(store, plan) {
+        return publish_javascript_expando_object_literal(store, plan, property_types);
+    }
     if !plan.spreads.is_empty() {
         return Err(PropertyObjectError::InvalidObjectLiteral(plan.node));
     }
@@ -8469,6 +8643,74 @@ pub(super) fn publish_object_literal(
         .unwrap_or_default();
     links.resolved_type = Some(type_);
     assert!(store.set_type_node_links(plan.node, links));
+    Ok(type_)
+}
+
+fn publish_javascript_expando_object_literal(
+    store: &mut CanonicalTypeMapperStore,
+    plan: &PropertyObjectPlan,
+    property_types: &[TypeId],
+) -> Result<TypeId, PropertyObjectError> {
+    if property_types.len() != plan.properties.len()
+        || !plan.spreads.is_empty()
+        || property_types
+            .iter()
+            .any(|type_| store.type_payload(*type_).is_none())
+    {
+        return Err(PropertyObjectError::InvalidObjectLiteral(plan.node));
+    }
+    if let Some(state) = javascript_expando_object_state(store, plan)? {
+        if plan
+            .properties
+            .iter()
+            .zip(property_types)
+            .any(|(property, expected)| {
+                store
+                    .value_symbol_links(property.symbol)
+                    .and_then(|links| links.resolved_type)
+                    != Some(*expected)
+            })
+        {
+            return Err(invalid_cache(plan, state.type_id()));
+        }
+        return Ok(state.type_id());
+    }
+    if !store.try_reserve_types(1)
+        || !store.try_reserve_value_symbol_links(plan.properties.len())
+        || !store.try_reserve_type_node_links(1)
+    {
+        return Err(PropertyObjectError::Capacity(plan.node));
+    }
+    for (property, type_) in plan.properties.iter().zip(property_types) {
+        if !store.set_value_symbol_links(
+            property.symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(*type_),
+                ..ValueSymbolLinks::default()
+            },
+        ) {
+            return Err(PropertyObjectError::InvalidObjectLiteral(plan.node));
+        }
+    }
+    let type_ = store
+        .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(plan.symbol))
+        .ok_or(PropertyObjectError::InvalidObjectLiteral(plan.node))?;
+    let properties = plan
+        .properties
+        .iter()
+        .map(|property| property.symbol)
+        .collect::<Vec<_>>();
+    if !store.set_structured_type_members(type_, plan.members, Some(properties), None, None, None)
+        || !store.set_type_node_links(
+            plan.node,
+            TypeNodeLinks {
+                resolved_type: Some(type_),
+                ..TypeNodeLinks::default()
+            },
+        )
+    {
+        return Err(PropertyObjectError::InvalidObjectLiteral(plan.node));
+    }
     Ok(type_)
 }
 

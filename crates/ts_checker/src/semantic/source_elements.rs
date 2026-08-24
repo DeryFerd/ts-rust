@@ -1440,6 +1440,11 @@ fn resolve_object_element(
     }
 
     if let Some(name) = index.property_name.as_deref() {
+        if let Some(property) =
+            resolve_javascript_expando_object_property(store, receiver_type, name)?
+        {
+            return Ok(property);
+        }
         if store
             .type_payload(receiver_type)
             .is_some_and(|record| record.flags().intersects(TypeFlags::UNION))
@@ -1531,6 +1536,82 @@ fn resolve_object_element(
             ElementDiagnostic::MissingBroadIndex
         },
     ))
+}
+
+fn resolve_javascript_expando_object_property(
+    store: &CanonicalTypeMapperStore,
+    receiver_type: TypeId,
+    name: &str,
+) -> Result<Option<ElementResolution>, SourceElementError> {
+    let Some(record) = store.type_payload(receiver_type) else {
+        return Err(SourceElementError::InvalidType(receiver_type));
+    };
+    let Some(owner_symbol) = record.symbol() else {
+        return Ok(None);
+    };
+    let Some(owner) = store.symbol(owner_symbol) else {
+        return Err(SourceElementError::InvalidType(receiver_type));
+    };
+    if owner.flags() != SymbolFlags::OBJECT_LITERAL || owner.exports().is_none() {
+        return Ok(None);
+    }
+    let TypeData::Object(object) = record.data() else {
+        return Err(SourceElementError::InvalidType(receiver_type));
+    };
+    let Some(exports) = owner.exports() else {
+        return Ok(None);
+    };
+    let table = store
+        .symbol_table(exports)
+        .ok_or(SourceElementError::InvalidType(receiver_type))?;
+    if record.flags() != TypeFlags::OBJECT
+        || record.object_flags() != ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
+        || object.structured.members != Some(exports)
+        || owner.members().is_some()
+        || owner.parent().is_some()
+        || owner.export_symbol().is_some()
+        || store.get_merged_symbol(owner_symbol) != Some(owner_symbol)
+    {
+        return Err(SourceElementError::InvalidType(receiver_type));
+    }
+    let Some(property_symbol) = table.get_source(name) else {
+        return Ok(None);
+    };
+    let property = store
+        .symbol(property_symbol)
+        .ok_or(SourceElementError::InvalidType(receiver_type))?;
+    let links = store
+        .value_symbol_links(property_symbol)
+        .ok_or(SourceElementError::InvalidType(receiver_type))?;
+    let Some(type_) = links.resolved_type else {
+        return Err(SourceElementError::InvalidType(receiver_type));
+    };
+    if property.flags() != SymbolFlags::PROPERTY | SymbolFlags::ASSIGNMENT
+        || property.check_flags() != CheckFlags::NONE
+        || property.parent() != Some(owner_symbol)
+        || property.name().as_utf8() != Some(name)
+        || property.members().is_some()
+        || property.exports().is_some()
+        || property.export_symbol().is_some()
+        || store.get_merged_symbol(property_symbol) != Some(property_symbol)
+        || object
+            .structured
+            .properties
+            .as_deref()
+            .is_none_or(|properties| !properties.contains(&property_symbol))
+        || links
+            != &(ValueSymbolLinks {
+                resolved_type: Some(type_),
+                ..ValueSymbolLinks::default()
+            })
+        || store.type_payload(type_).is_none()
+    {
+        return Err(SourceElementError::InvalidType(receiver_type));
+    }
+    Ok(Some(ElementResolution::success(
+        type_,
+        Some(property_symbol),
+    )))
 }
 
 fn resolve_enum_element(
