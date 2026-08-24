@@ -107,6 +107,7 @@ impl CanonicalJsxRuntimeEvidence<'_> {
 /// `jsx_runtime` retains classic or automatic JSX factory requirements.
 /// `emit_common_js` and `no_emit` preserve the emission conditions needed for
 /// module-scope reserved-name diagnostics.
+/// `uses_wildcard_types` selects the upstream missing-type-definition message.
 /// `no_error_truncation` raises semantic type display to the pinned hard output
 /// cutoff.
 #[allow(clippy::struct_excessive_bools)] // Flat immutable compiler-option projection.
@@ -121,6 +122,7 @@ pub struct CanonicalCheckerOptions {
     pub jsx_runtime: CanonicalJsxRuntime,
     pub emit_common_js: bool,
     pub no_emit: bool,
+    pub uses_wildcard_types: bool,
     pub no_error_truncation: bool,
     pub name_resolution: CanonicalNameResolverOptions,
 }
@@ -137,6 +139,7 @@ impl From<IntrinsicBootstrapOptions> for CanonicalCheckerOptions {
             jsx_runtime: CanonicalJsxRuntime::Preserve,
             emit_common_js: false,
             no_emit: false,
+            uses_wildcard_types: false,
             no_error_truncation: false,
             name_resolution: CanonicalNameResolverOptions::default(),
         }
@@ -3207,6 +3210,7 @@ mod tests {
             no_implicit_any: true,
             emit_common_js: true,
             no_emit: true,
+            uses_wildcard_types: true,
             ..CanonicalCheckerOptions::default()
         };
         let mut context = CanonicalCheckerContext::new(
@@ -3260,6 +3264,7 @@ mod tests {
         assert!(context.options().strict_function_types);
         assert!(context.options().emit_common_js);
         assert!(context.options().no_emit);
+        assert!(context.options().uses_wildcard_types);
         assert_eq!(context.diagnostics().len(), 2);
     }
 

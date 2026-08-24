@@ -3850,6 +3850,11 @@ impl Program {
             },
             emit_common_js: self.options.module == ModuleKind::CommonJs,
             no_emit: self.options.no_emit,
+            uses_wildcard_types: self
+                .options
+                .types
+                .as_ref()
+                .is_some_and(|types| types.iter().any(|name| name == "*")),
             no_error_truncation: self.options.no_error_truncation,
             name_resolution: (&self.options).into(),
         };
@@ -9956,6 +9961,35 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn canonical_missing_node_globals_follow_wildcard_type_configuration() {
+        for (types, expected_code) in [(None, 2591), (Some(vec!["*".to_owned()]), 2580)] {
+            let fs = MemoryFileSystem::new(true);
+            fs.write_file("/project/main.ts", "const value = module;")
+                .unwrap();
+
+            let program = Program::try_new_with_canonical_checker(
+                &fs,
+                "/project",
+                &["main.ts".to_owned()],
+                CompilerOptions {
+                    lib: Some(vec!["es5".to_owned()]),
+                    types,
+                    ..CompilerOptions::default()
+                },
+            )
+            .unwrap();
+
+            let [diagnostic] = program.diagnostics() else {
+                panic!(
+                    "expected one missing Node global diagnostic: {:?}",
+                    program.diagnostics()
+                );
+            };
+            assert_eq!(diagnostic.code, Some(expected_code));
+        }
     }
 
     #[test]

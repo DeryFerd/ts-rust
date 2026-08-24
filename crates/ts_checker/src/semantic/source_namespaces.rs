@@ -6196,10 +6196,12 @@ mod tests {
             CanonicalModuleState::Script,
         );
         let namespace = plan(&fixture, 0);
-        let [SourceNamespaceMemberPlan::Function {
-            declaration,
-            symbol,
-        }] = namespace.members.as_slice()
+        let [
+            SourceNamespaceMemberPlan::Function {
+                declaration,
+                symbol,
+            },
+        ] = namespace.members.as_slice()
         else {
             panic!("the ambient namespace must retain its implicitly exported function")
         };
@@ -6218,7 +6220,12 @@ mod tests {
             Some(namespace.symbol),
         );
         assert_eq!(
-            fixture.context.store().symbol(local).unwrap().export_symbol(),
+            fixture
+                .context
+                .store()
+                .symbol(local)
+                .unwrap()
+                .export_symbol(),
             Some(symbol),
         );
 

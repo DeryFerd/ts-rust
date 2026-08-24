@@ -10,6 +10,22 @@ use ts_ast::NodeRef;
 use ts_core::TextRange;
 use ts_diagnostics::Diagnostic;
 
+/// Selects the upstream missing-name diagnostic for known ambient globals.
+pub(super) fn missing_name_diagnostic_code(name: &str, uses_wildcard_types: bool) -> u32 {
+    match name {
+        "document" | "console" => 2_584,
+        "$" if uses_wildcard_types => 2_581,
+        "$" => 2_592,
+        "beforeEach" | "describe" | "suite" | "it" | "test" if uses_wildcard_types => 2_582,
+        "beforeEach" | "describe" | "suite" | "it" | "test" => 2_593,
+        "process" | "require" | "Buffer" | "module" | "NodeJS" if uses_wildcard_types => 2_580,
+        "process" | "require" | "Buffer" | "module" | "NodeJS" => 2_591,
+        "Bun" if uses_wildcard_types => 2_867,
+        "Bun" => 2_868,
+        _ => 2_304,
+    }
+}
+
 /// Related information attached to one checker diagnostic.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CanonicalCheckerRelatedInformation {
@@ -237,8 +253,34 @@ mod tests {
 
     use super::{
         CanonicalCheckerDiagnosticRange, CanonicalCheckerDiagnostics,
-        CanonicalCheckerRelatedInformation,
+        CanonicalCheckerRelatedInformation, missing_name_diagnostic_code,
     };
+
+    #[test]
+    fn known_ambient_global_names_select_the_pinned_missing_name_diagnostic() {
+        for (name, explicit_types, wildcard_types) in [
+            ("document", 2_584, 2_584),
+            ("console", 2_584, 2_584),
+            ("$", 2_592, 2_581),
+            ("beforeEach", 2_593, 2_582),
+            ("describe", 2_593, 2_582),
+            ("suite", 2_593, 2_582),
+            ("it", 2_593, 2_582),
+            ("test", 2_593, 2_582),
+            ("process", 2_591, 2_580),
+            ("require", 2_591, 2_580),
+            ("Buffer", 2_591, 2_580),
+            ("module", 2_591, 2_580),
+            ("NodeJS", 2_591, 2_580),
+            ("Bun", 2_868, 2_867),
+            ("missing", 2_304, 2_304),
+        ] {
+            assert_eq!(missing_name_diagnostic_code(name, false), explicit_types);
+            assert_eq!(missing_name_diagnostic_code(name, true), wildcard_types);
+            assert!(message_by_code(explicit_types).is_some());
+            assert!(message_by_code(wildcard_types).is_some());
+        }
+    }
 
     #[test]
     fn unconditional_add_preserves_raw_issuance_order() {
