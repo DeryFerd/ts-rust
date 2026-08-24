@@ -30777,7 +30777,7 @@ mod tests {
             let declaration = parsed(declaration_text);
             let source = parsed(source_text);
             let declaration_file = FileId::new(9_470 + u32::try_from(index).unwrap() * 2);
-            let file = FileId::new(declaration_file.index() + 1);
+            let file = FileId::new(u32::try_from(declaration_file.index()).unwrap() + 1);
             let mut context = context_with_cross_file_global(
                 declaration_file,
                 &declaration,
