@@ -22,6 +22,8 @@
 //! Numeric instance fields can retain a direct numeric initializer. An instance
 //! field may also reference its own constructor parameter and retain the
 //! upstream error-recovery `any` type for the source diagnostic.
+//! Simple same-file namespaces can merge with a class and contribute numeric
+//! variable exports to its static member table.
 //! Nonempty executable bodies, general heritage, and non-primitive annotations
 //! remain later class stages.
 
@@ -124,6 +126,15 @@ struct ClassIndexSignaturePlan {
     value_type_node: NodeRef,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ClassNamespaceExportPlan {
+    declaration: NodeRef,
+    initializer: NodeRef,
+    symbol: SemanticSymbolId,
+    name: String,
+    literal_text: String,
+}
+
 /// One source property with an annotation, a numeric initializer, or both.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct ClassPropertyPlan {
@@ -197,6 +208,7 @@ pub(super) struct ClassDeclarationPlan {
     properties: Vec<ClassPropertyPlan>,
     instance_properties: Vec<ClassPropertyPlan>,
     static_properties: Vec<ClassPropertyPlan>,
+    namespace_exports: Vec<ClassNamespaceExportPlan>,
     methods: Vec<ClassMethodPlan>,
     instance_methods: Vec<ClassMethodPlan>,
     static_methods: Vec<ClassMethodPlan>,
@@ -2566,6 +2578,369 @@ fn plan_empty_class_implementations(
     Ok(implementations)
 }
 
+fn validate_class_namespace_export_cache(
+    store: &CanonicalTypeMapperStore,
+    export: &ClassNamespaceExportPlan,
+) -> Result<(), ClassError> {
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or_else(|| invariant(ClassInvariant::BootstrapUnavailable(export.initializer)))?;
+    let number = bootstrap.number_type;
+    if store
+        .value_symbol_links(export.symbol)
+        .is_some_and(|links| {
+            links != &ValueSymbolLinks::default()
+                && links
+                    != &(ValueSymbolLinks {
+                        resolved_type: Some(number),
+                        ..ValueSymbolLinks::default()
+                    })
+        })
+    {
+        return Err(invariant(ClassInvariant::InvalidPropertyValueCache(
+            export.symbol,
+        )));
+    }
+    let Some(links) = store.type_node_links(export.initializer) else {
+        return Ok(());
+    };
+    if links == &TypeNodeLinks::default() {
+        return Ok(());
+    }
+    let regular = bootstrap.cached_number_literal_type(ts_jsnum::from_string(&export.literal_text));
+    let fresh = regular.and_then(|regular| store.fresh_type_of_literal_type(regular).ok());
+    if fresh.is_none_or(|fresh| {
+        links
+            != &(TypeNodeLinks {
+                resolved_type: Some(fresh),
+                ..TypeNodeLinks::default()
+            })
+    }) {
+        return Err(invariant(ClassInvariant::InvalidPropertyTypeCache(
+            export.initializer,
+        )));
+    }
+    Ok(())
+}
+
+fn plan_class_namespace_variable(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    namespace: NodeRef,
+    statement: NodeRef,
+) -> Option<Option<ClassNamespaceExportPlan>> {
+    let statement_record = preflight_node(store, host, statement).ok()?;
+    let NodeData::VariableStatement(variable_statement) = &statement_record.data else {
+        return None;
+    };
+    if statement_record.kind != SyntaxKind::VariableStatement
+        || statement_record.flags.0 != 0
+        || variable_statement.flow_node.is_some()
+        || variable_statement.facts != 0
+    {
+        return None;
+    }
+    let exported = match variable_statement.modifiers.as_ref() {
+        None => false,
+        Some(modifiers) => {
+            let [modifier] = modifiers.list.nodes.as_slice() else {
+                return None;
+            };
+            let modifier = NodeRef::new(statement.arena, statement.file, *modifier);
+            let modifier_record = preflight_node(store, host, modifier).ok()?;
+            if modifiers.flags.0 != 0
+                || modifiers.list.has_trailing_comma
+                || modifiers.list.range.start != statement_record.range.start
+                || modifier_record.kind != SyntaxKind::ExportKeyword
+                || modifier_record.flags.0 != 0
+                || modifier_record.parent != Some(statement.node)
+                || !matches!(modifier_record.data, NodeData::Token(_))
+                || modifier_record.range.start != modifiers.list.range.start
+                || modifier_record.range.end > modifiers.list.range.end
+            {
+                return None;
+            }
+            true
+        }
+    };
+
+    let list = NodeRef::new(
+        statement.arena,
+        statement.file,
+        variable_statement.declaration_list,
+    );
+    let list_record = preflight_node(store, host, list).ok()?;
+    let NodeData::VariableDeclarationList(declarations) = &list_record.data else {
+        return None;
+    };
+    let [declaration] = declarations.declarations.nodes.as_slice() else {
+        return None;
+    };
+    if list_record.kind != SyntaxKind::VariableDeclarationList
+        || list_record.flags.0 != 0
+        || list_record.parent != Some(statement.node)
+        || declarations.facts != 0
+        || declarations.declarations.has_trailing_comma
+    {
+        return None;
+    }
+    let declaration = NodeRef::new(list.arena, list.file, *declaration);
+    let declaration_record = preflight_node(store, host, declaration).ok()?;
+    let NodeData::VariableDeclaration(variable) = &declaration_record.data else {
+        return None;
+    };
+    if declaration_record.kind != SyntaxKind::VariableDeclaration
+        || declaration_record.flags.0 != 0
+        || declaration_record.parent != Some(list.node)
+        || variable.exclamation_token.is_some()
+        || variable.local_symbol.is_some()
+        || variable.symbol.is_some()
+        || variable.type_.is_some()
+        || variable.facts != 0
+    {
+        return None;
+    }
+
+    let name = NodeRef::new(declaration.arena, declaration.file, variable.name);
+    let name_record = preflight_node(store, host, name).ok()?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return None;
+    };
+    if name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(declaration.node)
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+        || identifier.text == PROTOTYPE_NAME
+    {
+        return None;
+    }
+
+    let initializer = NodeRef::new(declaration.arena, declaration.file, variable.initializer?);
+    let initializer_record = preflight_node(store, host, initializer).ok()?;
+    let NodeData::NumericLiteral(literal) = &initializer_record.data else {
+        return None;
+    };
+    let spelling_valid = host
+        .source(initializer)
+        .and_then(|(arena, _)| arena.source_text())
+        .is_none_or(|source| {
+            source.get(
+                initializer_record.range.start.get() as usize
+                    ..initializer_record.range.end.get() as usize,
+            ) == Some(literal.text.as_str())
+        });
+    if initializer_record.kind != SyntaxKind::NumericLiteral
+        || initializer_record.flags.0 != 0
+        || initializer_record.parent != Some(declaration.node)
+        || initializer_record.range.start < name_record.range.end
+        || initializer_record.range.end > declaration_record.range.end
+        || literal.token_flags.0 != 0
+        || ts_jsnum::from_string(&literal.text).is_nan()
+        || !spelling_valid
+    {
+        return None;
+    }
+
+    let bound = host.bound_file(declaration)?;
+    let symbol = bound_symbol(store, host, declaration)?;
+    let symbol_record = store.symbol(symbol)?;
+    let locals = bound
+        .locals(namespace)
+        .and_then(|locals| store.symbol_table(locals))?;
+    if symbol_record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+        || symbol_record.check_flags() != CheckFlags::NONE
+        || symbol_record.name().as_utf8() != Some(identifier.text.as_str())
+        || symbol_record.declarations() != Some(&[declaration])
+        || symbol_record.value_declaration() != Some(declaration)
+        || symbol_record.members().is_some()
+        || symbol_record.exports().is_some()
+        || symbol_record.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+    {
+        return None;
+    }
+
+    if !exported {
+        return (symbol_record.parent().is_none()
+            && bound.local_symbol(declaration).is_none()
+            && locals.get_source(&identifier.text) == Some(symbol))
+        .then_some(None);
+    }
+
+    let local = bound.local_symbol(declaration)?;
+    let local_record = store.symbol(local)?;
+    let exports = store.symbol(owner)?.exports()?;
+    if symbol_record.parent() != Some(owner)
+        || store.get_parent_of_symbol(symbol) != Some(owner)
+        || store.symbol_table(exports)?.get_source(&identifier.text) != Some(symbol)
+        || local == symbol
+        || local_record.flags() != SymbolFlags::EXPORT_VALUE
+        || local_record.check_flags() != CheckFlags::NONE
+        || local_record.name().as_utf8() != Some(identifier.text.as_str())
+        || local_record.declarations() != Some(&[declaration])
+        || local_record.value_declaration().is_some()
+        || local_record.members().is_some()
+        || local_record.exports().is_some()
+        || local_record.parent().is_some()
+        || local_record.export_symbol() != Some(symbol)
+        || store.get_merged_symbol(local) != Some(local)
+        || locals.get_source(&identifier.text) != Some(local)
+    {
+        return None;
+    }
+
+    Some(Some(ClassNamespaceExportPlan {
+        declaration,
+        initializer,
+        symbol,
+        name: identifier.text.clone(),
+        literal_text: literal.text.clone(),
+    }))
+}
+
+fn plan_class_owner_declarations(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+    owner: &Symbol,
+) -> Result<(NodeRef, Vec<ClassNamespaceExportPlan>), ClassError> {
+    let flags = owner.flags();
+    if flags == SymbolFlags::CLASS {
+        let Some([declaration]) = owner.declarations() else {
+            return Err(unsupported(ClassUnsupported::MergedDeclarations(symbol)));
+        };
+        return Ok((*declaration, Vec::new()));
+    }
+    if flags != (SymbolFlags::CLASS | SymbolFlags::NAMESPACE_MODULE)
+        && flags != (SymbolFlags::CLASS | SymbolFlags::VALUE_MODULE)
+    {
+        return if flags.contains(SymbolFlags::CLASS) {
+            Err(unsupported(ClassUnsupported::MergedDeclarations(symbol)))
+        } else {
+            Err(invariant(ClassInvariant::InvalidOwnerSymbol(symbol)))
+        };
+    }
+    let Some([declaration, namespaces @ ..]) = owner.declarations() else {
+        return Err(unsupported(ClassUnsupported::MergedDeclarations(symbol)));
+    };
+    if namespaces.is_empty() || owner.value_declaration() != Some(*declaration) {
+        return Err(unsupported(ClassUnsupported::MergedDeclarations(symbol)));
+    }
+    let declaration = *declaration;
+    let declaration_record = preflight_node(store, host, declaration)?;
+    if declaration_record.kind != SyntaxKind::ClassDeclaration
+        || !matches!(declaration_record.data, NodeData::ClassDeclaration(_))
+    {
+        return Err(unsupported(ClassUnsupported::MergedDeclarations(symbol)));
+    }
+
+    let mut exports = Vec::new();
+    let mut seen_namespaces = HashSet::new();
+    let mut seen_exports = HashSet::new();
+    exports
+        .try_reserve(namespaces.len())
+        .map_err(|_| invariant(ClassInvariant::Capacity(declaration)))?;
+    seen_namespaces
+        .try_reserve(namespaces.len())
+        .map_err(|_| invariant(ClassInvariant::Capacity(declaration)))?;
+    seen_exports
+        .try_reserve(namespaces.len())
+        .map_err(|_| invariant(ClassInvariant::Capacity(declaration)))?;
+    let mut previous_end = declaration_record.range.end;
+    let mut instantiated = false;
+    for &namespace in namespaces {
+        let reject = || unsupported(ClassUnsupported::MergedDeclarations(symbol));
+        let record = preflight_node(store, host, namespace)?;
+        let NodeData::ModuleDeclaration(module) = &record.data else {
+            return Err(reject());
+        };
+        if !namespace.is_for(declaration.arena, declaration.file)
+            || !seen_namespaces.insert(namespace)
+            || record.kind != SyntaxKind::ModuleDeclaration
+            || record.flags.0 != 0
+            || record.parent != declaration_record.parent
+            || record.range.start < previous_end
+            || !host.symbol_matches(store, namespace, symbol)
+            || module.asterisk_token.is_some()
+            || module.end_flow_node.is_some()
+            || module.flow_node.is_some()
+            || module.keyword != SyntaxKind::NamespaceKeyword
+            || module.local_symbol.is_some()
+            || module.next_container.is_some()
+            || module.symbol.is_some()
+            || module.facts != 0
+            || module.modifiers.is_some()
+        {
+            return Err(reject());
+        }
+        previous_end = record.range.end;
+
+        let name = NodeRef::new(namespace.arena, namespace.file, module.name);
+        let name_record = preflight_node(store, host, name)?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Err(reject());
+        };
+        if name_record.kind != SyntaxKind::Identifier
+            || name_record.flags.0 != 0
+            || name_record.parent != Some(namespace.node)
+            || identifier.flow_node.is_some()
+            || owner.name().as_utf8() != Some(identifier.text.as_str())
+        {
+            return Err(reject());
+        }
+
+        let body = NodeRef::new(
+            namespace.arena,
+            namespace.file,
+            module.body.ok_or_else(reject)?,
+        );
+        let body_record = preflight_node(store, host, body)?;
+        let NodeData::ModuleBlock(block) = &body_record.data else {
+            return Err(reject());
+        };
+        if body_record.kind != SyntaxKind::ModuleBlock
+            || body_record.flags.0 != 0
+            || body_record.parent != Some(namespace.node)
+            || block.flow_node.is_some()
+            || block.facts != 0
+            || block.statements.has_trailing_comma
+            || block.statements.nodes.len() > 1
+        {
+            return Err(reject());
+        }
+        let Some(statement) = block.statements.nodes.first().copied() else {
+            continue;
+        };
+        instantiated = true;
+        let statement = NodeRef::new(namespace.arena, namespace.file, statement);
+        if preflight_node(store, host, statement)?.parent != Some(body.node) {
+            return Err(reject());
+        }
+        let export = plan_class_namespace_variable(store, host, symbol, namespace, statement)
+            .ok_or_else(reject)?;
+        if let Some(export) = export {
+            if !seen_exports.insert(export.name.clone()) {
+                return Err(reject());
+            }
+            validate_class_namespace_export_cache(store, &export)?;
+            exports.push(export);
+        }
+    }
+
+    let expected = SymbolFlags::CLASS
+        | if instantiated {
+            SymbolFlags::VALUE_MODULE
+        } else {
+            SymbolFlags::NAMESPACE_MODULE
+        };
+    if flags != expected {
+        return Err(unsupported(ClassUnsupported::MergedDeclarations(symbol)));
+    }
+    Ok((declaration, exports))
+}
+
 /// Produces the opaque syntax/binder proof consumed by the class shell
 /// executor and the root annotation adapter.
 fn plan_class_declaration(
@@ -2583,17 +2958,8 @@ fn plan_class_declaration(
     let symbol_record = store
         .symbol(symbol)
         .ok_or_else(|| invariant(ClassInvariant::SymbolNotOwned(symbol)))?;
-    if symbol_record.flags() != SymbolFlags::CLASS {
-        return if symbol_record.flags().contains(SymbolFlags::CLASS) {
-            Err(unsupported(ClassUnsupported::MergedDeclarations(symbol)))
-        } else {
-            Err(invariant(ClassInvariant::InvalidOwnerSymbol(symbol)))
-        };
-    }
-    let Some([declaration]) = symbol_record.declarations() else {
-        return Err(unsupported(ClassUnsupported::MergedDeclarations(symbol)));
-    };
-    let declaration = *declaration;
+    let (declaration, namespace_exports) =
+        plan_class_owner_declarations(store, host, symbol, symbol_record)?;
     if symbol_record.check_flags() != CheckFlags::NONE
         || symbol_record.value_declaration() != Some(declaration)
         || symbol_record.parent().is_some()
@@ -2631,6 +2997,9 @@ fn plan_class_declaration(
     }
     if class.type_parameters.is_some() {
         return Err(unsupported(ClassUnsupported::Generic(declaration)));
+    }
+    if symbol_record.flags() != SymbolFlags::CLASS && class.heritage_clauses.is_some() {
+        return Err(unsupported(ClassUnsupported::MergedDeclarations(symbol)));
     }
     let (base, implementations) = match class.heritage_clauses.as_ref() {
         None => (None, Vec::new()),
@@ -2891,9 +3260,14 @@ fn plan_class_declaration(
     let expected_static_members = static_properties
         .len()
         .checked_add(static_methods.len())
+        .and_then(|count| count.checked_add(namespace_exports.len()))
         .and_then(|count| count.checked_add(1))
         .ok_or_else(|| invariant(ClassInvariant::Capacity(declaration)))?;
-    if static_table.len() != expected_static_members {
+    if static_table.len() != expected_static_members
+        || namespace_exports
+            .iter()
+            .any(|export| !static_names.insert(export.name.clone()))
+    {
         return Err(invariant(ClassInvariant::InvalidOwnerSymbol(symbol)));
     }
 
@@ -2915,6 +3289,7 @@ fn plan_class_declaration(
         properties,
         instance_properties,
         static_properties,
+        namespace_exports,
         methods,
         instance_methods,
         static_methods,
@@ -6015,6 +6390,20 @@ fn planned_class_member_entries(
         .collect()
 }
 
+fn planned_static_class_member_entries(
+    class: &ClassDeclarationPlan,
+) -> Vec<(EscapedName, SemanticSymbolId)> {
+    let mut entries =
+        planned_class_member_entries(&class.static_properties, &class.static_methods, None);
+    entries.extend(
+        class
+            .namespace_exports
+            .iter()
+            .map(|export| (EscapedName::source(export.name.as_str()), export.symbol)),
+    );
+    entries
+}
+
 fn exact_member_table(
     store: &CanonicalTypeMapperStore,
     table: Option<SymbolTableId>,
@@ -6218,14 +6607,10 @@ fn completed_class_members(
         return None;
     };
     let prototype = prototype_symbol(store, &plan.class)?;
-    let static_properties = planned_class_member_entries(
-        &plan.class.static_properties,
-        &plan.class.static_methods,
-        None,
-    )
-    .into_iter()
-    .map(|(_, symbol)| symbol)
-    .collect::<Vec<_>>();
+    let static_properties = planned_static_class_member_entries(&plan.class)
+        .into_iter()
+        .map(|(_, symbol)| symbol)
+        .collect::<Vec<_>>();
     let mut all_static_properties = static_properties.clone();
     all_static_properties.push(prototype);
     let [default_construct_signature] = value.structured.signatures.as_deref()? else {
@@ -6282,6 +6667,14 @@ fn completed_class_members(
                 })
                 || !exact_property_value_links(store, property, *property_type)
         })
+    {
+        return None;
+    }
+    if plan
+        .class
+        .namespace_exports
+        .iter()
+        .any(|export| validate_class_namespace_export_cache(store, export).is_err())
     {
         return None;
     }
@@ -6385,16 +6778,8 @@ fn prepare_derived_member_surfaces(
         &base_plan.class.instance_methods,
         base_plan.class.accessor.as_ref(),
     );
-    let own_static_entries = planned_class_member_entries(
-        &plan.class.static_properties,
-        &plan.class.static_methods,
-        None,
-    );
-    let inherited_static_entries = planned_class_member_entries(
-        &base_plan.class.static_properties,
-        &base_plan.class.static_methods,
-        None,
-    );
+    let own_static_entries = planned_static_class_member_entries(&plan.class);
+    let inherited_static_entries = planned_static_class_member_entries(&base_plan.class);
     let instance_capacity = own_instance_entries
         .len()
         .checked_add(inherited_instance_entries.len())
@@ -7301,11 +7686,7 @@ pub(super) fn execute_nongeneric_class_members(
         &plan.class.instance_methods,
         plan.class.accessor.as_ref(),
     );
-    let planned_static_entries = planned_class_member_entries(
-        &plan.class.static_properties,
-        &plan.class.static_methods,
-        None,
-    );
+    let planned_static_entries = planned_static_class_member_entries(&plan.class);
     let prepared_instance_members = if planned_instance_entries.is_empty() {
         None
     } else {
@@ -8970,6 +9351,120 @@ fn stored_class_index(
     }
 }
 
+fn exact_stored_class_namespace_export(
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+    owner_declaration: NodeRef,
+    export: SemanticSymbolId,
+) -> Option<NodeRef> {
+    let owner_record = store.symbol(owner)?;
+    if owner_record.flags() != (SymbolFlags::CLASS | SymbolFlags::VALUE_MODULE) {
+        return None;
+    }
+    let record = store.symbol(export)?;
+    let [declaration] = record.declarations()? else {
+        return None;
+    };
+    let declaration = *declaration;
+    let SourceNodeParent::Parent(list) = store.source_node_parent(declaration)? else {
+        return None;
+    };
+    let SourceNodeParent::Parent(statement) = store.source_node_parent(list)? else {
+        return None;
+    };
+    let SourceNodeParent::Parent(block) = store.source_node_parent(statement)? else {
+        return None;
+    };
+    let SourceNodeParent::Parent(namespace) = store.source_node_parent(block)? else {
+        return None;
+    };
+    if record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+        || record.check_flags() != CheckFlags::NONE
+        || record.value_declaration() != Some(declaration)
+        || record.members().is_some()
+        || record.exports().is_some()
+        || record.parent() != Some(owner)
+        || record.export_symbol().is_some()
+        || store.get_merged_symbol(export) != Some(export)
+        || store.source_node_kind(declaration) != Some(SyntaxKind::VariableDeclaration)
+        || store.source_node_kind(list) != Some(SyntaxKind::VariableDeclarationList)
+        || store.source_node_kind(statement) != Some(SyntaxKind::VariableStatement)
+        || store.source_node_kind(block) != Some(SyntaxKind::ModuleBlock)
+        || store.source_node_kind(namespace) != Some(SyntaxKind::ModuleDeclaration)
+        || !namespace.is_for(owner_declaration.arena, owner_declaration.file)
+        || store.source_node_parent(namespace) != store.source_node_parent(owner_declaration)
+        || !owner_record.declarations()?.contains(&namespace)
+        || owner_record
+            .exports()
+            .and_then(|exports| store.symbol_table(exports))
+            .and_then(|exports| exports.get(record.name()))
+            != Some(export)
+    {
+        return None;
+    }
+
+    let initializer_index = declaration
+        .node
+        .index()
+        .checked_sub(1)
+        .and_then(|index| u32::try_from(index).ok())?;
+    let initializer = NodeRef::new(
+        declaration.arena,
+        declaration.file,
+        ts_ast::NodeId::new(initializer_index),
+    );
+    if store.source_node_kind(initializer) != Some(SyntaxKind::NumericLiteral)
+        || store.source_node_parent(initializer) != Some(SourceNodeParent::Parent(declaration))
+    {
+        return None;
+    }
+    let bootstrap = store.intrinsic_bootstrap()?;
+    if store.value_symbol_links(export).is_some_and(|links| {
+        links != &ValueSymbolLinks::default()
+            && links
+                != &(ValueSymbolLinks {
+                    resolved_type: Some(bootstrap.number_type),
+                    ..ValueSymbolLinks::default()
+                })
+    }) {
+        return None;
+    }
+    if let Some(links) = store.type_node_links(initializer)
+        && links != &TypeNodeLinks::default()
+    {
+        let fresh = links.resolved_type?;
+        let literal_record = store.type_payload(fresh)?;
+        let TypeData::Literal(literal) = literal_record.data() else {
+            return None;
+        };
+        let super::type_records::LiteralValue::Number(value) = &literal.value else {
+            return None;
+        };
+        if links
+            != &(TypeNodeLinks {
+                resolved_type: Some(fresh),
+                ..TypeNodeLinks::default()
+            })
+            || literal_record.flags() != TypeFlags::NUMBER_LITERAL
+            || bootstrap.cached_number_literal_type(*value) != Some(literal.regular_type)
+            || store.fresh_type_of_literal_type(literal.regular_type) != Ok(fresh)
+        {
+            return None;
+        }
+    }
+    Some(declaration)
+}
+
+fn exact_stored_static_class_member(
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+    owner_declaration: NodeRef,
+    member: SemanticSymbolId,
+) -> Option<NodeRef> {
+    exact_stored_class_member(store, owner, owner_declaration, member)
+        .or_else(|| exact_stored_class_namespace_export(store, owner, owner_declaration, member))
+}
+
 fn stored_declared_properties(
     store: &CanonicalTypeMapperStore,
     owner: SemanticSymbolId,
@@ -8995,16 +9490,34 @@ fn stored_declared_properties(
         if Some(property) == prototype || Some(property) == constructor || Some(property) == index {
             continue;
         }
-        exact_stored_class_member(store, owner, owner_declaration, property)?;
+        if prototype.is_some() {
+            exact_stored_static_class_member(store, owner, owner_declaration, property)?;
+        } else {
+            exact_stored_class_member(store, owner, owner_declaration, property)?;
+        }
         properties.push(property);
     }
     properties.sort_unstable_by_key(|property| {
-        exact_stored_class_member(store, owner, owner_declaration, *property)
-            .expect("validated class member retains one declaration")
+        if prototype.is_some() {
+            exact_stored_static_class_member(store, owner, owner_declaration, *property)
+                .expect("validated static class member retains one declaration")
+        } else {
+            exact_stored_class_member(store, owner, owner_declaration, *property)
+                .expect("validated class member retains one declaration")
+        }
     });
     if properties.windows(2).any(|pair| {
-        exact_stored_class_member(store, owner, owner_declaration, pair[0])
-            >= exact_stored_class_member(store, owner, owner_declaration, pair[1])
+        let first = if prototype.is_some() {
+            exact_stored_static_class_member(store, owner, owner_declaration, pair[0])
+        } else {
+            exact_stored_class_member(store, owner, owner_declaration, pair[0])
+        };
+        let second = if prototype.is_some() {
+            exact_stored_static_class_member(store, owner, owner_declaration, pair[1])
+        } else {
+            exact_stored_class_member(store, owner, owner_declaration, pair[1])
+        };
+        first >= second
     }) {
         return None;
     }
@@ -9016,6 +9529,47 @@ fn stored_declared_properties(
     (table.len() == expected_len).then_some(properties)
 }
 
+fn stored_class_owner_declaration(
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+    record: &Symbol,
+) -> Option<NodeRef> {
+    let flags = record.flags();
+    if flags == SymbolFlags::CLASS {
+        let [declaration] = record.declarations()? else {
+            return None;
+        };
+        return Some(*declaration);
+    }
+    if flags != (SymbolFlags::CLASS | SymbolFlags::NAMESPACE_MODULE)
+        && flags != (SymbolFlags::CLASS | SymbolFlags::VALUE_MODULE)
+    {
+        return None;
+    }
+    let [declaration, namespaces @ ..] = record.declarations()? else {
+        return None;
+    };
+    let declaration = *declaration;
+    if namespaces.is_empty()
+        || record.parent().is_some()
+        || record.value_declaration() != Some(declaration)
+        || store.source_node_kind(declaration) != Some(SyntaxKind::ClassDeclaration)
+        || namespaces.iter().any(|namespace| {
+            !namespace.is_for(declaration.arena, declaration.file)
+                || store.source_node_kind(*namespace) != Some(SyntaxKind::ModuleDeclaration)
+                || store.source_node_parent(*namespace) != store.source_node_parent(declaration)
+        })
+        || namespaces
+            .iter()
+            .enumerate()
+            .any(|(index, namespace)| namespaces[..index].contains(namespace))
+        || store.get_merged_symbol(owner) != Some(owner)
+    {
+        return None;
+    }
+    Some(declaration)
+}
+
 fn stored_class_parts(
     store: &CanonicalTypeMapperStore,
     instance_type: TypeId,
@@ -9024,10 +9578,7 @@ fn stored_class_parts(
     let symbol = record.symbol()?;
     let instance = exact_class_instance_identity(store, symbol, instance_type)?.clone();
     let owner = store.symbol(symbol)?;
-    let [declaration] = owner.declarations()? else {
-        return None;
-    };
-    let declaration = *declaration;
+    let declaration = stored_class_owner_declaration(store, symbol, owner)?;
     let valid_owner_parent = match owner.parent() {
         None => true,
         Some(parent) => {
@@ -9060,7 +9611,6 @@ fn stored_class_parts(
     };
     if record.object_flags()
         != (ObjectFlags::CLASS | ObjectFlags::REFERENCE | ObjectFlags::MEMBERS_RESOLVED)
-        || owner.flags() != SymbolFlags::CLASS
         || owner.check_flags() != CheckFlags::NONE
         || owner.value_declaration() != Some(declaration)
         || !valid_owner_parent
@@ -9593,6 +10143,213 @@ mod tests {
         )
         .unwrap();
         pending.type_
+    }
+
+    #[test]
+    fn class_namespace_merges_preserve_static_exports_and_replay_warm() {
+        for (source, expected_flags, exported) in [
+            (
+                "class Model { public run() {} } namespace Model {}",
+                SymbolFlags::CLASS | SymbolFlags::NAMESPACE_MODULE,
+                false,
+            ),
+            (
+                "class Model { public run() {} } namespace Model { var value = 2; }",
+                SymbolFlags::CLASS | SymbolFlags::VALUE_MODULE,
+                false,
+            ),
+            (
+                "class Model { public run() {} } namespace Model { export var value = 2; }",
+                SymbolFlags::CLASS | SymbolFlags::VALUE_MODULE,
+                true,
+            ),
+        ] {
+            let mut fixture = fixture(source);
+            let owner = class_symbol(&fixture, "Model");
+            let declaration = class_node(&fixture, "Model");
+            let bound = &fixture.files[&fixture.file];
+            let host = host(&fixture.parsed.arena, bound);
+            let record = fixture.store.symbol(owner).unwrap();
+            assert_eq!(record.flags(), expected_flags, "{source}");
+            assert_eq!(record.value_declaration(), Some(declaration), "{source}");
+            assert_eq!(record.declarations().unwrap().len(), 2, "{source}");
+            let cold = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
+            let ClassMemberQueryPlan::Direct(class) = &plan else {
+                panic!("a namespace augmentation keeps a direct class")
+            };
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                cold,
+                "{source}",
+            );
+            assert_eq!(class.class.namespace_exports.len(), usize::from(exported));
+            let export = class.class.namespace_exports.first().cloned();
+
+            let members =
+                execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan).unwrap();
+
+            assert_eq!(
+                members
+                    .static_properties()
+                    .iter()
+                    .map(|symbol| {
+                        fixture
+                            .store
+                            .symbol(*symbol)
+                            .and_then(|symbol| symbol.name().as_utf8())
+                            .unwrap()
+                    })
+                    .collect::<Vec<_>>(),
+                if exported { vec!["value"] } else { Vec::new() },
+                "{source}",
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .type_payload(members.shells().value_type())
+                    .and_then(|record| record.data().structured())
+                    .and_then(|structured| structured.members),
+                fixture.store.symbol(owner).and_then(Symbol::exports),
+            );
+            assert_eq!(
+                validate_class_heritage_members(&fixture.store, members.shells().instance_type()),
+                ClassHeritageMembersValidation::Valid,
+                "{source}",
+            );
+
+            if let Some(export) = export {
+                assert!(fixture.store.value_symbol_links(export.symbol).is_none());
+                let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+                let value = ts_jsnum::from_string(&export.literal_text);
+                fixture
+                    .store
+                    .prepare_regular_literal_types(&[], &[value], &[])
+                    .unwrap();
+                let regular = fixture.store.regular_number_literal_type(value).unwrap();
+                let fresh = fixture.store.fresh_type_of_literal_type(regular).unwrap();
+                assert!(fixture.store.set_type_node_links(
+                    export.initializer,
+                    TypeNodeLinks {
+                        resolved_type: Some(fresh),
+                        ..TypeNodeLinks::default()
+                    },
+                ));
+                assert!(fixture.store.set_value_symbol_links(
+                    export.symbol,
+                    ValueSymbolLinks {
+                        resolved_type: Some(number),
+                        ..ValueSymbolLinks::default()
+                    },
+                ));
+                assert_eq!(
+                    validate_class_heritage_members(
+                        &fixture.store,
+                        members.shells().instance_type(),
+                    ),
+                    ClassHeritageMembersValidation::Valid,
+                );
+            }
+
+            let warm = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+            assert_eq!(
+                execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan),
+                Ok(members),
+                "{source}",
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                warm,
+                "{source}",
+            );
+        }
+    }
+
+    #[test]
+    fn class_namespace_merges_reject_forged_flags_declarations_and_export_caches() {
+        for poison in 0..3 {
+            let mut fixture = fixture(concat!(
+                "class Model { public run() {} } ",
+                "namespace Model { export var value = 2; }",
+            ));
+            let owner = class_symbol(&fixture, "Model");
+            let declaration = class_node(&fixture, "Model");
+            let namespace = fixture
+                .store
+                .symbol(owner)
+                .and_then(Symbol::declarations)
+                .and_then(|declarations| declarations.get(1).copied())
+                .unwrap();
+            let export = fixture
+                .store
+                .symbol(owner)
+                .and_then(Symbol::exports)
+                .and_then(|exports| fixture.store.symbol_table(exports))
+                .and_then(|exports| exports.get_source("value"))
+                .unwrap();
+            match poison {
+                0 => assert!(fixture.store.set_symbol_flags(
+                    owner,
+                    SymbolFlags::CLASS | SymbolFlags::NAMESPACE_MODULE,
+                    CheckFlags::NONE,
+                )),
+                1 => assert!(fixture.store.set_symbol_declarations(
+                    owner,
+                    Some(vec![namespace, declaration]),
+                    Some(declaration),
+                )),
+                2 => {
+                    let wrong = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+                    assert!(fixture.store.set_value_symbol_links(
+                        export,
+                        ValueSymbolLinks {
+                            resolved_type: Some(wrong),
+                            ..ValueSymbolLinks::default()
+                        },
+                    ));
+                }
+                _ => unreachable!("only the declared poison cases are visited"),
+            }
+            let bound = &fixture.files[&fixture.file];
+            let host = host(&fixture.parsed.arena, bound);
+            let state = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            assert!(
+                plan_nongeneric_class_member_query(&fixture.store, &host, owner).is_err(),
+                "poison case {poison}",
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                state,
+            );
+            assert!(fixture.store.declared_type_links(owner).is_none());
+            assert!(fixture.store.value_symbol_links(owner).is_none());
+        }
     }
 
     #[test]
