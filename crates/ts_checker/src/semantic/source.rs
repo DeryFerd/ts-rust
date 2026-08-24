@@ -131,7 +131,8 @@ use super::{
     source_elements::{
         SourceElementError, SourceElementPlan, SourceElementUnsupported,
         check_array_binding_element, check_computed_binding_element, check_direct_source_element,
-        finish_direct_source_element_plan, plan_direct_source_element_syntax,
+        check_direct_source_element_write, finish_direct_source_element_plan,
+        plan_direct_source_element_syntax, plan_direct_source_element_write_syntax,
     },
     source_enums::{
         SourceEnumError, SourceEnumPlan, execute_local_const_enum, execute_local_enum,
@@ -807,6 +808,7 @@ struct PlannedVariable {
     name: NodeRef,
     symbol: SemanticSymbolId,
     binding: VariableBindingKind,
+    evolving_array: bool,
     type_node: Option<NodeRef>,
     jsdoc_type: Option<PlannedJsDocType>,
     initializer: PlannedVariableInitializer,
@@ -1151,6 +1153,14 @@ struct PlannedAssignment {
 }
 
 #[derive(Clone, Debug)]
+struct PlannedEvolvingArrayAssignment {
+    expression: NodeRef,
+    element: SourceElementPlan,
+    target_symbol: SemanticSymbolId,
+    right: PlannedExpression,
+}
+
+#[derive(Clone, Debug)]
 struct PlannedCommonJsAssignment {
     expression: NodeRef,
     left: NodeRef,
@@ -1323,6 +1333,7 @@ enum PlannedStatement {
     ArrayVariable(Box<PlannedArrayVariable>),
     ObjectVariable(Box<PlannedObjectVariable>),
     Assignment(PlannedAssignment),
+    EvolvingArrayAssignment(Box<PlannedEvolvingArrayAssignment>),
     CommonJsAssignment(PlannedCommonJsAssignment),
     ArrowExpandoAssignment(PlannedArrowExpandoAssignment),
     ObjectExpandoAssignment(PlannedObjectExpandoAssignment),
@@ -1420,6 +1431,7 @@ struct SourcePlanner<'arena, 'semantic, 'sources> {
     javascript_jsdoc: Option<PlannedJavaScriptJsDoc>,
     uses_global_this: bool,
     allow_implicit_ambient_any: bool,
+    no_implicit_any: bool,
     value_import_bindings: HashMap<SemanticSymbolId, SourceImportBindingPlan>,
     type_import_bindings: HashMap<SemanticSymbolId, SourceImportBindingPlan>,
     import_reads: Vec<PlannedSourceImportRead>,
@@ -1438,6 +1450,7 @@ struct SourcePlanner<'arena, 'semantic, 'sources> {
     assignable_ambient_variables: HashSet<SemanticSymbolId>,
     assignable_uninitialized_variables: HashSet<SemanticSymbolId>,
     assignable_mutable_variables: HashSet<SemanticSymbolId>,
+    evolving_array_variables: HashSet<SemanticSymbolId>,
     redeclared_top_level_variables: HashSet<SemanticSymbolId>,
     recovered_anonymous_variables: HashSet<SemanticSymbolId>,
     planned_ambient_namespaces: HashSet<SemanticSymbolId>,
@@ -1466,6 +1479,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             javascript_jsdoc: None,
             uses_global_this: false,
             allow_implicit_ambient_any: false,
+            no_implicit_any: false,
             value_import_bindings: HashMap::new(),
             type_import_bindings: HashMap::new(),
             import_reads: Vec::new(),
@@ -1481,6 +1495,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             assignable_ambient_variables: HashSet::new(),
             assignable_uninitialized_variables: HashSet::new(),
             assignable_mutable_variables: HashSet::new(),
+            evolving_array_variables: HashSet::new(),
             redeclared_top_level_variables: HashSet::new(),
             recovered_anonymous_variables: HashSet::new(),
             planned_ambient_namespaces: HashSet::new(),
@@ -1513,6 +1528,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             javascript_jsdoc: None,
             uses_global_this: false,
             allow_implicit_ambient_any: false,
+            no_implicit_any: false,
             value_import_bindings: HashMap::new(),
             type_import_bindings: HashMap::new(),
             import_reads: Vec::new(),
@@ -1528,6 +1544,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             assignable_ambient_variables: HashSet::new(),
             assignable_uninitialized_variables: HashSet::new(),
             assignable_mutable_variables: HashSet::new(),
+            evolving_array_variables: HashSet::new(),
             redeclared_top_level_variables: HashSet::new(),
             recovered_anonymous_variables: HashSet::new(),
             planned_ambient_namespaces: HashSet::new(),
@@ -1551,6 +1568,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         let mut planner = Self::new_semantic(arena, bound, source, store, host);
         planner.array_targets = Some(CanonicalArrayTargets::from_global_types(global_types));
         planner.allow_implicit_ambient_any = !options.no_implicit_any;
+        planner.no_implicit_any = options.no_implicit_any;
         planner
     }
 
@@ -2781,6 +2799,14 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         continue;
                     }
                     if let Some(assignment) =
+                        self.plan_top_level_evolving_array_assignment(statement, expression)?
+                    {
+                        statements.push(PlannedStatement::EvolvingArrayAssignment(Box::new(
+                            assignment,
+                        )));
+                        continue;
+                    }
+                    if let Some(assignment) =
                         self.plan_top_level_namespace_assignment(expression, &statements)?
                     {
                         statements.push(PlannedStatement::NamespaceAssignment(assignment));
@@ -3755,6 +3781,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             name,
             symbol,
             binding: VariableBindingKind::Var,
+            evolving_array: false,
             type_node: None,
             jsdoc_type: None,
             initializer: PlannedVariableInitializer::Expression(initializer),
@@ -4587,6 +4614,77 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             return Err(SourceCheckError::Element(expression));
         }
         Ok(Some(planned))
+    }
+
+    fn plan_top_level_evolving_array_assignment(
+        &mut self,
+        statement: NodeRef,
+        expression: NodeRef,
+    ) -> Result<Option<PlannedEvolvingArrayAssignment>, SourceCheckError> {
+        let (left, right, operator) = {
+            let record = self.node(expression)?;
+            let NodeData::BinaryExpression(binary) = &record.data else {
+                return Ok(None);
+            };
+            let left = self.reference(binary.left);
+            if self.node(left)?.kind != SyntaxKind::ElementAccessExpression {
+                return Ok(None);
+            }
+            let right = self.reference(binary.right);
+            let operator = self.reference(binary.operator_token);
+            let operator_record = self.node(operator)?;
+            if operator_record.kind != SyntaxKind::EqualsToken {
+                return Ok(None);
+            }
+            if record.kind != SyntaxKind::BinaryExpression
+                || record.flags.0 != 0
+                || record.parent != Some(statement.node)
+                || binary.symbol.is_some()
+                || binary.type_.is_some()
+                || binary.facts != 0
+                || binary.modifiers.is_some()
+                || operator_record.flags.0 != 0
+                || operator_record.parent != Some(expression.node)
+                || !matches!(operator_record.data, NodeData::Token(_))
+                || self.node(left)?.parent != Some(expression.node)
+                || self.node(right)?.parent != Some(expression.node)
+            {
+                return Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Element(left),
+                ));
+            }
+            (left, right, operator)
+        };
+        debug_assert_eq!(self.node(operator)?.kind, SyntaxKind::EqualsToken);
+
+        let Some((store, _)) = self.semantic else {
+            return Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Element(left),
+            ));
+        };
+        let syntax = plan_direct_source_element_write_syntax(self.arena, store, left, expression)
+            .map_err(|error| Self::element_plan_error(left, error))?;
+        let receiver = self.plan_expression(syntax.receiver())?;
+        let PlannedExpressionKind::Identifier(read) = &receiver.kind else {
+            return Ok(None);
+        };
+        if read.kind != PlannedIdentifierReadKind::Variable
+            || !self.evolving_array_variables.contains(&read.value_symbol)
+        {
+            return Ok(None);
+        }
+        let target_symbol = read.value_symbol;
+        let index = self.plan_expression(syntax.index())?;
+        let element = finish_direct_source_element_plan(syntax, receiver, index)
+            .map_err(|error| Self::element_plan_error(left, error))?;
+        self.primitive_binary_position_roots.insert(right);
+        let right = self.plan_expression(right)?;
+        Ok(Some(PlannedEvolvingArrayAssignment {
+            expression,
+            element,
+            target_symbol,
+            right,
+        }))
     }
 
     fn plan_top_level_namespace_assignment(
@@ -7942,6 +8040,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
         let initializer = self.plan_expression(syntax.initializer)?;
         if syntax.type_node.is_none()
+            && self.no_implicit_any
             && matches!(&initializer.kind, PlannedExpressionKind::Array(elements) if elements.is_empty())
         {
             return Err(SourceCheckError::Unsupported(
@@ -7975,6 +8074,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             name: syntax.name,
             symbol: syntax.symbol,
             binding: syntax.binding,
+            evolving_array: false,
             type_node: syntax.type_node,
             jsdoc_type: None,
             initializer: PlannedVariableInitializer::Expression(initializer),
@@ -10455,6 +10555,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             self.plan_type_import_annotation_root(type_node)?;
         }
 
+        let mut evolving_array = false;
         let initializer = match initializer_id.map(|node| self.reference(node)) {
             Some(initializer) => {
                 if self.node(initializer)?.parent != Some(declaration.node) {
@@ -10480,16 +10581,10 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     }
                 } else {
                     let initializer = self.plan_expression(initializer)?;
-                    if type_node.is_none()
+                    evolving_array = self.no_implicit_any
+                        && type_node.is_none()
                         && !exported
-                        && matches!(&initializer.kind, PlannedExpressionKind::Array(elements) if elements.is_empty())
-                    {
-                        return Err(SourceCheckError::Unsupported(
-                            UnsupportedSourceSyntax::Variable(
-                                VariableUnsupported::InferredEmptyArrayOption(declaration),
-                            ),
-                        ));
-                    }
+                        && matches!(&initializer.kind, PlannedExpressionKind::Array(elements) if elements.is_empty());
                     if type_node.is_none()
                         && !exported
                         && !binding.is_const()
@@ -10589,11 +10684,17 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         if redeclared {
             self.redeclared_top_level_variables.insert(variable_symbol);
         }
+        if evolving_array && !self.evolving_array_variables.insert(variable_symbol) {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidSymbolShape(variable_symbol),
+            ));
+        }
         Ok(PlannedVariable {
             declaration,
             name,
             symbol: variable_symbol,
             binding,
+            evolving_array,
             type_node,
             jsdoc_type,
             initializer,
@@ -15943,6 +16044,52 @@ fn check_expression_type(
             diagnostics,
             expression,
         )?;
+    }
+    if options.no_implicit_any
+        && let PlannedExpressionKind::Identifier(read) = &expression.kind
+        && read.kind == PlannedIdentifierReadKind::Variable
+        && current_flow_types.get(&read.value_symbol) == Some(&global_types.auto_array_type)
+    {
+        let declaration = store
+            .symbol(read.value_symbol)
+            .and_then(|symbol| symbol.value_declaration())
+            .ok_or(SourceCheckError::Variable(
+                VariableInvariant::InvalidSymbolShape(read.value_symbol),
+            ))?;
+        let record = host.node(declaration).ok_or(SourceCheckError::Provenance(
+            SourceCheckProvenanceError::MissingNode(declaration),
+        ))?;
+        let NodeData::VariableDeclaration(variable) = &record.data else {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidSymbolShape(read.value_symbol),
+            ));
+        };
+        let name = NodeRef::new(declaration.arena, declaration.file, variable.name);
+        let name_record = host.node(name).ok_or(SourceCheckError::Provenance(
+            SourceCheckProvenanceError::MissingNode(name),
+        ))?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidSymbolShape(read.value_symbol),
+            ));
+        };
+        for (node, code) in [(name, 7034), (expression.node, 7005)] {
+            merge_retry_diagnostic(
+                diagnostics,
+                CanonicalCheckerDiagnostic {
+                    node: Some(node),
+                    range_override: None,
+                    diagnostic: Diagnostic::with_arguments(
+                        message_by_code(code).ok_or(SourceCheckError::MissingDiagnostic(code))?,
+                        [identifier.text.clone(), "any[]".to_owned()],
+                    ),
+                    related_information: Vec::new(),
+                },
+            );
+        }
+        let type_ = global_types.any_array_type;
+        publish_expression_type(store, expression.node, type_)?;
+        return Ok(CheckedExpressionTypes::leaf(type_, type_));
     }
     match &expression.kind {
         PlannedExpressionKind::Identifier(read)
@@ -23461,6 +23608,7 @@ pub(super) fn check_source_file(
     let mut staged_value_types = HashMap::new();
     let mut top_level_declared_types = HashMap::new();
     let mut current_flow_types = HashMap::new();
+    let mut evolving_array_types = HashMap::new();
     let mut mutable_variables = HashSet::new();
     let mut value_order = Vec::new();
     let mut commonjs_export_types = HashMap::<SemanticSymbolId, Vec<TypeId>>::new();
@@ -25750,7 +25898,9 @@ pub(super) fn check_source_file(
                                 None,
                                 &mut deferred,
                             )?;
-                            let declared_type = if preserve_const_assertion {
+                            let declared_type = if variable.evolving_array {
+                                global_types.auto_array_type
+                            } else if preserve_const_assertion {
                                 initializer.result
                             } else {
                                 inferred_variable_type(
@@ -25760,18 +25910,39 @@ pub(super) fn check_source_file(
                                     initializer.result,
                                 )?
                             };
-                            let current_flow_type = current_flow_type_after_assignment(
-                                store,
-                                host,
-                                global_types,
-                                options,
-                                session,
-                                diagnostics,
-                                CheckedAssignment {
-                                    declared_type,
-                                    assigned_type: initializer.result,
-                                },
-                            )?;
+                            let current_flow_type = if variable.evolving_array {
+                                let never = store
+                                    .intrinsic_bootstrap()
+                                    .ok_or(SourceCheckError::LiteralCache(
+                                        SourceLiteralCacheError::BootstrapUninitialized,
+                                    ))?
+                                    .never_type;
+                                let evolving = store.create_evolving_array_type(never)?;
+                                if evolving_array_types
+                                    .insert(variable.symbol, evolving)
+                                    .is_some()
+                                {
+                                    return Err(SourceCheckError::Variable(
+                                        VariableInvariant::DuplicateCurrentFlowType(
+                                            variable.symbol,
+                                        ),
+                                    ));
+                                }
+                                store.finalize_evolving_array_type(global_types, evolving)?
+                            } else {
+                                current_flow_type_after_assignment(
+                                    store,
+                                    host,
+                                    global_types,
+                                    options,
+                                    session,
+                                    diagnostics,
+                                    CheckedAssignment {
+                                        declared_type,
+                                        assigned_type: initializer.result,
+                                    },
+                                )?
+                            };
                             (declared_type, current_flow_type)
                         }
                         (
@@ -26393,6 +26564,114 @@ pub(super) fn check_source_file(
                     checked,
                 )?;
                 current_flow_types.insert(assignment.target_symbol, current_flow_type);
+            }
+            PlannedStatement::EvolvingArrayAssignment(assignment) => {
+                let evolving = *evolving_array_types.get(&assignment.target_symbol).ok_or(
+                    SourceCheckError::Variable(VariableInvariant::MissingCurrentFlowType(
+                        assignment.target_symbol,
+                    )),
+                )?;
+                if top_level_declared_types.get(&assignment.target_symbol)
+                    != Some(&global_types.auto_array_type)
+                    || !current_flow_types.contains_key(&assignment.target_symbol)
+                {
+                    return Err(SourceCheckError::Variable(
+                        VariableInvariant::MissingCurrentFlowType(assignment.target_symbol),
+                    ));
+                }
+                let PlannedExpressionKind::Identifier(receiver) = &assignment.element.receiver.kind
+                else {
+                    return Err(SourceCheckError::Element(assignment.element.node));
+                };
+                if receiver.kind != PlannedIdentifierReadKind::Variable
+                    || receiver.value_symbol != assignment.target_symbol
+                {
+                    return Err(SourceCheckError::Element(assignment.element.node));
+                }
+                publish_expression_type(
+                    store,
+                    assignment.element.receiver.node,
+                    global_types.auto_array_type,
+                )?;
+                let index = check_expression_type(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    &current_flow_types,
+                    &preflighted_type_import_value_uses,
+                    &assignment.element.index,
+                    None,
+                    &mut deferred,
+                )?;
+                let checked = check_direct_source_element_write(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    &assignment.element,
+                    global_types.auto_array_type,
+                    index.result,
+                )
+                .map_err(|error| {
+                    SourcePlanner::element_plan_error(assignment.element.node, error)
+                })?;
+                let valid_index = checked.diagnostic.is_none()
+                    && store.type_payload(index.result).is_some_and(|record| {
+                        record
+                            .flags()
+                            .intersects(TypeFlags::NUMBER_LIKE | TypeFlags::ANY)
+                    });
+                if let Some(diagnostic) = checked.diagnostic {
+                    merge_retry_diagnostic(diagnostics, diagnostic);
+                }
+                let assigned = check_assignment_to_type(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    &current_flow_types,
+                    &preflighted_type_import_value_uses,
+                    &mut deferred,
+                    checked.type_,
+                    None,
+                    &assignment.right,
+                    assignment.element.node,
+                    Some(assignment.expression),
+                )?;
+                if valid_index {
+                    let base = widened_fresh_literal_type(store, assigned.assigned_type)?;
+                    let element = store.get_regular_type_of_object_literal(base)?;
+                    let previous = store.evolving_array_element_type(evolving)?;
+                    let previous_is_empty = store
+                        .type_payload(previous)
+                        .is_some_and(|record| record.flags().intersects(TypeFlags::NEVER));
+                    let combined = if previous_is_empty {
+                        element
+                    } else if store.is_type_identical_to_with_global_types(
+                        previous,
+                        element,
+                        global_types,
+                    )? {
+                        previous
+                    } else {
+                        store.expression_union_type_with_global_types(
+                            global_types,
+                            &[previous, element],
+                            UnionReduction::Subtype,
+                        )?
+                    };
+                    let evolving = store.create_evolving_array_type(combined)?;
+                    let finalized = store.finalize_evolving_array_type(global_types, evolving)?;
+                    evolving_array_types.insert(assignment.target_symbol, evolving);
+                    current_flow_types.insert(assignment.target_symbol, finalized);
+                }
             }
             PlannedStatement::CommonJsAssignment(assignment) => {
                 let expected_flags = if assignment.named {
@@ -32264,35 +32543,161 @@ mod tests {
             );
         }
 
-        // Pinned tsgo-oracle (`typescript-go@dc37b524`): exported direct `=[]`
-        // and non-exported `=([])` are never[] for
-        // strictNullChecks=true,noImplicitAny=false, and any[] for
-        // strictNullChecks=false. Non-exported direct `=[]` becomes an evolving
-        // auto[] when noImplicitAny=true. Canonical source-variable planning
-        // does not consume that retained option yet, so only that direct syntax
-        // is rejected.
-        let blocked = parsed("const prior = 1; const blocked = [];");
-        let blocked_file = FileId::new(211);
+        let direct = parsed("const prior = 1; const direct = [];");
+        let direct_file = FileId::new(211);
         let mut context = context(
-            &[(library_file, &library), (blocked_file, &blocked)],
+            &[(library_file, &library), (direct_file, &direct)],
             strict_options,
         );
-        let before = observable_state(&context, blocked_file);
-        assert!(matches!(
-            context.check_source_file(blocked_file),
-            Err(SourceCheckError::Unsupported(
-                UnsupportedSourceSyntax::Variable(
-                    VariableUnsupported::InferredEmptyArrayOption(node)
-                )
-            )) if node == variable_declaration(&blocked, blocked_file, "blocked")
-        ));
-        assert_eq!(observable_state(&context, blocked_file), before);
-        assert!(
+        context.check_source_file(direct_file).unwrap();
+        assert_eq!(
             context
-                .store()
-                .value_symbol_links(variable_symbol(&context, &blocked, blocked_file, "prior"))
-                .and_then(|links| links.resolved_type)
-                .is_none()
+                .type_to_string(variable_value_type(
+                    &context,
+                    &direct,
+                    direct_file,
+                    "direct"
+                ))
+                .unwrap(),
+            "never[]",
+        );
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn evolving_empty_arrays_reuse_canonical_types_for_repeated_indexed_object_assignments() {
+        let library = parsed("interface Array<T> {}");
+        let mut text = String::from("let values = [];\n");
+        for _ in 0..24 {
+            text.push_str("values[0] = { foo: 'hi' };\n");
+        }
+        text.push_str("const observed = values;\n");
+        let source = parsed(&text);
+        let library_file = FileId::new(8_610);
+        let file = FileId::new(8_611);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions {
+                no_implicit_any: true,
+                no_unchecked_indexed_access: true,
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    exact_optional_property_types: false,
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let auto_array = context.global_types().auto_array_type;
+        let auto = context.store().intrinsic_bootstrap().unwrap().auto_type;
+        assert_eq!(
+            variable_value_type(&context, &source, file, "values"),
+            auto_array,
+        );
+        let observed = variable_value_type(&context, &source, file, "observed");
+        assert_eq!(
+            context.type_to_string(observed).unwrap(),
+            "{ foo: string; }[]"
+        );
+        assert_eq!(
+            resolved_node_type(&context, variable_initializer(&source, file, "observed")),
+            observed,
+        );
+        let mut assignment_count = 0;
+        for (node, record) in source.arena.iter() {
+            let NodeData::ElementAccessExpression(access) = &record.data else {
+                continue;
+            };
+            assignment_count += 1;
+            let receiver = NodeRef::new(source.arena.id(), file, access.expression);
+            let element = NodeRef::new(source.arena.id(), file, node);
+            assert_eq!(resolved_node_type(&context, receiver), auto_array);
+            assert_eq!(resolved_node_type(&context, element), auto);
+        }
+        assert_eq!(assignment_count, 24);
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        mark_source_unchecked(&mut context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn evolving_empty_arrays_accumulate_distinct_widened_element_types() {
+        let library = parsed("interface Array<T> {}");
+        let source = parsed(concat!(
+            "const values = []; ",
+            "values[0] = 1; const numbers = values; ",
+            "values[1] = 'value'; const mixed = values;",
+        ));
+        let library_file = FileId::new(8_612);
+        let file = FileId::new(8_613);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions {
+                no_implicit_any: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        assert_eq!(
+            variable_value_type(&context, &source, file, "values"),
+            context.global_types().auto_array_type,
+        );
+        assert_eq!(
+            context
+                .type_to_string(variable_value_type(&context, &source, file, "numbers"))
+                .unwrap(),
+            "number[]",
+        );
+        assert_eq!(
+            context
+                .type_to_string(variable_value_type(&context, &source, file, "mixed"))
+                .unwrap(),
+            "(string | number)[]",
+        );
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn unreadable_evolving_empty_arrays_report_both_implicit_any_diagnostics() {
+        let library = parsed("interface Array<T> {}");
+        let source = parsed("let values = []; const observed = values;");
+        let library_file = FileId::new(8_614);
+        let file = FileId::new(8_615);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions {
+                no_implicit_any: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let [declaration, read] = context.diagnostics().as_slice() else {
+            panic!("an unevolved array read must report both implicit-any diagnostics")
+        };
+        assert_eq!(declaration.diagnostic.code(), 7034);
+        assert_eq!(
+            declaration.node,
+            Some(variable_name(&source, file, "values"))
+        );
+        assert_eq!(declaration.diagnostic.arguments, ["values", "any[]"]);
+        assert_eq!(read.diagnostic.code(), 7005);
+        assert_eq!(
+            read.node,
+            Some(variable_initializer(&source, file, "observed")),
+        );
+        assert_eq!(read.diagnostic.arguments, ["values", "any[]"]);
+        assert_eq!(
+            variable_value_type(&context, &source, file, "observed"),
+            context.global_types().any_array_type,
         );
     }
 

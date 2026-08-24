@@ -208,6 +208,98 @@ impl CanonicalTypeMapperStore {
             .map(|reference| reference.element_type))
     }
 
+    /// Creates or reuses the control-flow-only evolving array for one exact
+    /// element identity. Evolving arrays never become ordinary array references.
+    pub(super) fn create_evolving_array_type(
+        &mut self,
+        element_type: TypeId,
+    ) -> Result<TypeId, ArrayTypeError> {
+        if self.type_payload(element_type).is_none() {
+            return Err(ArrayTypeError::InvalidReference(element_type));
+        }
+        if let Some((type_id, _)) = self.types().find(|(_, record)| {
+            record.flags() == TypeFlags::OBJECT
+                && record.object_flags() == ObjectFlags::EVOLVING_ARRAY
+                && record.symbol().is_none()
+                && record.alias().is_none()
+                && matches!(record.data(), TypeData::EvolvingArray(data)
+                    if data.element_type == Some(element_type))
+        }) {
+            return Ok(type_id);
+        }
+        if !self.try_reserve_types(1) {
+            return Err(ArrayTypeError::Capacity(element_type));
+        }
+        let evolving = self
+            .alloc_evolving_array_type(ObjectFlags::EVOLVING_ARRAY, None)
+            .ok_or(ArrayTypeError::Capacity(element_type))?;
+        if !self.set_evolving_array_types(evolving, Some(element_type), None) {
+            return Err(ArrayTypeError::InvalidReference(evolving));
+        }
+        Ok(evolving)
+    }
+
+    /// Returns the exact element identity retained by a valid evolving array.
+    pub(super) fn evolving_array_element_type(
+        &self,
+        type_id: TypeId,
+    ) -> Result<TypeId, ArrayTypeError> {
+        let record = self
+            .type_payload(type_id)
+            .ok_or(ArrayTypeError::InvalidReference(type_id))?;
+        let TypeData::EvolvingArray(data) = record.data() else {
+            return Err(ArrayTypeError::InvalidReference(type_id));
+        };
+        let element = data
+            .element_type
+            .ok_or(ArrayTypeError::InvalidReference(type_id))?;
+        if record.flags() != TypeFlags::OBJECT
+            || record.object_flags() != ObjectFlags::EVOLVING_ARRAY
+            || record.symbol().is_some()
+            || record.alias().is_some()
+            || self.type_payload(element).is_none()
+            || data
+                .final_array_type
+                .is_some_and(|final_type| self.type_payload(final_type).is_none())
+        {
+            return Err(ArrayTypeError::InvalidReference(type_id));
+        }
+        Ok(element)
+    }
+
+    /// Finalizes a control-flow array through the authoritative global array
+    /// cache. An empty evolving array retains upstream's canonical `auto[]`.
+    pub(super) fn finalize_evolving_array_type(
+        &mut self,
+        global_types: &CanonicalGlobalTypes,
+        type_id: TypeId,
+    ) -> Result<TypeId, ArrayTypeError> {
+        let element = self.evolving_array_element_type(type_id)?;
+        let cached = match self.type_payload(type_id).map(TypeRecord::data) {
+            Some(TypeData::EvolvingArray(data)) => data.final_array_type,
+            _ => return Err(ArrayTypeError::InvalidReference(type_id)),
+        };
+        let expected = if self
+            .type_payload(element)
+            .is_some_and(|record| record.flags().intersects(TypeFlags::NEVER))
+        {
+            global_types.auto_array_type
+        } else {
+            self.create_canonical_array_type(global_types, element, false)?
+        };
+        if let Some(cached) = cached {
+            return if cached == expected {
+                Ok(cached)
+            } else {
+                Err(ArrayTypeError::InvalidReference(type_id))
+            };
+        }
+        if !self.set_evolving_array_types(type_id, Some(element), Some(expected)) {
+            return Err(ArrayTypeError::InvalidReference(type_id));
+        }
+        Ok(expected)
+    }
+
     /// Creates or reuses the target-cache-owned `Array<T>` or
     /// `ReadonlyArray<T>` reference. A missing global target returns the
     /// canonical non-reference fallback unchanged.
@@ -1292,6 +1384,46 @@ mod tests {
                 .object_flags()
                 .contains(ObjectFlags::ARRAY_LITERAL)
         );
+    }
+
+    #[test]
+    fn evolving_arrays_reuse_element_identity_and_cache_canonical_final_arrays() {
+        let mut context = array_context(FileId::new(925));
+        let global_types = context.global_types().clone();
+        let (never, number) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (bootstrap.never_type, bootstrap.number_type)
+        };
+        let store = context.store_mut_for_test();
+
+        let empty = store.create_evolving_array_type(never).unwrap();
+        assert_eq!(store.create_evolving_array_type(never).unwrap(), empty);
+        assert_eq!(store.evolving_array_element_type(empty).unwrap(), never);
+        assert_eq!(
+            store
+                .finalize_evolving_array_type(&global_types, empty)
+                .unwrap(),
+            global_types.auto_array_type,
+        );
+
+        let evolving = store.create_evolving_array_type(number).unwrap();
+        let final_array = store
+            .finalize_evolving_array_type(&global_types, evolving)
+            .unwrap();
+        assert_eq!(
+            final_array,
+            store
+                .create_canonical_array_type(&global_types, number, false)
+                .unwrap(),
+        );
+        assert_eq!(store.create_evolving_array_type(number).unwrap(), evolving);
+        assert_eq!(
+            store
+                .finalize_evolving_array_type(&global_types, evolving)
+                .unwrap(),
+            final_array,
+        );
+        assert_ne!(empty, evolving);
     }
 
     #[test]

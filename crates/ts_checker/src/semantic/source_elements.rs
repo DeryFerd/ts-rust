@@ -8,8 +8,9 @@
 //! literals, authenticated enum members and numeric reverse indices, primitive
 //! string indexing, resolved anonymous string/number index signatures, finite
 //! unions of valid literal keys, optional properties, and optional chains.
-//! Writes, generic indexed access types, and apparent/global property lookup
-//! stay typed boundaries.
+//! Authenticated evolving-array element assignments reuse the same index
+//! validation. Other writes, generic indexed access types, and apparent/global
+//! property lookup stay typed boundaries.
 
 use std::collections::HashSet;
 
@@ -167,6 +168,25 @@ pub(super) fn plan_direct_source_element_syntax(
     store: &CanonicalTypeMapperStore,
     node: NodeRef,
 ) -> Result<DirectSourceElementSyntax, SourceElementError> {
+    plan_direct_source_element_syntax_worker(arena, store, node, None)
+}
+
+/// Proves an indexed assignment target owned by its exact ordinary assignment.
+pub(super) fn plan_direct_source_element_write_syntax(
+    arena: &NodeArena,
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+    assignment: NodeRef,
+) -> Result<DirectSourceElementSyntax, SourceElementError> {
+    plan_direct_source_element_syntax_worker(arena, store, node, Some(assignment))
+}
+
+fn plan_direct_source_element_syntax_worker(
+    arena: &NodeArena,
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+    assignment: Option<NodeRef>,
+) -> Result<DirectSourceElementSyntax, SourceElementError> {
     let Some(record) = arena.get(node.node) else {
         return Err(unsupported_access(node));
     };
@@ -194,10 +214,16 @@ pub(super) fn plan_direct_source_element_syntax(
         && let Some(parent_record) = arena.get(parent)
         && let NodeData::BinaryExpression(binary) = &parent_record.data
         && binary.left == node.node
-        && arena
-            .get(binary.operator_token)
-            .is_some_and(|operator| operator.kind.is_assignment_operator())
+        && let Some(operator) = arena.get(binary.operator_token)
+        && operator.kind.is_assignment_operator()
     {
+        let actual = NodeRef::new(node.arena, node.file, parent);
+        if assignment != Some(actual) || operator.kind != SyntaxKind::EqualsToken {
+            return Err(SourceElementError::Unsupported(
+                SourceElementUnsupported::Write(node),
+            ));
+        }
+    } else if assignment.is_some() {
         return Err(SourceElementError::Unsupported(
             SourceElementUnsupported::Write(node),
         ));
@@ -230,6 +256,12 @@ pub(super) fn plan_direct_source_element_syntax(
     } else {
         receiver_continues_optional_chain(arena, receiver_record)
     };
+
+    if assignment.is_some() && optional {
+        return Err(SourceElementError::Unsupported(
+            SourceElementUnsupported::Write(node),
+        ));
+    }
 
     preflight_element_links(store, node)?;
     Ok(DirectSourceElementSyntax {
@@ -284,6 +316,32 @@ pub(super) fn check_direct_source_element(
         plan,
         receiver_type,
         index_type,
+        false,
+    )
+}
+
+/// Checks an authenticated indexed assignment without applying read-only
+/// `noUncheckedIndexedAccess` widening to its assignment target.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn check_direct_source_element_write(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    plan: &SourceElementPlan,
+    receiver_type: TypeId,
+    index_type: TypeId,
+) -> Result<CheckedSourceElement, SourceElementError> {
+    check_direct_source_element_worker(
+        store,
+        host,
+        Some(global_types),
+        CanonicalArrayTargets::from_global_types(global_types),
+        options,
+        plan,
+        receiver_type,
+        index_type,
+        true,
     )
 }
 
@@ -900,6 +958,7 @@ fn check_direct_source_element_with_array_targets(
         plan,
         receiver_type,
         index_type,
+        false,
     )
 }
 
@@ -913,6 +972,7 @@ fn check_direct_source_element_worker(
     plan: &SourceElementPlan,
     receiver_type: TypeId,
     index_type: TypeId,
+    write: bool,
 ) -> Result<CheckedSourceElement, SourceElementError> {
     if store.type_payload(receiver_type).is_none() {
         return Err(SourceElementError::InvalidType(receiver_type));
@@ -993,7 +1053,7 @@ fn check_direct_source_element_worker(
         }
     };
 
-    let type_ = if resolution.from_index_signature {
+    let type_ = if resolution.from_index_signature && !write {
         unchecked_index_read_type(store, global_types, options, plan.node, resolution.type_)?
     } else {
         resolution.type_
@@ -4626,5 +4686,40 @@ mod tests {
             plan_direct_source_element_syntax(&poisoned.arena, &poisoned_store, poisoned_access,),
             Err(SourceElementError::InvalidCache(poisoned_access))
         );
+    }
+
+    #[test]
+    fn indexed_assignment_syntax_requires_its_exact_ordinary_assignment_owner() {
+        let parsed = parse_fixture("array[0] = 1;");
+        let file = FileId::new(616);
+        let access = element_access(&parsed, file);
+        let assignment = NodeRef::new(
+            parsed.arena.id(),
+            file,
+            parsed.arena.get(access.node).unwrap().parent.unwrap(),
+        );
+        let store = registered_store(&parsed, file);
+
+        assert!(matches!(
+            plan_direct_source_element_syntax(&parsed.arena, &store, access),
+            Err(SourceElementError::Unsupported(
+                SourceElementUnsupported::Write(node)
+            )) if node == access
+        ));
+        let syntax =
+            plan_direct_source_element_write_syntax(&parsed.arena, &store, access, assignment)
+                .unwrap();
+        assert_eq!(syntax.node, access);
+        assert_eq!(
+            parsed.arena.get(syntax.index.node).unwrap().kind,
+            SyntaxKind::NumericLiteral
+        );
+
+        assert!(matches!(
+            plan_direct_source_element_write_syntax(&parsed.arena, &store, access, access),
+            Err(SourceElementError::Unsupported(
+                SourceElementUnsupported::Write(node)
+            )) if node == access
+        ));
     }
 }

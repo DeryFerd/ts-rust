@@ -131,8 +131,8 @@ pub enum VariableUnsupported {
         symbol: SemanticSymbolId,
         declaration: NodeRef,
     },
-    /// `noImplicitAny` changes the type of a direct non-exported `=[]` initializer,
-    /// but that option is not yet represented by `CanonicalCheckerOptions`.
+    /// An evolving empty-array initializer appears in a flow scope that does
+    /// not yet support indexed mutations.
     InferredEmptyArrayOption(NodeRef),
     /// `noImplicitAny` switches a direct/parenthesized non-exported mutable
     /// nullish initializer to control-flow `autoType`.
