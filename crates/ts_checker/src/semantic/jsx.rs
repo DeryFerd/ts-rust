@@ -3351,7 +3351,9 @@ fn check_react_jsx_fragment_children(
     else {
         return Ok(true);
     };
-    if children.individual_errors || store.is_type_assignable_to(children.type_, expected)? {
+    if children.individual_errors
+        || jsx_child_is_assignable(store, children.type_, expected, children.node)?
+    {
         return Ok(true);
     }
 
@@ -3453,6 +3455,41 @@ fn resolve_expected_jsx_child_type(
         .map_err(Into::into)
 }
 
+fn jsx_child_is_assignable(
+    store: &mut CanonicalTypeMapperStore,
+    source: TypeId,
+    target: TypeId,
+    location: NodeRef,
+) -> Result<bool, SourceCheckError> {
+    let (any, unknown) = {
+        let bootstrap = store
+            .intrinsic_bootstrap()
+            .ok_or(SourceCheckError::LiteralCache(
+                SourceLiteralCacheError::BootstrapUninitialized,
+            ))?;
+        (bootstrap.any_type, bootstrap.unknown_type)
+    };
+    if source != unknown {
+        return store
+            .is_type_assignable_to(source, target)
+            .map_err(Into::into);
+    }
+
+    let record = store
+        .type_payload(source)
+        .ok_or(SourceCheckError::Property(location))?;
+    if record.flags() != TypeFlags::UNKNOWN
+        || !matches!(
+            record.data(),
+            super::TypeData::Intrinsic(intrinsic) if intrinsic.intrinsic_name == "unknown"
+        )
+    {
+        return Err(SourceCheckError::Property(location));
+    }
+
+    Ok(target == any || target == unknown)
+}
+
 #[allow(clippy::too_many_arguments)] // Contextual children retain their owner and expected props.
 fn check_jsx_implicit_children(
     store: &mut CanonicalTypeMapperStore,
@@ -3544,7 +3581,7 @@ fn check_jsx_implicit_children(
         };
         first_node.get_or_insert(node);
         if let Some(expected) = expected_child
-            && !store.is_type_assignable_to(type_, expected)?
+            && !jsx_child_is_assignable(store, type_, expected, node)?
         {
             let display = get_type_names_for_assignability_error(store, type_, expected)?;
             add_diagnostic(diagnostics, node, 2322, [display.source, display.target])?;
@@ -5130,6 +5167,14 @@ fn execute_scalar(
                                 .and_then(|links| links.resolved_type)
                                 .filter(|type_| store.type_payload(*type_).is_some())
                         })
+                        .or_else(|| {
+                            let initializer = child_ref(declaration, variable.initializer?);
+                            let initializer_record = arena.get(initializer.node)?;
+                            if initializer_record.kind != SyntaxKind::ArrowFunction {
+                                return None;
+                            }
+                            jsx_component_value_type(store, arena, bound, symbol, *node).ok()
+                        })
                 })
                 .ok_or(SourceCheckError::Property(*node))?;
             publish_symbol_links(store, *node, symbol)?;
@@ -5537,7 +5582,7 @@ fn check_attribute_assignability(
                 options,
                 diagnostics,
             )?
-            && !store.is_type_assignable_to(children.type_, expected_type)?
+            && !jsx_child_is_assignable(store, children.type_, expected_type, children.node)?
         {
             let display =
                 get_type_names_for_assignability_error(store, children.type_, expected_type)?;
