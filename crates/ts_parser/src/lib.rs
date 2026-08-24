@@ -3290,12 +3290,38 @@ impl<'a> Parser<'a> {
         let start = self.consume().range.start;
         let name = self.parse_identifier("Expected a type alias name.");
         let type_parameters = self.parse_type_parameters();
-        if self.current.kind == SyntaxKind::EqualsToken {
-            self.bump();
+        let missing_type_anchor = if self.current.kind == SyntaxKind::EqualsToken {
+            let equals = self.consume();
+            (self.current.kind == SyntaxKind::EndOfFile).then_some(equals.range.end)
         } else {
+            if self.current.kind == SyntaxKind::EndOfFile
+                && self
+                    .current
+                    .flags
+                    .contains(ScannerTokenFlags::PRECEDING_LINE_BREAK)
+            {
+                let position = self.node_end(name);
+                self.error_code_at(TextRange::new(position, position), 1110, []);
+            }
             self.error_current("Expected '='.");
-        }
-        let type_node = self.parse_type();
+            None
+        };
+        let type_node = if let Some(position) = missing_type_anchor {
+            self.error_code_at(TextRange::new(position, position), 1110, []);
+            let missing_position = self.current.range.start;
+            let missing_name = self.missing_identifier(missing_position);
+            self.alloc_node(
+                SyntaxKind::TypeReference,
+                TextRange::new(missing_position, missing_position),
+                NodeData::TypeReferenceNode(Box::new(TypeReferenceNodeData {
+                    type_arguments: None,
+                    type_name: missing_name,
+                })),
+                &[missing_name],
+            )
+        } else {
+            self.parse_type()
+        };
         let end = self.parse_semicolon(self.node_end(type_node));
         let mut children = vec![name, type_node];
         extend_list_children(&mut children, type_parameters.as_ref());
@@ -14215,6 +14241,51 @@ export as namespace GlobalName;
             result.arena.get(statements[2]).unwrap().kind,
             SyntaxKind::ExpressionStatement
         );
+    }
+
+    #[test]
+    fn missing_exported_type_alias_bodies_keep_upstream_diagnostic_positions() {
+        for (source, expected) in [
+            (
+                "import test from './test';\nexport type test\n",
+                vec![(1110, 43), (1005, 44)],
+            ),
+            (
+                "import test from './test';\nexport type test = \n",
+                vec![(1110, 45)],
+            ),
+        ] {
+            let parsed = parse_source_file(source);
+            assert_eq!(
+                parsed
+                    .diagnostics
+                    .iter()
+                    .map(|diagnostic| {
+                        (
+                            diagnostic.code.expect("parser diagnostic has a code"),
+                            diagnostic.range.start.get(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                expected,
+                "{source:?}",
+            );
+
+            let statements = source_statements(&parsed);
+            let NodeData::TypeAliasDeclaration(alias) =
+                &parsed.arena.get(statements[1]).unwrap().data
+            else {
+                panic!("expected the recovered type alias")
+            };
+            let NodeData::TypeReferenceNode(reference) =
+                &parsed.arena.get(alias.type_).unwrap().data
+            else {
+                panic!("expected a recovered type reference")
+            };
+            let missing = parsed.arena.get(reference.type_name).unwrap();
+            assert_eq!(missing.flags, NODE_FLAG_HAS_ERROR);
+            assert_eq!(missing.range.start, missing.range.end);
+        }
     }
 
     #[test]

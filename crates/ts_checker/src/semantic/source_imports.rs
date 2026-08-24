@@ -872,14 +872,20 @@ fn plan_top_level_named_import(
             .symbol(clause)
             .ok_or_else(|| invariant(SourceImportInvariant::MissingAliasSymbol(clause)))?;
         if phase == SourceImportPhase::Value {
-            if default_import_alias_is_exported_type_local(
-                bound,
-                store,
-                alias_symbol,
-                clause,
-                &local_text,
-            ) {
-                return Err(unsupported(SourceImportUnsupported::MergedAlias(clause)));
+            if store
+                .symbol(alias_symbol)
+                .is_some_and(|record| record.export_symbol().is_some())
+                && !default_import_alias_is_exported_type_local(
+                    bound,
+                    store,
+                    alias_symbol,
+                    clause,
+                    &local_text,
+                )
+            {
+                return Err(invariant(SourceImportInvariant::InvalidAliasSymbol(
+                    alias_symbol,
+                )));
             }
             validate_alias_symbol(store, alias_symbol, clause, local_name, &local_text)?;
             preflight_alias_value_links(store, alias_symbol)?;
@@ -2570,6 +2576,32 @@ fn default_import_alias_is_exported_type_local(
     let Some(record) = store.symbol(alias) else {
         return false;
     };
+    let Some([_, type_declaration]) = record.declarations() else {
+        return false;
+    };
+    let Some(export) = record.export_symbol() else {
+        return false;
+    };
+
+    default_import_alias_has_exported_type_local(store, alias, declaration, name)
+        && bound.symbol(declaration) == Some(alias)
+        && bound.local_symbol(*type_declaration) == Some(alias)
+        && bound.symbol(*type_declaration) == Some(export)
+        && store
+            .symbol(export)
+            .and_then(ts_binder::semantic::Symbol::parent)
+            == bound.symbol(bound.source_file())
+}
+
+fn default_import_alias_has_exported_type_local(
+    store: &CanonicalTypeMapperStore,
+    alias: SemanticSymbolId,
+    declaration: NodeRef,
+    name: &str,
+) -> bool {
+    let Some(record) = store.symbol(alias) else {
+        return false;
+    };
     let Some([import, type_declaration]) = record.declarations() else {
         return false;
     };
@@ -2579,11 +2611,18 @@ fn default_import_alias_is_exported_type_local(
     let Some(export_record) = store.symbol(export) else {
         return false;
     };
-    let source = bound.source_file();
-    let Some(module) = bound.symbol(source) else {
+    let Some(module) = export_record.parent() else {
         return false;
     };
     let Some(module_record) = store.symbol(module) else {
+        return false;
+    };
+    let Some(SourceNodeParent::Parent(import_declaration)) = store.source_node_parent(declaration)
+    else {
+        return false;
+    };
+    let Some(SourceNodeParent::Parent(source)) = store.source_node_parent(import_declaration)
+    else {
         return false;
     };
 
@@ -2591,12 +2630,11 @@ fn default_import_alias_is_exported_type_local(
         && declaration.is_for(source.arena, source.file)
         && type_declaration.is_for(source.arena, source.file)
         && store.source_node_kind(declaration) == Some(SyntaxKind::ImportClause)
+        && store.source_node_kind(import_declaration) == Some(SyntaxKind::ImportDeclaration)
+        && store.source_node_kind(source) == Some(SyntaxKind::SourceFile)
         && store.source_node_kind(*type_declaration) == Some(SyntaxKind::TypeAliasDeclaration)
         && store.source_node_parent(*type_declaration) == Some(SourceNodeParent::Parent(source))
         && store.source_node_is_exported(*type_declaration) == Some(true)
-        && bound.symbol(declaration) == Some(alias)
-        && bound.local_symbol(*type_declaration) == Some(alias)
-        && bound.symbol(*type_declaration) == Some(export)
         && record.flags() == SymbolFlags::ALIAS
         && record.check_flags() == CheckFlags::NONE
         && record.name().as_bytes() == name.as_bytes()
@@ -2637,6 +2675,8 @@ fn validate_alias_symbol(
         .symbol(alias)
         .ok_or_else(|| invariant(SourceImportInvariant::InvalidAliasSymbol(alias)))?;
     let merged = store.get_merged_symbol(alias);
+    let exported_type_local =
+        default_import_alias_has_exported_type_local(store, alias, declaration, name_text);
     if merged.is_some_and(|target| target != alias)
         || (record.flags().intersects(SymbolFlags::ALIAS)
             && record.flags() != SymbolFlags::ALIAS
@@ -2674,12 +2714,12 @@ fn validate_alias_symbol(
         || record.members().is_some()
         || record.exports().is_some()
         || !valid_parent
-        || record.export_symbol().is_some()
+        || record.export_symbol().is_some() != exported_type_local
         || merged != Some(alias)
     {
         return Err(invariant(SourceImportInvariant::InvalidAliasSymbol(alias)));
     }
-    if record.declarations() != Some(&[declaration]) {
+    if !exported_type_local && record.declarations() != Some(&[declaration]) {
         return Err(invariant(SourceImportInvariant::AliasDeclarationMismatch {
             alias,
             declaration,
@@ -5896,7 +5936,7 @@ mod tests {
     }
 
     #[test]
-    fn default_import_reused_by_an_exported_type_is_an_authenticated_boundary() {
+    fn default_import_reused_by_an_exported_type_retains_its_authenticated_alias() {
         let fixture = fixture(
             &[
                 r#"import test from "./target"; export type test = string;"#,
@@ -5941,17 +5981,18 @@ mod tests {
         let before = store_state(&fixture.store);
 
         for _ in 0..2 {
-            assert_eq!(
-                plan_top_level_named_value_import(
-                    &file.parsed.arena,
-                    bound,
-                    &fixture.store,
-                    declaration,
-                ),
-                Err(SourceImportError::Unsupported(
-                    SourceImportUnsupported::MergedAlias(clause),
-                )),
-            );
+            let plan = plan_top_level_named_value_import(
+                &file.parsed.arena,
+                bound,
+                &fixture.store,
+                declaration,
+            )
+            .unwrap();
+            let [binding] = plan.bindings.as_slice() else {
+                panic!("expected the merged default import binding")
+            };
+            assert_eq!(binding.alias_symbol, alias);
+            assert_eq!(binding.declaration, clause);
             assert_eq!(store_state(&fixture.store), before);
         }
         assert!(fixture.store.alias_symbol_links(alias).is_none());

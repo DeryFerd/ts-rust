@@ -3152,7 +3152,8 @@ fn baseline_unit_name(case: &Case, unit: &Unit, unit_index: usize) -> String {
     } else {
         unit.path.to_string_lossy().replace('\\', "/")
     };
-    remove_test_path_prefixes(&name)
+    let name = remove_test_path_prefixes(&name);
+    name.strip_prefix("./").unwrap_or(&name).to_owned()
 }
 
 fn baseline_diagnostic_file_name(case: &Case, file_name: &str) -> String {
@@ -6223,6 +6224,29 @@ mod tests {
                 "!!! error TS2322: Type 'number' is not assignable to type 'string'.",
             )
         );
+    }
+
+    #[test]
+    fn baseline_virtual_unit_names_remove_leading_current_directory_segments() {
+        let case = Case::parse(
+            "relativeUnits.ts",
+            concat!(
+                "// @filename: ./first.ts\n",
+                "const first: string = 1;\n",
+                "// @filename: ./second.ts\n",
+                "const second: number = '';\n",
+            ),
+        )
+        .unwrap();
+
+        for (index, expected) in ["first.ts", "second.ts"].into_iter().enumerate() {
+            let unit = &case.units[index];
+            assert_eq!(super::baseline_unit_name(&case, unit, index), expected);
+            assert_eq!(
+                super::baseline_diagnostic_file_name(&case, &virtual_unit_path(&case, unit, index),),
+                expected,
+            );
+        }
     }
 
     #[test]

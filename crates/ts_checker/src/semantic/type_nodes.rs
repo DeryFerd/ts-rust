@@ -78,6 +78,7 @@ use super::{
 };
 
 const NODE_FLAG_JSDOC: u32 = 1 << 22;
+const NODE_FLAG_HAS_ERROR: u32 = 1 << 15;
 const NODE_FLAG_LET: u32 = 1 << 0;
 const NODE_FLAG_CONST: u32 = 1 << 1;
 
@@ -4029,6 +4030,46 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                             TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
                         ));
                     }
+                    let reference_record = preflight_node(self.store, self.host, reference)?;
+                    if let NodeData::TypeReferenceNode(reference_data) = &reference_record.data {
+                        let name =
+                            NodeRef::new(reference.arena, reference.file, reference_data.type_name);
+                        let name_record = preflight_node(self.store, self.host, name)?;
+                        if matches!(
+                            &name_record.data,
+                            NodeData::Identifier(identifier)
+                                if identifier.text.is_empty() && identifier.flow_node.is_none()
+                        ) {
+                            let is_error_type = self
+                                .store
+                                .intrinsic_bootstrap()
+                                .is_some_and(|bootstrap| declared_type == bootstrap.error_type);
+                            if !is_error_type
+                                || !missing_generic_metadata.is_empty()
+                                || reference_record.kind != SyntaxKind::TypeReference
+                                || reference_record.flags.0 != 0
+                                || reference_record.range.start != reference_record.range.end
+                                || reference_data.type_arguments.is_some()
+                                || name_record.kind != SyntaxKind::Identifier
+                                || name_record.flags.0 != NODE_FLAG_HAS_ERROR
+                                || name_record.parent != Some(reference.node)
+                                || name_record.range != reference_record.range
+                                || self
+                                    .store
+                                    .symbol_node_links(reference)
+                                    .is_some_and(|links| links.resolved_symbol.is_some())
+                                || self
+                                    .store
+                                    .symbol_node_links(name)
+                                    .is_some_and(|links| links.resolved_symbol.is_some())
+                            {
+                                return Err(type_node_unavailable(
+                                    TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
+                                ));
+                            }
+                            return Ok(());
+                        }
+                    }
                     let Some(target) = self
                         .store
                         .symbol_node_links(reference)
@@ -5252,6 +5293,18 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 type_arguments.push(argument);
             }
         }
+        if !qualified
+            && name_text.is_empty()
+            && self.plan_parser_recovered_type_alias_reference(
+                node,
+                name,
+                alias_owner,
+                union_constituent,
+                &type_arguments,
+            )?
+        {
+            return Ok(());
+        }
         if record_heritage
             && (qualified
                 || name_text != "Record"
@@ -5771,6 +5824,69 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 .map_err(type_construction_error)?;
         }
         Ok(())
+    }
+
+    fn plan_parser_recovered_type_alias_reference(
+        &mut self,
+        node: NodeRef,
+        name: NodeRef,
+        alias_owner: Option<SemanticSymbolId>,
+        union_constituent: bool,
+        type_arguments: &[NodeRef],
+    ) -> Result<bool, DeclaredTypeError> {
+        let Some(owner) = alias_owner else {
+            return Ok(false);
+        };
+        if union_constituent || !type_arguments.is_empty() {
+            return Ok(false);
+        }
+
+        let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node));
+        let reference = preflight_node(self.store, self.host, node)?;
+        let missing = preflight_node(self.store, self.host, name)?;
+        let NodeData::Identifier(identifier) = &missing.data else {
+            return Ok(false);
+        };
+        let Some(declaration_id) = reference.parent else {
+            return Ok(false);
+        };
+        let declaration = NodeRef::new(node.arena, node.file, declaration_id);
+        let declaration_record = preflight_node(self.store, self.host, declaration)?;
+        let NodeData::TypeAliasDeclaration(alias) = &declaration_record.data else {
+            return Ok(false);
+        };
+        let Some(bound) = self.host.bound_file(declaration) else {
+            return Err(invalid());
+        };
+
+        if reference.kind != SyntaxKind::TypeReference
+            || reference.flags.0 != 0
+            || reference.range.start != reference.range.end
+            || missing.kind != SyntaxKind::Identifier
+            || missing.flags.0 != NODE_FLAG_HAS_ERROR
+            || missing.parent != Some(node.node)
+            || missing.range != reference.range
+            || !identifier.text.is_empty()
+            || identifier.flow_node.is_some()
+            || declaration_record.kind != SyntaxKind::TypeAliasDeclaration
+            || alias.type_ != node.node
+            || bound
+                .symbol(declaration)
+                .and_then(|symbol| self.store.get_merged_symbol(symbol))
+                != Some(owner)
+            || self
+                .store
+                .symbol(owner)
+                .is_none_or(|record| record.flags() != SymbolFlags::TYPE_ALIAS)
+        {
+            return Err(invalid());
+        }
+        if let Some(existing) = self.plan.recovered_missing_references.insert(node, name)
+            && existing != name
+        {
+            return Err(invalid());
+        }
+        Ok(true)
     }
 
     fn plan_missing_source_constraint_reference(
@@ -13164,13 +13280,15 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         if !self.store.set_type_node_links(node, links) {
             return Err(invalid());
         }
-        self.diagnostics.add(
-            Some(name),
-            Diagnostic::with_arguments(
-                message_by_code(2304).expect("TS2304 is in the diagnostic catalog"),
-                [identifier.text.clone()],
-            ),
-        );
+        if !identifier.text.is_empty() {
+            self.diagnostics.add(
+                Some(name),
+                Diagnostic::with_arguments(
+                    message_by_code(2304).expect("TS2304 is in the diagnostic catalog"),
+                    [identifier.text.clone()],
+                ),
+            );
+        }
         Ok(error_type)
     }
 
@@ -20659,6 +20777,67 @@ mod tests {
             assert_eq!(store_state(&fixture.store), before);
             assert!(diagnostics.is_empty());
         }
+    }
+
+    #[test]
+    fn parser_recovered_missing_type_alias_reference_uses_error_type_without_name_diagnostics() {
+        let mut fixture = fixture_with_mutation("type Recovered = Missing;", |parsed| {
+            let (reference, name) = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::TypeReferenceNode(reference) = &record.data else {
+                        return None;
+                    };
+                    Some((node, reference.type_name))
+                })
+                .expect("fixture has one type reference");
+            let position = parsed.arena.get(reference).unwrap().range.start;
+            let range = TextRange::new(position, position);
+            parsed.arena.get_mut(reference).unwrap().range = range;
+            let missing = parsed.arena.get_mut(name).unwrap();
+            missing.flags = NodeFlags(NODE_FLAG_HAS_ERROR);
+            missing.range = range;
+            let NodeData::Identifier(identifier) = &mut missing.data else {
+                panic!("type reference must have an identifier")
+            };
+            identifier.text.clear();
+        });
+        let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Recovered");
+        let reference = alias_parts(&fixture, "Recovered").2;
+        let error_type = fixture.store.intrinsic_bootstrap().unwrap().error_type;
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(error_type)
+        );
+        assert_eq!(
+            fixture
+                .store
+                .type_node_links(reference)
+                .and_then(|links| links.resolved_type),
+            Some(error_type)
+        );
+        assert!(diagnostics.is_empty());
+
+        let warm = store_state(&fixture.store);
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(error_type)
+        );
+        assert_eq!(store_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
     }
 
     #[test]
