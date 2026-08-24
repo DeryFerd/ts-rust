@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use ts_ast::{NodeRef, SyntaxKind};
+use ts_ast::{NodeId, NodeRef, SyntaxKind};
 use ts_binder::{
     CheckFlags, EscapedName, InternalSymbolName, SemanticSymbolId, SymbolFlags, SymbolTableId,
     semantic::PreparedSymbolTable,
@@ -1053,7 +1053,7 @@ fn declared_members(
     })
 }
 
-fn valid_index_symbol(
+pub(super) fn valid_index_symbol(
     store: &CanonicalTypeMapperStore,
     owner: SemanticSymbolId,
     owner_declarations: &[NodeRef],
@@ -1078,7 +1078,7 @@ fn valid_index_symbol(
         || record.value_declaration().is_some()
         || record.members().is_some()
         || record.exports().is_some()
-        || record.parent() != Some(owner)
+        || store.get_parent_of_symbol(symbol) != Some(owner)
         || record.export_symbol().is_some()
         || store.get_merged_symbol(symbol) != Some(symbol)
         || declarations.len() != indexes.len()
@@ -1389,12 +1389,8 @@ fn valid_interface_method_signatures(
         };
         let callable = store.signature(signature)?;
         let return_type = callable.resolved_return_type()?;
-        let annotation = store.source_primitive_type_annotation(declaration)?;
+        let annotation = store.source_direct_type_annotation(declaration)?;
         let cached_parameter_types = store.callable_signature_parameter_types(signature);
-        let required_parameters = callable
-            .parameters()
-            .len()
-            .checked_sub(usize::from(callable.has_rest_parameter()))?;
         if !seen_signatures.insert(signature)
             || !owner_declarations.contains(&owner_declaration)
             || store.source_node_kind(owner_declaration) != Some(SyntaxKind::InterfaceDeclaration)
@@ -1405,7 +1401,6 @@ fn valid_interface_method_signatures(
             || callable.declaration() != Some(declaration)
             || !callable.type_parameters().is_empty()
             || callable.this_parameter().is_some()
-            || usize::try_from(callable.min_argument_count()).ok() != Some(required_parameters)
             || callable.resolved_min_argument_count() != -1
             || callable.resolved_type_predicate().is_some()
             || callable.target().is_some()
@@ -1415,7 +1410,7 @@ fn valid_interface_method_signatures(
             || store.signature_has_circular_return_type(signature)
             || cached_parameter_types
                 .is_some_and(|parameters| parameters.len() != callable.parameters().len())
-            || !valid_call_return_annotation(store, annotation, false, return_type)
+            || !store.source_direct_type_annotation_is_exact(annotation, return_type)
             || store.signature_links(declaration)
                 != Some(&SignatureLinks {
                     resolved_signature: ResolvedSignatureState::Resolved(signature),
@@ -1426,6 +1421,7 @@ fn valid_interface_method_signatures(
         }
 
         let mut seen_parameters = HashSet::with_capacity(callable.parameters().len());
+        let mut required_parameters = 0usize;
         for (index, parameter) in callable.parameters().iter().copied().enumerate() {
             let record = store.symbol(parameter)?;
             let [parameter_declaration] = record.declarations()? else {
@@ -1433,6 +1429,19 @@ fn valid_interface_method_signatures(
             };
             let links = store.value_symbol_links(parameter)?;
             let parameter_type = links.resolved_type?;
+            let annotation = store.source_direct_type_annotation(*parameter_declaration)?;
+            let optional = annotation
+                .node
+                .index()
+                .checked_sub(1)
+                .and_then(|node| u32::try_from(node).ok())
+                .map(|node| NodeRef::new(annotation.arena, annotation.file, NodeId::new(node)))
+                .is_some_and(|token| {
+                    store.source_node_kind(token) == Some(SyntaxKind::QuestionToken)
+                        && store.source_node_parent(token)
+                            == Some(SourceNodeParent::Parent(*parameter_declaration))
+                });
+            let rest = callable.has_rest_parameter() && index + 1 == callable.parameters().len();
             if !seen_parameters.insert(parameter)
                 || record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
                 || record.check_flags() != CheckFlags::NONE
@@ -1453,9 +1462,17 @@ fn valid_interface_method_signatures(
                     })
                 || cached_parameter_types
                     .is_some_and(|parameters| parameters[index] != parameter_type)
+                || !store.source_direct_type_annotation_is_exact(annotation, parameter_type)
+                || rest && optional
             {
                 return None;
             }
+            if !optional && !rest {
+                required_parameters = required_parameters.checked_add(1)?;
+            }
+        }
+        if usize::try_from(callable.min_argument_count()).ok() != Some(required_parameters) {
+            return None;
         }
     }
     Some(signatures)
@@ -2456,6 +2473,46 @@ mod tests {
             base,
             derived
         ));
+    }
+
+    #[test]
+    fn interface_methods_keep_optional_parameter_arity() {
+        let mut fixture =
+            fixture_with_source("interface Base { method(value?: string): string }", 809);
+        let owner = interface_symbol(&fixture, "Base");
+        let host = host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        let plan = object_members::plan_interface(&fixture.store, &host, owner).unwrap();
+        let flags = fixture.store.symbol(owner).unwrap().flags();
+        get_declared_class_interface_or_type_parameter(&mut fixture.store, &host, owner, flags)
+            .unwrap()
+            .unwrap();
+        let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+
+        let values = object_members::publish_interface_method_values(
+            &mut fixture.store,
+            &plan,
+            &[ResolvedCallSignatureTypes {
+                parameter_types: vec![string],
+                return_type: string,
+            }],
+        )
+        .unwrap();
+
+        let method = plan.methods[0].symbol;
+        let signature = valid_interface_method_value(&fixture.store, method, values[0])
+            .expect("an optional method parameter must retain a valid source signature");
+        assert_eq!(
+            fixture
+                .store
+                .signature(signature)
+                .unwrap()
+                .min_argument_count(),
+            0
+        );
+        assert!(valid_property_symbol(&fixture.store, method));
     }
 
     #[test]
