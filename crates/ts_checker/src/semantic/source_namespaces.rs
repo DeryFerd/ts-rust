@@ -60,6 +60,7 @@ pub(super) enum SourceNamespaceMemberPlan {
         declaration: NodeRef,
         symbol: SemanticSymbolId,
         annotation: NodeRef,
+        deferred: bool,
     },
     Interface {
         declaration: NodeRef,
@@ -2122,11 +2123,140 @@ fn plan_type_alias_member(
             annotation_record.parent,
         ));
     }
+    let deferred = bound
+        .source_facts()
+        .is_some_and(ts_binder::CanonicalSourceFileFacts::is_declaration_file)
+        && annotation_record.kind != SyntaxKind::IntrinsicKeyword
+        && alias
+            .type_parameters
+            .as_ref()
+            .is_some_and(|parameters| !parameters.nodes.is_empty());
+    let deferred = if deferred {
+        let parameters = alias
+            .type_parameters
+            .as_ref()
+            .expect("generic aliases retain their type parameters");
+        match DeferredAmbientFunctionValidator::new(arena, bound, store).type_alias(
+            declaration,
+            owner,
+            symbol,
+            parameters,
+            annotation,
+        ) {
+            Ok(()) => {
+                let mut references_are_bound = deferred_namespace_alias_references_are_bound(
+                    arena, bound, store, owner, annotation,
+                )?;
+                for parameter in &parameters.nodes {
+                    let parameter = child(declaration, *parameter);
+                    let NodeData::TypeParameterDeclaration(data) =
+                        &owned_node(arena, bound, store, parameter)?.data
+                    else {
+                        return Err(SourceCheckError::Provenance(
+                            SourceCheckProvenanceError::MissingDeclarationSymbol(parameter),
+                        ));
+                    };
+                    for annotation in [data.constraint, data.default_type].into_iter().flatten() {
+                        references_are_bound &= deferred_namespace_alias_references_are_bound(
+                            arena,
+                            bound,
+                            store,
+                            owner,
+                            child(parameter, annotation),
+                        )?;
+                    }
+                }
+                references_are_bound
+            }
+            Err(SourceCheckError::Unsupported(_)) => false,
+            Err(error) => return Err(error),
+        }
+    } else {
+        false
+    };
     Ok(SourceNamespaceMemberPlan::TypeAlias {
         declaration,
         symbol,
         annotation,
+        deferred,
     })
+}
+
+fn deferred_namespace_alias_references_are_bound(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    namespace: SemanticSymbolId,
+    annotation: NodeRef,
+) -> Result<bool, SourceCheckError> {
+    let mut pending = vec![annotation];
+    let mut visited = HashSet::new();
+    while let Some(node) = pending.pop() {
+        if !visited.insert(node) {
+            return Err(SourceCheckError::Provenance(
+                SourceCheckProvenanceError::RepeatedNode(node),
+            ));
+        }
+        let record = owned_node(arena, bound, store, node)?;
+        if let NodeData::TypeReferenceNode(reference) = &record.data {
+            let Some(target) = namespace_interface_heritage_symbol(
+                arena,
+                bound,
+                store,
+                namespace,
+                child(node, reference.type_name),
+            )?
+            else {
+                return Ok(false);
+            };
+            let Some(target_record) = store.symbol(target) else {
+                return Ok(false);
+            };
+            let argument_count = reference
+                .type_arguments
+                .as_ref()
+                .map_or(0, |arguments| arguments.nodes.len());
+            if target_record.flags().contains(SymbolFlags::TYPE_PARAMETER) {
+                if argument_count != 0 {
+                    return Ok(false);
+                }
+            } else if target_record
+                .flags()
+                .intersects(SymbolFlags::TYPE_ALIAS | SymbolFlags::INTERFACE | SymbolFlags::CLASS)
+                && let Some(declaration) = target_record
+                    .declarations()
+                    .and_then(|declarations| declarations.first())
+                    .filter(|declaration| declaration.is_for(arena.id(), bound.file_id()))
+                && let Some(declaration_record) = arena.get(declaration.node)
+            {
+                let parameters = match &declaration_record.data {
+                    NodeData::TypeAliasDeclaration(alias) => alias.type_parameters.as_ref(),
+                    NodeData::InterfaceDeclaration(interface) => interface.type_parameters.as_ref(),
+                    NodeData::ClassDeclaration(class) => class.type_parameters.as_ref(),
+                    _ => None,
+                };
+                let maximum = parameters.map_or(0, |parameters| parameters.nodes.len());
+                let minimum = parameters.map_or(0, |parameters| {
+                    parameters
+                        .nodes
+                        .iter()
+                        .filter(|parameter| {
+                            matches!(
+                                arena.get(**parameter).map(|parameter| &parameter.data),
+                                Some(NodeData::TypeParameterDeclaration(parameter))
+                                    if parameter.default_type.is_none()
+                            )
+                        })
+                        .count()
+                });
+                if argument_count < minimum || argument_count > maximum {
+                    return Ok(false);
+                }
+            }
+        }
+        record.for_each_child(|nested| pending.push(child(node, nested)));
+    }
+    Ok(true)
 }
 
 fn namespace_callable_error(declaration: NodeRef, error: SourceCallableError) -> SourceCheckError {
@@ -2268,6 +2398,87 @@ impl<'a> DeferredAmbientFunctionValidator<'a> {
             ));
         }
         Ok(symbol)
+    }
+
+    fn type_alias(
+        &mut self,
+        declaration: NodeRef,
+        namespace: SemanticSymbolId,
+        symbol: SemanticSymbolId,
+        parameters: &NodeList,
+        annotation: NodeRef,
+    ) -> Result<(), SourceCheckError> {
+        let record = owned_node(self.arena, self.bound, self.store, declaration)?;
+        let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+            return Err(Self::invalid(declaration, record.kind));
+        };
+        let annotation_record = owned_node(self.arena, self.bound, self.store, annotation)?;
+        let name = self.identifier(declaration, child(declaration, alias.name))?;
+        let symbol_record = self
+            .store
+            .symbol(symbol)
+            .ok_or(SourceCheckError::Provenance(
+                SourceCheckProvenanceError::MissingDeclarationSymbol(declaration),
+            ))?;
+        if record.kind != SyntaxKind::TypeAliasDeclaration
+            || record.flags.0 != 0
+            || alias.flow_node.is_some()
+            || alias.local_symbol.is_some()
+            || alias.next_container.is_some()
+            || alias.symbol.is_some()
+            || parameters.nodes.is_empty()
+            || parameters.has_trailing_comma
+            || parameters.range.start < record.range.start
+            || parameters.range.end > annotation_record.range.start
+            || symbol_record.flags() != SymbolFlags::TYPE_ALIAS
+            || symbol_record.check_flags() != CheckFlags::NONE
+            || symbol_record.name().as_utf8() != Some(name.as_str())
+            || symbol_record.declarations() != Some(&[declaration])
+            || symbol_record.value_declaration().is_some()
+            || symbol_record.members().is_some()
+            || symbol_record.exports().is_some()
+            || symbol_record.export_symbol().is_some()
+            || self
+                .bound
+                .symbol(declaration)
+                .and_then(|bound_symbol| self.store.get_merged_symbol(bound_symbol))
+                != Some(symbol)
+            || self.store.get_parent_of_symbol(symbol) != Some(namespace)
+            || self
+                .store
+                .symbol(namespace)
+                .and_then(ts_binder::semantic::Symbol::exports)
+                .and_then(|exports| self.store.symbol_table(exports))
+                .and_then(|exports| exports.get(symbol_record.name()))
+                .and_then(|export| self.store.get_merged_symbol(export))
+                != Some(symbol)
+        {
+            return Err(SourceCheckError::Provenance(
+                SourceCheckProvenanceError::MissingDeclarationSymbol(declaration),
+            ));
+        }
+
+        let mut names = HashSet::with_capacity(parameters.nodes.len());
+        let mut default_seen = false;
+        for parameter in &parameters.nodes {
+            let parameter = child(declaration, *parameter);
+            let (_, has_default) = self.type_parameter(declaration, parameter, &mut names)?;
+            if default_seen && !has_default {
+                return Err(Self::invalid(parameter, SyntaxKind::TypeParameter));
+            }
+            default_seen |= has_default;
+        }
+        if self
+            .bound
+            .locals(declaration)
+            .and_then(|locals| self.store.symbol_table(locals))
+            .map_or(0, ts_binder::semantic::SymbolTable::len)
+            != parameters.nodes.len()
+        {
+            return Err(Self::invalid(declaration, record.kind));
+        }
+
+        self.type_node(declaration, annotation)
     }
 
     fn type_parameter(
@@ -2629,6 +2840,45 @@ impl<'a> DeferredAmbientFunctionValidator<'a> {
                 }
                 return Ok(());
             }
+            NodeData::MethodSignatureDeclaration(method) => {
+                if record.kind != SyntaxKind::MethodSignature
+                    || method.full_signature.is_some()
+                    || method.next_container.is_some()
+                    || method.symbol.is_some()
+                    || method.modifiers.is_some()
+                {
+                    return Err(Self::invalid(node, record.kind));
+                }
+                let name = self.identifier(node, child(node, method.name))?;
+                let optional = if let Some(token) = method.postfix_token {
+                    let token = child(node, token);
+                    if self.visit(node, token)?.kind != SyntaxKind::QuestionToken {
+                        return Err(Self::invalid(token, SyntaxKind::QuestionToken));
+                    }
+                    true
+                } else {
+                    false
+                };
+                let flags = SymbolFlags::METHOD
+                    | if optional {
+                        SymbolFlags::OPTIONAL
+                    } else {
+                        SymbolFlags::NONE
+                    };
+                self.type_literal_member_symbol(
+                    parent,
+                    node,
+                    EscapedName::source(&name).as_ref(),
+                    flags,
+                )?;
+                self.signature(
+                    node,
+                    method.type_parameters.as_ref(),
+                    &method.parameters,
+                    method.type_,
+                )?;
+                return Ok(());
+            }
             NodeData::PropertyDeclaration(property) => {
                 if record.kind != SyntaxKind::PropertyDeclaration
                     || property.initializer.is_some()
@@ -2722,6 +2972,45 @@ impl<'a> DeferredAmbientFunctionValidator<'a> {
                     for member in &members.nodes {
                         self.type_node(node, child(node, *member))?;
                     }
+                }
+                return Ok(());
+            }
+            NodeData::InferTypeNode(infer) => {
+                if record.kind != SyntaxKind::InferType {
+                    return Err(Self::invalid(node, record.kind));
+                }
+                let parameter = child(node, infer.type_parameter);
+                let parameter_record = self.visit(node, parameter)?;
+                let NodeData::TypeParameterDeclaration(data) = &parameter_record.data else {
+                    return Err(Self::invalid(parameter, parameter_record.kind));
+                };
+                if parameter_record.kind != SyntaxKind::TypeParameter
+                    || data.default_type.is_some()
+                    || data.expression.is_some()
+                    || data.modifiers.is_some()
+                    || data.symbol.is_some()
+                {
+                    return Err(Self::invalid(parameter, parameter_record.kind));
+                }
+                let name = self.identifier(parameter, child(parameter, data.name))?;
+                let mut current = node;
+                let container = loop {
+                    let current_record = owned_node(self.arena, self.bound, self.store, current)?;
+                    let Some(parent) = current_record.parent else {
+                        return Err(Self::invalid(node, record.kind));
+                    };
+                    let parent = child(current, parent);
+                    let parent_record = owned_node(self.arena, self.bound, self.store, parent)?;
+                    if let NodeData::ConditionalTypeNode(conditional) = &parent_record.data
+                        && conditional.extends_type == current.node
+                    {
+                        break parent;
+                    }
+                    current = parent;
+                };
+                self.local_symbol(container, parameter, &name, SymbolFlags::TYPE_PARAMETER)?;
+                if let Some(constraint) = data.constraint {
+                    self.type_node(parameter, child(parameter, constraint))?;
                 }
                 return Ok(());
             }
@@ -6281,9 +6570,16 @@ fn namespace_annotations<'plan>(
             SourceNamespaceMemberPlan::Namespace(namespace) => {
                 namespace_annotations(namespace, annotations, declarations, diagnostics);
             }
-            SourceNamespaceMemberPlan::TypeAlias { annotation, .. }
+            SourceNamespaceMemberPlan::TypeAlias {
+                annotation,
+                deferred: false,
+                ..
+            }
             | SourceNamespaceMemberPlan::AmbientVariable { annotation, .. } => {
                 annotations.push(*annotation);
+                declarations.push(member);
+            }
+            SourceNamespaceMemberPlan::TypeAlias { deferred: true, .. } => {
                 declarations.push(member);
             }
             SourceNamespaceMemberPlan::Interface {
@@ -7302,16 +7598,26 @@ pub(super) fn execute_source_namespace(
     for declaration in declarations {
         session.reset_query();
         match declaration {
-            SourceNamespaceMemberPlan::TypeAlias { symbol, .. } => {
-                CanonicalTypeQuery::new_with_global_types_and_session(
-                    store,
-                    host,
-                    global_types,
-                    options,
-                    session,
-                    diagnostics,
-                )?
-                .get_declared_type_of_symbol(*symbol)?;
+            SourceNamespaceMemberPlan::TypeAlias {
+                symbol,
+                annotation,
+                deferred,
+                ..
+            } => {
+                if !*deferred
+                    || store.type_alias_links(*symbol).is_some()
+                    || store.type_node_links(*annotation).is_some()
+                {
+                    CanonicalTypeQuery::new_with_global_types_and_session(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        session,
+                        diagnostics,
+                    )?
+                    .get_declared_type_of_symbol(*symbol)?;
+                }
             }
             SourceNamespaceMemberPlan::Interface {
                 declaration,
@@ -7795,7 +8101,7 @@ mod tests {
 
     use super::*;
     use crate::semantic::{
-        CanonicalCheckerContext,
+        CanonicalCheckerContext, TypeAliasLinks,
         instantiate::{InstantiationLimits, InstantiationSession},
         production::GlobalMergeCompletion,
     };
@@ -9508,6 +9814,429 @@ mod tests {
         assert!(execute(&mut fixture, &plan).unwrap().is_empty());
         assert_eq!(
             fixture.context.store().checker_link_allocated_lengths(),
+            before,
+        );
+    }
+
+    #[test]
+    fn ambient_generic_namespace_aliases_keep_mapped_inferred_and_intersection_types_cold() {
+        let mut fixture = declaration_fixture(
+            concat!(
+                "declare module 'prop-types' { ",
+                "export interface Validator<T> {} ",
+                "export type InferType<V> = V extends Validator<infer T> ? T : never; ",
+                "export type RequiredKeys<V> = ",
+                "{ [K in keyof V]: V[K] extends Validator<infer T> ? T : never }[keyof V]; ",
+                "export type InferPropsInner<V> = { [K in keyof V]: InferType<V[K]> }; ",
+                "export type InferProps<V> = InferPropsInner<V> & InferPropsInner<V>; ",
+                "}",
+            ),
+            CanonicalModuleState::Script,
+        );
+        let namespace = plan(&fixture, 0);
+        let aliases = namespace
+            .members
+            .iter()
+            .filter_map(|member| match member {
+                SourceNamespaceMemberPlan::TypeAlias {
+                    declaration,
+                    symbol,
+                    annotation,
+                    deferred,
+                } => Some((*declaration, *symbol, *annotation, *deferred)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(aliases.len(), 4);
+        let exports = fixture
+            .context
+            .store()
+            .symbol(namespace.symbol)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| fixture.context.store().symbol_table(exports))
+            .unwrap();
+        for (declaration, symbol, annotation, deferred) in &aliases {
+            let owner = fixture.context.store().symbol(*symbol).unwrap();
+            assert!(*deferred, "{:?}", owner.name());
+            assert_eq!(exports.get(owner.name()), Some(*symbol));
+            assert_eq!(owner.declarations(), Some(&[*declaration][..]));
+            assert!(fixture.context.store().type_alias_links(*symbol).is_none());
+            assert!(
+                fixture
+                    .context
+                    .store()
+                    .type_node_links(*annotation)
+                    .is_none()
+            );
+        }
+
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        for (_, symbol, annotation, _) in &aliases {
+            assert!(fixture.context.store().type_alias_links(*symbol).is_none());
+            assert!(
+                fixture
+                    .context
+                    .store()
+                    .type_node_links(*annotation)
+                    .is_none()
+            );
+        }
+
+        let warm = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn source_check_keeps_unreferenced_ambient_generic_aliases_cold() {
+        let mut fixture = declaration_fixture(
+            concat!(
+                "declare module 'prop-types' { ",
+                "export type InferProps<V> = V & V; ",
+                "}",
+            ),
+            CanonicalModuleState::Script,
+        );
+        let namespace = plan(&fixture, 0);
+        let [
+            SourceNamespaceMemberPlan::TypeAlias {
+                symbol,
+                annotation,
+                deferred,
+                ..
+            },
+        ] = namespace.members.as_slice()
+        else {
+            panic!("the declaration module must retain its generic alias")
+        };
+        let symbol = *symbol;
+        let annotation = *annotation;
+        assert!(*deferred);
+        let before = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+        );
+
+        fixture.context.check_source_file(fixture.file).unwrap();
+
+        assert!(fixture.context.store().type_alias_links(symbol).is_none());
+        assert!(
+            fixture
+                .context
+                .store()
+                .type_node_links(annotation)
+                .is_none()
+        );
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+            ),
+            before,
+        );
+    }
+
+    #[test]
+    fn ambient_generic_namespace_aliases_materialize_when_an_export_uses_them() {
+        let mut fixture = declaration_fixture(
+            concat!(
+                "declare module 'prop-types' { ",
+                "export type Value<T> = T; ",
+                "export const value: Value<string>; ",
+                "}",
+            ),
+            CanonicalModuleState::Script,
+        );
+        let namespace = plan(&fixture, 0);
+        let [
+            SourceNamespaceMemberPlan::TypeAlias {
+                symbol: alias,
+                deferred,
+                ..
+            },
+            SourceNamespaceMemberPlan::AmbientVariable { symbol: value, .. },
+        ] = namespace.members.as_slice()
+        else {
+            panic!("the declaration module must retain its alias and typed export")
+        };
+        let alias = *alias;
+        let value = *value;
+        assert!(*deferred);
+        assert!(fixture.context.store().type_alias_links(alias).is_none());
+
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        assert!(
+            fixture
+                .context
+                .store()
+                .type_alias_links(alias)
+                .and_then(|links| links.declared_type)
+                .is_some()
+        );
+        assert_eq!(
+            fixture
+                .context
+                .store()
+                .value_symbol_links(value)
+                .and_then(|links| links.resolved_type),
+            Some(
+                fixture
+                    .context
+                    .store()
+                    .intrinsic_bootstrap()
+                    .unwrap()
+                    .string_type
+            ),
+        );
+
+        let warm = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn ambient_generic_namespace_aliases_reject_forged_owner_and_parameter_symbols() {
+        for mutation in 0..4 {
+            let mut fixture = declaration_fixture(
+                "declare module 'prop-types' { export type Value<T> = T; }",
+                CanonicalModuleState::Script,
+            );
+            let namespace = plan(&fixture, 0);
+            let [
+                SourceNamespaceMemberPlan::TypeAlias {
+                    declaration: alias_declaration,
+                    symbol,
+                    deferred,
+                    ..
+                },
+            ] = namespace.members.as_slice()
+            else {
+                panic!("the declaration module must retain its generic alias")
+            };
+            assert!(*deferred);
+            let alias_declaration = *alias_declaration;
+            let symbol = *symbol;
+            let NodeData::TypeAliasDeclaration(alias) = &fixture
+                .parsed
+                .arena
+                .get(alias_declaration.node)
+                .unwrap()
+                .data
+            else {
+                panic!("the alias symbol must retain its declaration")
+            };
+            let parameter = child(
+                alias_declaration,
+                alias.type_parameters.as_ref().unwrap().nodes[0],
+            );
+            let parameter_symbol = fixture
+                .context
+                .file(fixture.file)
+                .unwrap()
+                .1
+                .symbol(parameter)
+                .unwrap();
+            let expected = if mutation < 2 {
+                alias_declaration
+            } else {
+                parameter
+            };
+            let store = fixture.context.store_mut_for_test();
+            match mutation {
+                0 => assert!(store.set_symbol_flags(
+                    symbol,
+                    SymbolFlags::TYPE_ALIAS | SymbolFlags::PROPERTY,
+                    CheckFlags::NONE,
+                )),
+                1 => assert!(store.set_symbol_relationships(symbol, None, None, None, None)),
+                2 => assert!(store.set_symbol_flags(
+                    parameter_symbol,
+                    SymbolFlags::TYPE_PARAMETER | SymbolFlags::PROPERTY,
+                    CheckFlags::NONE,
+                )),
+                3 => assert!(store.set_symbol_relationships(
+                    parameter_symbol,
+                    None,
+                    None,
+                    Some(symbol),
+                    None,
+                )),
+                _ => unreachable!(),
+            }
+            let before = (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            );
+            let root = declaration(&fixture, 0);
+            let (arena, bound) = fixture.context.file(fixture.file).unwrap();
+
+            assert!(matches!(
+                plan_source_namespace(arena, bound, fixture.context.store(), root),
+                Err(SourceCheckError::Provenance(
+                    SourceCheckProvenanceError::MissingDeclarationSymbol(node),
+                )) if node == expected
+            ));
+            assert!(fixture.context.store().type_alias_links(symbol).is_none());
+            assert_eq!(
+                (
+                    fixture.context.store().type_len(),
+                    fixture.context.store().symbol_len(),
+                    fixture.context.store().checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+        }
+    }
+
+    #[test]
+    fn ambient_generic_namespace_aliases_do_not_hide_missing_type_names() {
+        for source in [
+            "declare module 'prop-types' { export type Broken<T> = Missing<T>; }",
+            "declare module 'prop-types' { export type Broken<T extends Missing> = T; }",
+            "declare module 'prop-types' { export type Broken<T = Missing> = T; }",
+        ] {
+            let mut fixture = declaration_fixture(source, CanonicalModuleState::Script);
+            let namespace = plan(&fixture, 0);
+            let [
+                SourceNamespaceMemberPlan::TypeAlias {
+                    symbol, deferred, ..
+                },
+            ] = namespace.members.as_slice()
+            else {
+                panic!("the declaration module must retain its unresolved generic alias")
+            };
+            let symbol = *symbol;
+            assert!(!*deferred, "{source}");
+            let before = (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            );
+
+            assert!(
+                matches!(
+                    execute(&mut fixture, &namespace),
+                    Err(SourceCheckError::DeclaredType(
+                        DeclaredTypeError::TypeNodeUnavailable(
+                            TypeNodeUnavailable::MissingTypeReference(_)
+                        )
+                    ))
+                ),
+                "{source}",
+            );
+            assert!(fixture.context.store().type_alias_links(symbol).is_none());
+            assert_eq!(
+                (
+                    fixture.context.store().type_len(),
+                    fixture.context.store().symbol_len(),
+                    fixture.context.store().checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+        }
+    }
+
+    #[test]
+    fn ambient_generic_namespace_aliases_keep_invalid_reference_arity_eager() {
+        let fixture = declaration_fixture(
+            concat!(
+                "declare module 'prop-types' { ",
+                "export type Value<T> = T; ",
+                "export type Broken<T> = Value<T, T>; ",
+                "}",
+            ),
+            CanonicalModuleState::Script,
+        );
+        let namespace = plan(&fixture, 0);
+        let [
+            SourceNamespaceMemberPlan::TypeAlias {
+                deferred: valid, ..
+            },
+            SourceNamespaceMemberPlan::TypeAlias {
+                deferred: invalid, ..
+            },
+        ] = namespace.members.as_slice()
+        else {
+            panic!("the declaration module must retain both generic aliases")
+        };
+
+        assert!(*valid);
+        assert!(!*invalid);
+    }
+
+    #[test]
+    fn ambient_generic_namespace_aliases_reject_invalid_cached_metadata() {
+        let mut fixture = declaration_fixture(
+            "declare module 'prop-types' { export type Value<T> = T; }",
+            CanonicalModuleState::Script,
+        );
+        let namespace = plan(&fixture, 0);
+        let [
+            SourceNamespaceMemberPlan::TypeAlias {
+                symbol, deferred, ..
+            },
+        ] = namespace.members.as_slice()
+        else {
+            panic!("the declaration module must retain its generic alias")
+        };
+        let symbol = *symbol;
+        assert!(*deferred);
+        let string = fixture
+            .context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .string_type;
+        assert!(fixture.context.store_mut_for_test().set_type_alias_links(
+            symbol,
+            TypeAliasLinks {
+                declared_type: Some(string),
+                ..TypeAliasLinks::default()
+            },
+        ));
+        let before = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+
+        assert!(matches!(
+            execute(&mut fixture, &namespace),
+            Err(SourceCheckError::DeclaredType(
+                DeclaredTypeError::TypeNodeUnavailable(TypeNodeUnavailable::InvalidCachedTypeAlias(
+                    alias,
+                ))
+            )) if alias == symbol
+        ));
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
             before,
         );
     }

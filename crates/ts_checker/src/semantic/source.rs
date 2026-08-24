@@ -20201,6 +20201,13 @@ fn preflight_source_namespace_annotations(
                     nested,
                 )?;
             }
+            SourceNamespaceMemberPlan::TypeAlias {
+                symbol,
+                annotation,
+                deferred: true,
+                ..
+            } if store.type_alias_links(*symbol).is_none()
+                && store.type_node_links(*annotation).is_none() => {}
             SourceNamespaceMemberPlan::TypeAlias { annotation, .. }
             | SourceNamespaceMemberPlan::AmbientVariable { annotation, .. } => {
                 session.reset_query();
