@@ -20313,10 +20313,19 @@ pub(super) fn check_source_file(
                 current_flow_types.insert(assignment.target_symbol, current_flow_type);
             }
             PlannedStatement::CommonJsAssignment(assignment) => {
+                let expected_flags = match &assignment.right.kind {
+                    PlannedExpressionKind::Identifier(_) => SymbolFlags::ALIAS,
+                    PlannedExpressionKind::Object { .. } => SymbolFlags::PROPERTY,
+                    _ => {
+                        return Err(SourceCheckError::Assignment(
+                            AssignmentInvariant::InvalidSymbolShape(assignment.target_symbol),
+                        ));
+                    }
+                };
                 if bound.symbol(assignment.expression) != Some(assignment.target_symbol)
                     || store
                         .symbol(assignment.target_symbol)
-                        .is_none_or(|symbol| !symbol.flags().contains(SymbolFlags::ALIAS))
+                        .is_none_or(|symbol| !symbol.flags().contains(expected_flags))
                 {
                     return Err(SourceCheckError::Assignment(
                         AssignmentInvariant::InvalidSymbolShape(assignment.target_symbol),
@@ -30262,6 +30271,52 @@ mod tests {
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn commonjs_assignment_publishes_object_literal_types_cold_and_warm() {
+        for (index, text) in [
+            "module.exports = {};",
+            "module.exports = { value: 1 };",
+            "const local = 1; module.exports = { value: local };",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = ts_parser::parse_javascript_source_file(text);
+            assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+            let file = FileId::new(8_390 + u32::try_from(index).unwrap());
+            let mut context = javascript_context(file, &source, CanonicalCheckerOptions::default());
+
+            context.check_source_file(file).unwrap();
+
+            let (left, right) = assignment_parts(&source, file, 0);
+            let expression = NodeRef::new(
+                source.arena.id(),
+                file,
+                source.arena.get(left.node).unwrap().parent.unwrap(),
+            );
+            let object_type = context
+                .store()
+                .type_node_links(right)
+                .and_then(|links| links.resolved_type)
+                .expect("the exported object retains its source type");
+            for node in [left, right, expression] {
+                assert_eq!(
+                    context
+                        .store()
+                        .type_node_links(node)
+                        .and_then(|links| links.resolved_type),
+                    Some(object_type),
+                    "{text}",
+                );
+            }
+            assert!(context.diagnostics().is_empty(), "{text}");
+
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm, "{text}");
+        }
     }
 
     #[test]

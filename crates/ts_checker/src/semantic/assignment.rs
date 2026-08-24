@@ -7,8 +7,8 @@
 //! declarations or admitted annotated uninitialized variables. Those
 //! routes independently revalidate their direct `var`/`let` AST and binder shape
 //! before admission.
-//! A separate `CommonJS` route admits only binder-authenticated
-//! `module.exports = local` assignments in JavaScript modules.
+//! A separate `CommonJS` route admits binder-authenticated assignments of
+//! local identifiers and object literals to `module.exports`.
 //! Name lookup follows the pinned lexical resolver and checker export/merge routing.
 //! Valid syntax outside that closure is a typed unsupported result; malformed AST,
 //! binder, or semantic-store provenance is an invariant failure.
@@ -38,7 +38,7 @@ pub(super) struct SimpleAssignmentPlan {
     pub target_type_node: Option<NodeRef>,
 }
 
-/// One binder-authenticated `module.exports = local` assignment.
+/// One binder-authenticated `module.exports` assignment.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct CommonJsAssignmentPlan {
     pub(super) expression: NodeRef,
@@ -420,12 +420,23 @@ impl CommonJsAssignmentPlanner<'_> {
         }
 
         let right_node = self.node(right)?;
-        let NodeData::Identifier(local_name) = &right_node.data else {
-            return Ok(None);
+        let local_name = match &right_node.data {
+            NodeData::Identifier(local_name) => {
+                if right_node.flags.0 != 0 || local_name.flow_node.is_some() {
+                    return Err(AssignmentInvariant::InvalidIdentifierShape(right).into());
+                }
+                Some(local_name.text.as_str())
+            }
+            NodeData::ObjectLiteralExpression(object)
+                if right_node.kind == SyntaxKind::ObjectLiteralExpression
+                    && right_node.flags.0 == 0
+                    && object.symbol.is_none()
+                    && object.facts == 0 =>
+            {
+                None
+            }
+            _ => return Ok(None),
         };
-        if right_node.flags.0 != 0 || local_name.flow_node.is_some() {
-            return Err(AssignmentInvariant::InvalidIdentifierShape(right).into());
-        }
 
         let source = self.bound.source_file();
         let source_symbol = self
@@ -472,9 +483,17 @@ impl CommonJsAssignmentPlanner<'_> {
             .into());
         }
 
-        self.validate_export_alias(expression, left, source_symbol, target_symbol)?;
+        self.validate_export_assignment(
+            expression,
+            left,
+            source_symbol,
+            target_symbol,
+            local_name.is_some(),
+        )?;
         self.validate_implicit_module(receiver, source_symbol)?;
-        self.validate_local_identifier(right, &local_name.text)?;
+        if let Some(local_name) = local_name {
+            self.validate_local_identifier(right, local_name)?;
+        }
 
         Ok(Some(CommonJsAssignmentPlan {
             expression,
@@ -484,12 +503,13 @@ impl CommonJsAssignmentPlanner<'_> {
         }))
     }
 
-    fn validate_export_alias(
+    fn validate_export_assignment(
         &self,
         expression: NodeRef,
         left: NodeRef,
         source_symbol: SemanticSymbolId,
         target_symbol: SemanticSymbolId,
+        alias: bool,
     ) -> Result<(), AssignmentPlanError> {
         let merged = self
             .store
@@ -526,10 +546,15 @@ impl CommonJsAssignmentPlanner<'_> {
         }
 
         let promoted_type_exports = record.flags().contains(SymbolFlags::NAMESPACE_MODULE);
-        let expected_flags = if promoted_type_exports {
-            SymbolFlags::ALIAS | SymbolFlags::NAMESPACE_MODULE
-        } else {
+        let assignment_flags = if alias {
             SymbolFlags::ALIAS
+        } else {
+            SymbolFlags::PROPERTY
+        };
+        let expected_flags = if promoted_type_exports {
+            assignment_flags | SymbolFlags::NAMESPACE_MODULE
+        } else {
+            assignment_flags
         };
         if record.flags() != expected_flags
             || record.check_flags() != CheckFlags::NONE
@@ -2211,6 +2236,38 @@ mod tests {
     }
 
     #[test]
+    fn plans_commonjs_object_literal_exports_without_semantic_writes() {
+        for source in [
+            "module.exports = {};",
+            "module.exports = { value: 1 };",
+            "const local = 1; module.exports = { value: local };",
+        ] {
+            let fixture = Fixture::javascript(source);
+            let statement = fixture.expression_statement(0);
+            let (expression, left, right) = assignment_parts(&fixture.parsed, statement);
+            let target_symbol = fixture.bound.symbol(expression).unwrap();
+            let before = observable_state(&fixture.store);
+
+            assert_eq!(
+                fixture.store.symbol(target_symbol).unwrap().flags(),
+                SymbolFlags::PROPERTY,
+                "{source}",
+            );
+            assert_eq!(
+                fixture.commonjs_plan(0),
+                Ok(Some(CommonJsAssignmentPlan {
+                    expression,
+                    left,
+                    right,
+                    target_symbol,
+                })),
+                "{source}",
+            );
+            assert_eq!(observable_state(&fixture.store), before, "{source}");
+        }
+    }
+
+    #[test]
     fn commonjs_export_alias_preserves_promoted_type_exports() {
         let mut parsed = parse_source_file(concat!(
             "type Exported = number; ",
@@ -2265,7 +2322,6 @@ mod tests {
         for source in [
             "const local = 1; exports.value = local;",
             "const local = 1; module.exports.value = local;",
-            "const local = 1; module.exports = { value: local };",
             r#"const local = 1; module["exports"] = local;"#,
             "const local = 1; module.exports = (local);",
             "const local = { value: 1 }; module.exports = local.value;",
