@@ -154,6 +154,8 @@ pub(super) fn source_call_argument_contextual_type(
     ) {
         return Ok(None);
     }
+    let callee_type =
+        specialize_readonly_array_concat_callee(store, global_types, plan, callee_type)?;
 
     let parameter_index = argument_index + usize::from(plan.form == DirectCallForm::TaggedTemplate);
 
@@ -241,6 +243,57 @@ pub(super) fn source_call_argument_contextual_type(
         }
     }
     Ok(None)
+}
+
+/// Specializes readonly concat calls whose declaration returns mutable arrays.
+fn specialize_readonly_array_concat_callee(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    plan: &SourceCallPlan,
+    callee_type: TypeId,
+) -> Result<TypeId, SourceCheckError> {
+    let PlannedExpressionKind::Property(property) = &plan.callee.unparenthesized().kind else {
+        return Ok(callee_type);
+    };
+    let Some(method) = store.type_payload(callee_type).and_then(TypeRecord::symbol) else {
+        return Ok(callee_type);
+    };
+    let Some(method_record) = store.symbol(method) else {
+        return Err(SourceCheckError::Call(plan.node));
+    };
+    if method_record.flags() != SymbolFlags::METHOD
+        || method_record.name().as_utf8() != Some("concat")
+        || store
+            .value_symbol_links(method)
+            .and_then(|links| links.resolved_type)
+            != Some(callee_type)
+    {
+        return Ok(callee_type);
+    }
+    if store
+        .authenticated_interface_method_owner(method)
+        .is_none_or(|(_, target)| target != global_types.readonly_array_type)
+    {
+        return Ok(callee_type);
+    }
+    let receiver = store
+        .type_node_links(property.receiver.node)
+        .and_then(|links| links.resolved_type)
+        .ok_or(SourceCheckError::Call(plan.node))?;
+    if store
+        .canonical_array_reference(global_types, receiver)?
+        .is_none_or(|array| !array.readonly)
+    {
+        return Ok(callee_type);
+    }
+
+    super::instantiated_members::instantiate_published_generic_interface_method(
+        store,
+        global_types,
+        receiver,
+        method,
+    )
+    .map_err(|_| SourceCheckError::Call(plan.node))
 }
 
 fn shared_overload_index_type(
@@ -3017,6 +3070,8 @@ pub(super) fn check_direct_source_call(
     if argument_types.len() != plan.arguments.len() {
         return Err(SourceCheckError::Call(plan.node));
     }
+    let callee_type =
+        specialize_readonly_array_concat_callee(store, global_types, plan, callee_type)?;
     let tagged_argument_types = if plan.form == DirectCallForm::TaggedTemplate {
         let template = tagged_template_argument_type(
             store,
@@ -4661,6 +4716,70 @@ mod tests {
                 .collect::<Vec<_>>(),
             cold_properties
         );
+    }
+
+    #[test]
+    fn readonly_array_concat_calls_publish_mutable_specialized_returns_cold_and_warm() {
+        let library = parsed(concat!(
+            "interface Array<T> {} ",
+            "interface ReadonlyArray<T> { ",
+            "concat(...items: ConcatArray<T>[]): T[]; ",
+            "concat(...items: (T | ConcatArray<T>)[]): T[]; ",
+            "} ",
+            "interface ConcatArray<T> {}",
+        ));
+        let source = parsed(concat!(
+            "declare const values: ReadonlyArray<number>; ",
+            "const result: number[] = values.concat();",
+        ));
+        let library_file = FileId::new(4_886);
+        let source_file = FileId::new(4_887);
+        let mut context =
+            context_with_default_library(&library, library_file, &source, source_file);
+
+        context.check_source_file(source_file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
+        let call_nodes = calls(&source, source_file);
+        let [call] = call_nodes.as_slice() else {
+            panic!("expected one readonly Array.concat call")
+        };
+        let call = *call;
+        let return_type = context
+            .store()
+            .type_node_links(call)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let array = context
+            .store()
+            .canonical_array_reference(context.global_types(), return_type)
+            .unwrap()
+            .unwrap();
+        assert!(!array.readonly);
+        assert_eq!(
+            array.element_type,
+            context.store().intrinsic_bootstrap().unwrap().number_type,
+        );
+        let signature = context
+            .store()
+            .signature_links(call)
+            .and_then(|links| links.resolved_signature.signature())
+            .unwrap();
+        assert!(
+            context
+                .store()
+                .signature(signature)
+                .unwrap()
+                .target()
+                .is_some()
+        );
+        let cold = call_publication_state(&context, call);
+
+        mark_source_unchecked(&mut context, source_file);
+        context.check_source_file(source_file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
+        assert_eq!(call_publication_state(&context, call), cold);
     }
 
     #[test]

@@ -2549,7 +2549,27 @@ fn plan_global_array_concat_method(
     global_types: &CanonicalGlobalTypes,
     receiver: TypeId,
 ) -> Result<Option<GlobalArrayConcatPlan>, PropertyObjectError> {
-    let target = global_types.array_type;
+    let Some(array_owner) = store
+        .type_payload(global_types.array_type)
+        .and_then(TypeRecord::symbol)
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+    else {
+        return Ok(None);
+    };
+    let receiver_array = store
+        .canonical_array_reference(global_types, receiver)
+        .map_err(|_| PropertyObjectError::InvalidCachedInterface {
+            symbol: array_owner,
+            type_: global_types.array_type,
+        })?;
+    let Some(receiver_array) = receiver_array else {
+        return Ok(None);
+    };
+    let (target, owner_name) = if receiver_array.readonly {
+        (global_types.readonly_array_type, "ReadonlyArray")
+    } else {
+        (global_types.array_type, "Array")
+    };
     let Some(owner) = store
         .type_payload(target)
         .and_then(TypeRecord::symbol)
@@ -2561,17 +2581,10 @@ fn plan_global_array_concat_method(
         symbol: owner,
         type_: target,
     };
-    match store
-        .canonical_array_reference(global_types, receiver)
-        .map_err(|_| invalid())?
-    {
-        Some(array) if !array.readonly => {}
-        Some(_) | None => return Ok(None),
-    }
     let bootstrap = store.intrinsic_bootstrap().ok_or_else(invalid)?;
     let globals = store.symbol_table(bootstrap.globals).ok_or_else(invalid)?;
     if globals
-        .get_source("Array")
+        .get_source(owner_name)
         .and_then(|symbol| store.get_merged_symbol(symbol))
         != Some(owner)
     {
@@ -2715,6 +2728,7 @@ fn resolved_global_array_concat_method(
     store: &CanonicalTypeMapperStore,
     global_types: &CanonicalGlobalTypes,
     plan: &GlobalArrayConcatPlan,
+    return_type: TypeId,
 ) -> Option<TypeId> {
     let value = store.value_symbol_links(plan.method)?;
     let type_ = value.resolved_type?;
@@ -2765,7 +2779,7 @@ fn resolved_global_array_concat_method(
             || callable.this_parameter().is_some()
             || callable.min_argument_count() != 0
             || callable.resolved_min_argument_count() != -1
-            || callable.resolved_return_type() != Some(plan.target)
+            || callable.resolved_return_type() != Some(return_type)
             || callable.resolved_type_predicate().is_some()
             || callable.target().is_some()
             || callable.mapper().is_some()
@@ -2792,7 +2806,7 @@ fn resolved_global_array_concat_method(
                 })
             || store.type_node_links(overload.return_annotation)
                 != Some(&TypeNodeLinks {
-                    resolved_type: Some(plan.target),
+                    resolved_type: Some(return_type),
                     ..TypeNodeLinks::default()
                 })
             || store.function_signature_return_annotation(signature)
@@ -2932,10 +2946,10 @@ fn materialize_global_concat_array_members(
     Ok(())
 }
 
-/// Publishes only the two authenticated default-library `Array.concat` overloads.
+/// Publishes the two authenticated default-library `Array.concat` overloads.
 ///
-/// Their shared declaration annotations retain the global array's canonical
-/// type parameter. Receiver-specific substitution belongs to property lookup.
+/// Mutable and readonly declarations retain their own canonical type
+/// parameter. Both return mutable arrays; receiver specialization is separate.
 pub(super) fn materialize_global_array_concat_method(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -2949,11 +2963,21 @@ pub(super) fn materialize_global_array_concat_method(
         symbol: plan.owner,
         type_: plan.target,
     };
+    let return_type = if plan.target == global_types.array_type {
+        plan.target
+    } else {
+        let Ok(return_type) =
+            store.create_canonical_array_type(global_types, plan.type_parameter, false)
+        else {
+            return Ok(None);
+        };
+        return_type
+    };
     if store
         .value_symbol_links(plan.method)
         .is_some_and(|links| links != &ValueSymbolLinks::default())
     {
-        return resolved_global_array_concat_method(store, global_types, &plan)
+        return resolved_global_array_concat_method(store, global_types, &plan, return_type)
             .map(Some)
             .ok_or_else(invalid);
     }
@@ -3002,7 +3026,7 @@ pub(super) fn materialize_global_array_concat_method(
     for (overload, parameter_type) in plan.overloads.iter().zip(parameter_types) {
         for (annotation, type_) in [
             (overload.parameter_annotation, parameter_type),
-            (overload.return_annotation, plan.target),
+            (overload.return_annotation, return_type),
         ] {
             if store.type_node_links(annotation).is_some_and(|links| {
                 links != &TypeNodeLinks::default()
@@ -3097,7 +3121,7 @@ pub(super) fn materialize_global_array_concat_method(
                 Vec::new(),
                 None,
                 symbols,
-                Some(plan.target),
+                Some(return_type),
                 None,
                 0,
             )
@@ -3119,7 +3143,7 @@ pub(super) fn materialize_global_array_concat_method(
         assert!(store.set_type_node_links(
             overload.return_annotation,
             TypeNodeLinks {
-                resolved_type: Some(plan.target),
+                resolved_type: Some(return_type),
                 ..TypeNodeLinks::default()
             },
         ));

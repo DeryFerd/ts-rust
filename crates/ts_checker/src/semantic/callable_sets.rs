@@ -3016,6 +3016,201 @@ mod tests {
     }
 
     #[test]
+    fn readonly_array_concat_overloads_preserve_mutable_returns_and_warm_identity() {
+        let parsed = parse_source_file(concat!(
+            "interface IArguments {} ",
+            "interface ConcatArray<T> {} ",
+            "interface Array<T> { ",
+            "concat(...items: ConcatArray<T>[]): T[]; ",
+            "concat(...items: (T | ConcatArray<T>)[]): T[]; ",
+            "} ",
+            "interface Object {} ",
+            "interface Function {} ",
+            "interface String { toLowerCase(): string } ",
+            "interface Number { toFixed(fractionDigits?: number): string } ",
+            "interface Boolean {} ",
+            "interface RegExp {} ",
+            "interface ReadonlyArray<T> { ",
+            "concat(...items: ConcatArray<T>[]): T[]; ",
+            "concat(...items: (T | ConcatArray<T>)[]): T[]; ",
+            "} ",
+            "interface ThisType<T> {}",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(4_435);
+        let mut context = default_library_context(&parsed, file, false);
+        let global_types = context.global_types().clone();
+        let concat_array = context
+            .store()
+            .symbol_table(context.globals())
+            .and_then(|globals| globals.get_source("ConcatArray"))
+            .unwrap();
+        context.get_declared_type_of_symbol(concat_array).unwrap();
+        let (number, readonly_parameter) = {
+            let store = context.store();
+            let TypeData::Interface(readonly) = store
+                .type_payload(global_types.readonly_array_type)
+                .unwrap()
+                .data()
+            else {
+                panic!("ReadonlyArray must retain its global interface identity")
+            };
+            (
+                store.intrinsic_bootstrap().unwrap().number_type,
+                readonly.reference.resolved_type_arguments.as_ref().unwrap()[0],
+            )
+        };
+        let (readonly_receiver, mutable_return) = {
+            let store = context.store_mut_for_test();
+            (
+                store
+                    .create_canonical_array_type(&global_types, number, true)
+                    .unwrap(),
+                store
+                    .create_canonical_array_type(&global_types, number, false)
+                    .unwrap(),
+            )
+        };
+        let bound = context.file(file).unwrap().1.clone();
+        let host = super::super::DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let store = context.store_mut_for_test();
+        let mutable_method = store
+            .type_payload(global_types.array_type)
+            .and_then(TypeRecord::symbol)
+            .and_then(|owner| store.symbol(owner))
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get_source("concat"))
+            .unwrap();
+        let source = super::super::object_members::materialize_global_array_concat_method(
+            store,
+            &host,
+            &global_types,
+            readonly_receiver,
+        )
+        .unwrap()
+        .unwrap();
+        let method = store.type_payload(source).unwrap().symbol().unwrap();
+        let generic_return = store
+            .create_canonical_array_type(&global_types, readonly_parameter, false)
+            .unwrap();
+
+        assert_ne!(method, mutable_method);
+        assert!(store.value_symbol_links(mutable_method).is_none());
+        assert_ne!(generic_return, global_types.readonly_array_type);
+        let StoredCallableSetValidation::Valid {
+            projection: original,
+            ..
+        } = validate_stored_callable_set(store, source)
+        else {
+            panic!("expected both authenticated readonly concat declarations")
+        };
+        assert_eq!(original.call_signatures.len(), 2);
+        assert!(
+            original
+                .call_signatures
+                .iter()
+                .all(|callable| callable.return_type == Some(generic_return))
+        );
+
+        let instantiated =
+            super::super::instantiated_members::instantiate_published_generic_interface_method(
+                store,
+                &global_types,
+                readonly_receiver,
+                method,
+            )
+            .unwrap();
+        let StoredCallableSetValidation::Valid {
+            family, projection, ..
+        } = validate_stored_callable_set(store, instantiated)
+        else {
+            panic!("expected receiver-specialized readonly concat overloads")
+        };
+        assert_eq!(family, CallableFamily::DeclaredCallSignatures);
+        let [arrays, values_or_arrays] = projection.call_signatures.as_ref() else {
+            panic!("readonly concat must retain its two declaration overloads")
+        };
+        assert_eq!(arrays.return_type, Some(mutable_return));
+        assert_eq!(values_or_arrays.return_type, Some(mutable_return));
+        let arrays_element = store
+            .canonical_array_element_type(&global_types, arrays.rest_parameter.unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            validate_direct_generic_reference(store, arrays_element)
+                .unwrap()
+                .type_arguments,
+            vec![number],
+        );
+        let values_element = store
+            .canonical_array_element_type(&global_types, values_or_arrays.rest_parameter.unwrap())
+            .unwrap()
+            .unwrap();
+        let TypeData::Union(values) = store.type_payload(values_element).unwrap().data() else {
+            panic!("the second overload must preserve its element-or-array union")
+        };
+        assert!(values.union.types.contains(&number));
+        assert!(values.union.types.contains(&arrays_element));
+
+        let resolution = resolve_direct_call(
+            store,
+            &global_types,
+            false,
+            DirectCallRequest {
+                form: DirectCallForm::Call,
+                optional_chain: false,
+                type_argument_count: 0,
+                has_spread_argument: false,
+                callee: instantiated,
+                arguments: &[],
+            },
+        )
+        .unwrap();
+        assert_eq!(resolution.projection.return_type, mutable_return);
+
+        let warm = (
+            store.type_len(),
+            store.mapper_len(),
+            store.signature_len(),
+            store.symbol_len(),
+            store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            super::super::object_members::materialize_global_array_concat_method(
+                store,
+                &host,
+                &global_types,
+                readonly_receiver,
+            ),
+            Ok(Some(source)),
+        );
+        assert_eq!(
+            super::super::instantiated_members::instantiate_published_generic_interface_method(
+                store,
+                &global_types,
+                readonly_receiver,
+                method,
+            ),
+            Ok(instantiated),
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.mapper_len(),
+                store.signature_len(),
+                store.symbol_len(),
+                store.checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
     fn inherited_interface_callables_keep_derived_signatures_before_base_signatures() {
         let parsed = parse_source_file(&format!(
             "{DEFAULT_LIBRARY_METHODS} \
