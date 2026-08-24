@@ -19245,10 +19245,56 @@ fn inferred_variable_type(
     let initializer_type = if binding.is_const() {
         initializer_type
     } else {
-        widened_fresh_literal_type(store, initializer_type)?
+        widened_fresh_literal_union_type(store, global_types, initializer_type)?
     };
     store
         .get_widened_type_with_global_types(initializer_type, global_types)
+        .map_err(Into::into)
+}
+
+fn widened_fresh_literal_union_type(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    type_: TypeId,
+) -> Result<TypeId, SourceCheckError> {
+    let record = store
+        .type_payload(type_)
+        .ok_or(SourceCheckError::LiteralCache(
+            SourceLiteralCacheError::InvalidCachedLiteral(type_),
+        ))?;
+    let TypeData::Union(union) = record.data() else {
+        return widened_fresh_literal_type(store, type_);
+    };
+    let constituents = if let Some(origin) = union.origin {
+        let origin_record = store
+            .type_payload(origin)
+            .ok_or(RelationUnavailable::Type(origin))?;
+        if origin_record.flags().intersects(TypeFlags::UNION) {
+            let TypeData::Union(origin_union) = origin_record.data() else {
+                return Err(RelationUnavailable::MalformedUnion(origin).into());
+            };
+            origin_union.union.types.clone()
+        } else {
+            union.union.types.clone()
+        }
+    } else {
+        union.union.types.clone()
+    };
+
+    let mut widened = Vec::with_capacity(constituents.len());
+    let mut changed = false;
+    for constituent in constituents {
+        let widened_constituent =
+            widened_fresh_literal_union_type(store, global_types, constituent)?;
+        changed |= widened_constituent != constituent;
+        widened.push(widened_constituent);
+    }
+    if !changed {
+        return Ok(type_);
+    }
+
+    store
+        .expression_union_type_with_global_types(global_types, &widened, UnionReduction::Literal)
         .map_err(Into::into)
 }
 
@@ -39235,7 +39281,8 @@ mod tests {
         let source = parsed(concat!(
             "var numeric = false ? 1 : null; ",
             "var missing = true ? undefined : 0; ",
-            "var truth = false ? false : true;",
+            "var truth = false ? false : true; ",
+            "const fixed = false ? 1 : 0;",
         ));
         let file = FileId::new(4_812);
         let mut context = context(
@@ -39268,6 +39315,12 @@ mod tests {
         assert_eq!(
             variable_value_type(&context, &source, file, "truth"),
             bootstrap.boolean_type,
+        );
+        assert_eq!(
+            context
+                .type_to_string(variable_value_type(&context, &source, file, "fixed"))
+                .unwrap(),
+            "0 | 1",
         );
         assert!(context.diagnostics().is_empty());
         let warm = observable_state(&context, file);
