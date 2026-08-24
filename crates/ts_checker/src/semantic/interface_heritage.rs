@@ -335,7 +335,7 @@ fn plan_direct_interface_heritage_inner(
                 return Err(DirectInterfaceHeritageError::Invalid);
             }
             if let Some(inherited) = base_interface.heritage_clauses.as_ref() {
-                if base_declarations.len() != 1 || !active.insert(symbol) {
+                if !active.insert(symbol) {
                     return Err(DirectInterfaceHeritageError::Unsupported {
                         node: expression,
                         kind: expression_record.kind,
@@ -352,10 +352,11 @@ fn plan_direct_interface_heritage_inner(
                 );
                 assert!(active.remove(&symbol));
                 let planned = planned?;
-                if !matches!(
-                    planned.bases.as_slice(),
-                    [base] if base.kind == DirectInterfaceBaseKind::Interface
-                ) {
+                if planned
+                    .bases
+                    .iter()
+                    .any(|base| base.kind != DirectInterfaceBaseKind::Interface)
+                {
                     return Err(DirectInterfaceHeritageError::Unsupported {
                         node: expression,
                         kind: expression_record.kind,
@@ -2156,6 +2157,130 @@ mod tests {
                 "{index}: generic heritage planning published checker state",
             );
         }
+    }
+
+    #[test]
+    fn reopened_generic_interface_bases_keep_multiple_heritage_bases_and_recursion_lazy() {
+        let parsed = parse_source_file(concat!(
+            "interface Array<Value> { length: number }\n",
+            "type ReactNode = string | ReactNodeArray;\n",
+            "interface ReactNodeArray extends Array<ReactNode> {}\n",
+            "declare namespace React {\n",
+            "  interface AriaAttributes { label?: string }\n",
+            "  interface DOMAttributes<T> { children?: ReactNode; target?: T }\n",
+            "  interface HTMLAttributes<T> ",
+            "extends AriaAttributes, DOMAttributes<T> { id?: string }\n",
+            "  interface HTMLAttributes<T> { title?: string }\n",
+            "  interface InputHTMLAttributes<T> extends HTMLAttributes<T> { value?: string }\n",
+            "}\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(8_480);
+        let context = checker_context(&parsed, file);
+        let html_attributes = interface_symbol(&parsed, file, &context, "HTMLAttributes");
+        let aria_attributes = interface_symbol(&parsed, file, &context, "AriaAttributes");
+        let dom_attributes = interface_symbol(&parsed, file, &context, "DOMAttributes");
+        let array = interface_symbol(&parsed, file, &context, "Array");
+        let initial_array_links = context.store().declared_type_links(array).cloned();
+        let cold = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().symbol_store().symbol_table_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+
+        let input = heritage_plan(&parsed, file, &context, "InputHTMLAttributes").unwrap();
+        let [input_base] = input.bases.as_slice() else {
+            panic!("a reopened generic interface must retain its canonical direct base")
+        };
+        assert_eq!(input_base.symbol, html_attributes);
+        assert_eq!(input_base.kind, DirectInterfaceBaseKind::Interface);
+        assert_eq!(input_base.type_arguments.len(), 1);
+
+        let html = heritage_plan(&parsed, file, &context, "HTMLAttributes").unwrap();
+        assert_eq!(
+            html.bases
+                .iter()
+                .map(|base| (base.symbol, base.kind, base.type_arguments.len()))
+                .collect::<Vec<_>>(),
+            [
+                (aria_attributes, DirectInterfaceBaseKind::Interface, 0),
+                (dom_attributes, DirectInterfaceBaseKind::Interface, 1),
+            ],
+        );
+
+        let recursive = heritage_plan(&parsed, file, &context, "ReactNodeArray").unwrap();
+        let [recursive_base] = recursive.bases.as_slice() else {
+            panic!("a recursive ReactNode argument must retain its direct array base")
+        };
+        assert_eq!(recursive_base.symbol, array);
+        assert_eq!(recursive_base.kind, DirectInterfaceBaseKind::Interface);
+        assert_eq!(recursive_base.type_arguments.len(), 1);
+
+        assert_eq!(
+            heritage_plan(&parsed, file, &context, "InputHTMLAttributes").unwrap(),
+            input,
+        );
+        assert_eq!(
+            heritage_plan(&parsed, file, &context, "HTMLAttributes").unwrap(),
+            html,
+        );
+        assert_eq!(
+            heritage_plan(&parsed, file, &context, "ReactNodeArray").unwrap(),
+            recursive,
+        );
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().symbol_store().symbol_table_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            cold,
+        );
+        assert!(
+            context
+                .store()
+                .declared_type_links(html_attributes)
+                .is_none()
+        );
+        assert_eq!(
+            context.store().declared_type_links(array),
+            initial_array_links.as_ref(),
+        );
+    }
+
+    #[test]
+    fn reopened_generic_interface_heritage_cycles_remain_unsupported_without_publication() {
+        let parsed = parse_source_file(concat!(
+            "interface Left<T> extends Right<T> {}\n",
+            "interface Left<T> { value?: T }\n",
+            "interface Right<T> extends Left<T> {}\n",
+            "interface Derived<T> extends Left<T> {}\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(8_481);
+        let context = checker_context(&parsed, file);
+        let cold = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().symbol_store().symbol_table_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+
+        assert!(matches!(
+            heritage_plan(&parsed, file, &context, "Derived"),
+            Err(DirectInterfaceHeritageError::Unsupported { .. })
+        ));
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().symbol_store().symbol_table_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            cold,
+        );
     }
 
     #[test]

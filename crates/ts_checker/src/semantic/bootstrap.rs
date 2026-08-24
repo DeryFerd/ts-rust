@@ -49,7 +49,7 @@ use super::{
     object_members,
     relation::RelationStateSnapshot,
     signatures::{IndexFlags, SignatureFlags, TypePredicateKind},
-    store::SemanticStore,
+    store::{SemanticStore, SourceNodeParent},
     structured_members::{InterfaceHeritageMembersValidation, validate_interface_heritage_members},
     tuple_types::PreparedCanonicalTupleType,
     type_records::{
@@ -2429,6 +2429,179 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         result
     }
 
+    /// Authenticates the shared parameter created by merging generic interfaces.
+    fn valid_supported_merged_type_parameter(
+        &self,
+        type_: TypeId,
+        symbol: SemanticSymbolId,
+        parameter: &super::type_records::TypeParameterData,
+    ) -> bool {
+        let Some(record) = self.symbol(symbol) else {
+            return false;
+        };
+        let Some(declarations) = record
+            .declarations()
+            .filter(|declarations| !declarations.is_empty())
+        else {
+            return false;
+        };
+        let Some(owner) = self.get_parent_of_symbol(symbol) else {
+            return false;
+        };
+        let Some(owner_record) = self.symbol(owner) else {
+            return false;
+        };
+        let Some(owner_declarations) = owner_record.declarations() else {
+            return false;
+        };
+        let Some(members) = owner_record
+            .members()
+            .and_then(|members| self.symbol_table(members))
+        else {
+            return false;
+        };
+        let Some(owner_type) = self
+            .declared_type_links(owner)
+            .and_then(|links| links.declared_type)
+        else {
+            return false;
+        };
+        let Some(owner_type_record) = self.type_payload(owner_type) else {
+            return false;
+        };
+        let TypeData::Interface(interface) = owner_type_record.data() else {
+            return false;
+        };
+        let Some(arguments) = interface.reference.resolved_type_arguments.as_deref() else {
+            return false;
+        };
+        let Some(all_parameters) = interface.all_type_parameters.as_deref() else {
+            return false;
+        };
+        let Some(bootstrap) = self.intrinsic_bootstrap.as_ref() else {
+            return false;
+        };
+        let allowed_owner_flags =
+            SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::TRANSIENT;
+        if record.flags() != SymbolFlags::TYPE_PARAMETER | SymbolFlags::TRANSIENT
+            || record.members().is_some()
+            || owner_record.flags().without(allowed_owner_flags) != SymbolFlags::NONE
+            || !owner_record
+                .flags()
+                .contains(SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT)
+            || owner_record.check_flags() != CheckFlags::NONE
+            || owner_record.exports().is_some()
+            || owner_record.export_symbol().is_some()
+            || self.get_merged_symbol(owner) != Some(owner)
+            || members
+                .get(record.name())
+                .and_then(|parameter| self.get_merged_symbol(parameter))
+                != Some(symbol)
+            || owner_type_record.flags() != TypeFlags::OBJECT
+            || !owner_type_record
+                .object_flags()
+                .contains(ObjectFlags::INTERFACE | ObjectFlags::REFERENCE)
+            || owner_type_record.symbol() != Some(owner)
+            || owner_type_record.alias().is_some()
+            || interface.outer_type_parameter_count != 0
+            || interface.reference.object.target != Some(owner_type)
+            || interface.reference.object.mapper.is_some()
+            || interface.reference.node.is_some()
+            || all_parameters.len() != arguments.len().saturating_add(1)
+            || !all_parameters.starts_with(arguments)
+            || all_parameters.last().copied() != interface.this_type
+            || arguments
+                .iter()
+                .filter(|argument| **argument == type_)
+                .count()
+                != 1
+            || parameter
+                .resolved_default_type
+                .is_some_and(|default| default != bootstrap.no_constraint_type)
+        {
+            return false;
+        }
+
+        let authoritative_owner = match self.get_parent_of_symbol(owner) {
+            Some(parent) => self
+                .symbol(parent)
+                .filter(|parent| parent.flags().intersects(SymbolFlags::MODULE))
+                .and_then(ts_binder::semantic::Symbol::exports)
+                .and_then(|exports| self.symbol_table(exports))
+                .and_then(|exports| exports.get(owner_record.name()))
+                .and_then(|owner| self.get_merged_symbol(owner)),
+            None => self
+                .symbol_table(bootstrap.globals)
+                .and_then(|globals| globals.get(owner_record.name()))
+                .and_then(|owner| self.get_merged_symbol(owner)),
+        };
+        if authoritative_owner != Some(owner) {
+            return false;
+        }
+
+        let mut seen_owner_declarations = HashSet::with_capacity(owner_declarations.len());
+        let mut value_declaration = None;
+        for declaration in owner_declarations {
+            if !seen_owner_declarations.insert(*declaration) {
+                return false;
+            }
+            match self.source_node_kind(*declaration) {
+                Some(SyntaxKind::InterfaceDeclaration) => {}
+                Some(SyntaxKind::VariableDeclaration)
+                    if value_declaration.replace(*declaration).is_none() => {}
+                _ => return false,
+            }
+        }
+        if owner_record.value_declaration() != value_declaration
+            || owner_record
+                .flags()
+                .contains(SymbolFlags::FUNCTION_SCOPED_VARIABLE)
+                != value_declaration.is_some()
+        {
+            return false;
+        }
+
+        let mut expected_declarations = owner_declarations.iter().copied().filter(|declaration| {
+            self.source_node_kind(*declaration) == Some(SyntaxKind::InterfaceDeclaration)
+        });
+        let mut seen = HashSet::with_capacity(declarations.len());
+        for declaration in declarations {
+            let Some(expected_owner) = expected_declarations.next() else {
+                return false;
+            };
+            if !seen.insert(*declaration)
+                || self.source_node_kind(*declaration) != Some(SyntaxKind::TypeParameter)
+                || self.source_node_parent(*declaration)
+                    != Some(SourceNodeParent::Parent(expected_owner))
+            {
+                return false;
+            }
+
+            let annotation = self.source_direct_type_annotation(*declaration);
+            let consistent_constraint = match (annotation, parameter.constraint) {
+                (None, None) => true,
+                (None, Some(constraint)) => constraint == bootstrap.no_constraint_type,
+                (Some(annotation), Some(constraint)) => {
+                    constraint != bootstrap.no_constraint_type
+                        && self.source_direct_type_annotation_is_exact(annotation, constraint)
+                }
+                (Some(_), None) => false,
+            };
+            if !consistent_constraint {
+                return false;
+            }
+        }
+        if expected_declarations.next().is_some() {
+            return false;
+        }
+
+        let expected_base = parameter.constraint.unwrap_or(bootstrap.no_constraint_type);
+        parameter
+            .constrained
+            .resolved_base_constraint
+            .is_none_or(|base| base == expected_base)
+    }
+
     fn validate_supported_record_mapped_union_constituent(
         &self,
         type_: TypeId,
@@ -2632,23 +2805,31 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 self.validate_supported_literal_identity(type_, regular, fresh, &data.value)?;
                 Ok(())
             }
-            TypeData::TypeParameter(_) => {
+            TypeData::TypeParameter(parameter) => {
                 let Some(symbol) = cached_ordinary_type_parameter_owner(self, type_) else {
                     return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
                 };
-                let Some(record) = self.symbol(symbol) else {
+                let Some(symbol_record) = self.symbol(symbol) else {
                     return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
                 };
-                let Some([declaration]) = record.declarations() else {
-                    return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
+                let valid_declarations = match symbol_record.flags() {
+                    SymbolFlags::TYPE_PARAMETER => matches!(
+                        symbol_record.declarations(),
+                        Some([declaration])
+                            if self.source_node_kind(*declaration)
+                                == Some(SyntaxKind::TypeParameter)
+                    ),
+                    flags if flags == SymbolFlags::TYPE_PARAMETER | SymbolFlags::TRANSIENT => {
+                        self.valid_supported_merged_type_parameter(type_, symbol, parameter)
+                    }
+                    _ => false,
                 };
-                if record.flags() != SymbolFlags::TYPE_PARAMETER
-                    || record.check_flags() != CheckFlags::NONE
-                    || record.value_declaration().is_some()
-                    || record.exports().is_some()
-                    || record.export_symbol().is_some()
+                if !valid_declarations
+                    || symbol_record.check_flags() != CheckFlags::NONE
+                    || symbol_record.value_declaration().is_some()
+                    || symbol_record.exports().is_some()
+                    || symbol_record.export_symbol().is_some()
                     || self.get_merged_symbol(symbol) != Some(symbol)
-                    || self.source_node_kind(*declaration) != Some(SyntaxKind::TypeParameter)
                 {
                     return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
                 }
@@ -6857,6 +7038,250 @@ mod tests {
         assert_eq!(
             store.validate_union_constituent_with_array_targets(targets, mapped),
             Ok(()),
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Covers real merged ownership and its cold/warm poison paths.
+    fn merged_array_type_parameters_authenticate_concat_unions_and_reject_forgery() {
+        let base = parse_source_file(concat!(
+            "interface Array<T> { ",
+            "concat(...items: (T | ConcatArray<T>)[]): T[]; ",
+            "}",
+        ));
+        let augmentation = parse_source_file(concat!(
+            "interface Array<T> {} ",
+            "interface ReadonlyArray<T> {} ",
+            "interface ConcatArray<T> {}",
+        ));
+        let base_file = FileId::new(150);
+        let augmentation_file = FileId::new(151);
+        let mut binder = CanonicalBinder::new();
+        for (parsed, file) in [(&base, base_file), (&augmentation, augmentation_file)] {
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new_with_default_library(
+                        EscapedName::source(format!("\"/lib-{}.d.ts\"", file.index())),
+                        CanonicalSourceLanguage::TypeScript,
+                        true,
+                        true,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![
+                (base_file, &base.arena),
+                (augmentation_file, &augmentation.arena),
+            ],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        let global_types = context.global_types().clone();
+        let (
+            array_owner,
+            concat_owner,
+            parameter,
+            parameter_symbol,
+            parameter_parent,
+            declarations,
+        ) = {
+            let store = context.store();
+            let array_record = store.type_payload(global_types.array_type).unwrap();
+            let TypeData::Interface(array) = array_record.data() else {
+                panic!("the merged Array must retain its generic interface target")
+            };
+            let [parameter] = array.reference.resolved_type_arguments.as_deref().unwrap() else {
+                panic!("the merged Array must retain one canonical type parameter")
+            };
+            let parameter_symbol = cached_ordinary_type_parameter_owner(store, *parameter)
+                .expect("the merged parameter must own its declared type");
+            let parameter_record = store.symbol(parameter_symbol).unwrap();
+            assert_eq!(
+                parameter_record.flags(),
+                SymbolFlags::TYPE_PARAMETER | SymbolFlags::TRANSIENT,
+            );
+            let array_owner = array_record.symbol().unwrap();
+            assert_eq!(
+                store.get_parent_of_symbol(parameter_symbol),
+                Some(array_owner)
+            );
+            let declarations = parameter_record.declarations().unwrap().to_vec();
+            assert_eq!(declarations.len(), 2);
+            let concat_owner = store
+                .symbol_table(context.globals())
+                .and_then(|globals| globals.get_source("ConcatArray"))
+                .and_then(|owner| store.get_merged_symbol(owner))
+                .unwrap();
+            (
+                array_owner,
+                concat_owner,
+                *parameter,
+                parameter_symbol,
+                parameter_record.parent().unwrap(),
+                declarations,
+            )
+        };
+        let concat_target = context.get_declared_type_of_symbol(concat_owner).unwrap();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let store = context.store_mut_for_test();
+        let concat = store
+            .create_direct_generic_reference_type(concat_target, &[parameter])
+            .unwrap();
+
+        assert_eq!(
+            store.validate_union_constituent_with_global_types(&global_types, parameter),
+            Ok(()),
+        );
+        let union = store
+            .expression_union_type_with_global_types(
+                &global_types,
+                &[parameter, concat],
+                UnionReduction::Literal,
+            )
+            .unwrap();
+        assert_eq!(union_types(store, union).len(), 2);
+        assert!(union_types(store, union).contains(&parameter));
+        assert!(union_types(store, union).contains(&concat));
+
+        let warm = (
+            store.type_len(),
+            store.type_alias_len(),
+            store.intrinsic_bootstrap().unwrap().union_cache_len(),
+        );
+        assert_eq!(
+            store.expression_union_type_with_global_types(
+                &global_types,
+                &[concat, parameter],
+                UnionReduction::Literal,
+            ),
+            Ok(union),
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.type_alias_len(),
+                store.intrinsic_bootstrap().unwrap().union_cache_len(),
+            ),
+            warm,
+        );
+
+        let rejected = Err(LiteralTypeCacheError::UnsupportedUnionConstituent(
+            parameter,
+        ));
+        assert!(store.set_symbol_declarations(parameter_symbol, Some(vec![declarations[0]]), None));
+        assert_eq!(
+            store.validate_union_constituent_with_global_types(&global_types, parameter),
+            rejected,
+        );
+        assert!(store.set_symbol_declarations(parameter_symbol, Some(declarations.clone()), None));
+
+        let foreign_declaration = store
+            .symbol(concat_owner)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get_source("T"))
+            .and_then(|symbol| store.symbol(symbol))
+            .and_then(ts_binder::semantic::Symbol::declarations)
+            .and_then(|declarations| declarations.first())
+            .copied()
+            .unwrap();
+        assert!(store.set_symbol_declarations(
+            parameter_symbol,
+            Some(vec![declarations[0], foreign_declaration]),
+            None,
+        ));
+        assert_eq!(
+            store.validate_union_constituent_with_global_types(&global_types, parameter),
+            rejected,
+        );
+        assert!(store.set_symbol_declarations(parameter_symbol, Some(declarations), None));
+
+        assert!(store.set_symbol_relationships(
+            parameter_symbol,
+            None,
+            None,
+            Some(concat_owner),
+            None,
+        ));
+        assert_eq!(
+            store.validate_union_constituent_with_global_types(&global_types, parameter),
+            rejected,
+        );
+        assert!(store.set_symbol_relationships(
+            parameter_symbol,
+            None,
+            None,
+            Some(parameter_parent),
+            None,
+        ));
+        assert_eq!(
+            store.get_parent_of_symbol(parameter_symbol),
+            Some(array_owner)
+        );
+
+        let (constraint, target, mapper, default_type, base_constraint) = {
+            let TypeData::TypeParameter(data) = store.type_payload(parameter).unwrap().data()
+            else {
+                panic!("the merged parameter must retain its canonical type payload")
+            };
+            (
+                data.constraint,
+                data.target,
+                data.mapper,
+                data.resolved_default_type,
+                data.constrained.resolved_base_constraint,
+            )
+        };
+        assert!(store.set_type_parameter_resolution(
+            parameter,
+            Some(number),
+            target,
+            mapper,
+            default_type,
+        ));
+        assert_eq!(
+            store.validate_union_constituent_with_global_types(&global_types, parameter),
+            rejected,
+        );
+        assert!(store.set_type_parameter_resolution(
+            parameter,
+            constraint,
+            target,
+            mapper,
+            default_type,
+        ));
+
+        assert!(store.set_resolved_base_constraint(parameter, Some(number)));
+        assert_eq!(
+            store.validate_union_constituent_with_global_types(&global_types, parameter),
+            rejected,
+        );
+        assert!(store.set_resolved_base_constraint(parameter, base_constraint));
+        assert_eq!(
+            store.expression_union_type_with_global_types(
+                &global_types,
+                &[parameter, concat],
+                UnionReduction::Literal,
+            ),
+            Ok(union),
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.type_alias_len(),
+                store.intrinsic_bootstrap().unwrap().union_cache_len(),
+            ),
+            warm,
         );
     }
 

@@ -173,6 +173,7 @@ enum JsxChildPlan {
 #[derive(Clone, Copy, Debug)]
 struct JsxNamespace {
     element_type: TypeId,
+    element_type_constraint: Option<TypeId>,
     intrinsic_elements: Option<TypeId>,
     unknown_symbol: SemanticSymbolId,
     error_type: TypeId,
@@ -1402,6 +1403,7 @@ fn resolve_jsx_namespace(
     });
 
     let mut element_type = error_type;
+    let mut element_type_constraint = None;
     let mut intrinsic_elements = None;
     if let Some(namespace) = namespace {
         let exports = store
@@ -1412,36 +1414,21 @@ fn resolve_jsx_namespace(
             .symbol_table(exports)
             .ok_or(SourceCheckError::Property(location))?;
         let element = table.get_source("Element");
+        let element_type_symbol = table.get_source("ElementType");
         let intrinsic = table.get_source("IntrinsicElements");
         if let Some(symbol) = element {
-            if store
-                .symbol(symbol)
-                .is_none_or(|record| !record.flags().intersects(SymbolFlags::TYPE))
-            {
-                return Err(SourceCheckError::Property(location));
-            }
-            element_type = if jsx_namespace_interface_has_heritage(store, host, namespace, symbol)?
-            {
-                resolve_inherited_jsx_element_identity(store, host, symbol)?
-            } else {
-                resolve_namespace_export_type(
-                    store,
-                    host,
-                    namespace,
-                    symbol,
-                    None,
-                    options,
-                    diagnostics,
-                )?
-            };
+            validate_jsx_namespace_type_symbol(store, symbol, location)?;
+            element_type = resolve_jsx_namespace_element_type(
+                store,
+                host,
+                namespace,
+                symbol,
+                options,
+                diagnostics,
+            )?;
         }
         if let Some(symbol) = intrinsic {
-            if store
-                .symbol(symbol)
-                .is_none_or(|record| !record.flags().intersects(SymbolFlags::TYPE))
-            {
-                return Err(SourceCheckError::Property(location));
-            }
+            validate_jsx_namespace_type_symbol(store, symbol, location)?;
             if needs_intrinsics {
                 intrinsic_elements = Some(resolve_namespace_export_type(
                     store,
@@ -1454,15 +1441,120 @@ fn resolve_jsx_namespace(
                 )?);
             }
         }
+        if let Some(symbol) = element_type_symbol {
+            element_type_constraint = resolve_jsx_element_type_constraint(
+                store,
+                host,
+                namespace,
+                symbol,
+                options,
+                diagnostics,
+                location,
+            )?;
+        }
     }
 
     Ok(JsxNamespace {
         element_type,
+        element_type_constraint,
         intrinsic_elements,
         unknown_symbol,
         error_type,
         any_type,
     })
+}
+
+fn validate_jsx_namespace_type_symbol(
+    store: &CanonicalTypeMapperStore,
+    symbol: SemanticSymbolId,
+    location: NodeRef,
+) -> Result<(), SourceCheckError> {
+    if store
+        .symbol(symbol)
+        .is_none_or(|record| !record.flags().intersects(SymbolFlags::TYPE))
+    {
+        return Err(SourceCheckError::Property(location));
+    }
+    Ok(())
+}
+
+fn resolve_jsx_namespace_element_type(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    namespace: SemanticSymbolId,
+    symbol: SemanticSymbolId,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+) -> Result<TypeId, SourceCheckError> {
+    if jsx_namespace_interface_has_heritage(store, host, namespace, symbol)? {
+        resolve_inherited_jsx_element_identity(store, host, symbol)
+    } else {
+        resolve_namespace_export_type(store, host, namespace, symbol, None, options, diagnostics)
+    }
+}
+
+/// Resolves a nongeneric `JSX.ElementType` alias and ignores unsupported enum declarations.
+fn resolve_jsx_element_type_constraint(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    namespace: SemanticSymbolId,
+    symbol: SemanticSymbolId,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    location: NodeRef,
+) -> Result<Option<TypeId>, SourceCheckError> {
+    let record = store
+        .symbol(symbol)
+        .ok_or(SourceCheckError::Property(location))?;
+    if !record.flags().contains(SymbolFlags::TYPE_ALIAS) {
+        return Ok(None);
+    }
+    let [declaration] = record
+        .declarations()
+        .ok_or(SourceCheckError::Property(location))?
+    else {
+        return Err(SourceCheckError::Property(location));
+    };
+    let declaration = *declaration;
+    let node = host
+        .node(declaration)
+        .ok_or(SourceCheckError::Property(declaration))?;
+    let NodeData::TypeAliasDeclaration(alias) = &node.data else {
+        return Err(SourceCheckError::Property(declaration));
+    };
+    if record
+        .flags()
+        .without(SymbolFlags::TYPE_ALIAS | SymbolFlags::TRANSIENT)
+        != SymbolFlags::NONE
+        || record.check_flags() != CheckFlags::NONE
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || store.get_parent_of_symbol(symbol) != Some(namespace)
+        || node.kind != SyntaxKind::TypeAliasDeclaration
+        || node.flags.0 != 0
+        || !host.symbol_matches(store, declaration, symbol)
+    {
+        return Err(SourceCheckError::Property(declaration));
+    }
+    if alias.type_parameters.is_some() {
+        return Err(unsupported(declaration, SyntaxKind::TypeAliasDeclaration));
+    }
+
+    let resolved =
+        resolve_namespace_export_type(store, host, namespace, symbol, None, options, diagnostics)?;
+    if store
+        .type_alias_links(symbol)
+        .and_then(|links| links.type_parameters.as_deref())
+        .is_some_and(|parameters| !parameters.is_empty())
+    {
+        return Err(unsupported(declaration, SyntaxKind::TypeAliasDeclaration));
+    }
+    let error_type = store
+        .intrinsic_bootstrap()
+        .ok_or(SourceCheckError::LiteralCache(
+            SourceLiteralCacheError::BootstrapUninitialized,
+        ))?
+        .error_type;
+    Ok((resolved != error_type).then_some(resolved))
 }
 
 fn resolve_local_jsx_namespace(
@@ -2746,6 +2838,7 @@ fn execute_jsx_element(
             };
 
             publish_signature_links(store, plan.opening, signature)?;
+            check_jsx_element_type_constraint(store, host, namespace, tag, diagnostics)?;
             let children = if options.jsx_runtime == CanonicalJsxRuntime::Automatic {
                 check_automatic_jsx_children(
                     store,
@@ -2826,6 +2919,57 @@ fn execute_jsx_element(
 
     publish_type_links(store, plan.expression, namespace.element_type)?;
     Ok(namespace.element_type)
+}
+
+fn check_jsx_element_type_constraint(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    namespace: &JsxNamespace,
+    tag: &JsxTagPlan,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+) -> Result<(), SourceCheckError> {
+    let Some(constraint) = namespace.element_type_constraint else {
+        return Ok(());
+    };
+    let tag_type = if tag.intrinsic {
+        store.regular_string_literal_type(tag.name.clone())?
+    } else {
+        store
+            .type_node_links(tag.node)
+            .and_then(|links| links.resolved_type)
+            .filter(|type_| store.type_payload(*type_).is_some())
+            .ok_or(SourceCheckError::Property(tag.node))?
+    };
+    if store.is_type_assignable_to(tag_type, constraint)? {
+        return Ok(());
+    }
+
+    let formatted = type_to_string_with_host_and_flags(
+        store,
+        host,
+        tag_type,
+        CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
+    )?;
+    let detail = Diagnostic::with_arguments(
+        message_by_code(18_053).ok_or(SourceCheckError::MissingDiagnostic(18_053))?,
+        [formatted],
+    )
+    .render()
+    .map_err(|_| SourceCheckError::MissingDiagnostic(18_053))?;
+    merge_retry_diagnostic(
+        diagnostics,
+        CanonicalCheckerDiagnostic {
+            node: Some(tag.node),
+            range_override: None,
+            diagnostic: Diagnostic::with_arguments(
+                message_by_code(2786).ok_or(SourceCheckError::MissingDiagnostic(2786))?,
+                [tag.name.clone()],
+            )
+            .with_details([format!("  {detail}")]),
+            related_information: Vec::new(),
+        },
+    );
+    Ok(())
 }
 
 fn check_automatic_jsx_children(
@@ -7241,6 +7385,155 @@ mod runtime_tests {
             diagnostic.diagnostic.render().unwrap(),
             "Property 'plain-panel' does not exist on type 'JSX.IntrinsicElements'.",
         );
+    }
+
+    #[test]
+    fn intrinsic_element_type_constraints_keep_exact_diagnostics_and_warm_state() {
+        let source = concat!(
+            "declare namespace JSX {\n",
+            "  interface Element {}\n",
+            "  interface IntrinsicElements { div: any; span: any; }\n",
+            "  type ElementType = 'div';\n",
+            "}\n",
+            "const valid = <div />;\n",
+            "const rejected = <span />;\n",
+            "const missing = <ruhroh />;\n",
+        );
+        let parsed = parse_jsx_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(8_183);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/element-type.tsx\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = crate::semantic::CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2786, 2339, 2786],
+        );
+        for (diagnostic, name) in [(&diagnostics[0], "span"), (&diagnostics[2], "ruhroh")] {
+            let node = diagnostic.node.unwrap();
+            let NodeData::Identifier(identifier) = &parsed.arena.get(node.node).unwrap().data
+            else {
+                panic!("the invalid element diagnostic must point to its tag")
+            };
+            assert_eq!(identifier.text, name);
+            assert_eq!(
+                diagnostic.diagnostic.render().unwrap(),
+                format!(
+                    "'{name}' cannot be used as a JSX component.\n  \
+                     Its type '\"{name}\"' is not a valid JSX element type."
+                ),
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .type_node_links(node)
+                    .and_then(|links| links.resolved_type),
+                Some(context.store().intrinsic_bootstrap().unwrap().any_type),
+            );
+        }
+        assert_eq!(
+            parsed
+                .arena
+                .get(diagnostics[1].node.unwrap().node)
+                .unwrap()
+                .kind,
+            SyntaxKind::JsxSelfClosingElement,
+        );
+
+        let warm = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().signature_len(),
+            context.store().checker_link_allocated_lengths(),
+            diagnostics.to_vec(),
+        );
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.diagnostics().as_slice().to_vec(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn generic_element_type_aliases_remain_a_typed_boundary() {
+        let mut fixture = RuntimeFixture::new(
+            concat!(
+                "declare namespace JSX {\n",
+                "  interface IntrinsicElements { div: any; }\n",
+                "  type ElementType<T = any> = T;\n",
+                "}\n",
+                "const view = <div />;\n",
+            ),
+            FileId::new(8_184),
+        );
+        let namespace = fixture
+            .bound
+            .locals(fixture.bound.source_file())
+            .and_then(|locals| fixture.store.symbol_table(locals))
+            .and_then(|locals| locals.get_source("JSX"))
+            .unwrap();
+        let globals = fixture.store.intrinsic_bootstrap().unwrap().globals;
+        assert_eq!(
+            fixture
+                .store
+                .insert_symbol(globals, EscapedName::source("JSX"), namespace),
+            Some(None),
+        );
+        let expression = fixture.expression("view");
+        let host = DeclaredTypeHost::new([(&fixture.parsed.arena, &fixture.bound)]).unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let error = fixture
+            .store
+            .check_jsx_element(
+                &host,
+                expression,
+                CanonicalCheckerOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SourceCheckError::Unsupported(UnsupportedSourceSyntax::Syntax {
+                kind: SyntaxKind::TypeAliasDeclaration,
+                ..
+            })
+        ));
+        assert!(diagnostics.is_empty());
     }
 
     #[test]

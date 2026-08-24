@@ -103,6 +103,7 @@ pub(super) struct SourceNamespaceGenericInterfacePlan {
     properties: Vec<SourceNamespacePropertyPlan>,
     call_signatures: Vec<SemanticSymbolId>,
     construct_signatures: Vec<SemanticSymbolId>,
+    index_signatures: Vec<SemanticSymbolId>,
     methods: Vec<SemanticSymbolId>,
     computed_properties: Vec<SourceNamespaceComputedPropertyPlan>,
     base_interfaces: Vec<SemanticSymbolId>,
@@ -567,7 +568,13 @@ fn plan_generic_interface_parameters(
                 .ok_or(SourceCheckError::Provenance(
                     SourceCheckProvenanceError::MissingDeclarationSymbol(parameter),
                 ))?;
-        if parameter_record.flags() != SymbolFlags::TYPE_PARAMETER
+        if !parameter_record
+            .flags()
+            .contains(SymbolFlags::TYPE_PARAMETER)
+            || parameter_record
+                .flags()
+                .without(SymbolFlags::TYPE_PARAMETER | SymbolFlags::TRANSIENT)
+                != SymbolFlags::NONE
             || store.get_parent_of_symbol(parameter_symbol) != Some(symbol)
             || table.get(parameter_record.name()) != Some(parameter_symbol)
             || !seen.insert(parameter_symbol)
@@ -596,6 +603,7 @@ fn plan_generic_interface_parameters(
         properties: Vec::new(),
         call_signatures: Vec::new(),
         construct_signatures: Vec::new(),
+        index_signatures: Vec::new(),
         methods: Vec::new(),
         computed_properties: Vec::new(),
         base_interfaces: Vec::new(),
@@ -672,6 +680,106 @@ fn plan_interface_callable_signature(
         type_parameters,
         parameters,
         return_type,
+        annotations,
+    )?;
+    Ok(symbol)
+}
+
+fn plan_interface_index_signature(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+    declaration: NodeRef,
+    annotations: &mut Vec<NodeRef>,
+) -> Result<SemanticSymbolId, SourceCheckError> {
+    let invalid = |node, kind| unsupported(node, kind, SourceSyntaxRole::InterfaceDeclaration);
+    let record = owned_node(arena, bound, store, declaration)?;
+    let NodeData::IndexSignatureDeclaration(index) = &record.data else {
+        return Err(invalid(declaration, record.kind));
+    };
+    if record.kind != SyntaxKind::IndexSignature
+        || record.flags.0 != 0
+        || index.full_signature.is_some()
+        || index.next_container.is_some()
+        || index.symbol.is_some()
+        || index.type_parameters.is_some()
+        || index.modifiers.is_some()
+        || index.parameters.has_trailing_comma
+        || index.parameters.nodes.len() != 1
+        || index.parameters.range.start < record.range.start
+        || index.parameters.range.end > record.range.end
+    {
+        return Err(invalid(declaration, record.kind));
+    }
+
+    let parameter = child(declaration, index.parameters.nodes[0]);
+    let parameter_record = owned_node(arena, bound, store, parameter)?;
+    let NodeData::ParameterDeclaration(parameter_data) = &parameter_record.data else {
+        return Err(invalid(parameter, parameter_record.kind));
+    };
+    if parameter_record.kind != SyntaxKind::Parameter
+        || parameter_record.flags.0 != 0
+        || parameter_record.parent != Some(declaration.node)
+        || parameter_record.range.start < index.parameters.range.start
+        || parameter_record.range.end > index.parameters.range.end
+        || parameter_data.dot_dot_dot_token.is_some()
+        || parameter_data.question_token.is_some()
+        || parameter_data.initializer.is_some()
+        || parameter_data.modifiers.is_some()
+        || parameter_data.symbol.is_some()
+        || parameter_data.facts != 0
+    {
+        return Err(invalid(parameter, parameter_record.kind));
+    }
+    let key = child(
+        parameter,
+        parameter_data
+            .type_
+            .ok_or_else(|| invalid(parameter, parameter_record.kind))?,
+    );
+    let key_record = owned_node(arena, bound, store, key)?;
+    if key_record.kind != SyntaxKind::StringKeyword {
+        return Err(invalid(key, key_record.kind));
+    }
+    owned_node(arena, bound, store, child(declaration, index.type_))?;
+
+    let symbol = declaration_symbol(bound, store, declaration, SymbolFlags::SIGNATURE)?;
+    let symbol_record = store.symbol(symbol).ok_or(SourceCheckError::Provenance(
+        SourceCheckProvenanceError::MissingDeclarationSymbol(declaration),
+    ))?;
+    let members = store
+        .symbol(owner)
+        .and_then(ts_binder::semantic::Symbol::members)
+        .and_then(|members| store.symbol_table(members));
+    if bound.symbol(declaration) != Some(symbol)
+        || symbol_record.flags() != SymbolFlags::SIGNATURE
+        || symbol_record.check_flags() != CheckFlags::NONE
+        || symbol_record.name() != InternalSymbolName::Index.as_ref()
+        || symbol_record
+            .declarations()
+            .is_none_or(|declarations| !declarations.contains(&declaration))
+        || symbol_record.value_declaration().is_some()
+        || symbol_record.members().is_some()
+        || symbol_record.exports().is_some()
+        || store.get_parent_of_symbol(symbol) != Some(owner)
+        || symbol_record.export_symbol().is_some()
+        || members.and_then(|members| members.get(InternalSymbolName::Index.as_ref()))
+            != Some(symbol)
+    {
+        return Err(SourceCheckError::Provenance(
+            SourceCheckProvenanceError::MissingDeclarationSymbol(declaration),
+        ));
+    }
+
+    plan_interface_signature_annotations(
+        arena,
+        bound,
+        store,
+        declaration,
+        None,
+        &index.parameters,
+        Some(index.type_),
         annotations,
     )?;
     Ok(symbol)
@@ -1457,6 +1565,156 @@ fn merged_namespace_class_interface_members_are_exact(
     })
 }
 
+fn reopened_namespace_generic_interface_members_are_exact(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    namespace: SemanticSymbolId,
+    symbol: SemanticSymbolId,
+    generic: &SourceNamespaceGenericInterfacePlan,
+) -> bool {
+    let Some(record) = store.symbol(symbol) else {
+        return false;
+    };
+    let Some(declarations) = record.declarations() else {
+        return false;
+    };
+    if declarations.len() < 2
+        || !declarations.contains(&declaration)
+        || record.members() != Some(generic.members)
+        || store.get_parent_of_symbol(symbol) != Some(namespace)
+        || generic.type_parameters.len() != 1
+    {
+        return false;
+    }
+    let Ok(host) = DeclaredTypeHost::new([(arena, bound)]) else {
+        return false;
+    };
+    object_members::plan_lazy_merged_generic_interface(store, &host, symbol).is_ok_and(|plan| {
+        plan.symbol == symbol
+            && plan.namespace == namespace
+            && generic.type_parameters == [plan.type_parameter]
+            && store.symbol_table(generic.members).is_some_and(|table| {
+                table.iter().all(|(name, member)| {
+                    store.symbol(member).is_some_and(|member_record| {
+                        let flags = member_record.flags();
+                        member_record.name() == name
+                            && store.get_parent_of_symbol(member) == Some(symbol)
+                            && (flags == SymbolFlags::TYPE_PARAMETER
+                                || flags == SymbolFlags::TYPE_PARAMETER | SymbolFlags::TRANSIENT
+                                || flags == SymbolFlags::SIGNATURE
+                                || flags == SymbolFlags::METHOD
+                                || flags == SymbolFlags::METHOD | SymbolFlags::OPTIONAL
+                                || flags == SymbolFlags::PROPERTY
+                                || flags == SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL)
+                            && (member_record.check_flags() == CheckFlags::NONE
+                                || flags.contains(SymbolFlags::PROPERTY)
+                                    && member_record.check_flags() == CheckFlags::READONLY)
+                            && member_record.members().is_none()
+                            && member_record.exports().is_none()
+                            && member_record.export_symbol().is_none()
+                            && member_record
+                                .declarations()
+                                .is_some_and(|member_declarations| {
+                                    !member_declarations.is_empty()
+                                        && member_declarations.iter().all(|member_declaration| {
+                                            owned_node(arena, bound, store, *member_declaration)
+                                                .ok()
+                                                .and_then(|member_node| member_node.parent)
+                                                .is_some_and(|parent| {
+                                                    declarations.iter().any(|owner_declaration| {
+                                                        owner_declaration.arena
+                                                            == member_declaration.arena
+                                                            && owner_declaration.file
+                                                                == member_declaration.file
+                                                            && owner_declaration.node == parent
+                                                    })
+                                                })
+                                                && bound.symbol(*member_declaration).and_then(
+                                                    |bound_symbol| {
+                                                        store.get_merged_symbol(bound_symbol)
+                                                    },
+                                                ) == Some(member)
+                                        })
+                                })
+                    })
+                })
+            })
+    })
+}
+
+fn namespace_generic_annotation_requires_deferral(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    namespace: SemanticSymbolId,
+    annotation: NodeRef,
+) -> Result<bool, SourceCheckError> {
+    let mut pending = vec![annotation];
+    let mut visited = HashSet::new();
+    while let Some(node) = pending.pop() {
+        if !visited.insert(node) {
+            return Err(SourceCheckError::Provenance(
+                SourceCheckProvenanceError::RepeatedNode(node),
+            ));
+        }
+        let record = owned_node(arena, bound, store, node)?;
+        if let NodeData::TypeReferenceNode(reference) = &record.data {
+            let name = child(node, reference.type_name);
+            if let Some(target) =
+                namespace_interface_heritage_symbol(arena, bound, store, namespace, name)?
+                && let Some(target_record) = store.symbol(target)
+                && store.get_parent_of_symbol(target) == Some(namespace)
+            {
+                if target_record.flags() == SymbolFlags::TYPE_ALIAS
+                    && target_record.check_flags() == CheckFlags::NONE
+                    && target_record.value_declaration().is_none()
+                    && target_record.members().is_none()
+                    && target_record.exports().is_none()
+                    && target_record.export_symbol().is_none()
+                    && target_record.declarations().is_some_and(|declarations| {
+                        let [declaration] = declarations else {
+                            return false;
+                        };
+                        bound
+                            .symbol(*declaration)
+                            .and_then(|symbol| store.get_merged_symbol(symbol))
+                            == Some(target)
+                    })
+                    && store
+                        .symbol(namespace)
+                        .and_then(ts_binder::semantic::Symbol::exports)
+                        .and_then(|exports| store.symbol_table(exports))
+                        .and_then(|exports| exports.get(target_record.name()))
+                        .and_then(|symbol| store.get_merged_symbol(symbol))
+                        == Some(target)
+                {
+                    return Ok(true);
+                }
+
+                if target_record.flags().contains(SymbolFlags::INTERFACE)
+                    && !target_record.flags().contains(SymbolFlags::CLASS)
+                    && target_record
+                        .declarations()
+                        .is_some_and(|declarations| declarations.len() > 1)
+                {
+                    let host =
+                        DeclaredTypeHost::new([(arena, bound)]).map_err(DeclaredTypeError::from)?;
+                    if object_members::plan_lazy_merged_generic_interface(store, &host, target)
+                        .is_ok_and(|plan| plan.namespace == namespace)
+                    {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+
+        record.for_each_child(|nested| pending.push(child(node, nested)));
+    }
+    Ok(false)
+}
+
 fn plan_interface_member(
     arena: &NodeArena,
     bound: &BoundFile,
@@ -1630,6 +1888,27 @@ fn plan_interface_member(
                     }
                 }
             }
+            NodeData::IndexSignatureDeclaration(_)
+                if member_record.kind == SyntaxKind::IndexSignature && generic.is_some() =>
+            {
+                let first_annotation = annotations.len();
+                let index = plan_interface_index_signature(
+                    arena,
+                    bound,
+                    store,
+                    symbol,
+                    member,
+                    &mut annotations,
+                )?;
+                if let Some(generic) = generic.as_mut() {
+                    generic
+                        .deferred_annotations
+                        .extend_from_slice(&annotations[first_annotation..]);
+                    if !generic.index_signatures.contains(&index) {
+                        generic.index_signatures.push(index);
+                    }
+                }
+            }
             NodeData::PropertyDeclaration(property)
                 if member_record.kind == SyntaxKind::PropertyDeclaration
                     && property.initializer.is_none() =>
@@ -1748,6 +2027,7 @@ fn plan_interface_member(
                 + generic.properties.len()
                 + generic.call_signatures.len()
                 + generic.construct_signatures.len()
+                + generic.index_signatures.len()
                 + generic.methods.len()
         && !merged_namespace_class_interface_members_are_exact(
             arena,
@@ -1757,10 +2037,54 @@ fn plan_interface_member(
             symbol,
             generic.members,
         )
+        && !reopened_namespace_generic_interface_members_are_exact(
+            arena,
+            bound,
+            store,
+            declaration,
+            owner,
+            symbol,
+            generic,
+        )
     {
         return Err(SourceCheckError::Provenance(
             SourceCheckProvenanceError::MissingDeclarationSymbol(declaration),
         ));
+    }
+    if bound
+        .source_facts()
+        .is_some_and(ts_binder::CanonicalSourceFileFacts::is_declaration_file)
+        && let Some(generic) = generic.as_mut()
+    {
+        for annotation in &annotations {
+            if generic.annotation_is_deferred(*annotation)
+                || !namespace_generic_annotation_requires_deferral(
+                    arena,
+                    bound,
+                    store,
+                    owner,
+                    *annotation,
+                )?
+            {
+                continue;
+            }
+            let annotation_record = owned_node(arena, bound, store, *annotation)?;
+            let parent = annotation_record
+                .parent
+                .map(|parent| child(*annotation, parent))
+                .ok_or_else(|| invalid_parent(*annotation, declaration, None))?;
+            DeferredAmbientFunctionValidator::new(arena, bound, store)
+                .type_node(parent, *annotation)
+                .map_err(|error| match error {
+                    SourceCheckError::Unsupported(UnsupportedSourceSyntax::Syntax {
+                        node,
+                        kind,
+                        ..
+                    }) => unsupported(node, kind, SourceSyntaxRole::InterfaceDeclaration),
+                    error => error,
+                })?;
+            generic.deferred_annotations.push(*annotation);
+        }
     }
     Ok(SourceNamespaceMemberPlan::Interface {
         declaration,
@@ -7018,9 +7342,16 @@ pub(super) fn execute_source_namespace(
                 if let Some(generic) = generic {
                     if !generic.call_signatures.is_empty()
                         || !generic.construct_signatures.is_empty()
+                        || !generic.index_signatures.is_empty()
                         || !generic.methods.is_empty()
                         || !generic.computed_properties.is_empty()
                         || !generic.base_interfaces.is_empty()
+                        || generic
+                            .properties
+                            .iter()
+                            .any(|property| generic.annotation_is_deferred(property.annotation))
+                        || object_members::plan_lazy_merged_generic_interface(store, host, *symbol)
+                            .is_ok()
                     {
                         continue;
                     }
@@ -9647,6 +9978,278 @@ mod tests {
     }
 
     #[test]
+    fn merged_generic_namespace_interfaces_preserve_each_declaration_and_shared_members() {
+        let mut fixture = declaration_fixture(
+            concat!(
+                "declare namespace React { ",
+                "interface HTMLAttributes<T> { id?: string; } ",
+                "interface HTMLAttributes<T> { 'aria-label'?: string; } ",
+                "}",
+            ),
+            CanonicalModuleState::Script,
+        );
+        let namespace = plan(&fixture, 0);
+        let [
+            SourceNamespaceMemberPlan::Interface {
+                declaration: first_declaration,
+                symbol: first_symbol,
+                generic: Some(first),
+                ..
+            },
+            SourceNamespaceMemberPlan::Interface {
+                declaration: second_declaration,
+                symbol: second_symbol,
+                generic: Some(second),
+                ..
+            },
+        ] = namespace.members.as_slice()
+        else {
+            panic!("the namespace must retain both merged interface declarations")
+        };
+        assert_eq!(first_symbol, second_symbol);
+        assert_eq!(first.members, second.members);
+        assert_eq!(
+            fixture
+                .context
+                .store()
+                .symbol(*first_symbol)
+                .unwrap()
+                .declarations(),
+            Some(&[*first_declaration, *second_declaration][..]),
+        );
+        assert_eq!(first.properties[0].name, "id");
+        assert_eq!(second.properties[0].name, "aria-label");
+        assert_eq!(
+            fixture
+                .context
+                .store()
+                .symbol_table(first.members)
+                .unwrap()
+                .len(),
+            3,
+        );
+
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+    }
+
+    #[test]
+    fn generic_namespace_interface_index_signatures_stay_authenticated_and_lazy() {
+        let mut fixture = declaration_fixture(
+            concat!(
+                "declare namespace React { ",
+                "interface Mixin<P, S> { render(): P; } ",
+                "interface ComponentSpec<P, S> extends Mixin<P, S> { ",
+                "render(): P; ",
+                "[propertyName: string]: any; ",
+                "} }",
+            ),
+            CanonicalModuleState::Script,
+        );
+        let namespace = plan(&fixture, 0);
+        let [
+            SourceNamespaceMemberPlan::Interface { .. },
+            SourceNamespaceMemberPlan::Interface {
+                symbol,
+                generic: Some(generic),
+                ..
+            },
+        ] = namespace.members.as_slice()
+        else {
+            panic!("the component specification must retain its indexed interface")
+        };
+        let symbol = *symbol;
+        let [index] = generic.index_signatures.as_slice() else {
+            panic!("the indexed interface must retain one binder-owned index symbol")
+        };
+        let index = *index;
+        let index_record = fixture.context.store().symbol(index).unwrap();
+        let [index_declaration] = index_record.declarations().unwrap() else {
+            panic!("the index symbol must retain its declaration")
+        };
+        let index_declaration = *index_declaration;
+        let NodeData::IndexSignatureDeclaration(index_syntax) = &fixture
+            .parsed
+            .arena
+            .get(index_declaration.node)
+            .unwrap()
+            .data
+        else {
+            panic!("the index symbol must retain its index signature")
+        };
+        let parameter = child(index_declaration, index_syntax.parameters.nodes[0]);
+        let NodeData::ParameterDeclaration(parameter_syntax) =
+            &fixture.parsed.arena.get(parameter.node).unwrap().data
+        else {
+            panic!("the index signature must retain its key parameter")
+        };
+        let key = child(parameter, parameter_syntax.type_.unwrap());
+        let value = child(index_declaration, index_syntax.type_);
+        assert_eq!(index_record.flags(), SymbolFlags::SIGNATURE);
+        assert_eq!(index_record.name(), InternalSymbolName::Index.as_ref());
+        assert_eq!(
+            fixture.context.store().get_parent_of_symbol(index),
+            Some(symbol)
+        );
+        assert_eq!(
+            fixture
+                .context
+                .store()
+                .symbol_table(generic.members)
+                .and_then(|members| members.get(InternalSymbolName::Index.as_ref())),
+            Some(index),
+        );
+        assert!(generic.annotation_is_deferred(key));
+        assert!(generic.annotation_is_deferred(value));
+
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        let target = fixture
+            .context
+            .store()
+            .declared_type_links(symbol)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let TypeData::Interface(interface) =
+            fixture.context.store().type_payload(target).unwrap().data()
+        else {
+            panic!("the component specification must retain its declared interface type")
+        };
+        assert!(!interface.declared_members_resolved);
+        assert!(interface.declared_index_infos.is_none());
+        assert!(
+            fixture
+                .context
+                .store()
+                .signature_links(index_declaration)
+                .is_none()
+        );
+        assert!(fixture.context.store().type_node_links(key).is_none());
+        assert!(fixture.context.store().type_node_links(value).is_none());
+
+        let warm = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn generic_namespace_interface_index_signatures_reject_malformed_binder_symbols() {
+        for mutation in 0..4 {
+            let mut fixture = declaration_fixture(
+                concat!(
+                    "declare namespace React { ",
+                    "interface ComponentSpec<P, S> { ",
+                    "[propertyName: string]: any; ",
+                    "} }",
+                ),
+                CanonicalModuleState::Script,
+            );
+            let namespace = plan(&fixture, 0);
+            let [
+                SourceNamespaceMemberPlan::Interface {
+                    symbol,
+                    generic: Some(generic),
+                    ..
+                },
+            ] = namespace.members.as_slice()
+            else {
+                panic!("the component specification must retain its indexed interface")
+            };
+            let owner = *symbol;
+            let index = generic.index_signatures[0];
+            let index_declaration = fixture
+                .context
+                .store()
+                .symbol(index)
+                .and_then(ts_binder::semantic::Symbol::declarations)
+                .and_then(|declarations| declarations.first())
+                .copied()
+                .unwrap();
+            let NodeData::IndexSignatureDeclaration(index_syntax) = &fixture
+                .parsed
+                .arena
+                .get(index_declaration.node)
+                .unwrap()
+                .data
+            else {
+                panic!("the index symbol must retain its index signature")
+            };
+            let parameter = child(index_declaration, index_syntax.parameters.nodes[0]);
+            let parameter_symbol = fixture
+                .context
+                .file(fixture.file)
+                .unwrap()
+                .1
+                .symbol(parameter)
+                .unwrap();
+            let expected = if mutation == 3 {
+                parameter
+            } else {
+                index_declaration
+            };
+            let store = fixture.context.store_mut_for_test();
+            match mutation {
+                0 => {
+                    assert!(store.set_symbol_flags(index, SymbolFlags::PROPERTY, CheckFlags::NONE));
+                }
+                1 => assert!(store.set_symbol_relationships(index, None, None, None, None)),
+                2 => assert!(store.set_symbol_relationships(
+                    index,
+                    None,
+                    None,
+                    Some(namespace.symbol),
+                    None,
+                )),
+                3 => assert!(store.set_symbol_flags(
+                    parameter_symbol,
+                    SymbolFlags::PROPERTY,
+                    CheckFlags::NONE,
+                )),
+                _ => unreachable!(),
+            }
+            let before = (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            );
+            let root = declaration(&fixture, 0);
+            let (arena, bound) = fixture.context.file(fixture.file).unwrap();
+
+            assert!(matches!(
+                plan_source_namespace(arena, bound, fixture.context.store(), root),
+                Err(SourceCheckError::Provenance(
+                    SourceCheckProvenanceError::MissingDeclarationSymbol(node),
+                )) if node == expected
+            ));
+            assert!(fixture.context.store().declared_type_links(owner).is_none());
+            assert!(
+                fixture
+                    .context
+                    .store()
+                    .signature_links(index_declaration)
+                    .is_none()
+            );
+            assert_eq!(
+                (
+                    fixture.context.store().type_len(),
+                    fixture.context.store().symbol_len(),
+                    fixture.context.store().checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+        }
+    }
+
+    #[test]
     fn generic_namespace_interface_methods_stay_authenticated_and_lazy() {
         let mut fixture = declaration_fixture(
             concat!(
@@ -9860,6 +10463,408 @@ mod tests {
     }
 
     #[test]
+    fn reopened_generic_namespace_interfaces_keep_shared_members_and_references_lazy() {
+        let mut fixture = declaration_fixture(
+            concat!(
+                "declare namespace React { ",
+                "interface DOMAttributes<T> { value?: T; } ",
+                "interface HTMLAttributes<T> extends DOMAttributes<T> { id?: string; } ",
+                "interface HTMLAttributes<T> extends DOMAttributes<T> { title?: string; } ",
+                "interface Wrapper<P extends HTMLAttributes<string>> { ",
+                "value?: HTMLAttributes<P>; ",
+                "} }",
+            ),
+            CanonicalModuleState::Script,
+        );
+        let namespace = plan(&fixture, 0);
+        let [
+            SourceNamespaceMemberPlan::Interface { .. },
+            SourceNamespaceMemberPlan::Interface {
+                declaration: first_declaration,
+                symbol: first_symbol,
+                generic: Some(first),
+                ..
+            },
+            SourceNamespaceMemberPlan::Interface {
+                declaration: second_declaration,
+                symbol: second_symbol,
+                generic: Some(second),
+                ..
+            },
+            SourceNamespaceMemberPlan::Interface {
+                symbol: wrapper,
+                generic: Some(wrapper_generic),
+                annotations,
+                ..
+            },
+        ] = namespace.members.as_slice()
+        else {
+            panic!("React must retain its reopened interface and dependent generic interface")
+        };
+        let symbol = *first_symbol;
+        let wrapper = *wrapper;
+        let parameter = first.type_parameters[0];
+        let properties = [first.properties[0].symbol, second.properties[0].symbol];
+        let wrapper_property = wrapper_generic.properties[0].symbol;
+        let deferred = annotations.clone();
+        assert_eq!(*second_symbol, symbol);
+        assert_eq!(first.type_parameters, second.type_parameters);
+        assert_eq!(first.members, second.members);
+        assert_eq!(
+            fixture.context.store().get_parent_of_symbol(parameter),
+            Some(symbol),
+        );
+        assert_eq!(
+            fixture
+                .context
+                .store()
+                .symbol(symbol)
+                .unwrap()
+                .declarations(),
+            Some(&[*first_declaration, *second_declaration][..]),
+        );
+        let members = fixture.context.store().symbol_table(first.members).unwrap();
+        assert_eq!(members.len(), 3);
+        assert_eq!(members.get_source("T"), Some(parameter));
+        assert_eq!(members.get_source("id"), Some(properties[0]));
+        assert_eq!(members.get_source("title"), Some(properties[1]));
+        assert_eq!(deferred.len(), 2);
+        assert!(
+            deferred
+                .iter()
+                .all(|annotation| { wrapper_generic.annotation_is_deferred(*annotation) })
+        );
+
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        for owner in [symbol, wrapper] {
+            let target = fixture
+                .context
+                .store()
+                .declared_type_links(owner)
+                .and_then(|links| links.declared_type)
+                .unwrap();
+            let TypeData::Interface(interface) =
+                fixture.context.store().type_payload(target).unwrap().data()
+            else {
+                panic!("the React interface must retain its declared identity")
+            };
+            assert!(!interface.declared_members_resolved);
+        }
+        for property in properties.into_iter().chain([wrapper_property]) {
+            assert!(
+                fixture
+                    .context
+                    .store()
+                    .value_symbol_links(property)
+                    .is_none()
+            );
+        }
+        assert!(deferred.iter().all(|annotation| {
+            fixture
+                .context
+                .store()
+                .type_node_links(*annotation)
+                .is_none()
+        }));
+
+        let warm = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn reopened_generic_namespace_interfaces_reject_invalid_owner_parameter_and_members() {
+        for mutation in 0..4 {
+            let mut fixture = declaration_fixture(
+                concat!(
+                    "declare namespace React { ",
+                    "interface DOMAttributes<T> {} ",
+                    "interface HTMLAttributes<T> extends DOMAttributes<T> { id?: string; } ",
+                    "interface HTMLAttributes<T> extends DOMAttributes<T> { title?: string; } ",
+                    "}",
+                ),
+                CanonicalModuleState::Script,
+            );
+            let namespace = plan(&fixture, 0);
+            let [
+                SourceNamespaceMemberPlan::Interface { .. },
+                SourceNamespaceMemberPlan::Interface {
+                    declaration: owner_declaration,
+                    symbol,
+                    generic: Some(generic),
+                    ..
+                },
+                SourceNamespaceMemberPlan::Interface { .. },
+            ] = namespace.members.as_slice()
+            else {
+                panic!("React must retain both reopened generic declarations")
+            };
+            let symbol = *symbol;
+            let owner_declaration = *owner_declaration;
+            let parameter = generic.type_parameters[0];
+            let parameter_declaration = fixture
+                .context
+                .store()
+                .symbol(parameter)
+                .and_then(ts_binder::semantic::Symbol::declarations)
+                .and_then(|declarations| declarations.first())
+                .copied()
+                .unwrap();
+            let property = generic.properties[0].symbol;
+            let property_declaration = generic.properties[0].declaration;
+            let expected = match mutation {
+                0 => owner_declaration,
+                1 | 3 => parameter_declaration,
+                2 => property_declaration,
+                _ => unreachable!(),
+            };
+            let store = fixture.context.store_mut_for_test();
+            match mutation {
+                0 => assert!(store.set_symbol_flags(
+                    symbol,
+                    SymbolFlags::INTERFACE | SymbolFlags::PROPERTY,
+                    CheckFlags::NONE,
+                )),
+                1 => assert!(store.set_symbol_flags(
+                    parameter,
+                    SymbolFlags::TYPE_PARAMETER | SymbolFlags::PROPERTY,
+                    CheckFlags::NONE,
+                )),
+                2 => assert!(store.set_symbol_relationships(
+                    property,
+                    None,
+                    None,
+                    Some(namespace.symbol),
+                    None,
+                )),
+                3 => assert!(store.set_symbol_relationships(parameter, None, None, None, None)),
+                _ => unreachable!(),
+            }
+            let before = (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            );
+            let root = declaration(&fixture, 0);
+            let (arena, bound) = fixture.context.file(fixture.file).unwrap();
+
+            assert!(matches!(
+                plan_source_namespace(arena, bound, fixture.context.store(), root),
+                Err(SourceCheckError::Provenance(
+                    SourceCheckProvenanceError::MissingDeclarationSymbol(node),
+                )) if node == expected
+            ));
+            assert!(
+                fixture
+                    .context
+                    .store()
+                    .declared_type_links(symbol)
+                    .is_none()
+            );
+            assert_eq!(
+                (
+                    fixture.context.store().type_len(),
+                    fixture.context.store().symbol_len(),
+                    fixture.context.store().checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+        }
+    }
+
+    #[test]
+    fn declaration_generic_interfaces_do_not_defer_missing_type_references() {
+        let mut fixture = declaration_fixture(
+            "declare namespace React { interface Wrapper<T> { value?: Missing<T>; } }",
+            CanonicalModuleState::Script,
+        );
+        let namespace = plan(&fixture, 0);
+        let [
+            SourceNamespaceMemberPlan::Interface {
+                symbol,
+                generic: Some(generic),
+                annotations,
+                ..
+            },
+        ] = namespace.members.as_slice()
+        else {
+            panic!("the declaration must retain its generic interface")
+        };
+        let symbol = *symbol;
+        let [annotation] = annotations.as_slice() else {
+            panic!("the generic interface must retain its missing property type")
+        };
+        assert!(!generic.annotation_is_deferred(*annotation));
+        let before = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+
+        assert!(matches!(
+            execute(&mut fixture, &namespace),
+            Err(SourceCheckError::DeclaredType(
+                DeclaredTypeError::TypeNodeUnavailable(TypeNodeUnavailable::MissingTypeReference(
+                    _
+                ))
+            ))
+        ));
+        assert!(
+            fixture
+                .context
+                .store()
+                .declared_type_links(symbol)
+                .is_none()
+        );
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+    }
+
+    #[test]
+    fn declaration_generic_namespace_interface_alias_annotations_remain_lazy() {
+        let mut fixture = declaration_fixture(
+            concat!(
+                "declare namespace Shapes { ",
+                "type Value<T> = T; ",
+                "interface Wrapper<T> { value: Value<T>; } ",
+                "}",
+            ),
+            CanonicalModuleState::Script,
+        );
+        let namespace = plan(&fixture, 0);
+        let [
+            SourceNamespaceMemberPlan::TypeAlias { .. },
+            SourceNamespaceMemberPlan::Interface {
+                symbol,
+                generic: Some(generic),
+                annotations,
+                ..
+            },
+        ] = namespace.members.as_slice()
+        else {
+            panic!("the declaration namespace must retain its alias and generic interface")
+        };
+        let symbol = *symbol;
+        let property = generic.properties[0].symbol;
+        let [annotation] = annotations.as_slice() else {
+            panic!("the declaration interface must retain its alias-backed property")
+        };
+        let annotation = *annotation;
+        assert!(generic.annotation_is_deferred(annotation));
+
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        let target = fixture
+            .context
+            .store()
+            .declared_type_links(symbol)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let TypeData::Interface(interface) =
+            fixture.context.store().type_payload(target).unwrap().data()
+        else {
+            panic!("the declaration interface must retain its declared identity")
+        };
+        assert!(!interface.declared_members_resolved);
+        assert!(
+            fixture
+                .context
+                .store()
+                .value_symbol_links(property)
+                .is_none()
+        );
+        assert!(
+            fixture
+                .context
+                .store()
+                .type_node_links(annotation)
+                .is_none()
+        );
+
+        let warm = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn ordinary_generic_namespace_interface_alias_annotations_remain_eager() {
+        let mut fixture = fixture(
+            concat!(
+                "declare namespace Shapes { ",
+                "type Value<T> = T; ",
+                "interface Wrapper<T> { value: Value<T>; } ",
+                "}",
+            ),
+            CanonicalModuleState::Script,
+        );
+        let namespace = plan(&fixture, 0);
+        let [
+            SourceNamespaceMemberPlan::TypeAlias { .. },
+            SourceNamespaceMemberPlan::Interface {
+                symbol,
+                generic: Some(generic),
+                annotations,
+                ..
+            },
+        ] = namespace.members.as_slice()
+        else {
+            panic!("the ordinary namespace must retain its alias and generic interface")
+        };
+        let symbol = *symbol;
+        let property = generic.properties[0].symbol;
+        assert_eq!(annotations.len(), 1);
+        assert!(!generic.annotation_is_deferred(annotations[0]));
+
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        let target = fixture
+            .context
+            .store()
+            .declared_type_links(symbol)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let TypeData::Interface(interface) =
+            fixture.context.store().type_payload(target).unwrap().data()
+        else {
+            panic!("the ordinary generic interface must retain its declared identity")
+        };
+        assert!(interface.declared_members_resolved);
+        assert!(
+            fixture
+                .context
+                .store()
+                .value_symbol_links(property)
+                .is_some()
+        );
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)] // Keep nested base arguments and cold-cache checks together.
     fn nongeneric_namespace_interfaces_accept_concrete_generic_heritage_lazily() {
         let mut fixture = declaration_fixture(
@@ -9955,6 +10960,80 @@ mod tests {
                 .iter()
                 .all(|argument| { fixture.context.store().type_node_links(*argument).is_none() })
         );
+
+        let warm = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn reopened_generic_namespace_interfaces_preserve_their_shared_member_table() {
+        let mut fixture = declaration_fixture(
+            concat!(
+                "declare namespace React { ",
+                "interface DOMAttributes<T> {} ",
+                "interface HTMLAttributes<T> extends DOMAttributes<T> { id?: string; } ",
+                "interface HTMLAttributes<T> extends DOMAttributes<T> { title?: string; } ",
+                "}",
+            ),
+            CanonicalModuleState::Script,
+        );
+        let namespace = plan(&fixture, 0);
+        let [
+            SourceNamespaceMemberPlan::Interface { .. },
+            SourceNamespaceMemberPlan::Interface {
+                symbol: first,
+                generic: Some(first_generic),
+                ..
+            },
+            SourceNamespaceMemberPlan::Interface {
+                symbol: second,
+                generic: Some(second_generic),
+                ..
+            },
+        ] = namespace.members.as_slice()
+        else {
+            panic!("the namespace must retain its base and reopened generic interfaces")
+        };
+        assert_eq!(first, second);
+        assert_eq!(first_generic.members, second_generic.members);
+        assert_eq!(first_generic.properties.len(), 1);
+        assert_eq!(second_generic.properties.len(), 1);
+        assert_eq!(
+            fixture
+                .context
+                .store()
+                .symbol_table(first_generic.members)
+                .map(ts_binder::semantic::SymbolTable::len),
+            Some(3),
+        );
+        let symbol = *first;
+
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+
+        let target = fixture
+            .context
+            .store()
+            .declared_type_links(symbol)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let TypeData::Interface(interface) =
+            fixture.context.store().type_payload(target).unwrap().data()
+        else {
+            panic!("the reopened symbol must retain its generic interface identity")
+        };
+        assert!(!interface.declared_members_resolved);
 
         let warm = (
             fixture.context.store().type_len(),

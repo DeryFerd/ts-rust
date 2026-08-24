@@ -41,6 +41,7 @@ use super::{
     links::{MembersOrExportsResolutionKind, ValueSymbolLinks},
     mapped_types::{FiniteRecordMappedProjection, MappedTypeError, MappedTypeModifiers},
     mapper::TypeMapper,
+    reference_types::validate_direct_generic_reference,
     relation::{
         ExpandingFlags, IntersectionState, RecursionFlags, RecursionIdentityUnavailable,
         RelationComparisonResult, RelationKeyUnavailable, RelationKind, SignatureCheckMode,
@@ -800,6 +801,214 @@ impl<'store> RelaterSession<'store> {
         }))
     }
 
+    /// Compares canonical arrays against the exact cold global `ConcatArray` surface.
+    fn canonical_array_concat_reference_arguments(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+    ) -> Result<Option<CanonicalArrayReferenceArguments>, RelationUnavailable> {
+        let Some((source_target, concat_target)) = configured_array_concat_reference_targets(
+            self.store,
+            self.global_types,
+            source,
+            target,
+        )?
+        else {
+            return Ok(None);
+        };
+
+        let source_argument = self.canonical_array_reference_argument(source, source_target)?;
+        let reference = validate_direct_generic_reference(self.store, target)
+            .map_err(|_| RelationUnavailable::InvalidStructuredMembers(target))?;
+        let [target_argument] = reference.type_arguments.as_slice() else {
+            return Err(RelationUnavailable::InvalidStructuredMembers(target));
+        };
+        if reference.target != concat_target {
+            return Err(RelationUnavailable::InvalidStructuredMembers(target));
+        }
+
+        let concat_owner = self
+            .store
+            .type_payload(concat_target)
+            .and_then(TypeRecord::symbol)
+            .ok_or(RelationUnavailable::InvalidStructuredMembers(target))?;
+        let source_owner = self
+            .store
+            .type_payload(source_target)
+            .and_then(TypeRecord::symbol)
+            .ok_or(RelationUnavailable::InvalidStructuredMembers(source_target))?;
+
+        if !self.has_authenticated_concat_array_surface(concat_target, concat_owner, true)? {
+            return Err(RelationUnavailable::UnsupportedStructuredType(target));
+        }
+        if !self.has_authenticated_concat_array_surface(source_target, source_owner, false)?
+            || self.relation.is_identity()
+        {
+            return Ok(Some(CanonicalArrayReferenceArguments::Unrelated));
+        }
+
+        Ok(Some(CanonicalArrayReferenceArguments::Related {
+            source: source_argument,
+            target: *target_argument,
+        }))
+    }
+
+    fn has_authenticated_concat_array_surface(
+        &self,
+        type_id: TypeId,
+        owner: SemanticSymbolId,
+        exact: bool,
+    ) -> Result<bool, RelationUnavailable> {
+        let invalid = || RelationUnavailable::InvalidStructuredMembers(type_id);
+        let owner_record = self.store.symbol(owner).ok_or_else(invalid)?;
+        let owner_declarations = owner_record
+            .declarations()
+            .filter(|declarations| !declarations.is_empty())
+            .ok_or_else(invalid)?;
+        let members = owner_record
+            .members()
+            .and_then(|members| self.store.symbol_table(members))
+            .ok_or_else(invalid)?;
+        if !owner_record.flags().contains(SymbolFlags::INTERFACE)
+            || owner_record.check_flags() != CheckFlags::NONE
+            || self.store.get_merged_symbol(owner) != Some(owner)
+        {
+            return Err(invalid());
+        }
+
+        if exact {
+            let Some([declaration]) = owner_record.declarations() else {
+                return Ok(false);
+            };
+            let TypeData::Interface(interface) =
+                self.store.type_payload(type_id).ok_or_else(invalid)?.data()
+            else {
+                return Err(invalid());
+            };
+            let Some([parameter]) = interface.reference.resolved_type_arguments.as_deref() else {
+                return Err(invalid());
+            };
+            let parameter_symbol = self
+                .store
+                .type_payload(*parameter)
+                .and_then(TypeRecord::symbol)
+                .ok_or_else(invalid)?;
+            let parameter_record = self.store.symbol(parameter_symbol).ok_or_else(invalid)?;
+            if owner_record.name().as_utf8() != Some("ConcatArray")
+                || owner_record.parent().is_some()
+                || owner_record.value_declaration().is_some()
+                || owner_record.exports().is_some()
+                || owner_record.export_symbol().is_some()
+                || self.store.source_node_kind(*declaration)
+                    != Some(SyntaxKind::InterfaceDeclaration)
+                || members.len() != 5
+                || parameter_record.flags() != SymbolFlags::TYPE_PARAMETER
+                || self.store.get_parent_of_symbol(parameter_symbol) != Some(owner)
+                || members.get(parameter_record.name()) != Some(parameter_symbol)
+            {
+                return Ok(false);
+            }
+        }
+
+        for (name, flags, kind, annotation_kind) in [
+            (
+                "length",
+                SymbolFlags::PROPERTY,
+                SyntaxKind::PropertySignature,
+                SyntaxKind::NumberKeyword,
+            ),
+            (
+                "join",
+                SymbolFlags::METHOD,
+                SyntaxKind::MethodSignature,
+                SyntaxKind::StringKeyword,
+            ),
+            (
+                "slice",
+                SymbolFlags::METHOD,
+                SyntaxKind::MethodSignature,
+                SyntaxKind::ArrayType,
+            ),
+        ] {
+            let Some(symbol) = members.get_source(name) else {
+                return Ok(false);
+            };
+            let record = self.store.symbol(symbol).ok_or_else(invalid)?;
+            let Some([declaration]) = record.declarations() else {
+                return Err(invalid());
+            };
+            let annotation = self
+                .store
+                .source_direct_type_annotation(*declaration)
+                .ok_or_else(invalid)?;
+            let SourceNodeParent::Parent(parent) = self
+                .store
+                .source_node_parent(*declaration)
+                .ok_or_else(invalid)?
+            else {
+                return Err(invalid());
+            };
+            let valid_checks = if flags == SymbolFlags::PROPERTY {
+                record.check_flags() == CheckFlags::NONE
+                    || record.check_flags() == CheckFlags::READONLY
+            } else {
+                record.check_flags() == CheckFlags::NONE
+            };
+            let declaration_kind = self.store.source_node_kind(*declaration);
+            let valid_declaration_kind = declaration_kind == Some(kind)
+                || flags == SymbolFlags::PROPERTY
+                    && declaration_kind == Some(SyntaxKind::PropertyDeclaration);
+            if record.flags() != flags
+                || !valid_checks
+                || !valid_declaration_kind
+                || record.name().as_utf8() != Some(name)
+                || record.value_declaration() != Some(*declaration)
+                || record.members().is_some()
+                || record.exports().is_some()
+                || record.export_symbol().is_some()
+                || self.store.get_parent_of_symbol(symbol) != Some(owner)
+                || self.store.get_merged_symbol(symbol) != Some(symbol)
+                || !owner_declarations.contains(&parent)
+                || self.store.source_node_kind(parent) != Some(SyntaxKind::InterfaceDeclaration)
+                || self.store.source_node_kind(annotation) != Some(annotation_kind)
+            {
+                return Err(invalid());
+            }
+        }
+
+        let Some(index) = members.get(InternalSymbolName::Index.as_ref()) else {
+            return Ok(false);
+        };
+        let record = self.store.symbol(index).ok_or_else(invalid)?;
+        let Some([declaration]) = record.declarations() else {
+            return Err(invalid());
+        };
+        let SourceNodeParent::Parent(parent) = self
+            .store
+            .source_node_parent(*declaration)
+            .ok_or_else(invalid)?
+        else {
+            return Err(invalid());
+        };
+        if record.flags() != SymbolFlags::SIGNATURE
+            || record.check_flags() != CheckFlags::NONE
+            || record.name() != InternalSymbolName::Index.as_ref()
+            || record.value_declaration().is_some()
+            || record.members().is_some()
+            || record.exports().is_some()
+            || record.export_symbol().is_some()
+            || self.store.get_parent_of_symbol(index) != Some(owner)
+            || self.store.get_merged_symbol(index) != Some(index)
+            || !owner_declarations.contains(&parent)
+            || self.store.source_node_kind(parent) != Some(SyntaxKind::InterfaceDeclaration)
+            || self.store.source_node_kind(*declaration) != Some(SyntaxKind::IndexSignature)
+        {
+            return Err(invalid());
+        }
+
+        Ok(true)
+    }
+
     /// The only mixed Array/property-object relation that is independent of
     /// instantiating generic Array members.
     ///
@@ -1199,6 +1408,13 @@ impl<'store> RelaterSession<'store> {
 
         if source_flags.intersects(TypeFlags::OBJECT)
             && target_flags.intersects(TypeFlags::OBJECT)
+            && self.cold_global_object_matches_empty_interface(source, target)?
+        {
+            return Ok(Ternary::True);
+        }
+
+        if source_flags.intersects(TypeFlags::OBJECT)
+            && target_flags.intersects(TypeFlags::OBJECT)
             && canonical_fixed_tuple_pair(self.store, source, target)?.is_some()
         {
             return self.recursive_type_related_to(
@@ -1212,6 +1428,14 @@ impl<'store> RelaterSession<'store> {
             canonical_tuple_array_pair(self.store, self.global_types, source, target)?
         {
             return self.tuple_array_related_to(pair, intersection_state);
+        }
+        if let Some(arguments) = self.canonical_array_concat_reference_arguments(source, target)? {
+            return match arguments {
+                CanonicalArrayReferenceArguments::Related { source, target } => {
+                    self.is_related_to_ex(source, target, RecursionFlags::BOTH, intersection_state)
+                }
+                CanonicalArrayReferenceArguments::Unrelated => Ok(Ternary::False),
+            };
         }
 
         if self.relation.is_identity() {
@@ -2531,6 +2755,48 @@ impl<'store> RelaterSession<'store> {
             return Ok(false);
         };
         Ok(self.observe_merged_symbol_lookup(type_symbol) == Some(global_object))
+    }
+
+    fn cold_global_object_matches_empty_interface(
+        &mut self,
+        left: TypeId,
+        right: TypeId,
+    ) -> Result<bool, RelationUnavailable> {
+        if self.relation != RelationKind::Comparable {
+            return Ok(false);
+        }
+        let (global, other) = if self.is_direct_global_object_type(left)? {
+            (left, right)
+        } else if self.is_direct_global_object_type(right)? {
+            (right, left)
+        } else {
+            return Ok(false);
+        };
+        let global_record = self
+            .store
+            .type_payload(global)
+            .ok_or(RelationUnavailable::Type(global))?;
+        let other_record = self
+            .store
+            .type_payload(other)
+            .ok_or(RelationUnavailable::Type(other))?;
+        if !matches!(global_record.data(), TypeData::Interface(_))
+            || global_record
+                .object_flags()
+                .contains(ObjectFlags::MEMBERS_RESOLVED)
+            || !matches!(other_record.data(), TypeData::Interface(_))
+            || !other_record
+                .object_flags()
+                .contains(ObjectFlags::MEMBERS_RESOLVED)
+        {
+            return Ok(false);
+        }
+
+        let members = self.resolved_object_property_surface(other, false)?;
+        Ok(members.properties.is_empty()
+            && members.index_infos.is_empty()
+            && !members.exact_callable
+            && members.call_signature.is_none())
     }
 
     fn properties_identical_to(
@@ -5924,6 +6190,10 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         let supported_tuple_array_relation = source_flags.intersects(TypeFlags::OBJECT)
             && target_flags.intersects(TypeFlags::OBJECT)
             && canonical_tuple_array_pair(self, global_types, source, target)?.is_some();
+        let supported_array_concat_relation = source_flags.intersects(TypeFlags::OBJECT)
+            && target_flags.intersects(TypeFlags::OBJECT)
+            && configured_array_concat_reference_targets(self, global_types, source, target)?
+                .is_some();
         let supported_apparent_primitive_relation = relation != RelationKind::Identity
             && target_flags.intersects(TypeFlags::OBJECT)
             && global_types
@@ -5933,6 +6203,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             && target_flags.intersects(TypeFlags::OBJECT)
             && !supported_array_relation
             && !supported_tuple_array_relation
+            && !supported_array_concat_relation
             && !supported_fixed_tuple_relation
             && !supported_broad_string_record_relation
             && (strict_function_types.is_some() || self.claimed_strict_function_types().is_none())
@@ -5964,6 +6235,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             if union_relation
                 || supported_object_relation
                 || supported_array_relation
+                || supported_array_concat_relation
                 || supported_apparent_primitive_relation
             {
                 let mut session = RelaterSession::new_with_global_types_and_options(
@@ -5983,6 +6255,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 )?;
                 return if supported_array_relation
                     || supported_tuple_array_relation
+                    || supported_array_concat_relation
                     || supported_apparent_primitive_relation
                 {
                     Ok(session.finish_without_specialized_root_cache(result))
@@ -6725,6 +6998,53 @@ fn configured_array_reference_targets(
     .then_some((source_target, target_target)))
 }
 
+fn configured_array_concat_reference_targets(
+    store: &SemanticStore<TypeRecord, TypeMapper>,
+    global_types: Option<RelationGlobalTypes>,
+    source: TypeId,
+    target: TypeId,
+) -> Result<Option<(TypeId, TypeId)>, RelationUnavailable> {
+    let Some(global_types) = global_types else {
+        return Ok(None);
+    };
+    let source_record = store
+        .type_payload(source)
+        .ok_or(RelationUnavailable::Type(source))?;
+    let target_record = store
+        .type_payload(target)
+        .ok_or(RelationUnavailable::Type(target))?;
+    let (TypeData::TypeReference(source_reference), TypeData::TypeReference(target_reference)) =
+        (source_record.data(), target_record.data())
+    else {
+        return Ok(None);
+    };
+    let Some(source_target) = source_reference
+        .object
+        .target
+        .filter(|target| global_types.contains_array_target(*target))
+    else {
+        return Ok(None);
+    };
+    let Some(target_target) = target_reference.object.target else {
+        return Ok(None);
+    };
+    let globals = store
+        .intrinsic_bootstrap()
+        .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+        .ok_or(RelationUnavailable::MissingBootstrap)?;
+    let Some(global) = globals.get_source("ConcatArray") else {
+        return Ok(None);
+    };
+    let owner = store
+        .get_merged_symbol(global)
+        .ok_or(RelationUnavailable::Symbol(global))?;
+    let actual_owner = store
+        .type_payload(target_target)
+        .and_then(TypeRecord::symbol)
+        .and_then(|symbol| store.get_merged_symbol(symbol));
+    Ok((actual_owner == Some(owner)).then_some((source_target, target_target)))
+}
+
 const fn array_relation_preflight_error(
     type_: TypeId,
     error: RelationUnavailable,
@@ -6932,6 +7252,19 @@ mod tests {
         file: FileId,
         files: BTreeMap<FileId, BoundFile>,
         store: TestStore,
+    }
+
+    struct ConcatArrayRelationFixture {
+        relation: FunctionRelationFixture,
+        globals: RelationGlobalTypes,
+        concat_owner: SemanticSymbolId,
+        concat_target: TypeId,
+        source: TypeId,
+        readonly_source: TypeId,
+        target: TypeId,
+        incompatible_target: TypeId,
+        lookalike_target: TypeId,
+        incompatible_element: TypeId,
     }
 
     fn function_relation_fixture(source: &str) -> FunctionRelationFixture {
@@ -7167,6 +7500,87 @@ mod tests {
                 readonly,
             ))
             .unwrap()
+    }
+
+    fn concat_array_relation_fixture() -> ConcatArrayRelationFixture {
+        let mut relation = function_relation_fixture(concat!(
+            "interface Array<T> { ",
+            "length: number; [index: number]: T; ",
+            "join(separator?: string): string; ",
+            "slice(start?: number, end?: number): T[]; ",
+            "} ",
+            "interface ReadonlyArray<T> { ",
+            "readonly length: number; readonly [index: number]: T; ",
+            "join(separator?: string): string; ",
+            "slice(start?: number, end?: number): T[]; ",
+            "} ",
+            "interface ConcatArray<T> { ",
+            "readonly length: number; readonly [index: number]: T; ",
+            "join(separator?: string): string; ",
+            "slice(start?: number, end?: number): T[]; ",
+            "} ",
+            "interface Lookalike<T> { ",
+            "readonly length: number; readonly [index: number]: T; ",
+            "join(separator?: string): string; ",
+            "slice(start?: number, end?: number): T[]; ",
+            "}",
+        ));
+        let array = query_declared_interface(&mut relation, "Array");
+        let readonly_array = query_declared_interface(&mut relation, "ReadonlyArray");
+        let concat_target = query_declared_interface(&mut relation, "ConcatArray");
+        let lookalike = query_declared_interface(&mut relation, "Lookalike");
+        let (number, string, empty_object, concat_owner) = {
+            let bootstrap = relation.store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.number_type,
+                bootstrap.string_type,
+                bootstrap.empty_object_type,
+                relation
+                    .store
+                    .symbol_table(bootstrap.globals)
+                    .and_then(|globals| globals.get_source("ConcatArray"))
+                    .and_then(|owner| relation.store.get_merged_symbol(owner))
+                    .unwrap(),
+            )
+        };
+        let required = [ElementFlags::REQUIRED, ElementFlags::REQUIRED];
+        let element =
+            canonical_relation_tuple(&mut relation.store, &[number, number], &required, false);
+        let incompatible_element =
+            canonical_relation_tuple(&mut relation.store, &[string, string], &required, false);
+        let source = canonical_array_reference(&mut relation.store, array, element);
+        let readonly_source =
+            canonical_array_reference(&mut relation.store, readonly_array, element);
+        let target = relation
+            .store
+            .create_direct_generic_reference_type(concat_target, &[element])
+            .unwrap();
+        let incompatible_target = relation
+            .store
+            .create_direct_generic_reference_type(concat_target, &[incompatible_element])
+            .unwrap();
+        let lookalike_target = relation
+            .store
+            .create_direct_generic_reference_type(lookalike, &[element])
+            .unwrap();
+
+        ConcatArrayRelationFixture {
+            relation,
+            globals: RelationGlobalTypes {
+                array_targets: CanonicalArrayTargets::for_test(array, readonly_array),
+                string_wrapper: empty_object,
+                number_wrapper: empty_object,
+                boolean_wrapper: empty_object,
+            },
+            concat_owner,
+            concat_target,
+            source,
+            readonly_source,
+            target,
+            incompatible_target,
+            lookalike_target,
+            incompatible_element,
+        }
     }
 
     fn query_class_members(fixture: &mut FunctionRelationFixture, name: &str) -> ClassMembers {
@@ -11970,6 +12384,322 @@ mod tests {
             ),
             Ok(false),
             "different canonical array targets are never identical"
+        );
+    }
+
+    #[test]
+    fn canonical_arrays_match_cold_global_concat_array_elements() {
+        let mut fixture = concat_array_relation_fixture();
+        let members = fixture
+            .relation
+            .store
+            .symbol(fixture.concat_owner)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .unwrap();
+        let cold_symbols = fixture
+            .relation
+            .store
+            .symbol_table(members)
+            .unwrap()
+            .iter()
+            .map(|(_, symbol)| symbol)
+            .filter(|symbol| {
+                fixture
+                    .relation
+                    .store
+                    .symbol(*symbol)
+                    .is_some_and(|record| {
+                        record
+                            .flags()
+                            .intersects(SymbolFlags::PROPERTY | SymbolFlags::METHOD)
+                    })
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            cold_symbols
+                .iter()
+                .all(|symbol| { fixture.relation.store.value_symbol_links(*symbol).is_none() })
+        );
+
+        for relation in [
+            RelationKind::Assignable,
+            RelationKind::Subtype,
+            RelationKind::StrictSubtype,
+            RelationKind::Comparable,
+        ] {
+            for source in [fixture.source, fixture.readonly_source] {
+                assert_eq!(
+                    fixture
+                        .relation
+                        .store
+                        .is_type_related_to_with_optional_global_types(
+                            source,
+                            fixture.target,
+                            relation,
+                            Some(fixture.globals),
+                        ),
+                    Ok(true),
+                );
+                assert_eq!(
+                    fixture
+                        .relation
+                        .store
+                        .is_type_related_to_with_optional_global_types(
+                            source,
+                            fixture.incompatible_target,
+                            relation,
+                            Some(fixture.globals),
+                        ),
+                    Ok(false),
+                );
+            }
+        }
+        assert_eq!(
+            fixture
+                .relation
+                .store
+                .is_type_related_to_with_optional_global_types(
+                    fixture.source,
+                    fixture.target,
+                    RelationKind::Identity,
+                    Some(fixture.globals),
+                ),
+            Ok(false),
+        );
+        assert!(
+            cold_symbols
+                .iter()
+                .all(|symbol| { fixture.relation.store.value_symbol_links(*symbol).is_none() })
+        );
+    }
+
+    #[test]
+    fn cold_concat_array_relations_do_not_escape_into_the_shared_root_cache() {
+        let mut fixture = concat_array_relation_fixture();
+        assert_eq!(
+            fixture
+                .relation
+                .store
+                .is_type_related_to_with_optional_global_types(
+                    fixture.source,
+                    fixture.target,
+                    RelationKind::Assignable,
+                    Some(fixture.globals),
+                ),
+            Ok(true),
+        );
+        let warm = fixture.relation.store.relation_state_snapshot();
+        assert_eq!(
+            fixture
+                .relation
+                .store
+                .is_type_related_to_with_optional_global_types(
+                    fixture.source,
+                    fixture.target,
+                    RelationKind::Assignable,
+                    Some(fixture.globals),
+                ),
+            Ok(true),
+        );
+        assert_eq!(fixture.relation.store.relation_state_snapshot(), warm);
+        assert_eq!(
+            fixture
+                .relation
+                .store
+                .is_type_assignable_to(fixture.source, fixture.target),
+            Err(RelationUnavailable::UnsupportedStructuredType(
+                fixture.target
+            )),
+        );
+        assert_eq!(fixture.relation.store.relation_state_snapshot(), warm);
+
+        assert_eq!(
+            fixture
+                .relation
+                .store
+                .is_type_related_to_with_optional_global_types(
+                    fixture.source,
+                    fixture.lookalike_target,
+                    RelationKind::Assignable,
+                    Some(fixture.globals),
+                ),
+            Err(RelationUnavailable::UnsupportedStructuredType(
+                fixture.lookalike_target,
+            )),
+        );
+    }
+
+    #[test]
+    fn poisoned_concat_array_declarations_and_reference_caches_fail_closed() {
+        let mut fixture = concat_array_relation_fixture();
+        assert_eq!(
+            fixture
+                .relation
+                .store
+                .is_type_related_to_with_optional_global_types(
+                    fixture.source,
+                    fixture.target,
+                    RelationKind::Assignable,
+                    Some(fixture.globals),
+                ),
+            Ok(true),
+        );
+        let owner_members = fixture
+            .relation
+            .store
+            .symbol(fixture.concat_owner)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .unwrap();
+        let symbols = {
+            let members = fixture.relation.store.symbol_table(owner_members).unwrap();
+            [
+                members.get_source("length").unwrap(),
+                members.get_source("join").unwrap(),
+                members.get_source("slice").unwrap(),
+                members.get(InternalSymbolName::Index.as_ref()).unwrap(),
+            ]
+        };
+        for symbol in symbols {
+            let (declarations, value_declaration) = {
+                let record = fixture.relation.store.symbol(symbol).unwrap();
+                (
+                    record.declarations().unwrap().to_vec(),
+                    record.value_declaration(),
+                )
+            };
+            assert!(
+                fixture
+                    .relation
+                    .store
+                    .set_symbol_declarations(symbol, None, None)
+            );
+            let poisoned = fixture.relation.store.relation_state_snapshot();
+            assert_eq!(
+                fixture
+                    .relation
+                    .store
+                    .is_type_related_to_with_optional_global_types(
+                        fixture.source,
+                        fixture.target,
+                        RelationKind::Assignable,
+                        Some(fixture.globals),
+                    ),
+                Err(RelationUnavailable::InvalidStructuredMembers(
+                    fixture.concat_target,
+                )),
+            );
+            assert_eq!(fixture.relation.store.relation_state_snapshot(), poisoned);
+            assert!(fixture.relation.store.set_symbol_declarations(
+                symbol,
+                Some(declarations),
+                value_declaration,
+            ));
+        }
+
+        assert!(fixture.relation.store.set_type_reference_resolution(
+            fixture.target,
+            None,
+            Some(vec![fixture.incompatible_element]),
+        ));
+        let poisoned = fixture.relation.store.relation_state_snapshot();
+        assert_eq!(
+            fixture
+                .relation
+                .store
+                .is_type_related_to_with_optional_global_types(
+                    fixture.source,
+                    fixture.target,
+                    RelationKind::Assignable,
+                    Some(fixture.globals),
+                ),
+            Err(RelationUnavailable::InvalidStructuredMembers(
+                fixture.target
+            )),
+        );
+        assert_eq!(fixture.relation.store.relation_state_snapshot(), poisoned);
+    }
+
+    #[test]
+    fn empty_interfaces_are_comparable_to_unresolved_global_object() {
+        let library = parse_source_file(concat!(
+            "interface Array<T> {} ",
+            "interface ReadonlyArray<T> {} ",
+            "interface Object { toString(): string; } ",
+            "interface ObjectConstructor { new(value?: any): Object; } ",
+            "declare var Object: ObjectConstructor;",
+        ));
+        let source = parse_source_file("interface Empty {}");
+        assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let file = FileId::new(96_460);
+        let mut context =
+            source_relation_context(&library, &source, file, CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        let globals = context.global_types().clone();
+        let (empty, object) = {
+            let store = context.store();
+            let globals = store
+                .symbol_table(store.intrinsic_bootstrap().unwrap().globals)
+                .unwrap();
+            let empty = globals
+                .get_source("Empty")
+                .and_then(|owner| store.get_merged_symbol(owner))
+                .and_then(|owner| store.declared_type_links(owner))
+                .and_then(|links| links.declared_type)
+                .unwrap();
+            let object = globals
+                .get_source("Object")
+                .and_then(|owner| store.get_merged_symbol(owner))
+                .and_then(|owner| store.declared_type_links(owner))
+                .and_then(|links| links.declared_type)
+                .unwrap();
+            assert!(
+                store
+                    .type_payload(empty)
+                    .unwrap()
+                    .object_flags()
+                    .contains(ObjectFlags::MEMBERS_RESOLVED),
+            );
+            assert!(
+                !store
+                    .type_payload(object)
+                    .unwrap()
+                    .object_flags()
+                    .contains(ObjectFlags::MEMBERS_RESOLVED),
+            );
+            (empty, object)
+        };
+        let store = context.store_mut_for_test();
+
+        assert_eq!(
+            store.are_types_comparable_with_global_types(empty, object, &globals),
+            Ok(true),
+        );
+        let warm = (
+            store.type_len(),
+            store.symbol_len(),
+            store.checker_link_allocated_lengths(),
+            store.relation_state_snapshot(),
+        );
+        assert_eq!(
+            store.are_types_comparable_with_global_types(empty, object, &globals),
+            Ok(true),
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.symbol_len(),
+                store.checker_link_allocated_lengths(),
+                store.relation_state_snapshot(),
+            ),
+            warm,
+        );
+        assert!(
+            !store
+                .type_payload(object)
+                .unwrap()
+                .object_flags()
+                .contains(ObjectFlags::MEMBERS_RESOLVED),
         );
     }
 

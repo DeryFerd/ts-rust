@@ -238,6 +238,7 @@ pub(super) struct SourceCallablePlan {
     pub(super) owner_symbol: SemanticSymbolId,
     pub(super) owner_parent: Option<SemanticSymbolId>,
     pub(super) export_local: Option<SemanticSymbolId>,
+    javascript_duplicate_owner: bool,
     pub(super) type_parameters: Vec<SourceCallableTypeParameterPlan>,
     pub(super) type_parameter_syntax: Box<SourceCallableTypeParameterSyntaxProof>,
     generic_return_type_parameter_index: Option<usize>,
@@ -486,6 +487,7 @@ impl SourceSyntaxView<'_> {
 enum SourceCallableOwnerShape<'a> {
     Unique,
     AmbientOverload(&'a [NodeRef]),
+    JavaScriptDuplicateImplementation,
 }
 
 fn source_function_owner_declarations_are_exact(
@@ -521,6 +523,215 @@ fn source_function_owner_declarations_are_exact(
                     && store.source_node_kind(*candidate) == Some(SyntaxKind::ModuleDeclaration)
                     && store.source_node_parent(*candidate) == store.source_node_parent(declaration)
         })
+}
+
+fn javascript_duplicate_function_owner_structure(
+    store: &CanonicalTypeMapperStore,
+    owner_symbol: SemanticSymbolId,
+    owner: &ts_binder::semantic::Symbol,
+    declaration: NodeRef,
+) -> bool {
+    let Some(declarations) = owner.declarations() else {
+        return false;
+    };
+    let Some(SourceNodeParent::Parent(source)) = store.source_node_parent(declaration) else {
+        return false;
+    };
+    owner.flags() == SymbolFlags::FUNCTION
+        && owner.check_flags() == CheckFlags::NONE
+        && !owner.name().as_bytes().is_empty()
+        && owner.value_declaration() == Some(declaration)
+        && owner.members().is_none()
+        && owner.exports().is_none()
+        && owner.parent().is_none()
+        && owner.export_symbol().is_none()
+        && store.get_merged_symbol(owner_symbol) == Some(owner_symbol)
+        && store.source_node_kind(source) == Some(SyntaxKind::SourceFile)
+        && store.source_node_parent(source) == Some(SourceNodeParent::Root)
+        && declarations.len() >= 2
+        && declarations.first().copied() == Some(declaration)
+        && declarations
+            .iter()
+            .enumerate()
+            .all(|(index, implementation)| {
+                !declarations[..index].contains(implementation)
+                    && implementation.is_for(declaration.arena, declaration.file)
+                    && store.source_node_kind(*implementation)
+                        == Some(SyntaxKind::FunctionDeclaration)
+                    && store.source_node_parent(*implementation)
+                        == Some(SourceNodeParent::Parent(source))
+            })
+}
+
+/// Authenticates the first implementation of one exact JavaScript function group.
+pub(super) fn valid_javascript_duplicate_function_owner_shape(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner_symbol: SemanticSymbolId,
+    declaration: NodeRef,
+) -> bool {
+    let Some(bound) = host.bound_file(declaration) else {
+        return false;
+    };
+    if bound
+        .source_facts()
+        .is_none_or(|facts| !facts.is_javascript_file() || facts.is_declaration_file())
+    {
+        return false;
+    }
+    let Some(owner) = store.symbol(owner_symbol) else {
+        return false;
+    };
+    if !javascript_duplicate_function_owner_structure(store, owner_symbol, owner, declaration) {
+        return false;
+    }
+    let source = bound.source_file();
+    if !source.is_for(declaration.arena, declaration.file)
+        || bound
+            .locals(source)
+            .and_then(|locals| store.symbol_table(locals))
+            .and_then(|locals| locals.get(owner.name()))
+            != Some(owner_symbol)
+    {
+        return false;
+    }
+    let Some(source_record) = host.node(source) else {
+        return false;
+    };
+    let NodeData::SourceFile(source_data) = &source_record.data else {
+        return false;
+    };
+    if source_record.kind != SyntaxKind::SourceFile
+        || source_record.parent.is_some()
+        || source_record.range.end < source_record.range.start
+        || source_data.statements.range.end < source_data.statements.range.start
+        || source_data.statements.range.start < source_record.range.start
+        || source_data.statements.range.end > source_record.range.end
+    {
+        return false;
+    }
+
+    let declarations = owner
+        .declarations()
+        .expect("the duplicate owner structure checked its declarations");
+    let mut source_declarations = source_data.statements.nodes.iter().filter_map(|statement| {
+        let statement = NodeRef::new(source.arena, source.file, *statement);
+        (bound.symbol(statement) == Some(owner_symbol)).then_some(statement)
+    });
+    let mut previous_end = source_record.range.start;
+    for implementation in declarations {
+        if source_declarations.next() != Some(*implementation)
+            || bound.symbol(*implementation) != Some(owner_symbol)
+            || bound.local_symbol(*implementation).is_some()
+            || bound.container(*implementation) != Some(source)
+        {
+            return false;
+        }
+        let Some(record) = host.node(*implementation) else {
+            return false;
+        };
+        let NodeData::FunctionDeclaration(function) = &record.data else {
+            return false;
+        };
+        if record.kind != SyntaxKind::FunctionDeclaration
+            || record.parent != Some(source.node)
+            || record.flags.0 & NODE_FLAG_JSDOC != 0
+            || record.range.start < previous_end
+            || record.range.end < record.range.start
+            || record.range.end > source_record.range.end
+            || function.parameters.range.end < function.parameters.range.start
+            || function.parameters.range.start < record.range.start
+            || function.parameters.range.end > record.range.end
+            || function.full_signature.is_some()
+            || function.next_container.is_some()
+            || function.symbol.is_some()
+            || function.local_symbol.is_some()
+            || function.flow_node.is_some()
+            || function.end_flow_node.is_some()
+            || function.return_flow_node.is_some()
+        {
+            return false;
+        }
+        let Some(name) = function
+            .name
+            .map(|name| NodeRef::new(implementation.arena, implementation.file, name))
+        else {
+            return false;
+        };
+        let Some(name_record) = host.node(name) else {
+            return false;
+        };
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return false;
+        };
+        if name_record.kind != SyntaxKind::Identifier
+            || name_record.parent != Some(implementation.node)
+            || name_record.range.start < record.range.start
+            || name_record.range.end < name_record.range.start
+            || name_record.range.end > function.parameters.range.start
+            || identifier.text.is_empty()
+            || identifier.text.as_bytes() != owner.name().as_bytes()
+            || identifier.flow_node.is_some()
+        {
+            return false;
+        }
+        let Some(body) = function
+            .body
+            .map(|body| NodeRef::new(implementation.arena, implementation.file, body))
+        else {
+            return false;
+        };
+        let Some(body_record) = host.node(body) else {
+            return false;
+        };
+        let NodeData::Block(block) = &body_record.data else {
+            return false;
+        };
+        if body_record.kind != SyntaxKind::Block
+            || body_record.parent != Some(implementation.node)
+            || body_record.range.start < function.parameters.range.end
+            || body_record.range.end < body_record.range.start
+            || body_record.range.end > record.range.end
+            || block.statements.range.end < block.statements.range.start
+            || block.statements.range.start < body_record.range.start
+            || block.statements.range.end > body_record.range.end
+            || block.statements.has_trailing_comma
+            || block.flow_node.is_some()
+            || block.next_container.is_some()
+            || block.facts != 0
+            || bound.container(body) != Some(*implementation)
+        {
+            return false;
+        }
+        previous_end = record.range.end;
+    }
+    source_declarations.next().is_none()
+}
+
+fn published_javascript_duplicate_function_owner_shape(
+    store: &CanonicalTypeMapperStore,
+    owner_symbol: SemanticSymbolId,
+    owner: &ts_binder::semantic::Symbol,
+    declaration: NodeRef,
+) -> bool {
+    if !javascript_duplicate_function_owner_structure(store, owner_symbol, owner, declaration) {
+        return false;
+    }
+    let Some(type_) = store.source_callable_type_for_owner(owner_symbol) else {
+        return false;
+    };
+    let Some(provenance) = store.source_callable_provenance(type_) else {
+        return false;
+    };
+    provenance.family == SourceCallableFamily::FunctionDeclaration
+        && provenance.declaration == declaration
+        && provenance.owner_symbol == owner_symbol
+        && provenance.owner_parent.is_none()
+        && provenance.export_local.is_none()
+        && provenance.contextual_target.is_none()
+        && provenance.contextual_variable.is_none()
+        && store.source_callable_type_for_declaration(declaration) == Some(type_)
+        && store.source_callable_type_for_signature(provenance.signature) == Some(type_)
 }
 
 fn source_function_owner_exports_are_valid(
@@ -605,7 +816,7 @@ fn source_function_namespace_contains_declaration(
     false
 }
 
-/// Accepts ordinary functions and authenticated merged namespace exports.
+/// Accepts ordinary functions, namespace merges, and published JavaScript groups.
 pub(super) fn valid_source_function_owner_shape(
     store: &CanonicalTypeMapperStore,
     owner_symbol: SemanticSymbolId,
@@ -616,6 +827,12 @@ pub(super) fn valid_source_function_owner_shape(
     };
     source_function_owner_declarations_are_exact(store, owner, declaration)
         && source_function_owner_exports_are_valid(store, owner_symbol, owner)
+        || published_javascript_duplicate_function_owner_shape(
+            store,
+            owner_symbol,
+            owner,
+            declaration,
+        )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1343,6 +1560,24 @@ pub(super) fn plan_source_ambient_overload_declaration(
     )
 }
 
+/// Plans a later JavaScript implementation without publishing another callable.
+pub(super) fn plan_javascript_duplicate_function_implementation(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    owner_symbol: SemanticSymbolId,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<SourceCallablePlan, SourceCallableError> {
+    plan_source_callable_with_owner_shape(
+        store,
+        host,
+        declaration,
+        owner_symbol,
+        array_targets,
+        SourceCallableOwnerShape::JavaScriptDuplicateImplementation,
+    )
+}
+
 fn plan_source_callable_with_owner_shape(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -1447,9 +1682,17 @@ fn plan_source_callable_with_owner_shape(
         .symbol(owner_symbol)
         .ok_or_else(|| invariant(SourceCallableInvariant::InvalidOwnerSymbol(declaration)))?;
     let export_local = bound.local_symbol(declaration);
+    let javascript_duplicate_owner = owner
+        .declarations()
+        .and_then(|declarations| declarations.first())
+        .copied()
+        .is_some_and(|first| {
+            valid_javascript_duplicate_function_owner_shape(store, host, owner_symbol, first)
+        });
     let exact_owner_declarations = match owner_shape {
         SourceCallableOwnerShape::Unique => {
             source_function_owner_declarations_are_exact(store, owner, declaration)
+                || javascript_duplicate_owner && owner.value_declaration() == Some(declaration)
         }
         SourceCallableOwnerShape::AmbientOverload(declarations) => {
             declarations.len() >= 2
@@ -1457,6 +1700,14 @@ fn plan_source_callable_with_owner_shape(
                 && owner.declarations() == Some(declarations)
                 && owner.value_declaration() == declarations.first().copied()
                 && owner.parent().is_none()
+                && export_local.is_none()
+        }
+        SourceCallableOwnerShape::JavaScriptDuplicateImplementation => {
+            javascript_duplicate_owner
+                && owner.value_declaration() != Some(declaration)
+                && owner
+                    .declarations()
+                    .is_some_and(|declarations| declarations.contains(&declaration))
                 && export_local.is_none()
         }
     };
@@ -1982,6 +2233,8 @@ fn plan_source_callable_with_owner_shape(
         owner_symbol,
         owner_parent: owner.parent(),
         export_local,
+        javascript_duplicate_owner: javascript_duplicate_owner
+            && matches!(owner_shape, SourceCallableOwnerShape::Unique),
         type_parameters,
         type_parameter_syntax: Box::new(type_parameter_syntax),
         generic_return_type_parameter_index: None,
@@ -2060,6 +2313,18 @@ fn plan_source_callable_with_owner_shape(
                     .parameters
                     .iter()
                     .any(|parameter| parameter.rest || parameter.initializer.is_some())
+            {
+                return Err(SourceCallableError::Unsupported(
+                    SourceCallableUnsupported::OverloadDeclaration(declaration),
+                ));
+            }
+        }
+        SourceCallableOwnerShape::JavaScriptDuplicateImplementation => {
+            if plan.family != SourceCallableFamily::FunctionDeclaration
+                || plan.body_mode != SourceCallableBodyMode::Present
+                || !plan.type_parameters.is_empty()
+                || plan.export_local.is_some()
+                || plan.owner_parent.is_some()
             {
                 return Err(SourceCallableError::Unsupported(
                     SourceCallableUnsupported::OverloadDeclaration(declaration),
@@ -5055,7 +5320,14 @@ fn valid_source_callable_plan_owner(
                 && plan.export_local.is_none()
         }
         SourceCallableFamily::FunctionDeclaration => {
-            valid_source_function_owner_shape(store, plan.owner_symbol, plan.declaration)
+            (valid_source_function_owner_shape(store, plan.owner_symbol, plan.declaration)
+                || plan.javascript_duplicate_owner
+                    && javascript_duplicate_function_owner_structure(
+                        store,
+                        plan.owner_symbol,
+                        owner,
+                        plan.declaration,
+                    ))
                 && match (plan.owner_parent, plan.export_local) {
                     (None, None) => true,
                     (Some(parent), Some(local)) => {
@@ -12107,6 +12379,277 @@ mod tests {
                 ),
                 "{source}"
             );
+        }
+    }
+
+    #[test]
+    fn javascript_duplicate_implementations_publish_only_the_first_signature() {
+        let mut fixture = QueryFixture::javascript(
+            "function repeated() {} function repeated(arg) {}",
+            FileId::new(8_940),
+        );
+        let source = fixture
+            .parsed
+            .arena
+            .get(fixture.parsed.source_file)
+            .unwrap();
+        let NodeData::SourceFile(source) = &source.data else {
+            panic!("expected the duplicate fixture source file")
+        };
+        let [first, second] = source.statements.nodes.as_slice() else {
+            panic!("expected exactly two duplicate implementations")
+        };
+        let first = NodeRef::new(fixture.parsed.arena.id(), fixture.file, *first);
+        let second = NodeRef::new(fixture.parsed.arena.id(), fixture.file, *second);
+        let owner = fixture.bound.symbol(first).unwrap();
+        assert_eq!(fixture.bound.symbol(second), Some(owner));
+
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&fixture.parsed.arena, &fixture.bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let before = publication_state(&fixture.store);
+        assert!(valid_javascript_duplicate_function_owner_shape(
+            &fixture.store,
+            &host,
+            owner,
+            first,
+        ));
+        assert!(!valid_javascript_duplicate_function_owner_shape(
+            &fixture.store,
+            &host,
+            owner,
+            second,
+        ));
+        assert!(!valid_source_function_owner_shape(
+            &fixture.store,
+            owner,
+            first,
+        ));
+
+        let canonical = plan_source_callable(&fixture.store, &host, first, owner, None).unwrap();
+        assert!(canonical.parameters.is_empty());
+        assert_eq!(canonical.min_argument_count, 0);
+        assert_eq!(canonical.flags, SignatureFlags::NONE);
+
+        let secondary = plan_javascript_duplicate_function_implementation(
+            &fixture.store,
+            &host,
+            second,
+            owner,
+            None,
+        )
+        .unwrap();
+        assert_eq!(secondary.declaration, second);
+        assert_eq!(secondary.parameters.len(), 1);
+        assert!(secondary.parameters[0].is_implicit_any());
+        assert_eq!(
+            secondary.parameters[0].base_type(&fixture.store),
+            Some(fixture.store.intrinsic_bootstrap().unwrap().any_type),
+        );
+        assert!(
+            fixture
+                .store
+                .value_symbol_links(secondary.parameters[0].symbol)
+                .is_none()
+        );
+        assert!(matches!(
+            source_callable_state(&fixture.store, &secondary, false),
+            Err(SourceCallableError::Invariant(
+                SourceCallableInvariant::InvalidOwnerSymbol(node)
+            )) if node == second
+        ));
+        assert!(matches!(
+            plan_source_callable(&fixture.store, &host, second, owner, None),
+            Err(SourceCallableError::Invariant(
+                SourceCallableInvariant::InvalidOwnerSymbol(node)
+            )) if node == second
+        ));
+        assert_eq!(publication_state(&fixture.store), before);
+        drop(host);
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let callable = fixture
+            .query_callable(first, owner, &mut diagnostics)
+            .unwrap();
+        let signature = fixture
+            .store
+            .source_callable_provenance(callable)
+            .unwrap()
+            .signature;
+        assert!(
+            fixture
+                .store
+                .signature(signature)
+                .unwrap()
+                .parameters()
+                .is_empty()
+        );
+        assert!(valid_source_function_owner_shape(
+            &fixture.store,
+            owner,
+            first,
+        ));
+        let void = fixture.store.intrinsic_bootstrap().unwrap().void_type;
+        publish_inferred_source_callable_return(&mut fixture.store, &canonical, signature, void)
+            .unwrap();
+        assert!(matches!(
+            validate_stored_source_callable(&fixture.store, callable),
+            StoredSourceCallableValidation::Valid(_)
+        ));
+
+        let warm = publication_state(&fixture.store);
+        assert_eq!(
+            fixture.query_callable(first, owner, &mut diagnostics),
+            Ok(callable)
+        );
+        assert_eq!(publication_state(&fixture.store), warm);
+        assert!(
+            fixture
+                .store
+                .value_symbol_links(secondary.parameters[0].symbol)
+                .is_none()
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn typescript_duplicate_implementations_cannot_use_javascript_ownership() {
+        let mut fixture = QueryFixture::new(
+            "function repeated() {} function repeated(arg) {}",
+            FileId::new(8_941),
+        );
+        let source = fixture
+            .parsed
+            .arena
+            .get(fixture.parsed.source_file)
+            .unwrap();
+        let NodeData::SourceFile(source) = &source.data else {
+            panic!("expected the duplicate fixture source file")
+        };
+        let [first, second] = source.statements.nodes.as_slice() else {
+            panic!("expected exactly two duplicate implementations")
+        };
+        let first = NodeRef::new(fixture.parsed.arena.id(), fixture.file, *first);
+        let second = NodeRef::new(fixture.parsed.arena.id(), fixture.file, *second);
+        let owner = fixture.bound.symbol(first).unwrap();
+        assert!(fixture.store.set_symbol_declarations(
+            owner,
+            Some(vec![first, second]),
+            Some(first),
+        ));
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&fixture.parsed.arena, &fixture.bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let before = publication_state(&fixture.store);
+
+        assert!(!valid_javascript_duplicate_function_owner_shape(
+            &fixture.store,
+            &host,
+            owner,
+            first,
+        ));
+        assert!(matches!(
+            plan_source_callable(&fixture.store, &host, first, owner, None),
+            Err(SourceCallableError::Invariant(
+                SourceCallableInvariant::InvalidOwnerSymbol(node)
+            )) if node == first
+        ));
+        assert!(
+            plan_javascript_duplicate_function_implementation(
+                &fixture.store,
+                &host,
+                second,
+                owner,
+                None,
+            )
+            .is_err()
+        );
+        assert_eq!(publication_state(&fixture.store), before);
+    }
+
+    #[test]
+    fn javascript_duplicate_implementations_reject_forged_owner_groups() {
+        for (index, forged_shape) in ["reversed", "value", "repeated", "unrelated", "parent"]
+            .into_iter()
+            .enumerate()
+        {
+            let mut fixture = QueryFixture::javascript(
+                "function repeated() {} function repeated(arg) {} function unrelated() {}",
+                FileId::new(8_942 + u32::try_from(index).unwrap()),
+            );
+            let source = fixture
+                .parsed
+                .arena
+                .get(fixture.parsed.source_file)
+                .unwrap();
+            let NodeData::SourceFile(source) = &source.data else {
+                panic!("expected the duplicate fixture source file")
+            };
+            let [first, second, unrelated] = source.statements.nodes.as_slice() else {
+                panic!("expected two duplicate implementations and one unrelated function")
+            };
+            let first = NodeRef::new(fixture.parsed.arena.id(), fixture.file, *first);
+            let second = NodeRef::new(fixture.parsed.arena.id(), fixture.file, *second);
+            let unrelated = NodeRef::new(fixture.parsed.arena.id(), fixture.file, *unrelated);
+            let owner = fixture.bound.symbol(first).unwrap();
+            match forged_shape {
+                "reversed" => assert!(fixture.store.set_symbol_declarations(
+                    owner,
+                    Some(vec![second, first]),
+                    Some(first),
+                )),
+                "value" => assert!(fixture.store.set_symbol_declarations(
+                    owner,
+                    Some(vec![first, second]),
+                    Some(second),
+                )),
+                "repeated" => assert!(fixture.store.set_symbol_declarations(
+                    owner,
+                    Some(vec![first, first]),
+                    Some(first),
+                )),
+                "unrelated" => assert!(fixture.store.set_symbol_declarations(
+                    owner,
+                    Some(vec![first, unrelated]),
+                    Some(first),
+                )),
+                "parent" => {
+                    let unrelated_owner = fixture.bound.symbol(unrelated).unwrap();
+                    assert!(fixture.store.set_symbol_relationships(
+                        owner,
+                        None,
+                        None,
+                        Some(unrelated_owner),
+                        None,
+                    ));
+                }
+                _ => unreachable!(),
+            }
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            let before = publication_state(&fixture.store);
+
+            assert!(
+                !valid_javascript_duplicate_function_owner_shape(
+                    &fixture.store,
+                    &host,
+                    owner,
+                    first,
+                ),
+                "{forged_shape}",
+            );
+            assert!(
+                plan_source_callable(&fixture.store, &host, first, owner, None).is_err(),
+                "{forged_shape}",
+            );
+            assert_eq!(publication_state(&fixture.store), before, "{forged_shape}");
         }
     }
 

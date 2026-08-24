@@ -759,7 +759,7 @@ fn validate_property_interface_worker(
     if record.flags() != TypeFlags::OBJECT
         || record.object_flags() != ObjectFlags::INTERFACE | ObjectFlags::MEMBERS_RESOLVED
         || record.alias().is_some()
-        || owner_record.flags() != SymbolFlags::INTERFACE
+        || owner_record.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
         || owner_record.check_flags() != CheckFlags::NONE
         || owner_record.value_declaration().is_some()
         || owner_record.members() != interface.declared_members
@@ -1357,7 +1357,7 @@ fn valid_interface_method_signatures(
         return None;
     };
     let signatures = object.structured.signatures.as_deref()?;
-    if owner_record.flags() != SymbolFlags::INTERFACE
+    if owner_record.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
         || declarations.is_empty()
         || declarations.len() != signatures.len()
         || record.flags() != TypeFlags::OBJECT
@@ -2219,6 +2219,68 @@ mod tests {
     }
 
     #[test]
+    fn merged_interface_method_owners_preserve_authenticated_signatures() {
+        let mut fixture = fixture_with_source(METHOD_SOURCE, 809);
+        let (base, base_type, base_signature) =
+            publish_interface_method_for_test(&mut fixture, "Base");
+        let (derived, _, _) = publish_interface_method_for_test(&mut fixture, "Derived");
+        let owner = interface_symbol(&fixture, "Base");
+        assert!(fixture.store.set_symbol_flags(
+            owner,
+            SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT,
+            CheckFlags::NONE,
+        ));
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        assert_eq!(
+            valid_interface_method_value(&fixture.store, base, base_type),
+            Some(base_signature),
+        );
+        assert!(valid_property_symbol(&fixture.store, base));
+        assert!(matching_interface_method_contract(
+            &fixture.store,
+            base,
+            derived,
+        ));
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+
+        assert!(fixture.store.set_symbol_flags(
+            owner,
+            SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT | SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+            CheckFlags::NONE,
+        ));
+        assert_eq!(
+            valid_interface_method_value(&fixture.store, base, base_type),
+            None,
+        );
+        assert!(!valid_property_symbol(&fixture.store, base));
+        assert!(!matching_interface_method_contract(
+            &fixture.store,
+            base,
+            derived,
+        ));
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+    }
+
+    #[test]
     fn malformed_interface_method_values_and_return_types_fail_closed() {
         let mut fixture = fixture_with_source(METHOD_SOURCE, 805);
         let (base, _, _) = publish_interface_method_for_test(&mut fixture, "Base");
@@ -2697,6 +2759,162 @@ mod tests {
             ),
             warm_state
         );
+    }
+
+    #[test]
+    fn merged_interface_bases_preserve_inherited_members_cold_and_warm() {
+        let mut prepared = prepare_fixture(fixture_with_source(
+            concat!(
+                "interface Base { first: number }\n",
+                "interface Base { second: number }\n",
+                "interface Other { other: number }\n",
+                "interface Derived extends Base { own: number }\n",
+            ),
+            810,
+        ));
+        let base = interface_symbol(&prepared.fixture, "Base");
+        assert_eq!(
+            prepared
+                .fixture
+                .store
+                .symbol(base)
+                .unwrap()
+                .declarations()
+                .unwrap()
+                .len(),
+            2,
+        );
+        assert!(prepared.fixture.store.set_symbol_flags(
+            base,
+            SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT,
+            CheckFlags::NONE,
+        ));
+
+        assert_eq!(
+            resolve_direct_interface_members(
+                &mut prepared.fixture.store,
+                &prepared.derived_plan,
+                prepared.derived_type,
+                &[prepared.number_type],
+                &[prepared.base_type],
+            ),
+            Ok(prepared.derived_type),
+        );
+
+        let TypeData::Interface(derived) = prepared
+            .fixture
+            .store
+            .type_payload(prepared.derived_type)
+            .unwrap()
+            .data()
+        else {
+            panic!("the derived interface must retain its interface identity")
+        };
+        let names = derived
+            .reference
+            .object
+            .structured
+            .properties
+            .as_deref()
+            .unwrap()
+            .iter()
+            .map(|property| {
+                prepared
+                    .fixture
+                    .store
+                    .symbol(*property)
+                    .unwrap()
+                    .name()
+                    .as_utf8()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["own", "first", "second"]);
+        assert!(validate_planned_interface_heritage_members(
+            &prepared.fixture.store,
+            &prepared.derived_plan,
+            prepared.derived_type,
+        ));
+        assert_eq!(
+            validate_interface_heritage_members(&prepared.fixture.store, prepared.derived_type),
+            InterfaceHeritageMembersValidation::Valid,
+        );
+
+        let warm = (
+            prepared.fixture.store.type_len(),
+            prepared.fixture.store.symbol_len(),
+            prepared.fixture.store.signature_len(),
+            prepared.fixture.store.symbol_store().symbol_table_len(),
+            prepared.fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            resolve_direct_interface_members(
+                &mut prepared.fixture.store,
+                &prepared.derived_plan,
+                prepared.derived_type,
+                &[prepared.number_type],
+                &[prepared.base_type],
+            ),
+            Ok(prepared.derived_type),
+        );
+        assert_eq!(
+            (
+                prepared.fixture.store.type_len(),
+                prepared.fixture.store.symbol_len(),
+                prepared.fixture.store.signature_len(),
+                prepared.fixture.store.symbol_store().symbol_table_len(),
+                prepared.fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn invalid_merged_interface_base_flags_fail_without_publication() {
+        for flags in [
+            SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT | SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+            SymbolFlags::INTERFACE | SymbolFlags::PROPERTY,
+            SymbolFlags::TRANSIENT,
+        ] {
+            let mut prepared = prepare();
+            let base = interface_symbol(&prepared.fixture, "Base");
+            let own = prepared.derived_plan.properties[0].symbol;
+            assert!(
+                prepared
+                    .fixture
+                    .store
+                    .set_symbol_flags(base, flags, CheckFlags::NONE)
+            );
+            let before = (
+                derived_state(&prepared.fixture.store, prepared.derived_type, own),
+                prepared.fixture.store.type_len(),
+                prepared.fixture.store.symbol_len(),
+                prepared.fixture.store.signature_len(),
+                prepared.fixture.store.checker_link_allocated_lengths(),
+            );
+
+            assert!(matches!(
+                resolve_direct_interface_members(
+                    &mut prepared.fixture.store,
+                    &prepared.derived_plan,
+                    prepared.derived_type,
+                    &[prepared.number_type],
+                    &[prepared.base_type],
+                ),
+                Err(PropertyObjectError::InvalidCachedInterface { symbol, type_ })
+                    if symbol == prepared.derived_plan.symbol && type_ == prepared.derived_type
+            ));
+            assert_eq!(
+                (
+                    derived_state(&prepared.fixture.store, prepared.derived_type, own),
+                    prepared.fixture.store.type_len(),
+                    prepared.fixture.store.symbol_len(),
+                    prepared.fixture.store.signature_len(),
+                    prepared.fixture.store.checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+        }
     }
 
     #[test]

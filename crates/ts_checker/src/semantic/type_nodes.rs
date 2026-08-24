@@ -5813,7 +5813,11 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         } else if flags.intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE) {
             let local_count =
                 preflight_class_or_interface_reference(self.store, self.host, symbol, flags)?;
-            if union_constituent && (flags.contains(SymbolFlags::CLASS) || local_count != 0) {
+            if union_constituent
+                && (flags.contains(SymbolFlags::CLASS)
+                    || local_count != 0
+                        && (exact_import.is_some() || type_arguments.len() != local_count))
+            {
                 return Err(type_node_unavailable(
                     TypeNodeUnavailable::UnsupportedUnionConstituent(node),
                 ));
@@ -5847,6 +5851,11 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 }
                 direct_generic_constraints =
                     self.preflight_direct_generic_reference_target(node, symbol, local_count)?;
+                if union_constituent {
+                    for argument in &type_arguments {
+                        self.plan_type_node_in_context(*argument, None, true)?;
+                    }
+                }
                 for constraint in &direct_generic_constraints {
                     self.plan_type_node_in_context(constraint.node, None, false)?;
                 }
@@ -16836,6 +16845,232 @@ mod tests {
             query_node(&mut fixture, named_node, &mut diagnostics),
             Ok(direct)
         );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn generic_interface_union_constituents_preserve_identity_and_warm_caches() {
+        let mut fixture = fixture_with_intrinsic(
+            "interface Box<T> {} type Result = Box<string> | null;",
+            IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            },
+        );
+        let owner = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Box");
+        let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Result");
+        let body = alias_parts(&fixture, "Result").2;
+        let (string, null) = {
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.null_type)
+        };
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let resolved = query_declared(
+            &mut fixture,
+            alias,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let reference = union_types(&fixture.store, resolved)
+            .iter()
+            .copied()
+            .find(|type_| validate_direct_generic_reference(&fixture.store, *type_).is_ok())
+            .expect("the union retains its authenticated generic interface reference");
+        let validated = validate_direct_generic_reference(&fixture.store, reference).unwrap();
+        assert_eq!(
+            Some(validated.target),
+            fixture
+                .store
+                .declared_type_links(owner)
+                .and_then(|links| links.declared_type),
+        );
+        assert_eq!(validated.type_arguments.as_slice(), &[string]);
+        assert!(union_types(&fixture.store, resolved).contains(&null));
+        assert_eq!(union_alias_symbol(&fixture.store, resolved), Some(alias));
+        assert_eq!(fixture.store.validate_union_constituent(reference), Ok(()));
+
+        let warm = union_state(&fixture.store);
+        for _ in 0..2 {
+            assert_eq!(
+                query_declared(
+                    &mut fixture,
+                    alias,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                ),
+                Ok(resolved),
+            );
+            assert_eq!(
+                query_node(&mut fixture, body, &mut diagnostics),
+                Ok(resolved)
+            );
+            assert_eq!(union_state(&fixture.store), warm);
+        }
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn namespaced_react_child_union_authenticates_its_generic_element() {
+        let mut fixture = fixture(concat!(
+            "namespace React { ",
+            "export interface ReactElement<Props> {} ",
+            "export type ReactText = string | number; ",
+            "export type ReactChild = ReactElement<any> | ReactText; ",
+            "}",
+        ));
+        let element = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "ReactElement");
+        let child = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "ReactChild");
+        let (any, string, number) = {
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.any_type,
+                bootstrap.string_type,
+                bootstrap.number_type,
+            )
+        };
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let resolved = query_declared(
+            &mut fixture,
+            child,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let constituents = union_types(&fixture.store, resolved);
+        assert_eq!(constituents.len(), 3);
+        assert!(constituents.contains(&string));
+        assert!(constituents.contains(&number));
+        let reference = constituents
+            .iter()
+            .copied()
+            .find_map(|type_| validate_direct_generic_reference(&fixture.store, type_).ok())
+            .expect("ReactChild retains its authenticated ReactElement<any> constituent");
+        assert_eq!(
+            Some(reference.target),
+            fixture
+                .store
+                .declared_type_links(element)
+                .and_then(|links| links.declared_type),
+        );
+        assert_eq!(reference.type_arguments.as_slice(), &[any]);
+        assert_eq!(union_alias_symbol(&fixture.store, resolved), Some(child));
+
+        let warm = union_state(&fixture.store);
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                child,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(resolved),
+        );
+        assert_eq!(union_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn generic_interface_union_boundaries_fail_before_semantic_writes() {
+        for source in [
+            "interface Box<T> {} type Result = Box | null;",
+            "interface Box<T> {} type Result = Box<string, number> | null;",
+            "class Model {} type Result = Model | null;",
+            "class Model {} interface Box<T> {} type Result = Box<Model> | null;",
+        ] {
+            let mut fixture = fixture(source);
+            let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Result");
+            let before = union_state(&fixture.store);
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+            for _ in 0..2 {
+                assert!(
+                    matches!(
+                        query_declared(
+                            &mut fixture,
+                            alias,
+                            CanonicalTypeQueryOptions::default(),
+                            &mut diagnostics,
+                        ),
+                        Err(DeclaredTypeError::TypeNodeUnavailable(
+                            TypeNodeUnavailable::UnsupportedUnionConstituent(_)
+                        ))
+                    ),
+                    "source: {source}",
+                );
+                assert_eq!(union_state(&fixture.store), before, "source: {source}");
+            }
+            assert!(diagnostics.is_empty(), "source: {source}");
+        }
+    }
+
+    #[test]
+    fn poisoned_generic_interface_union_rejects_cached_arguments_before_writes() {
+        let mut fixture = fixture_with_intrinsic(
+            "interface Box<T> {} type Result = Box<string> | null;",
+            IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                ..IntrinsicBootstrapOptions::default()
+            },
+        );
+        let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Result");
+        let (string, number) = {
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let resolved = query_declared(
+            &mut fixture,
+            alias,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let reference = union_types(&fixture.store, resolved)
+            .iter()
+            .copied()
+            .find(|type_| validate_direct_generic_reference(&fixture.store, *type_).is_ok())
+            .expect("the union retains its generic interface reference");
+        let warm = union_state(&fixture.store);
+
+        assert!(
+            fixture
+                .store
+                .set_type_reference_resolution(reference, None, Some(vec![number]),)
+        );
+        let poisoned = union_state(&fixture.store);
+        for _ in 0..2 {
+            assert_eq!(
+                query_declared(
+                    &mut fixture,
+                    alias,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                ),
+                Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidCachedUnionType(reference),
+                )),
+            );
+            assert_eq!(union_state(&fixture.store), poisoned);
+        }
+
+        assert!(
+            fixture
+                .store
+                .set_type_reference_resolution(reference, None, Some(vec![string]),)
+        );
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(resolved),
+        );
+        assert_eq!(union_state(&fixture.store), warm);
         assert!(diagnostics.is_empty());
     }
 

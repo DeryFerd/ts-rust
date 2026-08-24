@@ -4883,6 +4883,7 @@ impl Program {
         let directives = reference_directives(&self.source_files[file_index].source_text);
         for directive in directives {
             match directive.kind {
+                ReferenceKind::Path | ReferenceKind::Types if self.options.no_resolve => {}
                 ReferenceKind::Path => {
                     let unresolved_file_name = resolve_path(
                         &directory_path(&containing_file),
@@ -10258,6 +10259,34 @@ mod tests {
     }
 
     #[test]
+    fn canonical_program_constructs_global_object_with_merged_es2015_libraries() {
+        for source in [
+            "var value = new Object();",
+            "interface Foo {} var value = <Foo> new Object();",
+        ] {
+            let fs = MemoryFileSystem::new(true);
+            fs.write_file("/project/input.ts", source).unwrap();
+
+            let program = Program::try_new_with_canonical_checker(
+                &fs,
+                "/project",
+                &["input.ts".to_owned()],
+                CompilerOptions {
+                    target: ScriptTarget::Es2015,
+                    ..CompilerOptions::default()
+                },
+            )
+            .unwrap_or_else(|error| panic!("{source}: {error:?}"));
+
+            assert!(
+                program.diagnostics().is_empty(),
+                "{source}: {:?}",
+                program.diagnostics()
+            );
+        }
+    }
+
+    #[test]
     fn canonical_missing_node_globals_follow_wildcard_type_configuration() {
         for (types, expected_code) in [(None, 2591), (Some(vec!["*".to_owned()]), 2580)] {
             let fs = MemoryFileSystem::new(true);
@@ -11160,6 +11189,76 @@ mod tests {
             program.diagnostics().is_empty(),
             "{:?}",
             program.diagnostics()
+        );
+    }
+
+    #[test]
+    fn no_resolve_skips_missing_path_and_type_reference_diagnostics() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/main.ts",
+            concat!(
+                "/// <reference path='./missing.ts' />\n",
+                "/// <reference types='missing-types' />\n",
+                "const value: number = 1;\n",
+            ),
+        )
+        .unwrap();
+
+        for no_resolve in [false, true] {
+            let program = Program::new_with_options(
+                &fs,
+                "/project",
+                &["main.ts".to_owned()],
+                CompilerOptions {
+                    no_lib: true,
+                    no_resolve,
+                    ..CompilerOptions::default()
+                },
+            );
+            let codes = program
+                .diagnostics()
+                .iter()
+                .filter_map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>();
+            let expected = if no_resolve {
+                Vec::new()
+            } else {
+                vec![6053, 2688]
+            };
+            assert_eq!(codes, expected, "noResolve={no_resolve}");
+        }
+    }
+
+    #[test]
+    fn no_resolve_preserves_explicit_library_references() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/main.ts",
+            "/// <reference lib='es2015.promise' />\nconst value: number = 1;\n",
+        )
+        .unwrap();
+
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["main.ts".to_owned()],
+            CompilerOptions {
+                no_lib: true,
+                no_resolve: true,
+                ..CompilerOptions::default()
+            },
+        );
+
+        assert!(
+            program.diagnostics().is_empty(),
+            "{:?}",
+            program.diagnostics()
+        );
+        assert!(
+            program
+                .source_file("/__typescript/lib/lib.es2015.promise.d.ts")
+                .is_some()
         );
     }
 

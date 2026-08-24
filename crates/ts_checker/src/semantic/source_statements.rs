@@ -17,7 +17,7 @@ use ts_ast::{
     FlowFlags, FlowNode, FlowNodePayload, FlowRef, Node, NodeArena, NodeData, NodeId, NodeRef,
     SyntaxKind,
 };
-use ts_binder::{BoundFile, SemanticSymbolId, SymbolFlags};
+use ts_binder::{BoundFile, CheckFlags, SemanticSymbolId, SymbolFlags};
 use ts_core::{TextPos, TextRange};
 use ts_diagnostics::{Diagnostic, message_by_code};
 
@@ -276,13 +276,23 @@ pub(super) struct SourceFunctionStatementsSyntax {
 pub(super) enum SourceLinearFunctionStatementSyntax {
     Local(SourceLocalDeclarationSyntax),
     Function(NodeRef),
+    Enum(SourceLocalEnumStatementSyntax),
     Expression {
         statement: NodeRef,
         expression: NodeRef,
     },
 }
 
-/// Ordered local statements with an optional final return statement.
+/// One function-owned enum, including the binder's reachability classification.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceLocalEnumStatementSyntax {
+    pub(super) declaration: NodeRef,
+    pub(super) symbol: SemanticSymbolId,
+    pub(super) is_const: bool,
+    pub(super) unreachable: bool,
+}
+
+/// Ordered local statements with a return that can precede one unreachable enum.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SourceLinearFunctionStatementsSyntax {
     pub(super) body: NodeRef,
@@ -2711,6 +2721,15 @@ impl SyntaxPlanner<'_> {
                         self.plan_nested_function_statement(statement, body, declaration)?,
                     ));
                 }
+                SyntaxKind::EnumDeclaration
+                    if index + 1 == body_statements.len()
+                        && return_statement.is_some()
+                        && return_expression.is_some() =>
+                {
+                    statements.push(SourceLinearFunctionStatementSyntax::Enum(
+                        self.plan_linear_enum_statement(statement, body, declaration)?,
+                    ));
+                }
                 SyntaxKind::ExpressionStatement => {
                     let expression =
                         self.plan_linear_expression_statement(statement, body, declaration)?;
@@ -2719,8 +2738,20 @@ impl SyntaxPlanner<'_> {
                         expression,
                     });
                 }
-                SyntaxKind::ReturnStatement if index + 1 == body_statements.len() => {
+                SyntaxKind::ReturnStatement
+                    if index + 1 == body_statements.len()
+                        || index + 2 == body_statements.len()
+                            && self.node(self.reference(body_statements[index + 1]))?.kind
+                                == SyntaxKind::EnumDeclaration =>
+                {
                     return_expression = self.plan_linear_return(statement, body, declaration)?;
+                    if index + 1 != body_statements.len() && return_expression.is_none() {
+                        return Err(self.unsupported(
+                            statement,
+                            SyntaxKind::ReturnStatement,
+                            SourceFunctionStatementsRole::BodyStatement,
+                        ));
+                    }
                     return_statement = Some(statement);
                 }
                 kind => {
@@ -2757,6 +2788,188 @@ impl SyntaxPlanner<'_> {
             statements,
             return_statement,
             return_expression,
+        })
+    }
+
+    fn plan_linear_enum_statement(
+        &self,
+        declaration: NodeRef,
+        parent: NodeRef,
+        callable: NodeRef,
+    ) -> Result<SourceLocalEnumStatementSyntax, SourceFunctionStatementsError> {
+        let record = self.node(declaration)?;
+        let NodeData::EnumDeclaration(enumeration) = &record.data else {
+            return Err(self.unsupported(
+                declaration,
+                record.kind,
+                SourceFunctionStatementsRole::BodyStatement,
+            ));
+        };
+        if record.kind != SyntaxKind::EnumDeclaration
+            || record.flags.0 != 0
+            || record.parent != Some(parent.node)
+            || enumeration.flow_node.is_some()
+            || enumeration.local_symbol.is_some()
+            || enumeration.symbol.is_some()
+            || enumeration.facts != 0
+        {
+            return Err(self.unsupported(
+                declaration,
+                record.kind,
+                SourceFunctionStatementsRole::BodyStatement,
+            ));
+        }
+        self.validate_range(declaration, parent)?;
+        self.validate_container(declaration, callable)?;
+        self.validate_block_scope_container(declaration, callable)?;
+        self.validate_node_list(
+            declaration,
+            enumeration.members.range,
+            &enumeration.members.nodes,
+        )?;
+
+        let name = self.reference(enumeration.name);
+        let name_record = self.node(name)?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Err(self.unsupported(
+                name,
+                name_record.kind,
+                SourceFunctionStatementsRole::BodyStatement,
+            ));
+        };
+        if name_record.kind != SyntaxKind::Identifier
+            || name_record.flags.0 != 0
+            || identifier.flow_node.is_some()
+            || identifier.text.is_empty()
+        {
+            return Err(self.unsupported(
+                name,
+                name_record.kind,
+                SourceFunctionStatementsRole::BodyStatement,
+            ));
+        }
+        self.validate_parent(
+            name,
+            Some(declaration.node),
+            SourceFunctionStatementsRole::BodyStatement,
+        )?;
+        self.validate_range(name, declaration)?;
+        self.validate_container(name, declaration)?;
+        self.validate_block_scope_container(name, declaration)?;
+
+        let is_const = if let Some(modifiers) = &enumeration.modifiers {
+            let [modifier] = modifiers.list.nodes.as_slice() else {
+                return Err(self.unsupported(
+                    declaration,
+                    record.kind,
+                    SourceFunctionStatementsRole::BodyStatement,
+                ));
+            };
+            let modifier = self.reference(*modifier);
+            let modifier_record = self.node(modifier)?;
+            if modifiers.flags.0 != 0
+                || modifiers.list.has_trailing_comma
+                || modifier_record.kind != SyntaxKind::ConstKeyword
+                || modifier_record.flags.0 != 0
+                || modifier_record.parent != Some(declaration.node)
+                || !matches!(modifier_record.data, NodeData::Token(_))
+            {
+                return Err(self.unsupported(
+                    modifier,
+                    modifier_record.kind,
+                    SourceFunctionStatementsRole::BodyStatement,
+                ));
+            }
+            self.validate_range(modifier, declaration)?;
+            self.validate_order(modifier, name)?;
+            true
+        } else {
+            false
+        };
+
+        let symbol = self.bound.symbol(declaration).ok_or(
+            SourceFunctionStatementsInvariant::InvalidCallableEdge(declaration),
+        )?;
+        let expected_flags = if is_const {
+            SymbolFlags::CONST_ENUM
+        } else {
+            SymbolFlags::REGULAR_ENUM
+        };
+        let owner = self
+            .store
+            .symbol(symbol)
+            .filter(|owner| {
+                owner.flags() == expected_flags
+                    && owner.check_flags() == CheckFlags::NONE
+                    && owner.name().as_utf8() == Some(identifier.text.as_str())
+                    && owner.declarations() == Some(&[declaration])
+                    && owner.value_declaration() == Some(declaration)
+                    && owner.parent().is_none()
+                    && owner.export_symbol().is_none()
+                    && self.store.get_merged_symbol(symbol) == Some(symbol)
+            })
+            .ok_or(SourceFunctionStatementsInvariant::InvalidCallableEdge(
+                declaration,
+            ))?;
+        if self.bound.local_symbol(declaration).is_some() || owner.members().is_some() {
+            return Err(SourceFunctionStatementsInvariant::InvalidCallableEdge(declaration).into());
+        }
+        let locals = self
+            .bound
+            .locals(callable)
+            .ok_or(SourceFunctionStatementsInvariant::MissingLocals(callable))?;
+        let actual = self
+            .store
+            .symbol_table(locals)
+            .and_then(|locals| locals.get_source(&identifier.text));
+        if actual != Some(symbol) {
+            return Err(SourceFunctionStatementsInvariant::LocalTableMismatch {
+                declaration,
+                scope: callable,
+                expected: symbol,
+                actual,
+            }
+            .into());
+        }
+
+        for member in &enumeration.members.nodes {
+            let member = self.reference(*member);
+            self.validate_parent(
+                member,
+                Some(declaration.node),
+                SourceFunctionStatementsRole::BodyStatement,
+            )?;
+            self.validate_container(member, declaration)?;
+            self.validate_block_scope_container(member, declaration)?;
+            let member_symbol = self.bound.symbol(member).ok_or(
+                SourceFunctionStatementsInvariant::InvalidCallableEdge(member),
+            )?;
+            if self.store.symbol(member_symbol).is_none_or(|record| {
+                record.flags() != SymbolFlags::ENUM_MEMBER || record.parent() != Some(symbol)
+            }) {
+                return Err(SourceFunctionStatementsInvariant::InvalidCallableEdge(member).into());
+            }
+        }
+
+        let flow = self.bound.flow_graph();
+        let actual = self.bound.flow_container(declaration);
+        if actual != Some(callable)
+            || flow.is_unreachable(declaration) != Some(true)
+            || self.bound.flow_at(declaration).is_some()
+        {
+            return Err(SourceFunctionStatementsInvariant::InvalidFlowContainer {
+                node: declaration,
+                expected: callable,
+                actual,
+            }
+            .into());
+        }
+
+        Ok(SourceLocalEnumStatementSyntax {
+            declaration,
+            symbol,
+            is_const,
+            unreachable: true,
         })
     }
 
@@ -5506,6 +5719,140 @@ mod joined_tests {
                 Err(SourceFunctionStatementsError::Unsupported(_)),
             ));
         }
+    }
+
+    #[test]
+    fn linear_body_preserves_unreachable_regular_and_const_enum_declarations() {
+        for (index, source, is_const) in [
+            (0, "function regular() { return E.A; enum E { A } }", false),
+            (
+                1,
+                "function constant() { return E.A; const enum E { A } }",
+                true,
+            ),
+        ] {
+            let fixture = JoinedFixture::new(source, FileId::new(1_360 + index));
+            let syntax = fixture.linear_plan().unwrap();
+            let callable = fixture.declaration();
+            assert!(syntax.locals.is_empty());
+            assert!(syntax.return_statement.is_some());
+            assert!(syntax.return_expression.is_some());
+            let [SourceLinearFunctionStatementSyntax::Enum(enumeration)] =
+                syntax.statements.as_slice()
+            else {
+                panic!("expected exactly one trailing local enum")
+            };
+            assert_eq!(enumeration.is_const, is_const);
+            assert!(enumeration.unreachable);
+            assert_eq!(
+                fixture.bound.symbol(enumeration.declaration),
+                Some(enumeration.symbol),
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .symbol_table(fixture.bound.locals(callable).unwrap())
+                    .and_then(|locals| locals.get_source("E")),
+                Some(enumeration.symbol),
+            );
+            assert_eq!(
+                fixture
+                    .bound
+                    .flow_graph()
+                    .is_unreachable(enumeration.declaration),
+                Some(true),
+            );
+            assert!(fixture.bound.flow_at(enumeration.declaration).is_none());
+
+            let return_statement = syntax.return_statement.unwrap();
+            assert!(
+                SourceFlowPlan::preflight(
+                    &fixture.bound,
+                    callable,
+                    None,
+                    [return_statement],
+                    [],
+                    [],
+                )
+                .is_ok(),
+            );
+        }
+    }
+
+    #[test]
+    fn linear_body_rejects_other_enum_positions_and_trailing_statements() {
+        for (index, source) in [
+            "function invalid() { enum E { A } return E.A; }",
+            "function invalid() { return; enum E { A } }",
+            "function invalid() { return E.A; enum E { A } const later = 1; }",
+            "function invalid() { return E.A; enum E { A } enum Other { A } }",
+            "function invalid() { return E.A; { enum E { A } } }",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture =
+                JoinedFixture::new(source, FileId::new(1_370 + u32::try_from(index).unwrap()));
+            assert!(
+                matches!(
+                    fixture.linear_plan(),
+                    Err(SourceFunctionStatementsError::Unsupported(_)),
+                ),
+                "unexpectedly admitted enum statement shape: {source}",
+            );
+        }
+    }
+
+    #[test]
+    fn trailing_local_enum_rejects_a_forged_function_scope_symbol() {
+        let mut fixture = JoinedFixture::new(
+            "enum Other { A } function invalid() { return E.A; enum E { A } }",
+            FileId::new(1_380),
+        );
+        let syntax = fixture.linear_plan().unwrap();
+        let [SourceLinearFunctionStatementSyntax::Enum(enumeration)] = syntax.statements.as_slice()
+        else {
+            panic!("expected exactly one trailing local enum")
+        };
+        let enumeration = *enumeration;
+        let other = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::EnumDeclaration(enumeration) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(name) = &fixture.parsed.arena.get(enumeration.name)?.data
+                else {
+                    return None;
+                };
+                (name.text == "Other").then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let other_symbol = fixture.bound.symbol(other).unwrap();
+        let callable = fixture.declaration();
+        let locals = fixture.bound.locals(callable).unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .insert_symbol(locals, EscapedName::source("E"), other_symbol),
+            Some(Some(enumeration.symbol)),
+        );
+        assert_eq!(
+            fixture.linear_plan(),
+            Err(SourceFunctionStatementsInvariant::LocalTableMismatch {
+                declaration: enumeration.declaration,
+                scope: callable,
+                expected: enumeration.symbol,
+                actual: Some(other_symbol),
+            }
+            .into()),
+        );
     }
 
     #[test]

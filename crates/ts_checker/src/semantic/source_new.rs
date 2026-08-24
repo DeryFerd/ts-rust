@@ -3,8 +3,8 @@
 //! This is the dependency-closed `new Model()`, `new Model`, and single-literal
 //! constructor branch of pinned TypeScript-Go `checkCallExpression`,
 //! `getResolvedSignature`, `resolveNewExpression`, and `resolveCall`.
-//! An admitted constructor belongs to one preceding local class or an earlier
-//! ambient variable with an authenticated declared construct signature. Both
+//! An admitted constructor belongs to one preceding local class, an earlier
+//! ambient variable, or the authenticated global `Object` constructor. These
 //! forms accept no arguments or one compatible primitive literal. Planning
 //! proves syntax, resolver routes, provider provenance, and cold/warm caches
 //! before source execution may publish class or expression state.
@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use ts_ast::{NodeArena, NodeData, NodeRef, SyntaxKind};
 use ts_binder::{
     BoundFile, CanonicalNameResolutionError, CanonicalNameResolver, CanonicalResolutionLocation,
-    CheckFlags, SemanticSymbolId, SymbolFlags,
+    CheckFlags, InternalSymbolName, SemanticSymbolId, SymbolFlags,
 };
 use ts_jsnum::Number;
 
@@ -33,6 +33,7 @@ use super::{
     object_members::{PropertyObjectPlan, plan_interface, plan_type_literal},
     signatures::SignatureFlags,
     type_nodes::normalize_numeric_separators,
+    types::{ObjectFlags, TypeFlags},
 };
 
 /// A valid construction form outside the exact default-class leaf.
@@ -150,6 +151,7 @@ pub(super) struct SourceDefaultNewPlan {
 enum SourceNewTarget {
     Class(Box<ClassMemberQueryPlan>),
     Declared(SourceDeclaredConstructorPlan),
+    GlobalObject(SourceGlobalObjectConstructorPlan),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -157,6 +159,16 @@ struct SourceDeclaredConstructorPlan {
     annotation: NodeRef,
     declaration: NodeRef,
     parameter: Option<SourceNewParameter>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SourceGlobalObjectConstructorPlan {
+    annotation: NodeRef,
+    owner: SemanticSymbolId,
+    declaration: NodeRef,
+    return_annotation: NodeRef,
+    parameter: SourceNewParameter,
+    object_type: TypeId,
 }
 
 #[derive(Clone, Debug)]
@@ -360,7 +372,20 @@ pub(super) fn plan_direct_default_new(
             symbol,
         }));
     }
-    let (target, parameter) = if symbol_record.flags() == SymbolFlags::CLASS {
+    let global_object = identifier.text == "Object"
+        && store
+            .intrinsic_bootstrap()
+            .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+            .and_then(|globals| globals.get_source("Object"))
+            .and_then(|global| store.get_merged_symbol(global))
+            == Some(symbol);
+    let (target, parameter) = if global_object {
+        let global = plan_global_object_constructor(store, host, constructor, symbol)?;
+        (
+            SourceNewTarget::GlobalObject(global),
+            argument.as_ref().map(|_| global.parameter),
+        )
+    } else if symbol_record.flags() == SymbolFlags::CLASS {
         let class = if let Some(class) = prior_classes.get(&symbol) {
             ClassMemberQueryPlan::Direct(class.clone())
         } else {
@@ -454,6 +479,230 @@ pub(super) fn plan_direct_default_new(
     };
     preflight_default_new_cache(store, &plan)?;
     Ok(plan)
+}
+
+fn plan_global_object_constructor(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    constructor: NodeRef,
+    symbol: SemanticSymbolId,
+) -> Result<SourceGlobalObjectConstructorPlan, SourceNewError> {
+    let reject = || {
+        unsupported(SourceNewUnsupported::ConstructorClass {
+            node: constructor,
+            symbol,
+        })
+    };
+    let bootstrap = store.intrinsic_bootstrap().ok_or_else(reject)?;
+    let globals = store.symbol_table(bootstrap.globals).ok_or_else(reject)?;
+    let object = store.symbol(symbol).ok_or_else(reject)?;
+    let allowed_object_flags =
+        SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::TRANSIENT;
+    let object_type = store
+        .declared_type_links(symbol)
+        .and_then(|links| links.declared_type)
+        .ok_or_else(reject)?;
+    let object_record = store.type_payload(object_type).ok_or_else(reject)?;
+    let declaration = object.value_declaration().ok_or_else(reject)?;
+    let (arena, bound) = host.source(declaration).ok_or_else(reject)?;
+    let declaration_record = arena.get(declaration.node).ok_or_else(reject)?;
+    let NodeData::VariableDeclaration(variable) = &declaration_record.data else {
+        return Err(reject());
+    };
+    let annotation = variable
+        .type_
+        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+        .ok_or_else(reject)?;
+    let annotation_record = arena.get(annotation.node).ok_or_else(reject)?;
+    let NodeData::TypeReferenceNode(reference) = &annotation_record.data else {
+        return Err(reject());
+    };
+    let annotation_name = NodeRef::new(annotation.arena, annotation.file, reference.type_name);
+    let annotation_name_record = arena.get(annotation_name.node).ok_or_else(reject)?;
+    let NodeData::Identifier(annotation_identifier) = &annotation_name_record.data else {
+        return Err(reject());
+    };
+    let owner = globals
+        .get_source("ObjectConstructor")
+        .and_then(|owner| store.get_merged_symbol(owner))
+        .ok_or_else(reject)?;
+    let owner_record = store.symbol(owner).ok_or_else(reject)?;
+    let owner_declarations = owner_record.declarations().ok_or_else(reject)?;
+    let signature_symbol = owner_record
+        .members()
+        .and_then(|members| store.symbol_table(members))
+        .and_then(|members| members.get(InternalSymbolName::New.as_ref()))
+        .and_then(|signature| store.get_merged_symbol(signature))
+        .ok_or_else(reject)?;
+    let signature_record = store.symbol(signature_symbol).ok_or_else(reject)?;
+    let signature_declarations = signature_record.declarations().ok_or_else(reject)?;
+    if object.flags() & SymbolFlags::TYPE != SymbolFlags::INTERFACE
+        || !object
+            .flags()
+            .contains(SymbolFlags::FUNCTION_SCOPED_VARIABLE)
+        || object.flags().without(allowed_object_flags) != SymbolFlags::NONE
+        || object.check_flags() != CheckFlags::NONE
+        || object.name().as_utf8() != Some("Object")
+        || object.parent().is_some()
+        || object.exports().is_some()
+        || object.export_symbol().is_some()
+        || globals
+            .get_source("Object")
+            .and_then(|global| store.get_merged_symbol(global))
+            != Some(symbol)
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || object_record.flags() != TypeFlags::OBJECT
+        || !object_record
+            .object_flags()
+            .contains(ObjectFlags::INTERFACE)
+        || object_record.symbol() != Some(symbol)
+        || object_record.alias().is_some()
+        || declaration_record.kind != SyntaxKind::VariableDeclaration
+        || variable.initializer.is_some()
+        || bound
+            .symbol(declaration)
+            .and_then(|declared| store.get_merged_symbol(declared))
+            != Some(symbol)
+        || annotation_record.kind != SyntaxKind::TypeReference
+        || annotation_record.parent != Some(declaration.node)
+        || reference.type_arguments.is_some()
+        || annotation_name_record.kind != SyntaxKind::Identifier
+        || annotation_name_record.parent != Some(annotation.node)
+        || annotation_identifier.text != "ObjectConstructor"
+        || !owner_record.flags().contains(SymbolFlags::INTERFACE)
+        || owner_record.check_flags() != CheckFlags::NONE
+        || owner_record.name().as_utf8() != Some("ObjectConstructor")
+        || owner_record.parent().is_some()
+        || owner_record.exports().is_some()
+        || owner_record.export_symbol().is_some()
+        || owner_declarations.is_empty()
+        || signature_record.flags() != SymbolFlags::SIGNATURE
+        || signature_record.check_flags() != CheckFlags::NONE
+        || signature_record
+            .parent()
+            .and_then(|parent| store.get_merged_symbol(parent))
+            != Some(owner)
+        || signature_declarations.is_empty()
+    {
+        return Err(reject());
+    }
+
+    for signature_declaration in signature_declarations {
+        let Some(record) = host.node(*signature_declaration) else {
+            continue;
+        };
+        let NodeData::ConstructSignatureDeclaration(signature) = &record.data else {
+            continue;
+        };
+        let [parameter] = signature.parameters.nodes.as_slice() else {
+            continue;
+        };
+        let parameter = NodeRef::new(
+            signature_declaration.arena,
+            signature_declaration.file,
+            *parameter,
+        );
+        let Some(parameter_record) = host.node(parameter) else {
+            continue;
+        };
+        let NodeData::ParameterDeclaration(parameter_data) = &parameter_record.data else {
+            continue;
+        };
+        let Some(question) = parameter_data.question_token else {
+            continue;
+        };
+        let question = NodeRef::new(parameter.arena, parameter.file, question);
+        let Some(question_record) = host.node(question) else {
+            continue;
+        };
+        let Some(type_node) = parameter_data.type_ else {
+            continue;
+        };
+        let type_node = NodeRef::new(parameter.arena, parameter.file, type_node);
+        let Some(type_record) = host.node(type_node) else {
+            continue;
+        };
+        let Some(return_node) = signature.type_ else {
+            continue;
+        };
+        let return_node = NodeRef::new(
+            signature_declaration.arena,
+            signature_declaration.file,
+            return_node,
+        );
+        let Some(return_record) = host.node(return_node) else {
+            continue;
+        };
+        let NodeData::TypeReferenceNode(return_reference) = &return_record.data else {
+            continue;
+        };
+        let return_name = NodeRef::new(
+            return_node.arena,
+            return_node.file,
+            return_reference.type_name,
+        );
+        let Some(return_name_record) = host.node(return_name) else {
+            continue;
+        };
+        let NodeData::Identifier(return_identifier) = &return_name_record.data else {
+            continue;
+        };
+        let Some(parameter_symbol) = host
+            .bound_file(parameter)
+            .and_then(|bound| bound.symbol(parameter))
+            .and_then(|parameter| store.get_merged_symbol(parameter))
+        else {
+            continue;
+        };
+        let Some(parameter_symbol_record) = store.symbol(parameter_symbol) else {
+            continue;
+        };
+        if record.kind != SyntaxKind::ConstructSignature
+            || !owner_declarations.iter().any(|owner_declaration| {
+                record.parent == Some(owner_declaration.node)
+                    && signature_declaration.arena == owner_declaration.arena
+                    && signature_declaration.file == owner_declaration.file
+            })
+            || parameter_record.kind != SyntaxKind::Parameter
+            || parameter_record.parent != Some(signature_declaration.node)
+            || parameter_data.initializer.is_some()
+            || parameter_data.dot_dot_dot_token.is_some()
+            || question_record.kind != SyntaxKind::QuestionToken
+            || question_record.parent != Some(parameter.node)
+            || type_record.kind != SyntaxKind::AnyKeyword
+            || type_record.parent != Some(parameter.node)
+            || !matches!(type_record.data, NodeData::KeywordTypeNode(_))
+            || return_record.kind != SyntaxKind::TypeReference
+            || return_record.parent != Some(signature_declaration.node)
+            || return_reference.type_arguments.is_some()
+            || return_name_record.kind != SyntaxKind::Identifier
+            || return_name_record.parent != Some(return_node.node)
+            || return_identifier.text != "Object"
+            || parameter_symbol_record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+            || parameter_symbol_record.check_flags() != CheckFlags::NONE
+            || parameter_symbol_record.declarations() != Some(&[parameter])
+            || parameter_symbol_record.value_declaration() != Some(parameter)
+            || parameter_symbol_record.parent().is_some()
+            || parameter_symbol_record.exports().is_some()
+            || parameter_symbol_record.export_symbol().is_some()
+            || store.get_merged_symbol(parameter_symbol) != Some(parameter_symbol)
+        {
+            continue;
+        }
+        return Ok(SourceGlobalObjectConstructorPlan {
+            annotation,
+            owner,
+            declaration: *signature_declaration,
+            return_annotation: return_node,
+            parameter: SourceNewParameter {
+                symbol: parameter_symbol,
+                type_: bootstrap.any_type,
+            },
+            object_type,
+        });
+    }
+
+    Err(reject())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -832,6 +1081,21 @@ pub(super) fn preflight_direct_default_new(
                 )));
             }
         }
+        SourceNewTarget::GlobalObject(expected) => {
+            let actual = plan_global_object_constructor(
+                store,
+                host,
+                plan.constructor,
+                plan.resolved_symbol,
+            )?;
+            if actual != *expected
+                || plan.parameter != plan.argument.as_ref().map(|_| expected.parameter)
+            {
+                return Err(invariant(SourceNewInvariant::InvalidConstructorCache(
+                    plan.constructor,
+                )));
+            }
+        }
     }
     preflight_default_new_cache(store, plan)
 }
@@ -855,6 +1119,15 @@ pub(super) fn prepare_direct_default_news(
             return Err(invariant(SourceNewInvariant::DuplicatePlan(plan.node)));
         }
         preflight_direct_default_new(store, host, plan)?;
+    }
+
+    for plan in plans {
+        let SourceNewTarget::GlobalObject(global) = &plan.target else {
+            continue;
+        };
+        if resolved_global_object_constructor(store, plan, global)?.is_none() {
+            materialize_global_object_constructor(store, host, plan, global)?;
+        }
     }
 
     let mut strings = Vec::new();
@@ -938,6 +1211,156 @@ pub(super) fn prepare_direct_default_news(
     Ok(())
 }
 
+/// Publishes the bound Object constructor without resolving unrelated members.
+fn materialize_global_object_constructor(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &SourceDefaultNewPlan,
+    global: &SourceGlobalObjectConstructorPlan,
+) -> Result<(), SourceNewError> {
+    if resolved_global_object_constructor(store, plan, global)?.is_some() {
+        return Ok(());
+    }
+
+    let invalid = || {
+        invariant(SourceNewInvariant::InvalidConstructorCache(
+            plan.constructor,
+        ))
+    };
+    let declared = store
+        .declared_type_links(global.owner)
+        .and_then(|links| links.declared_type);
+    let annotation = exact_type_cache(store, global.annotation).map_err(|()| invalid())?;
+    let object_value = exact_class_value_type(store, plan.resolved_symbol)?;
+    let parameter = exact_class_value_type(store, global.parameter.symbol)?;
+    let signature = exact_signature_cache(store, global.declaration).map_err(|()| invalid())?;
+    let return_annotation =
+        exact_type_cache(store, global.return_annotation).map_err(|()| invalid())?;
+    if signature.is_some()
+        || annotation.is_some_and(|type_| Some(type_) != declared)
+        || object_value.is_some_and(|type_| Some(type_) != declared)
+        || parameter.is_some_and(|type_| type_ != global.parameter.type_)
+        || return_annotation.is_some_and(|type_| type_ != global.object_type)
+    {
+        return Err(invalid());
+    }
+    if let Some(type_) = declared {
+        let record = store.type_payload(type_).ok_or_else(invalid)?;
+        let TypeData::Interface(interface) = record.data() else {
+            return Err(invalid());
+        };
+        if record
+            .object_flags()
+            .contains(ObjectFlags::MEMBERS_RESOLVED)
+            || interface.declared_members_resolved
+            || interface.reference.object.structured.signatures.is_some()
+            || interface.declared_construct_signatures.is_some()
+        {
+            return Err(invalid());
+        }
+    }
+
+    let missing_type_nodes = usize::from(store.type_node_links(global.annotation).is_none())
+        + usize::from(store.type_node_links(global.return_annotation).is_none());
+    let missing_value_symbols =
+        usize::from(store.value_symbol_links(plan.resolved_symbol).is_none())
+            + usize::from(store.value_symbol_links(global.parameter.symbol).is_none());
+    if !store.try_reserve_signatures(1)
+        || !store.try_reserve_signature_links(usize::from(
+            store.signature_links(global.declaration).is_none(),
+        ))
+        || !store.try_reserve_type_node_links(missing_type_nodes)
+        || !store.try_reserve_value_symbol_links(missing_value_symbols)
+        || !store.try_reserve_function_signature_return_annotations(1)
+    {
+        return Err(invariant(SourceNewInvariant::Capacity(plan.constructor)));
+    }
+
+    let value_type = store.get_declared_type_of_symbol(host, global.owner)?;
+    if declared.is_some_and(|declared| declared != value_type) {
+        return Err(invalid());
+    }
+    let value_record = store.type_payload(value_type).ok_or_else(invalid)?;
+    let TypeData::Interface(interface) = value_record.data() else {
+        return Err(invalid());
+    };
+    if value_record.flags() != TypeFlags::OBJECT
+        || !value_record.object_flags().contains(ObjectFlags::INTERFACE)
+        || value_record
+            .object_flags()
+            .contains(ObjectFlags::MEMBERS_RESOLVED)
+        || value_record.symbol() != Some(global.owner)
+        || value_record.alias().is_some()
+        || interface.declared_members_resolved
+        || interface.reference.object.structured.signatures.is_some()
+        || interface.declared_construct_signatures.is_some()
+    {
+        return Err(invalid());
+    }
+
+    let signature = store
+        .alloc_signature(
+            SignatureFlags::CONSTRUCT,
+            Some(global.declaration),
+            Vec::new(),
+            None,
+            vec![global.parameter.symbol],
+            Some(global.object_type),
+            None,
+            0,
+        )
+        .expect("the authenticated Object constructor reserved its bound signature");
+    assert!(store.set_type_node_links(
+        global.annotation,
+        TypeNodeLinks {
+            resolved_type: Some(value_type),
+            ..TypeNodeLinks::default()
+        },
+    ));
+    assert!(store.set_type_node_links(
+        global.return_annotation,
+        TypeNodeLinks {
+            resolved_type: Some(global.object_type),
+            ..TypeNodeLinks::default()
+        },
+    ));
+    assert!(store.set_value_symbol_links(
+        plan.resolved_symbol,
+        ValueSymbolLinks {
+            resolved_type: Some(value_type),
+            ..ValueSymbolLinks::default()
+        },
+    ));
+    assert!(store.set_value_symbol_links(
+        global.parameter.symbol,
+        ValueSymbolLinks {
+            resolved_type: Some(global.parameter.type_),
+            ..ValueSymbolLinks::default()
+        },
+    ));
+    assert!(store.set_signature_links(
+        global.declaration,
+        SignatureLinks {
+            resolved_signature: ResolvedSignatureState::Resolved(signature),
+            ..SignatureLinks::default()
+        },
+    ));
+    assert!(store.set_function_signature_return_annotation(
+        signature,
+        global.return_annotation,
+        false,
+    ));
+    debug_assert_eq!(
+        resolved_global_object_constructor(store, plan, global),
+        Ok(Some(CheckedSourceDefaultNew {
+            value_type,
+            instance_type: global.object_type,
+            signature,
+        })),
+    );
+    Ok(())
+}
+
 /// Selects the exact default construct signature and publishes the constructor,
 /// signature, and result caches as one prevalidated suffix.
 pub(super) fn check_direct_default_new(
@@ -967,6 +1390,13 @@ pub(super) fn check_direct_default_new(
         }
         SourceNewTarget::Declared(declared) => {
             resolved_declared_constructor(store, plan, declared)?.ok_or_else(|| {
+                invariant(SourceNewInvariant::InvalidConstructorCache(
+                    plan.constructor,
+                ))
+            })?
+        }
+        SourceNewTarget::GlobalObject(global) => {
+            resolved_global_object_constructor(store, plan, global)?.ok_or_else(|| {
                 invariant(SourceNewInvariant::InvalidConstructorCache(
                     plan.constructor,
                 ))
@@ -1148,6 +1578,117 @@ fn resolved_declared_constructor(
     }))
 }
 
+fn resolved_global_object_constructor(
+    store: &CanonicalTypeMapperStore,
+    plan: &SourceDefaultNewPlan,
+    global: &SourceGlobalObjectConstructorPlan,
+) -> Result<Option<CheckedSourceDefaultNew>, SourceNewError> {
+    let invalid = || {
+        invariant(SourceNewInvariant::InvalidConstructorCache(
+            plan.constructor,
+        ))
+    };
+    let Some(value_type) = store
+        .declared_type_links(global.owner)
+        .and_then(|links| links.declared_type)
+    else {
+        return Ok(None);
+    };
+    if exact_type_cache(store, global.annotation)
+        .map_err(|()| invalid())?
+        .is_some_and(|cached| cached != value_type)
+        || exact_class_value_type(store, plan.resolved_symbol)?
+            .is_some_and(|cached| cached != value_type)
+    {
+        return Err(invalid());
+    }
+    let value = store.type_payload(value_type).ok_or_else(invalid)?;
+    let TypeData::Interface(interface) = value.data() else {
+        return Err(invalid());
+    };
+    let signature =
+        if let Some(signatures) = interface.reference.object.structured.signatures.as_deref() {
+            let Some(signature) = signatures
+                .iter()
+                .skip(interface.reference.object.structured.call_signature_count)
+                .copied()
+                .find(|signature| {
+                    store.signature(*signature).is_some_and(|signature| {
+                        signature.declaration() == Some(global.declaration)
+                    })
+                })
+            else {
+                return Ok(None);
+            };
+            signature
+        } else {
+            if interface.reference.object.structured.call_signature_count != 0 {
+                return Err(invalid());
+            }
+            let Some(signature) = store
+                .signature_links(global.declaration)
+                .and_then(|links| links.resolved_signature.signature())
+            else {
+                return Ok(None);
+            };
+            signature
+        };
+    let record = store.signature(signature).ok_or_else(invalid)?;
+    let allowed_flags = SignatureFlags::CONSTRUCT | SignatureFlags::HAS_LITERAL_TYPES;
+    if value.flags() != TypeFlags::OBJECT
+        || !value.object_flags().contains(ObjectFlags::INTERFACE)
+        || value.symbol() != Some(global.owner)
+        || value.alias().is_some()
+        || record.declaration() != Some(global.declaration)
+        || !record.flags().contains(SignatureFlags::CONSTRUCT)
+        || record.flags().bits() & !allowed_flags.bits() != 0
+        || record.parameters() != [global.parameter.symbol]
+        || record.min_argument_count() != 0
+        || record.resolved_min_argument_count() != -1
+        || record.resolved_return_type() != Some(global.object_type)
+        || !record.type_parameters().is_empty()
+        || record.this_parameter().is_some()
+        || record.resolved_type_predicate().is_some()
+        || record.target().is_some()
+        || record.mapper().is_some()
+        || record.isolated_signature_type().is_some()
+        || record.composite().is_some()
+        || store.signature_links(global.declaration)
+            != Some(&SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(signature),
+                ..SignatureLinks::default()
+            })
+        || store.value_symbol_links(global.parameter.symbol)
+            != Some(&ValueSymbolLinks {
+                resolved_type: Some(global.parameter.type_),
+                ..ValueSymbolLinks::default()
+            })
+        || store
+            .callable_signature_parameter_types(signature)
+            .is_some_and(|types| types != [global.parameter.type_])
+        || store
+            .function_signature_return_annotation(signature)
+            .is_some_and(|annotation| annotation != (global.return_annotation, false))
+        || exact_type_cache(store, global.return_annotation)
+            .map_err(|()| invalid())?
+            .is_some_and(|cached| cached != global.object_type)
+        || store
+            .declared_type_links(plan.resolved_symbol)
+            .and_then(|links| links.declared_type)
+            != Some(global.object_type)
+    {
+        return Err(invariant(SourceNewInvariant::InvalidConstructSignature(
+            signature,
+        )));
+    }
+
+    Ok(Some(CheckedSourceDefaultNew {
+        value_type,
+        instance_type: global.object_type,
+        signature,
+    }))
+}
+
 fn preflight_default_new_cache(
     store: &CanonicalTypeMapperStore,
     plan: &SourceDefaultNewPlan,
@@ -1212,6 +1753,20 @@ fn preflight_default_new_cache(
         }
         SourceNewTarget::Declared(declared) => {
             let resolved = resolved_declared_constructor(store, plan, declared)?;
+            if constructor_type.is_some_and(|constructor| {
+                resolved.is_none_or(|resolved| constructor != resolved.value_type)
+            }) || result_type.is_some_and(|result| {
+                resolved.is_none_or(|resolved| result != resolved.instance_type)
+            }) || signature.is_some_and(|signature| {
+                resolved.is_none_or(|resolved| signature != resolved.signature)
+            }) {
+                return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
+                    plan.node,
+                )));
+            }
+        }
+        SourceNewTarget::GlobalObject(global) => {
+            let resolved = resolved_global_object_constructor(store, plan, global)?;
             if constructor_type.is_some_and(|constructor| {
                 resolved.is_none_or(|resolved| constructor != resolved.value_type)
             }) || result_type.is_some_and(|result| {
@@ -1479,7 +2034,8 @@ mod tests {
 
     use super::*;
     use crate::semantic::{
-        CanonicalCheckerContext, CanonicalCheckerOptions, SourceCheckError, UnsupportedSourceSyntax,
+        CanonicalCheckerContext, CanonicalCheckerOptions, DeclaredTypeLinks, SourceCheckError,
+        UnsupportedSourceSyntax,
     };
 
     fn context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
@@ -1602,6 +2158,492 @@ mod tests {
             .unwrap_or_else(|| panic!("missing ambient constructor {expected}"));
         let raw = context.file(file).unwrap().1.symbol(declaration).unwrap();
         (annotation, context.store().get_merged_symbol(raw).unwrap())
+    }
+
+    fn global_object_constructor_context<'arena>(
+        library: &'arena ParseResult,
+        source: &'arena ParseResult,
+        library_file: FileId,
+        source_file: FileId,
+    ) -> CanonicalCheckerContext<'arena> {
+        let mut binder = CanonicalBinder::new();
+        for (parsed, file, declaration) in
+            [(library, library_file, true), (source, source_file, false)]
+        {
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new_with_default_library(
+                        EscapedName::source(if declaration {
+                            "\"/lib/object.d.ts\""
+                        } else {
+                            "\"/project/object.ts\""
+                        }),
+                        CanonicalSourceLanguage::TypeScript,
+                        declaration,
+                        declaration,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(library_file, &library.arena), (source_file, &source.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap()
+    }
+
+    fn published_global_object_constructor<'arena>(
+        library: &'arena ParseResult,
+        source: &'arena ParseResult,
+        library_file: FileId,
+        source_file: FileId,
+    ) -> (
+        CanonicalCheckerContext<'arena>,
+        SemanticSymbolId,
+        SemanticSymbolId,
+        TypeId,
+        TypeId,
+        SignatureId,
+    ) {
+        let mut context =
+            global_object_constructor_context(library, source, library_file, source_file);
+        let (object, owner, declaration, parameter, annotation, object_type, any) = {
+            let store = context.store();
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            let globals = store.symbol_table(bootstrap.globals).unwrap();
+            let object = globals
+                .get_source("Object")
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+                .unwrap();
+            let owner = globals
+                .get_source("ObjectConstructor")
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+                .unwrap();
+            let signature_symbol = store
+                .symbol(owner)
+                .and_then(ts_binder::semantic::Symbol::members)
+                .and_then(|members| store.symbol_table(members))
+                .and_then(|members| members.get(InternalSymbolName::New.as_ref()))
+                .unwrap();
+            let declaration = store
+                .symbol(signature_symbol)
+                .unwrap()
+                .declarations()
+                .unwrap()[0];
+            let NodeData::ConstructSignatureDeclaration(signature) =
+                &library.arena.get(declaration.node).unwrap().data
+            else {
+                panic!("ObjectConstructor must own its real construct declaration")
+            };
+            let parameter_node = NodeRef::new(
+                declaration.arena,
+                declaration.file,
+                signature.parameters.nodes[0],
+            );
+            let parameter = context
+                .file(library_file)
+                .unwrap()
+                .1
+                .symbol(parameter_node)
+                .unwrap();
+            let variable = store.symbol(object).unwrap().value_declaration().unwrap();
+            let NodeData::VariableDeclaration(variable) =
+                &library.arena.get(variable.node).unwrap().data
+            else {
+                panic!("Object must retain its library value declaration")
+            };
+            let annotation =
+                NodeRef::new(library.arena.id(), library_file, variable.type_.unwrap());
+            let object_type = store
+                .declared_type_links(object)
+                .and_then(|links| links.declared_type)
+                .unwrap();
+            (
+                object,
+                owner,
+                declaration,
+                parameter,
+                annotation,
+                object_type,
+                bootstrap.any_type,
+            )
+        };
+        let store = context.store_mut_for_test();
+        let value_type = if let Some(existing) = store
+            .declared_type_links(owner)
+            .and_then(|links| links.declared_type)
+        {
+            existing
+        } else {
+            let type_ = store
+                .alloc_interface_type(ObjectFlags::INTERFACE, Some(owner))
+                .unwrap();
+            assert!(store.set_declared_type_links(
+                owner,
+                DeclaredTypeLinks {
+                    declared_type: Some(type_),
+                    ..DeclaredTypeLinks::default()
+                },
+            ));
+            type_
+        };
+        assert!(store.set_type_node_links(
+            annotation,
+            TypeNodeLinks {
+                resolved_type: Some(value_type),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        assert!(store.set_value_symbol_links(
+            object,
+            ValueSymbolLinks {
+                resolved_type: Some(value_type),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        assert!(store.set_value_symbol_links(
+            parameter,
+            ValueSymbolLinks {
+                resolved_type: Some(any),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        let signature = store
+            .alloc_signature(
+                SignatureFlags::CONSTRUCT,
+                Some(declaration),
+                Vec::new(),
+                None,
+                vec![parameter],
+                Some(object_type),
+                None,
+                0,
+            )
+            .unwrap();
+        assert!(store.set_signature_links(
+            declaration,
+            SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(signature),
+                ..SignatureLinks::default()
+            },
+        ));
+        assert!(store.set_structured_type_members(
+            value_type,
+            None,
+            None,
+            None,
+            Some(vec![signature]),
+            None,
+        ));
+        (context, object, owner, value_type, object_type, signature)
+    }
+
+    #[test]
+    fn global_object_constructor_materializes_real_signature_and_keeps_other_members_lazy() {
+        let library = parse_source_file(concat!(
+            "interface Object {} ",
+            "interface ObjectConstructor { ",
+            "new(value?: any): Object; ",
+            "readonly prototype: Object; ",
+            "} ",
+            "declare var Object: ObjectConstructor;",
+        ));
+        let source = parse_source_file("const result = new Object();");
+        assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let library_file = FileId::new(1_813);
+        let source_file = FileId::new(1_814);
+        let mut context =
+            global_object_constructor_context(&library, &source, library_file, source_file);
+        let (object, owner, declaration, object_type, initial_symbols) = {
+            let store = context.store();
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            let globals = store.symbol_table(bootstrap.globals).unwrap();
+            let object = globals
+                .get_source("Object")
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+                .unwrap();
+            let owner = globals
+                .get_source("ObjectConstructor")
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+                .unwrap();
+            let declaration = store
+                .symbol(owner)
+                .and_then(ts_binder::semantic::Symbol::members)
+                .and_then(|members| store.symbol_table(members))
+                .and_then(|members| members.get(InternalSymbolName::New.as_ref()))
+                .and_then(|signature| store.symbol(signature))
+                .and_then(ts_binder::semantic::Symbol::declarations)
+                .and_then(|declarations| declarations.first())
+                .copied()
+                .unwrap();
+            let object_type = store
+                .declared_type_links(object)
+                .and_then(|links| links.declared_type)
+                .unwrap();
+            assert!(store.declared_type_links(owner).is_none());
+            assert!(store.signature_links(declaration).is_none());
+            (object, owner, declaration, object_type, store.symbol_len())
+        };
+        let (construction, constructor) = variable_new(&source, source_file, "result");
+
+        context.check_source_file(source_file).unwrap();
+
+        let store = context.store();
+        let value_type = store
+            .declared_type_links(owner)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let value_record = store.type_payload(value_type).unwrap();
+        let TypeData::Interface(interface) = value_record.data() else {
+            panic!("ObjectConstructor must preserve its real interface identity")
+        };
+        assert!(
+            !value_record
+                .object_flags()
+                .contains(ObjectFlags::MEMBERS_RESOLVED)
+        );
+        assert!(!interface.declared_members_resolved);
+        assert!(interface.reference.object.structured.signatures.is_none());
+        let signature = store
+            .signature_links(declaration)
+            .and_then(|links| links.resolved_signature.signature())
+            .unwrap();
+        let signature_record = store.signature(signature).unwrap();
+        assert_eq!(signature_record.declaration(), Some(declaration));
+        assert_eq!(signature_record.resolved_return_type(), Some(object_type));
+        assert_eq!(signature_record.min_argument_count(), 0);
+        assert_eq!(store.symbol_len(), initial_symbols);
+        assert_eq!(
+            store.symbol_node_links(constructor),
+            Some(&SymbolNodeLinks {
+                resolved_symbol: Some(object),
+            }),
+        );
+        assert_eq!(
+            store.signature_links(construction),
+            Some(&SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(signature),
+                ..SignatureLinks::default()
+            }),
+        );
+        let warm = (
+            store.type_len(),
+            store.signature_len(),
+            store.symbol_len(),
+            store.checker_link_allocated_lengths(),
+        );
+
+        context.recheck_source_file(source_file).unwrap();
+
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn global_object_constructor_casts_to_empty_interfaces_without_resolving_object_members() {
+        let library = parse_source_file(concat!(
+            "interface Object { valueOf(): Object; } ",
+            "interface ObjectConstructor { ",
+            "new(value?: any): Object; ",
+            "readonly prototype: Object; ",
+            "} ",
+            "declare var Object: ObjectConstructor;",
+        ));
+        let source = parse_source_file("interface Foo {} const result = <Foo> new Object();");
+        assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let library_file = FileId::new(1_823);
+        let source_file = FileId::new(1_824);
+        let mut context =
+            global_object_constructor_context(&library, &source, library_file, source_file);
+        let object_type = context.global_types().object_type;
+        let before_symbols = context.store().symbol_len();
+
+        context.check_source_file(source_file).unwrap();
+
+        assert_eq!(context.store().symbol_len(), before_symbols);
+        let object = context.store().type_payload(object_type).unwrap();
+        assert!(
+            !object
+                .object_flags()
+                .contains(ObjectFlags::MEMBERS_RESOLVED)
+        );
+        assert!(context.diagnostics().is_empty());
+        let warm = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().symbol_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+
+        context.recheck_source_file(source_file).unwrap();
+
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn global_object_constructor_reuses_optional_signature_and_replays_warm() {
+        let library = parse_source_file(concat!(
+            "interface Object {} ",
+            "interface ObjectConstructor { new(value?: any): Object; } ",
+            "declare var Object: ObjectConstructor;",
+        ));
+        let source = parse_source_file("const result = new Object();");
+        assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let library_file = FileId::new(1_815);
+        let source_file = FileId::new(1_816);
+        let (mut context, object, _, value_type, object_type, signature) =
+            published_global_object_constructor(&library, &source, library_file, source_file);
+        let (construction, constructor) = variable_new(&source, source_file, "result");
+        let before_signatures = context.store().signature_len();
+        let before_symbols = context.store().symbol_len();
+
+        context.check_source_file(source_file).unwrap();
+
+        let store = context.store();
+        assert_eq!(store.signature_len(), before_signatures);
+        assert_eq!(store.symbol_len(), before_symbols);
+        assert_eq!(
+            store.symbol_node_links(constructor),
+            Some(&SymbolNodeLinks {
+                resolved_symbol: Some(object),
+            }),
+        );
+        assert_eq!(
+            store.type_node_links(constructor),
+            Some(&TypeNodeLinks {
+                resolved_type: Some(value_type),
+                ..TypeNodeLinks::default()
+            }),
+        );
+        assert_eq!(
+            store.type_node_links(construction),
+            Some(&TypeNodeLinks {
+                resolved_type: Some(object_type),
+                ..TypeNodeLinks::default()
+            }),
+        );
+        assert_eq!(
+            store.signature_links(construction),
+            Some(&SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(signature),
+                ..SignatureLinks::default()
+            }),
+        );
+        assert_eq!(store.signature(signature).unwrap().min_argument_count(), 0);
+        let warm = (
+            store.type_len(),
+            store.signature_len(),
+            store.symbol_len(),
+            store.checker_link_allocated_lengths(),
+        );
+
+        context.recheck_source_file(source_file).unwrap();
+
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn global_object_constructor_rejects_forged_signatures_without_expression_publication() {
+        for poison in 0..3 {
+            let library = parse_source_file(concat!(
+                "interface Object {} ",
+                "interface ObjectConstructor { new(value?: any): Object; } ",
+                "declare var Object: ObjectConstructor;",
+            ));
+            let source = parse_source_file("const result = new Object();");
+            let library_file = FileId::new(1_817 + poison * 2);
+            let source_file = FileId::new(1_818 + poison * 2);
+            let (mut context, object, owner, _, _, signature) =
+                published_global_object_constructor(&library, &source, library_file, source_file);
+            let (construction, constructor) = variable_new(&source, source_file, "result");
+            match poison {
+                0 => {
+                    assert!(context.store_mut_for_test().set_signature_flags(
+                        signature,
+                        SignatureFlags::CONSTRUCT | SignatureFlags::ABSTRACT,
+                    ));
+                }
+                1 => {
+                    let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+                    assert!(
+                        context
+                            .store_mut_for_test()
+                            .set_signature_resolved_return_type(signature, Some(string))
+                    );
+                }
+                2 => {
+                    let globals = context.store().intrinsic_bootstrap().unwrap().globals;
+                    assert_eq!(
+                        context.store_mut_for_test().insert_symbol(
+                            globals,
+                            EscapedName::source("Object"),
+                            owner,
+                        ),
+                        Some(Some(object)),
+                    );
+                }
+                _ => unreachable!("global Object poison cases are bounded"),
+            }
+            let before = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+
+            assert!(
+                context.check_source_file(source_file).is_err(),
+                "case {poison}"
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().symbol_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                before,
+                "case {poison}",
+            );
+            assert!(context.store().type_node_links(construction).is_none());
+            assert!(context.store().symbol_node_links(constructor).is_none());
+        }
     }
 
     #[test]

@@ -5,9 +5,10 @@
 //! mutable locations. Const-asserted properties retain regular literal types.
 //! Finite mapped `Record` targets retain their authenticated transient member
 //! symbols. Broad string-keyed records retain their real canonical index
-//! instead. This module validates the complete dependency tree before
-//! publishing the source object, so a malformed target cannot leave a
-//! partially constructed object behind.
+//! instead. Resolved object intersections preserve contextual information from
+//! their non-`any` constituents. This module validates the complete dependency
+//! tree before publishing the source object, so a malformed target cannot
+//! leave a partially constructed object behind.
 
 use std::collections::{HashMap, HashSet};
 
@@ -299,6 +300,23 @@ fn preflight_contextual_type_graph(
                     host,
                     global_types,
                     constituent,
+                    validated,
+                    visiting,
+                )?;
+            }
+            return Ok(());
+        }
+        if flags.intersects(TypeFlags::INTERSECTION) {
+            let contextual = resolve_contextual_property_object(store, host, contextual_type)?
+                .ok_or(RelationUnavailable::UnsupportedStructuredType(
+                    contextual_type,
+                ))?;
+            for property_type in contextual.property_types() {
+                preflight_contextual_type_graph(
+                    store,
+                    host,
+                    global_types,
+                    property_type,
                     validated,
                     visiting,
                 )?;
@@ -603,7 +621,7 @@ fn contextual_objects(
                 .type_payload(constituent)
                 .map(TypeRecord::flags)
                 .ok_or(RelationUnavailable::Type(constituent))?;
-            if flags.intersects(TypeFlags::OBJECT) {
+            if flags.intersects(TypeFlags::OBJECT | TypeFlags::INTERSECTION) {
                 let candidate = resolve_contextual_property_object(store, host, constituent)?
                     .ok_or(RelationUnavailable::UnsupportedStructuredType(constituent))?;
                 candidates.push(candidate);
@@ -647,7 +665,7 @@ fn contextual_objects(
         }
         return Ok(candidates);
     }
-    if flags.intersects(TypeFlags::OBJECT) {
+    if flags.intersects(TypeFlags::OBJECT | TypeFlags::INTERSECTION) {
         return resolve_contextual_property_object(store, host, contextual_type)
             .map(|object| object.into_iter().collect());
     }
@@ -662,6 +680,15 @@ fn resolve_contextual_property_object(
     host: &DeclaredTypeHost<'_>,
     contextual_type: TypeId,
 ) -> Result<Option<ContextualPropertyObject>, SourceCheckError> {
+    if store
+        .type_payload(contextual_type)
+        .is_some_and(|record| record.flags().intersects(TypeFlags::INTERSECTION))
+    {
+        return intersection_contextual_property_projection(store, host, contextual_type)
+            .map(ContextualPropertyObject::Synthetic)
+            .map(Some);
+    }
+
     let mapped_key = match store.type_payload(contextual_type).map(TypeRecord::data) {
         Some(TypeData::Mapped(mapped)) => mapped.constraint_type,
         _ => None,
@@ -693,6 +720,100 @@ fn resolve_contextual_property_object(
         .resolved_declared_property_object(host, contextual_type)
         .map(|object| object.map(ContextualPropertyObject::Declared))
         .map_err(Into::into)
+}
+
+/// Retains informative constituent properties instead of an `any`-merged value.
+fn intersection_contextual_property_projection(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    contextual_type: TypeId,
+) -> Result<Vec<(EscapedName, TypeId)>, SourceCheckError> {
+    let projection = match store.validate_intersection_type(contextual_type) {
+        Ok(projection) => projection,
+        Err(_)
+            if store
+                .validate_deferred_intersection_type(contextual_type)
+                .is_ok() =>
+        {
+            return Err(RelationUnavailable::UnresolvedStructuredMembers(contextual_type).into());
+        }
+        Err(_) => return Err(RelationUnavailable::MalformedIntersection(contextual_type).into()),
+    };
+    if projection.reduced_to_never {
+        return Err(RelationUnavailable::UnsupportedStructuredType(contextual_type).into());
+    }
+    let record = store
+        .type_payload(contextual_type)
+        .ok_or(RelationUnavailable::MalformedIntersection(contextual_type))?;
+    let TypeData::Intersection(intersection) = record.data() else {
+        return Err(RelationUnavailable::MalformedIntersection(contextual_type).into());
+    };
+    if intersection.intersection.structured.signatures.is_some()
+        || intersection.intersection.structured.call_signature_count != 0
+    {
+        return Err(RelationUnavailable::StructuredSignatures(contextual_type).into());
+    }
+
+    let mut constituents = Vec::with_capacity(projection.types.len());
+    for constituent in projection.types {
+        let flags = store
+            .type_payload(constituent)
+            .map(TypeRecord::flags)
+            .ok_or(RelationUnavailable::MalformedIntersection(contextual_type))?;
+        if !flags.intersects(TypeFlags::OBJECT) {
+            return Err(RelationUnavailable::UnsupportedStructuredType(contextual_type).into());
+        }
+        let object = resolve_contextual_property_object(store, host, constituent)?
+            .ok_or(RelationUnavailable::UnsupportedStructuredType(constituent))?;
+        constituents.push(object);
+    }
+
+    let mut properties = Vec::with_capacity(projection.properties.len());
+    for symbol in projection.properties {
+        let name = store
+            .symbol(symbol)
+            .map(|record| record.name().to_owned())
+            .ok_or(RelationUnavailable::MalformedIntersection(contextual_type))?;
+        let source_name = name
+            .as_utf8()
+            .ok_or(RelationUnavailable::MalformedIntersection(contextual_type))?;
+        let merged = store
+            .resolved_own_property(contextual_type, source_name)?
+            .ok_or(RelationUnavailable::MalformedIntersection(contextual_type))?;
+        if merged.symbol != symbol {
+            return Err(RelationUnavailable::MalformedIntersection(contextual_type).into());
+        }
+
+        let mut found = false;
+        let mut informative = None;
+        for constituent in &constituents {
+            let Some(type_) = constituent.get_source(source_name) else {
+                continue;
+            };
+            found = true;
+            let flags = store
+                .type_payload(type_)
+                .map(TypeRecord::flags)
+                .ok_or(RelationUnavailable::MalformedIntersection(contextual_type))?;
+            if flags.intersects(TypeFlags::ANY | TypeFlags::UNKNOWN) {
+                continue;
+            }
+            match informative {
+                None => informative = Some(type_),
+                Some(previous) if previous == type_ => {}
+                Some(_) => {
+                    return Err(
+                        RelationUnavailable::UnsupportedStructuredType(contextual_type).into(),
+                    );
+                }
+            }
+        }
+        if !found {
+            return Err(RelationUnavailable::MalformedIntersection(contextual_type).into());
+        }
+        properties.push((name, informative.unwrap_or(merged.type_)));
+    }
+    Ok(properties)
 }
 
 /// Projects declaration-free `JSDoc` properties through the relater's full validation.
@@ -1296,6 +1417,34 @@ mod tests {
         PlannedExpression::new(object, PlannedExpressionKind::Object { plan, properties })
     }
 
+    fn intersection_object_expression(
+        parsed: &ParseResult,
+        store: &CanonicalTypeMapperStore,
+        host: &DeclaredTypeHost<'_>,
+        object: NodeRef,
+    ) -> PlannedExpression {
+        let plan = super::super::object_members::plan_object_literal(store, host, object).unwrap();
+        let properties = plan
+            .properties
+            .iter()
+            .map(|property| {
+                let record = parsed.arena.get(property.type_node.node).unwrap();
+                let kind = match &record.data {
+                    NodeData::StringLiteral(literal) => {
+                        PlannedExpressionKind::String(literal.text.clone())
+                    }
+                    NodeData::NumericLiteral(literal) => PlannedExpressionKind::Number {
+                        value: ts_jsnum::Number::new(literal.text.parse().unwrap()),
+                        unary_operand: None,
+                    },
+                    _ => panic!("intersection fixtures use string or numeric properties"),
+                };
+                PlannedExpression::new(property.type_node, kind)
+            })
+            .collect();
+        PlannedExpression::new(object, PlannedExpressionKind::Object { plan, properties })
+    }
+
     fn contextual_function_types(
         parsed: &ParseResult,
         file: FileId,
@@ -1482,6 +1631,308 @@ mod tests {
                 target,
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn contextual_intersections_preserve_non_any_literals_in_either_constituent_order() {
+        for (index, source) in [
+            "const value: { item: any } & { item: 'edge' } = { item: 'edge' };",
+            "const value: { item: 'edge' } & { item: any } = { item: 'edge' };",
+            "const value: { item: any } & { item: 1 } = { item: 1 };",
+            "const value: { item: 1 } & { item: any } = { item: 1 };",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let parsed = parse_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(9_420 + u32::try_from(index).unwrap());
+            let mut context = mapped_record_context(&parsed, file);
+            let (annotation, object) = mapped_record_nodes(&parsed, file);
+            let target = context.get_type_from_type_node(annotation).unwrap();
+            let bound = context.file(file).unwrap().1.clone();
+            let host = DeclaredTypeHost::new([(&parsed.arena, &bound)]).unwrap();
+            let expression =
+                intersection_object_expression(&parsed, context.store(), &host, object);
+            let globals = context.global_types().clone();
+            let (any, expected) = {
+                let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+                let expected = if source.contains("'edge'") {
+                    bootstrap.cached_string_literal_type("edge").unwrap()
+                } else {
+                    bootstrap
+                        .cached_number_literal_type(ts_jsnum::Number::new(1.0))
+                        .unwrap()
+                };
+                (bootstrap.any_type, expected)
+            };
+            let store = context.store_mut_for_test();
+            let merged = store.validate_intersection_type(target).unwrap();
+            let [property] = merged.properties.as_slice() else {
+                panic!("the target intersection must have one merged property")
+            };
+            assert_eq!(
+                store
+                    .value_symbol_links(*property)
+                    .and_then(|links| links.resolved_type),
+                Some(any),
+            );
+            let before = (
+                store.type_len(),
+                store.mapper_len(),
+                store.signature_len(),
+                store.symbol_len(),
+                store.symbol_store().symbol_table_len(),
+                store.checker_link_allocated_lengths(),
+                store.relation_state_snapshot(),
+            );
+
+            for _ in 0..2 {
+                let contextual = resolve_contextual_property_object(store, &host, target)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(contextual.get_source("item"), Some(expected));
+                assert_eq!(
+                    prepare_expression_context_with_global_types(
+                        store,
+                        &host,
+                        &globals,
+                        &HashMap::new(),
+                        &expression,
+                        target,
+                    ),
+                    Ok(PreparedExpression::Object(vec![
+                        PreparedExpression::Literal(LiteralTreatment::Regular),
+                    ])),
+                );
+                assert_eq!(
+                    (
+                        store.type_len(),
+                        store.mapper_len(),
+                        store.signature_len(),
+                        store.symbol_len(),
+                        store.symbol_store().symbol_table_len(),
+                        store.checker_link_allocated_lengths(),
+                        store.relation_state_snapshot(),
+                    ),
+                    before,
+                );
+                assert!(store.type_node_links(object).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn contextual_intersections_reject_deferred_targets_without_writes() {
+        let deferred_source =
+            parse_source_file("const value: { item: any } & { item: 'edge' } = { item: 'edge' };");
+        assert!(
+            deferred_source.diagnostics.is_empty(),
+            "{:?}",
+            deferred_source.diagnostics
+        );
+        let file = FileId::new(9_424);
+        let mut context = mapped_record_context(&deferred_source, file);
+        let (annotation, object) = mapped_record_nodes(&deferred_source, file);
+        let NodeData::IntersectionTypeNode(intersection) =
+            &deferred_source.arena.get(annotation.node).unwrap().data
+        else {
+            panic!("expected a source intersection annotation")
+        };
+        let [left, right] = intersection.types.nodes.as_slice() else {
+            panic!("expected two source intersection constituents")
+        };
+        let left = context
+            .get_type_from_type_node(NodeRef::new(deferred_source.arena.id(), file, *left))
+            .unwrap();
+        let right = context
+            .get_type_from_type_node(NodeRef::new(deferred_source.arena.id(), file, *right))
+            .unwrap();
+        let deferred = context
+            .store_mut_for_test()
+            .canonical_deferred_intersection_type(&[left, right], None)
+            .unwrap();
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new([(&deferred_source.arena, &bound)]).unwrap();
+        let expression =
+            intersection_object_expression(&deferred_source, context.store(), &host, object);
+        let globals = context.global_types().clone();
+        let store = context.store_mut_for_test();
+        let before = (
+            store.type_len(),
+            store.mapper_len(),
+            store.symbol_len(),
+            store.symbol_store().symbol_table_len(),
+            store.checker_link_allocated_lengths(),
+            store.relation_state_snapshot(),
+        );
+        assert_eq!(
+            prepare_expression_context_with_global_types(
+                store,
+                &host,
+                &globals,
+                &HashMap::new(),
+                &expression,
+                deferred,
+            ),
+            Err(SourceCheckError::RelationUnavailable(
+                RelationUnavailable::UnresolvedStructuredMembers(deferred),
+            )),
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.mapper_len(),
+                store.symbol_len(),
+                store.symbol_store().symbol_table_len(),
+                store.checker_link_allocated_lengths(),
+                store.relation_state_snapshot(),
+            ),
+            before,
+        );
+        assert!(store.type_node_links(object).is_none());
+    }
+
+    #[test]
+    fn contextual_intersections_reject_ambiguous_properties_without_writes() {
+        let ambiguous_source =
+            parse_source_file("const value: { item: number } & { item: 1 } = { item: 1 };");
+        assert!(
+            ambiguous_source.diagnostics.is_empty(),
+            "{:?}",
+            ambiguous_source.diagnostics
+        );
+        let file = FileId::new(9_425);
+        let mut context = mapped_record_context(&ambiguous_source, file);
+        let (annotation, object) = mapped_record_nodes(&ambiguous_source, file);
+        let target = context.get_type_from_type_node(annotation).unwrap();
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new([(&ambiguous_source.arena, &bound)]).unwrap();
+        let expression =
+            intersection_object_expression(&ambiguous_source, context.store(), &host, object);
+        let globals = context.global_types().clone();
+        let store = context.store_mut_for_test();
+        let before = (
+            store.type_len(),
+            store.mapper_len(),
+            store.symbol_len(),
+            store.symbol_store().symbol_table_len(),
+            store.checker_link_allocated_lengths(),
+            store.relation_state_snapshot(),
+        );
+        assert_eq!(
+            prepare_expression_context_with_global_types(
+                store,
+                &host,
+                &globals,
+                &HashMap::new(),
+                &expression,
+                target,
+            ),
+            Err(SourceCheckError::RelationUnavailable(
+                RelationUnavailable::UnsupportedStructuredType(target),
+            )),
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.mapper_len(),
+                store.symbol_len(),
+                store.symbol_store().symbol_table_len(),
+                store.checker_link_allocated_lengths(),
+                store.relation_state_snapshot(),
+            ),
+            before,
+        );
+        assert!(store.type_node_links(object).is_none());
+    }
+
+    #[test]
+    fn contextual_intersections_reject_forged_cached_properties_without_writes() {
+        let parsed =
+            parse_source_file("const value: { item: any } & { item: 'edge' } = { item: 'edge' };");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(9_426);
+        let mut context = mapped_record_context(&parsed, file);
+        let (annotation, object) = mapped_record_nodes(&parsed, file);
+        let target = context.get_type_from_type_node(annotation).unwrap();
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new([(&parsed.arena, &bound)]).unwrap();
+        let expression = intersection_object_expression(&parsed, context.store(), &host, object);
+        let globals = context.global_types().clone();
+        let store = context.store_mut_for_test();
+        let property = store.validate_intersection_type(target).unwrap().properties[0];
+        let original_flags = store.symbol(property).unwrap().flags();
+        let original_checks = store.symbol(property).unwrap().check_flags();
+        let original_links = store.value_symbol_links(property).unwrap().clone();
+
+        for poison_links in [false, true] {
+            if poison_links {
+                let mut poisoned = original_links.clone();
+                poisoned.target = Some(property);
+                assert!(store.set_value_symbol_links(property, poisoned));
+            } else {
+                assert!(store.set_symbol_flags(
+                    property,
+                    original_flags.without(SymbolFlags::TRANSIENT),
+                    original_checks,
+                ));
+            }
+            let before = (
+                store.type_len(),
+                store.mapper_len(),
+                store.symbol_len(),
+                store.symbol_store().symbol_table_len(),
+                store.checker_link_allocated_lengths(),
+                store.relation_state_snapshot(),
+            );
+
+            assert_eq!(
+                prepare_expression_context_with_global_types(
+                    store,
+                    &host,
+                    &globals,
+                    &HashMap::new(),
+                    &expression,
+                    target,
+                ),
+                Err(SourceCheckError::RelationUnavailable(
+                    RelationUnavailable::MalformedIntersection(target),
+                )),
+            );
+            assert_eq!(
+                (
+                    store.type_len(),
+                    store.mapper_len(),
+                    store.symbol_len(),
+                    store.symbol_store().symbol_table_len(),
+                    store.checker_link_allocated_lengths(),
+                    store.relation_state_snapshot(),
+                ),
+                before,
+            );
+            assert!(store.type_node_links(object).is_none());
+
+            if poison_links {
+                assert!(store.set_value_symbol_links(property, original_links.clone()));
+            } else {
+                assert!(store.set_symbol_flags(property, original_flags, original_checks));
+            }
+        }
+
+        assert_eq!(
+            prepare_expression_context_with_global_types(
+                store,
+                &host,
+                &globals,
+                &HashMap::new(),
+                &expression,
+                target,
+            ),
+            Ok(PreparedExpression::Object(vec![
+                PreparedExpression::Literal(LiteralTreatment::Regular),
+            ])),
         );
     }
 

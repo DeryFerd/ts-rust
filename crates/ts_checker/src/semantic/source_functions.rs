@@ -195,7 +195,7 @@ pub(super) fn plan_top_level_function(
             },
         ));
     }
-    validate_function_target(store, declaration, name, name_text, merged)?;
+    validate_function_target(bound, store, declaration, name, name_text, merged)?;
 
     let local = bound.local_symbol(declaration);
     let expected_local = if exported {
@@ -356,7 +356,7 @@ pub(super) fn plan_function_identifier_read(
                 SourceFunctionUnsupported::CrossFileDeclaration { node, declaration },
             ));
         }
-        validate_function_target(store, declaration, node, name, routed.target)?;
+        validate_function_target(bound, store, declaration, node, name, routed.target)?;
         validate_function_read_declaration_symbol(bound, store, declaration, routed.target)?;
         if let Some(local) = routed.export_local {
             validate_export_local(store, local, declaration, routed.target, name)?;
@@ -538,6 +538,7 @@ fn route_value_symbol(
 }
 
 fn validate_function_target(
+    bound: &BoundFile,
     store: &CanonicalTypeMapperStore,
     declaration: NodeRef,
     name: NodeRef,
@@ -547,7 +548,14 @@ fn validate_function_target(
     let record = store
         .symbol(symbol)
         .ok_or(SourceFunctionInvariant::InvalidSymbol(symbol))?;
-    let valid_owner = valid_source_function_declaration_owner_shape(store, symbol, declaration);
+    let valid_owner = valid_source_function_declaration_owner_shape(store, symbol, declaration)
+        || valid_source_javascript_duplicate_function_owner_shape(
+            bound,
+            store,
+            symbol,
+            declaration,
+            name_text,
+        );
     if record.flags() != SymbolFlags::FUNCTION && !valid_owner {
         return Err(SourceFunctionPlanError::Unsupported(
             SourceFunctionUnsupported::NonFunctionSymbol {
@@ -603,6 +611,72 @@ fn validate_function_target(
         .into());
     }
     Ok(())
+}
+
+/// Authenticates the first implementation of a JavaScript function group.
+pub(super) fn valid_source_javascript_duplicate_function_owner_shape(
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    owner_symbol: SemanticSymbolId,
+    declaration: NodeRef,
+    name: &str,
+) -> bool {
+    if bound
+        .source_facts()
+        .is_none_or(|facts| !facts.is_javascript_file() || facts.is_declaration_file())
+    {
+        return false;
+    }
+    let Some(owner) = store.symbol(owner_symbol) else {
+        return false;
+    };
+    let source = bound.source_file();
+    if owner.flags() != SymbolFlags::FUNCTION
+        || owner.check_flags() != CheckFlags::NONE
+        || owner.name().as_bytes() != name.as_bytes()
+        || owner.value_declaration() != Some(declaration)
+        || owner.members().is_some()
+        || owner.exports().is_some()
+        || owner.parent().is_some()
+        || owner.export_symbol().is_some()
+        || store.get_merged_symbol(owner_symbol) != Some(owner_symbol)
+        || bound
+            .locals(source)
+            .and_then(|locals| store.symbol_table(locals))
+            .and_then(|locals| locals.get_source(name))
+            != Some(owner_symbol)
+    {
+        return false;
+    }
+    let Some(declarations) = owner.declarations() else {
+        return false;
+    };
+    declarations.len() >= 2
+        && declarations.first().copied() == Some(declaration)
+        && declarations
+            .iter()
+            .enumerate()
+            .all(|(index, implementation)| {
+                if declarations[..index].contains(implementation)
+                    || !implementation.is_for(source.arena, source.file)
+                    || store.source_node_kind(*implementation)
+                        != Some(ts_ast::SyntaxKind::FunctionDeclaration)
+                    || store.source_node_parent(*implementation)
+                        != Some(SourceNodeParent::Parent(source))
+                    || bound.container(*implementation) != Some(source)
+                    || bound.symbol(*implementation) != Some(owner_symbol)
+                    || bound.local_symbol(*implementation).is_some()
+                {
+                    return false;
+                }
+                let mut bodies = bound.traversal_order().filter(|candidate| {
+                    store.source_node_kind(*candidate) == Some(ts_ast::SyntaxKind::Block)
+                        && store.source_node_parent(*candidate)
+                            == Some(SourceNodeParent::Parent(*implementation))
+                        && bound.container(*candidate) == Some(*implementation)
+                });
+                bodies.next().is_some() && bodies.next().is_none()
+            })
 }
 
 fn valid_source_function_declaration_owner_shape(
@@ -801,7 +875,7 @@ mod tests {
         CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
         EscapedName,
     };
-    use ts_parser::parse_source_file;
+    use ts_parser::{parse_javascript_source_file, parse_source_file};
 
     use super::*;
 
@@ -858,6 +932,170 @@ mod tests {
             .unwrap();
 
         (parsed, bound, store, declaration, name)
+    }
+
+    fn javascript_duplicate_function_fixture(
+        file: FileId,
+    ) -> (
+        ts_parser::ParseResult,
+        BoundFile,
+        CanonicalTypeMapperStore,
+        Vec<(NodeRef, NodeRef)>,
+    ) {
+        let parsed =
+            parse_javascript_source_file("function repeated() {} function repeated(value) {}");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source(format!("\"/project/repeated-{}.js\"", file.index())),
+                    CanonicalSourceLanguage::JavaScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_javascript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let (symbols, mut files) = binder.finish().try_into_parts().unwrap();
+        let bound = files.remove(&file).unwrap();
+        let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
+        assert!(
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .is_some()
+        );
+        let source = parsed.arena.get(parsed.source_file).unwrap();
+        let NodeData::SourceFile(source) = &source.data else {
+            panic!("the JavaScript fixture must retain its source-file root")
+        };
+        let declarations = source
+            .statements
+            .nodes
+            .iter()
+            .filter_map(|node| {
+                let record = parsed.arena.get(*node)?;
+                let NodeData::FunctionDeclaration(function) = &record.data else {
+                    return None;
+                };
+                Some((
+                    NodeRef::new(parsed.arena.id(), file, *node),
+                    NodeRef::new(parsed.arena.id(), file, function.name?),
+                ))
+            })
+            .collect();
+
+        (parsed, bound, store, declarations)
+    }
+
+    #[test]
+    fn javascript_duplicate_functions_keep_the_first_implementation_on_replay() {
+        let (_, bound, store, declarations) =
+            javascript_duplicate_function_fixture(FileId::new(8_930));
+        let [(first, first_name), (second, second_name)] = declarations.as_slice() else {
+            panic!("the JavaScript fixture must retain both implementations")
+        };
+        let owner = bound.symbol(*first).unwrap();
+        assert_eq!(bound.symbol(*second), Some(owner));
+        assert_eq!(
+            store.symbol(owner).unwrap().value_declaration(),
+            Some(*first)
+        );
+        let before = (
+            store.type_len(),
+            store.symbol_len(),
+            store.symbol_store().symbol_table_len(),
+            store.checker_link_allocated_lengths(),
+        );
+
+        for _ in 0..2 {
+            assert!(valid_source_javascript_duplicate_function_owner_shape(
+                &bound, &store, owner, *first, "repeated",
+            ));
+            assert_eq!(
+                plan_top_level_function(&bound, &store, *first, *first_name, "repeated", false),
+                Ok(PlannedTopLevelFunction {
+                    declaration: *first,
+                    owner_symbol: owner,
+                }),
+            );
+            assert_eq!(
+                (
+                    store.type_len(),
+                    store.symbol_len(),
+                    store.symbol_store().symbol_table_len(),
+                    store.checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+        }
+        assert!(!valid_source_javascript_duplicate_function_owner_shape(
+            &bound, &store, owner, *second, "repeated",
+        ));
+        assert_eq!(
+            plan_top_level_function(&bound, &store, *second, *second_name, "repeated", false),
+            Err(SourceFunctionPlanError::Unsupported(
+                SourceFunctionUnsupported::NonUniqueDeclaration {
+                    node: *second,
+                    symbol: owner,
+                    declaration_count: 2,
+                },
+            )),
+        );
+    }
+
+    #[test]
+    fn javascript_duplicate_functions_reject_forged_declaration_order_and_relationships() {
+        let (_, bound, mut store, declarations) =
+            javascript_duplicate_function_fixture(FileId::new(8_931));
+        let [(first, first_name), (second, _)] = declarations.as_slice() else {
+            panic!("the JavaScript fixture must retain both implementations")
+        };
+        let owner = bound.symbol(*first).unwrap();
+        assert!(store.set_symbol_declarations(owner, Some(vec![*second, *first]), Some(*first)));
+        assert!(!valid_source_javascript_duplicate_function_owner_shape(
+            &bound, &store, owner, *first, "repeated",
+        ));
+        assert_eq!(
+            plan_top_level_function(&bound, &store, *first, *first_name, "repeated", false),
+            Err(SourceFunctionPlanError::Unsupported(
+                SourceFunctionUnsupported::NonUniqueDeclaration {
+                    node: *first,
+                    symbol: owner,
+                    declaration_count: 2,
+                },
+            )),
+        );
+
+        assert!(store.set_symbol_declarations(owner, Some(vec![*first, *second]), Some(*first)));
+        let record = store.symbol(owner).unwrap();
+        let (members, parent, export_symbol) =
+            (record.members(), record.parent(), record.export_symbol());
+        let exports = store.alloc_symbol_table();
+        assert!(store.set_symbol_relationships(
+            owner,
+            members,
+            Some(exports),
+            parent,
+            export_symbol
+        ));
+        assert!(!valid_source_javascript_duplicate_function_owner_shape(
+            &bound, &store, owner, *first, "repeated",
+        ));
+        assert_eq!(
+            plan_top_level_function(&bound, &store, *first, *first_name, "repeated", false),
+            Err(SourceFunctionPlanError::Unsupported(
+                SourceFunctionUnsupported::ExpandoFunction {
+                    node: *first,
+                    symbol: owner,
+                },
+            )),
+        );
     }
 
     #[test]
