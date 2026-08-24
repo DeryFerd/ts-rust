@@ -16,6 +16,7 @@
 //! closure), initialized identifier-named top-level variables (optionally
 //! exported), annotated uninitialized non-exported mutable top-level variables,
 //! exact top-level lexical blocks containing a forward read of one numeric const,
+//! top-level `for...in` loops with one lexical binding and expression statements,
 //! top-level `for...of` loops with one const binding and one direct call,
 //! ordinary direct identifier calls, bounded annotated arrow call arguments,
 //! anonymous zero-parameter function expressions with bounded block bodies,
@@ -184,7 +185,7 @@ use super::{
     source_statements::{
         SourceConditionalEnumFunctionStatementsSyntax, SourceControlIfSyntax,
         SourceControlLoopKind, SourceControlLoopSyntax, SourceFallthroughBranchSyntax,
-        SourceForOfStatementSyntax, SourceFunctionStatementsError,
+        SourceForInStatementSyntax, SourceForOfStatementSyntax, SourceFunctionStatementsError,
         SourceFunctionStatementsInvariant, SourceFunctionStatementsSyntax,
         SourceJoinedFunctionStatementsError, SourceJoinedFunctionStatementsInvariant,
         SourceJoinedFunctionStatementsSyntax, SourceLinearFunctionStatementSyntax,
@@ -192,8 +193,9 @@ use super::{
         SourceReturnBranchSyntax, SourceSwitchFunctionStatementsSyntax,
         SourceTypeofConditionSyntax, SourceTypeofSwitchFunctionStatementsSyntax,
         plan_source_conditional_enum_function_statements_syntax, plan_source_control_if_syntax,
-        plan_source_control_loop_syntax, plan_source_for_of_statement_syntax,
-        plan_source_function_statements_syntax, plan_source_joined_function_statements_syntax,
+        plan_source_control_loop_syntax, plan_source_for_in_statement_syntax,
+        plan_source_for_of_statement_syntax, plan_source_function_statements_syntax,
+        plan_source_joined_function_statements_syntax,
         plan_source_linear_function_statements_syntax,
         plan_source_switch_function_statements_syntax,
         plan_source_typeof_switch_function_statements_syntax, source_control_branch_is_empty,
@@ -1203,6 +1205,13 @@ struct PlannedTopLevelForOf {
     body: PlannedExpression,
 }
 
+#[derive(Clone, Debug)]
+struct PlannedTopLevelForIn {
+    syntax: SourceForInStatementSyntax,
+    iterable: PlannedExpression,
+    body: Vec<PlannedExpression>,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct PlannedCatchObjectRest {
     name: NodeRef,
@@ -1283,6 +1292,7 @@ enum PlannedStatement {
     NamespaceAssignment(PlannedNamespaceAssignment),
     ControlIf(Box<PlannedTopLevelIf>),
     ControlLoop(Box<PlannedTopLevelLoop>),
+    ForIn(Box<PlannedTopLevelForIn>),
     ForOf(Box<PlannedTopLevelForOf>),
     CatchObjectRest(PlannedCatchObjectRest),
     Break(NodeRef),
@@ -1895,6 +1905,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 SyntaxKind::WhileStatement | SyntaxKind::LabeledStatement => {
                     statements.push(PlannedStatement::ControlLoop(Box::new(
                         self.plan_top_level_while(statement)?,
+                    )));
+                }
+                SyntaxKind::ForInStatement => {
+                    statements.push(PlannedStatement::ForIn(Box::new(
+                        self.plan_top_level_for_in(statement)?,
                     )));
                 }
                 SyntaxKind::ForOfStatement => {
@@ -3204,6 +3219,64 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         self.readable_variables = readable_variables;
 
         Ok(PlannedTopLevelForOf {
+            syntax,
+            iterable,
+            body: result?,
+        })
+    }
+
+    fn plan_top_level_for_in(
+        &mut self,
+        statement: NodeRef,
+    ) -> Result<PlannedTopLevelForIn, SourceCheckError> {
+        let Some((store, _)) = self.semantic else {
+            return Err(self.unsupported(
+                statement,
+                SyntaxKind::ForInStatement,
+                SourceSyntaxRole::Statement,
+            ));
+        };
+        let syntax = plan_source_for_in_statement_syntax(self.arena, self.bound, store, statement)
+            .map_err(|error| match error {
+                SourceFunctionStatementsError::Unsupported(_) => self.unsupported(
+                    statement,
+                    SyntaxKind::ForInStatement,
+                    SourceSyntaxRole::Statement,
+                ),
+                SourceFunctionStatementsError::Variable(error) => Self::variable_plan_error(error),
+                SourceFunctionStatementsError::Invariant(_) => {
+                    SourceCheckError::Function(SourceFunctionInvariant::Callable(statement))
+                }
+            })?;
+        let iterable = self.plan_expression(syntax.control.iterable.ok_or(
+            SourceCheckError::Function(SourceFunctionInvariant::Callable(statement)),
+        )?)?;
+
+        let prior_variables = self.prior_variables.clone();
+        let readable_variables = self.readable_variables.clone();
+        let mutable_variables = self.assignable_mutable_variables.clone();
+        let result = (|| {
+            if !self.prior_variables.insert(syntax.symbol)
+                || !self.readable_variables.insert(syntax.symbol)
+                || syntax.binding == VariableBindingKind::Let
+                    && !self.assignable_mutable_variables.insert(syntax.symbol)
+            {
+                return Err(SourceCheckError::Variable(
+                    VariableInvariant::InvalidSymbolShape(syntax.symbol),
+                ));
+            }
+
+            syntax
+                .body_statements
+                .iter()
+                .map(|statement| self.plan_expression(statement.expression))
+                .collect::<Result<Vec<_>, _>>()
+        })();
+        self.prior_variables = prior_variables;
+        self.readable_variables = readable_variables;
+        self.assignable_mutable_variables = mutable_variables;
+
+        Ok(PlannedTopLevelForIn {
             syntax,
             iterable,
             body: result?,
@@ -10337,6 +10410,61 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                                 )
                             })
                         })
+                    {
+                        return Err(SourceCheckError::Unsupported(
+                            UnsupportedSourceSyntax::Arrow(declaration),
+                        ));
+                    }
+                    break;
+                }
+                NodeData::ExpressionStatement(statement)
+                    if record.kind == SyntaxKind::ExpressionStatement
+                        && statement.expression == argument.node =>
+                {
+                    let Some(body) = record.parent.map(|node| self.reference(node)) else {
+                        return Err(SourceCheckError::Unsupported(
+                            UnsupportedSourceSyntax::Arrow(declaration),
+                        ));
+                    };
+                    let body_record = self.node(body)?;
+                    let Some(iteration) = body_record.parent.map(|node| self.reference(node))
+                    else {
+                        return Err(SourceCheckError::Unsupported(
+                            UnsupportedSourceSyntax::Arrow(declaration),
+                        ));
+                    };
+                    let iteration_record = self.node(iteration)?;
+                    let NodeData::ForInOrOfStatement(loop_data) = &iteration_record.data else {
+                        return Err(SourceCheckError::Unsupported(
+                            UnsupportedSourceSyntax::Arrow(declaration),
+                        ));
+                    };
+                    let initializer = self.reference(loop_data.initializer);
+                    let NodeData::VariableDeclarationList(bindings) = &self.node(initializer)?.data
+                    else {
+                        return Err(SourceCheckError::Unsupported(
+                            UnsupportedSourceSyntax::Arrow(declaration),
+                        ));
+                    };
+                    let [binding] = bindings.declarations.nodes.as_slice() else {
+                        return Err(SourceCheckError::Unsupported(
+                            UnsupportedSourceSyntax::Arrow(declaration),
+                        ));
+                    };
+                    let binding = self.reference(*binding);
+                    let Some(symbol) = self.bound.symbol(binding) else {
+                        return Err(SourceCheckError::Unsupported(
+                            UnsupportedSourceSyntax::Arrow(declaration),
+                        ));
+                    };
+                    if body_record.kind != SyntaxKind::Block
+                        || iteration_record.kind != SyntaxKind::ForInStatement
+                        || iteration_record.parent != Some(self.source.node_ref().node)
+                        || loop_data.statement != body.node
+                        || self.bound.block_scope_container(parent) != Some(body)
+                        || self.bound.block_scope_container(binding) != Some(iteration)
+                        || !self.prior_variables.contains(&symbol)
+                        || !self.readable_variables.contains(&symbol)
                     {
                         return Err(SourceCheckError::Unsupported(
                             UnsupportedSourceSyntax::Arrow(declaration),
@@ -25677,6 +25805,100 @@ pub(super) fn check_source_file(
                     issue_node_diagnostic(diagnostics, statement, 1116)?;
                 }
             }
+            PlannedStatement::ForIn(iteration) => {
+                let iterable = check_expression_type(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    &current_flow_types,
+                    &preflighted_type_import_value_uses,
+                    &iteration.iterable,
+                    None,
+                    &mut deferred,
+                )?;
+                let bootstrap =
+                    store
+                        .intrinsic_bootstrap()
+                        .ok_or(SourceCheckError::LiteralCache(
+                            SourceLiteralCacheError::BootstrapUninitialized,
+                        ))?;
+                let string_type = bootstrap.string_type;
+                let error_type = bootstrap.error_type;
+                let flags = store
+                    .type_payload(iterable.result)
+                    .ok_or(RelationUnavailable::Type(iterable.result))?
+                    .flags();
+                if iterable.result != error_type
+                    && !flags.intersects(
+                        TypeFlags::ANY
+                            | TypeFlags::OBJECT
+                            | TypeFlags::NON_PRIMITIVE
+                            | TypeFlags::INSTANTIABLE_NON_PRIMITIVE,
+                    )
+                {
+                    let mut display_flags = CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT;
+                    if options.no_error_truncation {
+                        display_flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
+                    }
+                    let operand = type_to_string_with_host_global_types_and_flags(
+                        store,
+                        host,
+                        global_types,
+                        iterable.result,
+                        display_flags,
+                    )?;
+                    merge_retry_diagnostic(
+                        diagnostics,
+                        CanonicalCheckerDiagnostic {
+                            node: Some(iteration.iterable.node),
+                            range_override: None,
+                            diagnostic: Diagnostic::with_arguments(
+                                message_by_code(2407)
+                                    .ok_or(SourceCheckError::MissingDiagnostic(2407))?,
+                                [operand],
+                            ),
+                            related_information: Vec::new(),
+                        },
+                    );
+                }
+
+                let mut loop_flow_types = current_flow_types.clone();
+                if loop_flow_types
+                    .insert(iteration.syntax.symbol, string_type)
+                    .is_some()
+                {
+                    return Err(SourceCheckError::Variable(
+                        VariableInvariant::DuplicateCurrentFlowType(iteration.syntax.symbol),
+                    ));
+                }
+                for expression in &iteration.body {
+                    check_expression_type(
+                        store,
+                        host,
+                        global_types,
+                        source,
+                        options,
+                        session,
+                        diagnostics,
+                        &loop_flow_types,
+                        &preflighted_type_import_value_uses,
+                        expression,
+                        None,
+                        &mut deferred,
+                    )?;
+                }
+                stage_value_type(
+                    store,
+                    &mut staged_value_types,
+                    &mut value_order,
+                    iteration.syntax.symbol,
+                    string_type,
+                )?;
+            }
             PlannedStatement::ForOf(iteration) => {
                 let iterable = check_expression_type(
                     store,
@@ -27054,6 +27276,177 @@ mod tests {
                 .source_callable_type_for_owner(owner)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn for_in_lexical_keys_remain_strings_in_calls_and_captured_arrows() {
+        let source = parsed(concat!(
+            "declare function use(value: string): void; ",
+            "declare function capture(value: any): void; ",
+            "const key = 1; ",
+            "for (let key in { first: 1 }) { ",
+            "use(key); capture(() => key); (() => key); ",
+            "} ",
+            "for (const key in { second: 2 }) { use(key); } ",
+            "for (const unused in {}) {} ",
+            "capture(key);",
+        ));
+        let file = FileId::new(8_480);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
+        let (_, bound) = context.file(file).unwrap();
+        let mut loops = source
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let NodeData::ForInOrOfStatement(iteration) = &record.data else {
+                    return None;
+                };
+                if record.kind != SyntaxKind::ForInStatement {
+                    return None;
+                }
+                let NodeData::VariableDeclarationList(bindings) =
+                    &source.arena.get(iteration.initializer)?.data
+                else {
+                    return None;
+                };
+                let declaration = NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    *bindings.declarations.nodes.first()?,
+                );
+                Some((
+                    NodeRef::new(source.arena.id(), file, node),
+                    bound.symbol(declaration)?,
+                ))
+            })
+            .collect::<Vec<_>>();
+        loops.sort_unstable_by_key(|(node, _)| source.arena.get(node.node).unwrap().range.start);
+        let [(_, first), (_, second), (_, unused)] = loops.as_slice() else {
+            panic!("expected three authenticated for-in bindings")
+        };
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        for symbol in [*first, *second, *unused] {
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(symbol)
+                    .and_then(|links| links.resolved_type),
+                Some(string),
+            );
+        }
+        assert_ne!(first, second);
+
+        let top_level = variable_symbol(&context, &source, file, "key");
+        let top_level_type = variable_value_type(&context, &source, file, "key");
+        let mut reads = identifier_expressions(&source, file, "key");
+        reads.sort_unstable_by_key(|node| source.arena.get(node.node).unwrap().range.start);
+        let [
+            first_call,
+            call_capture,
+            direct_capture,
+            second_call,
+            trailing,
+        ] = reads.as_slice()
+        else {
+            panic!("expected the loop reads, captured arrows, and trailing top-level read")
+        };
+        for (node, expected) in [
+            (*first_call, *first),
+            (*call_capture, *first),
+            (*direct_capture, *first),
+            (*second_call, *second),
+        ] {
+            assert_eq!(
+                context
+                    .store()
+                    .symbol_node_links(node)
+                    .and_then(|links| links.resolved_symbol),
+                Some(expected),
+            );
+            assert_eq!(resolved_node_type(&context, node), string);
+        }
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(*trailing)
+                .and_then(|links| links.resolved_symbol),
+            Some(top_level),
+        );
+        assert_eq!(resolved_node_type(&context, *trailing), top_level_type);
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn for_in_invalid_operands_report_ts2407_without_changing_string_keys() {
+        let source = parsed(concat!(
+            "declare function use(value: string): void; ",
+            "for (let key in 1) { use(key); }",
+        ));
+        let file = FileId::new(8_481);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected one invalid for-in operand diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2407);
+        assert_eq!(diagnostic.diagnostic.arguments, ["1"]);
+        assert_eq!(node_text(&source, diagnostic.node.unwrap()), "1");
+        assert_eq!(
+            variable_value_type(&context, &source, file, "key"),
+            context.store().intrinsic_bootstrap().unwrap().string_type,
+        );
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn malformed_for_in_loops_fail_before_source_state_publication() {
+        for (index, iteration) in [
+            "for (var key in ready) { use(key); }",
+            "for (const key in ready) use(key);",
+            "for (let key in ready) { let nested = key; }",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let text = format!(
+                "declare function use(value: string): void; const ready = {{ value: 1 }}; {iteration}",
+            );
+            let source = parsed(&text);
+            let file = FileId::new(8_482 + u32::try_from(index).unwrap());
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            let ready = variable_symbol(&context, &source, file, "ready");
+            let cold = observable_state(&context, file);
+
+            assert!(
+                matches!(
+                    context.check_source_file(file),
+                    Err(SourceCheckError::Unsupported(
+                        UnsupportedSourceSyntax::Syntax {
+                            kind: SyntaxKind::ForInStatement,
+                            role: SourceSyntaxRole::Statement,
+                            ..
+                        }
+                    )),
+                ),
+                "unexpectedly admitted malformed for-in loop: {iteration}",
+            );
+            assert_eq!(observable_state(&context, file), cold);
+            assert!(context.store().value_symbol_links(ready).is_none());
+            assert!(context.diagnostics().is_empty());
+            assert!(!is_type_checked(&context, file));
+        }
     }
 
     #[test]
