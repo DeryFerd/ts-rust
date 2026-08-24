@@ -1329,6 +1329,7 @@ struct SourcePlanner<'arena, 'semantic, 'sources> {
     assignable_ambient_variables: HashSet<SemanticSymbolId>,
     assignable_uninitialized_variables: HashSet<SemanticSymbolId>,
     assignable_mutable_variables: HashSet<SemanticSymbolId>,
+    redeclared_top_level_variables: HashSet<SemanticSymbolId>,
     recovered_anonymous_variables: HashSet<SemanticSymbolId>,
     planned_ambient_namespaces: HashSet<SemanticSymbolId>,
     planned_classes: HashSet<SemanticSymbolId>,
@@ -1370,6 +1371,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             assignable_ambient_variables: HashSet::new(),
             assignable_uninitialized_variables: HashSet::new(),
             assignable_mutable_variables: HashSet::new(),
+            redeclared_top_level_variables: HashSet::new(),
             recovered_anonymous_variables: HashSet::new(),
             planned_ambient_namespaces: HashSet::new(),
             planned_classes: HashSet::new(),
@@ -1415,6 +1417,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             assignable_ambient_variables: HashSet::new(),
             assignable_uninitialized_variables: HashSet::new(),
             assignable_mutable_variables: HashSet::new(),
+            redeclared_top_level_variables: HashSet::new(),
             recovered_anonymous_variables: HashSet::new(),
             planned_ambient_namespaces: HashSet::new(),
             planned_classes: HashSet::new(),
@@ -9477,15 +9480,40 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 SourceSyntaxRole::VariableDeclaration,
             ));
         };
-        let variable_symbol = plan_top_level_variable(
-            self.bound,
-            store,
-            declaration,
-            name,
-            &name_text,
-            binding,
-            exported,
-        )
+        let redeclared = binding == VariableBindingKind::Var
+            && !exported
+            && type_id.is_none()
+            && initializer_id.is_some()
+            && self.javascript_jsdoc.is_none()
+            && self
+                .bound
+                .symbol(declaration)
+                .and_then(|symbol| store.symbol(symbol))
+                .is_some_and(|symbol| {
+                    symbol.flags() == SymbolFlags::FUNCTION_SCOPED_VARIABLE
+                        && symbol
+                            .declarations()
+                            .is_some_and(|declarations| declarations.len() > 1)
+                });
+        let variable_symbol = if redeclared {
+            plan_recovered_anonymous_module_variable(
+                self.bound,
+                store,
+                declaration,
+                name,
+                &name_text,
+            )
+        } else {
+            plan_top_level_variable(
+                self.bound,
+                store,
+                declaration,
+                name,
+                &name_text,
+                binding,
+                exported,
+            )
+        }
         .map_err(Self::variable_plan_error)?;
 
         let type_node = type_id.map(|node| self.reference(node));
@@ -9577,12 +9605,25 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 ));
             }
         };
-        if !self.prior_variables.insert(variable_symbol) {
+        let repeated = redeclared
+            && self
+                .redeclared_top_level_variables
+                .contains(&variable_symbol);
+        if repeated
+            && (!self.prior_variables.contains(&variable_symbol)
+                || !self.readable_variables.contains(&variable_symbol)
+                || !self.assignable_mutable_variables.contains(&variable_symbol))
+        {
             return Err(SourceCheckError::Variable(
                 VariableInvariant::InvalidSymbolShape(variable_symbol),
             ));
         }
-        if !self.readable_variables.insert(variable_symbol) {
+        if !self.prior_variables.insert(variable_symbol) && !repeated {
+            return Err(SourceCheckError::Variable(
+                VariableInvariant::InvalidSymbolShape(variable_symbol),
+            ));
+        }
+        if !self.readable_variables.insert(variable_symbol) && !repeated {
             return Err(SourceCheckError::Variable(
                 VariableInvariant::InvalidSymbolShape(variable_symbol),
             ));
@@ -9611,10 +9652,14 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             )
             && self.javascript_jsdoc.is_none()
             && !self.assignable_mutable_variables.insert(variable_symbol)
+            && !repeated
         {
             return Err(SourceCheckError::Variable(
                 VariableInvariant::InvalidSymbolShape(variable_symbol),
             ));
+        }
+        if redeclared {
+            self.redeclared_top_level_variables.insert(variable_symbol);
         }
         Ok(PlannedVariable {
             declaration,
@@ -10370,6 +10415,29 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         });
                 let kind = match variable_read {
                     Ok(read) => {
+                        PlannedExpressionKind::Identifier(PlannedIdentifierRead::variable(read))
+                    }
+                    Err(VariablePlanError::Unsupported(
+                        VariableUnsupported::NonUniqueDeclaration { node, symbol, .. },
+                    )) if node == expression
+                        && self.redeclared_top_level_variables.contains(&symbol) =>
+                    {
+                        let read = plan_recovered_anonymous_module_identifier_read(
+                            self.arena,
+                            self.bound,
+                            store,
+                            host,
+                            &self.prior_variables,
+                            &self.readable_variables,
+                            expression,
+                            &name,
+                        )
+                        .map_err(Self::variable_plan_error)?;
+                        if read.value_symbol != symbol {
+                            return Err(SourceCheckError::Variable(
+                                VariableInvariant::InvalidSymbolShape(symbol),
+                            ));
+                        }
                         PlannedExpressionKind::Identifier(PlannedIdentifierRead::variable(read))
                     }
                     Err(VariablePlanError::Unsupported(
@@ -23517,33 +23585,132 @@ pub(super) fn check_source_file(
                             ));
                         }
                     };
-                    stage_value_type(
-                        store,
-                        &mut staged_value_types,
-                        &mut value_order,
-                        variable.symbol,
-                        declared_type,
-                    )?;
-                    if top_level_declared_types
-                        .insert(variable.symbol, declared_type)
-                        .is_some()
+                    if let Some(previous) = top_level_declared_types.get(&variable.symbol).copied()
                     {
-                        return Err(SourceCheckError::Variable(
-                            VariableInvariant::DuplicateStagedValueType(variable.symbol),
-                        ));
-                    }
-                    if !variable.binding.is_const() && !mutable_variables.insert(variable.symbol) {
-                        return Err(SourceCheckError::Variable(
-                            VariableInvariant::DuplicateCurrentFlowType(variable.symbol),
-                        ));
-                    }
-                    if current_flow_types
-                        .insert(variable.symbol, current_flow_type)
-                        .is_some()
-                    {
-                        return Err(SourceCheckError::Variable(
-                            VariableInvariant::DuplicateCurrentFlowType(variable.symbol),
-                        ));
+                        let first_declaration = store
+                            .symbol(variable.symbol)
+                            .and_then(|symbol| symbol.value_declaration())
+                            .ok_or(SourceCheckError::Variable(
+                                VariableInvariant::InvalidSymbolShape(variable.symbol),
+                            ))?;
+                        if variable.binding != VariableBindingKind::Var
+                            || variable.type_node.is_some()
+                            || variable.jsdoc_type.is_some()
+                            || first_declaration == variable.declaration
+                            || bound.symbol(first_declaration) != Some(variable.symbol)
+                            || bound.symbol(variable.declaration) != Some(variable.symbol)
+                            || staged_value_types.get(&variable.symbol) != Some(&previous)
+                            || !mutable_variables.contains(&variable.symbol)
+                        {
+                            return Err(SourceCheckError::Variable(
+                                VariableInvariant::InvalidSymbolShape(variable.symbol),
+                            ));
+                        }
+
+                        if previous != declared_type
+                            && !store.is_type_identical_to_with_global_types(
+                                previous,
+                                declared_type,
+                                global_types,
+                            )?
+                        {
+                            let name = match arena.get(variable.name.node) {
+                                Some(Node {
+                                    data: NodeData::Identifier(identifier),
+                                    ..
+                                }) => identifier.text.clone(),
+                                _ => {
+                                    return Err(SourceCheckError::Variable(
+                                        VariableInvariant::InvalidSymbolShape(variable.symbol),
+                                    ));
+                                }
+                            };
+                            let mut flags = CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT;
+                            if options.no_error_truncation {
+                                flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
+                            }
+                            let display =
+                                get_type_names_for_assignability_error_with_host_global_types_and_flags(
+                                    store,
+                                    host,
+                                    global_types,
+                                    previous,
+                                    declared_type,
+                                    flags,
+                                )?;
+                            merge_retry_diagnostic(
+                                diagnostics,
+                                CanonicalCheckerDiagnostic {
+                                    node: Some(variable.name),
+                                    range_override: None,
+                                    diagnostic: Diagnostic::with_arguments(
+                                        message_by_code(2403)
+                                            .ok_or(SourceCheckError::MissingDiagnostic(2403))?,
+                                        [name.clone(), display.source, display.target],
+                                    ),
+                                    related_information: vec![CanonicalCheckerRelatedInformation {
+                                        node: Some(first_declaration),
+                                        diagnostic: Diagnostic::with_arguments(
+                                            message_by_code(6203)
+                                                .ok_or(SourceCheckError::MissingDiagnostic(6203))?,
+                                            [name],
+                                        ),
+                                    }],
+                                },
+                            );
+                        }
+
+                        let current_flow_type = current_flow_type_after_assignment(
+                            store,
+                            host,
+                            global_types,
+                            options,
+                            session,
+                            diagnostics,
+                            CheckedAssignment {
+                                declared_type: previous,
+                                assigned_type: current_flow_type,
+                            },
+                        )?;
+                        if current_flow_types
+                            .insert(variable.symbol, current_flow_type)
+                            .is_none()
+                        {
+                            return Err(SourceCheckError::Variable(
+                                VariableInvariant::MissingCurrentFlowType(variable.symbol),
+                            ));
+                        }
+                    } else {
+                        stage_value_type(
+                            store,
+                            &mut staged_value_types,
+                            &mut value_order,
+                            variable.symbol,
+                            declared_type,
+                        )?;
+                        if top_level_declared_types
+                            .insert(variable.symbol, declared_type)
+                            .is_some()
+                        {
+                            return Err(SourceCheckError::Variable(
+                                VariableInvariant::DuplicateStagedValueType(variable.symbol),
+                            ));
+                        }
+                        if !variable.binding.is_const()
+                            && !mutable_variables.insert(variable.symbol)
+                        {
+                            return Err(SourceCheckError::Variable(
+                                VariableInvariant::DuplicateCurrentFlowType(variable.symbol),
+                            ));
+                        }
+                        if current_flow_types
+                            .insert(variable.symbol, current_flow_type)
+                            .is_some()
+                        {
+                            return Err(SourceCheckError::Variable(
+                                VariableInvariant::DuplicateCurrentFlowType(variable.symbol),
+                            ));
+                        }
                     }
                 }
             }
@@ -27983,6 +28150,146 @@ mod tests {
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn repeated_top_level_var_declarations_share_one_published_value() {
+        let source = parsed(concat!(
+            "const untouched = true; ",
+            "var value = 1; ",
+            "var value = 2; ",
+            "const observed = value;",
+        ));
+        let file = FileId::new(8_530);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let value = variable_symbol(&context, &source, file, "value");
+        let declarations = context
+            .store()
+            .symbol(value)
+            .and_then(|symbol| symbol.declarations())
+            .expect("the shared var symbol has declarations")
+            .to_vec();
+        let [first, second] = declarations.as_slice() else {
+            panic!("expected two declarations for the shared var symbol")
+        };
+        let (_, bound) = context.file(file).unwrap();
+        assert_eq!(bound.symbol(*first), Some(value));
+        assert_eq!(bound.symbol(*second), Some(value));
+
+        context.check_source_file(file).unwrap();
+
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(
+            variable_value_type(&context, &source, file, "value"),
+            number
+        );
+        assert_eq!(
+            variable_value_type(&context, &source, file, "observed"),
+            number,
+        );
+        assert_eq!(
+            resolved_node_type(&context, variable_initializer(&source, file, "observed")),
+            number,
+        );
+        assert_eq!(
+            variable_value_type(&context, &source, file, "untouched"),
+            resolved_node_type(&context, variable_initializer(&source, file, "untouched")),
+        );
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(variable_initializer(&source, file, "observed"))
+                .and_then(|links| links.resolved_symbol),
+            Some(value),
+        );
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, file));
+
+        let links = context.store().value_symbol_links(value).cloned();
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+        assert_eq!(context.store().value_symbol_links(value).cloned(), links);
+    }
+
+    #[test]
+    fn repeated_top_level_var_type_mismatches_report_exact_related_diagnostics() {
+        let source = parsed(concat!(
+            "const untouched = true;\n",
+            "var value = 1;\n",
+            "var value = \"changed\";\n",
+            "const observed = value;\n",
+        ));
+        let file = FileId::new(8_531);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let value = variable_symbol(&context, &source, file, "value");
+        let declarations = context
+            .store()
+            .symbol(value)
+            .and_then(|symbol| symbol.declarations())
+            .expect("the shared var symbol has declarations")
+            .to_vec();
+        let [first, second] = declarations.as_slice() else {
+            panic!("expected two declarations for the shared var symbol")
+        };
+        let (first, second) = (*first, *second);
+        let NodeData::VariableDeclaration(second_declaration) =
+            &source.arena.get(second.node).unwrap().data
+        else {
+            panic!("expected the second variable declaration")
+        };
+        let second_name = NodeRef::new(source.arena.id(), file, second_declaration.name);
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected one subsequent-variable diagnostic")
+        };
+        assert_eq!(diagnostic.node, Some(second_name));
+        assert!(diagnostic.range_override.is_none());
+        assert_eq!(diagnostic.diagnostic.code(), 2403);
+        assert_eq!(
+            diagnostic.diagnostic.arguments,
+            ["value", "number", "string"]
+        );
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            concat!(
+                "Subsequent variable declarations must have the same type.  ",
+                "Variable 'value' must be of type 'number', but here has type 'string'.",
+            ),
+        );
+        let [related] = diagnostic.related_information.as_slice() else {
+            panic!("expected one related first declaration")
+        };
+        assert_eq!(related.node, Some(first));
+        assert_eq!(related.diagnostic.code(), 6203);
+        assert_eq!(related.diagnostic.arguments, ["value"]);
+        assert_eq!(
+            related.diagnostic.render().unwrap(),
+            "'value' was also declared here.",
+        );
+
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(
+            variable_value_type(&context, &source, file, "value"),
+            number
+        );
+        assert_eq!(
+            variable_value_type(&context, &source, file, "observed"),
+            number,
+        );
+        assert_eq!(
+            variable_value_type(&context, &source, file, "untouched"),
+            resolved_node_type(&context, variable_initializer(&source, file, "untouched")),
+        );
+        assert!(is_type_checked(&context, file));
+
+        let published_diagnostics = context.diagnostics().as_slice().to_vec();
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+        assert_eq!(context.diagnostics().as_slice(), published_diagnostics);
     }
 
     #[test]
