@@ -83,6 +83,9 @@ pub(super) struct SourceNamespaceGenericInterfacePlan {
     members: SymbolTableId,
     type_parameters: Vec<SemanticSymbolId>,
     properties: Vec<SourceNamespacePropertyPlan>,
+    call_signatures: Vec<SemanticSymbolId>,
+    computed_properties: Vec<SourceNamespaceComputedPropertyPlan>,
+    base_interfaces: Vec<SemanticSymbolId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -93,6 +96,12 @@ struct SourceNamespacePropertyPlan {
     annotation: NodeRef,
     optional: bool,
     readonly: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SourceNamespaceComputedPropertyPlan {
+    symbol: SemanticSymbolId,
+    key: SemanticSymbolId,
 }
 
 #[derive(Clone, Copy)]
@@ -528,7 +537,139 @@ fn plan_generic_interface_parameters(
         members,
         type_parameters,
         properties: Vec::new(),
+        call_signatures: Vec::new(),
+        computed_properties: Vec::new(),
+        base_interfaces: Vec::new(),
     })
+}
+
+fn plan_interface_call_signature(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+    declaration: NodeRef,
+    annotations: &mut Vec<NodeRef>,
+) -> Result<SemanticSymbolId, SourceCheckError> {
+    let invalid = |node, kind| unsupported(node, kind, SourceSyntaxRole::InterfaceDeclaration);
+    let record = owned_node(arena, bound, store, declaration)?;
+    let NodeData::CallSignatureDeclaration(signature) = &record.data else {
+        return Err(invalid(declaration, record.kind));
+    };
+    if record.kind != SyntaxKind::CallSignature
+        || record.flags.0 != 0
+        || signature.full_signature.is_some()
+        || signature.next_container.is_some()
+        || signature.symbol.is_some()
+        || signature.type_parameters.is_some()
+        || signature.parameters.has_trailing_comma
+    {
+        return Err(invalid(declaration, record.kind));
+    }
+
+    let symbol = declaration_symbol(bound, store, declaration, SymbolFlags::SIGNATURE)?;
+    let symbol_record = store.symbol(symbol).ok_or(SourceCheckError::Provenance(
+        SourceCheckProvenanceError::MissingDeclarationSymbol(declaration),
+    ))?;
+    let members = store
+        .symbol(owner)
+        .and_then(ts_binder::semantic::Symbol::members)
+        .and_then(|members| store.symbol_table(members));
+    if symbol_record.flags() != SymbolFlags::SIGNATURE
+        || symbol_record.check_flags() != CheckFlags::NONE
+        || symbol_record.name() != InternalSymbolName::Call.as_ref()
+        || symbol_record.value_declaration().is_some()
+        || symbol_record.members().is_some()
+        || symbol_record.exports().is_some()
+        || symbol_record.parent() != Some(owner)
+        || symbol_record.export_symbol().is_some()
+        || members.and_then(|members| members.get(InternalSymbolName::Call.as_ref()))
+            != Some(symbol)
+    {
+        return Err(SourceCheckError::Provenance(
+            SourceCheckProvenanceError::MissingDeclarationSymbol(declaration),
+        ));
+    }
+
+    let locals = bound
+        .locals(declaration)
+        .and_then(|locals| store.symbol_table(locals));
+    if locals.map_or(0, ts_binder::semantic::SymbolTable::len) != signature.parameters.nodes.len() {
+        return Err(invalid(declaration, record.kind));
+    }
+    for parameter_id in &signature.parameters.nodes {
+        let parameter = child(declaration, *parameter_id);
+        let parameter_record = owned_node(arena, bound, store, parameter)?;
+        let NodeData::ParameterDeclaration(data) = &parameter_record.data else {
+            return Err(invalid(parameter, parameter_record.kind));
+        };
+        let name = child(parameter, data.name);
+        let name_record = owned_node(arena, bound, store, name)?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Err(invalid(name, name_record.kind));
+        };
+        let annotation = data
+            .type_
+            .map(|annotation| child(parameter, annotation))
+            .ok_or_else(|| invalid(parameter, parameter_record.kind))?;
+        let annotation_record = owned_node(arena, bound, store, annotation)?;
+        let parameter_symbol = declaration_symbol(
+            bound,
+            store,
+            parameter,
+            SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+        )?;
+        let owner_record = store
+            .symbol(parameter_symbol)
+            .ok_or(SourceCheckError::Provenance(
+                SourceCheckProvenanceError::MissingDeclarationSymbol(parameter),
+            ))?;
+        if parameter_record.kind != SyntaxKind::Parameter
+            || parameter_record.flags.0 != 0
+            || parameter_record.parent != Some(declaration.node)
+            || data.dot_dot_dot_token.is_some()
+            || data.initializer.is_some()
+            || data.question_token.is_some()
+            || data.symbol.is_some()
+            || data.modifiers.is_some()
+            || data.facts != 0
+            || name_record.kind != SyntaxKind::Identifier
+            || name_record.flags.0 != 0
+            || name_record.parent != Some(parameter.node)
+            || identifier.flow_node.is_some()
+            || identifier.text.is_empty()
+            || annotation_record.parent != Some(parameter.node)
+            || owner_record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+            || owner_record.check_flags() != CheckFlags::NONE
+            || owner_record.name().as_utf8() != Some(identifier.text.as_str())
+            || owner_record.declarations() != Some(&[parameter])
+            || owner_record.value_declaration() != Some(parameter)
+            || owner_record.members().is_some()
+            || owner_record.exports().is_some()
+            || owner_record.parent().is_some()
+            || owner_record.export_symbol().is_some()
+            || locals.and_then(|locals| locals.get_source(&identifier.text))
+                != Some(parameter_symbol)
+        {
+            return Err(invalid(parameter, parameter_record.kind));
+        }
+        annotations.push(annotation);
+    }
+
+    let return_type = signature
+        .type_
+        .map(|annotation| child(declaration, annotation))
+        .ok_or_else(|| invalid(declaration, record.kind))?;
+    let return_record = owned_node(arena, bound, store, return_type)?;
+    if return_record.parent != Some(declaration.node) {
+        return Err(invalid_parent(
+            return_type,
+            declaration,
+            return_record.parent,
+        ));
+    }
+    annotations.push(return_type);
+    Ok(symbol)
 }
 
 fn plan_generic_interface_property(
@@ -630,6 +771,127 @@ fn plan_generic_interface_property(
         optional,
         readonly,
     })
+}
+
+fn plan_generic_computed_interface_property(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+    declaration: NodeRef,
+    syntax: SourceNamespacePropertySyntax<'_>,
+) -> Result<SourceNamespaceComputedPropertyPlan, SourceCheckError> {
+    let invalid = |node, kind| unsupported(node, kind, SourceSyntaxRole::InterfaceDeclaration);
+    let name = child(declaration, syntax.name);
+    let name_record = owned_node(arena, bound, store, name)?;
+    let NodeData::ComputedPropertyName(computed) = &name_record.data else {
+        return Err(invalid(name, name_record.kind));
+    };
+    let expression = child(name, computed.expression);
+    let expression_record = owned_node(arena, bound, store, expression)?;
+    let NodeData::Identifier(identifier) = &expression_record.data else {
+        return Err(invalid(expression, expression_record.kind));
+    };
+    if name_record.kind != SyntaxKind::ComputedPropertyName
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(declaration.node)
+        || computed.facts != 0
+        || expression_record.kind != SyntaxKind::Identifier
+        || expression_record.flags.0 != 0
+        || expression_record.parent != Some(name.node)
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+    {
+        return Err(invalid(name, name_record.kind));
+    }
+
+    let optional = if let Some(postfix) = syntax.postfix_token {
+        let postfix = child(declaration, postfix);
+        let postfix_record = owned_node(arena, bound, store, postfix)?;
+        if postfix_record.kind != SyntaxKind::QuestionToken
+            || postfix_record.parent != Some(declaration.node)
+        {
+            return Err(invalid(postfix, postfix_record.kind));
+        }
+        true
+    } else {
+        false
+    };
+    if syntax.modifiers.is_some() {
+        return Err(invalid(declaration, SyntaxKind::PropertySignature));
+    }
+
+    let symbol = declaration_symbol(bound, store, declaration, SymbolFlags::PROPERTY)?;
+    let record = store.symbol(symbol).ok_or(SourceCheckError::Provenance(
+        SourceCheckProvenanceError::MissingDeclarationSymbol(declaration),
+    ))?;
+    let expected_flags = SymbolFlags::PROPERTY
+        | if optional {
+            SymbolFlags::OPTIONAL
+        } else {
+            SymbolFlags::NONE
+        };
+    if record.flags() != expected_flags
+        || record.check_flags() != CheckFlags::NONE
+        || record.name() != InternalSymbolName::Computed.as_ref()
+        || record.declarations() != Some(&[declaration])
+        || record.value_declaration() != Some(declaration)
+        || record.members().is_some()
+        || record.exports().is_some()
+        || record.parent() != Some(owner)
+        || record.export_symbol().is_some()
+    {
+        return Err(SourceCheckError::Provenance(
+            SourceCheckProvenanceError::MissingDeclarationSymbol(declaration),
+        ));
+    }
+
+    let namespace = store
+        .get_parent_of_symbol(owner)
+        .ok_or(SourceCheckError::Provenance(
+            SourceCheckProvenanceError::MissingDeclarationSymbol(declaration),
+        ))?;
+    let key = store
+        .symbol(namespace)
+        .and_then(ts_binder::semantic::Symbol::exports)
+        .and_then(|exports| store.symbol_table(exports))
+        .and_then(|exports| exports.get_source(&identifier.text))
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .ok_or_else(|| invalid(expression, expression_record.kind))?;
+    let key_record = store
+        .symbol(key)
+        .ok_or_else(|| invalid(expression, expression_record.kind))?;
+    let key_declaration = key_record
+        .value_declaration()
+        .ok_or_else(|| invalid(expression, expression_record.kind))?;
+    let key_declaration_record = owned_node(arena, bound, store, key_declaration)?;
+    let NodeData::VariableDeclaration(variable) = &key_declaration_record.data else {
+        return Err(invalid(expression, expression_record.kind));
+    };
+    let annotation = variable
+        .type_
+        .map(|annotation| child(key_declaration, annotation))
+        .ok_or_else(|| invalid(expression, expression_record.kind))?;
+    let annotation_record = owned_node(arena, bound, store, annotation)?;
+    let NodeData::TypeOperatorNode(operator) = &annotation_record.data else {
+        return Err(invalid(expression, expression_record.kind));
+    };
+    let operand = child(annotation, operator.type_);
+    let operand_record = owned_node(arena, bound, store, operand)?;
+    if !key_record
+        .flags()
+        .contains(SymbolFlags::BLOCK_SCOPED_VARIABLE)
+        || store.get_parent_of_symbol(key) != Some(namespace)
+        || annotation_record.kind != SyntaxKind::TypeOperator
+        || annotation_record.parent != Some(key_declaration.node)
+        || operator.operator != SyntaxKind::UniqueKeyword
+        || operand_record.kind != SyntaxKind::SymbolKeyword
+        || operand_record.parent != Some(annotation.node)
+    {
+        return Err(invalid(expression, expression_record.kind));
+    }
+
+    Ok(SourceNamespaceComputedPropertyPlan { symbol, key })
 }
 
 fn plan_jsx_record_interface_heritage(
@@ -749,6 +1011,96 @@ fn plan_jsx_record_interface_heritage(
     Ok(annotations)
 }
 
+fn plan_generic_namespace_interface_heritage(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    owner: (SemanticSymbolId, NodeRef),
+    clauses: &ts_ast::NodeList,
+    generic: &mut SourceNamespaceGenericInterfacePlan,
+) -> Result<(), SourceCheckError> {
+    let (namespace, declaration) = owner;
+    let invalid = |node, kind| unsupported(node, kind, SourceSyntaxRole::InterfaceDeclaration);
+    let [clause] = clauses.nodes.as_slice() else {
+        return Err(invalid(declaration, SyntaxKind::InterfaceDeclaration));
+    };
+    let clause = child(declaration, *clause);
+    let clause_record = owned_node(arena, bound, store, clause)?;
+    let NodeData::HeritageClause(heritage) = &clause_record.data else {
+        return Err(invalid(clause, clause_record.kind));
+    };
+    if clauses.has_trailing_comma
+        || clause_record.kind != SyntaxKind::HeritageClause
+        || clause_record.flags.0 != 0
+        || clause_record.parent != Some(declaration.node)
+        || heritage.token != SyntaxKind::ExtendsKeyword
+        || heritage.facts != 0
+        || heritage.types.nodes.is_empty()
+        || heritage.types.has_trailing_comma
+    {
+        return Err(invalid(clause, clause_record.kind));
+    }
+
+    for base_id in &heritage.types.nodes {
+        let base = child(clause, *base_id);
+        let base_record = owned_node(arena, bound, store, base)?;
+        let NodeData::ExpressionWithTypeArguments(reference) = &base_record.data else {
+            return Err(invalid(base, base_record.kind));
+        };
+        let name = child(base, reference.expression);
+        let name_record = owned_node(arena, bound, store, name)?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Err(invalid(name, name_record.kind));
+        };
+        let symbol = store
+            .symbol(namespace)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| store.symbol_table(exports))
+            .and_then(|exports| exports.get_source(&identifier.text))
+            .or_else(|| {
+                store
+                    .intrinsic_bootstrap()
+                    .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+                    .and_then(|globals| globals.get_source(&identifier.text))
+            })
+            .and_then(|symbol| store.get_merged_symbol(symbol));
+        if base_record.kind != SyntaxKind::ExpressionWithTypeArguments
+            || base_record.flags.0 != 0
+            || base_record.parent != Some(clause.node)
+            || reference.facts != 0
+            || name_record.kind != SyntaxKind::Identifier
+            || name_record.flags.0 != 0
+            || name_record.parent != Some(base.node)
+            || identifier.flow_node.is_some()
+            || identifier.text.is_empty()
+            || symbol
+                .and_then(|symbol| store.symbol(symbol))
+                .is_none_or(|record| !record.flags().contains(SymbolFlags::INTERFACE))
+        {
+            return Err(invalid(base, base_record.kind));
+        }
+        let symbol = symbol.expect("the base symbol was authenticated");
+        if generic.base_interfaces.contains(&symbol) {
+            return Err(invalid(base, base_record.kind));
+        }
+        generic.base_interfaces.push(symbol);
+        if let Some(arguments) = &reference.type_arguments {
+            if arguments.has_trailing_comma || arguments.nodes.is_empty() {
+                return Err(invalid(base, base_record.kind));
+            }
+            for argument_id in &arguments.nodes {
+                let argument = child(base, *argument_id);
+                let argument_record = owned_node(arena, bound, store, argument)?;
+                if argument_record.parent != Some(base.node) {
+                    return Err(invalid_parent(argument, base, argument_record.parent));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn plan_interface_member(
     arena: &NodeArena,
     bound: &BoundFile,
@@ -790,16 +1142,6 @@ fn plan_interface_member(
     validate_symbol_parent(store, declaration, symbol, Some(owner))?;
 
     let mut annotations = Vec::new();
-    if let Some(heritage) = &interface.heritage_clauses {
-        annotations.extend(plan_jsx_record_interface_heritage(
-            arena,
-            bound,
-            store,
-            owner,
-            declaration,
-            heritage,
-        )?);
-    }
     let mut generic = interface
         .type_parameters
         .as_ref()
@@ -815,6 +1157,27 @@ fn plan_interface_member(
             )
         })
         .transpose()?;
+    if let Some(heritage) = &interface.heritage_clauses {
+        if let Some(generic) = generic.as_mut() {
+            plan_generic_namespace_interface_heritage(
+                arena,
+                bound,
+                store,
+                (owner, declaration),
+                heritage,
+                generic,
+            )?;
+        } else {
+            annotations.extend(plan_jsx_record_interface_heritage(
+                arena,
+                bound,
+                store,
+                owner,
+                declaration,
+                heritage,
+            )?);
+        }
+    }
     let mut seen = HashSet::new();
     for member_id in &interface.members.nodes {
         let member = child(declaration, *member_id);
@@ -828,6 +1191,23 @@ fn plan_interface_member(
             ));
         }
         match &member_record.data {
+            NodeData::CallSignatureDeclaration(_)
+                if member_record.kind == SyntaxKind::CallSignature =>
+            {
+                let call = plan_interface_call_signature(
+                    arena,
+                    bound,
+                    store,
+                    symbol,
+                    member,
+                    &mut annotations,
+                )?;
+                if let Some(generic) = generic.as_mut()
+                    && !generic.call_signatures.contains(&call)
+                {
+                    generic.call_signatures.push(call);
+                }
+            }
             NodeData::PropertyDeclaration(property)
                 if member_record.kind == SyntaxKind::PropertyDeclaration
                     && property.initializer.is_none() =>
@@ -842,20 +1222,32 @@ fn plan_interface_member(
                 let annotation = child(member, annotation);
                 annotations.push(annotation);
                 if let Some(generic) = generic.as_mut() {
-                    generic.properties.push(plan_generic_interface_property(
-                        arena,
-                        bound,
-                        store,
-                        symbol,
-                        generic.members,
-                        member,
-                        SourceNamespacePropertySyntax {
-                            name: property.name,
-                            annotation,
-                            postfix_token: property.postfix_token,
-                            modifiers: property.modifiers.as_ref(),
-                        },
-                    )?);
+                    let syntax = SourceNamespacePropertySyntax {
+                        name: property.name,
+                        annotation,
+                        postfix_token: property.postfix_token,
+                        modifiers: property.modifiers.as_ref(),
+                    };
+                    if arena
+                        .get(property.name)
+                        .is_some_and(|name| name.kind == SyntaxKind::ComputedPropertyName)
+                    {
+                        generic
+                            .computed_properties
+                            .push(plan_generic_computed_interface_property(
+                                arena, bound, store, symbol, member, syntax,
+                            )?);
+                    } else {
+                        generic.properties.push(plan_generic_interface_property(
+                            arena,
+                            bound,
+                            store,
+                            symbol,
+                            generic.members,
+                            member,
+                            syntax,
+                        )?);
+                    }
                 }
             }
             NodeData::PropertySignatureDeclaration(property)
@@ -864,20 +1256,32 @@ fn plan_interface_member(
                 let annotation = child(member, property.type_);
                 annotations.push(annotation);
                 if let Some(generic) = generic.as_mut() {
-                    generic.properties.push(plan_generic_interface_property(
-                        arena,
-                        bound,
-                        store,
-                        symbol,
-                        generic.members,
-                        member,
-                        SourceNamespacePropertySyntax {
-                            name: property.name,
-                            annotation,
-                            postfix_token: property.postfix_token,
-                            modifiers: property.modifiers.as_ref(),
-                        },
-                    )?);
+                    let syntax = SourceNamespacePropertySyntax {
+                        name: property.name,
+                        annotation,
+                        postfix_token: property.postfix_token,
+                        modifiers: property.modifiers.as_ref(),
+                    };
+                    if arena
+                        .get(property.name)
+                        .is_some_and(|name| name.kind == SyntaxKind::ComputedPropertyName)
+                    {
+                        generic
+                            .computed_properties
+                            .push(plan_generic_computed_interface_property(
+                                arena, bound, store, symbol, member, syntax,
+                            )?);
+                    } else {
+                        generic.properties.push(plan_generic_interface_property(
+                            arena,
+                            bound,
+                            store,
+                            symbol,
+                            generic.members,
+                            member,
+                            syntax,
+                        )?);
+                    }
                 }
             }
             NodeData::IndexSignatureDeclaration(index)
@@ -918,7 +1322,9 @@ fn plan_interface_member(
         && store
             .symbol_table(generic.members)
             .map_or(0, ts_binder::semantic::SymbolTable::len)
-            != generic.type_parameters.len() + generic.properties.len()
+            != generic.type_parameters.len()
+                + generic.properties.len()
+                + generic.call_signatures.len()
     {
         return Err(SourceCheckError::Provenance(
             SourceCheckProvenanceError::MissingDeclarationSymbol(declaration),
@@ -1039,11 +1445,7 @@ fn plan_namespace_function(
             ));
         };
         let annotation_record = owned_node(arena, bound, store, annotation)?;
-        if annotation_record.kind != SyntaxKind::VoidKeyword
-            || annotation_record.flags.0 != 0
-            || annotation_record.parent != Some(declaration.node)
-            || !matches!(annotation_record.data, NodeData::KeywordTypeNode(_))
-        {
+        if annotation_record.flags.0 != 0 || annotation_record.parent != Some(declaration.node) {
             return Err(unsupported(
                 annotation,
                 annotation_record.kind,
@@ -1099,9 +1501,7 @@ fn plan_namespace_function(
         || function.return_flow_node.is_some()
         || function.symbol.is_some()
         || function.type_.is_some() != ambient_declaration
-        || function.type_parameters.is_some()
         || function.facts != 0
-        || !function.parameters.nodes.is_empty()
         || function.parameters.has_trailing_comma
         || name_record.kind != SyntaxKind::Identifier
         || name_record.flags.0 != 0
@@ -1174,8 +1574,6 @@ fn plan_namespace_function(
             .map_err(|error| namespace_callable_error(declaration, error))?;
     if callable.owner_parent != Some(owner)
         || callable.export_local != Some(local)
-        || !callable.parameters.is_empty()
-        || !callable.type_parameters.is_empty()
         || callable.body != body
         || callable.body_mode.is_ambient() != ambient_declaration
         || if ambient_declaration {
@@ -4220,6 +4618,12 @@ pub(super) fn execute_source_namespace(
                     .get_declared_type_of_symbol(*symbol)?
                 };
                 if let Some(generic) = generic {
+                    if !generic.call_signatures.is_empty()
+                        || !generic.computed_properties.is_empty()
+                        || !generic.base_interfaces.is_empty()
+                    {
+                        continue;
+                    }
                     let mut property_types = Vec::with_capacity(generic.properties.len());
                     for property in &generic.properties {
                         property_types.push(resolve_generic_namespace_property_type(
@@ -4298,14 +4702,8 @@ pub(super) fn execute_source_namespace(
                     Some(CanonicalArrayTargets::from_global_types(global_types)),
                 )
                 .map_err(|error| namespace_callable_error(*declaration, error))?;
-                let void = store
-                    .intrinsic_bootstrap()
-                    .ok_or(SourceCheckError::LiteralCache(
-                        SourceLiteralCacheError::BootstrapUninitialized,
-                    ))?
-                    .void_type;
                 if callable_plan.body_mode.is_ambient() {
-                    let return_type = CanonicalTypeQuery::new_with_global_types_and_session(
+                    CanonicalTypeQuery::new_with_global_types_and_session(
                         store,
                         host,
                         global_types,
@@ -4314,12 +4712,13 @@ pub(super) fn execute_source_namespace(
                         diagnostics,
                     )?
                     .get_return_type_of_signature(signature)?;
-                    if return_type != void {
-                        return Err(SourceCheckError::Function(
-                            SourceFunctionInvariant::Callable(*declaration),
-                        ));
-                    }
                 } else {
+                    let void = store
+                        .intrinsic_bootstrap()
+                        .ok_or(SourceCheckError::LiteralCache(
+                            SourceLiteralCacheError::BootstrapUninitialized,
+                        ))?
+                        .void_type;
                     source_callables::publish_inferred_source_callable_return(
                         store,
                         &callable_plan,
@@ -4869,26 +5268,84 @@ mod tests {
     }
 
     #[test]
-    fn ambient_namespace_functions_reject_other_returns_and_nondeclaration_files() {
-        for source in [
-            "declare module \"lib\" { export function fn(): string; }",
-            "declare module \"lib\" { export function fn(); }",
-            "declare module \"lib\" { export function fn(value: string): void; }",
+    fn ambient_namespace_functions_publish_annotated_and_generic_signatures() {
+        for (source, parameters, type_parameters) in [
+            (
+                "declare module \"lib\" { export function fn(): string; }",
+                0,
+                0,
+            ),
+            (
+                "declare module \"lib\" { export function fn(value: string): void; }",
+                1,
+                0,
+            ),
+            (
+                "declare module \"lib\" { export function fn<T>(value: T): T; }",
+                1,
+                1,
+            ),
         ] {
-            let fixture = declaration_fixture(source, CanonicalModuleState::Script);
-            let declaration = declaration(&fixture, 0);
-            let (arena, bound) = fixture.context.file(fixture.file).unwrap();
-            let before = fixture.context.store().checker_link_allocated_lengths();
+            let mut fixture = declaration_fixture(source, CanonicalModuleState::Script);
+            let namespace = plan(&fixture, 0);
+            let [SourceNamespaceMemberPlan::Function { symbol, .. }] = namespace.members.as_slice()
+            else {
+                panic!("the namespace must retain its annotated function: {source}")
+            };
+            let symbol = *symbol;
 
-            assert!(matches!(
-                plan_source_namespace(arena, bound, fixture.context.store(), declaration),
-                Err(SourceCheckError::Unsupported(_))
-            ));
+            assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+
+            let callable = fixture
+                .context
+                .store()
+                .value_symbol_links(symbol)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            let signature = fixture
+                .context
+                .store()
+                .source_callable_provenance(callable)
+                .and_then(|provenance| fixture.context.store().signature(provenance.signature))
+                .unwrap();
+            assert_eq!(signature.parameters().len(), parameters, "{source}");
             assert_eq!(
-                fixture.context.store().checker_link_allocated_lengths(),
-                before,
+                signature.type_parameters().len(),
+                type_parameters,
+                "{source}"
             );
         }
+    }
+
+    #[test]
+    fn ambient_namespace_functions_reject_missing_returns_and_nondeclaration_files() {
+        let missing_return = declaration_fixture(
+            "declare module \"lib\" { export function fn(); }",
+            CanonicalModuleState::Script,
+        );
+        let missing_declaration = declaration(&missing_return, 0);
+        let (arena, bound) = missing_return.context.file(missing_return.file).unwrap();
+        let before = missing_return
+            .context
+            .store()
+            .checker_link_allocated_lengths();
+
+        assert!(matches!(
+            plan_source_namespace(
+                arena,
+                bound,
+                missing_return.context.store(),
+                missing_declaration,
+            ),
+            Err(SourceCheckError::Unsupported(_))
+        ));
+        assert_eq!(
+            missing_return
+                .context
+                .store()
+                .checker_link_allocated_lengths(),
+            before,
+        );
 
         let fixture = fixture(
             "declare module \"lib\" { export function fn(): void; }",
@@ -5452,6 +5909,142 @@ mod tests {
             ]
         ));
         assert!(execute(&mut fixture, &plan).unwrap().is_empty());
+    }
+
+    #[test]
+    fn ambient_namespace_interfaces_accept_call_signatures() {
+        let mut fixture = fixture(
+            "declare namespace Shapes { interface Validator { (value: string): string; } }",
+            CanonicalModuleState::Script,
+        );
+        let plan = plan(&fixture, 0);
+        let [SourceNamespaceMemberPlan::Interface { annotations, .. }] = plan.members.as_slice()
+        else {
+            panic!("the namespace must retain its callable interface")
+        };
+        assert_eq!(annotations.len(), 2);
+        assert!(execute(&mut fixture, &plan).unwrap().is_empty());
+    }
+
+    #[test]
+    fn generic_callable_namespace_interfaces_keep_declared_members_lazy() {
+        let mut fixture = fixture(
+            concat!(
+                "declare namespace Shapes { ",
+                "interface Validator<T> { (value: string): string; value?: T; } ",
+                "}",
+            ),
+            CanonicalModuleState::Script,
+        );
+        let plan = plan(&fixture, 0);
+        let [
+            SourceNamespaceMemberPlan::Interface {
+                symbol,
+                generic: Some(generic),
+                ..
+            },
+        ] = plan.members.as_slice()
+        else {
+            panic!("the namespace must retain its generic callable interface")
+        };
+        let symbol = *symbol;
+        let property = generic.properties[0].symbol;
+        assert_eq!(generic.call_signatures.len(), 1);
+
+        assert!(execute(&mut fixture, &plan).unwrap().is_empty());
+
+        let target = fixture
+            .context
+            .store()
+            .declared_type_links(symbol)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let TypeData::Interface(interface) =
+            fixture.context.store().type_payload(target).unwrap().data()
+        else {
+            panic!("the generic callable must retain its interface type")
+        };
+        assert!(!interface.declared_members_resolved);
+        assert!(
+            fixture
+                .context
+                .store()
+                .value_symbol_links(property)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn generic_callable_namespace_interfaces_retain_computed_symbol_properties() {
+        let fixture = fixture(
+            concat!(
+                "declare namespace Shapes { ",
+                "const key: unique symbol; ",
+                "interface Validator<T> { (value: string): string; [key]?: T; } ",
+                "}",
+            ),
+            CanonicalModuleState::Script,
+        );
+        let plan = plan(&fixture, 0);
+        let [
+            SourceNamespaceMemberPlan::AmbientVariable { symbol: key, .. },
+            SourceNamespaceMemberPlan::Interface {
+                generic: Some(generic),
+                ..
+            },
+        ] = plan.members.as_slice()
+        else {
+            panic!("the namespace must retain its unique symbol and callable interface")
+        };
+        assert_eq!(generic.call_signatures.len(), 1);
+        assert_eq!(generic.computed_properties.len(), 1);
+        assert_eq!(generic.computed_properties[0].key, *key);
+        assert!(generic.properties.is_empty());
+    }
+
+    #[test]
+    fn generic_namespace_interface_heritage_keeps_base_and_members_lazy() {
+        let mut fixture = fixture(
+            concat!(
+                "declare namespace Shapes { ",
+                "interface Validator<T> { (value: T): string; } ",
+                "interface Requireable<T> extends Validator<T | undefined> { ",
+                "isRequired: Validator<T>; ",
+                "} }",
+            ),
+            CanonicalModuleState::Script,
+        );
+        let plan = plan(&fixture, 0);
+        let [
+            SourceNamespaceMemberPlan::Interface { symbol: base, .. },
+            SourceNamespaceMemberPlan::Interface {
+                symbol: derived,
+                generic: Some(generic),
+                ..
+            },
+        ] = plan.members.as_slice()
+        else {
+            panic!("the namespace must retain its callable and derived interfaces")
+        };
+        let base = *base;
+        let derived = *derived;
+        assert_eq!(generic.base_interfaces, [base]);
+        assert_eq!(generic.properties.len(), 1);
+
+        assert!(execute(&mut fixture, &plan).unwrap().is_empty());
+
+        let target = fixture
+            .context
+            .store()
+            .declared_type_links(derived)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let TypeData::Interface(interface) =
+            fixture.context.store().type_payload(target).unwrap().data()
+        else {
+            panic!("the derived declaration must retain its interface type")
+        };
+        assert!(!interface.declared_members_resolved);
     }
 
     #[test]
