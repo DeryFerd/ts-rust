@@ -8060,15 +8060,15 @@ impl<'a> Parser<'a> {
         } else {
             self.parse_jsx_tag_name("Expected a JSX closing tag name.")
         };
-        let source_text = self.arena.source_text();
-        let tag_text = |node: NodeId| {
-            let range = self.arena.get(node)?.range;
-            source_text?.get(range.start.get() as usize..range.end.get() as usize)
-        };
         if !missing_closing_tag
-            && tag_text(tag_name) != tag_text(closing_name)
-            && let Some(opening_name) = tag_text(tag_name).map(str::to_owned)
+            && !self.jsx_tag_names_are_equivalent(tag_name, closing_name)
+            && let Some(opening_name) = self.arena.get(tag_name).and_then(|node| {
+                self.arena
+                    .source_text()?
+                    .get(node.range.start.get() as usize..node.range.end.get() as usize)
+            })
         {
+            let opening_name = opening_name.to_owned();
             let range = self.arena.get(closing_name).unwrap().range;
             self.error_code_at(range, 17002, [opening_name]);
         }
@@ -8444,10 +8444,16 @@ impl<'a> Parser<'a> {
 
     fn parse_jsx_tag_name(&mut self, message: &str) -> NodeId {
         let mut expression = self.parse_jsx_name(message);
+        if matches!(
+            self.arena.get(expression).map(|node| &node.data),
+            Some(NodeData::JsxNamespacedName(_))
+        ) {
+            return expression;
+        }
         while self.current.kind == SyntaxKind::DotToken {
             self.bump();
             self.current = self.scanner.scan_jsx_identifier();
-            let name = self.parse_identifier(message);
+            let name = self.parse_jsx_identifier_name(message);
             expression = self.alloc_node(
                 SyntaxKind::PropertyAccessExpression,
                 TextRange::new(self.node_start(expression), self.node_end(name)),
@@ -8466,13 +8472,13 @@ impl<'a> Parser<'a> {
 
     fn parse_jsx_name(&mut self, message: &str) -> NodeId {
         self.current = self.scanner.scan_jsx_identifier();
-        let namespace = self.parse_identifier_name(message);
+        let namespace = self.parse_jsx_identifier_name(message);
         if self.current.kind != SyntaxKind::ColonToken {
             return namespace;
         }
         self.bump();
         self.current = self.scanner.scan_jsx_identifier();
-        let name = self.parse_identifier_name(message);
+        let name = self.parse_jsx_identifier_name(message);
         self.alloc_node(
             SyntaxKind::JsxNamespacedName,
             TextRange::new(self.node_start(namespace), self.node_end(name)),
@@ -8483,6 +8489,50 @@ impl<'a> Parser<'a> {
             })),
             &[namespace, name],
         )
+    }
+
+    fn parse_jsx_identifier_name(&mut self, message: &str) -> NodeId {
+        if self
+            .current
+            .flags
+            .contains(ScannerTokenFlags::UNICODE_ESCAPE)
+            || self
+                .current
+                .flags
+                .contains(ScannerTokenFlags::EXTENDED_UNICODE_ESCAPE)
+        {
+            self.error_code_at(self.current.range, 17021, []);
+        }
+        self.parse_identifier_name(message)
+    }
+
+    fn jsx_tag_names_are_equivalent(&self, first: NodeId, second: NodeId) -> bool {
+        let (Some(first), Some(second)) = (self.arena.get(first), self.arena.get(second)) else {
+            return false;
+        };
+        if first.kind != second.kind {
+            return false;
+        }
+        match (&first.data, &second.data) {
+            (NodeData::Identifier(first), NodeData::Identifier(second)) => {
+                first.text == second.text
+            }
+            (NodeData::JsxNamespacedName(first), NodeData::JsxNamespacedName(second)) => {
+                self.jsx_tag_names_are_equivalent(first.namespace, second.namespace)
+                    && self.jsx_tag_names_are_equivalent(first.name, second.name)
+            }
+            (
+                NodeData::PropertyAccessExpression(first),
+                NodeData::PropertyAccessExpression(second),
+            ) => {
+                self.jsx_tag_names_are_equivalent(first.expression, second.expression)
+                    && self.jsx_tag_names_are_equivalent(first.name, second.name)
+            }
+            (NodeData::KeywordExpression(_), NodeData::KeywordExpression(_)) => {
+                first.kind == SyntaxKind::ThisKeyword
+            }
+            _ => false,
+        }
     }
 
     fn parse_identifier(&mut self, message: &str) -> NodeId {
@@ -17469,6 +17519,195 @@ export as namespace GlobalName;
             result.arena.get(element.children.nodes[2]).unwrap().kind,
             SyntaxKind::JsxSelfClosingElement
         );
+    }
+
+    #[test]
+    fn jsx_text_preserves_basic_and_supplementary_unicode_characters() {
+        let source = concat!(
+            "const view = <div><span>Warning: ⚠ Error</span>\n",
+            "  ⚠\n",
+            "  ⛔\n",
+            "  🚨\n",
+            "</div>;",
+        );
+        let result = parse_jsx_source_file(source);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let text_nodes = result
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let NodeData::JsxText(text) = &record.data else {
+                    return None;
+                };
+                let spelling =
+                    &source[record.range.start.get() as usize..record.range.end.get() as usize];
+                assert_eq!(text.text, spelling);
+                assert!(matches!(
+                    record.parent.and_then(|parent| result.arena.get(parent)),
+                    Some(parent) if parent.kind == SyntaxKind::JsxElement
+                ));
+                Some((node, text.text.as_str()))
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(text_nodes.len(), 2);
+        assert_eq!(text_nodes[0].1, "Warning: ⚠ Error");
+        assert_eq!(text_nodes[1].1, "\n  ⚠\n  ⛔\n  🚨\n");
+        assert!(!text_nodes.iter().any(|(_, text)| text.contains('�')));
+    }
+
+    #[test]
+    fn escaped_jsx_identifiers_report_exact_diagnostics_without_false_tag_mismatches() {
+        for (source, spelling, decoded) in [
+            (r#"const view = <\u0061></a>;"#, r"\u0061", "a"),
+            (r#"const view = <\u0061-b></a-b>;"#, r"\u0061-b", "a-b"),
+            (r#"const view = <a-\u0063></a-c>;"#, r"a-\u0063", "a-c"),
+            (r#"const view = <Comp\u0061 />;"#, r"Comp\u0061", "Compa"),
+            (
+                r#"const view = <value.\u0076ideo />;"#,
+                r"\u0076ideo",
+                "video",
+            ),
+            (r#"const view = <\u{0061}></a>;"#, r"\u{0061}", "a"),
+            (
+                r#"const view = <video data-\u0076ideo />;"#,
+                r"data-\u0076ideo",
+                "data-video",
+            ),
+            (r#"const view = <video \u0073rc="" />;"#, r"\u0073rc", "src"),
+            (r#"const view = <a></\u0061>;"#, r"\u0061", "a"),
+        ] {
+            let result = parse_jsx_source_file(source);
+            let start = u32::try_from(source.find(spelling).unwrap()).unwrap();
+            let end = start + u32::try_from(spelling.len()).unwrap();
+            assert_eq!(
+                result
+                    .diagnostics
+                    .iter()
+                    .map(|diagnostic| (
+                        diagnostic.code,
+                        diagnostic.range.start.get(),
+                        diagnostic.range.end.get(),
+                        diagnostic.message.as_str(),
+                    ))
+                    .collect::<Vec<_>>(),
+                [(
+                    Some(17021),
+                    start,
+                    end,
+                    "Unicode escape sequence cannot appear here.",
+                )],
+                "{source}"
+            );
+            let identifier = result
+                .arena
+                .iter()
+                .find_map(|(_, record)| {
+                    (record.range.start.get() == start && record.range.end.get() == end)
+                        .then_some(&record.data)
+                })
+                .expect("the escaped JSX name must retain its exact source range");
+            assert!(
+                matches!(identifier, NodeData::Identifier(identifier) if identifier.text == decoded),
+                "{source}: {identifier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn escaped_namespaced_jsx_names_preserve_decoded_parts_and_parent_identity() {
+        let source = r#"const view = <\u006es:\u0074hing \u006es:\u0074hing="⚠" />;"#;
+        let result = parse_jsx_source_file(source);
+        let expected_ranges = [r"\u006es", r"\u0074hing"]
+            .into_iter()
+            .flat_map(|spelling| {
+                source.match_indices(spelling).map(move |(start, _)| {
+                    (
+                        u32::try_from(start).unwrap(),
+                        u32::try_from(start + spelling.len()).unwrap(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut actual_ranges = result
+            .diagnostics
+            .iter()
+            .map(|diagnostic| {
+                assert_eq!(diagnostic.code, Some(17021));
+                (diagnostic.range.start.get(), diagnostic.range.end.get())
+            })
+            .collect::<Vec<_>>();
+        let mut expected_ranges = expected_ranges;
+        actual_ranges.sort_unstable();
+        expected_ranges.sort_unstable();
+        assert_eq!(actual_ranges, expected_ranges);
+
+        let names = result
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let NodeData::JsxNamespacedName(name) = &record.data else {
+                    return None;
+                };
+                for child in [name.namespace, name.name] {
+                    assert_eq!(result.arena.get(child).unwrap().parent, Some(node));
+                }
+                assert_eq!(identifier_text(&result, name.namespace), "ns");
+                assert_eq!(identifier_text(&result, name.name), "thing");
+                Some(node)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(names.len(), 2);
+        assert!(matches!(
+            result
+                .arena
+                .get(names[0])
+                .and_then(|node| node.parent)
+                .and_then(|parent| result.arena.get(parent)),
+            Some(parent) if parent.kind == SyntaxKind::JsxSelfClosingElement
+        ));
+        assert!(matches!(
+            result
+                .arena
+                .get(names[1])
+                .and_then(|node| node.parent)
+                .and_then(|parent| result.arena.get(parent)),
+            Some(parent) if parent.kind == SyntaxKind::JsxAttribute
+        ));
+    }
+
+    #[test]
+    fn escaped_jsx_closing_tags_compare_decoded_names_and_keep_real_mismatch_ranges() {
+        let equivalent = parse_jsx_source_file(r#"const view = <\u006es:\u0074hing></ns:thing>;"#);
+        assert_eq!(
+            equivalent
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [Some(17021), Some(17021)],
+        );
+
+        let source = r#"const view = <\u0061></other>;"#;
+        let mismatch = parse_jsx_source_file(source);
+        let escaped_start = u32::try_from(source.find(r"\u0061").unwrap()).unwrap();
+        let closing_start = u32::try_from(source.find("other").unwrap()).unwrap();
+        assert_eq!(
+            mismatch
+                .diagnostics
+                .iter()
+                .map(|diagnostic| (
+                    diagnostic.code,
+                    diagnostic.range.start.get(),
+                    diagnostic.range.end.get(),
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (Some(17021), escaped_start, escaped_start + 6),
+                (Some(17002), closing_start, closing_start + 5),
+            ],
+        );
+        assert!(mismatch.diagnostics[1].message.contains(r"\u0061"));
     }
 
     #[test]
