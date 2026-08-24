@@ -587,6 +587,7 @@ pub(super) struct ConditionalExpressionPlan {
     when_false: PlannedExpression,
     when_false_expectation: ConditionalScalarExpectation,
     expected_result: TypeId,
+    dynamic_result: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -604,6 +605,8 @@ enum ConditionalScalarExpectation {
         type_: TypeId,
     },
     Literal(ConditionalScalarFamily),
+    Fixed(TypeId),
+    Object,
     Error,
 }
 
@@ -913,6 +916,13 @@ enum PlannedFunctionBody {
     ReturnJsx {
         statement: NodeRef,
         expression: NodeRef,
+    },
+    ConstantIf {
+        condition: PlannedExpression,
+        then_statement: NodeRef,
+        then_expression: PlannedExpression,
+        else_statement: NodeRef,
+        else_expression: PlannedExpression,
     },
     Linear(Box<PlannedLinearFunctionStatements>),
     Switch(Box<PlannedSwitchFunctionStatements>),
@@ -6115,6 +6125,13 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             block.statements.nodes.clone()
         };
         if let [statement_id] = statements.as_slice()
+            && self.node(self.reference(*statement_id))?.kind == SyntaxKind::IfStatement
+            && let Some(body) =
+                self.plan_constant_boolean_return_if(callable, self.reference(*statement_id))?
+        {
+            return Ok(body);
+        }
+        if let [statement_id] = statements.as_slice()
             && self.node(self.reference(*statement_id))?.kind == SyntaxKind::ReturnStatement
         {
             let statement = self.reference(*statement_id);
@@ -6189,6 +6206,98 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             ));
         }
         Ok(PlannedFunctionBody::Empty)
+    }
+
+    fn plan_constant_boolean_return_if(
+        &mut self,
+        callable: &SourceCallablePlan,
+        statement: NodeRef,
+    ) -> Result<Option<PlannedFunctionBody>, SourceCheckError> {
+        let record = self.node(statement)?;
+        let NodeData::IfStatement(control) = &record.data else {
+            return Ok(None);
+        };
+        if record.kind != SyntaxKind::IfStatement
+            || record.flags.0 != 0
+            || record.parent != Some(callable.body.node)
+            || control.flow_node.is_some()
+            || control.facts != 0
+        {
+            return Ok(None);
+        }
+        let condition_node = self.reference(control.expression);
+        let then_block = self.reference(control.then_statement);
+        let Some(else_statement) = control.else_statement else {
+            return Ok(None);
+        };
+        let else_block = self.reference(else_statement);
+        if self.node(condition_node)?.parent != Some(statement.node)
+            || self.node(then_block)?.parent != Some(statement.node)
+            || self.node(else_block)?.parent != Some(statement.node)
+        {
+            return Ok(None);
+        }
+        let condition = self.plan_expression(condition_node)?;
+        if !matches!(
+            condition.unparenthesized().kind,
+            PlannedExpressionKind::Boolean(_)
+        ) {
+            return Ok(None);
+        }
+
+        let return_nodes =
+            |block: NodeRef| -> Result<Option<(NodeRef, NodeRef)>, SourceCheckError> {
+                let record = self.node(block)?;
+                let NodeData::Block(body) = &record.data else {
+                    return Ok(None);
+                };
+                let [return_node] = body.statements.nodes.as_slice() else {
+                    return Ok(None);
+                };
+                if record.kind != SyntaxKind::Block
+                    || record.flags.0 != 0
+                    || body.flow_node.is_some()
+                    || body.next_container.is_some()
+                    || body.statements.has_trailing_comma
+                    || body.facts != 0
+                {
+                    return Ok(None);
+                }
+                let statement = self.reference(*return_node);
+                let record = self.node(statement)?;
+                let NodeData::ReturnStatement(returned) = &record.data else {
+                    return Ok(None);
+                };
+                let Some(expression) = returned.expression else {
+                    return Ok(None);
+                };
+                let expression = self.reference(expression);
+                if record.kind != SyntaxKind::ReturnStatement
+                    || record.flags.0 != 0
+                    || record.parent != Some(block.node)
+                    || returned.flow_node.is_some()
+                    || returned.facts != 0
+                    || self.node(expression)?.parent != Some(statement.node)
+                {
+                    return Ok(None);
+                }
+                Ok(Some((statement, expression)))
+            };
+        let Some((then_statement, then_expression)) = return_nodes(then_block)? else {
+            return Ok(None);
+        };
+        let Some((else_statement, else_expression)) = return_nodes(else_block)? else {
+            return Ok(None);
+        };
+        let then_expression = self.plan_expression(then_expression)?;
+        let else_expression = self.plan_expression(else_expression)?;
+        Ok(Some(PlannedFunctionBody::ConstantIf {
+            condition,
+            then_statement,
+            then_expression,
+            else_statement,
+            else_expression,
+        }))
     }
 
     /// Accepts only a parser-recovered `for (let in)` with no iterable.
@@ -10785,6 +10894,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }
         let condition = self.plan_expression(condition)?;
         let condition_target = condition.unparenthesized();
+        let constant_condition = matches!(condition_target.kind, PlannedExpressionKind::Boolean(_));
         let condition_symbol = match &condition_target.kind {
             PlannedExpressionKind::Identifier(condition_read)
                 if !contextual
@@ -10796,7 +10906,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 (condition_read.kind == PlannedIdentifierReadKind::Variable)
                     .then_some(condition_read.value_symbol)
             }
-            PlannedExpressionKind::Boolean(_) if contextual => None,
+            PlannedExpressionKind::Boolean(_) => None,
             _ => {
                 return Err(self.unsupported(
                     condition_target.node,
@@ -10830,13 +10940,15 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 SourceSyntaxRole::VariableInitializer,
             ));
         };
-        if matches!(
-            when_true_expectation,
-            ConditionalScalarExpectation::Exact {
-                family: ConditionalScalarFamily::Boolean,
-                ..
-            }
-        ) {
+        if !constant_condition
+            && matches!(
+                when_true_expectation,
+                ConditionalScalarExpectation::Exact {
+                    family: ConditionalScalarFamily::Boolean,
+                    ..
+                }
+            )
+        {
             return Err(self.unsupported(
                 when_true.node,
                 self.node(when_true.node)?.kind,
@@ -10861,30 +10973,51 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 SourceSyntaxRole::VariableInitializer,
             ));
         };
-        if matches!(
-            when_false_expectation,
-            ConditionalScalarExpectation::Exact {
-                family: ConditionalScalarFamily::Boolean,
-                ..
-            }
-        ) {
+        if !constant_condition
+            && matches!(
+                when_false_expectation,
+                ConditionalScalarExpectation::Exact {
+                    family: ConditionalScalarFamily::Boolean,
+                    ..
+                }
+            )
+        {
             return Err(self.unsupported(
                 when_false.node,
                 self.node(when_false.node)?.kind,
                 SourceSyntaxRole::VariableInitializer,
             ));
         }
-        let Some(expected_result) = self.conditional_expected_result(
+        let expected_result = self.conditional_expected_result(
             when_true_expectation,
             when_false_expectation,
             contextual,
-        )?
-        else {
+        )?;
+        if expected_result.is_none() && !constant_condition {
             return Err(self.unsupported(
                 expression,
                 SyntaxKind::ConditionalExpression,
                 SourceSyntaxRole::VariableInitializer,
             ));
+        }
+        let dynamic_result = expected_result.is_none();
+        let expected_result = if let Some(expected_result) = expected_result {
+            expected_result
+        } else {
+            self.semantic
+                .and_then(|(store, _)| {
+                    store
+                        .type_node_links(expression)
+                        .and_then(|links| links.resolved_type)
+                        .or_else(|| {
+                            store
+                                .intrinsic_bootstrap()
+                                .map(|bootstrap| bootstrap.error_type)
+                        })
+                })
+                .ok_or(SourceCheckError::LiteralCache(
+                    SourceLiteralCacheError::BootstrapUninitialized,
+                ))?
         };
         if let Some((store, _)) = self.semantic {
             let expected_cache = if contextual
@@ -10898,7 +11031,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             } else {
                 expected_result
             };
-            preflight_source_expression_cache(store, expression, expected_cache)?;
+            if !dynamic_result || store.type_node_links(expression).is_some() {
+                preflight_source_expression_cache(store, expression, expected_cache)?;
+            }
             preflight_uncached_conditional_operand_links(store, &condition)?;
             preflight_uncached_conditional_operand_links(store, &when_true)?;
             preflight_uncached_conditional_operand_links(store, &when_false)?;
@@ -10914,6 +11049,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 when_false,
                 when_false_expectation,
                 expected_result,
+                dynamic_result,
             })),
         ))
     }
@@ -10922,6 +11058,28 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         &self,
         expression: &PlannedExpression,
     ) -> Result<Option<ConditionalScalarExpectation>, SourceCheckError> {
+        if matches!(
+            expression.kind,
+            PlannedExpressionKind::Null | PlannedExpressionKind::GlobalUndefined
+        ) {
+            let Some((store, _)) = self.semantic else {
+                return Ok(None);
+            };
+            let bootstrap = store
+                .intrinsic_bootstrap()
+                .ok_or(SourceCheckError::LiteralCache(
+                    SourceLiteralCacheError::BootstrapUninitialized,
+                ))?;
+            let type_ = if matches!(expression.kind, PlannedExpressionKind::Null) {
+                bootstrap.null_widening_type
+            } else {
+                bootstrap.undefined_widening_type
+            };
+            return Ok(Some(ConditionalScalarExpectation::Fixed(type_)));
+        }
+        if matches!(expression.kind, PlannedExpressionKind::Object { .. }) {
+            return Ok(Some(ConditionalScalarExpectation::Object));
+        }
         let literal = match &expression.kind {
             PlannedExpressionKind::String(_) => Some(ConditionalScalarFamily::String),
             PlannedExpressionKind::Number { .. } => Some(ConditionalScalarFamily::Number),
@@ -10945,7 +11103,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     .ok_or(SourceCheckError::LiteralCache(
                         SourceLiteralCacheError::BootstrapUninitialized,
                     ))?;
-                return Ok((conditional.expected_result == error_type)
+                return Ok((!conditional.dynamic_result
+                    && conditional.expected_result == error_type)
                     .then_some(ConditionalScalarExpectation::Error));
             }
             PlannedExpressionKind::Identifier(read)
@@ -11117,6 +11276,10 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             (ConditionalScalarExpectation::Error, _) | (_, ConditionalScalarExpectation::Error) => {
                 Some(bootstrap.error_type)
             }
+            (
+                ConditionalScalarExpectation::Fixed(left),
+                ConditionalScalarExpectation::Fixed(right),
+            ) if left == right => Some(left),
             (
                 ConditionalScalarExpectation::Exact {
                     family: left_family,
@@ -12542,10 +12705,13 @@ fn primitive_binary_operand_plan_is_supported(expression: &PlannedExpression) ->
 
 fn conditional_scalar_operand_plan_is_supported(expression: &PlannedExpression) -> bool {
     match &expression.kind {
-        PlannedExpressionKind::String(_)
+        PlannedExpressionKind::Null
+        | PlannedExpressionKind::GlobalUndefined
+        | PlannedExpressionKind::String(_)
         | PlannedExpressionKind::Number { .. }
         | PlannedExpressionKind::BigInt { .. }
         | PlannedExpressionKind::Boolean(_)
+        | PlannedExpressionKind::Object { .. }
         | PlannedExpressionKind::Conditional(_) => true,
         PlannedExpressionKind::Identifier(read) => matches!(
             read.kind,
@@ -12554,12 +12720,9 @@ fn conditional_scalar_operand_plan_is_supported(expression: &PlannedExpression) 
         PlannedExpressionKind::Parenthesized(inner) => {
             conditional_scalar_operand_plan_is_supported(inner)
         }
-        PlannedExpressionKind::Null
-        | PlannedExpressionKind::GlobalUndefined
-        | PlannedExpressionKind::TypeImportValueUse(_)
+        PlannedExpressionKind::TypeImportValueUse(_)
         | PlannedExpressionKind::Assertion { .. }
         | PlannedExpressionKind::Array(_)
-        | PlannedExpressionKind::Object { .. }
         | PlannedExpressionKind::Property(_)
         | PlannedExpressionKind::Element(_)
         | PlannedExpressionKind::Call(_)
@@ -12710,11 +12873,19 @@ fn preflight_uncached_conditional_operand_links(
             return preflight_source_expression_cache(store, expression.node, error_type);
         }
         PlannedExpressionKind::Conditional(conditional) => {
-            return preflight_source_expression_cache(
-                store,
-                expression.node,
-                conditional.expected_result,
-            );
+            if !conditional.dynamic_result || store.type_node_links(expression.node).is_some() {
+                return preflight_source_expression_cache(
+                    store,
+                    expression.node,
+                    conditional.expected_result,
+                );
+            }
+            return Ok(());
+        }
+        PlannedExpressionKind::Object { plan, .. } => {
+            super::object_members::object_literal_state(store, plan)
+                .map_err(source_object_execution_error)?;
+            return Ok(());
         }
         _ => {}
     }
@@ -12860,6 +13031,26 @@ fn preflight_inferred_function_return_dependencies(
                 &locals,
                 functions,
             ),
+            PlannedFunctionBody::ConstantIf {
+                condition,
+                then_expression,
+                else_expression,
+                ..
+            } => {
+                expression_is_closed(condition, &function.callable.parameters, &locals, functions)
+                    && expression_is_closed(
+                        then_expression,
+                        &function.callable.parameters,
+                        &locals,
+                        functions,
+                    )
+                    && expression_is_closed(
+                        else_expression,
+                        &function.callable.parameters,
+                        &locals,
+                        functions,
+                    )
+            }
             PlannedFunctionBody::Linear(statements) => {
                 locals.extend(statements.statements.iter().filter_map(|statement| {
                     if let PlannedLinearFunctionStatement::Enum(enumeration) = statement {
@@ -14468,58 +14659,70 @@ fn check_expression_type(
                 condition.result,
                 conditional.node,
             )?;
-            let when_true =
-                if conditional.when_true_expectation == ConditionalScalarExpectation::Error {
-                    check_expression_type(
-                        store,
-                        host,
-                        global_types,
-                        source,
-                        options,
-                        session,
-                        diagnostics,
-                        current_flow_types,
-                        preflighted_type_import_value_uses,
-                        &conditional.when_true,
-                        None,
-                        deferred,
-                    )?
-                } else {
-                    check_uncached_conditional_scalar(
-                        store,
-                        current_flow_types,
-                        &conditional.when_true,
-                    )?
-                };
+            let when_true = if matches!(
+                conditional.when_true_expectation,
+                ConditionalScalarExpectation::Error | ConditionalScalarExpectation::Object
+            ) {
+                check_expression_type(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    current_flow_types,
+                    preflighted_type_import_value_uses,
+                    &conditional.when_true,
+                    if conditional.when_true_expectation == ConditionalScalarExpectation::Object {
+                        contextual_type
+                    } else {
+                        None
+                    },
+                    deferred,
+                )?
+            } else {
+                check_uncached_conditional_scalar(
+                    store,
+                    current_flow_types,
+                    &conditional.when_true,
+                )?
+            };
             validate_conditional_scalar_expectation(
                 store,
                 &conditional.when_true,
                 when_true.result,
                 conditional.when_true_expectation,
             )?;
-            let when_false =
-                if conditional.when_false_expectation == ConditionalScalarExpectation::Error {
-                    check_expression_type(
-                        store,
-                        host,
-                        global_types,
-                        source,
-                        options,
-                        session,
-                        diagnostics,
-                        current_flow_types,
-                        preflighted_type_import_value_uses,
-                        &conditional.when_false,
-                        None,
-                        deferred,
-                    )?
-                } else {
-                    check_uncached_conditional_scalar(
-                        store,
-                        current_flow_types,
-                        &conditional.when_false,
-                    )?
-                };
+            let when_false = if matches!(
+                conditional.when_false_expectation,
+                ConditionalScalarExpectation::Error | ConditionalScalarExpectation::Object
+            ) {
+                check_expression_type(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    current_flow_types,
+                    preflighted_type_import_value_uses,
+                    &conditional.when_false,
+                    if conditional.when_false_expectation == ConditionalScalarExpectation::Object {
+                        contextual_type
+                    } else {
+                        None
+                    },
+                    deferred,
+                )?
+            } else {
+                check_uncached_conditional_scalar(
+                    store,
+                    current_flow_types,
+                    &conditional.when_false,
+                )?
+            };
             validate_conditional_scalar_expectation(
                 store,
                 &conditional.when_false,
@@ -14544,7 +14747,7 @@ fn check_expression_type(
             } else {
                 raw_type
             };
-            if result_type != conditional.expected_result {
+            if !conditional.dynamic_result && result_type != conditional.expected_result {
                 return Err(SourceCheckError::Conditional(conditional.node));
             }
             publish_expression_type(store, conditional.node, raw_type)?;
@@ -15647,6 +15850,24 @@ fn check_uncached_conditional_scalar(
     expression: &PlannedExpression,
 ) -> Result<CheckedExpressionTypes, SourceCheckError> {
     match &expression.kind {
+        PlannedExpressionKind::Null => {
+            let type_ = store
+                .intrinsic_bootstrap()
+                .map(|bootstrap| bootstrap.null_widening_type)
+                .ok_or(SourceCheckError::LiteralCache(
+                    SourceLiteralCacheError::BootstrapUninitialized,
+                ))?;
+            Ok(CheckedExpressionTypes::leaf(type_, type_))
+        }
+        PlannedExpressionKind::GlobalUndefined => {
+            let type_ = store
+                .intrinsic_bootstrap()
+                .map(|bootstrap| bootstrap.undefined_widening_type)
+                .ok_or(SourceCheckError::LiteralCache(
+                    SourceLiteralCacheError::BootstrapUninitialized,
+                ))?;
+            Ok(CheckedExpressionTypes::leaf(type_, type_))
+        }
         PlannedExpressionKind::Identifier(read)
             if read.kind == PlannedIdentifierReadKind::Variable =>
         {
@@ -15762,6 +15983,19 @@ fn validate_conditional_scalar_expectation(
         ConditionalScalarExpectation::Exact { .. } => {
             Err(SourceCheckError::Conditional(expression.node))
         }
+        ConditionalScalarExpectation::Fixed(expected) if type_ == expected => Ok(()),
+        ConditionalScalarExpectation::Fixed(_) => {
+            Err(SourceCheckError::Conditional(expression.node))
+        }
+        ConditionalScalarExpectation::Object
+            if matches!(
+                store.type_payload(type_).map(TypeRecord::data),
+                Some(TypeData::Object(_))
+            ) =>
+        {
+            Ok(())
+        }
+        ConditionalScalarExpectation::Object => Err(SourceCheckError::Conditional(expression.node)),
         ConditionalScalarExpectation::Error => {
             let expected = store
                 .intrinsic_bootstrap()
@@ -21468,6 +21702,61 @@ pub(super) fn check_source_file(
                 inferred_function_diagnostics[index] = Some(function_diagnostics);
                 continue;
             }
+            PlannedFunctionBody::ConstantIf {
+                condition,
+                then_expression,
+                else_expression,
+                ..
+            } => {
+                check_expression_type(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    &mut function_diagnostics,
+                    &body_flow_types,
+                    &preflighted_type_import_value_uses,
+                    condition,
+                    None,
+                    &mut deferred,
+                )?;
+                let mut return_types = Vec::with_capacity(2);
+                for expression in [then_expression, else_expression] {
+                    let checked = check_expression_type(
+                        store,
+                        host,
+                        global_types,
+                        source,
+                        options,
+                        session,
+                        &mut function_diagnostics,
+                        &body_flow_types,
+                        &preflighted_type_import_value_uses,
+                        expression,
+                        None,
+                        &mut deferred,
+                    )?;
+                    return_types.push(checked.result);
+                }
+                let combined = store.expression_union_type_with_global_types(
+                    global_types,
+                    &return_types,
+                    UnionReduction::Subtype,
+                )?;
+                let widened = widened_fresh_literal_type(store, combined)?;
+                let inferred = store.get_widened_type_with_global_types(widened, global_types)?;
+                publish_inferred_source_callable_return(
+                    store,
+                    &function.callable,
+                    materialized.signature,
+                    inferred,
+                )
+                .map_err(SourcePlanner::callable_plan_error)?;
+                inferred_function_diagnostics[index] = Some(function_diagnostics);
+                continue;
+            }
             PlannedFunctionBody::Linear(statements) => {
                 let flow_types = check_planned_linear_function_statements(
                     bound,
@@ -22300,6 +22589,51 @@ pub(super) fn check_source_file(
                             *statement,
                             None,
                         )?;
+                    }
+                    PlannedFunctionBody::ConstantIf {
+                        condition,
+                        then_statement,
+                        then_expression,
+                        else_statement,
+                        else_expression,
+                    } => {
+                        check_expression_type(
+                            store,
+                            host,
+                            global_types,
+                            source,
+                            options,
+                            session,
+                            diagnostics,
+                            &body_flow_types,
+                            &preflighted_type_import_value_uses,
+                            condition,
+                            None,
+                            &mut deferred,
+                        )?;
+                        for (statement, expression) in [
+                            (then_statement, then_expression),
+                            (else_statement, else_expression),
+                        ] {
+                            session.reset_query();
+                            check_planned_assignment(
+                                store,
+                                host,
+                                global_types,
+                                source,
+                                options,
+                                session,
+                                diagnostics,
+                                &body_flow_types,
+                                &preflighted_type_import_value_uses,
+                                &mut deferred,
+                                return_type,
+                                &[],
+                                expression,
+                                *statement,
+                                None,
+                            )?;
+                        }
                     }
                     PlannedFunctionBody::ReturnJsx {
                         statement,
@@ -38132,6 +38466,115 @@ mod tests {
         assert_eq!(diagnostic.diagnostic.arguments, ["+", "number", "boolean"]);
         assert_eq!(resolved_node_type(&context, binary), expected);
         assert!(is_type_checked(&context, file));
+    }
+
+    #[test]
+    fn constant_boolean_conditionals_match_loose_upstream_types_and_replay_warm() {
+        let library = parsed("interface Array<T> {} interface ReadonlyArray<T> {}");
+        let source = parsed(concat!(
+            "var a = false ? 1 : null; ",
+            "var b = false ? undefined : 0; ",
+            "var c = false ? 1 : 0; ",
+            "var d = false ? false : true; ",
+            "var e = false ? 'foo' : 'bar'; ",
+            "var f = false ? null : undefined; ",
+            "var g = true ? { g: 5 } : null; ",
+            "var h = [{ h: 5 }, null]; ",
+            "function i() { if (true) { return { x: 5 }; } else { return null; } }",
+        ));
+        let library_file = FileId::new(4_810);
+        let source_file = FileId::new(4_811);
+        let mut context = context_with_default_library_files(
+            &[(library_file, &library), (source_file, &source)],
+            &[library_file],
+            CanonicalCheckerOptions {
+                allow_unreachable_code: Some(true),
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(source_file).unwrap();
+
+        for (name, expected) in [
+            ("a", "number"),
+            ("b", "number"),
+            ("c", "number"),
+            ("d", "boolean"),
+            ("e", "string"),
+            ("f", "any"),
+            ("g", "{ g: number; }"),
+            ("h", "{ h: number; }[]"),
+        ] {
+            let type_ = variable_value_type(&context, &source, source_file, name);
+            assert_eq!(
+                context.type_to_string(type_).unwrap(),
+                expected,
+                "variable {name}",
+            );
+        }
+
+        let callable = context
+            .store()
+            .source_callable_type_for_owner(function_symbol(&context, &source, source_file, "i"))
+            .unwrap();
+        assert_eq!(
+            context.type_to_string(callable).unwrap(),
+            "() => { x: number; }"
+        );
+        assert!(
+            context.diagnostics().is_empty(),
+            "{:?}",
+            context.diagnostics()
+        );
+
+        let warm = observable_state(&context, source_file);
+        context.recheck_source_file(source_file).unwrap();
+        assert_eq!(observable_state(&context, source_file), warm);
+    }
+
+    #[test]
+    fn constant_boolean_conditionals_preserve_strict_nullable_branch_unions() {
+        let source = parsed(concat!(
+            "var numeric = false ? 1 : null; ",
+            "var missing = true ? undefined : 0; ",
+            "var truth = false ? false : true;",
+        ));
+        let file = FileId::new(4_812);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    exact_optional_property_types: false,
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        for (name, nullable) in [
+            ("numeric", bootstrap.null_type),
+            ("missing", bootstrap.undefined_type),
+        ] {
+            let type_ = variable_value_type(&context, &source, file, name);
+            let Some(TypeData::Union(union)) =
+                context.store().type_payload(type_).map(TypeRecord::data)
+            else {
+                panic!("{name} must retain its nullable branch union")
+            };
+            assert!(union.union.types.contains(&bootstrap.number_type));
+            assert!(union.union.types.contains(&nullable));
+        }
+        assert_eq!(
+            variable_value_type(&context, &source, file, "truth"),
+            bootstrap.boolean_type,
+        );
+        assert!(context.diagnostics().is_empty());
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
     }
 
     #[test]
