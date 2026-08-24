@@ -2,8 +2,9 @@
 //!
 //! This slice accepts leading, top-level side-effect imports, default imports,
 //! namespace imports, and named imports, including explicit named `default`
-//! bindings. Imports and named or namespace reexports must use identifier
-//! names. Alias discovery belongs to the production alias host. A
+//! bindings. Imported and exported module names can be identifiers or clean
+//! string literals; local bindings remain identifiers. Alias discovery belongs
+//! to the production alias host. A
 //! successful alias may traverse named and explicit default reexports before
 //! reaching an authenticated exported declaration in another retained source.
 //! JavaScript `JSDoc` typedef targets retain their exact parser-owned reparsed
@@ -1337,7 +1338,7 @@ fn plan_top_level_named_import(
                 specifier.property_name.unwrap_or(specifier.name),
             );
             let local_name = NodeRef::new(declaration.arena, declaration.file, specifier.name);
-            let imported_text = exact_identifier(
+            let imported_text = exact_module_export_name(
                 arena,
                 bound,
                 store,
@@ -1521,10 +1522,11 @@ fn validate_value_import_attributes(
 
 /// Proves one complete top-level named or namespace reexport without checker writes.
 ///
-/// Identifier-named `export { source as public } from "./target"` and
-/// `export * as public from "./target"` forms are admitted. Named bindings
-/// can use `default`. Star, local, attribute-bearing, and `CommonJS` forms
-/// require separate module support.
+/// `export { source as public } from "./target"` and
+/// `export * as public from "./target"` forms are admitted. Module names can
+/// be identifiers or string literals, and named bindings can use `default`.
+/// Star, local, attribute-bearing, and `CommonJS` forms require separate module
+/// support.
 #[cfg_attr(not(test), allow(dead_code))]
 #[allow(clippy::too_many_lines)] // One exact export-declaration provenance walk.
 pub(super) fn plan_top_level_named_reexport(
@@ -1626,7 +1628,7 @@ pub(super) fn plan_top_level_named_reexport(
         }
 
         let exported_name = NodeRef::new(declaration.arena, declaration.file, namespace.name);
-        let exported_text = exact_identifier(
+        let exported_text = exact_module_export_name(
             arena,
             bound,
             store,
@@ -1711,7 +1713,7 @@ pub(super) fn plan_top_level_named_reexport(
             specifier.property_name.unwrap_or(specifier.name),
         );
         let exported_name = NodeRef::new(declaration.arena, declaration.file, specifier.name);
-        let imported_text = exact_identifier(
+        let imported_text = exact_module_export_name(
             arena,
             bound,
             store,
@@ -1719,7 +1721,7 @@ pub(super) fn plan_top_level_named_reexport(
             binding,
             SourceImportUnsupported::NonIdentifierReexportName(imported_name),
         )?;
-        let exported_text = exact_identifier(
+        let exported_text = exact_module_export_name(
             arena,
             bound,
             store,
@@ -2975,6 +2977,36 @@ fn exact_identifier(
         return Err(unsupported(unsupported_reason));
     }
     Ok(identifier.text.clone())
+}
+
+fn exact_module_export_name(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    name: NodeRef,
+    parent: NodeRef,
+    unsupported_reason: SourceImportUnsupported,
+) -> Result<String, SourceImportError> {
+    let record = checked_node(arena, bound, store, name)?;
+    if record.parent != Some(parent.node) || record.flags.0 != 0 {
+        return Err(unsupported(unsupported_reason));
+    }
+
+    match &record.data {
+        NodeData::Identifier(identifier)
+            if record.kind == SyntaxKind::Identifier
+                && identifier.flow_node.is_none()
+                && !identifier.text.is_empty() =>
+        {
+            Ok(identifier.text.clone())
+        }
+        NodeData::StringLiteral(literal)
+            if record.kind == SyntaxKind::StringLiteral && literal.token_flags.0 == 0 =>
+        {
+            Ok(literal.text.clone())
+        }
+        _ => Err(unsupported(unsupported_reason)),
+    }
 }
 
 fn import_alias_is_exported_type_local(
@@ -10664,6 +10696,78 @@ mod tests {
         assert_eq!(warm, resolved);
         let warm_prepared = prepare_one(&mut fixture, &warm, &planned_read).unwrap();
         assert_eq!(warm_prepared, prepared);
+    }
+
+    #[test]
+    fn string_named_import_and_reexport_chains_preserve_alias_identity_cold_and_warm() {
+        let mut fixture = fixture(
+            &[
+                r#"import { "public value" as localValue } from "./barrel-b";"#,
+                r#"export { "intermediate value" as "public value" } from "./barrel-a";"#,
+                r#"export { original as "intermediate value" } from "./base";"#,
+                "export const original: number = 1;",
+            ],
+            &[
+                Route {
+                    source: 0,
+                    specifier: 0,
+                    target: Some(1),
+                },
+                Route {
+                    source: 1,
+                    specifier: 0,
+                    target: Some(2),
+                },
+                Route {
+                    source: 2,
+                    specifier: 0,
+                    target: Some(3),
+                },
+            ],
+        );
+        let import = fixture.plan_import(0, 0);
+        let public = fixture.plan_reexport(1, 0);
+        let intermediate = fixture.plan_reexport(2, 0);
+
+        assert_eq!(import.bindings[0].imported_text, "public value");
+        assert_eq!(import.bindings[0].local_text, "localValue");
+        assert_eq!(public.bindings[0].imported_text, "intermediate value");
+        assert_eq!(public.bindings[0].exported_text, "public value");
+        assert_eq!(intermediate.bindings[0].imported_text, "original");
+        assert_eq!(intermediate.bindings[0].exported_text, "intermediate value");
+
+        let resolved_imports = resolve_all(&mut fixture, &import.bindings).unwrap();
+        let resolved_public = resolve_all_reexports(&mut fixture, &public.bindings).unwrap();
+        let resolved_intermediate =
+            resolve_all_reexports(&mut fixture, &intermediate.bindings).unwrap();
+        let public_alias = direct_export(&fixture, 1, "public value");
+        let intermediate_alias = direct_export(&fixture, 2, "intermediate value");
+        let original = direct_export(&fixture, 3, "original");
+
+        assert_eq!(resolved_imports[0].immediate_target_symbol, public_alias);
+        assert_eq!(resolved_imports[0].target_symbol, original);
+        assert_eq!(
+            resolved_public[0].immediate_target_symbol,
+            intermediate_alias
+        );
+        assert_eq!(resolved_public[0].target_symbol, original);
+        assert_eq!(resolved_intermediate[0].immediate_target_symbol, original);
+        assert_eq!(resolved_intermediate[0].target_symbol, original);
+
+        let warm = store_state(&fixture.store);
+        assert_eq!(
+            resolve_all(&mut fixture, &import.bindings).unwrap(),
+            resolved_imports
+        );
+        assert_eq!(
+            resolve_all_reexports(&mut fixture, &public.bindings).unwrap(),
+            resolved_public
+        );
+        assert_eq!(
+            resolve_all_reexports(&mut fixture, &intermediate.bindings).unwrap(),
+            resolved_intermediate
+        );
+        assert_eq!(store_state(&fixture.store), warm);
     }
 
     #[test]
