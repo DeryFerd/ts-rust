@@ -17764,15 +17764,23 @@ fn issue_implicit_any_parameter_diagnostics(
         if has_jsdoc_annotation {
             continue;
         }
+        let diagnostic = if parameter.rest {
+            Diagnostic::with_arguments(
+                message_by_code(7019).ok_or(SourceCheckError::MissingDiagnostic(7019))?,
+                [identifier.text.clone()],
+            )
+        } else {
+            Diagnostic::with_arguments(
+                message_by_code(7006).ok_or(SourceCheckError::MissingDiagnostic(7006))?,
+                [identifier.text.clone(), "any".to_owned()],
+            )
+        };
         merge_retry_diagnostic(
             diagnostics,
             CanonicalCheckerDiagnostic {
                 node: Some(parameter.declaration),
                 range_override: None,
-                diagnostic: Diagnostic::with_arguments(
-                    message_by_code(7006).ok_or(SourceCheckError::MissingDiagnostic(7006))?,
-                    [identifier.text.clone(), "any".to_owned()],
-                ),
+                diagnostic,
                 related_information: Vec::new(),
             },
         );
@@ -41404,6 +41412,74 @@ mod tests {
             } else {
                 assert!(context.diagnostics().is_empty());
             }
+        }
+    }
+
+    #[test]
+    fn unannotated_rest_parameters_use_ts7019_and_ordinary_parameters_keep_ts7006() {
+        for (index, enabled) in [false, true].into_iter().enumerate() {
+            let source = parsed("function collect(first, ...values) {}");
+            let file = FileId::new(8_273 + u32::try_from(index).unwrap());
+            let mut context = context(
+                &[(file, &source)],
+                CanonicalCheckerOptions {
+                    no_implicit_any: enabled,
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+
+            context.check_source_file(file).unwrap();
+
+            if enabled {
+                let [ordinary, rest] = context.diagnostics().as_slice() else {
+                    panic!("expected ordinary and rest implicit-any diagnostics")
+                };
+                assert_eq!(ordinary.diagnostic.code(), 7006);
+                assert_eq!(
+                    ordinary.diagnostic.render().unwrap(),
+                    "Parameter 'first' implicitly has an 'any' type."
+                );
+                assert_eq!(node_text(&source, ordinary.node.unwrap()), "first");
+                assert_eq!(rest.diagnostic.code(), 7019);
+                assert_eq!(
+                    rest.diagnostic.render().unwrap(),
+                    "Rest parameter 'values' implicitly has an 'any[]' type."
+                );
+                assert_eq!(node_text(&source, rest.node.unwrap()), "...values");
+            } else {
+                assert!(context.diagnostics().is_empty());
+            }
+
+            let declaration = function_declaration(&source, file, "collect");
+            let (_, bound) = context.file(file).unwrap();
+            let owner = bound.symbol(declaration).unwrap();
+            let callable = context
+                .store()
+                .source_callable_type_for_owner(owner)
+                .unwrap();
+            let signature = context
+                .store()
+                .source_callable_provenance(callable)
+                .unwrap()
+                .signature;
+            assert!(
+                context
+                    .store()
+                    .signature(signature)
+                    .unwrap()
+                    .has_rest_parameter()
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .callable_signature_parameter_types(signature)
+                    .and_then(|types| types.last().copied()),
+                Some(context.global_types().any_array_type)
+            );
+
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
         }
     }
 
