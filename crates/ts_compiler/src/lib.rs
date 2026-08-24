@@ -50,6 +50,7 @@ use ts_printer::{
     emit_declaration_file_with_semantics_and_options, emit_source_file_with_context,
     runtime_identifier_uses, source_needs_extends_helper,
 };
+use ts_scanner::Scanner;
 use ts_sourcemap::{SourceMap, SourceMapBuilder};
 use ts_vfs::FileSystem;
 
@@ -1895,6 +1896,9 @@ impl Program {
             }
         });
         program.load_remaining_program_graph(file_system);
+        if let Some(diagnostic) = program.common_source_directory_diagnostic(file_system) {
+            program.diagnostics.push(diagnostic);
+        }
         let settings = program.options.printer_settings();
         if settings.emit_javascript || settings.emit_declarations {
             let diagnostics = program.canonical_output_diagnostics();
@@ -1961,6 +1965,118 @@ impl Program {
             &self.current_directory,
             self.case_sensitivity,
         )
+    }
+
+    fn common_source_directory_diagnostic(
+        &self,
+        file_system: &dyn FileSystem,
+    ) -> Option<ProgramDiagnostic> {
+        if self.options.no_emit || self.options.composite {
+            return None;
+        }
+        let config_file = self.config_file_path.as_deref()?;
+        let config_source = file_system.read_file(config_file).ok()?;
+        if self.has_explicit_config_root_directory(config_file, &config_source) {
+            return None;
+        }
+        let (option, fallback) = if self.options.out_file.is_some() {
+            ("outFile", None)
+        } else if self.options.out_dir.is_some() {
+            ("outDir", Some("declarationDir"))
+        } else if self.options.declaration && self.options.declaration_dir.is_some() {
+            ("declarationDir", None)
+        } else {
+            return None;
+        };
+        let emitted_sources = self
+            .source_files
+            .iter()
+            .filter(|source| {
+                !source.is_default_library
+                    && !ts_path::is_declaration_file(&source.file_name)
+                    && self.source_should_emit(source)
+            })
+            .map(|source| source.file_name.clone())
+            .collect::<Vec<_>>();
+        if emitted_sources.is_empty() {
+            return None;
+        }
+        let inferred_directory = ts_outputpaths::common_source_directory(
+            &emitted_sources,
+            &self.current_directory,
+            self.case_sensitivity,
+        );
+        if inferred_directory.is_empty()
+            || canonicalize(
+                &self.common_source_directory(),
+                &self.current_directory,
+                self.case_sensitivity,
+            ) == canonicalize(
+                &inferred_directory,
+                &self.current_directory,
+                self.case_sensitivity,
+            )
+        {
+            return None;
+        }
+
+        let range = compiler_option_key_range(config_file, &config_source, option, fallback)?;
+        let relative = ts_path::relative_path_from_directory(
+            &directory_path(config_file),
+            &inferred_directory,
+            self.case_sensitivity,
+        );
+        let relative = if relative.starts_with('.') || is_absolute(&relative) {
+            relative
+        } else {
+            format!("./{relative}")
+        };
+        let config_name = config_file.rsplit('/').next().unwrap_or(config_file);
+        let message = message_by_code(5011)?;
+        let migration = message_by_code(5111)?;
+        let message = format!(
+            "{}\n  {}",
+            message.format(&[config_name.to_owned(), relative]).ok()?,
+            migration.text(),
+        );
+        Some(ProgramDiagnostic {
+            file_name: Some(config_file.to_owned()),
+            range: Some(range),
+            code: Some(5011),
+            category: Category::Error,
+            message,
+            related_information: Vec::new(),
+        })
+    }
+
+    fn has_explicit_config_root_directory(&self, file_name: &str, source: &str) -> bool {
+        let Some(root_directory) = self.options.root_dir.as_deref() else {
+            return false;
+        };
+        let explicitly_configured =
+            ts_config::parse_jsonc(file_name, source)
+                .value
+                .is_some_and(|config| {
+                    config
+                        .as_object()
+                        .and_then(|root| root.get("compilerOptions"))
+                        .and_then(ts_config::JsonValue::as_object)
+                        .is_some_and(|options| {
+                            options
+                                .keys()
+                                .any(|key| key.eq_ignore_ascii_case("rootDir"))
+                        })
+                });
+        explicitly_configured
+            || canonicalize(
+                root_directory,
+                &self.current_directory,
+                self.case_sensitivity,
+            ) != canonicalize(
+                &directory_path(file_name),
+                &self.current_directory,
+                self.case_sensitivity,
+            )
     }
 
     fn canonical_output_diagnostics(&self) -> Vec<ProgramDiagnostic> {
@@ -2187,6 +2303,9 @@ impl Program {
             options_result.options,
         );
         program.config_file_path = Some(config.path);
+        if let Some(diagnostic) = program.common_source_directory_diagnostic(file_system) {
+            config_diagnostics.push(diagnostic);
+        }
         config_diagnostics.append(&mut program.diagnostics);
         program.diagnostics = config_diagnostics;
         program
@@ -8594,6 +8713,64 @@ fn type_definition_not_found(name: &str) -> ProgramDiagnostic {
     }
 }
 
+fn compiler_option_key_range(
+    file_name: &str,
+    source: &str,
+    primary: &str,
+    fallback: Option<&str>,
+) -> Option<TextRange> {
+    let parsed = ts_config::parse_jsonc(file_name, source).value?;
+    let root = parsed.as_object()?;
+    let options = root.get("compilerOptions")?.as_object()?;
+    let selected = std::iter::once(primary)
+        .chain(fallback)
+        .find_map(|option| options.keys().find(|key| key.eq_ignore_ascii_case(option)));
+
+    let mut scanner = Scanner::new(source);
+    let mut object_depth = 0usize;
+    let mut options_depth = None;
+    let mut pending_options = false;
+    loop {
+        let token = scanner.scan();
+        match token.kind {
+            SyntaxKind::EndOfFile => return None,
+            SyntaxKind::OpenBraceToken => {
+                object_depth = object_depth.checked_add(1)?;
+                if pending_options {
+                    options_depth = Some(object_depth);
+                    pending_options = false;
+                }
+            }
+            SyntaxKind::CloseBraceToken => {
+                if options_depth == Some(object_depth) {
+                    options_depth = None;
+                }
+                object_depth = object_depth.checked_sub(1)?;
+            }
+            SyntaxKind::StringLiteral => {
+                let value = token.value.as_ref()?.to_string_lossy();
+                let checkpoint = scanner.mark();
+                let is_property = scanner.scan().kind == SyntaxKind::ColonToken;
+                scanner.rewind(checkpoint);
+                if !is_property {
+                    continue;
+                }
+                if object_depth == 1 && value == "compilerOptions" {
+                    if selected.is_none() {
+                        return Some(token.range);
+                    }
+                    pending_options = true;
+                } else if options_depth == Some(object_depth)
+                    && selected.is_some_and(|selected| value.eq_ignore_ascii_case(selected))
+                {
+                    return Some(token.range);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn config_diagnostic(diagnostic: &ConfigDiagnostic) -> ProgramDiagnostic {
     ProgramDiagnostic {
         file_name: Some(diagnostic.file_name.clone()),
@@ -14331,6 +14508,121 @@ export function create() { return new M.Value(); }"#,
             .unwrap();
         assert!(javascript.text.contains("exports.value"));
         assert!(javascript.text.contains("sourceMappingURL=main.js.map"));
+    }
+
+    #[test]
+    fn config_reports_inferred_common_source_directory_on_output_option() {
+        let fs = MemoryFileSystem::new(true);
+        let config = concat!(
+            "{\n",
+            "    \"files\": [\"src/index.ts\", \"lib/globals.d.ts\"],\n",
+            "    \"compilerOptions\": {\n",
+            "        // \"outDir\": \"ignored\"\n",
+            "        \"outDir\": \"bin\",\n",
+            "        \"declaration\": true,\n",
+            "        \"noLib\": true\n",
+            "    }\n",
+            "}\n",
+        );
+        fs.write_file("/app/tsconfig.json", config).unwrap();
+        fs.write_file("/app/lib/globals.d.ts", "declare const outside: number;")
+            .unwrap();
+        fs.write_file("/app/src/index.ts", "export const value: number = 1;")
+            .unwrap();
+
+        let program = Program::from_config(&fs, "/app/tsconfig.json");
+        let [diagnostic] = program.diagnostics() else {
+            panic!(
+                "expected one inferred root diagnostic: {:?}",
+                program.diagnostics()
+            )
+        };
+        let start = u32::try_from(config.rfind("\"outDir\"").unwrap()).unwrap();
+        assert_eq!(diagnostic.code, Some(5011));
+        assert_eq!(diagnostic.file_name.as_deref(), Some("/app/tsconfig.json"));
+        assert_eq!(
+            diagnostic.range,
+            Some(TextRange::new(TextPos::new(start), TextPos::new(start + 8)))
+        );
+        assert_eq!(
+            diagnostic.message,
+            concat!(
+                "The common source directory of 'tsconfig.json' is './src'. ",
+                "The 'rootDir' setting must be explicitly set to this or another path ",
+                "to adjust your output's file layout.\n",
+                "  Visit https://aka.ms/ts6 for migration information.",
+            )
+        );
+    }
+
+    #[test]
+    fn canonical_config_reports_inferred_common_source_directory() {
+        let fs = MemoryFileSystem::new(true);
+        let config = "{\"compilerOptions\":{\"outDir\":\"bin\"}}";
+        fs.write_file("/app/tsconfig.json", config).unwrap();
+        fs.write_file("/app/src/index.ts", "export const value: number = 1;")
+            .unwrap();
+
+        let program = Program::try_new_with_canonical_checker_with_config_path(
+            &fs,
+            "/app",
+            &["src/index.ts".to_owned()],
+            CompilerOptions {
+                lib: Some(vec!["es5".to_owned()]),
+                out_dir: Some("/app/bin".to_owned()),
+                root_dir: Some("/app".to_owned()),
+                ..CompilerOptions::default()
+            },
+            Some("/app/tsconfig.json"),
+        )
+        .unwrap();
+
+        let [diagnostic] = program.diagnostics() else {
+            panic!(
+                "expected one canonical root diagnostic: {:?}",
+                program.diagnostics()
+            )
+        };
+        assert_eq!(diagnostic.code, Some(5011));
+        let range = diagnostic.range.unwrap();
+        assert_eq!(
+            &config[range.start.get() as usize..range.end.get() as usize],
+            "\"outDir\""
+        );
+    }
+
+    #[test]
+    fn common_source_directory_diagnostic_respects_project_output_guards() {
+        for (extra, file_name) in [
+            (", \"rootDir\": \"src\"", "src/index.ts"),
+            (", \"noEmit\": true", "src/index.ts"),
+            (", \"composite\": true", "src/index.ts"),
+            ("", "index.ts"),
+        ] {
+            let fs = MemoryFileSystem::new(true);
+            fs.write_file(
+                "/app/tsconfig.json",
+                &format!(
+                    "{{\"files\":[\"{file_name}\"],\"compilerOptions\":{{\"outDir\":\"bin\",\"noLib\":true{extra}}}}}"
+                ),
+            )
+            .unwrap();
+            fs.write_file(
+                &format!("/app/{file_name}"),
+                "export const value: number = 1;",
+            )
+            .unwrap();
+
+            let program = Program::from_config(&fs, "/app/tsconfig.json");
+            assert!(
+                program
+                    .diagnostics()
+                    .iter()
+                    .all(|diagnostic| diagnostic.code != Some(5011)),
+                "{file_name} with {extra}: {:?}",
+                program.diagnostics(),
+            );
+        }
     }
 
     #[test]
