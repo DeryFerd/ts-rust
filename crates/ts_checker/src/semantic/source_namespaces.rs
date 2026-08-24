@@ -60,6 +60,7 @@ pub(super) enum SourceNamespaceMemberPlan {
         declaration: NodeRef,
         symbol: SemanticSymbolId,
         annotation: NodeRef,
+        parameter_annotations: Vec<NodeRef>,
         deferred: bool,
     },
     Interface {
@@ -2123,9 +2124,10 @@ fn plan_type_alias_member(
             annotation_record.parent,
         ));
     }
-    let deferred = bound
+    let declaration_file = bound
         .source_facts()
-        .is_some_and(ts_binder::CanonicalSourceFileFacts::is_declaration_file)
+        .is_some_and(ts_binder::CanonicalSourceFileFacts::is_declaration_file);
+    let deferred = declaration_file
         && annotation_record.kind != SyntaxKind::IntrinsicKeyword
         && alias
             .type_parameters
@@ -2174,10 +2176,39 @@ fn plan_type_alias_member(
     } else {
         false
     };
+    let mut parameter_annotations = Vec::new();
+    if declaration_file && !deferred {
+        for parameter in alias
+            .type_parameters
+            .iter()
+            .flat_map(|parameters| &parameters.nodes)
+        {
+            let parameter = child(declaration, *parameter);
+            let parameter_record = owned_node(arena, bound, store, parameter)?;
+            let NodeData::TypeParameterDeclaration(data) = &parameter_record.data else {
+                return Err(SourceCheckError::Provenance(
+                    SourceCheckProvenanceError::MissingDeclarationSymbol(parameter),
+                ));
+            };
+            for annotation in [data.constraint, data.default_type].into_iter().flatten() {
+                let annotation = child(parameter, annotation);
+                let annotation_record = owned_node(arena, bound, store, annotation)?;
+                if annotation_record.parent != Some(parameter.node) {
+                    return Err(invalid_parent(
+                        annotation,
+                        parameter,
+                        annotation_record.parent,
+                    ));
+                }
+                parameter_annotations.push(annotation);
+            }
+        }
+    }
     Ok(SourceNamespaceMemberPlan::TypeAlias {
         declaration,
         symbol,
         annotation,
+        parameter_annotations,
         deferred,
     })
 }
@@ -6572,10 +6603,15 @@ fn namespace_annotations<'plan>(
             }
             SourceNamespaceMemberPlan::TypeAlias {
                 annotation,
+                parameter_annotations,
                 deferred: false,
                 ..
+            } => {
+                annotations.extend(parameter_annotations.iter().copied());
+                annotations.push(*annotation);
+                declarations.push(member);
             }
-            | SourceNamespaceMemberPlan::AmbientVariable { annotation, .. } => {
+            SourceNamespaceMemberPlan::AmbientVariable { annotation, .. } => {
                 annotations.push(*annotation);
                 declarations.push(member);
             }
@@ -9843,6 +9879,7 @@ mod tests {
                     symbol,
                     annotation,
                     deferred,
+                    ..
                 } => Some((*declaration, *symbol, *annotation, *deferred)),
                 _ => None,
             })
@@ -9903,7 +9940,7 @@ mod tests {
         let mut fixture = declaration_fixture(
             concat!(
                 "declare module 'prop-types' { ",
-                "export type InferProps<V> = V & V; ",
+                "export type InferProps<V = string> = V & V; ",
                 "}",
             ),
             CanonicalModuleState::Script,
@@ -10113,16 +10150,28 @@ mod tests {
 
     #[test]
     fn ambient_generic_namespace_aliases_do_not_hide_missing_type_names() {
-        for source in [
-            "declare module 'prop-types' { export type Broken<T> = Missing<T>; }",
-            "declare module 'prop-types' { export type Broken<T extends Missing> = T; }",
-            "declare module 'prop-types' { export type Broken<T = Missing> = T; }",
+        for (source, expected_parameter_annotations) in [
+            (
+                "declare module 'prop-types' { export type Broken<T> = Missing<T>; }",
+                0,
+            ),
+            (
+                "declare module 'prop-types' { export type Broken<T extends Missing> = T; }",
+                1,
+            ),
+            (
+                "declare module 'prop-types' { export type Broken<T = Missing> = T; }",
+                1,
+            ),
         ] {
             let mut fixture = declaration_fixture(source, CanonicalModuleState::Script);
             let namespace = plan(&fixture, 0);
             let [
                 SourceNamespaceMemberPlan::TypeAlias {
-                    symbol, deferred, ..
+                    symbol,
+                    deferred,
+                    parameter_annotations,
+                    ..
                 },
             ] = namespace.members.as_slice()
             else {
@@ -10130,6 +10179,11 @@ mod tests {
             };
             let symbol = *symbol;
             assert!(!*deferred, "{source}");
+            assert_eq!(
+                parameter_annotations.len(),
+                expected_parameter_annotations,
+                "{source}",
+            );
             let before = (
                 fixture.context.store().type_len(),
                 fixture.context.store().symbol_len(),
@@ -10157,6 +10211,56 @@ mod tests {
                 before,
             );
         }
+    }
+
+    #[test]
+    fn source_check_reports_missing_ambient_generic_alias_defaults_before_publication() {
+        let mut fixture = declaration_fixture(
+            "declare module 'prop-types' { export type Broken<T = Missing> = T; }",
+            CanonicalModuleState::Script,
+        );
+        let namespace = plan(&fixture, 0);
+        let [
+            SourceNamespaceMemberPlan::TypeAlias {
+                symbol,
+                deferred,
+                parameter_annotations,
+                ..
+            },
+        ] = namespace.members.as_slice()
+        else {
+            panic!("the declaration module must retain its generic alias")
+        };
+        let symbol = *symbol;
+        assert!(!*deferred);
+        let [default] = parameter_annotations.as_slice() else {
+            panic!("the generic alias must retain its missing default annotation")
+        };
+        let default = *default;
+        let before = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+
+        assert!(matches!(
+            fixture.context.check_source_file(fixture.file),
+            Err(SourceCheckError::DeclaredType(
+                DeclaredTypeError::TypeNodeUnavailable(TypeNodeUnavailable::MissingTypeReference(
+                    node,
+                ))
+            )) if node == default
+        ));
+        assert!(fixture.context.store().type_alias_links(symbol).is_none());
+        assert!(fixture.context.store().type_node_links(default).is_none());
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            before,
+        );
     }
 
     #[test]

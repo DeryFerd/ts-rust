@@ -20368,8 +20368,28 @@ fn preflight_source_namespace_annotations(
                 ..
             } if store.type_alias_links(*symbol).is_none()
                 && store.type_node_links(*annotation).is_none() => {}
-            SourceNamespaceMemberPlan::TypeAlias { annotation, .. }
-            | SourceNamespaceMemberPlan::AmbientVariable { annotation, .. } => {
+            SourceNamespaceMemberPlan::TypeAlias {
+                annotation,
+                parameter_annotations,
+                ..
+            } => {
+                for annotation in parameter_annotations
+                    .iter()
+                    .chain(std::iter::once(annotation))
+                {
+                    session.reset_query();
+                    CanonicalTypeQuery::new_with_global_types_and_session(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        session,
+                        diagnostics,
+                    )?
+                    .preflight_type_from_type_node(*annotation)?;
+                }
+            }
+            SourceNamespaceMemberPlan::AmbientVariable { annotation, .. } => {
                 session.reset_query();
                 CanonicalTypeQuery::new_with_global_types_and_session(
                     store,
