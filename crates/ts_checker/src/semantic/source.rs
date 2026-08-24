@@ -17660,6 +17660,24 @@ fn issue_source_enum_diagnostics(
     Ok(())
 }
 
+fn issue_unreachable_source_enum_diagnostic(
+    bound: &BoundFile,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    enumeration: &SourceEnumPlan,
+) -> Result<(), SourceCheckError> {
+    if options.allow_unreachable_code != Some(false) {
+        return Ok(());
+    }
+    if enumeration
+        .is_unreachable_runtime_declaration(bound, options.should_preserve_const_enums())
+        .map_err(|error| SourcePlanner::enum_plan_error(enumeration.declaration, error))?
+    {
+        issue_node_diagnostic(diagnostics, enumeration.declaration, 7027)?;
+    }
+    Ok(())
+}
+
 /// Reports TS1200 on the exact arrow token when its preceding trivia crosses a line.
 fn issue_arrow_line_terminator_diagnostic(
     host: &DeclaredTypeHost<'_>,
@@ -19481,7 +19499,6 @@ fn check_planned_linear_function_statements(
                     execute_local_enum(store, host, enumeration).map_err(|error| {
                         SourcePlanner::enum_plan_error(enumeration.declaration, error)
                     })?;
-                issue_source_enum_diagnostics(diagnostics, enumeration)?;
                 stage_value_type(
                     store,
                     staged_value_types,
@@ -19619,6 +19636,17 @@ fn check_planned_linear_function_statements(
                 {
                     return Err(SourceCheckError::Enum(enumeration.declaration));
                 }
+                if let Some(expression) = statements.return_expression.as_ref() {
+                    emit_enum_use_before_declaration_diagnostics(
+                        store,
+                        host,
+                        options,
+                        diagnostics,
+                        expression,
+                    )?;
+                }
+                issue_unreachable_source_enum_diagnostic(bound, options, diagnostics, enumeration)?;
+                issue_source_enum_diagnostics(diagnostics, enumeration)?;
             }
             PlannedLinearFunctionStatement::ParameterAssignment(assignment) => {
                 let snapshot = frame
@@ -30155,6 +30183,147 @@ mod tests {
             context.recheck_source_file(file).unwrap();
             assert_eq!(observable_state(&context, file), warm);
         }
+    }
+
+    #[test]
+    fn unreachable_enum_diagnostics_follow_runtime_preservation_and_replay_warm() {
+        let source = parsed(concat!(
+            "function regular() { return Regular.A; enum Regular { A } } ",
+            "function constant() { return Fixed.A; const enum Fixed { A } }",
+        ));
+        for (
+            index,
+            allow_unreachable_code,
+            preserve_const_enums,
+            isolated_modules,
+            verbatim_module_syntax,
+            expected,
+        ) in [
+            (0, None, false, false, false, &[(2450, "Regular")][..]),
+            (1, Some(true), true, false, false, &[(2450, "Regular")][..]),
+            (
+                2,
+                Some(false),
+                false,
+                false,
+                false,
+                &[(2450, "Regular"), (7027, "enum Regular { A }")][..],
+            ),
+            (
+                3,
+                Some(false),
+                true,
+                false,
+                false,
+                &[
+                    (2450, "Regular"),
+                    (7027, "enum Regular { A }"),
+                    (7027, "const enum Fixed { A }"),
+                ][..],
+            ),
+            (
+                4,
+                Some(false),
+                false,
+                true,
+                false,
+                &[
+                    (2450, "Regular"),
+                    (7027, "enum Regular { A }"),
+                    (2450, "Fixed"),
+                    (7027, "const enum Fixed { A }"),
+                ][..],
+            ),
+            (
+                5,
+                Some(false),
+                false,
+                false,
+                true,
+                &[
+                    (2450, "Regular"),
+                    (7027, "enum Regular { A }"),
+                    (7027, "const enum Fixed { A }"),
+                ][..],
+            ),
+        ] {
+            let file = FileId::new(8_690 + index);
+            let mut context = context(
+                &[(file, &source)],
+                CanonicalCheckerOptions {
+                    allow_unreachable_code,
+                    preserve_const_enums,
+                    isolated_modules,
+                    name_resolution: CanonicalNameResolverOptions {
+                        verbatim_module_syntax,
+                        ..CanonicalNameResolverOptions::default()
+                    },
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+
+            context.check_source_file(file).unwrap();
+
+            let actual = context
+                .diagnostics()
+                .as_slice()
+                .iter()
+                .map(|diagnostic| {
+                    (
+                        diagnostic.diagnostic.code(),
+                        node_text(&source, diagnostic.node.unwrap()),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(actual.as_slice(), expected);
+            let warm = observable_state(&context, file);
+
+            context.recheck_source_file(file).unwrap();
+
+            assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
+    fn local_enum_initializer_diagnostics_follow_unreachable_diagnostics() {
+        let source = parsed(concat!(
+            "function invalid() { ",
+            "return Broken.Infinite; ",
+            "const enum Broken { Infinite = 1 / 0, Unknown = missing } ",
+            "}",
+        ));
+        let file = FileId::new(8_700);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                allow_unreachable_code: Some(false),
+                isolated_modules: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2450, 7027, 2477, 2474],
+        );
+        assert_eq!(node_text(&source, diagnostics[0].node.unwrap()), "Broken");
+        assert_eq!(
+            node_text(&source, diagnostics[1].node.unwrap()),
+            "const enum Broken { Infinite = 1 / 0, Unknown = missing }",
+        );
+        assert_eq!(node_text(&source, diagnostics[2].node.unwrap()), "1 / 0");
+        assert_eq!(node_text(&source, diagnostics[3].node.unwrap()), "missing");
+        let warm = observable_state(&context, file);
+
+        context.recheck_source_file(file).unwrap();
+
+        assert_eq!(observable_state(&context, file), warm);
     }
 
     #[test]

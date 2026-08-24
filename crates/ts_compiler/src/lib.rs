@@ -3965,6 +3965,7 @@ impl Program {
             no_unchecked_indexed_access: self.options.no_unchecked_indexed_access,
             no_unused_locals: self.options.no_unused_locals,
             allow_unreachable_code: self.options.allow_unreachable_code,
+            preserve_const_enums: self.options.preserve_const_enums,
             isolated_modules: self.options.isolated_modules,
             jsx_runtime: if self.options.jsx_runtime_module_specifier().is_some() {
                 CanonicalJsxRuntime::Automatic
@@ -10207,6 +10208,7 @@ mod tests {
                 lib: Some(vec!["es5".to_owned()]),
                 no_unused_locals: true,
                 allow_unreachable_code: Some(false),
+                preserve_const_enums: true,
                 isolated_modules: true,
                 ..CompilerOptions::default()
             },
@@ -10215,13 +10217,14 @@ mod tests {
                 (
                     options.no_unused_locals,
                     options.allow_unreachable_code,
+                    options.preserve_const_enums,
                     options.isolated_modules,
                 )
             },
         )
         .unwrap();
 
-        assert_eq!(projected, Some((true, Some(false), true)));
+        assert_eq!(projected, Some((true, Some(false), true, true)));
         assert!(
             program.diagnostics().is_empty(),
             "{:?}",

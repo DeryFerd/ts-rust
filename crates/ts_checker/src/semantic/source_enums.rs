@@ -19,7 +19,7 @@
 use std::collections::HashSet;
 
 use ts_ast::{Node, NodeData, NodeRef, SyntaxKind};
-use ts_binder::{CheckFlags, SemanticSymbolId, SymbolFlags};
+use ts_binder::{BoundFile, CheckFlags, SemanticSymbolId, SymbolFlags};
 
 use super::{
     CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost,
@@ -71,6 +71,48 @@ pub(super) struct SourceEnumPlan {
     pub(super) export_route: SourceEnumExportRoute,
     pub(super) is_const: bool,
     pub(super) is_ambient: bool,
+}
+
+impl SourceEnumPlan {
+    /// Returns whether this function-owned enum produces unreachable runtime code.
+    pub(super) fn is_unreachable_runtime_declaration(
+        &self,
+        bound: &BoundFile,
+        preserve_const_enums: bool,
+    ) -> Result<bool, SourceEnumError> {
+        let Some(lexical_owner) = self.lexical_owner else {
+            return Ok(false);
+        };
+        if !self
+            .declaration
+            .is_for(bound.node_arena_id(), bound.file_id())
+            || !bound.contains(self.declaration)
+            || bound.container(self.declaration) != Some(lexical_owner)
+            || bound.block_scope_container(self.declaration) != Some(lexical_owner)
+            || bound.symbol(self.declaration) != Some(self.declaration_symbol)
+            || bound.flow_graph().container_is_complete(lexical_owner) != Some(true)
+        {
+            return Err(invariant(SourceEnumInvariant::InvalidLocalStatement(
+                self.declaration,
+            )));
+        }
+        match bound.flow_container(self.declaration) {
+            Some(flow_owner) if flow_owner == lexical_owner => {}
+            None => return Ok(false),
+            Some(_) => {
+                return Err(invariant(SourceEnumInvariant::InvalidLocalStatement(
+                    self.declaration,
+                )));
+            }
+        }
+        let unreachable = bound
+            .flow_graph()
+            .is_unreachable(self.declaration)
+            .ok_or_else(|| {
+                invariant(SourceEnumInvariant::InvalidLocalStatement(self.declaration))
+            })?;
+        Ok(unreachable && !self.is_ambient && (!self.is_const || preserve_const_enums))
+    }
 }
 
 /// Valid source forms intentionally outside this first enum statement cut.
@@ -974,6 +1016,75 @@ mod tests {
                 warm,
             );
         }
+    }
+
+    #[test]
+    fn unreachable_local_enums_follow_runtime_preservation() {
+        let fixture = fixture(
+            concat!(
+                "function regular() { ",
+                "return Regular.First; enum Regular { First = 1 } ",
+                "} ",
+                "function constant() { ",
+                "return Fixed.Ready; const enum Fixed { Ready = 3 } ",
+                "} ",
+                "function conditional(value: number) { ",
+                "if (value) const enum Active { Ready = 1 } ",
+                "}",
+            ),
+            CanonicalModuleState::Script,
+            false,
+        );
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+
+        let regular_owner = statement(&fixture, 0);
+        let regular = plan_local_enum(
+            &fixture.store,
+            &host,
+            local_enum(&fixture, regular_owner, "Regular"),
+            regular_owner,
+        )
+        .unwrap();
+        assert_eq!(
+            regular.is_unreachable_runtime_declaration(bound, false),
+            Ok(true),
+        );
+        assert_eq!(
+            regular.is_unreachable_runtime_declaration(bound, true),
+            Ok(true),
+        );
+
+        let constant_owner = statement(&fixture, 1);
+        let constant = plan_local_const_enum(
+            &fixture.store,
+            &host,
+            local_enum(&fixture, constant_owner, "Fixed"),
+            constant_owner,
+        )
+        .unwrap();
+        assert_eq!(
+            constant.is_unreachable_runtime_declaration(bound, false),
+            Ok(false),
+        );
+        assert_eq!(
+            constant.is_unreachable_runtime_declaration(bound, true),
+            Ok(true),
+        );
+
+        let conditional_owner = statement(&fixture, 2);
+        let conditional = plan_local_const_enum(
+            &fixture.store,
+            &host,
+            local_enum(&fixture, conditional_owner, "Active"),
+            conditional_owner,
+        )
+        .unwrap();
+        assert_eq!(bound.flow_container(conditional.declaration), None);
+        assert_eq!(
+            conditional.is_unreachable_runtime_declaration(bound, true),
+            Ok(false),
+        );
     }
 
     #[test]

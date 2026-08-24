@@ -109,6 +109,7 @@ impl CanonicalJsxRuntimeEvidence<'_> {
 /// `no_unused_locals` enables diagnostics for unreferenced local declarations.
 /// `allow_unreachable_code` preserves whether unreachable-code diagnostics were
 /// explicitly enabled, explicitly suppressed, or left at their default.
+/// `preserve_const_enums` retains const enums as executable declarations.
 /// `isolated_modules` enables per-file module restrictions.
 /// `jsx_runtime` retains classic or automatic JSX factory requirements.
 /// `emit_common_js` and `no_emit` preserve the emission conditions needed for
@@ -128,6 +129,7 @@ pub struct CanonicalCheckerOptions {
     pub no_unchecked_indexed_access: bool,
     pub no_unused_locals: bool,
     pub allow_unreachable_code: Option<bool>,
+    pub preserve_const_enums: bool,
     pub isolated_modules: bool,
     pub jsx_runtime: CanonicalJsxRuntime,
     pub emit_common_js: bool,
@@ -149,6 +151,7 @@ impl From<IntrinsicBootstrapOptions> for CanonicalCheckerOptions {
             no_unchecked_indexed_access: false,
             no_unused_locals: false,
             allow_unreachable_code: None,
+            preserve_const_enums: false,
             isolated_modules: false,
             jsx_runtime: CanonicalJsxRuntime::Preserve,
             emit_common_js: false,
@@ -157,6 +160,15 @@ impl From<IntrinsicBootstrapOptions> for CanonicalCheckerOptions {
             no_error_truncation: false,
             name_resolution: CanonicalNameResolverOptions::default(),
         }
+    }
+}
+
+impl CanonicalCheckerOptions {
+    pub(super) const fn should_preserve_const_enums(self) -> bool {
+        self.preserve_const_enums
+            || self.isolated_modules
+            || self.name_resolution.isolated_modules
+            || self.name_resolution.verbatim_module_syntax
     }
 }
 
@@ -3011,6 +3023,8 @@ mod tests {
         assert!(!defaults.no_unchecked_indexed_access);
         assert!(!defaults.no_unused_locals);
         assert_eq!(defaults.allow_unreachable_code, None);
+        assert!(!defaults.preserve_const_enums);
+        assert!(!defaults.should_preserve_const_enums());
         assert!(!defaults.isolated_modules);
         assert_eq!(defaults.jsx_runtime, CanonicalJsxRuntime::Preserve);
         assert!(!defaults.emit_common_js);
@@ -3030,11 +3044,43 @@ mod tests {
         assert!(!options.no_unchecked_indexed_access);
         assert!(!options.no_unused_locals);
         assert_eq!(options.allow_unreachable_code, None);
+        assert!(!options.preserve_const_enums);
+        assert!(!options.should_preserve_const_enums());
         assert!(!options.isolated_modules);
         assert_eq!(options.jsx_runtime, CanonicalJsxRuntime::Preserve);
         assert!(!options.emit_common_js);
         assert!(!options.no_emit);
         assert!(!options.no_error_truncation);
+    }
+
+    #[test]
+    fn const_enum_preservation_follows_explicit_and_isolated_module_options() {
+        for options in [
+            CanonicalCheckerOptions {
+                preserve_const_enums: true,
+                ..CanonicalCheckerOptions::default()
+            },
+            CanonicalCheckerOptions {
+                isolated_modules: true,
+                ..CanonicalCheckerOptions::default()
+            },
+            CanonicalCheckerOptions {
+                name_resolution: CanonicalNameResolverOptions {
+                    isolated_modules: true,
+                    ..CanonicalNameResolverOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+            CanonicalCheckerOptions {
+                name_resolution: CanonicalNameResolverOptions {
+                    verbatim_module_syntax: true,
+                    ..CanonicalNameResolverOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        ] {
+            assert!(options.should_preserve_const_enums());
+        }
     }
 
     #[test]
@@ -3233,6 +3279,7 @@ mod tests {
             no_unchecked_indexed_access: true,
             no_unused_locals: true,
             allow_unreachable_code: Some(false),
+            preserve_const_enums: true,
             isolated_modules: true,
             emit_common_js: true,
             no_emit: true,
@@ -3291,6 +3338,8 @@ mod tests {
         assert!(context.options().no_unchecked_indexed_access);
         assert!(context.options().no_unused_locals);
         assert_eq!(context.options().allow_unreachable_code, Some(false));
+        assert!(context.options().preserve_const_enums);
+        assert!(context.options().should_preserve_const_enums());
         assert!(context.options().isolated_modules);
         assert!(context.options().emit_common_js);
         assert!(context.options().no_emit);
