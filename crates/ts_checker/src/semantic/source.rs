@@ -5054,6 +5054,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 expression: self.plan_expression(expression)?,
             });
         }
+        if let [statement] = statements.as_slice()
+            && self.is_recovered_empty_for_in_function_body(callable, self.reference(*statement))?
+        {
+            return Ok(PlannedFunctionBody::Empty);
+        }
         if !statements.is_empty() {
             return self.plan_function_statements(callable);
         }
@@ -5063,6 +5068,100 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             ));
         }
         Ok(PlannedFunctionBody::Empty)
+    }
+
+    /// Accepts only a parser-recovered `for (let in)` with no iterable.
+    fn is_recovered_empty_for_in_function_body(
+        &self,
+        callable: &SourceCallablePlan,
+        statement: NodeRef,
+    ) -> Result<bool, SourceCheckError> {
+        if callable.family != SourceCallableFamily::FunctionDeclaration
+            || !callable.parameters.is_empty()
+            || !callable.type_parameters.is_empty()
+            || !callable.return_type.is_inferred()
+            || callable.is_async
+            || callable.owner_parent.is_some()
+            || callable.export_local.is_some()
+            || self.node(callable.declaration)?.parent != Some(self.source.node_ref().node)
+        {
+            return Ok(false);
+        }
+
+        let record = self.node(statement)?;
+        let NodeData::ForInOrOfStatement(loop_data) = &record.data else {
+            return Ok(false);
+        };
+        if record.kind != SyntaxKind::ForInStatement
+            || record.flags.0 != 0
+            || record.parent != Some(callable.body.node)
+            || loop_data.await_modifier.is_some()
+            || loop_data.flow_node.is_some()
+            || loop_data.next_container.is_some()
+            || loop_data.facts != 0
+        {
+            return Ok(false);
+        }
+
+        let initializer = self.reference(loop_data.initializer);
+        let initializer_record = self.node(initializer)?;
+        let NodeData::VariableDeclarationList(declarations) = &initializer_record.data else {
+            return Ok(false);
+        };
+        if initializer_record.kind != SyntaxKind::VariableDeclarationList
+            || initializer_record.flags.0 != NODE_FLAG_LET
+            || initializer_record.parent != Some(statement.node)
+            || !declarations.declarations.nodes.is_empty()
+            || declarations.declarations.has_trailing_comma
+            || declarations.declarations.range.start != declarations.declarations.range.end
+            || declarations.declarations.range.start != initializer_record.range.end
+            || declarations.facts != 0
+        {
+            return Ok(false);
+        }
+
+        let missing = self.reference(loop_data.expression);
+        let missing_record = self.node(missing)?;
+        let NodeData::Identifier(identifier) = &missing_record.data else {
+            return Ok(false);
+        };
+        if missing_record.kind != SyntaxKind::Identifier
+            || missing_record.flags.0 != NODE_FLAG_HAS_ERROR
+            || missing_record.parent != Some(statement.node)
+            || missing_record.range.start != missing_record.range.end
+            || !identifier.text.is_empty()
+            || identifier.flow_node.is_some()
+        {
+            return Ok(false);
+        }
+
+        let body = self.reference(loop_data.statement);
+        let body_record = self.node(body)?;
+        let NodeData::Block(block) = &body_record.data else {
+            return Ok(false);
+        };
+        if body_record.kind != SyntaxKind::Block
+            || body_record.flags.0 != 0
+            || body_record.parent != Some(statement.node)
+            || body_record.range.start < missing_record.range.end
+            || block.flow_node.is_some()
+            || block.next_container.is_some()
+            || block.statements.has_trailing_comma
+            || block.facts != 0
+        {
+            return Ok(false);
+        }
+
+        let Some(source) = self.arena.source_text() else {
+            return Ok(false);
+        };
+        let Ok(start) = usize::try_from(initializer_record.range.end.get()) else {
+            return Ok(false);
+        };
+        let Ok(end) = usize::try_from(missing_record.range.start.get()) else {
+            return Ok(false);
+        };
+        Ok(source.get(start..end) == Some("in") && source.as_bytes().get(end) == Some(&b')'))
     }
 
     fn plan_function_statements(
@@ -13081,6 +13180,7 @@ fn check_planned_arrow_argument(
     {
         return Err(SourceCheckError::Arrow(expression));
     }
+    issue_arrow_line_terminator_diagnostic(host, diagnostics, expression)?;
     let contextual_property = if !host
         .bound_file(expression)
         .and_then(BoundFile::source_facts)
@@ -13127,20 +13227,32 @@ fn check_planned_arrow_argument(
         let contextual_type = contextual_type.ok_or(SourceCheckError::Unsupported(
             UnsupportedSourceSyntax::Arrow(expression),
         ))?;
-        return check_contextual_direct_call_arrow(
-            store,
-            host,
-            global_types,
-            source,
-            options,
-            session,
-            diagnostics,
-            current_flow_types,
-            preflighted_type_import_value_uses,
-            deferred,
-            arrow,
-            contextual_type,
+        let zero_parameter_target = matches!(
+            validate_stored_single_callable(store, contextual_type),
+            StoredSingleCallableValidation::Valid { callable, .. }
+                if callable.parameters.is_empty()
+                    && callable.min_argument_count == 0
+                    && callable.rest_parameter.is_none()
+                    && store.signature(callable.signature).is_some_and(|signature| {
+                        signature.type_parameters().is_empty() && !signature.has_rest_parameter()
+                    })
         );
+        if !zero_parameter_target {
+            return check_contextual_direct_call_arrow(
+                store,
+                host,
+                global_types,
+                source,
+                options,
+                session,
+                diagnostics,
+                current_flow_types,
+                preflighted_type_import_value_uses,
+                deferred,
+                arrow,
+                contextual_type,
+            );
+        }
     }
     let materialized = materialize_checked_source_callable(
         store,
@@ -13907,6 +14019,61 @@ fn issue_node_diagnostic(
             related_information: Vec::new(),
         },
     );
+    Ok(())
+}
+
+/// Reports TS1200 on the exact arrow token when its preceding trivia crosses a line.
+fn issue_arrow_line_terminator_diagnostic(
+    host: &DeclaredTypeHost<'_>,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    declaration: NodeRef,
+) -> Result<(), SourceCheckError> {
+    let record = host
+        .node(declaration)
+        .ok_or(SourceCheckError::Arrow(declaration))?;
+    let NodeData::ArrowFunction(arrow) = &record.data else {
+        return Err(SourceCheckError::Arrow(declaration));
+    };
+    let token = NodeRef::new(
+        declaration.arena,
+        declaration.file,
+        arrow.equals_greater_than_token,
+    );
+    let token_record = host.node(token).ok_or(SourceCheckError::Arrow(token))?;
+    if token_record.kind != SyntaxKind::EqualsGreaterThanToken
+        || token_record.parent != Some(declaration.node)
+    {
+        return Err(SourceCheckError::Arrow(token));
+    }
+
+    let previous_end = match arrow.type_ {
+        Some(annotation) => {
+            let annotation = NodeRef::new(declaration.arena, declaration.file, annotation);
+            host.node(annotation)
+                .ok_or(SourceCheckError::Arrow(annotation))?
+                .range
+                .end
+        }
+        None => arrow.parameters.range.end,
+    };
+    let Some(source) = host
+        .source(declaration)
+        .and_then(|(arena, _)| arena.source_text())
+    else {
+        return Ok(());
+    };
+    let start = usize::try_from(previous_end.get()).map_err(|_| SourceCheckError::Arrow(token))?;
+    let end = usize::try_from(token_record.range.start.get())
+        .map_err(|_| SourceCheckError::Arrow(token))?;
+    let trivia = source
+        .get(start..end)
+        .ok_or(SourceCheckError::Arrow(token))?;
+    if trivia
+        .chars()
+        .any(|character| matches!(character, '\n' | '\r' | '\u{2028}' | '\u{2029}'))
+    {
+        issue_node_diagnostic(diagnostics, token, 1200)?;
+    }
     Ok(())
 }
 
@@ -19316,6 +19483,11 @@ pub(super) fn check_source_file(
                 let arrow = arrows
                     .get(index)
                     .ok_or(SourceCheckError::Arrow(source.node_ref()))?;
+                issue_arrow_line_terminator_diagnostic(
+                    host,
+                    diagnostics,
+                    arrow.source.callable.declaration,
+                )?;
                 let materialized = materialize_checked_source_callable(
                     store,
                     host,
@@ -19433,6 +19605,11 @@ pub(super) fn check_source_file(
                 let arrow = contextual_arrows
                     .get(index)
                     .ok_or(SourceCheckError::Arrow(source.node_ref()))?;
+                issue_arrow_line_terminator_diagnostic(
+                    host,
+                    diagnostics,
+                    arrow.source.declaration,
+                )?;
                 let (target, _) = materialize_contextual_source_arrow(
                     store,
                     host,
@@ -21116,6 +21293,101 @@ mod tests {
             AliasTargetState::Resolved(target) => target,
             state => panic!("import alias {alias:?} is not resolved: {state:?}"),
         }
+    }
+
+    #[test]
+    fn recovered_empty_for_in_function_preserves_parser_diagnostics_and_warm_state() {
+        let source = parse_source_file(concat!(
+            "let values: string[] = [];\n",
+            "let index = 0;\n",
+            "function read() {\n",
+            "  for (let in) {\n",
+            "    let value = values[index];\n",
+            "    return value;\n",
+            "  }\n",
+            "}\n",
+        ));
+        let [diagnostic] = source.diagnostics.as_slice() else {
+            panic!("expected the missing for-in iterable diagnostic")
+        };
+        assert_eq!(diagnostic.code, Some(1109));
+        let file = FileId::new(8_372);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let values = variable_symbol(&context, &source, file, "values");
+        let index = variable_symbol(&context, &source, file, "index");
+        let ignored_local = variable_symbol(&context, &source, file, "value");
+        let owner = function_symbol(&context, &source, file, "read");
+        let missing = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                matches!(
+                    &record.data,
+                    NodeData::Identifier(identifier)
+                        if identifier.text.is_empty()
+                            && record.flags.0 == NODE_FLAG_HAS_ERROR
+                )
+                .then_some(NodeRef::new(source.arena.id(), file, node))
+            })
+            .expect("the malformed loop retains a missing iterable");
+
+        context.check_source_file(file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
+        for symbol in [values, index] {
+            assert!(
+                context
+                    .store()
+                    .value_symbol_links(symbol)
+                    .and_then(|links| links.resolved_type)
+                    .is_some()
+            );
+        }
+        assert!(context.store().value_symbol_links(ignored_local).is_none());
+        assert!(context.store().type_node_links(missing).is_none());
+        let callable = context
+            .store()
+            .source_callable_type_for_owner(owner)
+            .unwrap();
+        let signature = context
+            .store()
+            .source_callable_provenance(callable)
+            .unwrap()
+            .signature;
+        assert_eq!(
+            context
+                .store()
+                .signature(signature)
+                .and_then(super::super::signatures::Signature::resolved_return_type),
+            Some(context.store().intrinsic_bootstrap().unwrap().void_type),
+        );
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn ordinary_for_in_function_remains_unsupported_before_publication() {
+        let source = parsed("function read() { for (let value in source) {} }");
+        let file = FileId::new(8_373);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let owner = function_symbol(&context, &source, file, "read");
+        let cold = observable_state(&context, file);
+
+        assert!(matches!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Function(SourceFunctionUnsupported::FunctionBody(_))
+            ))
+        ));
+        assert_eq!(observable_state(&context, file), cold);
+        assert!(
+            context
+                .store()
+                .source_callable_type_for_owner(owner)
+                .is_none()
+        );
     }
 
     #[test]
@@ -30576,6 +30848,144 @@ mod tests {
                 .signature(provenance.signature)
                 .and_then(super::super::signatures::Signature::resolved_return_type),
             Some(bootstrap.void_type),
+        );
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn zero_parameter_callback_targets_preserve_return_and_extra_parameter_diagnostics() {
+        let source = parsed(concat!(
+            "function accept(callback: () => number): void {}\n",
+            "accept(() => {});\n",
+            "accept((first, second, third, fourth) => {});\n",
+            "accept(value => 1 +\n  2);\n",
+        ));
+        let file = FileId::new(8_374);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let rendered = context
+            .diagnostics()
+            .as_slice()
+            .iter()
+            .map(|diagnostic| diagnostic.diagnostic.render().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rendered,
+            [
+                concat!(
+                    "Argument of type '() => void' is not assignable to parameter ",
+                    "of type '() => number'.\n",
+                    "  Type 'void' is not assignable to type 'number'.",
+                ),
+                concat!(
+                    "Argument of type '(first: any, second: any, third: any, fourth: any) ",
+                    "=> void' is not assignable to parameter of type '() => number'.\n",
+                    "  Target signature provides too few arguments. ",
+                    "Expected 4 or more, but got 0.",
+                ),
+                concat!(
+                    "Argument of type '(value: any) => number' is not assignable to ",
+                    "parameter of type '() => number'.\n",
+                    "  Target signature provides too few arguments. ",
+                    "Expected 1 or more, but got 0.",
+                ),
+            ],
+        );
+
+        let mut arrows = source
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::ArrowFunction).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .collect::<Vec<_>>();
+        arrows.sort_by_key(|arrow| source.arena.get(arrow.node).unwrap().range.start);
+        let (_, bound) = context.file(file).unwrap();
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        for (arrow, (expected_count, expected_return)) in arrows.into_iter().zip([
+            (0, bootstrap.void_type),
+            (4, bootstrap.void_type),
+            (1, bootstrap.number_type),
+        ]) {
+            let owner = bound.symbol(arrow).unwrap();
+            let callable = context
+                .store()
+                .source_callable_type_for_owner(owner)
+                .unwrap();
+            let provenance = context
+                .store()
+                .source_callable_provenance(callable)
+                .unwrap();
+            assert!(provenance.contextual_target.is_none());
+            let signature = context.store().signature(provenance.signature).unwrap();
+            assert_eq!(signature.parameters().len(), expected_count);
+            assert_eq!(signature.resolved_return_type(), Some(expected_return));
+            for parameter in signature.parameters() {
+                assert_eq!(
+                    context
+                        .store()
+                        .value_symbol_links(*parameter)
+                        .and_then(|links| links.resolved_type),
+                    Some(bootstrap.any_type),
+                );
+            }
+        }
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn arrow_line_terminator_diagnostics_use_only_the_exact_arrow_token() {
+        let source = parsed(concat!(
+            "function accept(callback: () => number): void {}\n",
+            "accept(()\n    => {});\n",
+            "accept((first,\n    second) => {});\n",
+            "accept(() /* same line */ => {});\n",
+            "accept(() /* crossed\n    */ => {});\n",
+        ));
+        let file = FileId::new(8_375);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let grammar = context
+            .diagnostics()
+            .as_slice()
+            .iter()
+            .filter(|diagnostic| diagnostic.diagnostic.code() == 1200)
+            .collect::<Vec<_>>();
+        assert_eq!(grammar.len(), 2);
+        for diagnostic in grammar {
+            let node = diagnostic.node.expect("TS1200 retains its arrow token");
+            assert_eq!(
+                source.arena.get(node.node).unwrap().kind,
+                SyntaxKind::EqualsGreaterThanToken
+            );
+            assert_eq!(node_text(&source, node), "=>");
+            assert_eq!(
+                diagnostic.diagnostic.render().unwrap(),
+                "Line terminator not permitted before arrow."
+            );
+        }
+        assert_eq!(
+            context
+                .diagnostics()
+                .as_slice()
+                .iter()
+                .filter(|diagnostic| diagnostic.diagnostic.code() == 2345)
+                .count(),
+            4,
         );
 
         let warm = observable_state(&context, file);

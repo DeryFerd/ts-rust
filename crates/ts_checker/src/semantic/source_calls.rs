@@ -1633,6 +1633,65 @@ fn extra_argument_diagnostic_range(
     ))
 }
 
+fn arrow_argument_diagnostic_range(
+    host: &DeclaredTypeHost<'_>,
+    argument: &PlannedExpression,
+) -> Result<Option<CanonicalCheckerDiagnosticRange>, SourceCheckError> {
+    let argument = argument.unparenthesized();
+    if !matches!(argument.kind, PlannedExpressionKind::Arrow(_)) {
+        return Ok(None);
+    }
+
+    let record = host
+        .node(argument.node)
+        .ok_or(SourceCheckError::Call(argument.node))?;
+    let NodeData::ArrowFunction(arrow) = &record.data else {
+        return Err(SourceCheckError::Call(argument.node));
+    };
+    let body = NodeRef::new(argument.node.arena, argument.node.file, arrow.body);
+    let body = host
+        .node(body)
+        .ok_or(SourceCheckError::Call(argument.node))?;
+    if body.kind != SyntaxKind::Block {
+        return Ok(None);
+    }
+
+    let token = NodeRef::new(
+        argument.node.arena,
+        argument.node.file,
+        arrow.equals_greater_than_token,
+    );
+    let token = host
+        .node(token)
+        .ok_or(SourceCheckError::Call(argument.node))?;
+    let Some(source) = host
+        .source(argument.node)
+        .and_then(|(arena, _)| arena.source_text())
+    else {
+        return Ok(None);
+    };
+    let start = usize::try_from(token.range.end.get())
+        .map_err(|_| SourceCheckError::Call(argument.node))?;
+    let end =
+        usize::try_from(body.range.end.get()).map_err(|_| SourceCheckError::Call(argument.node))?;
+    let text = source
+        .get(start..end)
+        .ok_or(SourceCheckError::Call(argument.node))?;
+    let Some(line_break) = text.find(['\n', '\r', '\u{2028}', '\u{2029}']) else {
+        return Ok(None);
+    };
+    let end = start
+        .checked_add(line_break)
+        .and_then(|end| u32::try_from(end).ok())
+        .map(TextPos::new)
+        .ok_or(SourceCheckError::Call(argument.node))?;
+
+    Ok(Some(CanonicalCheckerDiagnosticRange::new(
+        argument.node,
+        TextRange::new(record.range.start, end),
+    )))
+}
+
 fn missing_argument_related_information(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -1962,7 +2021,7 @@ fn prepare_source_argument_mismatch_diagnostics(
 
     Ok(vec![CanonicalCheckerDiagnostic {
         node: Some(argument.unparenthesized().node),
-        range_override: None,
+        range_override: arrow_argument_diagnostic_range(host, argument)?,
         diagnostic: Diagnostic::with_arguments(
             message_by_code(code).ok_or(SourceCheckError::MissingDiagnostic(code))?,
             [display.source, display.target],
@@ -5196,6 +5255,61 @@ mod tests {
                 (2345, return_type.to_owned()),
             ],
         );
+
+        let calls = calls(&parsed, file);
+        let cold = calls
+            .iter()
+            .map(|call| call_publication_state(&context, *call))
+            .collect::<Vec<_>>();
+        mark_source_unchecked(&mut context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .map(|call| call_publication_state(&context, *call))
+                .collect::<Vec<_>>(),
+            cold,
+        );
+    }
+
+    #[test]
+    fn multiline_block_arrow_argument_diagnostics_stop_at_the_first_body_line() {
+        let text = concat!(
+            "function accept(callback: (value: number) => number): void {}\n",
+            "function identity<T>(value: T): T { return value; }\n",
+            "accept((value: number) => {});\n",
+            "accept((value: number) => {\n});\n",
+            "accept((value: number) =>\n// body comment\n{\n});\n",
+            "identity<(value: number) => number>((value: number) => {\r\n});\n",
+            "accept((value: number) =>\n'wrong');",
+        );
+        let parsed = parsed(text);
+        let file = FileId::new(477);
+        let mut context = context(&parsed, file);
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 5, "{diagnostics:?}");
+        let expected = [
+            ("(value: number) => {}", false),
+            ("(value: number) => {", true),
+            ("(value: number) =>", true),
+            ("(value: number) => {", true),
+            ("(value: number) =>\n'wrong'", false),
+        ];
+        for (diagnostic, (expected_text, overridden)) in diagnostics.iter().zip(expected) {
+            assert_eq!(diagnostic.diagnostic.code(), 2345);
+            assert_eq!(diagnostic.range_override.is_some(), overridden);
+            let node = diagnostic.node.expect("TS2345 must retain its arrow");
+            let range = diagnostic.range_override.map_or_else(
+                || parsed.arena.get(node.node).unwrap().range,
+                CanonicalCheckerDiagnosticRange::range,
+            );
+            let start = usize::try_from(range.start.get()).unwrap();
+            let end = usize::try_from(range.end.get()).unwrap();
+            assert_eq!(&text[start..end], expected_text);
+        }
 
         let calls = calls(&parsed, file);
         let cold = calls

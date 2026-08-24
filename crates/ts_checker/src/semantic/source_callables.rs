@@ -1438,11 +1438,12 @@ fn plan_source_callable_with_owner_shape(
         body_mode,
         array_targets,
     );
-    let eligible_implicit_any_arrow = view.family == SourceCallableFamily::ArrowFunction
-        && view.parameters.nodes.len() == 1
+    let implicit_any_arrow_shape = view.family == SourceCallableFamily::ArrowFunction
+        && !view.parameters.nodes.is_empty()
         && !view.parameters.has_trailing_comma
         && view.return_type.is_none()
         && type_parameters.is_empty();
+    let eligible_implicit_any_arrow = implicit_any_arrow_shape && view.parameters.nodes.len() == 1;
     let direct_implicit_any_arrow = eligible_implicit_any_arrow
         && is_direct_noncontextual_source_arrow(store, host, declaration)?;
     let array_implicit_any_arrow = eligible_implicit_any_arrow
@@ -1452,11 +1453,13 @@ fn plan_source_callable_with_owner_shape(
         && !direct_implicit_any_arrow
         && !array_implicit_any_arrow
         && source_object_property_arrow_symbol(store, host, declaration)?.is_some();
-    let direct_call_argument_arrow = eligible_implicit_any_arrow
+    let direct_call_argument_arrow = implicit_any_arrow_shape
         && !direct_implicit_any_arrow
         && !array_implicit_any_arrow
         && !object_property_arrow
-        && source_direct_call_argument_arrow_is_exact(store, host, declaration)?;
+        && source_direct_call_argument_arrow_is_exact(store, host, declaration)?
+        && (eligible_implicit_any_arrow
+            || source_direct_call_arrow_has_zero_parameter_target(store, host, declaration)?);
     let javascript_object_implicit_any_arrow = eligible_implicit_any_arrow
         && object_property_arrow
         && bound
@@ -1633,8 +1636,7 @@ fn plan_source_callable_with_owner_shape(
                         && view.parameters.range.end > parameter_record.range.end
                     || object_property_arrow
                         && view.parameters.nodes.as_slice() == [parameter.node]
-                    || direct_call_argument_arrow
-                        && view.parameters.nodes.as_slice() == [parameter.node])
+                    || direct_call_argument_arrow)
                     || body_mode.is_ambient()
                     || !type_parameters.is_empty()
                     || rest
@@ -2216,6 +2218,132 @@ pub(super) fn source_direct_call_argument_arrow_is_exact(
         && store
             .symbol(callee_symbol)
             .is_some_and(|symbol| symbol.flags().contains(SymbolFlags::FUNCTION)))
+}
+
+/// Authenticates ordinary extra callback parameters against a zero-arity target.
+#[allow(clippy::too_many_lines)] // Keep the arrow, call, callee, and target proof together.
+pub(super) fn source_direct_call_arrow_has_zero_parameter_target(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+) -> Result<bool, SourceCallableError> {
+    let record = preflight_node(store, host, declaration)?;
+    let NodeData::ArrowFunction(arrow) = &record.data else {
+        return Ok(false);
+    };
+    if record.kind != SyntaxKind::ArrowFunction
+        || arrow.parameters.nodes.len() < 2
+        || arrow.parameters.has_trailing_comma
+        || arrow.type_parameters.is_some()
+        || arrow.type_.is_some()
+        || arrow.modifiers.is_some()
+    {
+        return Ok(false);
+    }
+    for parameter_id in &arrow.parameters.nodes {
+        let parameter = NodeRef::new(declaration.arena, declaration.file, *parameter_id);
+        let parameter_record = preflight_node(store, host, parameter)?;
+        let NodeData::ParameterDeclaration(parameter_data) = &parameter_record.data else {
+            return Ok(false);
+        };
+        if parameter_record.kind != SyntaxKind::Parameter
+            || parameter_record.parent != Some(declaration.node)
+            || parameter_data.type_.is_some()
+            || parameter_data.dot_dot_dot_token.is_some()
+            || parameter_data.question_token.is_some()
+            || parameter_data.initializer.is_some()
+            || parameter_data.modifiers.is_some()
+        {
+            return Ok(false);
+        }
+    }
+
+    let Some(SourceNodeParent::Parent(call)) = store.source_node_parent(declaration) else {
+        return Ok(false);
+    };
+    let call_record = preflight_node(store, host, call)?;
+    let NodeData::CallExpression(call_data) = &call_record.data else {
+        return Ok(false);
+    };
+    let Some(index) = call_data
+        .arguments
+        .nodes
+        .iter()
+        .position(|argument| *argument == declaration.node)
+    else {
+        return Ok(false);
+    };
+    let callee = NodeRef::new(call.arena, call.file, call_data.expression);
+    let callee_record = preflight_node(store, host, callee)?;
+    let NodeData::Identifier(callee_name) = &callee_record.data else {
+        return Ok(false);
+    };
+    let Some(bound) = host.bound_file(declaration) else {
+        return Ok(false);
+    };
+    let Some(symbol) = bound
+        .locals(bound.source_file())
+        .and_then(|locals| store.symbol_table(locals))
+        .and_then(|locals| locals.get_source(&callee_name.text))
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+    else {
+        return Ok(false);
+    };
+    let Some(owner) = store.symbol(symbol) else {
+        return Ok(false);
+    };
+    let Some([function]) = owner.declarations() else {
+        return Ok(false);
+    };
+    if owner.value_declaration() != Some(*function)
+        || bound.symbol(*function) != Some(symbol)
+        || store.source_node_parent(*function)
+            != Some(SourceNodeParent::Parent(bound.source_file()))
+    {
+        return Ok(false);
+    }
+    let function_record = preflight_node(store, host, *function)?;
+    let NodeData::FunctionDeclaration(function_data) = &function_record.data else {
+        return Ok(false);
+    };
+    if function_record.kind != SyntaxKind::FunctionDeclaration
+        || function_data.type_parameters.is_some()
+    {
+        return Ok(false);
+    }
+    let Some(parameter_id) = function_data.parameters.nodes.get(index).copied() else {
+        return Ok(false);
+    };
+    let parameter = NodeRef::new(function.arena, function.file, parameter_id);
+    let parameter_record = preflight_node(store, host, parameter)?;
+    let NodeData::ParameterDeclaration(parameter_data) = &parameter_record.data else {
+        return Ok(false);
+    };
+    let Some(annotation_id) = parameter_data.type_ else {
+        return Ok(false);
+    };
+    if parameter_record.kind != SyntaxKind::Parameter
+        || parameter_record.parent != Some(function.node)
+        || parameter_data.dot_dot_dot_token.is_some()
+    {
+        return Ok(false);
+    }
+    let annotation = NodeRef::new(parameter.arena, parameter.file, annotation_id);
+    let annotation_record = preflight_node(store, host, annotation)?;
+    let NodeData::FunctionTypeNode(target) = &annotation_record.data else {
+        return Ok(false);
+    };
+    Ok(annotation_record.kind == SyntaxKind::FunctionType
+        && annotation_record.parent == Some(parameter.node)
+        && annotation_record.flags.0 == 0
+        && target.full_signature.is_none()
+        && target.next_container.is_none()
+        && target.symbol.is_none()
+        && target.parameters.nodes.is_empty()
+        && !target.parameters.has_trailing_comma
+        && target.type_parameters.is_none()
+        && target.type_.is_some()
+        && target.modifiers.is_none())
 }
 
 fn stored_direct_call_argument_arrow_is_exact(
@@ -9838,6 +9966,160 @@ mod tests {
             StoredSourceCallableValidation::Valid(_)
         ));
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn zero_parameter_callback_targets_accept_multiple_implicit_any_parameters() {
+        let mut fixture = QueryFixture::new(
+            concat!(
+                "function consume(callback: () => number): void {} ",
+                "consume((first, second, third, fourth) => {});",
+            ),
+            FileId::new(1_218),
+        );
+        let declaration = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ArrowFunction).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let owner = fixture.bound.symbol(declaration).unwrap();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&fixture.parsed.arena, &fixture.bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let before = publication_state(&fixture.store);
+
+        assert_eq!(
+            source_direct_call_argument_arrow_is_exact(&fixture.store, &host, declaration),
+            Ok(true),
+        );
+        assert_eq!(
+            source_direct_call_arrow_has_zero_parameter_target(&fixture.store, &host, declaration,),
+            Ok(true),
+        );
+        let plan = plan_source_callable(&fixture.store, &host, declaration, owner, None).unwrap();
+        let any = fixture.store.intrinsic_bootstrap().unwrap().any_type;
+        assert_eq!(plan.parameters.len(), 4);
+        assert_eq!(plan.min_argument_count, 4);
+        assert!(plan.parameters.iter().all(|parameter| {
+            parameter.is_implicit_any() && parameter.base_type(&fixture.store) == Some(any)
+        }));
+        assert_eq!(publication_state(&fixture.store), before);
+        drop(host);
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let callable = fixture
+            .query_callable(declaration, owner, &mut diagnostics)
+            .unwrap();
+        let signature = fixture
+            .store
+            .source_callable_provenance(callable)
+            .unwrap()
+            .signature;
+        let void = fixture.store.intrinsic_bootstrap().unwrap().void_type;
+        publish_inferred_source_callable_return(&mut fixture.store, &plan, signature, void)
+            .unwrap();
+        let provenance = fixture.store.source_callable_provenance(callable).unwrap();
+        assert_eq!(provenance.contextual_target, None);
+        assert_eq!(provenance.contextual_variable, None);
+        assert_eq!(
+            fixture
+                .store
+                .callable_signature_parameter_types(provenance.signature),
+            Some([any, any, any, any].as_slice()),
+        );
+        assert!(matches!(
+            validate_stored_source_callable(&fixture.store, callable),
+            StoredSourceCallableValidation::Valid(_)
+        ));
+        let warm = publication_state(&fixture.store);
+        assert_eq!(
+            fixture.query_callable(declaration, owner, &mut diagnostics),
+            Ok(callable),
+        );
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&fixture.parsed.arena, &fixture.bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        assert_eq!(
+            plan_source_callable(&fixture.store, &host, declaration, owner, None),
+            Ok(plan),
+        );
+        assert_eq!(publication_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn multiple_implicit_any_callback_parameters_require_zero_arity_targets() {
+        for (index, source) in [
+            concat!(
+                "function consume(callback: (value: number) => number): void {} ",
+                "consume((first, second) => {});",
+            ),
+            concat!(
+                "function consume(callback: () => number): void {} ",
+                "consume((first: number, second) => {});",
+            ),
+            concat!(
+                "function consume(callback: () => number): void {} ",
+                "consume((first, second?) => {});",
+            ),
+            "const value = (first, second) => {};",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture =
+                QueryFixture::new(source, FileId::new(1_219 + u32::try_from(index).unwrap()));
+            let declaration = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::ArrowFunction).then_some(NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let owner = fixture.bound.symbol(declaration).unwrap();
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            let before = publication_state(&fixture.store);
+
+            assert_eq!(
+                source_direct_call_arrow_has_zero_parameter_target(
+                    &fixture.store,
+                    &host,
+                    declaration,
+                ),
+                Ok(false),
+                "{source}",
+            );
+            assert!(
+                matches!(
+                    plan_source_callable(&fixture.store, &host, declaration, owner, None),
+                    Err(SourceCallableError::Unsupported(
+                        SourceCallableUnsupported::MissingParameterType(_)
+                    ))
+                ),
+                "{source}",
+            );
+            assert_eq!(publication_state(&fixture.store), before);
+        }
     }
 
     #[test]

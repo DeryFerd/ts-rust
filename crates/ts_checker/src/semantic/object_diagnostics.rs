@@ -1165,7 +1165,7 @@ pub(super) fn missing_mapped_index_signature_details(
     Ok(vec![format!("  {detail}")])
 }
 
-/// Explains one incompatible required callable parameter or return type.
+/// Explains incompatible required callable parameters, arity, or return types.
 pub(super) fn callable_assignability_details(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -1198,65 +1198,94 @@ pub(super) fn callable_assignability_details(
     let (Some(source), Some(target)) = (source, target) else {
         return Ok(Vec::new());
     };
-    let ([source_parameter], [target_parameter]) =
-        (source.parameters.as_slice(), target.parameters.as_slice())
-    else {
-        return Ok(Vec::new());
-    };
     if source_callable.owner != source_type
         || target_callable.owner != target_type
         || source.owner != source_type
         || target.owner != target_type
         || source_callable.rest_parameter.is_some()
         || target_callable.rest_parameter.is_some()
-        || source_callable.parameters.as_slice() != [source_parameter.value_type]
-        || target_callable.parameters.as_slice() != [target_parameter.value_type]
-        || source_parameter.optional
-        || target_parameter.optional
-        || source_callable.min_argument_count != 1
-        || target_callable.min_argument_count != 1
+        || source_callable.parameters.len() != source.parameters.len()
+        || target_callable.parameters.len() != target.parameters.len()
+        || source
+            .parameters
+            .iter()
+            .zip(&source_callable.parameters)
+            .any(|(display, semantic)| display.optional || display.value_type != *semantic)
+        || target
+            .parameters
+            .iter()
+            .zip(&target_callable.parameters)
+            .any(|(display, semantic)| display.optional || display.value_type != *semantic)
+        || source_callable.min_argument_count > source.parameters.len()
+        || target_callable.min_argument_count > target.parameters.len()
         || source.return_type != source_callable.return_type
         || target.return_type != target_callable.return_type
     {
         return Ok(Vec::new());
     }
 
-    let contravariant = store.is_type_assignable_to_with_global_types_and_strict_function_types(
-        target_parameter.value_type,
-        source_parameter.value_type,
-        global_types,
-        options.strict_function_types,
-    )?;
-    let parameter_compatible = contravariant
-        || !options.strict_function_types
-            && store.is_type_assignable_to_with_global_types_and_strict_function_types(
-                source_parameter.value_type,
-                target_parameter.value_type,
-                global_types,
-                options.strict_function_types,
-            )?;
-    if !parameter_compatible {
-        let detail = Diagnostic::with_arguments(
-            message_by_code(2328).ok_or(SourceCheckError::MissingDiagnostic(2328))?,
-            [
-                source_parameter.name.as_str(),
-                target_parameter.name.as_str(),
-            ],
-        )
-        .render()
-        .expect("TS2328 has two formatting arguments");
-        return Ok(vec![
-            format!("  {detail}"),
-            nested_assignability_message(
-                store,
-                host,
-                global_types,
-                target_parameter.value_type,
-                source_parameter.value_type,
-                flags,
-                2,
-            )?,
-        ]);
+    match (source.parameters.as_slice(), target.parameters.as_slice()) {
+        (source_parameters, []) if target_callable.min_argument_count == 0 => {
+            if source_callable.min_argument_count > 0 {
+                let detail = Diagnostic::with_arguments(
+                    message_by_code(2849).ok_or(SourceCheckError::MissingDiagnostic(2849))?,
+                    [
+                        source_callable.min_argument_count.to_string(),
+                        target_callable.parameters.len().to_string(),
+                    ],
+                )
+                .render()
+                .expect("TS2849 has two formatting arguments");
+                return Ok(vec![format!("  {detail}")]);
+            }
+            if !source_parameters.is_empty() {
+                return Ok(Vec::new());
+            }
+        }
+        ([source_parameter], [target_parameter])
+            if source_callable.min_argument_count == 1
+                && target_callable.min_argument_count == 1 =>
+        {
+            let contravariant = store
+                .is_type_assignable_to_with_global_types_and_strict_function_types(
+                    target_parameter.value_type,
+                    source_parameter.value_type,
+                    global_types,
+                    options.strict_function_types,
+                )?;
+            let parameter_compatible = contravariant
+                || !options.strict_function_types
+                    && store.is_type_assignable_to_with_global_types_and_strict_function_types(
+                        source_parameter.value_type,
+                        target_parameter.value_type,
+                        global_types,
+                        options.strict_function_types,
+                    )?;
+            if !parameter_compatible {
+                let detail = Diagnostic::with_arguments(
+                    message_by_code(2328).ok_or(SourceCheckError::MissingDiagnostic(2328))?,
+                    [
+                        source_parameter.name.as_str(),
+                        target_parameter.name.as_str(),
+                    ],
+                )
+                .render()
+                .expect("TS2328 has two formatting arguments");
+                return Ok(vec![
+                    format!("  {detail}"),
+                    nested_assignability_message(
+                        store,
+                        host,
+                        global_types,
+                        target_parameter.value_type,
+                        source_parameter.value_type,
+                        flags,
+                        2,
+                    )?,
+                ]);
+            }
+        }
+        _ => return Ok(Vec::new()),
     }
 
     let source_return =
@@ -2449,6 +2478,133 @@ mod tests {
             .is_empty()
         );
         assert_eq!(context.store().relation_state_snapshot(), warmed);
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn zero_parameter_callable_targets_report_return_and_required_arity_details() {
+        let parsed = parse_source_file(concat!(
+            "const wrongReturn = (): void => {}; ",
+            "const oneExtra = (value: any): void => {}; ",
+            "const fourExtra = (a: any, b: any, c: any, d: any): void => {}; ",
+            "const compatible = (): number => 1; ",
+            "declare let target: () => number;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(219);
+        let mut context = diagnostic_context(&parsed, file);
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let bound = context.file(file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new([(&parsed.arena, &bound)]).unwrap();
+        let global_types = context.global_types().clone();
+        let variable_type = |expected: &str| {
+            let declaration = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::VariableDeclaration(variable) = &record.data else {
+                        return None;
+                    };
+                    let NodeData::Identifier(name) = &parsed.arena.get(variable.name)?.data else {
+                        return None;
+                    };
+                    (name.text == expected).then_some(NodeRef::new(parsed.arena.id(), file, node))
+                })
+                .unwrap();
+            let symbol = bound.symbol(declaration).unwrap();
+            context
+                .store()
+                .value_symbol_links(symbol)
+                .and_then(|links| links.resolved_type)
+                .unwrap()
+        };
+        let wrong_return = variable_type("wrongReturn");
+        let one_extra = variable_type("oneExtra");
+        let four_extra = variable_type("fourExtra");
+        let compatible = variable_type("compatible");
+        let target = variable_type("target");
+        let StoredSingleCallableValidation::Valid {
+            callable: target_callable,
+            ..
+        } = validate_stored_single_callable(context.store(), target)
+        else {
+            panic!("the target must retain one authenticated function signature")
+        };
+        let flags = CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT;
+        let options = CanonicalCheckerOptions::default();
+
+        assert_eq!(
+            callable_assignability_details(
+                context.store_mut_for_test(),
+                &host,
+                &global_types,
+                one_extra,
+                target,
+                flags,
+                options,
+            )
+            .unwrap(),
+            ["  Target signature provides too few arguments. Expected 1 or more, but got 0."],
+        );
+        assert_eq!(
+            callable_assignability_details(
+                context.store_mut_for_test(),
+                &host,
+                &global_types,
+                four_extra,
+                target,
+                flags,
+                options,
+            )
+            .unwrap(),
+            ["  Target signature provides too few arguments. Expected 4 or more, but got 0."],
+        );
+        assert!(matches!(
+            callable_assignability_details(
+                context.store_mut_for_test(),
+                &host,
+                &global_types,
+                wrong_return,
+                target,
+                flags,
+                options,
+            ),
+            Err(SourceCheckError::RelationUnavailable(
+                RelationUnavailable::UnresolvedSignatureReturn(signature)
+            )) if signature == target_callable.signature
+        ));
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(
+            context.get_return_type_of_signature(target_callable.signature),
+            Ok(number),
+        );
+        assert_eq!(
+            callable_assignability_details(
+                context.store_mut_for_test(),
+                &host,
+                &global_types,
+                wrong_return,
+                target,
+                flags,
+                options,
+            )
+            .unwrap(),
+            ["  Type 'void' is not assignable to type 'number'."],
+        );
+        assert!(
+            callable_assignability_details(
+                context.store_mut_for_test(),
+                &host,
+                &global_types,
+                compatible,
+                target,
+                flags,
+                options,
+            )
+            .unwrap()
+            .is_empty()
+        );
         assert!(context.diagnostics().is_empty());
     }
 
