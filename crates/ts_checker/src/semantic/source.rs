@@ -32818,12 +32818,20 @@ mod tests {
                     .and_then(|links| links.resolved_type),
                 Some(expected),
             );
+            let annotation = variable_type_node(&declaration, declaration_file, name);
+            let expected_annotation_cache = (!declaration
+                .arena
+                .get(annotation.node)
+                .unwrap()
+                .kind
+                .is_keyword_type())
+            .then_some(expected);
             assert_eq!(
                 context
                     .store()
-                    .type_node_links(variable_type_node(&declaration, declaration_file, name))
+                    .type_node_links(annotation)
                     .and_then(|links| links.resolved_type),
-                Some(expected),
+                expected_annotation_cache,
             );
             for read in identifier_expressions(&source, file, name) {
                 assert_eq!(
