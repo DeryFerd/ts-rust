@@ -3036,7 +3036,14 @@ fn execute_jsx_element(
                     )?;
                 }
                 if let Some(closing) = closing {
-                    check_jsx_closing_tag(store, source, namespace, closing, options, diagnostics)?;
+                    check_jsx_closing_tag(
+                        store,
+                        (arena, bound, host),
+                        namespace,
+                        closing,
+                        options,
+                        diagnostics,
+                    )?;
                 }
                 (intrinsic.attributes_type, signature)
             } else {
@@ -3062,7 +3069,14 @@ fn execute_jsx_element(
                     },
                 )?;
                 if let Some(closing) = closing {
-                    check_jsx_closing_tag(store, source, namespace, closing, options, diagnostics)?;
+                    check_jsx_closing_tag(
+                        store,
+                        (arena, bound, host),
+                        namespace,
+                        closing,
+                        options,
+                        diagnostics,
+                    )?;
                 }
                 (attributes_type, signature)
             };
