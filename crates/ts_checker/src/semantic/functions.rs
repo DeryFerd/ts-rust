@@ -22,6 +22,7 @@ use super::{
         cached_ordinary_type_parameter_owner, execute_type_parameter,
         explicit_type_parameter_symbols, preflight_node, preflight_type_parameter_symbol,
     },
+    jsdoc::{JsDocType, plan_javascript_source_jsdoc, validate_stored_source_jsdoc_function_type},
     links::{
         DecoratorSignatureState, EffectsSignatureState, ResolvedSignatureState, SignatureLinks,
         SymbolNodeLinks, TypeAliasLinks, TypeNodeLinks, ValueSymbolLinks,
@@ -969,6 +970,9 @@ pub(super) fn function_type_display_projection(
             _ => None,
         })
         .ok_or(FunctionTypeDisplayError::Malformed)?;
+    if store.source_node_kind(declaration) == Some(SyntaxKind::Parameter) {
+        return source_jsdoc_function_type_display_projection(store, host, type_, declaration);
+    }
     let (alias_symbol, alias_is_generic) = match record.alias() {
         None => (None, false),
         Some(alias) => {
@@ -1049,6 +1053,71 @@ pub(super) fn function_type_display_projection(
         owner: type_,
         parameters,
         return_type,
+    })
+}
+
+fn source_jsdoc_function_type_display_projection(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    type_: TypeId,
+    declaration: NodeRef,
+) -> Result<ValidatedSingleCallSignatureDisplay, FunctionTypeDisplayError> {
+    if validate_stored_source_jsdoc_function_type(store, type_).is_none() {
+        return Err(FunctionTypeDisplayError::Malformed);
+    }
+    let (arena, bound) = host
+        .source(declaration)
+        .ok_or(FunctionTypeDisplayError::Malformed)?;
+    let parameter = host
+        .node(declaration)
+        .ok_or(FunctionTypeDisplayError::Malformed)?;
+    let NodeData::ParameterDeclaration(parameter) = &parameter.data else {
+        return Err(FunctionTypeDisplayError::Malformed);
+    };
+    let name = NodeRef::new(declaration.arena, declaration.file, parameter.name);
+    let Some(NodeData::Identifier(identifier)) = host.node(name).map(|node| &node.data) else {
+        return Err(FunctionTypeDisplayError::Malformed);
+    };
+    let Some(SourceNodeParent::Parent(callable)) = store.source_node_parent(declaration) else {
+        return Err(FunctionTypeDisplayError::Malformed);
+    };
+    let comments = plan_javascript_source_jsdoc(arena, bound.source_file())
+        .map_err(|_| FunctionTypeDisplayError::Malformed)?;
+    let annotation = comments
+        .callable_declaration(arena, callable)
+        .and_then(|callable| callable.parameter(&identifier.text))
+        .and_then(super::jsdoc::PlannedJsDocParameter::type_)
+        .ok_or(FunctionTypeDisplayError::Malformed)?;
+    let JsDocType::Function(function) = annotation.type_() else {
+        return Err(FunctionTypeDisplayError::Malformed);
+    };
+    let signature = store
+        .signature_links(declaration)
+        .and_then(|links| links.resolved_signature.signature())
+        .ok_or(FunctionTypeDisplayError::Malformed)?;
+    let record = store
+        .signature(signature)
+        .ok_or(FunctionTypeDisplayError::Malformed)?;
+    let types = store
+        .callable_signature_parameter_types(signature)
+        .ok_or(FunctionTypeDisplayError::Malformed)?;
+    if function.parameters().len() != types.len() {
+        return Err(FunctionTypeDisplayError::Malformed);
+    }
+    let parameters = function
+        .parameters()
+        .iter()
+        .zip(types)
+        .map(|(parameter, type_)| ValidatedSingleCallParameterDisplay {
+            name: parameter.name().to_owned(),
+            value_type: *type_,
+            optional: parameter.is_optional(),
+        })
+        .collect();
+    Ok(ValidatedSingleCallSignatureDisplay {
+        owner: type_,
+        parameters,
+        return_type: record.resolved_return_type(),
     })
 }
 
@@ -1650,6 +1719,16 @@ pub(super) fn validate_stored_function_type(
     else {
         return not_function();
     };
+    if store.source_node_kind(declaration) == Some(SyntaxKind::Parameter) {
+        return if branded {
+            validate_stored_source_jsdoc_function_type(store, type_).map_or(
+                StoredFunctionTypeValidation::Malformed,
+                StoredFunctionTypeValidation::Valid,
+            )
+        } else {
+            not_function()
+        };
+    }
     if store.source_node_kind(declaration) != Some(SyntaxKind::FunctionType) {
         return not_function();
     }

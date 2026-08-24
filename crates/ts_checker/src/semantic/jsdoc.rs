@@ -11,7 +11,9 @@ use std::{
 };
 
 use ts_ast::{NodeArena, NodeData, NodeFlags, NodeId, NodeRef, SyntaxKind};
-use ts_binder::{CheckFlags, EscapedName, SymbolFlags, semantic::PreparedSymbolTable};
+use ts_binder::{
+    CheckFlags, EscapedName, SemanticSymbolId, SymbolFlags, semantic::PreparedSymbolTable,
+};
 use ts_core::{Diagnostic, DiagnosticCategory, TextPos, TextRange};
 use ts_diagnostics::{Category, Diagnostic as CheckerDiagnostic, message_by_code};
 use ts_jsnum::{Number, PseudoBigInt};
@@ -19,9 +21,15 @@ use ts_parser::{parse_jsdoc_comment, parse_source_file};
 
 use super::{
     ArrayTypeError, CanonicalCheckerDiagnostic, CanonicalCheckerDiagnosticRange,
-    CanonicalCheckerOptions, CanonicalGlobalTypes, CanonicalTypeMapperStore,
-    IntrinsicBootstrapOptions, TypeId, ValueSymbolLinks, bootstrap::UnionReduction,
-    types::ObjectFlags,
+    CanonicalCheckerOptions, CanonicalGlobalTypes, CanonicalTypeMapperStore, DeclaredTypeHost,
+    IntrinsicBootstrapOptions, ResolvedSignatureState, SignatureLinks, TypeId, TypeNodeLinks,
+    ValueSymbolLinks,
+    bootstrap::UnionReduction,
+    functions::{StoredFunctionTypeValidation, validate_stored_function_type},
+    signatures::SignatureFlags,
+    store::SourceNodeParent,
+    type_records::{ConstrainedTypeData, TypeCacheState, TypeData},
+    types::{ObjectFlags, TypeFlags},
 };
 
 const TYPE_PREFIX: &str = "type __JsDoc = ";
@@ -1595,6 +1603,416 @@ pub fn resolve_planned_jsdoc_type(
         annotation.resolution_type(),
         annotation.range(),
     )
+}
+
+/// Validates a nongeneric source-owned JSDoc function annotation without publishing a type.
+pub(super) fn preflight_source_jsdoc_function_type(
+    store: &CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    annotation: &PlannedJsDocType,
+) -> Result<(), JsDocTypeResolutionError> {
+    source_jsdoc_function_signature_types(store, global_types, options, annotation).map(|_| ())
+}
+
+/// Publishes a comment-defined callable on its real JavaScript parameter declaration.
+pub(super) fn resolve_source_jsdoc_function_type(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    declaration: NodeRef,
+    owner: SemanticSymbolId,
+    annotation: &PlannedJsDocType,
+) -> Result<TypeId, JsDocTypeResolutionError> {
+    let invalid = || JsDocTypeResolutionError::UnsupportedType {
+        kind: SyntaxKind::FunctionType,
+        range: annotation.range(),
+    };
+    let (parameter_types, return_type) =
+        source_jsdoc_function_signature_types(store, global_types, options, annotation)?;
+    let (arena, bound) = host.source(declaration).ok_or_else(invalid)?;
+    let record = host.node(declaration).ok_or_else(invalid)?;
+    let NodeData::ParameterDeclaration(parameter) = &record.data else {
+        return Err(invalid());
+    };
+    let Some(callable) = record
+        .parent
+        .map(|parent| NodeRef::new(declaration.arena, declaration.file, parent))
+    else {
+        return Err(invalid());
+    };
+    let name = NodeRef::new(declaration.arena, declaration.file, parameter.name);
+    let Some(NodeData::Identifier(identifier)) = host.node(name).map(|node| &node.data) else {
+        return Err(invalid());
+    };
+    let owner_record = store.symbol(owner).ok_or_else(invalid)?;
+    if record.kind != SyntaxKind::Parameter
+        || parameter.type_.is_some()
+        || parameter.initializer.is_some()
+        || parameter.question_token.is_some()
+        || parameter.dot_dot_dot_token.is_some()
+        || bound
+            .source_facts()
+            .is_none_or(|facts| !facts.is_javascript_file())
+        || store.source_node_kind(callable) != Some(SyntaxKind::FunctionDeclaration)
+        || bound.symbol(declaration) != Some(owner)
+        || store.get_merged_symbol(owner) != Some(owner)
+        || owner_record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+        || owner_record.check_flags() != CheckFlags::NONE
+        || owner_record.name().as_utf8() != Some(identifier.text.as_str())
+        || owner_record.declarations() != Some(&[declaration])
+        || owner_record.value_declaration() != Some(declaration)
+        || owner_record.members().is_some()
+        || owner_record.exports().is_some()
+        || owner_record.parent().is_some()
+        || owner_record.export_symbol().is_some()
+    {
+        return Err(invalid());
+    }
+
+    let comments =
+        plan_javascript_source_jsdoc(arena, bound.source_file()).map_err(|_| invalid())?;
+    if comments
+        .callable_declaration(arena, callable)
+        .and_then(|callable| callable.parameter(&identifier.text))
+        .and_then(PlannedJsDocParameter::type_)
+        != Some(annotation)
+    {
+        return Err(invalid());
+    }
+
+    if let Some(links) = store.type_node_links(declaration) {
+        let Some(cached) = links.resolved_type else {
+            return Err(invalid());
+        };
+        if links.outer_type_parameters.is_some()
+            || !matches!(
+                validate_stored_function_type(store, cached),
+                StoredFunctionTypeValidation::Valid(_)
+            )
+            || !source_jsdoc_function_signature_matches(
+                store,
+                declaration,
+                owner,
+                cached,
+                &parameter_types,
+                return_type,
+            )
+        {
+            return Err(invalid());
+        }
+        return Ok(cached);
+    }
+    if store
+        .signature_links(declaration)
+        .is_some_and(|links| links != &SignatureLinks::default())
+        || store
+            .value_symbol_links(owner)
+            .is_some_and(|links| links != &ValueSymbolLinks::default())
+        || !store.try_reserve_types(1)
+        || !store.try_reserve_signatures(1)
+        || !store.try_reserve_function_type_provenance(1)
+        || !store.try_reserve_checker_symbol_allocations(parameter_types.len(), 0)
+        || !store.try_reserve_value_symbol_links(parameter_types.len())
+        || !store.try_reserve_type_node_links(1)
+        || !store.try_reserve_signature_links(1)
+        || !store.try_reserve_callable_signature_parameter_types(1)
+    {
+        return Err(JsDocTypeResolutionError::ObjectConstruction(
+            annotation.range(),
+        ));
+    }
+
+    let parameters = parameter_types
+        .iter()
+        .map(|(name, type_)| {
+            let parameter = store.alloc_transient_symbol(
+                SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+                EscapedName::source(name),
+                CheckFlags::NONE,
+            );
+            assert!(store.set_value_symbol_links(
+                parameter,
+                ValueSymbolLinks {
+                    resolved_type: Some(*type_),
+                    ..ValueSymbolLinks::default()
+                },
+            ));
+            parameter
+        })
+        .collect::<Vec<_>>();
+    let type_ = store
+        .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(owner))
+        .ok_or_else(invalid)?;
+    assert!(store.set_function_type_provenance(type_));
+    assert!(store.set_type_node_links(
+        declaration,
+        TypeNodeLinks {
+            resolved_type: Some(type_),
+            ..TypeNodeLinks::default()
+        },
+    ));
+    let minimum = i32::try_from(parameters.len()).map_err(|_| invalid())?;
+    let signature = store
+        .alloc_signature(
+            SignatureFlags::NONE,
+            Some(declaration),
+            Vec::new(),
+            None,
+            parameters,
+            Some(return_type),
+            None,
+            minimum,
+        )
+        .ok_or_else(invalid)?;
+    assert!(store.set_signature_links(
+        declaration,
+        SignatureLinks {
+            resolved_signature: ResolvedSignatureState::Resolved(signature),
+            ..SignatureLinks::default()
+        },
+    ));
+    assert!(store.set_structured_type_members(
+        type_,
+        None,
+        None,
+        Some(vec![signature]),
+        None,
+        None,
+    ));
+    assert!(store.set_callable_signature_parameter_types_batch(vec![(
+        signature,
+        parameter_types.iter().map(|(_, type_)| *type_).collect(),
+    )]));
+    if !source_jsdoc_function_signature_matches(
+        store,
+        declaration,
+        owner,
+        type_,
+        &parameter_types,
+        return_type,
+    ) {
+        return Err(invalid());
+    }
+    Ok(type_)
+}
+
+fn source_jsdoc_function_signature_types(
+    store: &CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    annotation: &PlannedJsDocType,
+) -> Result<(Vec<(String, TypeId)>, TypeId), JsDocTypeResolutionError> {
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(JsDocTypeResolutionError::MissingBootstrap)?;
+    if bootstrap.options != options.intrinsic {
+        return Err(JsDocTypeResolutionError::OptionsMismatch {
+            initialized: bootstrap.options,
+            requested: options.intrinsic,
+        });
+    }
+    let invalid = || JsDocTypeResolutionError::UnsupportedType {
+        kind: SyntaxKind::FunctionType,
+        range: annotation.range(),
+    };
+    let JsDocType::Function(function) = annotation.resolution_type() else {
+        return Err(invalid());
+    };
+    let mut names = HashSet::with_capacity(function.parameters.len());
+    let mut parameters = Vec::with_capacity(function.parameters.len());
+    for parameter in &function.parameters {
+        let Some(type_) = parameter.type_.as_ref() else {
+            return Err(invalid());
+        };
+        if parameter.name.is_empty()
+            || !names.insert(parameter.name.as_str())
+            || parameter.optional
+            || parameter.rest
+            || !matches!(type_, JsDocType::Intrinsic(_))
+        {
+            return Err(invalid());
+        }
+        validate_resolvable_type(store, global_types, options, type_, annotation.range())?;
+        parameters.push((
+            parameter.name.clone(),
+            resolve_intrinsic_type(store, options, type_, annotation.range())?,
+        ));
+    }
+    if !matches!(&function.return_type, JsDocType::Intrinsic(_)) {
+        return Err(invalid());
+    }
+    validate_resolvable_type(
+        store,
+        global_types,
+        options,
+        &function.return_type,
+        annotation.range(),
+    )?;
+    let return_type =
+        resolve_intrinsic_type(store, options, &function.return_type, annotation.range())?;
+    Ok((parameters, return_type))
+}
+
+fn source_jsdoc_function_signature_matches(
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    owner: SemanticSymbolId,
+    type_: TypeId,
+    parameters: &[(String, TypeId)],
+    return_type: TypeId,
+) -> bool {
+    let Some(record) = store.type_payload(type_) else {
+        return false;
+    };
+    let Some(signature) = store
+        .signature_links(declaration)
+        .and_then(|links| links.resolved_signature.signature())
+        .and_then(|signature| store.signature(signature))
+    else {
+        return false;
+    };
+    record.symbol() == Some(owner)
+        && signature.declaration() == Some(declaration)
+        && signature.resolved_return_type() == Some(return_type)
+        && signature.parameters().len() == parameters.len()
+        && signature
+            .parameters()
+            .iter()
+            .zip(parameters)
+            .all(|(symbol, (name, type_))| {
+                store
+                    .symbol(*symbol)
+                    .is_some_and(|parameter| parameter.name().as_utf8() == Some(name.as_str()))
+                    && store.value_symbol_links(*symbol)
+                        == Some(&ValueSymbolLinks {
+                            resolved_type: Some(*type_),
+                            ..ValueSymbolLinks::default()
+                        })
+            })
+}
+
+/// Validates the source-parameter-anchored callable family without an AST host.
+pub(super) fn validate_stored_source_jsdoc_function_type(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Option<Vec<TypeId>> {
+    let record = store.type_payload(type_)?;
+    let TypeData::Object(object) = record.data() else {
+        return None;
+    };
+    let owner = record.symbol()?;
+    let owner_record = store.symbol(owner)?;
+    let [declaration] = owner_record.declarations()? else {
+        return None;
+    };
+    let declaration = *declaration;
+    let SourceNodeParent::Parent(callable) = store.source_node_parent(declaration)? else {
+        return None;
+    };
+    let links = store.signature_links(declaration)?;
+    let ResolvedSignatureState::Resolved(signature) = links.resolved_signature else {
+        return None;
+    };
+    let signature_record = store.signature(signature)?;
+    let parameter_types = store.callable_signature_parameter_types(signature)?;
+    if !store.type_has_function_type_provenance(type_)
+        || record.flags() != TypeFlags::OBJECT
+        || record.object_flags() != ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
+        || record.alias().is_some()
+        || owner_record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+        || owner_record.check_flags() != CheckFlags::NONE
+        || owner_record.value_declaration() != Some(declaration)
+        || owner_record.members().is_some()
+        || owner_record.exports().is_some()
+        || owner_record.parent().is_some()
+        || owner_record.export_symbol().is_some()
+        || store.get_merged_symbol(owner) != Some(owner)
+        || store.source_node_kind(declaration) != Some(SyntaxKind::Parameter)
+        || store.source_node_kind(callable) != Some(SyntaxKind::FunctionDeclaration)
+        || store.type_node_links(declaration)
+            != Some(&TypeNodeLinks {
+                resolved_type: Some(type_),
+                ..TypeNodeLinks::default()
+            })
+        || links
+            != &(SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(signature),
+                ..SignatureLinks::default()
+            })
+        || signature_record.flags() != SignatureFlags::NONE
+        || signature_record.declaration() != Some(declaration)
+        || !signature_record.type_parameters().is_empty()
+        || signature_record.this_parameter().is_some()
+        || signature_record.resolved_type_predicate().is_some()
+        || signature_record.target().is_some()
+        || signature_record.mapper().is_some()
+        || signature_record.isolated_signature_type().is_some()
+        || signature_record.composite().is_some()
+        || signature_record.resolved_min_argument_count() != -1
+        || usize::try_from(signature_record.min_argument_count()).ok()
+            != Some(signature_record.parameters().len())
+        || parameter_types.len() != signature_record.parameters().len()
+        || object.structured.constrained != ConstrainedTypeData::default()
+        || object.structured.members.is_some()
+        || object.structured.properties.is_some()
+        || object.structured.signatures.as_deref() != Some(&[signature])
+        || object.structured.call_signature_count != 1
+        || object.structured.index_infos.is_some()
+        || object
+            .structured
+            .object_type_without_abstract_construct_signatures
+            .is_some()
+        || object.target.is_some()
+        || object.mapper.is_some()
+        || object.instantiations != TypeCacheState::Unallocated
+        || store.value_symbol_links(owner).is_some_and(|links| {
+            links != &ValueSymbolLinks::default()
+                && links
+                    != &(ValueSymbolLinks {
+                        resolved_type: Some(type_),
+                        ..ValueSymbolLinks::default()
+                    })
+        })
+    {
+        return None;
+    }
+
+    let mut names = HashSet::with_capacity(parameter_types.len());
+    let mut symbols = HashSet::with_capacity(parameter_types.len());
+    for (parameter, type_) in signature_record.parameters().iter().zip(parameter_types) {
+        let parameter_record = store.symbol(*parameter)?;
+        let name = parameter_record.name().as_utf8()?;
+        if !symbols.insert(*parameter)
+            || !names.insert(name)
+            || parameter_record.flags()
+                != SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::TRANSIENT
+            || parameter_record.check_flags() != CheckFlags::NONE
+            || parameter_record.declarations().is_some()
+            || parameter_record.value_declaration().is_some()
+            || parameter_record.members().is_some()
+            || parameter_record.exports().is_some()
+            || parameter_record.parent().is_some()
+            || parameter_record.export_symbol().is_some()
+            || store.get_merged_symbol(*parameter) != Some(*parameter)
+            || store.value_symbol_links(*parameter)
+                != Some(&ValueSymbolLinks {
+                    resolved_type: Some(*type_),
+                    ..ValueSymbolLinks::default()
+                })
+            || store.type_payload(*type_).is_none()
+        {
+            return None;
+        }
+    }
+    let return_type = signature_record.resolved_return_type()?;
+    if store.type_payload(return_type).is_none() {
+        return None;
+    }
+    let mut edges = parameter_types.to_vec();
+    edges.push(return_type);
+    Some(edges)
 }
 
 /// Binds source `@template` names to canonical checker-owned type parameters.
@@ -4987,6 +5405,52 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn nameless_jsdoc_callable_parameter_preserves_its_complete_function_signature() {
+        let source = concat!(
+            "/** @param {(x: string) => string} */\n",
+            "function invoke(callback) { return callback(123); }",
+        );
+        let javascript = parse_javascript_source_file(source);
+        assert!(
+            javascript.diagnostics.is_empty(),
+            "{:?}",
+            javascript.diagnostics
+        );
+        let root = NodeRef::new(
+            javascript.arena.id(),
+            FileId::new(102),
+            javascript.source_file,
+        );
+        let plan = plan_javascript_source_jsdoc(&javascript.arena, root).unwrap();
+        let [declaration] = plan.declarations() else {
+            panic!("expected one callable-owning function declaration")
+        };
+        let parameter = declaration.parameter("callback").unwrap();
+        let annotation = parameter.type_().unwrap();
+        let JsDocType::Function(function) = annotation.type_() else {
+            panic!("expected the complete JSDoc callable annotation")
+        };
+        let [argument] = function.parameters() else {
+            panic!("expected one callable parameter")
+        };
+        assert_eq!(argument.name(), "x");
+        assert_eq!(
+            argument.type_(),
+            Some(&JsDocType::Intrinsic(JsDocIntrinsicType::String)),
+        );
+        assert_eq!(
+            function.return_type(),
+            &JsDocType::Intrinsic(JsDocIntrinsicType::String),
+        );
+        let start = source.find("callback)").unwrap();
+        assert_eq!(parameter.range().start.get() as usize, start);
+        assert_eq!(
+            parameter.range().end.get() as usize,
+            start + "callback".len(),
+        );
     }
 
     #[test]

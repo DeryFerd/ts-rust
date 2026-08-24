@@ -2299,6 +2299,11 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             .and_then(Signature::declaration)
             .is_some_and(|declaration| {
                 self.node_is_function_type(declaration)
+                    || self.source_node_kind(declaration) == Some(SyntaxKind::Parameter)
+                        && self
+                            .type_node_links(declaration)
+                            .and_then(|links| links.resolved_type)
+                            .is_some_and(|type_| self.type_has_function_type_provenance(type_))
                     || self.node_is_declared_callable_signature(declaration)
                     || self
                         .global_interface_method_linked_type(signature)
@@ -2328,7 +2333,9 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         }) {
             return false;
         }
-        let type_ = if self.node_is_function_type(declaration) {
+        let type_ = if self.node_is_function_type(declaration)
+            || self.source_node_kind(declaration) == Some(SyntaxKind::Parameter)
+        {
             self.type_node_links(declaration)
                 .and_then(|links| links.resolved_type)
                 .filter(|type_| self.type_has_function_type_provenance(*type_))

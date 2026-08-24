@@ -28,7 +28,10 @@ use super::{
         cached_ordinary_type_parameter_owner, explicit_type_parameter_symbols, preflight_node,
     },
     functions::{StoredFunctionTypeValidation, validate_stored_function_type},
-    jsdoc::{JsDocIntrinsicType, JsDocType, ResolvedJsDocSignature, plan_javascript_source_jsdoc},
+    jsdoc::{
+        JsDocIntrinsicType, JsDocType, PlannedJsDocType, ResolvedJsDocSignature,
+        plan_javascript_source_jsdoc,
+    },
     links::{
         DeclaredTypeLinks, DecoratorSignatureState, EffectsSignatureState, ResolvedSignatureState,
         SignatureLinks, SymbolNodeLinks, TypeNodeLinks, ValueSymbolLinks,
@@ -64,6 +67,7 @@ pub(super) struct SourceCallableParameterPlan {
     identity_node: NodeRef,
     null_literal_identity: bool,
     implicit_any: bool,
+    jsdoc_function: bool,
     jsdoc_contextual_type: Option<TypeId>,
     pub(super) optional: bool,
     pub(super) initializer: Option<NodeRef>,
@@ -101,6 +105,10 @@ impl SourceCallableParameterPlan {
 
     pub(super) const fn is_implicit_any(self) -> bool {
         self.implicit_any && self.jsdoc_contextual_type.is_none()
+    }
+
+    pub(super) const fn has_jsdoc_function_type(self) -> bool {
+        self.jsdoc_function
     }
 }
 
@@ -253,6 +261,49 @@ pub(super) struct SourceCallablePlan {
     pub(super) flags: SignatureFlags,
     pub(super) min_argument_count: i32,
     pub(super) array_targets: Option<CanonicalArrayTargets>,
+}
+
+impl SourceCallablePlan {
+    /// Installs a callable JSDoc annotation on its authenticated source parameter.
+    pub(super) fn set_jsdoc_function_parameter_type(
+        &mut self,
+        store: &CanonicalTypeMapperStore,
+        declaration: NodeRef,
+        type_: TypeId,
+    ) -> Result<(), SourceCallableError> {
+        let invalid = || invariant(SourceCallableInvariant::InvalidParameterCache(declaration));
+        let Some(parameter) = self
+            .parameters
+            .iter_mut()
+            .find(|parameter| parameter.declaration == declaration)
+        else {
+            return Err(invalid());
+        };
+        if self.family != SourceCallableFamily::FunctionDeclaration
+            || self.flags != SignatureFlags::NONE
+            || !parameter.implicit_any
+            || !parameter.jsdoc_function
+            || parameter.optional
+            || parameter.rest
+            || parameter.initializer.is_some()
+            || store.type_payload(type_).and_then(TypeRecord::symbol) != Some(parameter.symbol)
+            || store
+                .type_node_links(declaration)
+                .and_then(|links| links.resolved_type)
+                != Some(type_)
+            || !matches!(
+                validate_stored_function_type(store, type_),
+                StoredFunctionTypeValidation::Valid(_)
+            )
+            || parameter
+                .jsdoc_contextual_type
+                .is_some_and(|existing| existing != type_)
+        {
+            return Err(invalid());
+        }
+        parameter.jsdoc_contextual_type = Some(type_);
+        Ok(())
+    }
 }
 
 /// Source syntax families intentionally deferred beyond the exact first cut.
@@ -1894,6 +1945,19 @@ fn plan_source_callable_with_owner_shape(
         && bound
             .source_facts()
             .is_some_and(CanonicalSourceFileFacts::is_javascript_file);
+    let javascript_jsdoc_function_parameter = if view.family
+        == SourceCallableFamily::FunctionDeclaration
+        && view.parameters.nodes.len() == 1
+        && type_parameters.is_empty()
+        && body_mode == SourceCallableBodyMode::Present
+        && bound
+            .source_facts()
+            .is_some_and(CanonicalSourceFileFacts::is_javascript_file)
+    {
+        source_jsdoc_function_parameter_annotation(store, host, declaration, view.parameters)?
+    } else {
+        None
+    };
     let untyped_javascript_signature = bound
         .source_facts()
         .is_some_and(CanonicalSourceFileFacts::is_javascript_file)
@@ -1903,6 +1967,7 @@ fn plan_source_callable_with_owner_shape(
         && (view.family == SourceCallableFamily::FunctionDeclaration
             || javascript_object_implicit_any_arrow
             || javascript_direct_implicit_any_arrow)
+        && javascript_jsdoc_function_parameter.is_none()
         && view.parameters.nodes.iter().all(|parameter| {
             host.node(NodeRef::new(
                 declaration.arena,
@@ -2199,6 +2264,9 @@ fn plan_source_callable_with_owner_shape(
             identity_node,
             null_literal_identity,
             implicit_any,
+            jsdoc_function: javascript_jsdoc_function_parameter
+                .as_ref()
+                .is_some_and(|(declaration, _)| *declaration == parameter),
             jsdoc_contextual_type: None,
             optional,
             initializer,
@@ -2361,6 +2429,9 @@ fn plan_source_callable_with_owner_shape(
     };
     if javascript_direct_implicit_any_arrow {
         hydrate_warm_jsdoc_contextual_source_callable(store, host, &mut plan)?;
+    }
+    if let Some((parameter, annotation)) = javascript_jsdoc_function_parameter {
+        hydrate_warm_jsdoc_function_parameter(store, &mut plan, parameter, &annotation)?;
     }
     plan.generic_return_type_parameter_index = if plan.return_type.is_inferred() {
         None
@@ -5792,6 +5863,174 @@ fn jsdoc_intrinsic_type(store: &CanonicalTypeMapperStore, type_: &JsDocType) -> 
         JsDocIntrinsicType::Symbol => bootstrap.es_symbol_type,
         JsDocIntrinsicType::Object => bootstrap.non_primitive_type,
     })
+}
+
+fn source_jsdoc_function_parameter_annotation(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    parameters: &NodeList,
+) -> Result<Option<(NodeRef, PlannedJsDocType)>, SourceCallableError> {
+    let [parameter] = parameters.nodes.as_slice() else {
+        return Ok(None);
+    };
+    let parameter = NodeRef::new(declaration.arena, declaration.file, *parameter);
+    let record = preflight_node(store, host, parameter)?;
+    let NodeData::ParameterDeclaration(parameter_data) = &record.data else {
+        return Err(invariant(SourceCallableInvariant::InvalidParameter(
+            parameter,
+        )));
+    };
+    if parameter_data.type_.is_some() {
+        return Ok(None);
+    }
+    let name = NodeRef::new(parameter.arena, parameter.file, parameter_data.name);
+    let name_record = preflight_node(store, host, name)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Ok(None);
+    };
+    let (arena, bound) = host
+        .source(declaration)
+        .ok_or_else(|| invariant(SourceCallableInvariant::InvalidOwnerSymbol(declaration)))?;
+    if super::jsdoc::leading_jsdoc_comment(arena, declaration)
+        .map_err(|_| invariant(SourceCallableInvariant::InvalidSyntax(declaration)))?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    let comments = plan_javascript_source_jsdoc(arena, bound.source_file())
+        .map_err(|_| invariant(SourceCallableInvariant::InvalidSyntax(declaration)))?;
+    let Some(annotation) = comments
+        .callable_declaration(arena, declaration)
+        .and_then(|callable| callable.parameter(&identifier.text))
+        .and_then(super::jsdoc::PlannedJsDocParameter::type_)
+    else {
+        return Ok(None);
+    };
+    Ok(matches!(annotation.type_(), JsDocType::Function(_))
+        .then(|| (parameter, annotation.clone())))
+}
+
+fn hydrate_warm_jsdoc_function_parameter(
+    store: &CanonicalTypeMapperStore,
+    plan: &mut SourceCallablePlan,
+    declaration: NodeRef,
+    annotation: &PlannedJsDocType,
+) -> Result<(), SourceCallableError> {
+    let Some(type_) = store
+        .type_node_links(declaration)
+        .and_then(|links| links.resolved_type)
+    else {
+        return Ok(());
+    };
+    let invalid = || invariant(SourceCallableInvariant::InvalidParameterCache(declaration));
+    let JsDocType::Function(function) = annotation.type_() else {
+        return Err(invalid());
+    };
+    let signature = store
+        .signature_links(declaration)
+        .and_then(|links| links.resolved_signature.signature())
+        .and_then(|signature| store.signature(signature))
+        .ok_or_else(invalid)?;
+    if signature.parameters().len() != function.parameters().len()
+        || jsdoc_intrinsic_type(store, function.return_type()) != signature.resolved_return_type()
+        || signature
+            .parameters()
+            .iter()
+            .zip(function.parameters())
+            .any(|(symbol, parameter)| {
+                store
+                    .symbol(*symbol)
+                    .is_none_or(|record| record.name().as_utf8() != Some(parameter.name()))
+                    || parameter
+                        .type_()
+                        .and_then(|type_| jsdoc_intrinsic_type(store, type_))
+                        != store
+                            .value_symbol_links(*symbol)
+                            .and_then(|links| links.resolved_type)
+            })
+    {
+        return Err(invalid());
+    }
+    plan.set_jsdoc_function_parameter_type(store, declaration, type_)
+}
+
+/// Publishes a JavaScript function whose real parameter owns a JSDoc callable type.
+pub(super) fn publish_jsdoc_parameterized_source_callable(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &SourceCallablePlan,
+) -> Result<(TypeId, SignatureId), SourceCallableError> {
+    let invalid = || invariant(SourceCallableInvariant::Publication(plan.declaration));
+    let [parameter] = plan.parameters.as_slice() else {
+        return Err(invalid());
+    };
+    let Some(parameter_type) = parameter.jsdoc_contextual_type else {
+        return Err(invalid());
+    };
+    if plan.family != SourceCallableFamily::FunctionDeclaration
+        || plan.body_mode != SourceCallableBodyMode::Present
+        || !plan.return_type.is_inferred()
+        || !plan.type_parameters.is_empty()
+        || plan.flags != SignatureFlags::NONE
+        || plan.min_argument_count != 1
+        || plan_source_callable(
+            store,
+            host,
+            plan.declaration,
+            plan.owner_symbol,
+            plan.array_targets,
+        )? != *plan
+        || !matches!(
+            validate_stored_function_type(store, parameter_type),
+            StoredFunctionTypeValidation::Valid(_)
+        )
+    {
+        return Err(invalid());
+    }
+
+    match source_callable_state(store, plan, true)? {
+        SourceCallableState::AwaitingInferredReturn { type_, signature }
+        | SourceCallableState::Resolved { type_, signature } => return Ok((type_, signature)),
+        SourceCallableState::Cold => {}
+        SourceCallableState::ActiveBarrier { .. }
+        | SourceCallableState::ActiveParameters { .. } => {
+            return Err(invalid());
+        }
+    }
+
+    reserve_source_callable_capacities(store, &[plan])?;
+    if !store.try_reserve_types(1)
+        || !store.try_reserve_signature_links(1)
+        || !store.try_reserve_value_symbol_links(2)
+    {
+        return Err(invariant(SourceCallableInvariant::Capacity(
+            plan.declaration,
+        )));
+    }
+    let pending = begin_source_callable(store, plan, &[])?
+        .map_err(|_| invariant(SourceCallableInvariant::InvalidTypeCache(plan.declaration)))?;
+    finalize_source_callable_structure(store, plan, pending)?;
+    if !store.set_callable_signature_parameter_types_batch(vec![(
+        pending.signature,
+        vec![parameter_type],
+    )]) || !store.set_value_symbol_links(
+        parameter.symbol,
+        ValueSymbolLinks {
+            resolved_type: Some(parameter_type),
+            ..ValueSymbolLinks::default()
+        },
+    ) {
+        return Err(invalid());
+    }
+    if !matches!(
+        source_callable_state(store, plan, false)?,
+        SourceCallableState::AwaitingInferredReturn { type_, signature }
+            if type_ == pending.type_ && signature == pending.signature
+    ) {
+        return Err(invalid());
+    }
+    Ok((pending.type_, pending.signature))
 }
 
 fn authenticated_jsdoc_contextual_source_signature(

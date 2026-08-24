@@ -82,7 +82,8 @@ use super::{
         JsDocImportType, JsDocType, PlannedJavaScriptDeclaration, PlannedJavaScriptJsDoc,
         PlannedJsDocType, append_javascript_jsdoc_diagnostics, leading_jsdoc_comment,
         plan_javascript_source_jsdoc, preflight_planned_jsdoc_type,
-        resolve_planned_jsdoc_callback_signature, resolve_planned_jsdoc_type,
+        preflight_source_jsdoc_function_type, resolve_planned_jsdoc_callback_signature,
+        resolve_planned_jsdoc_type, resolve_source_jsdoc_function_type,
     },
     logical_operators::{
         LogicalBinaryError, LogicalBinaryInvariant, LogicalBinaryRequest, LogicalBinaryUnsupported,
@@ -112,8 +113,9 @@ use super::{
         materialize_global_wrapper_method, plan_javascript_duplicate_function_implementation,
         plan_source_callable, publish_contextual_direct_call_source_callable,
         publish_contextual_source_callable, publish_inferred_source_callable_return,
-        publish_jsdoc_contextual_source_callable, source_direct_call_argument_arrow_is_exact,
-        source_object_property_arrow_symbol, validate_stored_source_callable,
+        publish_jsdoc_contextual_source_callable, publish_jsdoc_parameterized_source_callable,
+        source_direct_call_argument_arrow_is_exact, source_object_property_arrow_symbol,
+        validate_stored_source_callable,
     },
     source_calls::{
         SourceCallCalleeForm, SourceCallPlan, check_direct_source_call,
@@ -13098,11 +13100,16 @@ fn preflight_inferred_function_return_dependencies(
                 let PlannedExpressionKind::Identifier(read) = &callee.kind else {
                     return false;
                 };
-                read.kind == PlannedIdentifierReadKind::Function
+                (read.kind == PlannedIdentifierReadKind::Function
                     && functions.iter().any(|function| {
                         function.callable.owner_symbol == read.value_symbol
                             && !function.callable.return_type.is_inferred()
                     })
+                    || read.kind == PlannedIdentifierReadKind::Variable
+                        && parameters.iter().any(|parameter| {
+                            parameter.symbol == read.value_symbol
+                                && parameter.has_jsdoc_function_type()
+                        }))
                     && call.arguments.iter().all(|argument| {
                         expression_is_closed(argument, parameters, locals, functions)
                     })
@@ -20498,6 +20505,39 @@ fn imported_jsdoc_static_import<'imports, 'annotation>(
     candidates.next().is_none().then_some((selected, imported))
 }
 
+fn source_jsdoc_function_parameter(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    function: &PlannedFunction,
+    declaration: &PlannedJavaScriptDeclaration,
+    annotation: &PlannedJsDocType,
+) -> Option<(NodeRef, SemanticSymbolId)> {
+    if function.callable.family != SourceCallableFamily::FunctionDeclaration
+        || function.callable.declaration != declaration.node()
+        || !matches!(annotation.type_(), JsDocType::Function(_))
+    {
+        return None;
+    }
+    let documented = declaration
+        .parameters()
+        .iter()
+        .find(|parameter| parameter.type_() == Some(annotation))?;
+    function.callable.parameters.iter().find_map(|parameter| {
+        let record = arena.get(parameter.declaration.node)?;
+        let NodeData::ParameterDeclaration(syntax) = &record.data else {
+            return None;
+        };
+        let NodeData::Identifier(name) = &arena.get(syntax.name)?.data else {
+            return None;
+        };
+        (record.kind == SyntaxKind::Parameter
+            && record.parent == Some(function.callable.declaration.node)
+            && bound.symbol(parameter.declaration) == Some(parameter.symbol)
+            && name.text == documented.name())
+        .then_some((parameter.declaration, parameter.symbol))
+    })
+}
+
 fn source_variable_owns_jsdoc_annotation(
     statements: &[PlannedStatement],
     declaration: &PlannedJavaScriptDeclaration,
@@ -20805,7 +20845,7 @@ pub(super) fn check_source_file(
         ambient_variables,
         ambient_namespace_reads,
         overloads,
-        functions,
+        mut functions,
         arrows,
         nested_arrow_callables,
         contextual_arrows,
@@ -20915,6 +20955,18 @@ pub(super) fn check_source_file(
                         .filter_map(super::jsdoc::PlannedJsDocTypedef::type_),
                 );
             for annotation in annotations {
+                if functions.iter().any(|function| {
+                    source_jsdoc_function_parameter(arena, bound, function, declaration, annotation)
+                        .is_some()
+                }) {
+                    preflight_source_jsdoc_function_type(store, global_types, options, annotation)
+                        .map_err(|_| {
+                            SourceCheckError::Unsupported(UnsupportedSourceSyntax::JsDoc(
+                                declaration.node(),
+                            ))
+                        })?;
+                    continue;
+                }
                 if source_variable_owns_jsdoc_annotation(&statements, declaration, annotation)
                     && (jsdoc_typedef_import_variables.contains_key(&declaration.node())
                         || imported_jsdoc_static_import(arena, bound, &value_imports, annotation)
@@ -21865,19 +21917,65 @@ pub(super) fn check_source_file(
         }
     }
 
+    if let Some(jsdoc) = &javascript_jsdoc {
+        for function in &mut functions {
+            let Some(declaration) = jsdoc.declaration(function.callable.declaration) else {
+                continue;
+            };
+            let annotations = declaration
+                .parameters()
+                .iter()
+                .filter_map(|parameter| parameter.type_())
+                .filter_map(|annotation| {
+                    source_jsdoc_function_parameter(arena, bound, function, declaration, annotation)
+                        .map(|(parameter, symbol)| (parameter, symbol, annotation.clone()))
+                })
+                .collect::<Vec<_>>();
+            for (parameter, symbol, annotation) in annotations {
+                let type_ = resolve_source_jsdoc_function_type(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    parameter,
+                    symbol,
+                    &annotation,
+                )
+                .map_err(|_| {
+                    SourceCheckError::Unsupported(UnsupportedSourceSyntax::JsDoc(
+                        declaration.node(),
+                    ))
+                })?;
+                function
+                    .callable
+                    .set_jsdoc_function_parameter_type(store, parameter, type_)
+                    .map_err(SourcePlanner::callable_plan_error)?;
+            }
+        }
+    }
+
     let mut materialized_functions = Vec::with_capacity(functions.len());
     for function in &functions {
         session.reset_query();
-        let materialized = materialize_checked_source_callable(
-            store,
-            host,
-            global_types,
-            options,
-            session,
-            diagnostics,
-            &function.callable,
-            &type_import_capabilities,
-        )?;
+        let materialized = if function.callable.parameters.iter().any(|parameter| {
+            parameter.explicit_type_node().is_none() && !parameter.is_implicit_any()
+        }) {
+            let (type_, signature) =
+                publish_jsdoc_parameterized_source_callable(store, host, &function.callable)
+                    .map_err(SourcePlanner::callable_plan_error)?;
+            MaterializedSourceCallable { type_, signature }
+        } else {
+            materialize_checked_source_callable(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                diagnostics,
+                &function.callable,
+                &type_import_capabilities,
+            )?
+        };
         let owner = function.callable.owner_symbol;
         if current_flow_types
             .insert(owner, materialized.type_)
@@ -35648,6 +35746,109 @@ mod tests {
         let warm = observable_state(&context, imported_file);
         context.recheck_source_file(imported_file).unwrap();
         assert_eq!(observable_state(&context, imported_file), warm);
+    }
+
+    #[test]
+    fn nameless_jsdoc_callable_parameter_reports_exact_argument_diagnostic_and_replays_warm() {
+        let source = parse_javascript_source_file(concat!(
+            "/**\n",
+            " * @param {(x: string) => string}\n",
+            " */\n",
+            "function foo(f) {\n",
+            "    return f(123);\n",
+            "}\n",
+        ));
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let file = FileId::new(8_960);
+        let mut context = javascript_context(
+            file,
+            &source,
+            CanonicalCheckerOptions {
+                no_implicit_any: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected exactly one typed JSDoc callback argument diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2345);
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "Argument of type 'number' is not assignable to parameter of type 'string'.",
+        );
+        assert_eq!(node_text(&source, diagnostic.node.unwrap()), "123");
+
+        let declaration = function_declaration(&source, file, "foo");
+        let NodeData::FunctionDeclaration(function) =
+            &source.arena.get(declaration.node).unwrap().data
+        else {
+            panic!("expected the annotated source function")
+        };
+        let [parameter] = function.parameters.nodes.as_slice() else {
+            panic!("expected one source-owned callback parameter")
+        };
+        let parameter = NodeRef::new(source.arena.id(), file, *parameter);
+        let (_, bound) = context.file(file).unwrap();
+        let owner = bound.symbol(parameter).unwrap();
+        let callback = context
+            .store()
+            .value_symbol_links(owner)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        assert_eq!(resolved_node_type(&context, parameter), callback);
+        assert_eq!(
+            context.type_to_string(callback).unwrap(),
+            "(x: string) => string"
+        );
+
+        let signature = context
+            .store()
+            .signature_links(parameter)
+            .and_then(|links| links.resolved_signature.signature())
+            .unwrap();
+        let record = context.store().signature(signature).unwrap();
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        assert_eq!(record.declaration(), Some(parameter));
+        assert_eq!(record.resolved_return_type(), Some(string));
+        assert_eq!(
+            context
+                .store()
+                .callable_signature_parameter_types(signature),
+            Some([string].as_slice()),
+        );
+        let [argument] = record.parameters() else {
+            panic!("expected one checker-owned callback argument")
+        };
+        assert_eq!(
+            context.store().symbol(*argument).unwrap().name().as_utf8(),
+            Some("x"),
+        );
+
+        let call = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::CallExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        assert_eq!(
+            context
+                .store()
+                .signature_links(call)
+                .and_then(|links| links.resolved_signature.signature()),
+            Some(signature),
+        );
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
     }
 
     #[test]
