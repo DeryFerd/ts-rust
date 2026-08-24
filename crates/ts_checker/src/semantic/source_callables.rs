@@ -4112,6 +4112,7 @@ fn validate_exact_generic_annotation_shape(
             host,
             return_identity_node,
             &plan.type_parameters,
+            plan.array_targets,
         )?
     {
         return Err(SourceCallableError::Unsupported(
@@ -4623,6 +4624,7 @@ fn is_exact_source_generic_mapper_annotation(
     host: &DeclaredTypeHost<'_>,
     annotation: NodeRef,
     type_parameters: &[SourceCallableTypeParameterPlan],
+    array_targets: Option<CanonicalArrayTargets>,
 ) -> Result<bool, SourceCallableError> {
     let record = preflight_node(store, host, annotation)?;
     let valid = if matches!(
@@ -4655,7 +4657,7 @@ fn is_exact_source_generic_mapper_annotation(
                 host,
                 annotation,
                 type_parameters,
-                None,
+                array_targets,
             )?;
         }
         exact
@@ -9641,6 +9643,7 @@ mod tests {
                     &host,
                     return_annotation,
                     &plans,
+                    None,
                 )
                 .unwrap();
             (proof, index, fixed)

@@ -2,8 +2,8 @@
 //!
 //! The full-vector branch admits one stored signature with ordered type
 //! parameters, fixed required parameters whose targets are naked type
-//! parameters or canonical nested Array wrappers, and a mapper-supported
-//! return. It owns declaration-order
+//! parameters or canonical nested Array/interface references, and a
+//! mapper-supported return. It owns declaration-order
 //! inference/default/constraint finalization, overload-failure projection, and
 //! exact checked-instantiation cache publication. Recovery signatures remain a
 //! separate call-node concern and never enter the global signature cache. The
@@ -38,11 +38,12 @@ use super::{
         instantiate_type_with_session, instantiate_type_with_vector_and_session,
     },
     keyof_types::{cached_nongeneric_keyof_type, plan_nongeneric_keyof_type},
+    reference_types::{DirectGenericReference, validate_direct_generic_reference},
     signatures::{IndexFlags, SignatureFlags},
     source_callables::{StoredSourceCallableValidation, validate_stored_source_callable},
     store::CachedSignatureLookup,
     type_records::TypeData,
-    types::{ObjectFlags, TypeFlags},
+    types::{ObjectFlags, TypeFlags, VarianceFlags},
 };
 
 /// Syntax-neutral input for the declaration-order generic-call kernel.
@@ -84,6 +85,11 @@ pub(super) enum GenericCallVectorUnsupported {
     InstantiationType {
         signature: SignatureId,
         type_: TypeId,
+    },
+    ContravariantInterfaceTypeArgument {
+        signature: SignatureId,
+        type_: TypeId,
+        index: usize,
     },
     TypeParameterDependency {
         type_parameter: TypeId,
@@ -137,6 +143,14 @@ pub(super) enum GenericCallVectorInvariant {
         signature: SignatureId,
         type_: TypeId,
         error: ArrayTypeError,
+    },
+    InvalidInterfaceReference {
+        signature: SignatureId,
+        type_: TypeId,
+    },
+    InvalidInterfaceVariance {
+        signature: SignatureId,
+        type_: TypeId,
     },
 }
 
@@ -1358,43 +1372,161 @@ fn validate_generic_parameter_template(
     type_parameters: &[TypeId],
     array_targets: Option<CanonicalArrayTargets>,
     signature: SignatureId,
-    active_arrays: &mut Vec<TypeId>,
+    active_types: &mut Vec<TypeId>,
 ) -> Result<bool, GenericCallVectorError> {
     if type_parameters.contains(&type_) {
         return Ok(true);
     }
-    let Some(array_targets) = array_targets else {
-        return Ok(false);
-    };
-    let reference = store
-        .canonical_array_reference_with_targets(array_targets, type_)
-        .map_err(|error| GenericCallVectorInvariant::InvalidArrayType {
-            signature,
-            type_,
-            error,
-        })?;
-    let Some(reference) = reference else {
-        return Ok(false);
-    };
-    if reference.array_literal || active_arrays.contains(&type_) {
-        return Err(GenericCallVectorInvariant::InvalidArrayType {
-            signature,
-            type_,
-            error: ArrayTypeError::InvalidReference(type_),
+
+    if let Some(array_targets) = array_targets {
+        let reference = store
+            .canonical_array_reference_with_targets(array_targets, type_)
+            .map_err(|error| GenericCallVectorInvariant::InvalidArrayType {
+                signature,
+                type_,
+                error,
+            })?;
+        if let Some(reference) = reference {
+            if reference.array_literal || active_types.contains(&type_) {
+                return Err(GenericCallVectorInvariant::InvalidArrayType {
+                    signature,
+                    type_,
+                    error: ArrayTypeError::InvalidReference(type_),
+                }
+                .into());
+            }
+            active_types.push(type_);
+            let contains_type_parameter = validate_generic_parameter_template(
+                store,
+                reference.element_type,
+                type_parameters,
+                Some(array_targets),
+                signature,
+                active_types,
+            )?;
+            active_types.pop();
+            return Ok(contains_type_parameter);
         }
-        .into());
     }
-    active_arrays.push(type_);
-    let contains_type_parameter = validate_generic_parameter_template(
-        store,
-        reference.element_type,
-        type_parameters,
-        Some(array_targets),
-        signature,
-        active_arrays,
-    )?;
-    active_arrays.pop();
+
+    let Some(reference) = validate_generic_interface_reference(store, type_, signature)? else {
+        return Ok(false);
+    };
+    if active_types.contains(&type_) {
+        return Err(
+            GenericCallVectorInvariant::InvalidInterfaceReference { signature, type_ }.into(),
+        );
+    }
+    active_types.push(type_);
+    let mut contains_type_parameter = true;
+    for argument in reference.type_arguments {
+        contains_type_parameter &= validate_generic_parameter_template(
+            store,
+            argument,
+            type_parameters,
+            array_targets,
+            signature,
+            active_types,
+        )?;
+    }
+    active_types.pop();
     Ok(contains_type_parameter)
+}
+
+/// Authenticates a direct generic interface without treating classes as wrappers.
+fn validate_generic_interface_reference(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    signature: SignatureId,
+) -> Result<Option<DirectGenericReference>, GenericCallVectorError> {
+    let invalid = || GenericCallVectorInvariant::InvalidInterfaceReference { signature, type_ };
+    let Some(record) = store.type_payload(type_) else {
+        return Err(invalid().into());
+    };
+    let target = match record.data() {
+        TypeData::TypeReference(reference) => reference.object.target.ok_or_else(invalid)?,
+        TypeData::Interface(interface) => {
+            let Some(target) = interface.reference.object.target else {
+                return Ok(None);
+            };
+            target
+        }
+        _ => return Ok(None),
+    };
+    let target_record = store.type_payload(target).ok_or_else(invalid)?;
+    let TypeData::Interface(interface) = target_record.data() else {
+        return Ok(None);
+    };
+    if interface
+        .reference
+        .resolved_type_arguments
+        .as_ref()
+        .is_none_or(Vec::is_empty)
+        || target_record.object_flags() & ObjectFlags::CLASS_OR_INTERFACE != ObjectFlags::INTERFACE
+    {
+        return Ok(None);
+    }
+
+    let reference = validate_direct_generic_reference(store, type_).map_err(|_| invalid())?;
+    let owner = target_record.symbol().ok_or_else(invalid)?;
+    let owner_record = store.symbol(owner).ok_or_else(invalid)?;
+    if !owner_record.flags().contains(SymbolFlags::INTERFACE)
+        || owner_record
+            .flags()
+            .without(SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT)
+            != SymbolFlags::NONE
+        || owner_record.check_flags() != CheckFlags::NONE
+        || store.get_merged_symbol(owner) != Some(owner)
+        || store
+            .declared_type_links(owner)
+            .and_then(|links| links.declared_type)
+            != Some(reference.target)
+    {
+        return Err(invalid().into());
+    }
+
+    if let Some(variances) = store
+        .variance_links(owner)
+        .and_then(|links| links.variances.as_deref())
+    {
+        if variances.len() != reference.type_arguments.len() {
+            return Err(
+                GenericCallVectorInvariant::InvalidInterfaceVariance { signature, type_ }.into(),
+            );
+        }
+        let allowed = VarianceFlags::VARIANCE_MASK | VarianceFlags::ALLOWS_STRUCTURAL_FALLBACK;
+        for (index, variance) in variances.iter().copied().enumerate() {
+            let kind = variance & VarianceFlags::VARIANCE_MASK;
+            if variance.bits() & !allowed.bits() != 0
+                || !matches!(
+                    kind,
+                    VarianceFlags::INVARIANT
+                        | VarianceFlags::COVARIANT
+                        | VarianceFlags::CONTRAVARIANT
+                        | VarianceFlags::BIVARIANT
+                        | VarianceFlags::INDEPENDENT
+                )
+            {
+                return Err(GenericCallVectorInvariant::InvalidInterfaceVariance {
+                    signature,
+                    type_,
+                }
+                .into());
+            }
+            if kind == VarianceFlags::CONTRAVARIANT {
+                return Err(
+                    GenericCallVectorUnsupported::ContravariantInterfaceTypeArgument {
+                        signature,
+                        type_,
+                        index,
+                    }
+                    .into(),
+                );
+            }
+        }
+    }
+
+    Ok(Some(reference))
 }
 
 fn optional_generic_parameter_template(
@@ -1633,7 +1765,7 @@ fn validate_generic_mapper_type(
     type_parameters: &[TypeId],
     array_targets: Option<CanonicalArrayTargets>,
     signature: SignatureId,
-    active_arrays: &mut Vec<TypeId>,
+    active_types: &mut Vec<TypeId>,
 ) -> Result<(), GenericCallVectorError> {
     let record = store
         .type_payload(type_)
@@ -1649,47 +1781,68 @@ fn validate_generic_mapper_type(
                     type_parameters,
                     None,
                     signature,
-                    active_arrays,
+                    active_types,
                 )?;
             }
             Ok(())
         }
-        TypeData::TypeReference(_) => {
-            let Some(array_targets) = array_targets else {
+        TypeData::TypeReference(_) | TypeData::Interface(_) => {
+            if let Some(array_targets) = array_targets {
+                let reference = store
+                    .canonical_array_reference_with_targets(array_targets, type_)
+                    .map_err(|error| GenericCallVectorInvariant::InvalidArrayType {
+                        signature,
+                        type_,
+                        error,
+                    })?;
+                if let Some(reference) = reference {
+                    if reference.array_literal || active_types.contains(&type_) {
+                        return Err(GenericCallVectorInvariant::InvalidArrayType {
+                            signature,
+                            type_,
+                            error: ArrayTypeError::InvalidReference(type_),
+                        }
+                        .into());
+                    }
+                    active_types.push(type_);
+                    validate_generic_mapper_type(
+                        store,
+                        reference.element_type,
+                        type_parameters,
+                        Some(array_targets),
+                        signature,
+                        active_types,
+                    )?;
+                    active_types.pop();
+                    return Ok(());
+                }
+            }
+
+            let Some(reference) = validate_generic_interface_reference(store, type_, signature)?
+            else {
                 return Err(
                     GenericCallVectorUnsupported::InstantiationType { signature, type_ }.into(),
                 );
             };
-            let reference = store
-                .canonical_array_reference_with_targets(array_targets, type_)
-                .map_err(|error| GenericCallVectorInvariant::InvalidArrayType {
+            if active_types.contains(&type_) {
+                return Err(GenericCallVectorInvariant::InvalidInterfaceReference {
                     signature,
                     type_,
-                    error,
-                })?;
-            let Some(reference) = reference else {
-                return Err(
-                    GenericCallVectorUnsupported::InstantiationType { signature, type_ }.into(),
-                );
-            };
-            if reference.array_literal || active_arrays.contains(&type_) {
-                return Err(GenericCallVectorInvariant::InvalidArrayType {
-                    signature,
-                    type_,
-                    error: ArrayTypeError::InvalidReference(type_),
                 }
                 .into());
             }
-            active_arrays.push(type_);
-            validate_generic_mapper_type(
-                store,
-                reference.element_type,
-                type_parameters,
-                Some(array_targets),
-                signature,
-                active_arrays,
-            )?;
-            active_arrays.pop();
+            active_types.push(type_);
+            for argument in reference.type_arguments {
+                validate_generic_mapper_type(
+                    store,
+                    argument,
+                    type_parameters,
+                    array_targets,
+                    signature,
+                    active_types,
+                )?;
+            }
+            active_types.pop();
             Ok(())
         }
         _ => Err(GenericCallVectorUnsupported::InstantiationType { signature, type_ }.into()),
@@ -1953,47 +2106,92 @@ fn collect_generic_call_inferences(
         return Ok(());
     }
 
-    let Some(array_targets) = array_targets else {
-        unreachable!("validated parameter templates are naked without Array targets")
-    };
-    if active_targets.contains(&target) {
-        return Err(GenericCallVectorError::Inference(
-            NakedTypeInferenceError::RecursiveArrayCandidate(target).into(),
-        ));
+    if let Some(array_targets) = array_targets {
+        let target_reference = store
+            .canonical_array_reference_with_targets(array_targets, target)
+            .map_err(|error| GenericCallVectorInvariant::InvalidArrayType {
+                signature,
+                type_: target,
+                error,
+            })?;
+        if let Some(target_reference) = target_reference {
+            if active_targets.contains(&target) {
+                return Err(GenericCallVectorError::Inference(
+                    NakedTypeInferenceError::RecursiveArrayCandidate(target).into(),
+                ));
+            }
+            let source_reference = store
+                .canonical_array_reference_with_targets(array_targets, source)
+                .map_err(|error| {
+                    GenericCallVectorError::Inference(
+                        NakedTypeInferenceError::InvalidCanonicalArrayCandidate {
+                            candidate: source,
+                            error,
+                        }
+                        .into(),
+                    )
+                })?;
+            let Some(source_reference) = source_reference else {
+                return Ok(());
+            };
+            active_targets.push(target);
+            let result = collect_generic_call_inferences(
+                store,
+                Some(array_targets),
+                source_reference.element_type,
+                target_reference.element_type,
+                type_parameters,
+                buckets,
+                signature,
+                active_targets,
+            );
+            active_targets.pop();
+            return result;
+        }
     }
-    let target_reference = store
-        .canonical_array_reference_with_targets(array_targets, target)
-        .map_err(|error| GenericCallVectorInvariant::InvalidArrayType {
+
+    let target_reference = validate_generic_interface_reference(store, target, signature)?
+        .expect("signature validation admitted a canonical generic interface target");
+    let source_target = store
+        .type_payload(source)
+        .and_then(|record| match record.data() {
+            TypeData::TypeReference(reference) => reference.object.target,
+            TypeData::Interface(interface) => interface.reference.object.target,
+            _ => None,
+        });
+    if source_target != Some(target_reference.target) {
+        return Ok(());
+    }
+    let source_reference = validate_generic_interface_reference(store, source, signature)?.ok_or(
+        GenericCallVectorInvariant::InvalidInterfaceReference {
+            signature,
+            type_: source,
+        },
+    )?;
+    if active_targets.contains(&target) {
+        return Err(GenericCallVectorInvariant::InvalidInterfaceReference {
             signature,
             type_: target,
-            error,
-        })?
-        .expect("signature validation admitted a canonical Array target");
-    let source_reference = store
-        .canonical_array_reference_with_targets(array_targets, source)
-        .map_err(|error| {
-            GenericCallVectorError::Inference(
-                NakedTypeInferenceError::InvalidCanonicalArrayCandidate {
-                    candidate: source,
-                    error,
-                }
-                .into(),
-            )
-        })?;
-    let Some(source_reference) = source_reference else {
-        return Ok(());
-    };
+        }
+        .into());
+    }
     active_targets.push(target);
-    let result = collect_generic_call_inferences(
-        store,
-        Some(array_targets),
-        source_reference.element_type,
-        target_reference.element_type,
-        type_parameters,
-        buckets,
-        signature,
-        active_targets,
-    );
+    let result = source_reference
+        .type_arguments
+        .into_iter()
+        .zip(target_reference.type_arguments)
+        .try_for_each(|(source, target)| {
+            collect_generic_call_inferences(
+                store,
+                array_targets,
+                source,
+                target,
+                type_parameters,
+                buckets,
+                signature,
+                active_targets,
+            )
+        });
     active_targets.pop();
     result
 }
@@ -2726,35 +2924,71 @@ fn generic_call_type_instantiation_matches(
                 active_templates,
             )
         }
-        TypeData::TypeReference(_) => {
-            let Some(array_targets) = array_targets else {
-                return false;
-            };
+        TypeData::TypeReference(_) | TypeData::Interface(_) => {
             if active_templates.contains(&template) {
                 return false;
             }
-            let (Ok(Some(template_reference)), Ok(Some(actual_reference))) = (
-                store.canonical_array_reference_with_targets(array_targets, template),
-                store.canonical_array_reference_with_targets(array_targets, actual),
+
+            if let Some(array_targets) = array_targets {
+                let Ok(template_reference) =
+                    store.canonical_array_reference_with_targets(array_targets, template)
+                else {
+                    return false;
+                };
+                if let Some(template_reference) = template_reference {
+                    let Ok(Some(actual_reference)) =
+                        store.canonical_array_reference_with_targets(array_targets, actual)
+                    else {
+                        return false;
+                    };
+                    if template_reference.array_literal
+                        || actual_reference.array_literal
+                        || template_reference.readonly != actual_reference.readonly
+                    {
+                        return false;
+                    }
+                    active_templates.push(template);
+                    let matches = generic_call_type_instantiation_matches(
+                        store,
+                        Some(array_targets),
+                        template_reference.element_type,
+                        actual_reference.element_type,
+                        sources,
+                        targets,
+                        active_templates,
+                    );
+                    active_templates.pop();
+                    return matches;
+                }
+            }
+
+            let (Ok(template_reference), Ok(actual_reference)) = (
+                validate_direct_generic_reference(store, template),
+                validate_direct_generic_reference(store, actual),
             ) else {
                 return false;
             };
-            if template_reference.array_literal
-                || actual_reference.array_literal
-                || template_reference.readonly != actual_reference.readonly
+            if template_reference.target != actual_reference.target
+                || template_reference.type_arguments.len() != actual_reference.type_arguments.len()
             {
                 return false;
             }
             active_templates.push(template);
-            let matches = generic_call_type_instantiation_matches(
-                store,
-                Some(array_targets),
-                template_reference.element_type,
-                actual_reference.element_type,
-                sources,
-                targets,
-                active_templates,
-            );
+            let matches = template_reference
+                .type_arguments
+                .into_iter()
+                .zip(actual_reference.type_arguments)
+                .all(|(template, actual)| {
+                    generic_call_type_instantiation_matches(
+                        store,
+                        array_targets,
+                        template,
+                        actual,
+                        sources,
+                        targets,
+                        active_templates,
+                    )
+                });
             active_templates.pop();
             matches
         }
@@ -4304,7 +4538,7 @@ mod tests {
     use super::*;
     use crate::semantic::{
         CanonicalCheckerContext, CanonicalCheckerOptions, DeclaredTypeLinks,
-        IntrinsicBootstrapOptions, SemanticStore, instantiate::InstantiationLimits,
+        IntrinsicBootstrapOptions, SemanticStore, VarianceLinks, instantiate::InstantiationLimits,
         mapper::TypeMapper, type_records::TypeRecord, types::ObjectFlags,
     };
 
@@ -4566,6 +4800,29 @@ mod tests {
     ) -> TypeId {
         store
             .create_canonical_array_type_with_targets(targets, element, readonly)
+            .unwrap()
+    }
+
+    fn canonical_interface_target(store: &mut CanonicalTypeMapperStore, name: &str) -> TypeId {
+        let target = canonical_array_target(store, name);
+        let owner = store.type_payload(target).unwrap().symbol().unwrap();
+        assert!(store.set_declared_type_links(
+            owner,
+            DeclaredTypeLinks {
+                declared_type: Some(target),
+                ..DeclaredTypeLinks::default()
+            },
+        ));
+        target
+    }
+
+    fn canonical_interface_reference(
+        store: &mut CanonicalTypeMapperStore,
+        target: TypeId,
+        argument: TypeId,
+    ) -> TypeId {
+        store
+            .create_direct_generic_reference_type(target, &[argument])
             .unwrap()
     }
 
@@ -5058,6 +5315,384 @@ mod tests {
                 actual: 0,
             }
         );
+    }
+
+    #[test]
+    fn generic_interface_inference_reuses_checked_signature_and_return_identity() {
+        let mut store = initialized_store();
+        let target = canonical_interface_target(&mut store, "Box");
+        let owner = store.type_payload(target).unwrap().symbol().unwrap();
+        assert!(store.set_variance_links(
+            owner,
+            VarianceLinks {
+                variances: Some(vec![VarianceFlags::COVARIANT]),
+            },
+        ));
+        let (callable, type_parameter) = structured_vector_callable(
+            &mut store,
+            |store, type_parameter| canonical_interface_reference(store, target, type_parameter),
+            |store, type_parameter| canonical_interface_reference(store, target, type_parameter),
+        );
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let argument = canonical_interface_reference(&mut store, target, number);
+
+        let inferred = project_vector(
+            &mut store,
+            &callable,
+            vector_request(callable.owner, None, &[argument]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            inferred.applicability,
+            GenericCallVectorApplicability::Applicable
+        );
+        assert_eq!(inferred.projection.type_parameters, [type_parameter]);
+        assert_eq!(inferred.projection.instantiation.type_arguments, [number]);
+        assert_eq!(
+            demand_vector_parameter(
+                &mut store,
+                &callable,
+                &inferred,
+                &inferred.projection.instantiation,
+                0,
+            ),
+            argument,
+        );
+        assert_eq!(
+            demand_vector_return(
+                &mut store,
+                &callable,
+                &inferred,
+                &inferred.projection.instantiation,
+            ),
+            argument,
+        );
+
+        let warm = vector_cache_graph_counts(&store);
+        let explicit = project_vector(
+            &mut store,
+            &callable,
+            vector_request(callable.owner, Some(&[number]), &[argument]),
+        )
+        .unwrap();
+        assert_eq!(explicit, inferred);
+        assert_eq!(vector_cache_graph_counts(&store), warm);
+        assert_eq!(
+            project_vector(
+                &mut store,
+                &callable,
+                vector_request(callable.owner, None, &[argument]),
+            ),
+            Ok(inferred),
+        );
+        assert_eq!(vector_cache_graph_counts(&store), warm);
+    }
+
+    #[test]
+    fn generic_interface_inference_preserves_nested_and_array_wrapped_targets() {
+        let mut store = initialized_store();
+        let target = canonical_interface_target(&mut store, "Box");
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let (nested, _) = structured_vector_callable(
+            &mut store,
+            |store, type_parameter| {
+                let inner = canonical_interface_reference(store, target, type_parameter);
+                canonical_interface_reference(store, target, inner)
+            },
+            |store, type_parameter| {
+                let inner = canonical_interface_reference(store, target, type_parameter);
+                canonical_interface_reference(store, target, inner)
+            },
+        );
+        let inner = canonical_interface_reference(&mut store, target, number);
+        let nested_argument = canonical_interface_reference(&mut store, target, inner);
+        let nested_resolution = project_vector(
+            &mut store,
+            &nested,
+            vector_request(nested.owner, None, &[nested_argument]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            nested_resolution.projection.instantiation.type_arguments,
+            [number],
+        );
+        assert_eq!(
+            demand_vector_return(
+                &mut store,
+                &nested,
+                &nested_resolution,
+                &nested_resolution.projection.instantiation,
+            ),
+            nested_argument,
+        );
+        let outer_reference = validate_direct_generic_reference(&store, nested_argument).unwrap();
+        let inner_reference = validate_direct_generic_reference(&store, inner).unwrap();
+        assert_eq!(outer_reference.target, target);
+        assert_eq!(outer_reference.type_arguments, [inner]);
+        assert_eq!(inner_reference.target, target);
+        assert_eq!(inner_reference.type_arguments, [number]);
+
+        let array_targets = canonical_array_targets(&mut store);
+        for array_target in [
+            array_targets.array_type(),
+            array_targets.readonly_array_type(),
+        ] {
+            let owner = store.type_payload(array_target).unwrap().symbol().unwrap();
+            assert!(store.set_declared_type_links(
+                owner,
+                DeclaredTypeLinks {
+                    declared_type: Some(array_target),
+                    ..DeclaredTypeLinks::default()
+                },
+            ));
+        }
+        let (mixed, _) = structured_vector_callable(
+            &mut store,
+            |store, type_parameter| {
+                let array = canonical_array_type(store, array_targets, type_parameter, false);
+                canonical_interface_reference(store, target, array)
+            },
+            |store, type_parameter| {
+                let array = canonical_array_type(store, array_targets, type_parameter, false);
+                canonical_interface_reference(store, target, array)
+            },
+        );
+        let array = canonical_array_type(&mut store, array_targets, number, false);
+        let mixed_argument = canonical_interface_reference(&mut store, target, array);
+        let mixed_resolution = project_array_vector(
+            &mut store,
+            array_targets,
+            &mixed,
+            vector_request(mixed.owner, None, &[mixed_argument]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            mixed_resolution.applicability,
+            GenericCallVectorApplicability::Applicable,
+        );
+        assert_eq!(
+            mixed_resolution.projection.instantiation.type_arguments,
+            [number],
+        );
+        assert_eq!(
+            demand_vector_return(
+                &mut store,
+                &mixed,
+                &mixed_resolution,
+                &mixed_resolution.projection.instantiation,
+            ),
+            mixed_argument,
+        );
+    }
+
+    #[test]
+    fn generic_interface_mismatches_preserve_argument_diagnostics() {
+        let mut store = initialized_store();
+        let target = canonical_interface_target(&mut store, "Box");
+        let other_target = canonical_interface_target(&mut store, "Other");
+        let (callable, _) = structured_vector_callable(
+            &mut store,
+            |store, type_parameter| canonical_interface_reference(store, target, type_parameter),
+            |store, type_parameter| canonical_interface_reference(store, target, type_parameter),
+        );
+        let (number, string, unknown) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.number_type,
+                bootstrap.string_type,
+                bootstrap.unknown_type,
+            )
+        };
+        let number_box = canonical_interface_reference(&mut store, target, number);
+        let string_box = canonical_interface_reference(&mut store, target, string);
+        let unknown_box = canonical_interface_reference(&mut store, target, unknown);
+        let other_number = canonical_interface_reference(&mut store, other_target, number);
+
+        let explicit = project_vector(
+            &mut store,
+            &callable,
+            vector_request(callable.owner, Some(&[string]), &[number_box]),
+        )
+        .unwrap();
+        assert_eq!(
+            explicit.applicability,
+            GenericCallVectorApplicability::ArgumentNotAssignable {
+                index: 0,
+                argument_type: number_box,
+                parameter_type: string_box,
+            },
+        );
+        assert_eq!(explicit.applicability.diagnostic_code(), Some(2345));
+
+        let mismatched_target = project_vector(
+            &mut store,
+            &callable,
+            vector_request(callable.owner, None, &[other_number]),
+        )
+        .unwrap();
+        assert_eq!(
+            mismatched_target.projection.instantiation.type_arguments,
+            [unknown],
+        );
+        assert_eq!(
+            mismatched_target.applicability,
+            GenericCallVectorApplicability::ArgumentNotAssignable {
+                index: 0,
+                argument_type: other_number,
+                parameter_type: unknown_box,
+            },
+        );
+    }
+
+    #[test]
+    fn forged_generic_interface_reference_is_rejected_before_projection_writes() {
+        let mut store = initialized_store();
+        let target = canonical_interface_target(&mut store, "Box");
+        let mut forged = None;
+        let (callable, _) = structured_vector_callable(
+            &mut store,
+            |store, type_parameter| {
+                let canonical = canonical_interface_reference(store, target, type_parameter);
+                let owner = store.type_payload(canonical).unwrap().symbol();
+                let duplicate = store
+                    .alloc_type_reference(ObjectFlags::NONE, owner)
+                    .unwrap();
+                assert!(store.set_object_target_and_mapper(duplicate, Some(target), None));
+                assert!(store.set_type_reference_resolution(
+                    duplicate,
+                    None,
+                    Some(vec![type_parameter]),
+                ));
+                forged = Some(duplicate);
+                duplicate
+            },
+            |_, type_parameter| type_parameter,
+        );
+        let forged = forged.unwrap();
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let argument = canonical_interface_reference(&mut store, target, number);
+        let before = vector_cache_graph_counts(&store);
+
+        assert_eq!(
+            project_vector(
+                &mut store,
+                &callable,
+                vector_request(callable.owner, None, &[argument]),
+            ),
+            Err(GenericCallVectorError::Invariant(
+                GenericCallVectorInvariant::InvalidInterfaceReference {
+                    signature: callable.signature,
+                    type_: forged,
+                },
+            )),
+        );
+        assert_eq!(vector_cache_graph_counts(&store), before);
+    }
+
+    #[test]
+    fn poisoned_generic_interface_cache_is_rejected_before_projection_writes() {
+        let mut store = initialized_store();
+        let target = canonical_interface_target(&mut store, "Box");
+        let (callable, _) = structured_vector_callable(
+            &mut store,
+            |store, type_parameter| canonical_interface_reference(store, target, type_parameter),
+            |_, type_parameter| type_parameter,
+        );
+        let (number, string) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.number_type, bootstrap.string_type)
+        };
+        let argument = canonical_interface_reference(&mut store, target, number);
+        let owner = store.type_payload(target).unwrap().symbol();
+        let poison = store
+            .alloc_type_reference(ObjectFlags::NONE, owner)
+            .unwrap();
+        assert!(store.set_object_target_and_mapper(poison, Some(target), None));
+        assert!(store.set_type_reference_resolution(poison, None, Some(vec![number])));
+        assert!(store.try_reserve_object_instantiations(target, 1));
+        assert_eq!(
+            store.insert_object_instantiation(target, type_list_key(&[string]), poison),
+            Some(poison),
+        );
+        let before = vector_cache_graph_counts(&store);
+
+        assert_eq!(
+            project_vector(
+                &mut store,
+                &callable,
+                vector_request(callable.owner, None, &[argument]),
+            ),
+            Err(GenericCallVectorError::Invariant(
+                GenericCallVectorInvariant::InvalidInterfaceReference {
+                    signature: callable.signature,
+                    type_: callable.parameters[0],
+                },
+            )),
+        );
+        assert_eq!(vector_cache_graph_counts(&store), before);
+    }
+
+    #[test]
+    fn generic_interface_variance_rejects_unsupported_and_malformed_caches() {
+        for (variances, contravariant) in [
+            (vec![VarianceFlags::CONTRAVARIANT], true),
+            (Vec::new(), false),
+            (
+                vec![VarianceFlags::INDEPENDENT | VarianceFlags::COVARIANT],
+                false,
+            ),
+        ] {
+            let mut store = initialized_store();
+            let target = canonical_interface_target(&mut store, "Box");
+            let (callable, _) = structured_vector_callable(
+                &mut store,
+                |store, type_parameter| {
+                    canonical_interface_reference(store, target, type_parameter)
+                },
+                |store, type_parameter| {
+                    canonical_interface_reference(store, target, type_parameter)
+                },
+            );
+            let number = store.intrinsic_bootstrap().unwrap().number_type;
+            let argument = canonical_interface_reference(&mut store, target, number);
+            let owner = store.type_payload(target).unwrap().symbol().unwrap();
+            assert!(store.set_variance_links(
+                owner,
+                VarianceLinks {
+                    variances: Some(variances),
+                },
+            ));
+            let before = vector_cache_graph_counts(&store);
+            let expected = if contravariant {
+                GenericCallVectorError::Unsupported(
+                    GenericCallVectorUnsupported::ContravariantInterfaceTypeArgument {
+                        signature: callable.signature,
+                        type_: callable.parameters[0],
+                        index: 0,
+                    },
+                )
+            } else {
+                GenericCallVectorError::Invariant(
+                    GenericCallVectorInvariant::InvalidInterfaceVariance {
+                        signature: callable.signature,
+                        type_: callable.parameters[0],
+                    },
+                )
+            };
+
+            assert_eq!(
+                project_vector(
+                    &mut store,
+                    &callable,
+                    vector_request(callable.owner, None, &[argument]),
+                ),
+                Err(expected),
+            );
+            assert_eq!(vector_cache_graph_counts(&store), before);
+        }
     }
 
     #[test]

@@ -3239,6 +3239,7 @@ mod tests {
         object_members::{
             DeclaredPropertyTypeGraphValidation, validate_resolved_declared_property_type_graph,
         },
+        reference_types::validate_direct_generic_reference,
         source::{PlannedIdentifierRead, PlannedIdentifierReadKind},
         type_records::{LiteralValue, TypeData},
     };
@@ -6768,6 +6769,129 @@ mod tests {
         assert_eq!(
             [*inferred, *explicit].map(|call| call_publication_state(&context, call)),
             cold_calls
+        );
+    }
+
+    #[test]
+    fn generic_source_interface_calls_preserve_nested_references_and_warm_signatures() {
+        let library = parsed("interface Array<T> {} interface ReadonlyArray<T> {}");
+        let source = parsed(concat!(
+            "interface Box<T> { value: T } ",
+            "interface Validator<T> { value: T } ",
+            "interface Requireable<T> { value: T } ",
+            "declare function wrap<T>(value: Box<T>): Box<T>; ",
+            "declare function nested<T>(value: Box<Box<T>>): Box<Box<T>>; ",
+            "declare function mixed<T>(value: Box<T[]>): Box<T[]>; ",
+            "declare function arrayOf<T>(value: Validator<T>): Requireable<T[]>; ",
+            "declare const numberBox: Box<number>; ",
+            "declare const nestedBox: Box<Box<number>>; ",
+            "declare const arrayBox: Box<number[]>; ",
+            "declare const numberValidator: Validator<number>; ",
+            "const inferred = wrap(numberBox); ",
+            "const explicit = wrap<number>(numberBox); ",
+            "const nestedResult = nested(nestedBox); ",
+            "const mixedResult = mixed(arrayBox); ",
+            "const requiredArray = arrayOf(numberValidator); ",
+            "const wrong = wrap<string>(numberBox);",
+        ));
+        let library_file = FileId::new(4_886);
+        let source_file = FileId::new(4_887);
+        let mut context =
+            context_with_default_library(&library, library_file, &source, source_file);
+        let mut call_nodes = calls(&source, source_file);
+        call_nodes.sort_by_key(|call| source.arena.get(call.node).unwrap().range.start);
+        let [inferred, explicit, nested, mixed, required_array, wrong] = call_nodes.as_slice()
+        else {
+            panic!("expected inferred, explicit, nested, mixed, React-style, and invalid calls")
+        };
+
+        context.check_source_file(source_file).unwrap();
+
+        assert_eq!(
+            context
+                .diagnostics()
+                .as_slice()
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2345],
+        );
+        let resolved_type = |node| {
+            context
+                .store()
+                .type_node_links(node)
+                .and_then(|links| links.resolved_type)
+                .unwrap()
+        };
+        let inferred_type = resolved_type(*inferred);
+        let explicit_type = resolved_type(*explicit);
+        let nested_type = resolved_type(*nested);
+        let mixed_type = resolved_type(*mixed);
+        let required_array_type = resolved_type(*required_array);
+        let wrong_type = resolved_type(*wrong);
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+
+        assert_eq!(inferred_type, explicit_type);
+        let inferred_reference =
+            validate_direct_generic_reference(context.store(), inferred_type).unwrap();
+        assert_eq!(inferred_reference.type_arguments, [number]);
+        let nested_reference =
+            validate_direct_generic_reference(context.store(), nested_type).unwrap();
+        assert_eq!(nested_reference.target, inferred_reference.target);
+        assert_eq!(nested_reference.type_arguments, [inferred_type]);
+        let mixed_reference =
+            validate_direct_generic_reference(context.store(), mixed_type).unwrap();
+        assert_eq!(mixed_reference.target, inferred_reference.target);
+        assert_eq!(
+            context
+                .store()
+                .canonical_array_element_type(
+                    context.global_types(),
+                    mixed_reference.type_arguments[0],
+                )
+                .unwrap(),
+            Some(number),
+        );
+        let required_reference =
+            validate_direct_generic_reference(context.store(), required_array_type).unwrap();
+        assert_ne!(required_reference.target, inferred_reference.target);
+        assert_eq!(
+            context
+                .store()
+                .canonical_array_element_type(
+                    context.global_types(),
+                    required_reference.type_arguments[0],
+                )
+                .unwrap(),
+            Some(number),
+        );
+        let wrong_reference =
+            validate_direct_generic_reference(context.store(), wrong_type).unwrap();
+        assert_eq!(wrong_reference.target, inferred_reference.target);
+        assert_eq!(wrong_reference.type_arguments, [string]);
+
+        let signatures = [*inferred, *explicit].map(|call| {
+            context
+                .store()
+                .signature_links(call)
+                .and_then(|links| links.resolved_signature.signature())
+                .unwrap()
+        });
+        assert_eq!(signatures[0], signatures[1]);
+
+        let cold_calls = call_nodes
+            .iter()
+            .map(|call| call_publication_state(&context, *call))
+            .collect::<Vec<_>>();
+        mark_source_unchecked(&mut context, source_file);
+        context.check_source_file(source_file).unwrap();
+        assert_eq!(
+            call_nodes
+                .iter()
+                .map(|call| call_publication_state(&context, *call))
+                .collect::<Vec<_>>(),
+            cold_calls,
         );
     }
 
