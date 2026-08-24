@@ -135,6 +135,11 @@ struct ClassNamespaceExportPlan {
     literal_text: String,
 }
 
+enum ClassNamespaceVariablePlan {
+    NonExport,
+    Export(ClassNamespaceExportPlan),
+}
+
 /// One source property with an annotation, a numeric initializer, or both.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct ClassPropertyPlan {
@@ -2629,7 +2634,7 @@ fn plan_class_namespace_variable(
     owner: SemanticSymbolId,
     namespace: NodeRef,
     statement: NodeRef,
-) -> Option<Option<ClassNamespaceExportPlan>> {
+) -> Option<ClassNamespaceVariablePlan> {
     let statement_record = preflight_node(store, host, statement).ok()?;
     let NodeData::VariableStatement(variable_statement) = &statement_record.data else {
         return None;
@@ -2766,7 +2771,7 @@ fn plan_class_namespace_variable(
         return (symbol_record.parent().is_none()
             && bound.local_symbol(declaration).is_none()
             && locals.get_source(&identifier.text) == Some(symbol))
-        .then_some(None);
+        .then_some(ClassNamespaceVariablePlan::NonExport);
     }
 
     let local = bound.local_symbol(declaration)?;
@@ -2791,13 +2796,15 @@ fn plan_class_namespace_variable(
         return None;
     }
 
-    Some(Some(ClassNamespaceExportPlan {
-        declaration,
-        initializer,
-        symbol,
-        name: identifier.text.clone(),
-        literal_text: literal.text.clone(),
-    }))
+    Some(ClassNamespaceVariablePlan::Export(
+        ClassNamespaceExportPlan {
+            declaration,
+            initializer,
+            symbol,
+            name: identifier.text.clone(),
+            literal_text: literal.text.clone(),
+        },
+    ))
 }
 
 fn plan_class_owner_declarations(
@@ -2918,9 +2925,9 @@ fn plan_class_owner_declarations(
         if preflight_node(store, host, statement)?.parent != Some(body.node) {
             return Err(reject());
         }
-        let export = plan_class_namespace_variable(store, host, symbol, namespace, statement)
+        let variable = plan_class_namespace_variable(store, host, symbol, namespace, statement)
             .ok_or_else(reject)?;
-        if let Some(export) = export {
+        if let ClassNamespaceVariablePlan::Export(export) = variable {
             if !seen_exports.insert(export.name.clone()) {
                 return Err(reject());
             }

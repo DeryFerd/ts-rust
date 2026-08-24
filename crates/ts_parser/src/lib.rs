@@ -13615,6 +13615,34 @@ export as namespace GlobalName;
             SyntaxKind::InstanceOfKeyword
         );
 
+        let anonymous_module = parse_source_file("declare module {}");
+        assert_eq!(
+            source_statements(&anonymous_module)
+                .iter()
+                .map(|statement| anonymous_module.arena.get(*statement).unwrap().kind)
+                .collect::<Vec<_>>(),
+            [
+                SyntaxKind::ExpressionStatement,
+                SyntaxKind::ExpressionStatement,
+                SyntaxKind::Block,
+            ]
+        );
+        assert_eq!(
+            anonymous_module
+                .diagnostics
+                .iter()
+                .map(|diagnostic| (
+                    diagnostic.code,
+                    diagnostic.range.start.get(),
+                    diagnostic.range.end.get()
+                ))
+                .collect::<Vec<_>>(),
+            [(Some(1005), 8, 14), (Some(1437), 15, 16)]
+        );
+    }
+
+    #[test]
+    fn parses_declare_as_a_tagged_template_expression() {
         for (source, expected_template) in [
             (
                 "declare `value`;",
@@ -13647,31 +13675,6 @@ export as namespace GlobalName;
                 expected_template
             );
         }
-
-        let anonymous_module = parse_source_file("declare module {}");
-        assert_eq!(
-            source_statements(&anonymous_module)
-                .iter()
-                .map(|statement| anonymous_module.arena.get(*statement).unwrap().kind)
-                .collect::<Vec<_>>(),
-            [
-                SyntaxKind::ExpressionStatement,
-                SyntaxKind::ExpressionStatement,
-                SyntaxKind::Block,
-            ]
-        );
-        assert_eq!(
-            anonymous_module
-                .diagnostics
-                .iter()
-                .map(|diagnostic| (
-                    diagnostic.code,
-                    diagnostic.range.start.get(),
-                    diagnostic.range.end.get()
-                ))
-                .collect::<Vec<_>>(),
-            [(Some(1005), 8, 14), (Some(1437), 15, 16)]
-        );
     }
 
     #[test]
