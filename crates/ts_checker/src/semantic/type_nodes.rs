@@ -34099,6 +34099,71 @@ mod tests {
     }
 
     #[test]
+    fn generic_function_type_aliases_keep_parameter_identity_and_variance() {
+        let mut fixture = fixture("type Fn = <Value>(input: Value) => Value;");
+        let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Fn");
+        let function = function_type_node(&fixture, "Fn");
+        let parameters = function_parameter_nodes(&fixture, function);
+        let [parameter] = parameters.as_slice() else {
+            panic!("the generic function alias must retain one value parameter")
+        };
+        let parameter = *parameter;
+        let parameter_symbol = node_symbol(&fixture, parameter);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let type_ = query_declared(
+            &mut fixture,
+            alias,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let signature = function_signature(&fixture.store, function);
+        let record = fixture.store.signature(signature).unwrap();
+        let [type_parameter] = record.type_parameters() else {
+            panic!("the generic function signature must retain its type parameter")
+        };
+        let type_parameter = *type_parameter;
+        assert_eq!(record.parameters(), [parameter_symbol].as_slice());
+        assert_eq!(record.min_argument_count(), 1);
+        assert_eq!(
+            fixture.store.value_symbol_links(parameter_symbol),
+            Some(&ValueSymbolLinks {
+                resolved_type: Some(type_parameter),
+                ..ValueSymbolLinks::default()
+            }),
+        );
+        let StoredCallableSetValidation::Valid { projection, .. } =
+            validate_stored_callable_set(&fixture.store, type_)
+        else {
+            panic!("the generic function must retain its authenticated callable provider")
+        };
+        let [callable] = projection.call_signatures.as_ref() else {
+            panic!("the generic function must expose exactly one call signature")
+        };
+        assert_eq!(callable.signature, signature);
+        assert_eq!(callable.parameters.as_slice(), [type_parameter].as_slice());
+        assert!(!callable.strict_variance_exempt);
+
+        assert_eq!(
+            query_signature_return(&mut fixture, signature, &mut diagnostics),
+            Ok(type_parameter),
+        );
+        let warm = function_store_state(&fixture.store);
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(type_),
+        );
+        assert_eq!(function_store_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
     fn function_type_cold_warm_signature_parameters_and_optionality_are_exact() {
         let mut fixture = fixture_with_intrinsic(
             "type Fn = (required: 1, optional?: (2),) => 3;",
@@ -35159,7 +35224,6 @@ mod tests {
         };
         for source in [
             "type Fn<T> = (value: string) => number;",
-            "type Fn = <T>(value: T) => T;",
             "type Fn = (this: object, value: string) => number;",
             "type Fn = (...value: string[]) => number;",
             "type Fn = ([value]: [string]) => number;",

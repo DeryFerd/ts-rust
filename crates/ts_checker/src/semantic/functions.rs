@@ -1,7 +1,7 @@
 //! Exact function-type signatures for the dependency-closed type-node cut.
 //!
 //! This module owns nongeneric function types, implicit `any[]` rest parameters,
-//! and one constrained generic form.
+//! and authenticated generic function types with outer lexical constraints.
 //! The type-node planner/executor only supplies recursive annotation callbacks;
 //! binder proof, cache validation, shell publication, signatures, parameter
 //! value types, and lazy return-type validation stay here.
@@ -59,13 +59,13 @@ struct FunctionRestTupleElementPlan {
     null_literal_identity: bool,
 }
 
-/// One inner signature parameter constrained by an outer lexical parameter.
+/// One inner signature parameter with an optional outer lexical constraint.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct FunctionTypeParameterPlan {
     pub(super) declaration: NodeRef,
     pub(super) symbol: SemanticSymbolId,
-    pub(super) constraint: NodeRef,
-    pub(super) outer_symbol: SemanticSymbolId,
+    pub(super) constraint: Option<NodeRef>,
+    pub(super) outer_symbol: Option<SemanticSymbolId>,
 }
 
 /// Binder and syntax identities retained for one function-type node.
@@ -265,11 +265,6 @@ pub(super) fn plan_function_type(
         || function.modifiers.is_some()
     {
         return Err(invariant(FunctionTypeInvariant::InvalidSyntax(node)));
-    }
-    if function.type_parameters.is_some() && !function.parameters.nodes.is_empty() {
-        return Err(FunctionTypeError::Unsupported(
-            FunctionTypeUnsupported::GenericSignature(node),
-        ));
     }
     if function.parameters.range.start < record.range.start
         || function.parameters.range.end > record.range.end
@@ -580,6 +575,17 @@ pub(super) fn plan_function_type(
         function.parameters.range.start,
         return_identity_node,
     )?;
+    if !type_parameters.is_empty()
+        && (flags != SignatureFlags::NONE
+            || usize::try_from(min_argument_count).ok() != Some(parameters.len())
+            || parameters
+                .iter()
+                .any(|parameter| parameter.rest_tuple_element.is_some()))
+    {
+        return Err(FunctionTypeError::Unsupported(
+            FunctionTypeUnsupported::GenericSignature(node),
+        ));
+    }
     let plan = FunctionTypePlan {
         node,
         symbol,
@@ -746,6 +752,14 @@ fn plan_function_type_parameters(
     let NodeData::TypeParameterDeclaration(parameter) = &declaration_record.data else {
         return Err(invariant(FunctionTypeInvariant::InvalidSyntax(declaration)));
     };
+    let name = NodeRef::new(declaration.arena, declaration.file, parameter.name);
+    let name_record = preflight_node(store, host, name)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(invariant(FunctionTypeInvariant::InvalidSyntax(declaration)));
+    };
+    let owner = store
+        .symbol(*symbol)
+        .ok_or_else(|| invariant(FunctionTypeInvariant::InvalidSyntax(declaration)))?;
     if declaration_record.kind != SyntaxKind::TypeParameter
         || declaration_record.parent != Some(function.node)
         || declaration_record.flags.0 & NODE_FLAG_JSDOC != 0
@@ -755,43 +769,62 @@ fn plan_function_type_parameters(
         || parameter.expression.is_some()
         || parameter.modifiers.is_some()
         || parameter.symbol.is_some()
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(declaration.node)
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+        || owner.flags() != SymbolFlags::TYPE_PARAMETER
+        || owner.check_flags() != CheckFlags::NONE
+        || owner.name().as_utf8() != Some(identifier.text.as_str())
+        || owner.declarations() != Some(&[declaration])
+        || owner.value_declaration().is_some()
+        || owner.members().is_some()
+        || owner.exports().is_some()
+        || owner.parent().is_some()
+        || owner.export_symbol().is_some()
+        || store.get_merged_symbol(*symbol) != Some(*symbol)
     {
         return Err(FunctionTypeError::Unsupported(
             FunctionTypeUnsupported::GenericSignature(function),
         ));
     }
-    let Some(constraint) = parameter.constraint else {
-        return Err(FunctionTypeError::Unsupported(
-            FunctionTypeUnsupported::GenericSignature(function),
-        ));
-    };
-    let constraint = NodeRef::new(function.arena, function.file, constraint);
-    let constraint_record = preflight_node(store, host, constraint)?;
-    if constraint_record.parent != Some(declaration.node)
-        || constraint_record.range.start < declaration_record.range.start
-        || constraint_record.range.end > declaration_record.range.end
-    {
-        return Err(invariant(FunctionTypeInvariant::InvalidSyntax(constraint)));
-    }
+    let (constraint, outer_symbol) = match parameter.constraint {
+        Some(constraint) => {
+            let constraint = NodeRef::new(function.arena, function.file, constraint);
+            let constraint_record = preflight_node(store, host, constraint)?;
+            if constraint_record.parent != Some(declaration.node)
+                || constraint_record.range.start < declaration_record.range.start
+                || constraint_record.range.end > declaration_record.range.end
+            {
+                return Err(invariant(FunctionTypeInvariant::InvalidSyntax(constraint)));
+            }
 
-    let outer_symbol = function_type_parameter_reference_symbol(store, host, constraint)?;
-    if outer_symbol == *symbol {
-        return Err(FunctionTypeError::Unsupported(
-            FunctionTypeUnsupported::GenericSignature(function),
-        ));
-    }
-    preflight_type_parameter_symbol(store, host, outer_symbol, &mut checked)?;
-    let outer_declaration = store
-        .symbol(outer_symbol)
-        .and_then(|record| record.declarations())
-        .and_then(|declarations| match declarations {
-            [declaration] => Some(*declaration),
-            _ => None,
-        })
-        .ok_or_else(|| invariant(FunctionTypeInvariant::InvalidSyntax(constraint)))?;
-    if !function_type_parameter_is_outer(store, function, outer_declaration)
-        || function_type_parameter_reference_symbol(store, host, return_type)? != *symbol
-    {
+            let outer_symbol = function_type_parameter_reference_symbol(store, host, constraint)?;
+            if outer_symbol == *symbol {
+                return Err(FunctionTypeError::Unsupported(
+                    FunctionTypeUnsupported::GenericSignature(function),
+                ));
+            }
+            preflight_type_parameter_symbol(store, host, outer_symbol, &mut checked)?;
+            let outer_declaration = store
+                .symbol(outer_symbol)
+                .and_then(|record| record.declarations())
+                .and_then(|declarations| match declarations {
+                    [declaration] => Some(*declaration),
+                    _ => None,
+                })
+                .ok_or_else(|| invariant(FunctionTypeInvariant::InvalidSyntax(constraint)))?;
+            if !function_type_parameter_is_outer(store, function, outer_declaration) {
+                return Err(FunctionTypeError::Unsupported(
+                    FunctionTypeUnsupported::GenericSignature(function),
+                ));
+            }
+            (Some(constraint), Some(outer_symbol))
+        }
+        None => (None, None),
+    };
+    if function_type_parameter_reference_symbol(store, host, return_type)? != *symbol {
         return Err(FunctionTypeError::Unsupported(
             FunctionTypeUnsupported::GenericSignature(function),
         ));
@@ -1220,7 +1253,7 @@ pub(super) fn reserve_function_type_capacities(
                 .checked_add(usize::from(plan.alias_symbol.is_some()))
                 .ok_or_else(|| invariant(FunctionTypeInvariant::Capacity(plan.node)))?;
             for parameter in &plan.type_parameters {
-                for symbol in [parameter.outer_symbol, parameter.symbol] {
+                for symbol in parameter.outer_symbol.into_iter().chain([parameter.symbol]) {
                     if store
                         .declared_type_links(symbol)
                         .and_then(|links| links.declared_type)
@@ -1347,10 +1380,17 @@ fn resolve_function_type_parameters(
         .map(|bootstrap| bootstrap.no_constraint_type)
         .ok_or_else(|| invariant(FunctionTypeInvariant::Publication(plan.node)))?;
     for parameter in &plan.type_parameters {
-        let outer = execute_type_parameter(store, parameter.outer_symbol);
+        if parameter.constraint.is_some() != parameter.outer_symbol.is_some() {
+            return Err(invariant(FunctionTypeInvariant::Publication(plan.node)));
+        }
+        let constraint = parameter
+            .outer_symbol
+            .map(|symbol| execute_type_parameter(store, symbol))
+            .unwrap_or(no_constraint);
         let inner = execute_type_parameter(store, parameter.symbol);
-        if cached_ordinary_type_parameter_owner(store, outer) != Some(parameter.outer_symbol)
-            || cached_ordinary_type_parameter_owner(store, inner) != Some(parameter.symbol)
+        if parameter.outer_symbol.is_some_and(|symbol| {
+            cached_ordinary_type_parameter_owner(store, constraint) != Some(symbol)
+        }) || cached_ordinary_type_parameter_owner(store, inner) != Some(parameter.symbol)
         {
             return Err(invariant(FunctionTypeInvariant::Publication(plan.node)));
         }
@@ -1360,7 +1400,7 @@ fn resolve_function_type_parameters(
         };
         if data
             .constraint
-            .is_some_and(|constraint| constraint != outer)
+            .is_some_and(|existing| existing != constraint)
             || data
                 .resolved_default_type
                 .is_some_and(|default_type| default_type != no_constraint)
@@ -1370,10 +1410,11 @@ fn resolve_function_type_parameters(
         {
             return Err(invariant(FunctionTypeInvariant::Publication(plan.node)));
         }
-        if (data.constraint != Some(outer) || data.resolved_default_type != Some(no_constraint))
+        if (data.constraint != Some(constraint)
+            || data.resolved_default_type != Some(no_constraint))
             && !store.set_type_parameter_resolution(
                 inner,
-                Some(outer),
+                Some(constraint),
                 None,
                 None,
                 Some(no_constraint),
@@ -2191,9 +2232,9 @@ fn valid_stored_function_type_parameters(
     let [type_parameter] = signature.type_parameters() else {
         return signature.type_parameters().is_empty().then(Vec::new);
     };
-    if !signature.parameters().is_empty()
-        || signature.flags() != SignatureFlags::NONE
-        || signature.min_argument_count() != 0
+    if signature.flags() != SignatureFlags::NONE
+        || usize::try_from(signature.min_argument_count()).ok()
+            != Some(signature.parameters().len())
         || store.source_node_kind(return_annotation) != Some(SyntaxKind::TypeReference)
         || store.source_node_parent(return_annotation) != Some(SourceNodeParent::Parent(function))
     {
@@ -2211,6 +2252,7 @@ fn valid_stored_function_type_parameters(
         || symbol_record.exports().is_some()
         || symbol_record.parent().is_some()
         || symbol_record.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
         || store.source_node_kind(*declaration) != Some(SyntaxKind::TypeParameter)
         || store.source_node_parent(*declaration) != Some(SourceNodeParent::Parent(function))
     {
@@ -2219,30 +2261,58 @@ fn valid_stored_function_type_parameters(
     let TypeData::TypeParameter(data) = store.type_payload(*type_parameter)?.data() else {
         return None;
     };
-    let outer = data.constraint?;
     let no_constraint = store.intrinsic_bootstrap()?.no_constraint_type;
-    if outer == *type_parameter
-        || data.resolved_default_type != Some(no_constraint)
+    if data.resolved_default_type != Some(no_constraint)
         || data.target.is_some()
         || data.mapper.is_some()
         || data.is_this_type
     {
         return None;
     }
-    let outer_symbol = cached_ordinary_type_parameter_owner(store, outer)?;
-    let [outer_declaration] = store.symbol(outer_symbol)?.declarations()? else {
-        return None;
+    let outer = match store.source_direct_type_annotation(*declaration) {
+        Some(annotation) => {
+            let outer = data.constraint?;
+            let outer_symbol = cached_ordinary_type_parameter_owner(store, outer)?;
+            let [outer_declaration] = store.symbol(outer_symbol)?.declarations()? else {
+                return None;
+            };
+            if outer == *type_parameter
+                || store.source_node_kind(annotation) != Some(SyntaxKind::TypeReference)
+                || store.source_node_parent(annotation)
+                    != Some(SourceNodeParent::Parent(*declaration))
+                || !function_type_parameter_is_outer(store, function, *outer_declaration)
+                || store.symbol_node_links(annotation).is_some_and(|links| {
+                    links != &SymbolNodeLinks::default()
+                        && links
+                            != &SymbolNodeLinks {
+                                resolved_symbol: Some(outer_symbol),
+                            }
+                })
+                || store.type_node_links(annotation).is_some_and(|links| {
+                    links != &TypeNodeLinks::default()
+                        && links
+                            != &TypeNodeLinks {
+                                resolved_type: Some(outer),
+                                outer_type_parameters: None,
+                            }
+                })
+            {
+                return None;
+            }
+            Some(outer)
+        }
+        None if data.constraint == Some(no_constraint) => None,
+        None => return None,
     };
-    if !function_type_parameter_is_outer(store, function, *outer_declaration)
-        || store
-            .symbol_node_links(return_annotation)
-            .is_some_and(|links| {
-                links != &SymbolNodeLinks::default()
-                    && links
-                        != &SymbolNodeLinks {
-                            resolved_symbol: Some(symbol),
-                        }
-            })
+    if store
+        .symbol_node_links(return_annotation)
+        .is_some_and(|links| {
+            links != &SymbolNodeLinks::default()
+                && links
+                    != &SymbolNodeLinks {
+                        resolved_symbol: Some(symbol),
+                    }
+        })
         || store
             .type_node_links(return_annotation)
             .is_some_and(|links| {
@@ -2256,7 +2326,9 @@ fn valid_stored_function_type_parameters(
     {
         return None;
     }
-    Some(vec![*type_parameter, outer])
+    let mut edges = vec![*type_parameter];
+    edges.extend(outer);
+    Some(edges)
 }
 
 fn exact_signature_link(
@@ -2714,14 +2786,13 @@ mod tests {
         let [planned] = plan.type_parameters.as_slice() else {
             panic!("expected one constrained signature type parameter")
         };
+        let outer_symbol = planned
+            .outer_symbol
+            .expect("the constrained signature must retain its outer parameter");
+        assert!(planned.constraint.is_some());
         assert!(plan.parameters.is_empty());
         assert!(fixture.store.declared_type_links(planned.symbol).is_none());
-        assert!(
-            fixture
-                .store
-                .declared_type_links(planned.outer_symbol)
-                .is_none()
-        );
+        assert!(fixture.store.declared_type_links(outer_symbol).is_none());
 
         reserve_function_type_capacities(&mut fixture.store, &[&plan]).unwrap();
         let pending = begin_function_type(&mut fixture.store, &plan)
@@ -2735,7 +2806,7 @@ mod tests {
         let inner = *inner;
         let outer = fixture
             .store
-            .declared_type_links(planned.outer_symbol)
+            .declared_type_links(outer_symbol)
             .unwrap()
             .declared_type
             .unwrap();
@@ -2799,12 +2870,324 @@ mod tests {
     }
 
     #[test]
+    fn unconstrained_generic_function_parameters_preserve_binder_identity_cold_and_warm() {
+        let mut fixture = fixture(
+            "declare let value: <Value>(input: Value) => Value;",
+            FileId::new(95_002),
+        );
+        let function = generic_function_node(&fixture);
+        let plan = {
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            plan_function_type(&fixture.store, &host, function, None, false, None).unwrap()
+        };
+        let [planned] = plan.type_parameters.as_slice() else {
+            panic!("expected one binder-owned generic signature parameter")
+        };
+        let [value] = plan.parameters.as_slice() else {
+            panic!("expected one binder-owned generic value parameter")
+        };
+        assert!(planned.constraint.is_none());
+        assert!(planned.outer_symbol.is_none());
+        assert_eq!(plan.min_argument_count, 1);
+        assert!(fixture.store.declared_type_links(planned.symbol).is_none());
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let function_type = {
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_from_type_node(function)
+            .unwrap()
+        };
+        let FunctionTypeState::Resolved { signature, .. } =
+            function_type_state(&fixture.store, &plan, false).unwrap()
+        else {
+            panic!("the generic function signature must be fully resolved")
+        };
+        let signature_record = fixture.store.signature(signature).unwrap();
+        let [inner] = signature_record.type_parameters() else {
+            panic!("the signature must retain its binder-owned type parameter")
+        };
+        let inner = *inner;
+        let no_constraint = fixture
+            .store
+            .intrinsic_bootstrap()
+            .unwrap()
+            .no_constraint_type;
+        let TypeData::TypeParameter(parameter) = fixture.store.type_payload(inner).unwrap().data()
+        else {
+            panic!("the generic signature parameter must retain its canonical identity")
+        };
+        assert_eq!(
+            cached_ordinary_type_parameter_owner(&fixture.store, inner),
+            Some(planned.symbol)
+        );
+        assert_eq!(parameter.constraint, Some(no_constraint));
+        assert_eq!(parameter.resolved_default_type, Some(no_constraint));
+        assert_eq!(signature_record.parameters(), [value.symbol].as_slice());
+        assert_eq!(signature_record.min_argument_count(), 1);
+        assert_eq!(
+            fixture.store.value_symbol_links(value.symbol),
+            Some(&ValueSymbolLinks {
+                resolved_type: Some(inner),
+                ..ValueSymbolLinks::default()
+            }),
+        );
+        assert!(matches!(
+            validate_stored_function_type(&fixture.store, function_type),
+            StoredFunctionTypeValidation::Valid(_)
+        ));
+
+        {
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            assert_eq!(
+                CanonicalTypeQuery::new(
+                    &mut fixture.store,
+                    &host,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_return_type_of_signature(signature),
+                Ok(inner),
+            );
+        }
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            begin_function_type(&mut fixture.store, &plan),
+            Ok(Err(function_type)),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn constrained_generic_function_value_parameters_preserve_outer_constraint() {
+        let mut fixture = fixture(
+            concat!(
+                "type Outer<Value> = ",
+                "(<Inner extends Value>(input: Inner) => Inner) ",
+                "extends ((input: Value) => infer Result) ? Result : never;",
+            ),
+            FileId::new(95_003),
+        );
+        let function = generic_function_node(&fixture);
+        let plan = {
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            plan_function_type(&fixture.store, &host, function, None, false, None).unwrap()
+        };
+        let [planned] = plan.type_parameters.as_slice() else {
+            panic!("expected one constrained generic type parameter")
+        };
+        let outer_symbol = planned.outer_symbol.unwrap();
+        assert!(planned.constraint.is_some());
+        assert_eq!(plan.parameters.len(), 1);
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let function_type = {
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_from_type_node(function)
+            .unwrap()
+        };
+        let FunctionTypeState::Resolved { signature, .. } =
+            function_type_state(&fixture.store, &plan, false).unwrap()
+        else {
+            panic!("the constrained generic function must publish its signature")
+        };
+        let [inner] = fixture
+            .store
+            .signature(signature)
+            .unwrap()
+            .type_parameters()
+        else {
+            panic!("the constrained generic signature must own one type parameter")
+        };
+        let outer = fixture
+            .store
+            .declared_type_links(outer_symbol)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let TypeData::TypeParameter(parameter) = fixture.store.type_payload(*inner).unwrap().data()
+        else {
+            panic!("the signature type parameter must preserve its constraint")
+        };
+        assert_eq!(parameter.constraint, Some(outer));
+        assert!(matches!(
+            validate_stored_function_type(&fixture.store, function_type),
+            StoredFunctionTypeValidation::Valid(_)
+        ));
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn unconstrained_generic_function_rejects_poisoned_constraint_without_publication() {
+        let mut fixture = fixture(
+            "declare let value: <Value>(input: Value) => Value;",
+            FileId::new(95_004),
+        );
+        let function = generic_function_node(&fixture);
+        let plan = {
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            plan_function_type(&fixture.store, &host, function, None, false, None).unwrap()
+        };
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let function_type = {
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_from_type_node(function)
+            .unwrap()
+        };
+        let inner = fixture
+            .store
+            .declared_type_links(plan.type_parameters[0].symbol)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let no_constraint = bootstrap.no_constraint_type;
+        let string = bootstrap.string_type;
+        assert!(fixture.store.set_type_parameter_resolution(
+            inner,
+            Some(string),
+            None,
+            None,
+            Some(no_constraint),
+        ));
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        assert_eq!(
+            validate_stored_function_type(&fixture.store, function_type),
+            StoredFunctionTypeValidation::Malformed,
+        );
+        assert!(begin_function_type(&mut fixture.store, &plan).is_err());
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+    }
+
+    #[test]
+    fn malformed_generic_function_parameter_owners_fail_before_publication() {
+        for mutation in 0..2 {
+            let mut fixture = fixture(
+                "declare let value: <Value>(input: Value) => Value;",
+                FileId::new(95_005 + mutation),
+            );
+            let function = generic_function_node(&fixture);
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            let plan =
+                plan_function_type(&fixture.store, &host, function, None, false, None).unwrap();
+            let parameter = plan.type_parameters[0].symbol;
+            match mutation {
+                0 => assert!(fixture.store.set_symbol_flags(
+                    parameter,
+                    SymbolFlags::TYPE_PARAMETER | SymbolFlags::PROPERTY,
+                    CheckFlags::NONE,
+                )),
+                1 => assert!(fixture.store.set_symbol_relationships(
+                    parameter,
+                    None,
+                    None,
+                    Some(plan.symbol),
+                    None,
+                )),
+                _ => unreachable!(),
+            }
+            let before = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            assert!(
+                plan_function_type(&fixture.store, &host, function, None, false, None).is_err()
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+        }
+    }
+
+    #[test]
     fn unsupported_generic_function_signatures_fail_before_publication() {
         for (index, signature) in [
-            "<o>() => o",
             "<o extends string>() => o",
-            "<o extends x>(value: o) => o",
             "<o extends x>() => x",
+            "<o>(value?: o) => o",
+            "<o>(value: 'literal') => o",
             "<o extends x = x>() => o",
             "<o extends x, p extends x>() => o",
         ]
