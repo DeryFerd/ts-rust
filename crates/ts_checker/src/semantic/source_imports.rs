@@ -9896,7 +9896,7 @@ mod tests {
         ));
         assert_eq!(store_state(&fixture.store), cold);
 
-        let (expression, expression_type, value_type, regular) = {
+        let (expression, expression_type, value_type, property_type) = {
             let Fixture {
                 files,
                 bound,
@@ -9940,6 +9940,11 @@ mod tests {
             let value_type = store
                 .get_widened_type_with_global_types(expression_type, global_types)
                 .unwrap();
+            let property_type = store
+                .resolved_own_property(expression_type, "name")
+                .unwrap()
+                .unwrap()
+                .type_;
             assert!(store.set_value_symbol_links(
                 target,
                 ValueSymbolLinks {
@@ -9947,7 +9952,7 @@ mod tests {
                     ..ValueSymbolLinks::default()
                 },
             ));
-            (expression, expression_type, value_type, regular)
+            (expression, expression_type, value_type, property_type)
         };
 
         let prepared = prepare_one(&mut fixture, &resolved[0], &read).unwrap();
@@ -9966,7 +9971,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .type_,
-            regular,
+            property_type,
         );
 
         publish_for_test(&mut fixture.store, std::slice::from_ref(&prepared));
