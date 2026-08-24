@@ -20777,6 +20777,40 @@ pub(super) fn check_source_file(
                             .flags()
                             .without(SymbolFlags::MODULE | SymbolFlags::CONST_ENUM_ONLY_MODULE)
                             == SymbolFlags::NONE
+                        || matches!(
+                            target.flags(),
+                            SymbolFlags::FUNCTION_SCOPED_VARIABLE
+                                | SymbolFlags::BLOCK_SCOPED_VARIABLE
+                        ) && target.check_flags() == CheckFlags::NONE
+                            && target.name().as_utf8()
+                                == Some(export.binding.imported_text.as_str())
+                            && target.members().is_none()
+                            && target.exports().is_none()
+                            && target.parent().is_none()
+                            && target.export_symbol().is_none()
+                            && target.declarations().is_some_and(|declarations| {
+                                matches!(declarations, [declaration] if {
+                                    declaration.is_for(arena.id(), bound.file_id())
+                                        && target.value_declaration() == Some(*declaration)
+                                        && bound.symbol(*declaration)
+                                            == Some(resolved.target_symbol)
+                                        && bound.local_symbol(*declaration).is_none()
+                                        && bound.container(*declaration)
+                                            == Some(bound.source_file())
+                                        && store.get_merged_symbol(resolved.target_symbol)
+                                            == Some(resolved.target_symbol)
+                                        && arena.get(declaration.node).is_some_and(|element| {
+                                            element.kind == SyntaxKind::BindingElement
+                                                && element
+                                                    .parent
+                                                    .and_then(|parent| arena.get(parent))
+                                                    .is_some_and(|pattern| {
+                                                        pattern.kind
+                                                            == SyntaxKind::ObjectBindingPattern
+                                                    })
+                                        })
+                                })
+                            })
                 }
             })
             || resolved.type_only_declaration != expected_type_only_marker
@@ -31433,7 +31467,7 @@ mod tests {
             expected_text
         );
         assert_eq!(
-            object_binding_value_type(&context, &source, file, "count"),
+            variable_value_type(&context, &source, file, "count"),
             expected_count
         );
         assert_eq!(
@@ -37225,7 +37259,7 @@ mod tests {
 
         let bootstrap = context.store().intrinsic_bootstrap().unwrap();
         assert_eq!(
-            variable_value_type(&context, &source, file, "count"),
+            object_binding_value_type(&context, &source, file, "count"),
             bootstrap.number_type,
         );
         assert_eq!(
