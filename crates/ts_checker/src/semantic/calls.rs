@@ -229,21 +229,23 @@ pub(super) fn resolve_direct_call(
     {
         return Err(DirectCallUnsupported::NotExactSingleCallable(request.callee).into());
     }
-    let mut callables = projection.call_signatures.iter().collect::<Vec<_>>();
-    callables.sort_by_key(|callable| {
-        !store
-            .signature(callable.signature)
-            .is_some_and(|signature| {
-                signature
-                    .flags()
-                    .contains(SignatureFlags::HAS_LITERAL_TYPES)
-            })
-    });
-    let candidates = callables
-        .into_iter()
-        .map(|callable| project_validated_direct_call(store, Some(global_types), request, callable))
-        .collect::<Result<Vec<_>, _>>()?;
-    if candidates.len() == 1 {
+    let callables =
+        reorder_direct_call_candidates(store, request.callee, &projection.call_signatures)?;
+    let candidate_count = callables.len();
+    let mut candidates = Vec::with_capacity(candidate_count);
+    for callable in callables {
+        match project_validated_direct_call(store, Some(global_types), request, callable) {
+            Ok(candidate) => candidates.push(candidate),
+            Err(DirectCallError::Unsupported(DirectCallUnsupported::Form(
+                DirectCallForm::TaggedTemplate,
+            ))) if candidate_count > 1 => {}
+            Err(error) => return Err(error),
+        }
+    }
+    if candidates.is_empty() {
+        return Err(DirectCallUnsupported::Form(request.form).into());
+    }
+    if candidate_count == 1 {
         let mut resolution = candidates
             .into_iter()
             .next()
@@ -284,6 +286,66 @@ pub(super) fn resolve_direct_call(
         return Ok(candidate);
     }
     Err(DirectCallUnsupported::OverloadFailureRecovery(request.callee).into())
+}
+
+/// Keeps specialized overloads first and reverses merged declaration groups.
+fn reorder_direct_call_candidates<'a>(
+    store: &CanonicalTypeMapperStore,
+    callee: TypeId,
+    callables: &'a [ValidatedSingleCallable],
+) -> Result<Vec<&'a ValidatedSingleCallable>, DirectCallError> {
+    let shared_declaration_owner = store
+        .type_payload(callee)
+        .and_then(|record| record.symbol())
+        .and_then(|owner| store.symbol(owner))
+        .and_then(|owner| owner.declarations())
+        .is_some_and(|declarations| {
+            callables.iter().all(|callable| {
+                store
+                    .signature(callable.signature)
+                    .and_then(|signature| signature.declaration())
+                    .is_some_and(|declaration| declarations.contains(&declaration))
+            })
+        });
+    let mut ordered = Vec::with_capacity(callables.len());
+    let mut previous_parent = None;
+    let mut declaration_index = 0;
+    let mut cutoff_index = 0;
+    let mut specialized_count = 0;
+
+    for callable in callables {
+        let signature = store
+            .signature(callable.signature)
+            .ok_or(DirectCallInvariant::InvalidSignature(callable.signature))?;
+        if shared_declaration_owner {
+            let parent = signature
+                .declaration()
+                .and_then(|declaration| store.source_node_parent(declaration));
+            if previous_parent.is_some() && previous_parent == parent {
+                declaration_index += 1;
+            } else {
+                previous_parent = parent;
+                declaration_index = cutoff_index;
+            }
+        } else {
+            declaration_index = ordered.len();
+        }
+
+        let insertion_index = if signature
+            .flags()
+            .contains(SignatureFlags::HAS_LITERAL_TYPES)
+        {
+            let index = specialized_count;
+            specialized_count += 1;
+            cutoff_index += 1;
+            index
+        } else {
+            declaration_index
+        };
+        ordered.insert(insertion_index, callable);
+    }
+
+    Ok(ordered)
 }
 
 fn choose_applicable_overload(
@@ -659,7 +721,7 @@ fn check_argument_applicability(
 
 #[cfg(test)]
 mod tests {
-    use ts_ast::FileId;
+    use ts_ast::{FileId, NodeRef, SyntaxKind};
     use ts_binder::{
         CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
         EscapedName, SemanticSymbolId, SymbolData, SymbolFlags,
@@ -843,6 +905,263 @@ mod tests {
                 Err(DirectCallError::Unsupported(expected))
             );
         }
+    }
+
+    #[test]
+    fn literal_overloads_stay_first_without_changing_their_relative_order() {
+        let mut store = initialized_store();
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let broad_first = callable(&mut store, SignatureFlags::NONE, &[number], 1, Some(number));
+        let literal_first = callable(
+            &mut store,
+            SignatureFlags::HAS_LITERAL_TYPES,
+            &[number],
+            1,
+            Some(number),
+        );
+        let broad_second = callable(&mut store, SignatureFlags::NONE, &[number], 1, Some(number));
+        let literal_second = callable(
+            &mut store,
+            SignatureFlags::HAS_LITERAL_TYPES,
+            &[number],
+            1,
+            Some(number),
+        );
+        let expected = [
+            literal_first.signature,
+            literal_second.signature,
+            broad_first.signature,
+            broad_second.signature,
+        ];
+        let callee = broad_first.owner;
+        let callables = [broad_first, literal_first, broad_second, literal_second];
+
+        let actual = reorder_direct_call_candidates(&store, callee, &callables)
+            .unwrap()
+            .into_iter()
+            .map(|callable| callable.signature)
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn merged_interface_method_overloads_prefer_later_declaration_groups() {
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} ",
+            "interface ReadonlyArray<T> {} ",
+            "interface API { ",
+            "run(value: string): number; ",
+            "run(value: number): number; ",
+            "} ",
+            "interface API { ",
+            "run(value: string): string; ",
+            "run(value: number): string; ",
+            "} ",
+            "function use(api: API): string { return api.run('ok'); }",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(9_411);
+        let mut context = array_context(&parsed);
+
+        context.check_source_file(file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
+        let mut declarations = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::MethodSignature).then_some((
+                    record.range.start,
+                    NodeRef::new(parsed.arena.id(), file, node),
+                ))
+            })
+            .collect::<Vec<_>>();
+        declarations.sort_by_key(|(start, _)| *start);
+        let [first, second, third, fourth] = declarations.as_slice() else {
+            panic!("expected two overloads in each merged declaration")
+        };
+        let signatures = [third.1, fourth.1, first.1, second.1].map(|declaration| {
+            context
+                .store()
+                .signature_links(declaration)
+                .and_then(|links| links.resolved_signature.signature())
+                .unwrap()
+        });
+        let access = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::PropertyAccessExpression).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let callee = context
+            .store()
+            .type_node_links(access)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let StoredCallableSetValidation::Valid { projection, .. } =
+            validate_stored_callable_set(context.store(), callee)
+        else {
+            panic!("expected an authenticated merged interface method")
+        };
+        let ordered =
+            reorder_direct_call_candidates(context.store(), callee, &projection.call_signatures)
+                .unwrap()
+                .into_iter()
+                .map(|callable| callable.signature)
+                .collect::<Vec<_>>();
+        assert_eq!(ordered, signatures);
+
+        let call = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::CallExpression).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        assert_eq!(
+            context
+                .store()
+                .signature_links(call)
+                .and_then(|links| links.resolved_signature.signature()),
+            Some(signatures[0]),
+        );
+        let warm = (
+            context.store().type_len(),
+            context.store().mapper_len(),
+            context.store().signature_len(),
+        );
+
+        context.recheck_source_file(file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().mapper_len(),
+                context.store().signature_len(),
+            ),
+            warm,
+        );
+        assert_eq!(
+            context
+                .store()
+                .signature_links(call)
+                .and_then(|links| links.resolved_signature.signature()),
+            Some(signatures[0]),
+        );
+    }
+
+    #[test]
+    fn tagged_templates_skip_overloads_with_incompatible_first_parameters() {
+        for declarations in [
+            "(template: string): number; (template: TemplateStringsArray): string;",
+            "(template: TemplateStringsArray): string; (template: string): number;",
+        ] {
+            let parsed = parse_source_file(&format!(
+                "interface Array<T> {{}} \
+                 interface ReadonlyArray<T> {{}} \
+                 interface TemplateStringsArray {{}} \
+                 interface Tag {{ {declarations} }}",
+            ));
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let mut context = array_context(&parsed);
+            let template = context_template_strings_array(&mut context);
+            let owner = context
+                .store()
+                .symbol_table(context.globals())
+                .and_then(|globals| globals.get_source("Tag"))
+                .unwrap();
+            let callee = context.get_declared_type_of_symbol(owner).unwrap();
+            let globals = context.global_types().clone();
+            let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+            let expected = match validate_stored_callable_set(context.store(), callee) {
+                StoredCallableSetValidation::Valid { projection, .. } => {
+                    projection
+                        .call_signatures
+                        .iter()
+                        .find(|callable| callable.return_type == Some(string))
+                        .unwrap()
+                        .signature
+                }
+                _ => panic!("expected two authenticated tag overloads"),
+            };
+            let arguments = [template];
+            let tagged = DirectCallRequest {
+                form: DirectCallForm::TaggedTemplate,
+                ..request(callee, &arguments)
+            };
+            let before = (
+                context.store().type_len(),
+                context.store().mapper_len(),
+                context.store().signature_len(),
+            );
+
+            for _ in 0..2 {
+                let resolution =
+                    resolve_direct_call(context.store_mut_for_test(), &globals, false, tagged)
+                        .unwrap();
+                assert_eq!(resolution.projection.signature, expected);
+                assert_eq!(resolution.projection.return_type, string);
+                assert_eq!(
+                    resolution.applicability,
+                    DirectCallApplicability::Applicable
+                );
+            }
+
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().mapper_len(),
+                    context.store().signature_len(),
+                ),
+                before,
+            );
+        }
+    }
+
+    #[test]
+    fn incompatible_tagged_template_overloads_keep_their_unsupported_boundary() {
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} ",
+            "interface ReadonlyArray<T> {} ",
+            "interface TemplateStringsArray {} ",
+            "interface Tag { ",
+            "(template: string): number; ",
+            "(template: number): string; ",
+            "}",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut context = array_context(&parsed);
+        let template = context_template_strings_array(&mut context);
+        let owner = context
+            .store()
+            .symbol_table(context.globals())
+            .and_then(|globals| globals.get_source("Tag"))
+            .unwrap();
+        let callee = context.get_declared_type_of_symbol(owner).unwrap();
+        let globals = context.global_types().clone();
+        let arguments = [template];
+        let tagged = DirectCallRequest {
+            form: DirectCallForm::TaggedTemplate,
+            ..request(callee, &arguments)
+        };
+
+        assert_eq!(
+            resolve_direct_call(context.store_mut_for_test(), &globals, false, tagged),
+            Err(DirectCallError::Unsupported(DirectCallUnsupported::Form(
+                DirectCallForm::TaggedTemplate,
+            ))),
+        );
     }
 
     #[test]
