@@ -4625,6 +4625,40 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             && statement_record.parent == Some(self.source.node_ref().node))
     }
 
+    fn is_direct_top_level_assignment_right(
+        &self,
+        expression: NodeRef,
+    ) -> Result<bool, SourceCheckError> {
+        let Some(assignment) = self
+            .node(expression)?
+            .parent
+            .map(|node| self.reference(node))
+        else {
+            return Ok(false);
+        };
+        let assignment_record = self.node(assignment)?;
+        let NodeData::BinaryExpression(binary) = &assignment_record.data else {
+            return Ok(false);
+        };
+        let operator = self.reference(binary.operator_token);
+        if assignment_record.kind != SyntaxKind::BinaryExpression
+            || binary.right != expression.node
+            || self.node(operator)?.kind != SyntaxKind::EqualsToken
+        {
+            return Ok(false);
+        }
+        let Some(statement) = assignment_record.parent.map(|node| self.reference(node)) else {
+            return Ok(false);
+        };
+        let statement_record = self.node(statement)?;
+        let NodeData::ExpressionStatement(statement_data) = &statement_record.data else {
+            return Ok(false);
+        };
+        Ok(statement_record.kind == SyntaxKind::ExpressionStatement
+            && statement_record.parent == Some(self.source.node_ref().node)
+            && statement_data.expression == assignment.node)
+    }
+
     fn is_recovered_missing_arrow_body(
         &self,
         expression: NodeRef,
@@ -11130,7 +11164,10 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     }
                     initializer = parent;
                 }
-                if !self.is_direct_top_level_variable_initializer(initializer)? {
+                let direct_initializer =
+                    self.is_direct_top_level_variable_initializer(initializer)?;
+                let assignment_right = self.is_direct_top_level_assignment_right(initializer)?;
+                if !direct_initializer && !assignment_right {
                     return Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::New(
                         expression,
                     )));
@@ -11149,6 +11186,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     expression,
                 )
                 .map_err(|error| Self::new_plan_error(expression, error))?;
+                if assignment_right && !construction.is_global_array_constructor() {
+                    return Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::New(
+                        expression,
+                    )));
+                }
                 self.default_news.push(construction.clone());
                 Ok(PlannedExpression::new(
                     expression,
@@ -15430,7 +15472,7 @@ fn check_expression_type(
             contextual_type,
         ),
         PlannedExpressionKind::New(construction) => {
-            if contextual_type.is_some() {
+            if contextual_type.is_some() && !construction.is_global_array_constructor() {
                 return Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::New(
                     construction.node(),
                 )));
@@ -22661,7 +22703,7 @@ pub(super) fn check_source_file(
         inferred_function_diagnostics[index] = Some(function_diagnostics);
     }
 
-    prepare_direct_default_news(store, host, &default_news)
+    prepare_direct_default_news(store, host, global_types, &default_news)
         .map_err(|error| SourcePlanner::new_plan_error(source.node_ref(), error))?;
     for statement in statements {
         session.reset_query();

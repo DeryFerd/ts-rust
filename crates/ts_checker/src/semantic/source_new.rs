@@ -4,8 +4,8 @@
 //! constructor branch of pinned TypeScript-Go `checkCallExpression`,
 //! `getResolvedSignature`, `resolveNewExpression`, and `resolveCall`.
 //! An admitted constructor belongs to one preceding local class, an earlier
-//! ambient variable, or the authenticated global `Object` constructor. These
-//! forms accept no arguments or one compatible primitive literal. Planning
+//! ambient variable, or an authenticated global `Object`/`Array` constructor.
+//! Global arrays retain their real length and generic-item overloads. Planning
 //! proves syntax, resolver routes, provider provenance, and cold/warm caches
 //! before source execution may publish class or expression state.
 
@@ -19,9 +19,9 @@ use ts_binder::{
 use ts_jsnum::Number;
 
 use super::{
-    CanonicalTypeMapperStore, ClassError, DeclaredTypeError, DeclaredTypeHost,
-    ResolvedSignatureState, SignatureId, SignatureLinks, SymbolNodeLinks, TypeData, TypeId,
-    TypeNodeLinks, ValueSymbolLinks,
+    CanonicalGlobalTypes, CanonicalTypeMapperStore, ClassError, DeclaredTypeError,
+    DeclaredTypeHost, ResolvedSignatureState, SignatureId, SignatureLinks, SymbolNodeLinks,
+    TypeData, TypeId, TypeNodeLinks, ValueSymbolLinks,
     bootstrap::LiteralTypeCacheError,
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
     callables::CallableFamily,
@@ -30,9 +30,12 @@ use super::{
         execute_nongeneric_class_member_query, plan_nongeneric_class_member_query,
         preflight_nongeneric_class_member_query,
     },
+    declared::execute_type_parameter,
     object_members::{PropertyObjectPlan, plan_interface, plan_type_literal},
     signatures::SignatureFlags,
+    store::CachedSignatureLookup,
     type_nodes::normalize_numeric_separators,
+    type_records::type_list_key,
     types::{ObjectFlags, TypeFlags},
 };
 
@@ -144,6 +147,7 @@ pub(super) struct SourceDefaultNewPlan {
     resolved_symbol: SemanticSymbolId,
     target: SourceNewTarget,
     argument: Option<SourceNewArgument>,
+    additional_arguments: Vec<SourceNewArgument>,
     parameter: Option<SourceNewParameter>,
 }
 
@@ -152,6 +156,7 @@ enum SourceNewTarget {
     Class(Box<ClassMemberQueryPlan>),
     Declared(SourceDeclaredConstructorPlan),
     GlobalObject(SourceGlobalObjectConstructorPlan),
+    GlobalArray(SourceGlobalArrayConstructorPlan),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -171,6 +176,33 @@ struct SourceGlobalObjectConstructorPlan {
     return_annotation: NodeRef,
     parameter: SourceNewParameter,
     object_type: TypeId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SourceGlobalArraySignaturePlan {
+    declaration: NodeRef,
+    parameter: SemanticSymbolId,
+    parameter_annotation: NodeRef,
+    return_annotation: NodeRef,
+    type_parameter: Option<SemanticSymbolId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceGlobalArraySelection {
+    Length,
+    GenericLength(TypeId),
+    Items(TypeId),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SourceGlobalArrayConstructorPlan {
+    annotation: NodeRef,
+    owner: SemanticSymbolId,
+    array_target: TypeId,
+    length: SourceGlobalArraySignaturePlan,
+    generic_length: SourceGlobalArraySignaturePlan,
+    items: SourceGlobalArraySignaturePlan,
+    selection: SourceGlobalArraySelection,
 }
 
 #[derive(Clone, Debug)]
@@ -203,6 +235,14 @@ impl SourceDefaultNewPlan {
     pub(super) const fn resolved_symbol(&self) -> SemanticSymbolId {
         self.resolved_symbol
     }
+
+    pub(super) const fn is_global_array_constructor(&self) -> bool {
+        matches!(self.target, SourceNewTarget::GlobalArray(_))
+    }
+
+    fn arguments(&self) -> impl Iterator<Item = &SourceNewArgument> {
+        self.argument.iter().chain(&self.additional_arguments)
+    }
 }
 
 /// Exact selected signature and result of one default construction.
@@ -233,27 +273,25 @@ pub(super) fn plan_direct_default_new(
     {
         return Err(unsupported(SourceNewUnsupported::Expression(node)));
     }
-    if new_expression.type_arguments.is_some() {
-        return Err(unsupported(SourceNewUnsupported::TypeArguments(node)));
-    }
-    let mut argument = None;
+    let mut arguments = Vec::new();
     let argument_start = match new_expression.arguments.as_ref() {
-        Some(arguments) => {
-            if arguments.nodes.len() > 1
-                || arguments.has_trailing_comma
-                || arguments.range.start < record.range.start
-                || arguments.range.end != record.range.end
-                || arguments.range.end.get() < arguments.range.start.get().saturating_add(2)
+        Some(argument_nodes) => {
+            if argument_nodes.has_trailing_comma
+                || argument_nodes.range.start < record.range.start
+                || argument_nodes.range.end != record.range.end
+                || argument_nodes.range.end.get()
+                    < argument_nodes.range.start.get().saturating_add(2)
                 || arena.source_text().is_some_and(|source| {
-                    let open = usize::try_from(arguments.range.start.get()).ok();
-                    let close = usize::try_from(arguments.range.end.get().saturating_sub(1)).ok();
+                    let open = usize::try_from(argument_nodes.range.start.get()).ok();
+                    let close =
+                        usize::try_from(argument_nodes.range.end.get().saturating_sub(1)).ok();
                     open.is_none_or(|open| source.as_bytes().get(open) != Some(&b'('))
                         || close.is_none_or(|close| source.as_bytes().get(close) != Some(&b')'))
                 })
             {
                 return Err(unsupported(SourceNewUnsupported::Arguments(node)));
             }
-            if let Some(&argument_node) = arguments.nodes.first() {
+            for &argument_node in &argument_nodes.nodes {
                 let argument_node = NodeRef::new(node.arena, node.file, argument_node);
                 let argument_record = arena
                     .get(argument_node.node)
@@ -291,18 +329,18 @@ pub(super) fn plan_direct_default_new(
                 };
                 if argument_record.flags.0 != 0
                     || argument_record.parent != Some(node.node)
-                    || argument_record.range.start <= arguments.range.start
-                    || argument_record.range.end >= arguments.range.end
+                    || argument_record.range.start <= argument_nodes.range.start
+                    || argument_record.range.end >= argument_nodes.range.end
                     || !bound.contains(argument_node)
                 {
                     return Err(unsupported(SourceNewUnsupported::Arguments(node)));
                 }
-                argument = Some(SourceNewArgument {
+                arguments.push(SourceNewArgument {
                     node: argument_node,
                     value,
                 });
             }
-            arguments.range.start
+            argument_nodes.range.start
         }
         None => record.range.end,
     };
@@ -381,12 +419,56 @@ pub(super) fn plan_direct_default_new(
             .and_then(|globals| globals.get_source("Object"))
             .and_then(|global| store.get_merged_symbol(global))
             == Some(symbol);
+    let global_array = identifier.text == "Array"
+        && store
+            .intrinsic_bootstrap()
+            .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+            .and_then(|globals| globals.get_source("Array"))
+            .and_then(|global| store.get_merged_symbol(global))
+            == Some(symbol);
+    if !global_array && (arguments.len() > 1 || new_expression.type_arguments.is_some()) {
+        return Err(unsupported(if new_expression.type_arguments.is_some() {
+            SourceNewUnsupported::TypeArguments(node)
+        } else {
+            SourceNewUnsupported::Arguments(node)
+        }));
+    }
+    let argument = arguments.first().cloned();
+    let additional_arguments = arguments.into_iter().skip(1).collect::<Vec<_>>();
     let (target, parameter) = if global_object {
         let global = plan_global_object_constructor(store, host, constructor, symbol)?;
         (
             SourceNewTarget::GlobalObject(global),
             argument.as_ref().map(|_| global.parameter),
         )
+    } else if global_array {
+        let global = plan_global_array_constructor(
+            arena,
+            store,
+            host,
+            node,
+            constructor,
+            symbol,
+            argument.as_ref(),
+            &additional_arguments,
+        )?;
+        let number = store
+            .intrinsic_bootstrap()
+            .map(|bootstrap| bootstrap.number_type)
+            .ok_or_else(|| invariant(SourceNewInvariant::InvalidConstructorCache(constructor)))?;
+        let parameter = argument.as_ref().map(|_| SourceNewParameter {
+            symbol: match global.selection {
+                SourceGlobalArraySelection::Length => global.length.parameter,
+                SourceGlobalArraySelection::GenericLength(_) => global.generic_length.parameter,
+                SourceGlobalArraySelection::Items(_) => global.items.parameter,
+            },
+            type_: match global.selection {
+                SourceGlobalArraySelection::Length
+                | SourceGlobalArraySelection::GenericLength(_) => number,
+                SourceGlobalArraySelection::Items(element) => element,
+            },
+        });
+        (SourceNewTarget::GlobalArray(global), parameter)
     } else if symbol_record.flags() == SymbolFlags::CLASS {
         let class = if let Some(class) = prior_classes.get(&symbol) {
             ClassMemberQueryPlan::Direct(class.clone())
@@ -477,6 +559,7 @@ pub(super) fn plan_direct_default_new(
         resolved_symbol,
         target,
         argument,
+        additional_arguments,
         parameter,
     };
     preflight_default_new_cache(store, &plan)?;
@@ -705,6 +788,337 @@ fn plan_global_object_constructor(
     }
 
     Err(reject())
+}
+
+#[allow(clippy::too_many_arguments)] // Keeps constructor syntax and binder ownership explicit.
+fn plan_global_array_constructor(
+    arena: &NodeArena,
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+    constructor: NodeRef,
+    symbol: SemanticSymbolId,
+    first_argument: Option<&SourceNewArgument>,
+    additional_arguments: &[SourceNewArgument],
+) -> Result<SourceGlobalArrayConstructorPlan, SourceNewError> {
+    let reject = || {
+        unsupported(SourceNewUnsupported::ConstructorClass {
+            node: constructor,
+            symbol,
+        })
+    };
+    let bootstrap = store.intrinsic_bootstrap().ok_or_else(reject)?;
+    let globals = store.symbol_table(bootstrap.globals).ok_or_else(reject)?;
+    let array = store.symbol(symbol).ok_or_else(reject)?;
+    let allowed_flags =
+        SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::TRANSIENT;
+    let array_target = store
+        .declared_type_links(symbol)
+        .and_then(|links| links.declared_type)
+        .ok_or_else(reject)?;
+    let array_record = store.type_payload(array_target).ok_or_else(reject)?;
+    let TypeData::Interface(array_interface) = array_record.data() else {
+        return Err(reject());
+    };
+    let declaration = array.value_declaration().ok_or_else(reject)?;
+    let (library_arena, bound) = host.source(declaration).ok_or_else(reject)?;
+    let declaration_record = library_arena.get(declaration.node).ok_or_else(reject)?;
+    let NodeData::VariableDeclaration(variable) = &declaration_record.data else {
+        return Err(reject());
+    };
+    let annotation = variable
+        .type_
+        .map(|annotation| NodeRef::new(declaration.arena, declaration.file, annotation))
+        .ok_or_else(reject)?;
+    let annotation_record = host.node(annotation).ok_or_else(reject)?;
+    let NodeData::TypeReferenceNode(reference) = &annotation_record.data else {
+        return Err(reject());
+    };
+    let name = NodeRef::new(annotation.arena, annotation.file, reference.type_name);
+    let name_record = host.node(name).ok_or_else(reject)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(reject());
+    };
+    let owner = globals
+        .get_source("ArrayConstructor")
+        .and_then(|owner| store.get_merged_symbol(owner))
+        .ok_or_else(reject)?;
+    let owner_record = store.symbol(owner).ok_or_else(reject)?;
+    let owner_declarations = owner_record.declarations().ok_or_else(reject)?;
+    let constructor_symbol = owner_record
+        .members()
+        .and_then(|members| store.symbol_table(members))
+        .and_then(|members| members.get(InternalSymbolName::New.as_ref()))
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .ok_or_else(reject)?;
+    let signatures = store.symbol(constructor_symbol).ok_or_else(reject)?;
+    let declarations = signatures.declarations().ok_or_else(reject)?;
+    if array.flags() & SymbolFlags::TYPE != SymbolFlags::INTERFACE
+        || !array
+            .flags()
+            .contains(SymbolFlags::FUNCTION_SCOPED_VARIABLE)
+        || array.flags().without(allowed_flags) != SymbolFlags::NONE
+        || array.check_flags() != CheckFlags::NONE
+        || array.name().as_utf8() != Some("Array")
+        || array.parent().is_some()
+        || array.exports().is_some()
+        || array.export_symbol().is_some()
+        || array_record.flags() != TypeFlags::OBJECT
+        || !array_record.object_flags().contains(ObjectFlags::INTERFACE)
+        || array_record.symbol() != Some(symbol)
+        || array_record.alias().is_some()
+        || array_interface
+            .reference
+            .resolved_type_arguments
+            .as_ref()
+            .is_none_or(|arguments| arguments.len() != 1)
+        || declaration_record.kind != SyntaxKind::VariableDeclaration
+        || variable.initializer.is_some()
+        || bound
+            .symbol(declaration)
+            .and_then(|declared| store.get_merged_symbol(declared))
+            != Some(symbol)
+        || annotation_record.kind != SyntaxKind::TypeReference
+        || annotation_record.parent != Some(declaration.node)
+        || reference.type_arguments.is_some()
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.parent != Some(annotation.node)
+        || identifier.text != "ArrayConstructor"
+        || !owner_record.flags().contains(SymbolFlags::INTERFACE)
+        || owner_record.check_flags() != CheckFlags::NONE
+        || owner_record.name().as_utf8() != Some("ArrayConstructor")
+        || owner_record.parent().is_some()
+        || owner_record.exports().is_some()
+        || owner_record.export_symbol().is_some()
+        || owner_declarations.is_empty()
+        || signatures.flags() != SymbolFlags::SIGNATURE
+        || signatures.check_flags() != CheckFlags::NONE
+        || signatures
+            .parent()
+            .and_then(|parent| store.get_merged_symbol(parent))
+            != Some(owner)
+        || declarations.len() < 3
+    {
+        return Err(reject());
+    }
+
+    let mut length = None;
+    let mut generic_length = None;
+    let mut items = None;
+    for &declaration in declarations {
+        let Some(signature_record) = host.node(declaration) else {
+            continue;
+        };
+        let NodeData::ConstructSignatureDeclaration(signature) = &signature_record.data else {
+            continue;
+        };
+        let [parameter_node] = signature.parameters.nodes.as_slice() else {
+            continue;
+        };
+        let parameter_node = NodeRef::new(declaration.arena, declaration.file, *parameter_node);
+        let Some(parameter_record) = host.node(parameter_node) else {
+            continue;
+        };
+        let NodeData::ParameterDeclaration(parameter_data) = &parameter_record.data else {
+            continue;
+        };
+        let Some(parameter_annotation) = parameter_data.type_ else {
+            continue;
+        };
+        let parameter_annotation = NodeRef::new(
+            parameter_node.arena,
+            parameter_node.file,
+            parameter_annotation,
+        );
+        let Some(parameter_annotation_record) = host.node(parameter_annotation) else {
+            continue;
+        };
+        let Some(return_annotation) = signature.type_ else {
+            continue;
+        };
+        let return_annotation =
+            NodeRef::new(declaration.arena, declaration.file, return_annotation);
+        let Some(return_record) = host.node(return_annotation) else {
+            continue;
+        };
+        let NodeData::ArrayTypeNode(return_array) = &return_record.data else {
+            continue;
+        };
+        let return_element = NodeRef::new(
+            return_annotation.arena,
+            return_annotation.file,
+            return_array.element_type,
+        );
+        let Some(return_element_record) = host.node(return_element) else {
+            continue;
+        };
+        let Some(parameter) = host
+            .bound_file(parameter_node)
+            .and_then(|bound| bound.symbol(parameter_node))
+            .and_then(|parameter| store.get_merged_symbol(parameter))
+        else {
+            continue;
+        };
+        let Some(parameter_symbol) = store.symbol(parameter) else {
+            continue;
+        };
+        let type_parameter = match signature.type_parameters.as_ref() {
+            None => None,
+            Some(parameters) if parameters.nodes.len() == 1 => {
+                let declaration =
+                    NodeRef::new(declaration.arena, declaration.file, parameters.nodes[0]);
+                let Some(symbol) = host
+                    .bound_file(declaration)
+                    .and_then(|bound| bound.symbol(declaration))
+                    .and_then(|parameter| store.get_merged_symbol(parameter))
+                else {
+                    continue;
+                };
+                let Some(record) = store.symbol(symbol) else {
+                    continue;
+                };
+                if record.flags() != SymbolFlags::TYPE_PARAMETER
+                    || record.check_flags() != CheckFlags::NONE
+                    || record.declarations() != Some(&[declaration])
+                {
+                    continue;
+                }
+                Some(symbol)
+            }
+            Some(_) => continue,
+        };
+        if signature_record.kind != SyntaxKind::ConstructSignature
+            || !owner_declarations.iter().any(|owner_declaration| {
+                signature_record.parent == Some(owner_declaration.node)
+                    && declaration.arena == owner_declaration.arena
+                    && declaration.file == owner_declaration.file
+            })
+            || parameter_record.kind != SyntaxKind::Parameter
+            || parameter_record.parent != Some(declaration.node)
+            || parameter_data.initializer.is_some()
+            || parameter_annotation_record.parent != Some(parameter_node.node)
+            || return_record.kind != SyntaxKind::ArrayType
+            || return_record.parent != Some(declaration.node)
+            || return_element_record.parent != Some(return_annotation.node)
+            || parameter_symbol.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+            || parameter_symbol.check_flags() != CheckFlags::NONE
+            || parameter_symbol.declarations() != Some(&[parameter_node])
+            || parameter_symbol.value_declaration() != Some(parameter_node)
+            || parameter_symbol.parent().is_some()
+            || parameter_symbol.exports().is_some()
+            || parameter_symbol.export_symbol().is_some()
+        {
+            continue;
+        }
+
+        let planned = SourceGlobalArraySignaturePlan {
+            declaration,
+            parameter,
+            parameter_annotation,
+            return_annotation,
+            type_parameter,
+        };
+        match (
+            type_parameter,
+            parameter_data.question_token.is_some(),
+            parameter_data.dot_dot_dot_token.is_some(),
+            parameter_annotation_record.kind,
+            return_element_record.kind,
+        ) {
+            (None, true, false, SyntaxKind::NumberKeyword, SyntaxKind::AnyKeyword)
+                if length.is_none() =>
+            {
+                length = Some(planned);
+            }
+            (Some(_), false, false, SyntaxKind::NumberKeyword, SyntaxKind::TypeReference)
+                if generic_length.is_none() =>
+            {
+                generic_length = Some(planned);
+            }
+            (Some(_), false, true, SyntaxKind::ArrayType, SyntaxKind::TypeReference)
+                if items.is_none() =>
+            {
+                items = Some(planned);
+            }
+            _ => {}
+        }
+    }
+    let (Some(length), Some(generic_length), Some(items)) = (length, generic_length, items) else {
+        return Err(reject());
+    };
+
+    let record = arena.get(node.node).ok_or_else(reject)?;
+    let NodeData::NewExpression(expression) = &record.data else {
+        return Err(reject());
+    };
+    let explicit_element = if let Some(arguments) = expression.type_arguments.as_ref() {
+        let [argument] = arguments.nodes.as_slice() else {
+            return Err(unsupported(SourceNewUnsupported::TypeArguments(node)));
+        };
+        if arguments.has_trailing_comma {
+            return Err(unsupported(SourceNewUnsupported::TypeArguments(node)));
+        }
+        let argument = NodeRef::new(node.arena, node.file, *argument);
+        let argument_record = arena.get(argument.node).ok_or_else(reject)?;
+        if argument_record.parent != Some(node.node) {
+            return Err(unsupported(SourceNewUnsupported::TypeArguments(node)));
+        }
+        match argument_record.kind {
+            SyntaxKind::StringKeyword => Some(bootstrap.string_type),
+            SyntaxKind::NumberKeyword => Some(bootstrap.number_type),
+            SyntaxKind::BooleanKeyword => Some(bootstrap.boolean_type),
+            SyntaxKind::AnyKeyword => Some(bootstrap.any_type),
+            _ => return Err(unsupported(SourceNewUnsupported::TypeArguments(argument))),
+        }
+    } else {
+        None
+    };
+    let argument_count = usize::from(first_argument.is_some()) + additional_arguments.len();
+    let selection = match (argument_count, first_argument, explicit_element) {
+        (0, _, None) => SourceGlobalArraySelection::Length,
+        (0, _, Some(element)) => SourceGlobalArraySelection::Items(element),
+        (1, Some(argument), None)
+            if matches!(&argument.value, SourceNewArgumentValue::Number(_)) =>
+        {
+            SourceGlobalArraySelection::Length
+        }
+        (1, Some(argument), Some(element))
+            if matches!(&argument.value, SourceNewArgumentValue::Number(_)) =>
+        {
+            SourceGlobalArraySelection::GenericLength(element)
+        }
+        (_, Some(argument), explicit) => {
+            let inferred = match &argument.value {
+                SourceNewArgumentValue::String(_) => bootstrap.string_type,
+                SourceNewArgumentValue::Number(_) => bootstrap.number_type,
+            };
+            let element = explicit.unwrap_or(inferred);
+            if std::iter::once(argument)
+                .chain(additional_arguments)
+                .any(|argument| {
+                    let actual = match &argument.value {
+                        SourceNewArgumentValue::String(_) => bootstrap.string_type,
+                        SourceNewArgumentValue::Number(_) => bootstrap.number_type,
+                    };
+                    element != bootstrap.any_type && element != actual
+                })
+            {
+                return Err(unsupported(SourceNewUnsupported::Arguments(node)));
+            }
+            SourceGlobalArraySelection::Items(element)
+        }
+        _ => return Err(unsupported(SourceNewUnsupported::Arguments(node))),
+    };
+
+    Ok(SourceGlobalArrayConstructorPlan {
+        annotation,
+        owner,
+        array_target,
+        length,
+        generic_length,
+        items,
+        selection,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1105,6 +1519,28 @@ pub(super) fn preflight_direct_default_new(
                 )));
             }
         }
+        SourceNewTarget::GlobalArray(expected) => {
+            let (arena, _) = host.source(plan.node).ok_or_else(|| {
+                invariant(SourceNewInvariant::InvalidConstructorCache(
+                    plan.constructor,
+                ))
+            })?;
+            let actual = plan_global_array_constructor(
+                arena,
+                store,
+                host,
+                plan.node,
+                plan.constructor,
+                plan.resolved_symbol,
+                plan.argument.as_ref(),
+                &plan.additional_arguments,
+            )?;
+            if actual != *expected {
+                return Err(invariant(SourceNewInvariant::InvalidConstructorCache(
+                    plan.constructor,
+                )));
+            }
+        }
     }
     preflight_default_new_cache(store, plan)
 }
@@ -1115,6 +1551,7 @@ pub(super) fn preflight_direct_default_new(
 pub(super) fn prepare_direct_default_news(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
     plans: &[SourceDefaultNewPlan],
 ) -> Result<(), SourceNewError> {
     let Some(capacity_node) = plans.first().map(|plan| plan.node) else {
@@ -1131,11 +1568,18 @@ pub(super) fn prepare_direct_default_news(
     }
 
     for plan in plans {
-        let SourceNewTarget::GlobalObject(global) = &plan.target else {
-            continue;
-        };
-        if resolved_global_object_constructor(store, plan, global)?.is_none() {
-            materialize_global_object_constructor(store, host, plan, global)?;
+        match &plan.target {
+            SourceNewTarget::GlobalObject(global)
+                if resolved_global_object_constructor(store, plan, global)?.is_none() =>
+            {
+                materialize_global_object_constructor(store, host, plan, global)?;
+            }
+            SourceNewTarget::GlobalArray(global)
+                if resolved_global_array_constructor(store, plan, global)?.is_none() =>
+            {
+                materialize_global_array_constructor(store, host, global_types, plan, global)?;
+            }
+            _ => {}
         }
     }
 
@@ -1147,7 +1591,7 @@ pub(super) fn prepare_direct_default_news(
     numbers
         .try_reserve(plans.len())
         .map_err(|_| invariant(SourceNewInvariant::Capacity(capacity_node)))?;
-    for argument in plans.iter().filter_map(|plan| plan.argument.as_ref()) {
+    for argument in plans.iter().flat_map(SourceDefaultNewPlan::arguments) {
         match &argument.value {
             SourceNewArgumentValue::String(value) => strings.push(value.clone()),
             SourceNewArgumentValue::Number(value) => numbers.push(*value),
@@ -1178,11 +1622,11 @@ pub(super) fn prepare_direct_default_news(
         expression_type_nodes = expression_type_nodes
             .checked_add(usize::from(store.type_node_links(plan.node).is_none()))
             .ok_or_else(|| invariant(SourceNewInvariant::Capacity(plan.node)))?;
-        argument_type_nodes = argument_type_nodes
-            .checked_add(usize::from(plan.argument.as_ref().is_some_and(
-                |argument| store.type_node_links(argument.node).is_none(),
-            )))
-            .ok_or_else(|| invariant(SourceNewInvariant::Capacity(plan.node)))?;
+        for argument in plan.arguments() {
+            argument_type_nodes = argument_type_nodes
+                .checked_add(usize::from(store.type_node_links(argument.node).is_none()))
+                .ok_or_else(|| invariant(SourceNewInvariant::Capacity(plan.node)))?;
+        }
         signatures = signatures
             .checked_add(usize::from(store.signature_links(plan.node).is_none()))
             .ok_or_else(|| invariant(SourceNewInvariant::Capacity(plan.node)))?;
@@ -1211,10 +1655,10 @@ pub(super) fn prepare_direct_default_news(
         if store.type_node_links(plan.node).is_none() {
             assert!(store.ensure_type_node_links(plan.node));
         }
-        if let Some(argument) = plan.argument.as_ref()
-            && store.type_node_links(argument.node).is_none()
-        {
-            assert!(store.ensure_type_node_links(argument.node));
+        for argument in plan.arguments() {
+            if store.type_node_links(argument.node).is_none() {
+                assert!(store.ensure_type_node_links(argument.node));
+            }
         }
     }
     Ok(())
@@ -1370,6 +1814,228 @@ fn materialize_global_object_constructor(
     Ok(())
 }
 
+/// Publishes only the selected real ArrayConstructor declaration and instance.
+fn materialize_global_array_constructor(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    plan: &SourceDefaultNewPlan,
+    global: &SourceGlobalArrayConstructorPlan,
+) -> Result<(), SourceNewError> {
+    if resolved_global_array_constructor(store, plan, global)?.is_some() {
+        return Ok(());
+    }
+    let invalid = || {
+        invariant(SourceNewInvariant::InvalidConstructorCache(
+            plan.constructor,
+        ))
+    };
+    if global_types.array_type != global.array_target {
+        return Err(invalid());
+    }
+    let value_type = store.get_declared_type_of_symbol(host, global.owner)?;
+    let value = store.type_payload(value_type).ok_or_else(invalid)?;
+    let TypeData::Interface(interface) = value.data() else {
+        return Err(invalid());
+    };
+    if value.flags() != TypeFlags::OBJECT
+        || !value.object_flags().contains(ObjectFlags::INTERFACE)
+        || value.symbol() != Some(global.owner)
+        || value.alias().is_some()
+        || interface.reference.object.structured.signatures.is_some()
+        || exact_type_cache(store, global.annotation)
+            .map_err(|()| invalid())?
+            .is_some_and(|annotation| annotation != value_type)
+        || exact_class_value_type(store, plan.resolved_symbol)?
+            .is_some_and(|value| value != value_type)
+    {
+        return Err(invalid());
+    }
+
+    let selected = match global.selection {
+        SourceGlobalArraySelection::Length => global.length,
+        SourceGlobalArraySelection::GenericLength(_) => global.generic_length,
+        SourceGlobalArraySelection::Items(_) => global.items,
+    };
+    let base = if let Some(signature) =
+        exact_signature_cache(store, selected.declaration).map_err(|()| invalid())?
+    {
+        signature
+    } else {
+        let type_parameter = selected
+            .type_parameter
+            .map(|parameter| execute_type_parameter(store, parameter));
+        let parameter_type = match global.selection {
+            SourceGlobalArraySelection::Items(_) => store
+                .create_canonical_array_type(
+                    global_types,
+                    type_parameter.ok_or_else(invalid)?,
+                    false,
+                )
+                .map_err(|_| invalid())?,
+            SourceGlobalArraySelection::Length | SourceGlobalArraySelection::GenericLength(_) => {
+                store.intrinsic_bootstrap().ok_or_else(invalid)?.number_type
+            }
+        };
+        let return_type = match type_parameter {
+            Some(parameter) => store
+                .create_canonical_array_type(global_types, parameter, false)
+                .map_err(|_| invalid())?,
+            None => global_types.any_array_type,
+        };
+        let missing_type_nodes = [
+            global.annotation,
+            selected.parameter_annotation,
+            selected.return_annotation,
+        ]
+        .iter()
+        .filter(|node| store.type_node_links(**node).is_none())
+        .count();
+        let missing_values = [plan.resolved_symbol, selected.parameter]
+            .iter()
+            .filter(|symbol| store.value_symbol_links(**symbol).is_none())
+            .count();
+        if !store.try_reserve_signatures(1)
+            || !store.try_reserve_signature_links(usize::from(
+                store.signature_links(selected.declaration).is_none(),
+            ))
+            || !store.try_reserve_type_node_links(missing_type_nodes)
+            || !store.try_reserve_value_symbol_links(missing_values)
+            || !store.try_reserve_function_signature_return_annotations(1)
+        {
+            return Err(invariant(SourceNewInvariant::Capacity(plan.constructor)));
+        }
+        if store
+            .value_symbol_links(selected.parameter)
+            .is_some_and(|links| {
+                links != &ValueSymbolLinks::default()
+                    && links
+                        != &ValueSymbolLinks {
+                            resolved_type: Some(parameter_type),
+                            ..ValueSymbolLinks::default()
+                        }
+            })
+            || exact_type_cache(store, selected.parameter_annotation)
+                .map_err(|()| invalid())?
+                .is_some_and(|cached| cached != parameter_type)
+            || exact_type_cache(store, selected.return_annotation)
+                .map_err(|()| invalid())?
+                .is_some_and(|cached| cached != return_type)
+        {
+            return Err(invalid());
+        }
+        let flags = SignatureFlags::CONSTRUCT
+            | if matches!(global.selection, SourceGlobalArraySelection::Items(_)) {
+                SignatureFlags::HAS_REST_PARAMETER
+            } else {
+                SignatureFlags::NONE
+            };
+        let minimum = i32::from(matches!(
+            global.selection,
+            SourceGlobalArraySelection::GenericLength(_)
+        ));
+        let signature = store
+            .alloc_signature(
+                flags,
+                Some(selected.declaration),
+                type_parameter.into_iter().collect(),
+                None,
+                vec![selected.parameter],
+                Some(return_type),
+                None,
+                minimum,
+            )
+            .ok_or_else(invalid)?;
+        assert!(store.set_type_node_links(
+            global.annotation,
+            TypeNodeLinks {
+                resolved_type: Some(value_type),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        assert!(store.set_type_node_links(
+            selected.parameter_annotation,
+            TypeNodeLinks {
+                resolved_type: Some(parameter_type),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        assert!(store.set_type_node_links(
+            selected.return_annotation,
+            TypeNodeLinks {
+                resolved_type: Some(return_type),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        assert!(store.set_value_symbol_links(
+            plan.resolved_symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(value_type),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        assert!(store.set_value_symbol_links(
+            selected.parameter,
+            ValueSymbolLinks {
+                resolved_type: Some(parameter_type),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        assert!(store.set_signature_links(
+            selected.declaration,
+            SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(signature),
+                ..SignatureLinks::default()
+            },
+        ));
+        assert!(store.set_function_signature_return_annotation(
+            signature,
+            selected.return_annotation,
+            false,
+        ));
+        signature
+    };
+
+    if let SourceGlobalArraySelection::GenericLength(element)
+    | SourceGlobalArraySelection::Items(element) = global.selection
+    {
+        let key = type_list_key(&[element]);
+        match store.cached_signature(base, key, &[element]) {
+            CachedSignatureLookup::Hit(_) => {}
+            CachedSignatureLookup::Missing => {
+                let generic = store
+                    .signature(base)
+                    .and_then(|signature| signature.type_parameters().first())
+                    .copied()
+                    .ok_or_else(invalid)?;
+                let mapper = store
+                    .new_simple_type_mapper(generic, element)
+                    .ok_or_else(invalid)?;
+                let signature = store
+                    .instantiate_signature_ex(base, mapper, true)
+                    .map_err(|_| invalid())?;
+                let return_type = store
+                    .create_canonical_array_type(global_types, element, false)
+                    .map_err(|_| invalid())?;
+                if !store.try_reserve_cached_signatures(1)
+                    || !store.set_signature_resolved_return_type(signature, Some(return_type))
+                    || !store.set_cached_signature(base, key, Box::new([element]), signature)
+                {
+                    return Err(invalid());
+                }
+            }
+            CachedSignatureLookup::HashCollision(_) | CachedSignatureLookup::Invalid => {
+                return Err(invalid());
+            }
+        }
+    }
+
+    if resolved_global_array_constructor(store, plan, global)?.is_none() {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
 /// Selects the exact default construct signature and publishes the constructor,
 /// signature, and result caches as one prevalidated suffix.
 pub(super) fn check_direct_default_new(
@@ -1411,15 +2077,21 @@ pub(super) fn check_direct_default_new(
                 ))
             })?
         }
+        SourceNewTarget::GlobalArray(global) => {
+            resolved_global_array_constructor(store, plan, global)?.ok_or_else(|| {
+                invariant(SourceNewInvariant::InvalidConstructorCache(
+                    plan.constructor,
+                ))
+            })?
+        }
     };
     let CheckedSourceDefaultNew {
         value_type,
         instance_type,
         signature,
     } = selected;
-    let argument_type = plan
-        .argument
-        .as_ref()
+    let argument_types = plan
+        .arguments()
         .map(|argument| {
             let regular = match &argument.value {
                 SourceNewArgumentValue::String(value) => {
@@ -1432,14 +2104,14 @@ pub(super) fn check_direct_default_new(
                 .fresh_type_of_literal_type(regular)
                 .map_err(|error| literal_cache_error(argument.node, error))
         })
-        .transpose()?;
+        .collect::<Result<Vec<_>, _>>()?;
     preflight_publication_cache(
         store,
         plan,
         value_type,
         instance_type,
         signature,
-        argument_type,
+        &argument_types,
     )?;
 
     let symbol_links = SymbolNodeLinks {
@@ -1461,7 +2133,7 @@ pub(super) fn check_direct_default_new(
     assert!(store.set_type_node_links(plan.constructor, constructor_links));
     assert!(store.set_signature_links(plan.node, signature_links));
     assert!(store.set_type_node_links(plan.node, expression_links));
-    if let Some((argument, argument_type)) = plan.argument.as_ref().zip(argument_type) {
+    for (argument, argument_type) in plan.arguments().zip(argument_types) {
         assert!(store.set_type_node_links(
             argument.node,
             TypeNodeLinks {
@@ -1486,9 +2158,8 @@ fn preflight_prepared_default_new_cache(
         || store.signature_links(plan.node).is_none()
         || store.type_node_links(plan.node).is_none()
         || plan
-            .argument
-            .as_ref()
-            .is_some_and(|argument| store.type_node_links(argument.node).is_none())
+            .arguments()
+            .any(|argument| store.type_node_links(argument.node).is_none())
     {
         return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
             plan.node,
@@ -1698,6 +2369,125 @@ fn resolved_global_object_constructor(
     }))
 }
 
+fn resolved_global_array_constructor(
+    store: &CanonicalTypeMapperStore,
+    plan: &SourceDefaultNewPlan,
+    global: &SourceGlobalArrayConstructorPlan,
+) -> Result<Option<CheckedSourceDefaultNew>, SourceNewError> {
+    let invalid = || {
+        invariant(SourceNewInvariant::InvalidConstructorCache(
+            plan.constructor,
+        ))
+    };
+    let Some(value_type) = store
+        .declared_type_links(global.owner)
+        .and_then(|links| links.declared_type)
+    else {
+        return Ok(None);
+    };
+    if exact_type_cache(store, global.annotation)
+        .map_err(|()| invalid())?
+        .is_some_and(|cached| cached != value_type)
+        || exact_class_value_type(store, plan.resolved_symbol)?
+            .is_some_and(|cached| cached != value_type)
+    {
+        return Err(invalid());
+    }
+    let value = store.type_payload(value_type).ok_or_else(invalid)?;
+    if value.flags() != TypeFlags::OBJECT
+        || !value.object_flags().contains(ObjectFlags::INTERFACE)
+        || value.symbol() != Some(global.owner)
+        || value.alias().is_some()
+    {
+        return Err(invalid());
+    }
+    let selected = match global.selection {
+        SourceGlobalArraySelection::Length => global.length,
+        SourceGlobalArraySelection::GenericLength(_) => global.generic_length,
+        SourceGlobalArraySelection::Items(_) => global.items,
+    };
+    let Some(base) = exact_signature_cache(store, selected.declaration).map_err(|()| invalid())?
+    else {
+        return Ok(None);
+    };
+    let base_record = store.signature(base).ok_or_else(invalid)?;
+    let is_rest = matches!(global.selection, SourceGlobalArraySelection::Items(_));
+    let expected_minimum = i32::from(matches!(
+        global.selection,
+        SourceGlobalArraySelection::GenericLength(_)
+    ));
+    let expected_type_parameters = usize::from(selected.type_parameter.is_some());
+    if base_record.declaration() != Some(selected.declaration)
+        || !base_record.flags().contains(SignatureFlags::CONSTRUCT)
+        || base_record
+            .flags()
+            .contains(SignatureFlags::HAS_REST_PARAMETER)
+            != is_rest
+        || base_record.parameters() != [selected.parameter]
+        || base_record.min_argument_count() != expected_minimum
+        || base_record.resolved_min_argument_count() != -1
+        || base_record.type_parameters().len() != expected_type_parameters
+        || base_record.this_parameter().is_some()
+        || base_record.resolved_type_predicate().is_some()
+        || base_record.target().is_some()
+        || base_record.mapper().is_some()
+        || base_record.composite().is_some()
+        || store
+            .value_symbol_links(selected.parameter)
+            .and_then(|links| links.resolved_type)
+            .is_none()
+        || store
+            .function_signature_return_annotation(base)
+            .is_some_and(|annotation| annotation != (selected.return_annotation, false))
+    {
+        return Err(invalid());
+    }
+
+    let (signature, element) = match global.selection {
+        SourceGlobalArraySelection::Length => {
+            let any = store.intrinsic_bootstrap().ok_or_else(invalid)?.any_type;
+            (base, any)
+        }
+        SourceGlobalArraySelection::GenericLength(element)
+        | SourceGlobalArraySelection::Items(element) => {
+            let key = type_list_key(&[element]);
+            match store.cached_signature(base, key, &[element]) {
+                CachedSignatureLookup::Hit(signature) => (signature, element),
+                CachedSignatureLookup::Missing => return Ok(None),
+                CachedSignatureLookup::HashCollision(_) | CachedSignatureLookup::Invalid => {
+                    return Err(invalid());
+                }
+            }
+        }
+    };
+    let selected_record = store.signature(signature).ok_or_else(invalid)?;
+    let instance_type = selected_record.resolved_return_type().ok_or_else(invalid)?;
+    let instance = store.type_payload(instance_type).ok_or_else(invalid)?;
+    let TypeData::TypeReference(reference) = instance.data() else {
+        return Err(invalid());
+    };
+    if reference.object.target != Some(global.array_target)
+        || reference.resolved_type_arguments.as_deref() != Some(&[element])
+        || selected_record
+            .flags()
+            .contains(SignatureFlags::HAS_REST_PARAMETER)
+            != is_rest
+        || selected_record.min_argument_count() != expected_minimum
+        || signature != base
+            && (selected_record.target() != Some(base)
+                || selected_record.mapper().is_none()
+                || !selected_record.type_parameters().is_empty())
+    {
+        return Err(invalid());
+    }
+
+    Ok(Some(CheckedSourceDefaultNew {
+        value_type,
+        instance_type,
+        signature,
+    }))
+}
+
 fn preflight_default_new_cache(
     store: &CanonicalTypeMapperStore,
     plan: &SourceDefaultNewPlan,
@@ -1726,7 +2516,7 @@ fn preflight_default_new_cache(
             plan.node,
         )));
     }
-    if let Some(argument) = plan.argument.as_ref() {
+    for argument in plan.arguments() {
         let cached = exact_type_cache(store, argument.node)
             .map_err(|()| invariant(SourceNewInvariant::InvalidExpressionCache(argument.node)))?;
         let expected = cached_argument_type(store, argument)?;
@@ -1788,6 +2578,20 @@ fn preflight_default_new_cache(
                 )));
             }
         }
+        SourceNewTarget::GlobalArray(global) => {
+            let resolved = resolved_global_array_constructor(store, plan, global)?;
+            if constructor_type.is_some_and(|constructor| {
+                resolved.is_none_or(|resolved| constructor != resolved.value_type)
+            }) || result_type.is_some_and(|result| {
+                resolved.is_none_or(|resolved| result != resolved.instance_type)
+            }) || signature.is_some_and(|signature| {
+                resolved.is_none_or(|resolved| signature != resolved.signature)
+            }) {
+                return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
+                    plan.node,
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -1798,7 +2602,7 @@ fn preflight_publication_cache(
     value_type: TypeId,
     instance_type: TypeId,
     signature: SignatureId,
-    argument_type: Option<TypeId>,
+    argument_types: &[TypeId],
 ) -> Result<(), SourceNewError> {
     preflight_prepared_default_new_cache(store, plan)?;
     let constructor_symbol = exact_symbol_cache(store, plan.constructor).map_err(|()| {
@@ -1815,16 +2619,16 @@ fn preflight_publication_cache(
         .map_err(|()| invariant(SourceNewInvariant::InvalidExpressionCache(plan.node)))?;
     let selected = exact_signature_cache(store, plan.node)
         .map_err(|()| invariant(SourceNewInvariant::InvalidExpressionCache(plan.node)))?;
-    if plan.argument.is_some() != argument_type.is_some() {
+    if plan.arguments().count() != argument_types.len() {
         return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
             plan.node,
         )));
     }
-    if let Some(argument) = plan.argument.as_ref() {
+    for (argument, argument_type) in plan.arguments().zip(argument_types) {
         let cached = exact_type_cache(store, argument.node)
             .map_err(|()| invariant(SourceNewInvariant::InvalidExpressionCache(argument.node)))?;
-        if cached.is_some_and(|cached| Some(cached) != argument_type)
-            || cached_argument_type(store, argument)? != argument_type
+        if cached.is_some_and(|cached| cached != *argument_type)
+            || cached_argument_type(store, argument)? != Some(*argument_type)
         {
             return Err(invariant(SourceNewInvariant::InvalidExpressionCache(
                 argument.node,
@@ -2207,6 +3011,23 @@ mod tests {
             CanonicalCheckerOptions::default(),
         )
         .unwrap()
+    }
+
+    fn global_array_constructor_library() -> ParseResult {
+        parse_source_file(concat!(
+            "interface Array<T> {} ",
+            "interface ReadonlyArray<T> {} ",
+            "interface ArrayConstructor { ",
+            "new(arrayLength?: number): any[]; ",
+            "new<T>(arrayLength: number): T[]; ",
+            "new<T>(...items: T[]): T[]; ",
+            "(arrayLength?: number): any[]; ",
+            "<T>(arrayLength: number): T[]; ",
+            "<T>(...items: T[]): T[]; ",
+            "readonly prototype: any[]; ",
+            "} ",
+            "declare var Array: ArrayConstructor;",
+        ))
     }
 
     fn published_global_object_constructor<'arena>(
@@ -2653,6 +3474,185 @@ mod tests {
             assert!(context.store().type_node_links(construction).is_none());
             assert!(context.store().symbol_node_links(constructor).is_none());
         }
+    }
+
+    #[test]
+    fn global_array_constructors_preserve_real_overloads_and_warm_instantiations() {
+        let library = global_array_constructor_library();
+        let source = parse_source_file(concat!(
+            "const empty = new Array(); ",
+            "const length = new Array(1); ",
+            "const strings = new Array('hi', 'bye'); ",
+            "const numbers = new Array<number>(1, 2); ",
+            "const typedLength = new Array<string>(1);",
+        ));
+        assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let library_file = FileId::new(1_840);
+        let source_file = FileId::new(1_841);
+        let mut context =
+            global_object_constructor_context(&library, &source, library_file, source_file);
+        let globals = context.global_types().clone();
+
+        context.check_source_file(source_file).unwrap();
+
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        for (name, expected) in [
+            ("empty", bootstrap.any_type),
+            ("length", bootstrap.any_type),
+            ("strings", bootstrap.string_type),
+            ("numbers", bootstrap.number_type),
+            ("typedLength", bootstrap.string_type),
+        ] {
+            let (construction, constructor) = variable_new(&source, source_file, name);
+            let type_ = context
+                .store()
+                .type_node_links(construction)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            assert_eq!(
+                context
+                    .store()
+                    .canonical_array_element_type(&globals, type_)
+                    .unwrap(),
+                Some(expected),
+                "{name}",
+            );
+            assert!(
+                context
+                    .store()
+                    .symbol_node_links(constructor)
+                    .and_then(|links| links.resolved_symbol)
+                    .is_some()
+            );
+            assert!(
+                context
+                    .store()
+                    .signature_links(construction)
+                    .and_then(|links| links.resolved_signature.signature())
+                    .is_some()
+            );
+        }
+        let owner = context
+            .store()
+            .symbol_table(bootstrap.globals)
+            .and_then(|globals| globals.get_source("ArrayConstructor"))
+            .and_then(|owner| context.store().get_merged_symbol(owner))
+            .unwrap();
+        let value = context
+            .store()
+            .declared_type_links(owner)
+            .and_then(|links| links.declared_type)
+            .and_then(|type_| context.store().type_payload(type_))
+            .unwrap();
+        let TypeData::Interface(interface) = value.data() else {
+            panic!("ArrayConstructor must retain its real interface identity")
+        };
+        assert!(!value.object_flags().contains(ObjectFlags::MEMBERS_RESOLVED));
+        assert!(!interface.declared_members_resolved);
+        assert!(interface.reference.object.structured.signatures.is_none());
+        let declarations = context
+            .store()
+            .symbol(owner)
+            .and_then(|owner| owner.members())
+            .and_then(|members| context.store().symbol_table(members))
+            .and_then(|members| members.get(InternalSymbolName::New.as_ref()))
+            .and_then(|constructor| context.store().symbol(constructor))
+            .and_then(|constructor| constructor.declarations())
+            .unwrap();
+        assert_eq!(declarations.len(), 3);
+        assert!(declarations.iter().all(|declaration| {
+            context
+                .store()
+                .signature_links(*declaration)
+                .and_then(|links| links.resolved_signature.signature())
+                .is_some()
+        }));
+        let warm = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().mapper_len(),
+            context.store().cached_signature_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+
+        context.recheck_source_file(source_file).unwrap();
+
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().mapper_len(),
+                context.store().cached_signature_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn global_array_constructors_work_on_contextual_assignment_right_sides() {
+        let library = global_array_constructor_library();
+        let source = parse_source_file(concat!(
+            "var text: string[]; ",
+            "text = new Array(1); ",
+            "text = new Array('hi', 'bye'); ",
+            "text = new Array<string>('hi', 'bye'); ",
+            "var numeric: number[]; ",
+            "numeric = new Array(1); ",
+            "numeric = new Array(1, 2); ",
+            "numeric = new Array<number>(1, 2);",
+        ));
+        assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let library_file = FileId::new(1_842);
+        let source_file = FileId::new(1_843);
+        let mut context =
+            global_object_constructor_context(&library, &source, library_file, source_file);
+
+        context.check_source_file(source_file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
+        let constructions = source
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::NewExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    source_file,
+                    node,
+                ))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(constructions.len(), 6);
+        assert!(constructions.iter().all(|construction| {
+            context
+                .store()
+                .signature_links(*construction)
+                .and_then(|links| links.resolved_signature.signature())
+                .is_some()
+        }));
+        let warm = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().mapper_len(),
+            context.store().cached_signature_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+
+        context.recheck_source_file(source_file).unwrap();
+
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().mapper_len(),
+                context.store().cached_signature_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
     }
 
     #[test]
