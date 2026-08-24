@@ -14,8 +14,8 @@ use std::collections::HashSet;
 
 use ts_ast::SyntaxKind;
 use ts_binder::{
-    CheckFlags, EscapedName, SemanticSymbolId, SymbolData, SymbolFlags, SymbolTableId,
-    semantic::PreparedSymbolTable,
+    CheckFlags, EscapedName, InternalSymbolName, SemanticSymbolId, SymbolData, SymbolFlags,
+    SymbolTableId, semantic::PreparedSymbolTable,
 };
 
 use super::{
@@ -1532,13 +1532,11 @@ fn declared_target_header(
         || &all_parameters[..source_parameters.len()] != source_parameters.as_slice()
         || all_parameters.last().copied() != Some(this_type)
         || interface.outer_type_parameter_count != 0
-        || !interface.base_types_resolved
         || interface.resolved_base_constructor_type.is_some()
         || interface
             .resolved_base_types
             .as_ref()
             .is_some_and(Vec::is_empty)
-        || !interface.declared_members_resolved
         || interface.declared_call_signatures.is_some()
         || interface.declared_construct_signatures.is_some()
         || interface.declared_index_infos.is_some()
@@ -1608,6 +1606,27 @@ fn declared_target_header(
         {
             return Err(GenericInterfaceMemberError::InvalidTarget(target));
         }
+    }
+    if !interface.base_types_resolved || !interface.declared_members_resolved {
+        if !interface.base_types_resolved
+            && !interface.declared_members_resolved
+            && interface.resolved_base_types.is_none()
+            && declared_members.is_none()
+            && !record
+                .object_flags()
+                .contains(ObjectFlags::MEMBERS_RESOLVED)
+            && structured == &StructuredTypeData::default()
+            && cold_generic_interface_has_authenticated_non_property_members(
+                store,
+                owner,
+                owner_declarations,
+                raw_members,
+                &parameter_symbols,
+            )
+        {
+            return Err(GenericInterfaceMemberError::UnsupportedTarget(target));
+        }
+        return Err(GenericInterfaceMemberError::InvalidTarget(target));
     }
     let declared_count = declared_table.map_or(0, ts_binder::semantic::SymbolTable::len);
     let resolved_table = store
@@ -1786,6 +1805,103 @@ fn declared_target_header(
         .map(|(_, _, property)| property)
         .collect();
     Ok((owner, source_parameters, declared_members, properties))
+}
+
+fn cold_generic_interface_has_authenticated_non_property_members(
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+    owner_declarations: &[ts_ast::NodeRef],
+    members: SymbolTableId,
+    parameter_symbols: &HashSet<SemanticSymbolId>,
+) -> bool {
+    let Some(table) = store.symbol_table(members) else {
+        return false;
+    };
+    let mut seen = HashSet::with_capacity(table.len());
+    let mut unsupported_member = false;
+    for (name, raw) in table.iter() {
+        let Some(symbol) = store.get_merged_symbol(raw) else {
+            return false;
+        };
+        let Some(record) = store.symbol(symbol) else {
+            return false;
+        };
+        if !seen.insert(symbol)
+            || record.name() != name
+            || store.get_parent_of_symbol(symbol) != Some(owner)
+            || record.members().is_some()
+            || record.exports().is_some()
+            || record.export_symbol().is_some()
+            || store.get_merged_symbol(symbol) != Some(symbol)
+        {
+            return false;
+        }
+        if parameter_symbols.contains(&symbol) {
+            continue;
+        }
+
+        let Some(declarations) = record
+            .declarations()
+            .filter(|declarations| !declarations.is_empty())
+        else {
+            return false;
+        };
+        let (expected_kind, has_value) = if record.flags().contains(SymbolFlags::PROPERTY) {
+            let allowed = SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL;
+            if record.flags().without(allowed) != SymbolFlags::NONE
+                || record.check_flags().bits() & !CheckFlags::READONLY.bits() != 0
+                || record.name().as_utf8().is_none()
+            {
+                return false;
+            }
+            (SyntaxKind::PropertySignature, true)
+        } else if record.flags() == SymbolFlags::METHOD {
+            if record.check_flags() != CheckFlags::NONE || record.name().as_utf8().is_none() {
+                return false;
+            }
+            unsupported_member = true;
+            (SyntaxKind::MethodSignature, true)
+        } else if record.flags() == SymbolFlags::SIGNATURE {
+            if record.check_flags() != CheckFlags::NONE {
+                return false;
+            }
+            let kind = if record.name() == InternalSymbolName::Index.as_ref() {
+                SyntaxKind::IndexSignature
+            } else if record.name() == InternalSymbolName::Call.as_ref() {
+                SyntaxKind::CallSignature
+            } else if record.name() == InternalSymbolName::New.as_ref() {
+                SyntaxKind::ConstructSignature
+            } else {
+                return false;
+            };
+            unsupported_member = true;
+            (kind, false)
+        } else {
+            return false;
+        };
+        if record
+            .value_declaration()
+            .is_some_and(|declaration| !declarations.contains(&declaration))
+            || record.value_declaration().is_some() != has_value
+            || store
+                .value_symbol_links(symbol)
+                .is_some_and(|links| links != &ValueSymbolLinks::default())
+            || declarations.iter().any(|declaration| {
+                let declaration_kind = store.source_node_kind(*declaration);
+                (declaration_kind != Some(expected_kind)
+                    && (expected_kind != SyntaxKind::PropertySignature
+                        || declaration_kind != Some(SyntaxKind::PropertyDeclaration)))
+                    || !matches!(
+                        store.source_node_parent(*declaration),
+                        Some(SourceNodeParent::Parent(parent))
+                            if owner_declarations.contains(&parent)
+                    )
+            })
+        {
+            return false;
+        }
+    }
+    unsupported_member
 }
 
 fn valid_late_bound_unique_symbol_member(
@@ -3003,6 +3119,100 @@ mod tests {
                 string,
             );
         }
+    }
+
+    #[test]
+    fn cold_generic_interfaces_with_non_property_members_are_unsupported() {
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} ",
+            "interface ReadonlyArray<T> {} ",
+            "interface ConcatArray<T> { ",
+            "readonly length: number; ",
+            "readonly [n: number]: T; ",
+            "join(separator?: string): string; ",
+            "slice(start?: number, end?: number): T[]; ",
+            "}",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(6_218);
+        let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+        let global_types = context.global_types().clone();
+        let owner = source_symbol(&parsed, file, &context, "ConcatArray");
+        let target = context.get_declared_type_of_symbol(owner).unwrap();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let store = context.store_mut_for_test();
+        let element = store
+            .create_tuple_element_info(ElementFlags::REQUIRED, None)
+            .unwrap();
+        let tuple = store
+            .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(
+                &[number, number],
+                &[element, element],
+                false,
+            ))
+            .unwrap();
+        let reference = store
+            .create_direct_generic_reference_type(target, &[tuple])
+            .unwrap();
+        let method = store
+            .symbol(owner)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get_source("join"))
+            .unwrap();
+        let before = (
+            store.type_len(),
+            store.mapper_len(),
+            store.symbol_len(),
+            store.symbol_store().symbol_table_len(),
+            store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            validate_generic_interface_members(
+                store,
+                reference,
+                Some(CanonicalArrayTargets::from_global_types(&global_types)),
+            ),
+            Err(GenericInterfaceMemberError::UnsupportedTarget(target)),
+        );
+        assert!(store.set_symbol_flags(method, SymbolFlags::PROPERTY, CheckFlags::NONE));
+        assert_eq!(
+            validate_generic_interface_members(
+                store,
+                reference,
+                Some(CanonicalArrayTargets::from_global_types(&global_types)),
+            ),
+            Err(GenericInterfaceMemberError::InvalidTarget(target)),
+        );
+        assert!(store.set_symbol_flags(method, SymbolFlags::METHOD, CheckFlags::NONE));
+        assert!(store.set_interface_base_resolution(target, true, None, None));
+        assert_eq!(
+            validate_generic_interface_members(
+                store,
+                reference,
+                Some(CanonicalArrayTargets::from_global_types(&global_types)),
+            ),
+            Err(GenericInterfaceMemberError::InvalidTarget(target)),
+        );
+        assert!(store.set_interface_base_resolution(target, false, None, None));
+        assert_eq!(
+            validate_generic_interface_members(
+                store,
+                reference,
+                Some(CanonicalArrayTargets::from_global_types(&global_types)),
+            ),
+            Err(GenericInterfaceMemberError::UnsupportedTarget(target)),
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.mapper_len(),
+                store.symbol_len(),
+                store.symbol_store().symbol_table_len(),
+                store.checker_link_allocated_lengths(),
+            ),
+            before,
+        );
     }
 
     #[test]
