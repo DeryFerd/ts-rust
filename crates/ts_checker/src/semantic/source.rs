@@ -34596,6 +34596,205 @@ mod tests {
     }
 
     #[test]
+    fn nested_commonjs_named_exports_preserve_export_types_and_warm_caches() {
+        let source = parse_javascript_source_file(concat!(
+            "module.exports.value = 1; ",
+            "exports.value = 2; ",
+            "module.exports.ready = true;",
+        ));
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let file = FileId::new(8_398);
+        let mut context = javascript_context(file, &source, CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let (_, bound) = context.file(file).unwrap();
+        let module = bound.symbol(bound.source_file()).unwrap();
+        let exports = context
+            .store()
+            .symbol(module)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| context.store().symbol_table(exports))
+            .unwrap();
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        for (name, expected_type) in [
+            ("value", bootstrap.number_type),
+            ("ready", bootstrap.boolean_type),
+        ] {
+            let export = exports.get_source(name).unwrap();
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(export)
+                    .and_then(|links| links.resolved_type),
+                Some(expected_type),
+                "{name}",
+            );
+        }
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn computed_commonjs_named_exports_share_binder_owned_properties() {
+        let source = parse_javascript_source_file(concat!(
+            "exports['value'] = 1; ",
+            "module.exports.value = 2; ",
+            "module.exports['ready'] = true;",
+        ));
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let file = FileId::new(8_400);
+        let mut context = javascript_context(file, &source, CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let (_, bound) = context.file(file).unwrap();
+        let module = bound.symbol(bound.source_file()).unwrap();
+        let exports = context
+            .store()
+            .symbol(module)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| context.store().symbol_table(exports))
+            .unwrap();
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(exports.get_source("value").unwrap())
+                .and_then(|links| links.resolved_type),
+            Some(bootstrap.number_type),
+        );
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(exports.get_source("ready").unwrap())
+                .and_then(|links| links.resolved_type),
+            Some(bootstrap.boolean_type),
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn nested_commonjs_named_exports_preserve_imported_value_identity() {
+        let target = parse_javascript_source_file("module.exports.value = 1;");
+        let importer = parsed("import { value } from './target.js'; const copied = value;");
+        assert!(target.diagnostics.is_empty(), "{:?}", target.diagnostics);
+        let target_file = FileId::new(8_401);
+        let importer_file = FileId::new(8_402);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &target.arena,
+                target.source_file,
+                target_file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/target.js\""),
+                    CanonicalSourceLanguage::JavaScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_source_file_with_facts(
+                &importer.arena,
+                importer.source_file,
+                importer_file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/importer.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::External,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_javascript_declaration_slice(&target.arena, target_file)
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&importer.arena, importer_file)
+            .unwrap();
+        let specifiers = source_module_specifiers(&importer);
+        let [specifier] = specifiers.as_slice() else {
+            panic!("expected one authenticated CommonJS module specifier")
+        };
+        let manifest = CanonicalModuleResolutionManifestInput::new([
+            CanonicalModuleResolutionEntry::resolved(
+                NodeRef::new(importer.arena.id(), importer_file, *specifier),
+                CanonicalResolvedModuleInput::new(
+                    target_file,
+                    CanonicalModuleResolutionMode::Esm,
+                    CanonicalModuleResolutionMode::CommonJs,
+                ),
+            ),
+        ]);
+        let mut context = CanonicalCheckerContext::new_with_module_resolutions(
+            binder.finish(),
+            vec![
+                (target_file, &target.arena),
+                (importer_file, &importer.arena),
+            ],
+            CanonicalCheckerOptions::default(),
+            manifest,
+        )
+        .unwrap();
+
+        context.check_source_file(target_file).unwrap();
+        context.check_source_file(importer_file).unwrap();
+
+        assert_eq!(
+            variable_value_type(&context, &importer, importer_file, "copied"),
+            context.store().intrinsic_bootstrap().unwrap().number_type,
+        );
+        assert!(context.diagnostics().is_empty());
+        let warm = observable_state(&context, importer_file);
+        context.recheck_source_file(target_file).unwrap();
+        context.recheck_source_file(importer_file).unwrap();
+        assert_eq!(observable_state(&context, importer_file), warm);
+    }
+
+    #[test]
+    fn nested_commonjs_named_exports_keep_first_jsdoc_diagnostic_locations() {
+        let source = parse_javascript_source_file(concat!(
+            "module.exports.value = 1;\n",
+            "/** @type {string} */\n",
+            "exports.value = \"text\";\n",
+            "module.exports.value = true;",
+        ));
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let file = FileId::new(8_399);
+        let mut context = javascript_context(file, &source, CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(diagnostics[0].diagnostic.code(), 2322);
+        assert_eq!(diagnostics[0].diagnostic.arguments, ["number", "string"]);
+        assert_eq!(
+            node_text(&source, diagnostics[0].node.unwrap()),
+            "module.exports.value",
+        );
+        assert_eq!(diagnostics[1].diagnostic.code(), 2322);
+        assert_eq!(diagnostics[1].diagnostic.arguments, ["boolean", "string"]);
+        assert_eq!(
+            node_text(&source, diagnostics[1].node.unwrap()),
+            "module.exports.value",
+        );
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
     fn commonjs_assignment_publishes_the_local_value_type() {
         let source =
             ts_parser::parse_javascript_source_file("const local = 1; module.exports = local;");
