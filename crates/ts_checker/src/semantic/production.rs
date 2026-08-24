@@ -4,10 +4,11 @@
 //! checker-owned semantic store. Construction includes the dependency-closed
 //! prefix of typescript-go's `initializeChecker`: ordered global merging,
 //! deferred ambient-module collection, UMD globals, global-scope
-//! augmentations, the built-in `undefined` conflict rule, intrinsic value
-//! links, and eager standard-library type identities. Alias-dependent merging,
-//! general checker diagnostics, deferred ambient-module merging, and non-global
-//! module augmentations remain explicit typed boundaries.
+//! augmentations, authenticated named ambient-module augmentations, the
+//! built-in `undefined` conflict rule, intrinsic value links, and eager
+//! standard-library type identities. Alias-dependent merging, general checker
+//! diagnostics, and unresolved named module augmentations remain explicit
+//! typed boundaries.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -17,7 +18,7 @@ use ts_ast::{
 use ts_binder::{
     BoundFile, CanonicalExtractionError, CanonicalNameResolverOptions,
     CanonicalPatternAmbientModule, CanonicalProgramBindings, CheckFlags, EscapedName,
-    SemanticStoreId, SemanticSymbolId, SymbolFlags, SymbolStore, SymbolTableId,
+    InternalSymbolName, SemanticStoreId, SemanticSymbolId, SymbolFlags, SymbolStore, SymbolTableId,
 };
 
 use super::{
@@ -1510,8 +1511,7 @@ fn initialize_globals(
         }
     }
 
-    // Global-scope augmentations run only after every ordinary global and UMD
-    // export is indexed, and before the built-in `undefined` rule.
+    // Global augmentations run before special global types are initialized.
     for &file in file_order {
         let (arena, bound) = files
             .snapshot(file)
@@ -1560,12 +1560,372 @@ fn initialize_globals(
     let global_types =
         initialize_global_library_types(store, &declared_host, globals, strict_bind_call_apply)?;
 
+    // Named module augmentation can depend on initialized global object types.
+    for &file in file_order {
+        let (arena, bound) = files
+            .snapshot(file)
+            .ok_or(CanonicalGlobalInitializationError::MissingFile(file))?;
+        for augmentation in bound.module_augmentations() {
+            let name = augmentation.name();
+            let module = validate_augmentation_name(arena, bound, file, name)?;
+            if matches!(
+                arena.get(module.node).map(|node| &node.data),
+                Some(NodeData::ModuleDeclaration(module))
+                    if module.keyword == SyntaxKind::GlobalKeyword
+            ) {
+                continue;
+            }
+            if let Some(plan) = plan_named_ambient_module_augmentation(
+                store,
+                files,
+                &pending_ambient_modules,
+                arena,
+                bound,
+                file,
+                module,
+                name,
+            )? {
+                merge_named_ambient_module_augmentation(store, file, plan)?;
+            }
+        }
+    }
+
     Ok(GlobalInitialization {
         globals,
         global_types,
         pending_ambient_modules,
         pattern_ambient_modules,
     })
+}
+
+#[derive(Debug)]
+struct NamedAmbientAugmentationPlan {
+    namespace: SemanticSymbolId,
+    augmentation: SemanticSymbolId,
+    members: Vec<(EscapedName, SemanticSymbolId)>,
+}
+
+#[allow(clippy::too_many_arguments)] // Every input authenticates one retained augmentation.
+fn plan_named_ambient_module_augmentation(
+    store: &CanonicalTypeMapperStore,
+    files: &ProductionAliasSourceRegistry<'_>,
+    pending_ambient_modules: &[SemanticSymbolId],
+    arena: &NodeArena,
+    bound: &BoundFile,
+    file: FileId,
+    augmentation: NodeRef,
+    name: NodeRef,
+) -> Result<Option<NamedAmbientAugmentationPlan>, CanonicalGlobalInitializationError> {
+    let Some(NodeData::StringLiteral(module_name)) = arena.get(name.node).map(|node| &node.data)
+    else {
+        return Ok(None);
+    };
+    if module_name.text.is_empty() || module_name.text.contains('*') {
+        return Ok(None);
+    }
+    let quoted_name = EscapedName::source(format!("\"{}\"", module_name.text));
+    let mut candidates = pending_ambient_modules.iter().copied().filter(|candidate| {
+        store
+            .symbol(*candidate)
+            .is_some_and(|symbol| symbol.name().as_bytes() == quoted_name.as_bytes())
+    });
+    let Some(ambient_module) = candidates.next() else {
+        return Ok(None);
+    };
+    if candidates.next().is_some() {
+        return Ok(None);
+    }
+
+    let Some(augmentation_symbol) = bound.symbol(augmentation) else {
+        return Err(CanonicalGlobalInitializationError::MissingAugmentationSymbol(augmentation));
+    };
+    let augmentation_record = store.symbol(augmentation_symbol).ok_or(
+        CanonicalGlobalInitializationError::InvalidSymbol(augmentation_symbol),
+    )?;
+    if !augmentation_record.flags().intersects(SymbolFlags::MODULE)
+        || augmentation_record.name().as_bytes() != quoted_name.as_bytes()
+        || augmentation_record
+            .declarations()
+            .and_then(|declarations| declarations.first())
+            .copied()
+            != Some(augmentation)
+        || store.get_merged_symbol(augmentation_symbol) != Some(augmentation_symbol)
+    {
+        return Ok(None);
+    }
+    let Some(augmentation_exports) = augmentation_record.exports() else {
+        return Ok(None);
+    };
+    let members = ordered_table_entries(store, file, augmentation_exports)?;
+    if members.is_empty() {
+        return Ok(None);
+    }
+
+    let Some((namespace, namespace_exports)) =
+        ambient_export_assignment_namespace(store, files, ambient_module, &module_name.text)?
+    else {
+        return Ok(None);
+    };
+    let augmentation_record = arena
+        .get(augmentation.node)
+        .ok_or(CanonicalGlobalInitializationError::InvalidDeclarationProvenance(augmentation))?;
+    let NodeData::ModuleDeclaration(module) = &augmentation_record.data else {
+        return Ok(None);
+    };
+    let Some(body) = module.body else {
+        return Ok(None);
+    };
+    if augmentation_record.parent != Some(bound.source_file().node)
+        || !matches!(
+            arena.get(body).map(|node| &node.data),
+            Some(NodeData::ModuleBlock(_))
+        )
+    {
+        return Ok(None);
+    }
+
+    let target_exports = store.symbol_table(namespace_exports).ok_or(
+        CanonicalGlobalInitializationError::InvalidTable {
+            file,
+            table: namespace_exports,
+        },
+    )?;
+    for (name, symbol) in &members {
+        let source = store
+            .symbol(*symbol)
+            .ok_or(CanonicalGlobalInitializationError::InvalidSymbol(*symbol))?;
+        let Some(target) = target_exports
+            .get(name.as_ref())
+            .and_then(|target| store.get_merged_symbol(target))
+        else {
+            return Ok(None);
+        };
+        let target_record = store
+            .symbol(target)
+            .ok_or(CanonicalGlobalInitializationError::InvalidSymbol(target))?;
+        if store.get_merged_symbol(*symbol) != Some(*symbol)
+            || source.flags() != SymbolFlags::INTERFACE
+            || source.parent() != Some(augmentation_symbol)
+            || !source.declarations().is_some_and(|declarations| {
+                !declarations.is_empty()
+                    && declarations.iter().all(|declaration| {
+                        declaration.is_for(arena.id(), file)
+                            && bound.contains(*declaration)
+                            && store.contains_node_ref(*declaration)
+                            && bound.symbol(*declaration) == Some(*symbol)
+                            && arena.get(declaration.node).is_some_and(|node| {
+                                node.kind == SyntaxKind::InterfaceDeclaration
+                                    && node.parent == Some(body)
+                            })
+                    })
+            })
+            || !target_record.flags().contains(SymbolFlags::INTERFACE)
+            || store.get_parent_of_symbol(target) != Some(namespace)
+        {
+            return Ok(None);
+        }
+    }
+
+    Ok(Some(NamedAmbientAugmentationPlan {
+        namespace,
+        augmentation: augmentation_symbol,
+        members,
+    }))
+}
+
+fn ambient_export_assignment_namespace(
+    store: &CanonicalTypeMapperStore,
+    files: &ProductionAliasSourceRegistry<'_>,
+    module: SemanticSymbolId,
+    module_name: &str,
+) -> Result<Option<(SemanticSymbolId, SymbolTableId)>, CanonicalGlobalInitializationError> {
+    let module_record = store
+        .symbol(module)
+        .ok_or(CanonicalGlobalInitializationError::InvalidSymbol(module))?;
+    if !module_record.flags().intersects(SymbolFlags::MODULE)
+        || store.get_merged_symbol(module) != Some(module)
+    {
+        return Ok(None);
+    }
+    let Some(module_exports) = module_record.exports() else {
+        return Ok(None);
+    };
+    let Some(module_file) = module_record
+        .declarations()
+        .and_then(|declarations| declarations.first())
+        .map(|declaration| declaration.file)
+    else {
+        return Ok(None);
+    };
+    let exports = store.symbol_table(module_exports).ok_or(
+        CanonicalGlobalInitializationError::InvalidTable {
+            file: module_file,
+            table: module_exports,
+        },
+    )?;
+    let Some(alias) = exports.get(InternalSymbolName::ExportEquals.as_ref()) else {
+        return Ok(None);
+    };
+    let alias_record = store
+        .symbol(alias)
+        .ok_or(CanonicalGlobalInitializationError::InvalidSymbol(alias))?;
+    let Some([declaration]) = alias_record.declarations() else {
+        return Ok(None);
+    };
+    let declaration = *declaration;
+    if alias_record.flags() != SymbolFlags::ALIAS
+        || alias_record.check_flags() != CheckFlags::NONE
+        || alias_record.name() != InternalSymbolName::ExportEquals.as_ref()
+        || alias_record.value_declaration() != Some(declaration)
+        || alias_record.members().is_some()
+        || alias_record.exports().is_some()
+        || alias_record.parent() != Some(module)
+        || alias_record.export_symbol().is_some()
+        || store.get_merged_symbol(alias) != Some(alias)
+    {
+        return Ok(None);
+    }
+
+    let (arena, bound) = files
+        .snapshot(declaration.file)
+        .ok_or(CanonicalGlobalInitializationError::InvalidDeclarationProvenance(declaration))?;
+    let Some(record) = arena.get(declaration.node) else {
+        return Ok(None);
+    };
+    let NodeData::ExportAssignment(assignment) = &record.data else {
+        return Ok(None);
+    };
+    let Some(block) = record.parent else {
+        return Ok(None);
+    };
+    let Some(NodeData::ModuleBlock(module_block)) = arena.get(block).map(|node| &node.data) else {
+        return Ok(None);
+    };
+    let Some(module_declaration) = arena.get(block).and_then(|node| node.parent) else {
+        return Ok(None);
+    };
+    let module_declaration = NodeRef::new(arena.id(), bound.file_id(), module_declaration);
+    let Some(module_node) = arena.get(module_declaration.node) else {
+        return Ok(None);
+    };
+    let NodeData::ModuleDeclaration(ambient) = &module_node.data else {
+        return Ok(None);
+    };
+    let Some(NodeData::StringLiteral(name)) = arena.get(ambient.name).map(|node| &node.data) else {
+        return Ok(None);
+    };
+    let Some(expression) = arena.get(assignment.expression) else {
+        return Ok(None);
+    };
+    let NodeData::Identifier(identifier) = &expression.data else {
+        return Ok(None);
+    };
+    if record.kind != SyntaxKind::ExportAssignment
+        || !assignment.is_export_equals
+        || !declaration.is_for(arena.id(), bound.file_id())
+        || !bound.contains(declaration)
+        || !store.contains_node_ref(declaration)
+        || bound.symbol(declaration) != Some(alias)
+        || !module_block.statements.nodes.contains(&declaration.node)
+        || ambient.body != Some(block)
+        || name.text != module_name
+        || module_node.parent != Some(bound.source_file().node)
+        || bound.symbol(module_declaration) != Some(module)
+        || expression.kind != SyntaxKind::Identifier
+        || expression.parent != Some(declaration.node)
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+    {
+        return Ok(None);
+    }
+
+    let Some(local) = bound
+        .locals(module_declaration)
+        .and_then(|locals| store.symbol_table(locals))
+        .and_then(|locals| locals.get_source(&identifier.text))
+        .and_then(|local| store.get_merged_symbol(local))
+    else {
+        return Ok(None);
+    };
+    let Some(namespace) = store
+        .symbol(local)
+        .map(|record| record.export_symbol().unwrap_or(local))
+        .and_then(|namespace| store.get_merged_symbol(namespace))
+    else {
+        return Ok(None);
+    };
+    let namespace_record = store
+        .symbol(namespace)
+        .ok_or(CanonicalGlobalInitializationError::InvalidSymbol(namespace))?;
+    let Some(namespace_exports) = namespace_record.exports() else {
+        return Ok(None);
+    };
+    if !namespace_record.flags().intersects(SymbolFlags::NAMESPACE)
+        || namespace_record.name().as_utf8() != Some(identifier.text.as_str())
+        || !namespace_record.declarations().is_some_and(|declarations| {
+            declarations.iter().any(|declaration| {
+                declaration.is_for(arena.id(), bound.file_id())
+                    && bound.contains(*declaration)
+                    && store.contains_node_ref(*declaration)
+                    && bound
+                        .symbol(*declaration)
+                        .and_then(|symbol| store.get_merged_symbol(symbol))
+                        == Some(namespace)
+                    && arena.get(declaration.node).is_some_and(|node| {
+                        node.kind == SyntaxKind::ModuleDeclaration && node.parent == Some(block)
+                    })
+            })
+        })
+        || store.alias_symbol_links(alias).is_some_and(|links| {
+            links.type_only_declaration.is_some()
+                || links
+                    .immediate_target
+                    .is_some_and(|target| store.get_merged_symbol(target) != Some(namespace))
+                || match links.alias_target {
+                    super::AliasTargetState::Unresolved => false,
+                    super::AliasTargetState::Unknown => true,
+                    super::AliasTargetState::Resolved(target) => {
+                        store.get_merged_symbol(target) != Some(namespace)
+                    }
+                }
+        })
+    {
+        return Ok(None);
+    }
+
+    Ok(Some((namespace, namespace_exports)))
+}
+
+fn merge_named_ambient_module_augmentation(
+    store: &mut CanonicalTypeMapperStore,
+    file: FileId,
+    plan: NamedAmbientAugmentationPlan,
+) -> Result<(), CanonicalGlobalInitializationError> {
+    let namespace = store.merge_symbol(plan.namespace, plan.augmentation, false)?;
+    if store.get_merged_symbol(plan.namespace) != Some(namespace)
+        || store.get_merged_symbol(plan.augmentation) != Some(namespace)
+    {
+        return Err(CanonicalGlobalInitializationError::InvalidSymbol(namespace));
+    }
+    let exports = store
+        .symbol(namespace)
+        .and_then(ts_binder::semantic::Symbol::exports)
+        .ok_or(CanonicalGlobalInitializationError::InvalidSymbol(namespace))?;
+    for (name, source) in plan.members {
+        let merged = store
+            .symbol_table(exports)
+            .and_then(|exports| exports.get(name.as_ref()))
+            .ok_or(CanonicalGlobalInitializationError::InvalidTable {
+                file,
+                table: exports,
+            })?;
+        if store.get_merged_symbol(source) != Some(merged)
+            || store.get_parent_of_symbol(merged) != Some(namespace)
+        {
+            return Err(CanonicalGlobalInitializationError::InvalidSymbol(merged));
+        }
+    }
+    Ok(())
 }
 
 fn table_symbol(
@@ -3753,6 +4113,223 @@ declare global { interface Augmented { second: number } }
             context.file(file).unwrap().1.module_augmentations().len(),
             3
         );
+    }
+
+    #[test]
+    fn merges_named_ambient_augmentations_into_the_exported_namespace_in_program_order() {
+        let library = parsed(concat!(
+            "declare module \"react\" { ",
+            "export = React; ",
+            "namespace React { interface Attributes { key?: string; } } ",
+            "}",
+        ));
+        let first = parsed(concat!(
+            "export {}; ",
+            "declare module \"react\" { interface Attributes { 'ns:thing'?: string; } } ",
+            "declare module \"unknown\" { interface Attributes { ignored: string; } }",
+        ));
+        let second = parsed(concat!(
+            "export {}; ",
+            "declare module \"react\" { interface Attributes { extra?: number; } }",
+        ));
+        let library_file = FileId::new(8_451);
+        let first_file = FileId::new(8_452);
+        let second_file = FileId::new(8_453);
+        let context = CanonicalCheckerContext::new(
+            completed_bindings_with_facts(&[
+                (library_file, &library, true, CanonicalModuleState::Script),
+                (first_file, &first, false, CanonicalModuleState::External),
+                (second_file, &second, false, CanonicalModuleState::External),
+            ]),
+            vec![
+                (library_file, &library.arena),
+                (first_file, &first.arena),
+                (second_file, &second.arena),
+            ],
+            IntrinsicBootstrapOptions::default(),
+        )
+        .unwrap();
+
+        let ambient = context.pending_ambient_modules()[0];
+        let (_, library_bound) = context.file(library_file).unwrap();
+        let namespace_declaration = library
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::ModuleDeclaration(module) = &record.data else {
+                    return None;
+                };
+                matches!(
+                    library.arena.get(module.name).map(|name| &name.data),
+                    Some(NodeData::Identifier(identifier)) if identifier.text == "React"
+                )
+                .then_some(node_ref(&library, library_file, node))
+            })
+            .unwrap();
+        let original_namespace = library_bound.symbol(namespace_declaration).unwrap();
+        let namespace = context
+            .store()
+            .get_merged_symbol(original_namespace)
+            .unwrap();
+        assert_ne!(namespace, original_namespace);
+        let namespace_exports = context
+            .store()
+            .symbol(namespace)
+            .unwrap()
+            .exports()
+            .unwrap();
+        let ambient_exports = context.store().symbol(ambient).unwrap().exports().unwrap();
+        let attributes = context
+            .store()
+            .symbol_table(namespace_exports)
+            .unwrap()
+            .get_source("Attributes")
+            .unwrap();
+        assert!(
+            context
+                .store()
+                .symbol_table(ambient_exports)
+                .unwrap()
+                .get_source("Attributes")
+                .is_none()
+        );
+        assert!(
+            context
+                .store()
+                .symbol_table(ambient_exports)
+                .unwrap()
+                .get(InternalSymbolName::ExportEquals.as_ref())
+                .is_some()
+        );
+        for (file, parsed) in [(first_file, &first), (second_file, &second)] {
+            let (_, bound) = context.file(file).unwrap();
+            let name = bound.module_augmentations()[0].name();
+            let declaration = validate_augmentation_name(&parsed.arena, bound, file, name).unwrap();
+            let augmentation = bound.symbol(declaration).unwrap();
+            assert_eq!(
+                context.store().get_merged_symbol(augmentation),
+                Some(namespace)
+            );
+        }
+        let record = context.store().symbol(attributes).unwrap();
+        assert!(record.flags().contains(SymbolFlags::INTERFACE));
+        assert!(record.flags().contains(SymbolFlags::TRANSIENT));
+        assert_eq!(record.parent(), Some(namespace));
+        assert_eq!(
+            record
+                .declarations()
+                .unwrap()
+                .iter()
+                .map(|declaration| declaration.file)
+                .collect::<Vec<_>>(),
+            [library_file, first_file, second_file],
+        );
+        let members = context
+            .store()
+            .symbol_table(record.members().unwrap())
+            .unwrap();
+        for name in ["key", "ns:thing", "extra"] {
+            assert!(members.get_source(name).is_some(), "missing {name}");
+        }
+        assert!(global_symbol(&context, "Attributes").is_none());
+        assert_eq!(
+            context
+                .file(first_file)
+                .unwrap()
+                .1
+                .module_augmentations()
+                .len(),
+            2
+        );
+
+        let (_, first_bound) = context.file(first_file).unwrap();
+        let name = first_bound.module_augmentations()[0].name();
+        let module =
+            validate_augmentation_name(&first.arena, first_bound, first_file, name).unwrap();
+        let warm = (
+            context.store().symbol_len(),
+            context.store().merged_symbol_len(),
+            context.store().symbol_store().symbol_table_len(),
+        );
+        assert!(
+            plan_named_ambient_module_augmentation(
+                context.store(),
+                &context.files,
+                context.pending_ambient_modules(),
+                &first.arena,
+                first_bound,
+                first_file,
+                module,
+                name,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(
+            (
+                context.store().symbol_len(),
+                context.store().merged_symbol_len(),
+                context.store().symbol_store().symbol_table_len(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn named_ambient_augmentations_reject_non_namespace_export_assignments() {
+        let library = parsed("declare module \"react\" { export = React; const React: number; }");
+        let augmentation = parsed(concat!(
+            "export {}; ",
+            "declare module \"react\" { interface Attributes { 'ns:thing'?: string; } }",
+        ));
+        let library_file = FileId::new(8_454);
+        let augmentation_file = FileId::new(8_455);
+        let context = CanonicalCheckerContext::new(
+            completed_bindings_with_facts(&[
+                (library_file, &library, true, CanonicalModuleState::Script),
+                (
+                    augmentation_file,
+                    &augmentation,
+                    false,
+                    CanonicalModuleState::External,
+                ),
+            ]),
+            vec![
+                (library_file, &library.arena),
+                (augmentation_file, &augmentation.arena),
+            ],
+            IntrinsicBootstrapOptions::default(),
+        )
+        .unwrap();
+
+        let ambient = context.pending_ambient_modules()[0];
+        let exports = context.store().symbol(ambient).unwrap().exports().unwrap();
+        assert!(
+            context
+                .store()
+                .symbol_table(exports)
+                .unwrap()
+                .get_source("Attributes")
+                .is_none()
+        );
+        let (_, bound) = context.file(augmentation_file).unwrap();
+        let name = bound.module_augmentations()[0].name();
+        let module =
+            validate_augmentation_name(&augmentation.arena, bound, augmentation_file, name)
+                .unwrap();
+        let symbol = bound.symbol(module).unwrap();
+        let attributes = context
+            .store()
+            .symbol(symbol)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| context.store().symbol_table(exports))
+            .and_then(|exports| exports.get_source("Attributes"))
+            .unwrap();
+        assert_eq!(
+            context.store().get_merged_symbol(attributes),
+            Some(attributes)
+        );
+        assert!(global_symbol(&context, "Attributes").is_none());
     }
 
     #[test]

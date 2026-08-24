@@ -33,6 +33,7 @@ use super::{
     indexed_access_types::template_pattern_index_matches_name,
     mapped_types::MappedTypeModifiers,
     production::{CanonicalJsxRuntime, CanonicalJsxRuntimeEvidence},
+    reference_types::validate_direct_generic_reference,
     signatures::SignatureFlags,
     source::merge_retry_diagnostic,
     spelling::get_spelling_suggestion,
@@ -216,6 +217,13 @@ struct JsxRecordHeritage {
     alias: SemanticSymbolId,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct DeferredReactAttributeProperty {
+    owner: SemanticSymbolId,
+    symbol: SemanticSymbolId,
+    type_argument: Option<TypeId>,
+}
+
 impl CanonicalTypeMapperStore {
     /// Validates a JSX expression and every supported child without mutation.
     ///
@@ -276,7 +284,14 @@ impl CanonicalTypeMapperStore {
 
         let plan = plan_jsx_element(arena, bound, self, expression)?;
         let namespace = resolve_jsx_namespace(self, host, options, diagnostics, &plan)?;
-        execute_jsx_element(self, arena, bound, &namespace, &plan, options, diagnostics)
+        execute_jsx_element(
+            self,
+            (arena, bound, host),
+            &namespace,
+            &plan,
+            options,
+            diagnostics,
+        )
     }
 }
 
@@ -1862,8 +1877,24 @@ fn resolve_namespace_interface(
                     .is_none_or(|requested| requested.contains(&name))
                     || jsx_intrinsic_property_has_call_signature(host, annotation)
                 {
-                    let resolved = CanonicalTypeQuery::new(store, host, options, diagnostics)?
-                        .get_type_from_type_node(annotation)?;
+                    let cached_react = if let Some(cached) = cached_type
+                        && store
+                            .type_node_links(annotation)
+                            .and_then(|links| links.resolved_type)
+                            == Some(cached)
+                        && store.validate_deferred_intersection_type(cached).is_ok()
+                    {
+                        deferred_react_class_attributes_base(store, host, cached, member)?
+                            .map(|_| cached)
+                    } else {
+                        None
+                    };
+                    let resolved = if let Some(cached) = cached_react {
+                        cached
+                    } else {
+                        CanonicalTypeQuery::new(store, host, options, diagnostics)?
+                            .get_type_from_type_node(annotation)?
+                    };
                     if cached_type.is_some_and(|cached| cached != resolved) {
                         return Err(SourceCheckError::Property(member));
                     }
@@ -2588,13 +2619,13 @@ fn invalid_namespace_symbol(symbol: SemanticSymbolId) -> SourceCheckError {
 #[allow(clippy::too_many_lines)] // Preserve opening, closing, attribute, and child ordering.
 fn execute_jsx_element(
     store: &mut CanonicalTypeMapperStore,
-    arena: &NodeArena,
-    bound: &BoundFile,
+    source: (&NodeArena, &BoundFile, &DeclaredTypeHost<'_>),
     namespace: &JsxNamespace,
     plan: &JsxElementPlan,
     options: CanonicalCheckerOptions,
     diagnostics: &mut CanonicalCheckerDiagnostics,
 ) -> Result<TypeId, SourceCheckError> {
+    let (arena, bound, host) = source;
     let mut children_checked = false;
     if plan.expression != plan.opening {
         publish_jsx_links(
@@ -2718,8 +2749,7 @@ fn execute_jsx_element(
             let children = if options.jsx_runtime == CanonicalJsxRuntime::Automatic {
                 check_automatic_jsx_children(
                     store,
-                    arena,
-                    bound,
+                    source,
                     namespace,
                     plan,
                     attributes,
@@ -2734,7 +2764,7 @@ fn execute_jsx_element(
                 JsxAttributesPlan::Properties(attributes) => {
                     let checked = check_jsx_attributes(
                         store,
-                        (arena, bound),
+                        source,
                         namespace,
                         expected_attributes,
                         attributes,
@@ -2753,7 +2783,7 @@ fn execute_jsx_element(
                 JsxAttributesPlan::ObjectSpread(spread) => {
                     let (checked, actual) = check_jsx_object_spread(
                         store,
-                        (arena, bound),
+                        source,
                         namespace,
                         expected_attributes,
                         spread,
@@ -2766,12 +2796,13 @@ fn execute_jsx_element(
             };
             check_attribute_assignability(
                 store,
-                (arena, bound),
+                host,
                 plan.opening,
                 tag,
                 (expected_attributes, actual_attributes),
                 &checked,
                 children,
+                options,
                 diagnostics,
             )?;
         }
@@ -2782,27 +2813,12 @@ fn execute_jsx_element(
             match child {
                 JsxChildPlan::Text { .. } => {}
                 JsxChildPlan::Expression { wrapper, value } => {
-                    let type_ = execute_scalar(
-                        store,
-                        arena,
-                        bound,
-                        namespace,
-                        value,
-                        options,
-                        diagnostics,
-                    )?;
+                    let type_ =
+                        execute_scalar(store, source, namespace, value, options, diagnostics)?;
                     publish_type_links(store, *wrapper, type_)?;
                 }
                 JsxChildPlan::Element(element) => {
-                    execute_jsx_element(
-                        store,
-                        arena,
-                        bound,
-                        namespace,
-                        element,
-                        options,
-                        diagnostics,
-                    )?;
+                    execute_jsx_element(store, source, namespace, element, options, diagnostics)?;
                 }
             }
         }
@@ -2812,11 +2828,9 @@ fn execute_jsx_element(
     Ok(namespace.element_type)
 }
 
-#[allow(clippy::too_many_arguments)] // JSX child execution retains the enclosing checker state.
 fn check_automatic_jsx_children(
     store: &mut CanonicalTypeMapperStore,
-    arena: &NodeArena,
-    bound: &BoundFile,
+    source: (&NodeArena, &BoundFile, &DeclaredTypeHost<'_>),
     namespace: &JsxNamespace,
     plan: &JsxElementPlan,
     attributes: &JsxAttributesPlan,
@@ -2855,21 +2869,13 @@ fn check_automatic_jsx_children(
             (*node, string_type)
         }
         JsxChildPlan::Expression { wrapper, value } => {
-            let type_ =
-                execute_scalar(store, arena, bound, namespace, value, options, diagnostics)?;
+            let type_ = execute_scalar(store, source, namespace, value, options, diagnostics)?;
             publish_type_links(store, *wrapper, type_)?;
             (*wrapper, type_)
         }
         JsxChildPlan::Element(element) => {
-            let type_ = execute_jsx_element(
-                store,
-                arena,
-                bound,
-                namespace,
-                element,
-                options,
-                diagnostics,
-            )?;
+            let type_ =
+                execute_jsx_element(store, source, namespace, element, options, diagnostics)?;
             (element.expression, type_)
         }
     };
@@ -3624,14 +3630,14 @@ fn resolve_scoped_jsx_value_symbol(
 
 fn check_jsx_attributes(
     store: &mut CanonicalTypeMapperStore,
-    source: (&NodeArena, &BoundFile),
+    source: (&NodeArena, &BoundFile, &DeclaredTypeHost<'_>),
     namespace: &JsxNamespace,
     expected_attributes: TypeId,
     attributes: &[JsxAttributePlan],
     options: CanonicalCheckerOptions,
     diagnostics: &mut CanonicalCheckerDiagnostics,
 ) -> Result<Vec<CheckedJsxAttribute>, SourceCheckError> {
-    let (arena, bound) = source;
+    let (arena, _, _) = source;
     let mut checked = Vec::with_capacity(attributes.len());
     let mut names = HashSet::with_capacity(attributes.len());
     for attribute in attributes {
@@ -3660,8 +3666,7 @@ fn check_jsx_attributes(
                 namespace.error_type
             }
             JsxAttributeValue::Expression { wrapper, value } => {
-                let type_ =
-                    execute_scalar(store, arena, bound, namespace, value, options, diagnostics)?;
+                let type_ = execute_scalar(store, source, namespace, value, options, diagnostics)?;
                 if let Some(wrapper) = wrapper {
                     publish_type_links(store, *wrapper, type_)?;
                 }
@@ -3697,14 +3702,13 @@ fn check_jsx_attributes(
 
 fn check_jsx_object_spread(
     store: &mut CanonicalTypeMapperStore,
-    source: (&NodeArena, &BoundFile),
+    source: (&NodeArena, &BoundFile, &DeclaredTypeHost<'_>),
     namespace: &JsxNamespace,
     expected_attributes: TypeId,
     spread: &JsxObjectSpreadPlan,
     options: CanonicalCheckerOptions,
     diagnostics: &mut CanonicalCheckerDiagnostics,
 ) -> Result<(Vec<CheckedJsxAttribute>, TypeId), SourceCheckError> {
-    let (arena, bound) = source;
     let mut checked = Vec::with_capacity(spread.properties.len());
     let mut property_types = Vec::with_capacity(spread.properties.len());
 
@@ -3716,8 +3720,7 @@ fn check_jsx_object_spread(
         else {
             return Err(SourceCheckError::Property(spread.node));
         };
-        let value_type =
-            execute_scalar(store, arena, bound, namespace, value, options, diagnostics)?;
+        let value_type = execute_scalar(store, source, namespace, value, options, diagnostics)?;
         let property_type =
             widened_jsx_attribute_type(store, expected_attributes, property, value_type)?;
         property_types.push(property_type);
@@ -3804,13 +3807,13 @@ fn publish_attribute_value_links(
 
 fn execute_scalar(
     store: &mut CanonicalTypeMapperStore,
-    arena: &NodeArena,
-    bound: &BoundFile,
+    source: (&NodeArena, &BoundFile, &DeclaredTypeHost<'_>),
     namespace: &JsxNamespace,
     scalar: &JsxScalarPlan,
     options: CanonicalCheckerOptions,
     diagnostics: &mut CanonicalCheckerDiagnostics,
 ) -> Result<TypeId, SourceCheckError> {
+    let (arena, bound, host) = source;
     let (node, type_) = match scalar {
         JsxScalarPlan::String { node, value } => {
             let regular = store.regular_string_literal_type(value.clone())?;
@@ -3901,15 +3904,8 @@ fn execute_scalar(
             name_node,
             name,
         } => {
-            let receiver_type = execute_scalar(
-                store,
-                arena,
-                bound,
-                namespace,
-                receiver,
-                options,
-                diagnostics,
-            )?;
+            let receiver_type =
+                execute_scalar(store, source, namespace, receiver, options, diagnostics)?;
             if matches!(receiver.as_ref(), JsxScalarPlan::GlobalThis(_)) {
                 let bootstrap =
                     store
@@ -3939,11 +3935,9 @@ fn execute_scalar(
                 publish_symbol_links(store, *node, property.symbol)?;
                 (*node, property.type_)
             } else {
-                let host = DeclaredTypeHost::new([(arena, bound)])
-                    .map_err(super::DeclaredTypeError::from)?;
                 let target = type_to_string_with_host_and_flags(
                     store,
-                    &host,
+                    host,
                     receiver_type,
                     CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
                 )?;
@@ -3961,7 +3955,7 @@ fn execute_scalar(
             type_node,
             value,
         } => {
-            execute_scalar(store, arena, bound, namespace, value, options, diagnostics)?;
+            execute_scalar(store, source, namespace, value, options, diagnostics)?;
             let any = store
                 .intrinsic_bootstrap()
                 .ok_or(SourceCheckError::LiteralCache(
@@ -3972,8 +3966,7 @@ fn execute_scalar(
             (*node, any)
         }
         JsxScalarPlan::Parenthesized { node, value } => {
-            let type_ =
-                execute_scalar(store, arena, bound, namespace, value, options, diagnostics)?;
+            let type_ = execute_scalar(store, source, namespace, value, options, diagnostics)?;
             (*node, type_)
         }
         JsxScalarPlan::Conditional {
@@ -3982,33 +3975,11 @@ fn execute_scalar(
             when_true,
             when_false,
         } => {
-            execute_scalar(
-                store,
-                arena,
-                bound,
-                namespace,
-                condition,
-                options,
-                diagnostics,
-            )?;
-            let true_type = execute_scalar(
-                store,
-                arena,
-                bound,
-                namespace,
-                when_true,
-                options,
-                diagnostics,
-            )?;
-            let false_type = execute_scalar(
-                store,
-                arena,
-                bound,
-                namespace,
-                when_false,
-                options,
-                diagnostics,
-            )?;
+            execute_scalar(store, source, namespace, condition, options, diagnostics)?;
+            let true_type =
+                execute_scalar(store, source, namespace, when_true, options, diagnostics)?;
+            let false_type =
+                execute_scalar(store, source, namespace, when_false, options, diagnostics)?;
             let type_ = if true_type == false_type {
                 true_type
             } else {
@@ -4018,21 +3989,12 @@ fn execute_scalar(
             (*node, type_)
         }
         JsxScalarPlan::AdjacentElements { node, left, right } => {
-            execute_jsx_element(store, arena, bound, namespace, left, options, diagnostics)?;
-            let type_ =
-                execute_jsx_element(store, arena, bound, namespace, right, options, diagnostics)?;
+            execute_jsx_element(store, source, namespace, left, options, diagnostics)?;
+            let type_ = execute_jsx_element(store, source, namespace, right, options, diagnostics)?;
             (*node, type_)
         }
         JsxScalarPlan::Element(element) => {
-            return execute_jsx_element(
-                store,
-                arena,
-                bound,
-                namespace,
-                element,
-                options,
-                diagnostics,
-            );
+            return execute_jsx_element(store, source, namespace, element, options, diagnostics);
         }
     };
     publish_type_links(store, node, type_)?;
@@ -4225,12 +4187,13 @@ fn validate_attribute_object(
 #[allow(clippy::too_many_arguments)] // Attribute diagnostics retain the implicit child property.
 fn check_attribute_assignability(
     store: &mut CanonicalTypeMapperStore,
-    source: (&NodeArena, &BoundFile),
+    host: &DeclaredTypeHost<'_>,
     opening: NodeRef,
     tag: &JsxTagPlan,
     (expected, actual): (TypeId, TypeId),
     attributes: &[CheckedJsxAttribute],
     children: Option<CheckedJsxChildren>,
+    options: CanonicalCheckerOptions,
     diagnostics: &mut CanonicalCheckerDiagnostics,
 ) -> Result<(), SourceCheckError> {
     let expected_record = store
@@ -4259,6 +4222,10 @@ fn check_attribute_assignability(
                 .and_then(|links| links.resolved_type)
                 .ok_or(SourceCheckError::Property(attribute.plan.node))?
         } else if let Some(type_) =
+            deferred_react_attribute_type(store, host, expected, attribute, options, diagnostics)?
+        {
+            type_
+        } else if let Some(type_) =
             matching_attribute_index_value_type(store, &index_infos, &attribute.plan.name)?
         {
             type_
@@ -4266,10 +4233,9 @@ fn check_attribute_assignability(
             continue;
         } else {
             has_excess_attribute = true;
-            let host = DeclaredTypeHost::new([source]).map_err(super::DeclaredTypeError::from)?;
             let target = type_to_string_with_host_and_flags(
                 store,
-                &host,
+                host,
                 expected,
                 CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
             )?;
@@ -4282,7 +4248,7 @@ fn check_attribute_assignability(
             let diagnostic = Diagnostic::with_arguments(
                 message_by_code(2322).ok_or(SourceCheckError::MissingDiagnostic(2322))?,
                 [
-                    format_attribute_object(store, &host, attributes, children)?,
+                    format_attribute_object(store, host, attributes, children)?,
                     target,
                 ],
             )
@@ -4343,12 +4309,10 @@ fn check_attribute_assignability(
                 .as_utf8()
                 .ok_or(SourceCheckError::Property(opening))?;
             if !present.contains(name) {
-                let host =
-                    DeclaredTypeHost::new([source]).map_err(super::DeclaredTypeError::from)?;
-                let source = format_attribute_object(store, &host, attributes, children)?;
+                let source = format_attribute_object(store, host, attributes, children)?;
                 let target = type_to_string_with_host_and_flags(
                     store,
-                    &host,
+                    host,
                     expected,
                     CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT,
                 )?;
@@ -4404,6 +4368,661 @@ fn check_attribute_assignability(
         return Err(SourceCheckError::Property(opening));
     }
     Ok(())
+}
+
+fn deferred_react_attribute_type(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    expected: TypeId,
+    attribute: &CheckedJsxAttribute,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+) -> Result<Option<TypeId>, SourceCheckError> {
+    let location = attribute.plan.node;
+    let Some(attributes) = deferred_react_class_attributes_base(store, host, expected, location)?
+    else {
+        return Ok(None);
+    };
+    let Some(selected) = select_deferred_react_attribute_property(
+        store,
+        host,
+        expected,
+        attributes,
+        &attribute.plan.name,
+        location,
+    )?
+    else {
+        return Ok(None);
+    };
+    let property = selected.symbol;
+    let property_record = store
+        .symbol(property)
+        .ok_or(SourceCheckError::Property(location))?;
+    let [declaration] = property_record
+        .declarations()
+        .ok_or(SourceCheckError::Property(location))?
+    else {
+        return Err(SourceCheckError::Property(location));
+    };
+    let declaration = *declaration;
+    let allowed = SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL | SymbolFlags::TRANSIENT;
+    if !property_record.flags().contains(SymbolFlags::PROPERTY)
+        || property_record.flags().without(allowed) != SymbolFlags::NONE
+        || property_record.check_flags() != CheckFlags::NONE
+        || property_record.name().as_utf8() != Some(attribute.plan.name.as_str())
+        || property_record.value_declaration() != Some(declaration)
+        || property_record.members().is_some()
+        || property_record.exports().is_some()
+        || property_record.export_symbol().is_some()
+        || store.get_parent_of_symbol(property) != Some(selected.owner)
+        || !host.symbol_matches(store, declaration, property)
+    {
+        return Err(SourceCheckError::Property(declaration));
+    }
+    let annotation = validate_react_attribute_declaration(
+        store,
+        host,
+        selected.owner,
+        declaration,
+        &attribute.plan.name,
+        property_record.flags().contains(SymbolFlags::OPTIONAL),
+    )?;
+    let cached = match store.value_symbol_links(property) {
+        None => None,
+        Some(links) if links == &ValueSymbolLinks::default() => None,
+        Some(links) => {
+            let type_ = links
+                .resolved_type
+                .filter(|type_| store.type_payload(*type_).is_some())
+                .ok_or(SourceCheckError::Property(declaration))?;
+            let expected_links = ValueSymbolLinks {
+                resolved_type: Some(type_),
+                ..ValueSymbolLinks::default()
+            };
+            if links != &expected_links
+                || store
+                    .type_node_links(annotation)
+                    .and_then(|links| links.resolved_type)
+                    .is_some_and(|resolved| resolved != type_)
+            {
+                return Err(SourceCheckError::Property(declaration));
+            }
+            Some(type_)
+        }
+    };
+    if cached.is_none() && !store.try_reserve_value_symbol_links(1) {
+        return Err(SourceCheckError::Property(declaration));
+    }
+    let resolved = CanonicalTypeQuery::new(store, host, options, diagnostics)?
+        .get_type_from_type_node(annotation)?;
+    if cached.is_some_and(|cached| cached != resolved) {
+        return Err(SourceCheckError::Property(declaration));
+    }
+    publish_attribute_value_links(store, property, resolved, declaration)?;
+    instantiate_deferred_react_attribute_type(store, selected, resolved, declaration).map(Some)
+}
+
+fn instantiate_deferred_react_attribute_type(
+    store: &CanonicalTypeMapperStore,
+    property: DeferredReactAttributeProperty,
+    type_: TypeId,
+    declaration: NodeRef,
+) -> Result<TypeId, SourceCheckError> {
+    let Some(argument) = property.type_argument else {
+        return Ok(type_);
+    };
+    if !matches!(
+        store
+            .type_payload(type_)
+            .map(super::type_records::TypeRecord::data),
+        Some(super::TypeData::TypeParameter(_))
+    ) {
+        return Ok(type_);
+    }
+    let parameter = super::declared::cached_ordinary_type_parameter_owner(store, type_)
+        .ok_or(SourceCheckError::Property(declaration))?;
+    if store.get_parent_of_symbol(parameter) != Some(property.owner) {
+        return Err(SourceCheckError::Property(declaration));
+    }
+    Ok(argument)
+}
+
+fn select_deferred_react_attribute_property(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    expected: TypeId,
+    attributes: SemanticSymbolId,
+    name: &str,
+    location: NodeRef,
+) -> Result<Option<DeferredReactAttributeProperty>, SourceCheckError> {
+    let projection = store
+        .validate_deferred_intersection_type(expected)
+        .map_err(|_| SourceCheckError::Property(location))?;
+    let [class_type, element_type] = projection.types.as_slice() else {
+        return Err(SourceCheckError::Property(location));
+    };
+    let [_, element_argument] = projection.alias_arguments.as_slice() else {
+        return Err(SourceCheckError::Property(location));
+    };
+    let class = validate_direct_generic_reference(store, *class_type)
+        .map_err(|_| SourceCheckError::Property(location))?;
+    let class_owner = store
+        .type_payload(class.target)
+        .and_then(super::type_records::TypeRecord::symbol)
+        .ok_or(SourceCheckError::Property(location))?;
+    for (owner, type_argument) in [(class_owner, Some(*element_argument)), (attributes, None)] {
+        if let Some(symbol) = react_interface_named_property(store, owner, name, location)? {
+            return Ok(Some(DeferredReactAttributeProperty {
+                owner,
+                symbol,
+                type_argument,
+            }));
+        }
+    }
+
+    let element = validate_direct_generic_reference(store, *element_type)
+        .map_err(|_| SourceCheckError::Property(location))?;
+    let owner = store
+        .type_payload(element.target)
+        .and_then(super::type_records::TypeRecord::symbol)
+        .ok_or(SourceCheckError::Property(location))?;
+    let namespace = store
+        .get_parent_of_symbol(attributes)
+        .ok_or(SourceCheckError::Property(location))?;
+    validate_react_html_attribute_owner(store, host, namespace, owner, location)?;
+    if element.type_arguments.as_slice() != [*element_argument] {
+        return Err(SourceCheckError::Property(location));
+    }
+    if let Some(symbol) = react_interface_named_property(store, owner, name, location)? {
+        return Ok(Some(DeferredReactAttributeProperty {
+            owner,
+            symbol,
+            type_argument: Some(*element_argument),
+        }));
+    }
+
+    let base = store
+        .symbol(namespace)
+        .and_then(ts_binder::semantic::Symbol::exports)
+        .and_then(|exports| store.symbol_table(exports))
+        .and_then(|exports| exports.get_source("HTMLAttributes"))
+        .and_then(|base| store.get_merged_symbol(base))
+        .ok_or(SourceCheckError::Property(location))?;
+    if base == owner {
+        return Ok(None);
+    }
+    validate_react_html_attribute_owner(store, host, namespace, base, location)?;
+    validate_react_derived_html_attributes(store, host, owner, base, location)?;
+    Ok(
+        react_interface_named_property(store, base, name, location)?.map(|symbol| {
+            DeferredReactAttributeProperty {
+                owner: base,
+                symbol,
+                type_argument: Some(*element_argument),
+            }
+        }),
+    )
+}
+
+fn react_interface_named_property(
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+    name: &str,
+    location: NodeRef,
+) -> Result<Option<SemanticSymbolId>, SourceCheckError> {
+    let members = store
+        .symbol(owner)
+        .and_then(ts_binder::semantic::Symbol::members)
+        .and_then(|members| store.symbol_table(members))
+        .ok_or(SourceCheckError::Property(location))?;
+    let Some(symbol) = members.get_source(name) else {
+        return Ok(None);
+    };
+    store
+        .get_merged_symbol(symbol)
+        .map(Some)
+        .ok_or(SourceCheckError::Property(location))
+}
+
+fn validate_react_html_attribute_owner(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    namespace: SemanticSymbolId,
+    owner: SemanticSymbolId,
+    location: NodeRef,
+) -> Result<(), SourceCheckError> {
+    let record = store
+        .symbol(owner)
+        .ok_or(SourceCheckError::Property(location))?;
+    let name = record
+        .name()
+        .as_utf8()
+        .ok_or(SourceCheckError::Property(location))?;
+    let declarations = record
+        .declarations()
+        .filter(|declarations| !declarations.is_empty())
+        .ok_or(SourceCheckError::Property(location))?;
+    let exported = store
+        .symbol(namespace)
+        .and_then(ts_binder::semantic::Symbol::exports)
+        .and_then(|exports| store.symbol_table(exports))
+        .and_then(|exports| exports.get_source(name))
+        .and_then(|symbol| store.get_merged_symbol(symbol));
+    if !record.flags().contains(SymbolFlags::INTERFACE)
+        || record
+            .flags()
+            .without(SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT)
+            != SymbolFlags::NONE
+        || record.check_flags() != CheckFlags::NONE
+        || !name.ends_with("HTMLAttributes")
+        || record.members().is_none()
+        || record.exports().is_some()
+        || store.get_parent_of_symbol(owner) != Some(namespace)
+        || store.get_merged_symbol(owner) != Some(owner)
+        || exported != Some(owner)
+    {
+        return Err(SourceCheckError::Property(location));
+    }
+    for declaration in declarations {
+        let declaration_record = host
+            .node(*declaration)
+            .ok_or(SourceCheckError::Property(*declaration))?;
+        let NodeData::InterfaceDeclaration(interface) = &declaration_record.data else {
+            return Err(SourceCheckError::Property(*declaration));
+        };
+        if declaration_record.kind != SyntaxKind::InterfaceDeclaration
+            || declaration_record.flags.0 != 0
+            || !host.symbol_matches(store, *declaration, owner)
+            || interface
+                .type_parameters
+                .as_ref()
+                .is_none_or(|parameters| parameters.nodes.len() != 1)
+        {
+            return Err(SourceCheckError::Property(*declaration));
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)] // Base syntax and its generic argument share one identity proof.
+fn validate_react_derived_html_attributes(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    derived: SemanticSymbolId,
+    base: SemanticSymbolId,
+    location: NodeRef,
+) -> Result<(), SourceCheckError> {
+    let owner = store
+        .symbol(derived)
+        .ok_or(SourceCheckError::Property(location))?;
+    let [declaration] = owner
+        .declarations()
+        .ok_or(SourceCheckError::Property(location))?
+    else {
+        return Err(SourceCheckError::Property(location));
+    };
+    let declaration = *declaration;
+    let record = host
+        .node(declaration)
+        .ok_or(SourceCheckError::Property(declaration))?;
+    let NodeData::InterfaceDeclaration(interface) = &record.data else {
+        return Err(SourceCheckError::Property(declaration));
+    };
+    let clauses = interface
+        .heritage_clauses
+        .as_ref()
+        .ok_or(SourceCheckError::Property(declaration))?;
+    let [clause] = clauses.nodes.as_slice() else {
+        return Err(SourceCheckError::Property(declaration));
+    };
+    let clause = child_ref(declaration, *clause);
+    let clause_record = host
+        .node(clause)
+        .ok_or(SourceCheckError::Property(clause))?;
+    let NodeData::HeritageClause(heritage) = &clause_record.data else {
+        return Err(SourceCheckError::Property(clause));
+    };
+    let [reference] = heritage.types.nodes.as_slice() else {
+        return Err(SourceCheckError::Property(clause));
+    };
+    let reference = child_ref(clause, *reference);
+    let reference_record = host
+        .node(reference)
+        .ok_or(SourceCheckError::Property(reference))?;
+    let NodeData::ExpressionWithTypeArguments(expression) = &reference_record.data else {
+        return Err(SourceCheckError::Property(reference));
+    };
+    let name = child_ref(reference, expression.expression);
+    let name_record = host.node(name).ok_or(SourceCheckError::Property(name))?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(SourceCheckError::Property(name));
+    };
+    let arguments = expression
+        .type_arguments
+        .as_ref()
+        .ok_or(SourceCheckError::Property(reference))?;
+    let [argument] = arguments.nodes.as_slice() else {
+        return Err(SourceCheckError::Property(reference));
+    };
+    let argument = child_ref(reference, *argument);
+    let argument_record = host
+        .node(argument)
+        .ok_or(SourceCheckError::Property(argument))?;
+    let NodeData::TypeReferenceNode(argument_type) = &argument_record.data else {
+        return Err(SourceCheckError::Property(argument));
+    };
+    let parameter = child_ref(argument, argument_type.type_name);
+    let parameter_record = host
+        .node(parameter)
+        .ok_or(SourceCheckError::Property(parameter))?;
+    let NodeData::Identifier(parameter_name) = &parameter_record.data else {
+        return Err(SourceCheckError::Property(parameter));
+    };
+    if clauses.has_trailing_comma
+        || clause_record.kind != SyntaxKind::HeritageClause
+        || clause_record.flags.0 != 0
+        || clause_record.parent != Some(declaration.node)
+        || heritage.token != SyntaxKind::ExtendsKeyword
+        || heritage.facts != 0
+        || heritage.types.has_trailing_comma
+        || reference_record.kind != SyntaxKind::ExpressionWithTypeArguments
+        || reference_record.flags.0 != 0
+        || reference_record.parent != Some(clause.node)
+        || expression.facts != 0
+        || arguments.has_trailing_comma
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(reference.node)
+        || identifier.flow_node.is_some()
+        || identifier.text != "HTMLAttributes"
+        || argument_record.kind != SyntaxKind::TypeReference
+        || argument_record.flags.0 != 0
+        || argument_record.parent != Some(reference.node)
+        || argument_type.type_arguments.is_some()
+        || parameter_record.kind != SyntaxKind::Identifier
+        || parameter_record.flags.0 != 0
+        || parameter_record.parent != Some(argument.node)
+        || parameter_name.flow_node.is_some()
+    {
+        return Err(SourceCheckError::Property(declaration));
+    }
+    let mut resolver = host.name_resolver_host(store)?;
+    let resolved_base = resolver
+        .resolve_entity_name(name, SymbolFlags::TYPE)
+        .map_err(super::DeclaredTypeError::from)?
+        .and_then(|symbol| store.get_merged_symbol(symbol));
+    let resolved_parameter = resolver
+        .resolve_entity_name(parameter, SymbolFlags::TYPE)
+        .map_err(super::DeclaredTypeError::from)?
+        .and_then(|symbol| store.get_merged_symbol(symbol));
+    let expected_parameter = owner
+        .members()
+        .and_then(|members| store.symbol_table(members))
+        .and_then(|members| members.get_source(&parameter_name.text))
+        .and_then(|symbol| store.get_merged_symbol(symbol));
+    if resolved_base != Some(base)
+        || resolved_parameter.is_none()
+        || resolved_parameter != expected_parameter
+    {
+        return Err(SourceCheckError::Property(declaration));
+    }
+    Ok(())
+}
+
+fn deferred_react_class_attributes_base(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    expected: TypeId,
+    location: NodeRef,
+) -> Result<Option<SemanticSymbolId>, SourceCheckError> {
+    let record = store
+        .type_payload(expected)
+        .ok_or(SourceCheckError::Property(location))?;
+    if record.flags() != TypeFlags::INTERSECTION {
+        return Ok(None);
+    }
+    let projection = store
+        .validate_deferred_intersection_type(expected)
+        .map_err(|_| SourceCheckError::Property(location))?;
+    let Some(alias) = projection.alias_symbol else {
+        return Ok(None);
+    };
+    let alias_record = store
+        .symbol(alias)
+        .ok_or(SourceCheckError::Property(location))?;
+    if alias_record.name().as_utf8() != Some("DetailedHTMLProps") {
+        return Ok(None);
+    }
+    let namespace = store
+        .get_parent_of_symbol(alias)
+        .ok_or(SourceCheckError::Property(location))?;
+    let namespace_record = store
+        .symbol(namespace)
+        .ok_or(SourceCheckError::Property(location))?;
+    if namespace_record.name().as_utf8() != Some("React") {
+        return Ok(None);
+    }
+    let exports = namespace_record
+        .exports()
+        .and_then(|exports| store.symbol_table(exports))
+        .ok_or(SourceCheckError::Property(location))?;
+    let [class_reference, attributes_reference] = projection.types.as_slice() else {
+        return Err(SourceCheckError::Property(location));
+    };
+    let [attributes_argument, target_argument] = projection.alias_arguments.as_slice() else {
+        return Err(SourceCheckError::Property(location));
+    };
+    let reference = validate_direct_generic_reference(store, *class_reference)
+        .map_err(|_| SourceCheckError::Property(location))?;
+    let class = store
+        .type_payload(reference.target)
+        .and_then(super::type_records::TypeRecord::symbol)
+        .ok_or(SourceCheckError::Property(location))?;
+    let attributes = exports
+        .get_source("Attributes")
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .ok_or(SourceCheckError::Property(location))?;
+    let class_record = store
+        .symbol(class)
+        .ok_or(SourceCheckError::Property(location))?;
+    let attributes_record = store
+        .symbol(attributes)
+        .ok_or(SourceCheckError::Property(location))?;
+    let interface_flags = SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT;
+    if !alias_record.flags().contains(SymbolFlags::TYPE_ALIAS)
+        || alias_record
+            .flags()
+            .without(SymbolFlags::TYPE_ALIAS | SymbolFlags::TRANSIENT)
+            != SymbolFlags::NONE
+        || !namespace_record.flags().intersects(SymbolFlags::NAMESPACE)
+        || store.get_merged_symbol(alias) != Some(alias)
+        || exports
+            .get_source("DetailedHTMLProps")
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            != Some(alias)
+        || *attributes_reference != *attributes_argument
+        || reference.type_arguments.as_slice() != [*target_argument]
+        || !class_record.flags().contains(SymbolFlags::INTERFACE)
+        || class_record.flags().without(interface_flags) != SymbolFlags::NONE
+        || class_record.name().as_utf8() != Some("ClassAttributes")
+        || store.get_parent_of_symbol(class) != Some(namespace)
+        || exports
+            .get_source("ClassAttributes")
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            != Some(class)
+        || !attributes_record.flags().contains(SymbolFlags::INTERFACE)
+        || attributes_record.flags().without(interface_flags) != SymbolFlags::NONE
+        || attributes_record.check_flags() != CheckFlags::NONE
+        || attributes_record.name().as_utf8() != Some("Attributes")
+        || attributes_record
+            .declarations()
+            .is_none_or(<[NodeRef]>::is_empty)
+        || attributes_record.members().is_none()
+        || attributes_record.exports().is_some()
+        || store.get_parent_of_symbol(attributes) != Some(namespace)
+    {
+        return Err(SourceCheckError::Property(location));
+    }
+    validate_react_class_attributes_heritage(store, host, class, attributes, location)?;
+    Ok(Some(attributes))
+}
+
+fn validate_react_class_attributes_heritage(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    class: SemanticSymbolId,
+    attributes: SemanticSymbolId,
+    location: NodeRef,
+) -> Result<(), SourceCheckError> {
+    let owner = store
+        .symbol(class)
+        .ok_or(SourceCheckError::Property(location))?;
+    let [declaration] = owner
+        .declarations()
+        .ok_or(SourceCheckError::Property(location))?
+    else {
+        return Err(SourceCheckError::Property(location));
+    };
+    let declaration = *declaration;
+    let record = host
+        .node(declaration)
+        .ok_or(SourceCheckError::Property(declaration))?;
+    let NodeData::InterfaceDeclaration(interface) = &record.data else {
+        return Err(SourceCheckError::Property(declaration));
+    };
+    let clauses = interface
+        .heritage_clauses
+        .as_ref()
+        .ok_or(SourceCheckError::Property(declaration))?;
+    let [clause] = clauses.nodes.as_slice() else {
+        return Err(SourceCheckError::Property(declaration));
+    };
+    let clause = child_ref(declaration, *clause);
+    let clause_record = host
+        .node(clause)
+        .ok_or(SourceCheckError::Property(clause))?;
+    let NodeData::HeritageClause(heritage) = &clause_record.data else {
+        return Err(SourceCheckError::Property(clause));
+    };
+    let [base] = heritage.types.nodes.as_slice() else {
+        return Err(SourceCheckError::Property(clause));
+    };
+    let base = child_ref(clause, *base);
+    let base_record = host.node(base).ok_or(SourceCheckError::Property(base))?;
+    let NodeData::ExpressionWithTypeArguments(expression) = &base_record.data else {
+        return Err(SourceCheckError::Property(base));
+    };
+    let name = child_ref(base, expression.expression);
+    let name_record = host.node(name).ok_or(SourceCheckError::Property(name))?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(SourceCheckError::Property(name));
+    };
+    if record.kind != SyntaxKind::InterfaceDeclaration
+        || record.flags.0 != 0
+        || !host.symbol_matches(store, declaration, class)
+        || clauses.has_trailing_comma
+        || clause_record.kind != SyntaxKind::HeritageClause
+        || clause_record.flags.0 != 0
+        || clause_record.parent != Some(declaration.node)
+        || heritage.token != SyntaxKind::ExtendsKeyword
+        || heritage.facts != 0
+        || heritage.types.has_trailing_comma
+        || base_record.kind != SyntaxKind::ExpressionWithTypeArguments
+        || base_record.flags.0 != 0
+        || base_record.parent != Some(clause.node)
+        || expression.type_arguments.is_some()
+        || expression.facts != 0
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(base.node)
+        || identifier.flow_node.is_some()
+        || identifier.text != "Attributes"
+    {
+        return Err(SourceCheckError::Property(declaration));
+    }
+    let resolved = host
+        .name_resolver_host(store)?
+        .resolve_entity_name(name, SymbolFlags::TYPE)
+        .map_err(super::DeclaredTypeError::from)?
+        .and_then(|symbol| store.get_merged_symbol(symbol));
+    if resolved != Some(attributes) {
+        return Err(SourceCheckError::Property(declaration));
+    }
+    Ok(())
+}
+
+fn validate_react_attribute_declaration(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    attributes: SemanticSymbolId,
+    declaration: NodeRef,
+    expected_name: &str,
+    expected_optional: bool,
+) -> Result<NodeRef, SourceCheckError> {
+    let record = host
+        .node(declaration)
+        .ok_or(SourceCheckError::Property(declaration))?;
+    let (name, annotation, postfix) = match &record.data {
+        NodeData::PropertyDeclaration(property)
+            if record.kind == SyntaxKind::PropertyDeclaration
+                && property.initializer.is_none()
+                && property.symbol.is_none()
+                && property.facts == 0 =>
+        {
+            (
+                property.name,
+                property
+                    .type_
+                    .ok_or(SourceCheckError::Property(declaration))?,
+                property.postfix_token,
+            )
+        }
+        NodeData::PropertySignatureDeclaration(property)
+            if record.kind == SyntaxKind::PropertySignature && property.symbol.is_none() =>
+        {
+            (property.name, property.type_, property.postfix_token)
+        }
+        _ => return Err(SourceCheckError::Property(declaration)),
+    };
+    let interface = record
+        .parent
+        .map(|parent| child_ref(declaration, parent))
+        .ok_or(SourceCheckError::Property(declaration))?;
+    let interface_record = host
+        .node(interface)
+        .ok_or(SourceCheckError::Property(interface))?;
+    let NodeData::InterfaceDeclaration(interface_data) = &interface_record.data else {
+        return Err(SourceCheckError::Property(interface));
+    };
+    let name = child_ref(declaration, name);
+    let (actual_name, _) = jsx_namespace_property_name(host, declaration, name)?;
+    let annotation = child_ref(declaration, annotation);
+    let annotation_record = host
+        .node(annotation)
+        .ok_or(SourceCheckError::Property(annotation))?;
+    if record.flags.0 != 0
+        || interface_record.kind != SyntaxKind::InterfaceDeclaration
+        || !host.symbol_matches(store, interface, attributes)
+        || !interface_data.members.nodes.contains(&declaration.node)
+        || actual_name != expected_name
+        || annotation_record.parent != Some(declaration.node)
+        || postfix.is_some() != expected_optional
+    {
+        return Err(SourceCheckError::Property(declaration));
+    }
+    if let Some(postfix) = postfix {
+        let postfix = child_ref(declaration, postfix);
+        let token = host
+            .node(postfix)
+            .ok_or(SourceCheckError::Property(postfix))?;
+        if token.kind != SyntaxKind::QuestionToken
+            || token.flags.0 != 0
+            || token.parent != Some(declaration.node)
+        {
+            return Err(SourceCheckError::Property(postfix));
+        }
+    }
+    Ok(annotation)
 }
 
 fn matching_attribute_index_value_type(
@@ -6872,6 +7491,401 @@ mod runtime_tests {
             unreachable!("the object property name owns its assignment diagnostic")
         };
         assert_eq!(name.text, "count");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep merged React ownership and lazy cache checks together.
+    fn augmented_react_attributes_resolve_only_the_requested_namespaced_property() {
+        let dom = parse_source_file(concat!(
+            "interface HTMLDivElement { align: string; } ",
+            "interface HTMLImageElement { src: string; }",
+        ));
+        let react = parse_source_file(concat!(
+            "declare module 'react' { ",
+            "export = React; ",
+            "namespace React { ",
+            "interface DOMAttributes<T> {} ",
+            "interface HTMLAttributes<T> extends DOMAttributes<T> { id?: string; } ",
+            "interface HTMLAttributes<T> extends DOMAttributes<T> { title?: string; } ",
+            "interface ImgHTMLAttributes<T> extends HTMLAttributes<T> { ",
+            "src?: string; alt?: MissingImage; ",
+            "} ",
+            "interface Attributes { key?: MissingKey; } ",
+            "interface ClassAttributes<T> extends Attributes { ref?: T; } ",
+            "type DetailedHTMLProps<E extends HTMLAttributes<T>, T> = ClassAttributes<T> & E; ",
+            "} ",
+            "global { namespace JSX { interface IntrinsicElements { ",
+            "div: React.DetailedHTMLProps<React.HTMLAttributes<HTMLDivElement>, HTMLDivElement>; ",
+            "img: React.DetailedHTMLProps<React.ImgHTMLAttributes<HTMLImageElement>, HTMLImageElement>; ",
+            "} } } ",
+            "}",
+        ));
+        let consumer = parse_jsx_source_file(concat!(
+            "declare module 'react' { interface Attributes { ",
+            "[key: `do-${string}`]: MissingIndex; ",
+            "'ns:thing'?: string; ",
+            "} } ",
+            "export const tag = <div ns:thing='a' />; ",
+            "export const image = <img src='./image.png' />; ",
+            "export const inherited = <img id='photo' />; ",
+            "export const invalid = <img src={1} />;",
+        ));
+        let dom_file = FileId::new(8_180);
+        let react_file = FileId::new(8_181);
+        let consumer_file = FileId::new(8_182);
+        let mut binder = CanonicalBinder::new();
+        for (parsed, file, declaration, default_library, module_state) in [
+            (&dom, dom_file, true, true, CanonicalModuleState::Script),
+            (
+                &react,
+                react_file,
+                true,
+                false,
+                CanonicalModuleState::Script,
+            ),
+            (
+                &consumer,
+                consumer_file,
+                false,
+                false,
+                CanonicalModuleState::External,
+            ),
+        ] {
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new_with_default_library(
+                        EscapedName::source(format!("\"/react-jsx-{}.ts\"", file.index())),
+                        CanonicalSourceLanguage::TypeScript,
+                        declaration,
+                        default_library,
+                        module_state,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let (symbols, mut files) = binder.finish().try_into_parts().unwrap();
+        let dom_bound = files.remove(&dom_file).unwrap();
+        let react_bound = files.remove(&react_file).unwrap();
+        let consumer_bound = files.remove(&consumer_file).unwrap();
+        let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
+        for (parsed, file) in [
+            (&dom, dom_file),
+            (&react, react_file),
+            (&consumer, consumer_file),
+        ] {
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .unwrap();
+        }
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        let globals = store.intrinsic_bootstrap().unwrap().globals;
+        for bound in [&dom_bound, &react_bound] {
+            let locals = bound.locals(bound.source_file()).unwrap();
+            let symbols = store
+                .symbol_table(locals)
+                .unwrap()
+                .iter()
+                .map(|(_, symbol)| symbol)
+                .collect::<Vec<_>>();
+            for symbol in symbols {
+                store.merge_global_symbol(globals, symbol).unwrap();
+            }
+        }
+        for augmentation in react_bound.module_augmentations() {
+            let name = augmentation.name();
+            let declaration = react
+                .arena
+                .get(name.node)
+                .and_then(|record| record.parent)
+                .map(|node| NodeRef::new(name.arena, name.file, node))
+                .unwrap();
+            let NodeData::ModuleDeclaration(module) =
+                &react.arena.get(declaration.node).unwrap().data
+            else {
+                unreachable!("the React fixture has a module augmentation")
+            };
+            if module.keyword == SyntaxKind::GlobalKeyword {
+                let symbol = react_bound.symbol(declaration).unwrap();
+                let exports = store.symbol(symbol).unwrap().exports().unwrap();
+                store
+                    .merge_symbol_table(globals, exports, false, None)
+                    .unwrap();
+            }
+        }
+        let react_namespace = react
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::ModuleDeclaration(module) = &record.data else {
+                    return None;
+                };
+                matches!(
+                    react.arena.get(module.name).map(|record| &record.data),
+                    Some(NodeData::Identifier(name)) if name.text == "React"
+                )
+                .then_some(NodeRef::new(react.arena.id(), react_file, node))
+                .and_then(|declaration| react_bound.symbol(declaration))
+            })
+            .unwrap();
+        let augmentation = consumer
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                matches!(&record.data, NodeData::ModuleDeclaration(_))
+                    .then_some(NodeRef::new(consumer.arena.id(), consumer_file, node))
+                    .and_then(|declaration| consumer_bound.symbol(declaration))
+            })
+            .unwrap();
+        let react_namespace = store
+            .merge_symbol(react_namespace, augmentation, false)
+            .unwrap();
+        let react_exports = store.symbol(react_namespace).unwrap().exports().unwrap();
+        let attributes = store
+            .symbol_table(react_exports)
+            .and_then(|exports| exports.get_source("Attributes"))
+            .unwrap();
+        assert!(
+            store
+                .symbol(attributes)
+                .unwrap()
+                .flags()
+                .contains(SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT)
+        );
+        let attribute_members = store.symbol(attributes).unwrap().members().unwrap();
+        let key = store
+            .symbol_table(attribute_members)
+            .and_then(|members| members.get_source("key"))
+            .unwrap();
+        let namespaced = store
+            .symbol_table(attribute_members)
+            .and_then(|members| members.get_source("ns:thing"))
+            .unwrap();
+        let class = store
+            .symbol_table(react_exports)
+            .and_then(|exports| exports.get_source("ClassAttributes"))
+            .unwrap();
+        let html = store
+            .symbol_table(react_exports)
+            .and_then(|exports| exports.get_source("HTMLAttributes"))
+            .unwrap();
+        let class_members = store.symbol(class).unwrap().members().unwrap();
+        let reference = store
+            .symbol_table(class_members)
+            .and_then(|members| members.get_source("ref"))
+            .unwrap();
+        let html_members = store.symbol(html).unwrap().members().unwrap();
+        let html_properties = ["id", "title"].map(|name| {
+            store
+                .symbol_table(html_members)
+                .and_then(|members| members.get_source(name))
+                .unwrap()
+        });
+        let image_attributes = store
+            .symbol_table(react_exports)
+            .and_then(|exports| exports.get_source("ImgHTMLAttributes"))
+            .unwrap();
+        let image_members = store.symbol(image_attributes).unwrap().members().unwrap();
+        let image_properties = ["src", "alt"].map(|name| {
+            store
+                .symbol_table(image_members)
+                .and_then(|members| members.get_source(name))
+                .unwrap()
+        });
+        let template = consumer
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::TemplateLiteralType).then_some(NodeRef::new(
+                    consumer.arena.id(),
+                    consumer_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let opening_named = |expected: &str| {
+            consumer
+                .arena
+                .iter()
+                .find_map(|(_, record)| {
+                    let NodeData::VariableDeclaration(variable) = &record.data else {
+                        return None;
+                    };
+                    let NodeData::Identifier(name) = &consumer.arena.get(variable.name)?.data
+                    else {
+                        return None;
+                    };
+                    (name.text == expected).then_some(NodeRef::new(
+                        consumer.arena.id(),
+                        consumer_file,
+                        variable.initializer?,
+                    ))
+                })
+                .unwrap()
+        };
+        let opening = opening_named("tag");
+        let image = opening_named("image");
+        let inherited = opening_named("inherited");
+        let invalid = opening_named("invalid");
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&dom.arena, &dom_bound),
+                (&react.arena, &react_bound),
+                (&consumer.arena, &consumer_bound),
+            ],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        store
+            .check_jsx_element(
+                &host,
+                opening,
+                CanonicalCheckerOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap();
+
+        assert!(diagnostics.is_empty());
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        assert_eq!(
+            store.value_symbol_links(namespaced),
+            Some(&ValueSymbolLinks {
+                resolved_type: Some(string),
+                ..ValueSymbolLinks::default()
+            }),
+        );
+        for property in [key, reference, html_properties[0], html_properties[1]] {
+            assert!(store.value_symbol_links(property).is_none());
+        }
+        assert!(store.type_node_links(template).is_none());
+        assert!(store.value_symbol_links(image_properties[0]).is_none());
+        assert!(store.value_symbol_links(image_properties[1]).is_none());
+
+        store
+            .check_jsx_element(
+                &host,
+                image,
+                CanonicalCheckerOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap();
+        assert!(diagnostics.is_empty());
+        assert_eq!(
+            store.value_symbol_links(image_properties[0]),
+            Some(&ValueSymbolLinks {
+                resolved_type: Some(string),
+                ..ValueSymbolLinks::default()
+            }),
+        );
+        for property in [
+            key,
+            reference,
+            html_properties[0],
+            html_properties[1],
+            image_properties[1],
+        ] {
+            assert!(store.value_symbol_links(property).is_none());
+        }
+        assert!(store.type_node_links(template).is_none());
+
+        store
+            .check_jsx_element(
+                &host,
+                inherited,
+                CanonicalCheckerOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap();
+        assert!(diagnostics.is_empty());
+        assert_eq!(
+            store.value_symbol_links(html_properties[0]),
+            Some(&ValueSymbolLinks {
+                resolved_type: Some(string),
+                ..ValueSymbolLinks::default()
+            }),
+        );
+        for property in [key, reference, html_properties[1], image_properties[1]] {
+            assert!(store.value_symbol_links(property).is_none());
+        }
+
+        store
+            .check_jsx_element(
+                &host,
+                invalid,
+                CanonicalCheckerOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics.as_slice()[0].diagnostic.code(), 2322);
+        assert_eq!(
+            diagnostics.as_slice()[0].diagnostic.render().unwrap(),
+            "Type 'number' is not assignable to type 'string'.",
+        );
+        let expected = store
+            .jsx_element_links(opening)
+            .and_then(|links| links.resolved_jsx_element_attributes_type)
+            .unwrap();
+        assert!(store.validate_deferred_intersection_type(expected).is_ok());
+        for symbol in [class, html, image_attributes] {
+            let type_ = store
+                .declared_type_links(symbol)
+                .and_then(|links| links.declared_type)
+                .unwrap();
+            let super::super::TypeData::Interface(interface) =
+                store.type_payload(type_).unwrap().data()
+            else {
+                panic!("React attributes must retain their generic interface identities")
+            };
+            assert!(!interface.declared_members_resolved);
+        }
+        let warm = (
+            store.type_len(),
+            store.symbol_len(),
+            store.signature_len(),
+            store.index_info_len(),
+            store.checker_link_allocated_lengths(),
+            diagnostics.as_slice().to_vec(),
+        );
+        for expression in [opening, image, inherited, invalid] {
+            store
+                .check_jsx_element(
+                    &host,
+                    expression,
+                    CanonicalCheckerOptions::default(),
+                    &mut diagnostics,
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            (
+                store.type_len(),
+                store.symbol_len(),
+                store.signature_len(),
+                store.index_info_len(),
+                store.checker_link_allocated_lengths(),
+                diagnostics.as_slice().to_vec(),
+            ),
+            warm,
+        );
+        assert_eq!(
+            store.insert_symbol(react_exports, EscapedName::source("Attributes"), class),
+            Some(Some(attributes)),
+        );
+        assert!(matches!(
+            deferred_react_class_attributes_base(&store, &host, expected, opening),
+            Err(SourceCheckError::Property(node)) if node == opening
+        ));
     }
 
     #[test]

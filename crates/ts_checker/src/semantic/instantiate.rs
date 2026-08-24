@@ -3,10 +3,10 @@
 //! This is the first exact slice of pinned `instantiateTypeWorker`. It covers
 //! primitive and literal leaves, direct type-parameter mapping, canonical
 //! Array/ReadonlyArray references under an explicit target capability, direct
-//! full-arity generic class/interface references, template literals, intrinsic
-//! string mappings, and anonymous origin-free unions. Other object, signature,
-//! alias, and origin instantiation needs its owning caches and is rejected
-//! instead of identity.
+//! full-arity generic class/interface references, authenticated deferred
+//! intersections, template literals, intrinsic string mappings, and anonymous
+//! origin-free unions. Other object, signature, alias, and origin
+//! instantiation needs its owning caches and is rejected instead of identity.
 
 use std::collections::{HashMap, HashSet};
 
@@ -14,6 +14,7 @@ use super::{
     TypeAliasId, TypeId, TypeMapperId,
     array_types::{ArrayTypeError, CanonicalArrayTargets},
     bootstrap::LiteralTypeCacheError,
+    intersection_types::{DeferredIntersectionTypeProjection, IntersectionTypeError},
     mapper::{CanonicalTypeMapperStore, TypeMapperApplication},
     reference_types::{
         DirectGenericReferenceError, create_direct_generic_reference,
@@ -586,9 +587,16 @@ fn could_contain_installed_type_variables_worker(
     seen: &mut HashSet<TypeId>,
 ) -> Result<bool, InstantiationError> {
     if !seen.insert(type_) {
-        // The installed domain cannot construct a recursive union/array graph,
-        // but fail conservatively if a future producer exposes one.
-        return Ok(true);
+        // Deferred intersections must reject recursive graphs before any
+        // mapped constituent can allocate a new generic reference.
+        return if matches!(
+            store.type_payload(type_).map(TypeRecord::data),
+            Some(TypeData::Intersection(_))
+        ) {
+            Err(InstantiationError::UnsupportedType(type_))
+        } else {
+            Ok(true)
+        };
     }
     let record = store
         .type_payload(type_)
@@ -655,6 +663,21 @@ fn could_contain_installed_type_variables_worker(
                 contains = could_contain_installed_type_variables_worker(
                     store,
                     origin,
+                    array_targets,
+                    seen,
+                )?;
+            }
+            Ok(contains)
+        }
+        TypeData::Intersection(_) => {
+            let projection = store
+                .validate_deferred_intersection_type(type_)
+                .map_err(|error| deferred_intersection_error(type_, error))?;
+            let mut contains = false;
+            for constituent in projection.types.iter().chain(&projection.alias_arguments) {
+                contains |= could_contain_installed_type_variables_worker(
+                    store,
+                    *constituent,
                     array_targets,
                     seen,
                 )?;
@@ -1267,6 +1290,7 @@ enum InstantiationWork {
         has_origin: bool,
         constituents: Vec<TypeId>,
     },
+    Intersection(DeferredIntersectionTypeProjection),
     TypeReference,
     Unsupported,
 }
@@ -1302,6 +1326,11 @@ fn instantiate_type_worker(
                 has_origin: data.origin.is_some(),
                 constituents: data.union.types.clone(),
             },
+            TypeData::Intersection(_) => InstantiationWork::Intersection(
+                store
+                    .validate_deferred_intersection_type(type_)
+                    .map_err(|error| deferred_intersection_error(type_, error))?,
+            ),
             TypeData::TypeReference(_) => InstantiationWork::TypeReference,
             TypeData::Interface(interface)
                 if interface
@@ -1351,6 +1380,9 @@ fn instantiate_type_worker(
                 return Err(InstantiationError::UnsupportedUnionOrigin(type_));
             }
             instantiate_union(store, type_, &constituents, mapping, array_targets, session)
+        }
+        InstantiationWork::Intersection(projection) => {
+            instantiate_intersection(store, type_, &projection, mapping, array_targets, session)
         }
         InstantiationWork::TypeReference => {
             instantiate_reference(store, type_, mapping, array_targets, session)
@@ -1443,6 +1475,58 @@ fn instantiate_reference(
         ObjectFlags::NONE,
     )
     .map_err(Into::into)
+}
+
+fn instantiate_intersection(
+    store: &mut CanonicalTypeMapperStore,
+    source: TypeId,
+    projection: &DeferredIntersectionTypeProjection,
+    mapping: InstantiationMapping<'_>,
+    array_targets: Option<CanonicalArrayTargets>,
+    session: &mut InstantiationSession,
+) -> Result<TypeId, InstantiationError> {
+    let mut constituents = Vec::with_capacity(projection.types.len());
+    let mut changed = false;
+    for constituent in &projection.types {
+        let instantiated = instantiate_type_with_alias(
+            store,
+            *constituent,
+            mapping,
+            array_targets,
+            None,
+            session,
+        )?;
+        changed |= instantiated != *constituent;
+        constituents.push(instantiated);
+    }
+
+    let mut alias_arguments = Vec::with_capacity(projection.alias_arguments.len());
+    for argument in &projection.alias_arguments {
+        let instantiated =
+            instantiate_type_with_alias(store, *argument, mapping, array_targets, None, session)?;
+        changed |= instantiated != *argument;
+        alias_arguments.push(instantiated);
+    }
+
+    if !changed {
+        return Ok(source);
+    }
+
+    let alias = projection
+        .alias_symbol
+        .map(|symbol| (symbol, alias_arguments.as_slice()));
+    store
+        .canonical_deferred_intersection_type(&constituents, alias)
+        .map_err(|error| deferred_intersection_error(source, error))
+}
+
+fn deferred_intersection_error(source: TypeId, error: IntersectionTypeError) -> InstantiationError {
+    match error {
+        IntersectionTypeError::Capacity => {
+            InstantiationError::Union(LiteralTypeCacheError::Capacity)
+        }
+        _ => InstantiationError::UnsupportedType(source),
+    }
 }
 
 fn apply_mapping(
@@ -1621,16 +1705,182 @@ pub(super) fn canonical_anonymous_union(
 mod tests {
     use super::*;
     use crate::semantic::{
-        DeclaredTypeLinks, IntrinsicBootstrapOptions, SemanticStore,
-        declared::type_list_key,
+        DeclaredTypeHost, DeclaredTypeLinks, IntrinsicBootstrapOptions, SemanticStore,
+        declared::{get_declared_class_interface_or_type_parameter, type_list_key},
         mapper::TypeMapper,
         template_types::MAX_TEMPLATE_UNION_SIZE,
         type_records::{LiteralValue, TypeRecord},
         types::ObjectFlags,
     };
-    use ts_ast::{decode_js_string, encode_js_string};
-    use ts_binder::{EscapedName, SymbolData, SymbolFlags};
+    use ts_ast::{FileId, NodeData, NodeRef, decode_js_string, encode_js_string};
+    use ts_binder::{
+        CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
+        EscapedName, SymbolData, SymbolFlags,
+    };
     use ts_core::JsString;
+    use ts_parser::parse_source_file;
+
+    struct DeferredGenericIntersectionFixture {
+        store: CanonicalTypeMapperStore,
+        intersection: TypeId,
+        class_reference: TypeId,
+        attributes_reference: TypeId,
+        element: TypeId,
+        props: TypeId,
+        string: TypeId,
+        alias: SemanticSymbolId,
+    }
+
+    #[allow(clippy::too_many_lines)] // The fixture binds one complete generic alias graph.
+    fn deferred_generic_intersection_fixture() -> DeferredGenericIntersectionFixture {
+        let parsed = parse_source_file(concat!(
+            "interface ClassAttributes<T> {}\n",
+            "interface HTMLAttributes<T> {}\n",
+            "type DetailedHTMLProps<E, T> = ClassAttributes<T> & E;\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(8_551);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/deferred-intersection.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let (symbols, mut files) = binder.finish().try_into_parts().unwrap();
+        let bound = files.remove(&file).unwrap();
+        let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
+        store
+            .register_source_file(&parsed.arena, parsed.source_file, file)
+            .unwrap();
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        let locals = bound.locals(bound.source_file()).unwrap();
+        let class_symbol = store
+            .symbol_table(locals)
+            .unwrap()
+            .get_source("ClassAttributes")
+            .unwrap();
+        let attributes_symbol = store
+            .symbol_table(locals)
+            .unwrap()
+            .get_source("HTMLAttributes")
+            .unwrap();
+        let alias = store
+            .symbol_table(locals)
+            .unwrap()
+            .get_source("DetailedHTMLProps")
+            .unwrap();
+        let declaration = store.symbol(alias).unwrap().declarations().unwrap()[0];
+        let NodeData::TypeAliasDeclaration(alias_declaration) =
+            &parsed.arena.get(declaration.node).unwrap().data
+        else {
+            panic!("the deferred intersection fixture must bind its alias")
+        };
+        let [props_node, element_node] = alias_declaration
+            .type_parameters
+            .as_ref()
+            .unwrap()
+            .nodes
+            .as_slice()
+        else {
+            panic!("the deferred intersection fixture must bind E and T")
+        };
+        let props_symbol = bound
+            .symbol(NodeRef::new(parsed.arena.id(), file, *props_node))
+            .unwrap();
+        let element_symbol = bound
+            .symbol(NodeRef::new(parsed.arena.id(), file, *element_node))
+            .unwrap();
+        let host = DeclaredTypeHost::new([(&parsed.arena, &bound)]).unwrap();
+        let class_target = get_declared_class_interface_or_type_parameter(
+            &mut store,
+            &host,
+            class_symbol,
+            SymbolFlags::INTERFACE,
+        )
+        .unwrap()
+        .unwrap();
+        let attributes_target = get_declared_class_interface_or_type_parameter(
+            &mut store,
+            &host,
+            attributes_symbol,
+            SymbolFlags::INTERFACE,
+        )
+        .unwrap()
+        .unwrap();
+        let props = get_declared_class_interface_or_type_parameter(
+            &mut store,
+            &host,
+            props_symbol,
+            SymbolFlags::TYPE_PARAMETER,
+        )
+        .unwrap()
+        .unwrap();
+        let element = get_declared_class_interface_or_type_parameter(
+            &mut store,
+            &host,
+            element_symbol,
+            SymbolFlags::TYPE_PARAMETER,
+        )
+        .unwrap()
+        .unwrap();
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let class_reference = create_direct_generic_reference(
+            &mut store,
+            class_target,
+            &[element],
+            ObjectFlags::NONE,
+        )
+        .unwrap();
+        let attributes_reference = create_direct_generic_reference(
+            &mut store,
+            attributes_target,
+            &[string],
+            ObjectFlags::NONE,
+        )
+        .unwrap();
+        let intersection = store
+            .canonical_deferred_intersection_type(
+                &[class_reference, props],
+                Some((alias, &[props, element])),
+            )
+            .unwrap();
+        DeferredGenericIntersectionFixture {
+            store,
+            intersection,
+            class_reference,
+            attributes_reference,
+            element,
+            props,
+            string,
+            alias,
+        }
+    }
+
+    fn deferred_intersection_store_state(
+        store: &CanonicalTypeMapperStore,
+    ) -> (usize, usize, usize, usize, usize, [usize; 26]) {
+        (
+            store.type_len(),
+            store.type_alias_len(),
+            store.mapper_len(),
+            store.symbol_len(),
+            store.symbol_store().symbol_table_len(),
+            store.checker_link_allocated_lengths(),
+        )
+    }
 
     fn initialized_store() -> CanonicalTypeMapperStore {
         let mut store = SemanticStore::<TypeRecord, TypeMapper>::new();
@@ -1694,6 +1944,89 @@ mod tests {
 
         assert_eq!(instantiate_type(&mut store, parameter, mapper), Ok(number));
         assert_eq!(instantiate_type(&mut store, string, mapper), Ok(string));
+    }
+
+    #[test]
+    fn deferred_generic_intersections_substitute_constituents_and_alias_arguments_lazily() {
+        let mut fixture = deferred_generic_intersection_fixture();
+        let source = fixture.intersection;
+        let sources = [fixture.props, fixture.element];
+        let targets = [fixture.attributes_reference, fixture.string];
+
+        let instantiated =
+            instantiate_type_with_vector(&mut fixture.store, source, &sources, &targets).unwrap();
+
+        let projection = fixture
+            .store
+            .validate_deferred_intersection_type(instantiated)
+            .unwrap();
+        assert_eq!(projection.alias_symbol, Some(fixture.alias));
+        assert_eq!(projection.alias_arguments, targets);
+        assert_eq!(projection.types[1], fixture.attributes_reference);
+        assert_eq!(
+            validate_direct_generic_reference(&fixture.store, projection.types[0])
+                .unwrap()
+                .type_arguments,
+            [fixture.string],
+        );
+        let record = fixture.store.type_payload(instantiated).unwrap();
+        assert!(
+            !record
+                .object_flags()
+                .contains(ObjectFlags::MEMBERS_RESOLVED)
+        );
+        assert!(record.data().structured().unwrap().members.is_none());
+
+        let warm = deferred_intersection_store_state(&fixture.store);
+        assert_eq!(
+            instantiate_type_with_vector(&mut fixture.store, source, &sources, &targets),
+            Ok(instantiated),
+        );
+        assert_eq!(deferred_intersection_store_state(&fixture.store), warm);
+    }
+
+    #[test]
+    fn unchanged_deferred_generic_intersections_reuse_their_original_identity() {
+        let mut fixture = deferred_generic_intersection_fixture();
+        let source = fixture.intersection;
+        let arguments = [fixture.props, fixture.element];
+        let before = deferred_intersection_store_state(&fixture.store);
+
+        assert_eq!(
+            instantiate_type_with_vector(&mut fixture.store, source, &arguments, &arguments),
+            Ok(source),
+        );
+        assert_eq!(deferred_intersection_store_state(&fixture.store), before);
+    }
+
+    #[test]
+    fn forged_deferred_generic_intersections_fail_before_semantic_writes() {
+        for forge_alias in [false, true] {
+            let mut fixture = deferred_generic_intersection_fixture();
+            let source = fixture.intersection;
+            let sources = [fixture.props, fixture.element];
+            let targets = [fixture.attributes_reference, fixture.string];
+            if forge_alias {
+                let identity = fixture.store.type_payload(source).unwrap().alias().unwrap();
+                assert!(fixture.store.set_type_alias_arguments(
+                    identity,
+                    Some(vec![fixture.element, fixture.props]),
+                ));
+            } else {
+                assert!(fixture.store.set_type_reference_resolution(
+                    fixture.class_reference,
+                    None,
+                    Some(vec![fixture.string]),
+                ));
+            }
+            let before = deferred_intersection_store_state(&fixture.store);
+
+            assert_eq!(
+                instantiate_type_with_vector(&mut fixture.store, source, &sources, &targets),
+                Err(InstantiationError::UnsupportedType(source)),
+            );
+            assert_eq!(deferred_intersection_store_state(&fixture.store), before);
+        }
     }
 
     #[test]

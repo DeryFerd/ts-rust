@@ -1,7 +1,8 @@
 //! Exact syntax and symbol plan for the first interface-heritage slice.
 //!
 //! This module admits one or two nongeneric interface bases, including merged
-//! declarations, authenticated namespace exports, and bounded base chains.
+//! declarations, authenticated namespace exports, bounded base chains, and
+//! merged default-library DOM interface/value identities.
 //! It also authenticates the exact `Record<string, any>` mapped-alias base.
 //! Every base is resolved before publication so member construction retains
 //! its declaration identity and, for mapped bases, its source type arguments.
@@ -10,17 +11,18 @@ use std::collections::HashSet;
 
 use ts_ast::{NodeData, NodeList, NodeRef, SyntaxKind};
 use ts_binder::{
-    CanonicalNameResolver, CanonicalResolutionLocation, SemanticSymbolId, SymbolFlags,
+    CanonicalNameResolver, CanonicalResolutionLocation, CheckFlags, SemanticSymbolId, SymbolFlags,
 };
 
 use super::{
-    CanonicalTypeMapperStore, DeclaredTypeHost, declared::preflight_node,
-    mapped_types::plan_mapped_type_declaration,
+    CanonicalTypeMapperStore, DeclaredTypeHost, TypeData, declared::preflight_node,
+    mapped_types::plan_mapped_type_declaration, types::ObjectFlags,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum DirectInterfaceBaseKind {
     Interface,
+    DefaultLibraryInterface,
     RecordMappedAlias,
 }
 
@@ -247,6 +249,17 @@ fn plan_direct_interface_heritage_inner(
             continue;
         }
         if symbol_record.flags() != SymbolFlags::INTERFACE {
+            if authenticate_default_library_interface_base(store, host, symbol, base_declarations)?
+            {
+                bases.push(DirectInterfaceBasePlan {
+                    node,
+                    expression,
+                    symbol,
+                    kind: DirectInterfaceBaseKind::DefaultLibraryInterface,
+                    type_arguments,
+                });
+                continue;
+            }
             return Err(DirectInterfaceHeritageError::Unsupported {
                 node: expression,
                 kind: expression_record.kind,
@@ -314,6 +327,203 @@ fn plan_direct_interface_heritage_inner(
     }
 
     Ok(DirectInterfaceHeritagePlan { clause, bases })
+}
+
+fn authenticate_default_library_interface_base(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+    declarations: &[NodeRef],
+) -> Result<bool, DirectInterfaceHeritageError> {
+    let owner = store
+        .symbol(symbol)
+        .ok_or(DirectInterfaceHeritageError::Invalid)?;
+    let Some(name) = owner.name().as_utf8() else {
+        return Ok(false);
+    };
+    let flags = owner.flags().without(SymbolFlags::TRANSIENT);
+    let global = store
+        .intrinsic_bootstrap()
+        .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+        .and_then(|globals| globals.get(owner.name()))
+        .and_then(|global| store.get_merged_symbol(global));
+    if !(name.starts_with("HTML") || name.starts_with("SVG"))
+        || !name.ends_with("Element")
+        || flags != SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE
+        || owner.check_flags() != CheckFlags::NONE
+        || owner.parent().is_some()
+        || owner.exports().is_some()
+        || owner.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || global != Some(symbol)
+    {
+        return Ok(false);
+    }
+
+    let mut seen = HashSet::with_capacity(declarations.len());
+    let mut has_interface = false;
+    let mut value_declaration = None;
+    for &declaration in declarations {
+        let bound = host
+            .bound_file(declaration)
+            .ok_or(DirectInterfaceHeritageError::Invalid)?;
+        let Some(facts) = bound.source_facts() else {
+            return Err(DirectInterfaceHeritageError::Invalid);
+        };
+        let record = preflight_node(store, host, declaration)
+            .map_err(|_| DirectInterfaceHeritageError::Invalid)?;
+        if !seen.insert(declaration)
+            || !facts.is_default_library()
+            || !facts.is_declaration_file()
+            || facts.is_javascript_file()
+            || facts.is_external_or_common_js_module()
+            || !host.symbol_matches(store, declaration, symbol)
+        {
+            return Ok(false);
+        }
+
+        let declaration_name = match &record.data {
+            NodeData::InterfaceDeclaration(interface)
+                if record.kind == SyntaxKind::InterfaceDeclaration
+                    && record.flags.0 == 0
+                    && record.parent == Some(bound.source_file().node)
+                    && interface.type_parameters.is_none()
+                    && interface.flow_node.is_none()
+                    && interface.local_symbol.is_none()
+                    && interface.symbol.is_none()
+                    && !interface.members.has_trailing_comma =>
+            {
+                has_interface = true;
+                interface.name
+            }
+            NodeData::VariableDeclaration(variable)
+                if record.kind == SyntaxKind::VariableDeclaration
+                    && record.flags.0 == 0
+                    && variable.initializer.is_none()
+                    && variable.exclamation_token.is_none()
+                    && variable.local_symbol.is_none()
+                    && variable.symbol.is_none()
+                    && variable.facts == 0
+                    && value_declaration.replace(declaration).is_none() =>
+            {
+                if !authenticated_default_library_value_declaration(
+                    store,
+                    host,
+                    declaration,
+                    bound.source_file(),
+                )? {
+                    return Ok(false);
+                }
+                variable.name
+            }
+            _ => return Ok(false),
+        };
+        let declaration_name = NodeRef::new(declaration.arena, declaration.file, declaration_name);
+        let declaration_name_record = preflight_node(store, host, declaration_name)
+            .map_err(|_| DirectInterfaceHeritageError::Invalid)?;
+        if declaration_name_record.kind != SyntaxKind::Identifier
+            || declaration_name_record.flags.0 != 0
+            || declaration_name_record.parent != Some(declaration.node)
+            || !matches!(
+                &declaration_name_record.data,
+                NodeData::Identifier(identifier)
+                    if identifier.flow_node.is_none() && identifier.text == name
+            )
+        {
+            return Ok(false);
+        }
+    }
+    if !has_interface
+        || value_declaration.is_none()
+        || owner.value_declaration() != value_declaration
+    {
+        return Ok(false);
+    }
+
+    if let Some(links) = store.declared_type_links(symbol) {
+        let Some(type_) = links.declared_type else {
+            return Ok(false);
+        };
+        let Some(record) = store.type_payload(type_) else {
+            return Ok(false);
+        };
+        let TypeData::Interface(interface) = record.data() else {
+            return Ok(false);
+        };
+        if !record.object_flags().contains(ObjectFlags::INTERFACE)
+            || record.object_flags().contains(ObjectFlags::CLASS)
+            || record.symbol() != Some(symbol)
+            || record.alias().is_some()
+            || interface.outer_type_parameter_count != 0
+            || interface
+                .reference
+                .resolved_type_arguments
+                .as_ref()
+                .is_some_and(|arguments| !arguments.is_empty())
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn authenticated_default_library_value_declaration(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    source: NodeRef,
+) -> Result<bool, DirectInterfaceHeritageError> {
+    let record = preflight_node(store, host, declaration)
+        .map_err(|_| DirectInterfaceHeritageError::Invalid)?;
+    let Some(list) = record
+        .parent
+        .map(|parent| NodeRef::new(declaration.arena, declaration.file, parent))
+    else {
+        return Ok(false);
+    };
+    let list_record =
+        preflight_node(store, host, list).map_err(|_| DirectInterfaceHeritageError::Invalid)?;
+    let NodeData::VariableDeclarationList(variables) = &list_record.data else {
+        return Ok(false);
+    };
+    let Some(statement) = list_record
+        .parent
+        .map(|parent| NodeRef::new(list.arena, list.file, parent))
+    else {
+        return Ok(false);
+    };
+    let statement_record = preflight_node(store, host, statement)
+        .map_err(|_| DirectInterfaceHeritageError::Invalid)?;
+    let NodeData::VariableStatement(variable_statement) = &statement_record.data else {
+        return Ok(false);
+    };
+    let Some(modifiers) = variable_statement.modifiers.as_ref() else {
+        return Ok(false);
+    };
+    let [modifier] = modifiers.list.nodes.as_slice() else {
+        return Ok(false);
+    };
+    let modifier = NodeRef::new(statement.arena, statement.file, *modifier);
+    let modifier_record =
+        preflight_node(store, host, modifier).map_err(|_| DirectInterfaceHeritageError::Invalid)?;
+    Ok(list_record.kind == SyntaxKind::VariableDeclarationList
+        && list_record.flags.0 == 0
+        && variables
+            .declarations
+            .nodes
+            .iter()
+            .filter(|candidate| **candidate == declaration.node)
+            .count()
+            == 1
+        && statement_record.kind == SyntaxKind::VariableStatement
+        && statement_record.flags.0 == 0
+        && statement_record.parent == Some(source.node)
+        && variable_statement.declaration_list == list.node
+        && modifiers.flags.0 == 0
+        && !modifiers.list.has_trailing_comma
+        && modifier_record.kind == SyntaxKind::DeclareKeyword
+        && modifier_record.flags.0 == 0
+        && modifier_record.parent == Some(statement.node))
 }
 
 fn resolve_qualified_interface_base(
@@ -821,9 +1031,13 @@ mod tests {
         else {
             unreachable!("the declaration was selected by its interface payload")
         };
-        let (arena, bound) = context.file(file).unwrap();
+        let sources = context
+            .file_order()
+            .iter()
+            .map(|file| context.file(*file).unwrap())
+            .collect::<Vec<_>>();
         let host = DeclaredTypeHost::new_after_global_merge(
-            [(arena, bound)],
+            sources,
             GlobalMergeCompletion::for_test(context.options().name_resolution),
         )
         .unwrap();
@@ -834,6 +1048,211 @@ mod tests {
             interface_symbol(parsed, file, context, expected),
             interface.heritage_clauses.as_ref().unwrap(),
         )
+    }
+
+    fn default_library_heritage_context<'arena>(
+        library: &'arena ParseResult,
+        source: &'arena ParseResult,
+        default_library: bool,
+    ) -> (CanonicalCheckerContext<'arena>, FileId, FileId) {
+        let library_file = FileId::new(8_470);
+        let source_file = FileId::new(8_471);
+        let mut binder = CanonicalBinder::new();
+        for (parsed, file, is_default_library) in [
+            (library, library_file, default_library),
+            (source, source_file, false),
+        ] {
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new_with_default_library(
+                        EscapedName::source(format!("\"/dom-heritage-{}.d.ts\"", file.index())),
+                        CanonicalSourceLanguage::TypeScript,
+                        true,
+                        is_default_library,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(library_file, &library.arena), (source_file, &source.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        (context, library_file, source_file)
+    }
+
+    #[test]
+    fn default_library_dom_interface_value_bases_remain_cold_and_canonical() {
+        let library = parse_source_file(concat!(
+            "interface DomRoot { root: string }\n",
+            "interface DomExtra {}\n",
+            "interface DomMore {}\n",
+            "interface HTMLElement extends DomRoot, DomExtra, DomMore {\n",
+            "  addEventListener(value: string): void;\n",
+            "}\n",
+            "declare var HTMLElement: unknown;\n",
+        ));
+        let source = parse_source_file("interface HTMLWebViewElement extends HTMLElement {}\n");
+        assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let (mut context, library_file, source_file) =
+            default_library_heritage_context(&library, &source, true);
+        let base = interface_symbol(&library, library_file, &context, "HTMLElement");
+        let cold = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().symbol_store().symbol_table_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+
+        let planned = heritage_plan(&source, source_file, &context, "HTMLWebViewElement").unwrap();
+        let [inherited] = planned.bases.as_slice() else {
+            panic!("the default-library DOM interface must remain the sole direct base")
+        };
+        assert_eq!(inherited.symbol, base);
+        assert_eq!(
+            inherited.kind,
+            DirectInterfaceBaseKind::DefaultLibraryInterface
+        );
+        assert!(inherited.type_arguments.is_empty());
+        assert_eq!(
+            context.store().symbol(base).unwrap().flags(),
+            SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE
+        );
+        assert!(context.store().declared_type_links(base).is_none());
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().symbol_store().symbol_table_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            cold
+        );
+        assert_eq!(
+            heritage_plan(&source, source_file, &context, "HTMLWebViewElement").unwrap(),
+            planned
+        );
+
+        assert!(context.store_mut_for_test().set_symbol_flags(
+            base,
+            SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::TRANSIENT,
+            CheckFlags::NONE,
+        ));
+        let transient_state = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().symbol_store().symbol_table_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            heritage_plan(&source, source_file, &context, "HTMLWebViewElement").unwrap(),
+            planned
+        );
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().symbol_store().symbol_table_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            transient_state
+        );
+    }
+
+    #[test]
+    fn default_library_dom_interface_bases_reject_forged_provenance() {
+        let library = parse_source_file(concat!(
+            "interface HTMLElement { value: string }\n",
+            "declare var HTMLElement: unknown;\n",
+        ));
+        let source = parse_source_file("interface HTMLWebViewElement extends HTMLElement {}\n");
+        assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+
+        for corruption in 0..4 {
+            let (mut context, library_file, source_file) =
+                default_library_heritage_context(&library, &source, corruption != 0);
+            let base = interface_symbol(&library, library_file, &context, "HTMLElement");
+            match corruption {
+                0 => {}
+                1 => {
+                    assert!(context.store_mut_for_test().set_symbol_flags(
+                        base,
+                        SymbolFlags::INTERFACE
+                            | SymbolFlags::FUNCTION_SCOPED_VARIABLE
+                            | SymbolFlags::CLASS,
+                        CheckFlags::NONE,
+                    ));
+                }
+                2 => {
+                    let declarations = context
+                        .store()
+                        .symbol(base)
+                        .unwrap()
+                        .declarations()
+                        .unwrap()
+                        .to_vec();
+                    assert!(context.store_mut_for_test().set_symbol_declarations(
+                        base,
+                        Some(declarations),
+                        None,
+                    ));
+                }
+                3 => {
+                    let declarations = context
+                        .store()
+                        .symbol(base)
+                        .unwrap()
+                        .declarations()
+                        .unwrap()
+                        .iter()
+                        .copied()
+                        .filter(|declaration| {
+                            context.store().source_node_kind(*declaration)
+                                == Some(SyntaxKind::InterfaceDeclaration)
+                        })
+                        .collect::<Vec<_>>();
+                    assert!(context.store_mut_for_test().set_symbol_declarations(
+                        base,
+                        Some(declarations),
+                        None,
+                    ));
+                }
+                _ => unreachable!("the provenance matrix has four cases"),
+            }
+            let before = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().symbol_store().symbol_table_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+            assert!(
+                matches!(
+                    heritage_plan(&source, source_file, &context, "HTMLWebViewElement"),
+                    Err(DirectInterfaceHeritageError::Unsupported { .. })
+                ),
+                "corruption {corruption} accepted a forged DOM base"
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().symbol_store().symbol_table_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                before,
+                "corruption {corruption} published checker state"
+            );
+        }
     }
 
     #[test]

@@ -468,8 +468,12 @@ fn project_validated_direct_call(
     };
     let has_effective_rest = rest_element_type.is_some();
     if request.form == DirectCallForm::TaggedTemplate {
+        let first_parameter = callable.parameters.first().copied();
         let has_required_template_parameter = callable.min_argument_count != 0
-            && callable.parameters.first() == request.arguments.first();
+            && (first_parameter == request.arguments.first().copied()
+                || store
+                    .intrinsic_bootstrap()
+                    .is_some_and(|bootstrap| first_parameter == Some(bootstrap.any_type)));
         let has_canonical_any_rest = callable.parameters.is_empty()
             && callable.min_argument_count == 0
             && global_types.is_some_and(|global_types| {
@@ -892,7 +896,10 @@ mod tests {
     fn tagged_templates_reject_missing_or_forged_template_arguments() {
         let mut store = initialized_store();
         let callee = store.intrinsic_bootstrap().unwrap().any_function_type;
-        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let number = bootstrap.number_type;
+        let any = bootstrap.any_type;
+        let unknown = bootstrap.unknown_type;
         let unsupported = DirectCallError::Unsupported(DirectCallUnsupported::Form(
             DirectCallForm::TaggedTemplate,
         ));
@@ -941,6 +948,114 @@ mod tests {
         assert_eq!(
             project_validated_direct_call(&store, None, tagged, &optional_template),
             Err(unsupported)
+        );
+
+        let optional_any = callable(&mut store, SignatureFlags::NONE, &[any], 0, Some(number));
+        assert_eq!(
+            project_validated_direct_call(&store, None, tagged, &optional_any),
+            Err(unsupported)
+        );
+
+        let unknown_signature = callable(
+            &mut store,
+            SignatureFlags::NONE,
+            &[unknown],
+            1,
+            Some(number),
+        );
+        assert_eq!(
+            project_validated_direct_call(&store, None, tagged, &unknown_signature),
+            Err(unsupported)
+        );
+    }
+
+    #[test]
+    fn tagged_templates_accept_required_intrinsic_any_first_parameters() {
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} ",
+            "interface ReadonlyArray<T> {} ",
+            "interface TemplateStringsArray {}",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut context = array_context(&parsed);
+        let template = context_template_strings_array(&mut context);
+        let global_types = context.global_types().clone();
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let any = bootstrap.any_type;
+        let number = bootstrap.number_type;
+        let string = bootstrap.string_type;
+
+        let fixed = callable(
+            context.store_mut_for_test(),
+            SignatureFlags::NONE,
+            &[any],
+            1,
+            Some(string),
+        );
+        let fixed_arguments = [template];
+        let fixed_tag = DirectCallRequest {
+            form: DirectCallForm::TaggedTemplate,
+            ..request(fixed.owner, &fixed_arguments)
+        };
+        assert_eq!(
+            validate_tagged_template_argument(context.store(), fixed_tag),
+            Ok(())
+        );
+        let fixed_resolution =
+            project_validated_direct_call(context.store(), None, fixed_tag, &fixed).unwrap();
+        assert_eq!(
+            fixed_resolution.projection.argument_targets,
+            vec![DirectCallArgumentTarget {
+                index: 0,
+                argument_type: template,
+                parameter_type: any,
+            }],
+        );
+        assert_eq!(fixed_resolution.projection.minimum_argument_count, 1);
+        assert_eq!(fixed_resolution.projection.maximum_argument_count, 1);
+        assert!(!fixed_resolution.projection.has_effective_rest);
+
+        let with_rest = callable(
+            context.store_mut_for_test(),
+            SignatureFlags::HAS_REST_PARAMETER,
+            &[any, global_types.any_array_type],
+            1,
+            Some(string),
+        );
+        let arguments = [template, number];
+        let tagged = DirectCallRequest {
+            form: DirectCallForm::TaggedTemplate,
+            ..request(with_rest.owner, &arguments)
+        };
+        assert_eq!(
+            validate_tagged_template_argument(context.store(), tagged),
+            Ok(())
+        );
+        let resolution =
+            project_validated_direct_call(context.store(), Some(&global_types), tagged, &with_rest)
+                .unwrap();
+        assert_eq!(
+            resolution.applicability,
+            DirectCallApplicability::Applicable
+        );
+        assert_eq!(resolution.projection.minimum_argument_count, 1);
+        assert_eq!(resolution.projection.maximum_argument_count, 1);
+        assert!(resolution.projection.has_effective_rest);
+        assert_eq!(resolution.projection.return_type, string);
+        assert_eq!(
+            resolution.projection.argument_targets,
+            vec![
+                DirectCallArgumentTarget {
+                    index: 0,
+                    argument_type: template,
+                    parameter_type: any,
+                },
+                DirectCallArgumentTarget {
+                    index: 1,
+                    argument_type: number,
+                    parameter_type: any,
+                },
+            ],
         );
     }
 

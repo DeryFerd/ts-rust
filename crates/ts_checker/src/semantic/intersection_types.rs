@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+use ts_ast::SyntaxKind;
 use ts_binder::{
     CheckFlags, EscapedName, SemanticSymbolId, SymbolFlags, SymbolTableId,
     semantic::PreparedSymbolTable,
@@ -9,12 +10,14 @@ use super::{
     CanonicalTypeMapperStore, SignatureId, TypeId,
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
     callables::ValidatedSingleCallable,
+    declared::cached_ordinary_type_parameter_owner,
     instantiated_members::{GenericInterfaceMemberError, validate_generic_interface_members},
     links::ValueSymbolLinks,
     object_members::{
         DeclaredPropertyObjectValidation, resolved_declared_property_types,
         validate_resolved_declared_property_object,
     },
+    reference_types::validate_direct_generic_reference,
     type_records::{StructuredTypeData, TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
 };
@@ -23,6 +26,7 @@ use super::{
 pub(super) struct IntersectionTypeCacheKey {
     pub(super) types: Vec<TypeId>,
     pub(super) alias_symbol: Option<SemanticSymbolId>,
+    pub(super) alias_arguments: Vec<TypeId>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -42,6 +46,14 @@ pub(super) struct IntersectionTypeProjection {
     pub(super) members: SymbolTableId,
     pub(super) properties: Vec<SemanticSymbolId>,
     pub(super) reduced_to_never: bool,
+}
+
+/// Validated constituent and alias identity before intersection members resolve.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct DeferredIntersectionTypeProjection {
+    pub(super) types: Vec<TypeId>,
+    pub(super) alias_symbol: Option<SemanticSymbolId>,
+    pub(super) alias_arguments: Vec<TypeId>,
 }
 
 #[derive(Clone, Debug)]
@@ -125,10 +137,19 @@ impl CanonicalTypeMapperStore {
         let key = IntersectionTypeCacheKey {
             types,
             alias_symbol,
+            alias_arguments: Vec::new(),
         };
         if let Some(cached) = self.intersection_types.get(&key).copied() {
-            self.validate_intersection_type(cached)?;
-            return Ok(cached);
+            if self.type_payload(cached).is_some_and(|record| {
+                record
+                    .object_flags()
+                    .contains(ObjectFlags::MEMBERS_RESOLVED)
+            }) {
+                self.validate_intersection_type(cached)?;
+                return Ok(cached);
+            }
+            self.validate_deferred_intersection_type(cached)?;
+            return self.materialize_deferred_intersection_type(cached);
         }
 
         let expected = expected_properties(self, &key.types)?;
@@ -250,6 +271,409 @@ impl CanonicalTypeMapperStore {
                 .is_none()
         );
         Ok(intersection_type)
+    }
+
+    /// Interns an authenticated intersection without resolving constituent members.
+    pub(super) fn canonical_deferred_intersection_type(
+        &mut self,
+        input: &[TypeId],
+        alias: Option<(SemanticSymbolId, &[TypeId])>,
+    ) -> Result<TypeId, IntersectionTypeError> {
+        let unknown = self
+            .intrinsic_bootstrap()
+            .map(|bootstrap| bootstrap.unknown_type)
+            .ok_or(IntersectionTypeError::BootstrapUninitialized)?;
+        let (alias_symbol, alias_arguments) = match alias {
+            None => (None, Vec::new()),
+            Some((symbol, arguments)) => {
+                self.validate_deferred_intersection_alias(symbol, arguments)?;
+                (Some(symbol), arguments.to_vec())
+            }
+        };
+
+        let mut types = Vec::with_capacity(input.len());
+        for type_ in input {
+            self.append_deferred_intersection_constituent(*type_, &mut types)?;
+        }
+        if types.is_empty() {
+            return Ok(unknown);
+        }
+        if types.len() == 1 {
+            return Ok(types[0]);
+        }
+
+        let key = IntersectionTypeCacheKey {
+            types,
+            alias_symbol,
+            alias_arguments,
+        };
+        if let Some(cached) = self.intersection_types.get(&key).copied() {
+            if self.type_payload(cached).is_some_and(|record| {
+                record
+                    .object_flags()
+                    .contains(ObjectFlags::MEMBERS_RESOLVED)
+            }) {
+                self.validate_intersection_type(cached)?;
+            } else {
+                self.validate_deferred_intersection_type(cached)?;
+            }
+            return Ok(cached);
+        }
+
+        let object_flags = self.deferred_intersection_object_flags(&key.types)?;
+        let alias_count = usize::from(key.alias_symbol.is_some());
+        if !self.try_reserve_types(1)
+            || !self.try_reserve_type_aliases(alias_count)
+            || self.intersection_types.try_reserve(1).is_err()
+            || self.intersection_keys_by_type.try_reserve(1).is_err()
+        {
+            return Err(IntersectionTypeError::Capacity);
+        }
+
+        let intersection = self
+            .alloc_intersection_type(object_flags, key.types.clone())
+            .ok_or(IntersectionTypeError::Capacity)?;
+        if let Some(symbol) = key.alias_symbol {
+            let identity = self
+                .alloc_type_alias(Some(symbol))
+                .ok_or(IntersectionTypeError::InvalidAliasSymbol(symbol))?;
+            if !key.alias_arguments.is_empty()
+                && !self.set_type_alias_arguments(identity, Some(key.alias_arguments.clone()))
+            {
+                return Err(IntersectionTypeError::InvalidAliasSymbol(symbol));
+            }
+            if !self.set_type_alias(intersection, Some(identity)) {
+                return Err(IntersectionTypeError::InvalidAliasSymbol(symbol));
+            }
+        }
+        if self
+            .intersection_types
+            .insert(key.clone(), intersection)
+            .is_some()
+            || self
+                .intersection_keys_by_type
+                .insert(intersection, key)
+                .is_some()
+        {
+            return Err(IntersectionTypeError::InvalidCachedIntersection(
+                intersection,
+            ));
+        }
+        Ok(intersection)
+    }
+
+    /// Validates an interned intersection whose properties remain unresolved.
+    pub(super) fn validate_deferred_intersection_type(
+        &self,
+        type_: TypeId,
+    ) -> Result<DeferredIntersectionTypeProjection, IntersectionTypeError> {
+        let invalid = || IntersectionTypeError::InvalidCachedIntersection(type_);
+        let record = self.type_payload(type_).ok_or_else(invalid)?;
+        let TypeData::Intersection(intersection) = record.data() else {
+            return Err(invalid());
+        };
+        if record.flags() != TypeFlags::INTERSECTION
+            || record.symbol().is_some()
+            || intersection.intersection.types.len() < 2
+            || intersection.intersection.structured != StructuredTypeData::default()
+            || intersection.intersection.property_cache.is_some()
+            || intersection
+                .intersection
+                .property_cache_without_function_property_augment
+                .is_some()
+            || intersection.intersection.resolved_properties.is_some()
+            || intersection.resolved_apparent_type.is_some()
+            || intersection.unique_literal_filled_instantiation.is_some()
+        {
+            return Err(invalid());
+        }
+
+        let (alias_symbol, alias_arguments) = match record.alias() {
+            None => (None, Vec::new()),
+            Some(identity) => {
+                let identity = self.type_alias(identity).ok_or_else(invalid)?;
+                let symbol = identity.symbol().ok_or_else(invalid)?;
+                let arguments = identity.type_arguments().unwrap_or_default().to_vec();
+                self.validate_deferred_intersection_alias(symbol, &arguments)
+                    .map_err(|_| invalid())?;
+                (Some(symbol), arguments)
+            }
+        };
+        let key = IntersectionTypeCacheKey {
+            types: intersection.intersection.types.clone(),
+            alias_symbol,
+            alias_arguments: alias_arguments.clone(),
+        };
+        if self.intersection_types.get(&key) != Some(&type_)
+            || self.intersection_keys_by_type.get(&type_) != Some(&key)
+            || record.object_flags()
+                != self
+                    .deferred_intersection_object_flags(&key.types)
+                    .map_err(|_| invalid())?
+        {
+            return Err(invalid());
+        }
+
+        let mut validated = Vec::with_capacity(key.types.len());
+        for constituent in &key.types {
+            self.append_deferred_intersection_constituent(*constituent, &mut validated)
+                .map_err(|_| invalid())?;
+        }
+        if validated != key.types {
+            return Err(invalid());
+        }
+
+        Ok(DeferredIntersectionTypeProjection {
+            types: key.types,
+            alias_symbol,
+            alias_arguments,
+        })
+    }
+
+    fn validate_deferred_intersection_alias(
+        &self,
+        symbol: SemanticSymbolId,
+        arguments: &[TypeId],
+    ) -> Result<(), IntersectionTypeError> {
+        let owner = self
+            .symbol(symbol)
+            .ok_or(IntersectionTypeError::InvalidAliasSymbol(symbol))?;
+        let Some([declaration]) = owner.declarations() else {
+            return Err(IntersectionTypeError::InvalidAliasSymbol(symbol));
+        };
+        if !owner.flags().contains(SymbolFlags::TYPE_ALIAS)
+            || self.get_merged_symbol(symbol) != Some(symbol)
+            || self.source_node_kind(*declaration) != Some(SyntaxKind::TypeAliasDeclaration)
+            || arguments
+                .iter()
+                .any(|argument| self.type_payload(*argument).is_none())
+            || self
+                .type_alias_links(symbol)
+                .and_then(|links| links.type_parameters.as_deref())
+                .is_some_and(|parameters| parameters.len() != arguments.len())
+        {
+            return Err(IntersectionTypeError::InvalidAliasSymbol(symbol));
+        }
+        Ok(())
+    }
+
+    fn deferred_intersection_object_flags(
+        &self,
+        constituents: &[TypeId],
+    ) -> Result<ObjectFlags, IntersectionTypeError> {
+        constituents
+            .iter()
+            .try_fold(ObjectFlags::NONE, |flags, constituent| {
+                let record = self
+                    .type_payload(*constituent)
+                    .ok_or(IntersectionTypeError::MalformedConstituent(*constituent))?;
+                Ok(flags | record.object_flags() & ObjectFlags::PROPAGATING_FLAGS)
+            })
+    }
+
+    fn append_deferred_intersection_constituent(
+        &self,
+        type_: TypeId,
+        output: &mut Vec<TypeId>,
+    ) -> Result<(), IntersectionTypeError> {
+        let record = self
+            .type_payload(type_)
+            .ok_or(IntersectionTypeError::MalformedConstituent(type_))?;
+        match record.data() {
+            TypeData::Intersection(_) => {
+                let constituents = if record
+                    .object_flags()
+                    .contains(ObjectFlags::MEMBERS_RESOLVED)
+                {
+                    self.validate_intersection_type(type_)?.types
+                } else {
+                    self.validate_deferred_intersection_type(type_)?.types
+                };
+                for constituent in constituents {
+                    self.append_deferred_intersection_constituent(constituent, output)?;
+                }
+                return Ok(());
+            }
+            TypeData::TypeParameter(_) => {
+                let owner = cached_ordinary_type_parameter_owner(self, type_)
+                    .ok_or(IntersectionTypeError::MalformedConstituent(type_))?;
+                let symbol = self
+                    .symbol(owner)
+                    .ok_or(IntersectionTypeError::MalformedConstituent(type_))?;
+                let Some([declaration]) = symbol.declarations() else {
+                    return Err(IntersectionTypeError::MalformedConstituent(type_));
+                };
+                if self.get_merged_symbol(owner) != Some(owner)
+                    || self.source_node_kind(*declaration) != Some(SyntaxKind::TypeParameter)
+                {
+                    return Err(IntersectionTypeError::MalformedConstituent(type_));
+                }
+            }
+            TypeData::TypeReference(_) | TypeData::Interface(_)
+                if record.object_flags().contains(ObjectFlags::REFERENCE) =>
+            {
+                let reference = validate_direct_generic_reference(self, type_)
+                    .map_err(|_| IntersectionTypeError::MalformedConstituent(type_))?;
+                let target = self
+                    .type_payload(reference.target)
+                    .ok_or(IntersectionTypeError::MalformedConstituent(type_))?;
+                if !matches!(target.data(), TypeData::Interface(_))
+                    || target.symbol().is_none_or(|symbol| {
+                        self.get_merged_symbol(symbol) != Some(symbol)
+                            || self.symbol(symbol).is_none_or(|owner| {
+                                !owner.flags().contains(SymbolFlags::INTERFACE)
+                                    || owner
+                                        .flags()
+                                        .without(SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT)
+                                        != SymbolFlags::NONE
+                            })
+                    })
+                {
+                    return Err(IntersectionTypeError::UnsupportedConstituent(type_));
+                }
+                if record
+                    .object_flags()
+                    .contains(ObjectFlags::MEMBERS_RESOLVED)
+                {
+                    if !matches!(
+                        validate_generic_interface_members(self, type_, None),
+                        Ok(Some(_))
+                    ) {
+                        return Err(IntersectionTypeError::MalformedConstituent(type_));
+                    }
+                } else if record.data().structured() != Some(&StructuredTypeData::default()) {
+                    return Err(IntersectionTypeError::MalformedConstituent(type_));
+                }
+            }
+            TypeData::Interface(_) | TypeData::Object(_) => {
+                match validate_resolved_declared_property_object(self, type_) {
+                    DeclaredPropertyObjectValidation::Valid(_) => {}
+                    DeclaredPropertyObjectValidation::NotDeclared => {
+                        return Err(IntersectionTypeError::UnsupportedConstituent(type_));
+                    }
+                    DeclaredPropertyObjectValidation::Malformed => {
+                        return Err(IntersectionTypeError::MalformedConstituent(type_));
+                    }
+                }
+            }
+            _ => return Err(IntersectionTypeError::UnsupportedConstituent(type_)),
+        }
+        if !output.contains(&type_) {
+            output.push(type_);
+        }
+        Ok(())
+    }
+
+    fn materialize_deferred_intersection_type(
+        &mut self,
+        type_: TypeId,
+    ) -> Result<TypeId, IntersectionTypeError> {
+        let projection = self.validate_deferred_intersection_type(type_)?;
+        for constituent in &projection.types {
+            let mut validated = Vec::new();
+            self.append_intersection_constituent(*constituent, &mut validated)?;
+            if validated.as_slice() != [*constituent] {
+                return Err(IntersectionTypeError::InvalidCachedIntersection(type_));
+            }
+        }
+        let expected = expected_properties(self, &projection.types)?;
+        let call_signatures = expected_call_signatures(self, &projection.types)?;
+        let synthetic_count = expected
+            .iter()
+            .filter(|property| matches!(property, ExpectedProperty::Synthetic { .. }))
+            .count();
+        let prepared_members =
+            PreparedSymbolTable::new(expected.len()).ok_or(IntersectionTypeError::Capacity)?;
+        if !self.try_reserve_checker_symbol_allocations(synthetic_count, 1)
+            || !self.try_reserve_value_symbol_links(synthetic_count)
+        {
+            return Err(IntersectionTypeError::Capacity);
+        }
+
+        let never = self
+            .intrinsic_bootstrap()
+            .map(|bootstrap| bootstrap.never_type)
+            .ok_or(IntersectionTypeError::BootstrapUninitialized)?;
+        let reduced_to_never = expected.iter().any(|property| {
+            matches!(
+                property,
+                ExpectedProperty::Synthetic {
+                    type_,
+                    flags,
+                    check_flags,
+                    ..
+                } if *type_ == never
+                    && !flags.contains(SymbolFlags::OPTIONAL)
+                    && check_flags.contains(CheckFlags::NON_UNIFORM_AND_LITERAL)
+                    && !check_flags.contains(CheckFlags::HAS_NEVER_TYPE)
+            )
+        });
+        let mut flags = self.deferred_intersection_object_flags(&projection.types)?
+            | ObjectFlags::IS_NEVER_INTERSECTION_COMPUTED;
+        if reduced_to_never {
+            flags |= ObjectFlags::IS_NEVER_INTERSECTION;
+        }
+        if !self.set_type_object_flags(type_, flags)
+            || !self.set_structured_type_members(
+                type_,
+                None,
+                None,
+                (!call_signatures.is_empty()).then_some(call_signatures),
+                None,
+                None,
+            )
+        {
+            return Err(IntersectionTypeError::InvalidCachedIntersection(type_));
+        }
+
+        let members = self.alloc_prepared_symbol_table(prepared_members);
+        let mut properties = Vec::with_capacity(expected.len());
+        for property in expected {
+            let (name, symbol) = match property {
+                ExpectedProperty::Borrowed(symbol) => {
+                    let name = self
+                        .symbol(symbol)
+                        .ok_or(IntersectionTypeError::InvalidCachedIntersection(type_))?
+                        .name()
+                        .to_owned();
+                    (name, symbol)
+                }
+                ExpectedProperty::Synthetic {
+                    name,
+                    type_: property_type,
+                    flags,
+                    check_flags,
+                    declarations,
+                } => {
+                    let symbol = self.alloc_transient_symbol(flags, name.clone(), check_flags);
+                    if declarations.is_some()
+                        && !self.set_symbol_declarations(symbol, declarations, None)
+                    {
+                        return Err(IntersectionTypeError::InvalidCachedIntersection(type_));
+                    }
+                    if !self.set_value_symbol_links(
+                        symbol,
+                        ValueSymbolLinks {
+                            resolved_type: Some(property_type),
+                            containing_type: Some(type_),
+                            ..ValueSymbolLinks::default()
+                        },
+                    ) {
+                        return Err(IntersectionTypeError::InvalidCachedIntersection(type_));
+                    }
+                    (name, symbol)
+                }
+            };
+            if self.insert_symbol(members, name, symbol) != Some(None) {
+                return Err(IntersectionTypeError::InvalidCachedIntersection(type_));
+            }
+            properties.push(symbol);
+        }
+        if !self.set_union_or_intersection_caches(type_, Some(members), None, Some(properties)) {
+            return Err(IntersectionTypeError::InvalidCachedIntersection(type_));
+        }
+        self.validate_intersection_type(type_)?;
+        Ok(type_)
     }
 
     fn append_intersection_constituent(
@@ -411,13 +835,10 @@ impl CanonicalTypeMapperStore {
             return Err(invalid());
         }
 
-        let alias_symbol = match record.alias() {
-            None => None,
+        let (alias_symbol, alias_arguments) = match record.alias() {
+            None => (None, Vec::new()),
             Some(alias) => {
                 let alias = self.type_alias(alias).ok_or_else(invalid)?;
-                if alias.type_arguments().is_some() {
-                    return Err(invalid());
-                }
                 let symbol = alias.symbol().ok_or_else(invalid)?;
                 if self.symbol(symbol).is_none_or(|record| {
                     !record.flags().contains(SymbolFlags::TYPE_ALIAS)
@@ -425,12 +846,20 @@ impl CanonicalTypeMapperStore {
                 }) {
                     return Err(invalid());
                 }
-                Some(symbol)
+                let arguments = alias.type_arguments().unwrap_or_default().to_vec();
+                if arguments
+                    .iter()
+                    .any(|argument| self.type_payload(*argument).is_none())
+                {
+                    return Err(invalid());
+                }
+                (Some(symbol), arguments)
             }
         };
         let key = IntersectionTypeCacheKey {
             types: data.intersection.types.clone(),
             alias_symbol,
+            alias_arguments,
         };
         if self.intersection_types.get(&key) != Some(&type_)
             || self.intersection_keys_by_type.get(&type_) != Some(&key)
@@ -1099,12 +1528,12 @@ mod tests {
         context
     }
 
-    fn generic_intersection_alias(
+    fn generic_intersection_alias_symbol(
         source: &ParseResult,
         context: &CanonicalCheckerContext<'_>,
         file: FileId,
         name: &str,
-    ) -> TypeId {
+    ) -> SemanticSymbolId {
         let declaration = source
             .arena
             .iter()
@@ -1118,7 +1547,16 @@ mod tests {
                 (identifier.text == name).then_some(NodeRef::new(source.arena.id(), file, node))
             })
             .unwrap();
-        let symbol = context.file(file).unwrap().1.symbol(declaration).unwrap();
+        context.file(file).unwrap().1.symbol(declaration).unwrap()
+    }
+
+    fn generic_intersection_alias(
+        source: &ParseResult,
+        context: &CanonicalCheckerContext<'_>,
+        file: FileId,
+        name: &str,
+    ) -> TypeId {
+        let symbol = generic_intersection_alias_symbol(source, context, file, name);
         context
             .store()
             .type_alias_links(symbol)
@@ -1136,6 +1574,288 @@ mod tests {
             store.symbol_store().symbol_table_len(),
             store.checker_link_allocated_lengths(),
         )
+    }
+
+    #[test]
+    fn deferred_intersections_preserve_cold_references_and_materialize_in_place() {
+        let source = parse_source_file(concat!(
+            "interface Base<T> { base: T }\n",
+            "interface Extra<T> { extra: T }\n",
+            "type Left = Base<string>;\n",
+            "type Right = Extra<number>;\n",
+        ));
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let file = FileId::new(4_405);
+        let mut context = generic_intersection_context(&source, file);
+        let left = generic_intersection_alias(&source, &context, file, "Left");
+        let right = generic_intersection_alias(&source, &context, file, "Right");
+        let store = context.store_mut_for_test();
+        let before = intersection_cache_state(store);
+
+        let deferred = store
+            .canonical_deferred_intersection_type(&[left, right], None)
+            .unwrap();
+        let projection = store.validate_deferred_intersection_type(deferred).unwrap();
+        assert_eq!(projection.types, [left, right]);
+        assert_eq!(projection.alias_symbol, None);
+        assert!(projection.alias_arguments.is_empty());
+        assert_eq!(store.type_len(), before.0 + 1);
+        assert_eq!(store.mapper_len(), before.1);
+        assert_eq!(store.symbol_len(), before.2);
+        assert_eq!(store.symbol_store().symbol_table_len(), before.3);
+        let TypeData::Intersection(data) = store.type_payload(deferred).unwrap().data() else {
+            panic!("expected a deferred intersection")
+        };
+        assert_eq!(data.intersection.structured, StructuredTypeData::default());
+        assert!(data.intersection.property_cache.is_none());
+        assert!(data.intersection.resolved_properties.is_none());
+        assert!(matches!(
+            store.validate_intersection_type(deferred),
+            Err(IntersectionTypeError::InvalidCachedIntersection(actual)) if actual == deferred
+        ));
+
+        let warm = intersection_cache_state(store);
+        assert_eq!(
+            store.canonical_deferred_intersection_type(&[left, right], None),
+            Ok(deferred),
+        );
+        assert_eq!(intersection_cache_state(store), warm);
+
+        store
+            .resolve_generic_interface_property(left, "base", None)
+            .unwrap();
+        store
+            .resolve_generic_interface_property(right, "extra", None)
+            .unwrap();
+        assert_eq!(
+            store.canonical_intersection_type(&[left, right], None),
+            Ok(deferred),
+        );
+        let resolved = store.validate_intersection_type(deferred).unwrap();
+        assert_eq!(resolved.types, [left, right]);
+        assert_eq!(resolved.properties.len(), 2);
+        assert!(store.validate_deferred_intersection_type(deferred).is_err());
+
+        let resolved_state = intersection_cache_state(store);
+        assert_eq!(
+            store.canonical_deferred_intersection_type(&[left, right], None),
+            Ok(deferred),
+        );
+        assert_eq!(intersection_cache_state(store), resolved_state);
+    }
+
+    #[test]
+    fn deferred_intersections_authenticate_transient_generic_interface_owners() {
+        let source = parse_source_file(concat!(
+            "interface Base<T> { base: T }\n",
+            "interface Extra<T> { extra: T }\n",
+            "type Left = Base<string>;\n",
+            "type Right = Extra<number>;\n",
+        ));
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let file = FileId::new(4_408);
+        let mut context = generic_intersection_context(&source, file);
+        let left = generic_intersection_alias(&source, &context, file, "Left");
+        let right = generic_intersection_alias(&source, &context, file, "Right");
+        let target = validate_direct_generic_reference(context.store(), left)
+            .unwrap()
+            .target;
+        let owner = context
+            .store()
+            .type_payload(target)
+            .and_then(TypeRecord::symbol)
+            .unwrap();
+        let store = context.store_mut_for_test();
+        assert!(store.set_symbol_flags(
+            owner,
+            SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT,
+            CheckFlags::NONE,
+        ));
+
+        let deferred = store
+            .canonical_deferred_intersection_type(&[left, right], None)
+            .unwrap();
+        assert_eq!(
+            store
+                .validate_deferred_intersection_type(deferred)
+                .unwrap()
+                .types,
+            [left, right],
+        );
+        let warm = intersection_cache_state(store);
+        assert_eq!(
+            store.canonical_deferred_intersection_type(&[left, right], None),
+            Ok(deferred),
+        );
+        assert_eq!(intersection_cache_state(store), warm);
+
+        assert!(store.set_symbol_flags(
+            owner,
+            SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT | SymbolFlags::PROPERTY,
+            CheckFlags::NONE,
+        ));
+        let poisoned = intersection_cache_state(store);
+        assert_eq!(
+            store.validate_deferred_intersection_type(deferred),
+            Err(IntersectionTypeError::InvalidCachedIntersection(deferred)),
+        );
+        assert_eq!(
+            store.canonical_deferred_intersection_type(&[left, right], None),
+            Err(IntersectionTypeError::UnsupportedConstituent(left)),
+        );
+        assert_eq!(intersection_cache_state(store), poisoned);
+
+        assert!(store.set_symbol_flags(
+            owner,
+            SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT,
+            CheckFlags::NONE,
+        ));
+        assert_eq!(
+            store.canonical_deferred_intersection_type(&[left, right], None),
+            Ok(deferred),
+        );
+        assert_eq!(intersection_cache_state(store), warm);
+    }
+
+    #[test]
+    fn deferred_intersections_authenticate_binder_parameters_and_alias_argument_order() {
+        let source = parse_source_file(concat!(
+            "interface Base<T> { value: T }\n",
+            "type Left = Base<string>;\n",
+            "type Alias<E, T> = E;\n",
+        ));
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let file = FileId::new(4_406);
+        let mut context = generic_intersection_context(&source, file);
+        let left = generic_intersection_alias(&source, &context, file, "Left");
+        let alias = generic_intersection_alias_symbol(&source, &context, file, "Alias");
+        let parameters = context
+            .store()
+            .type_alias_links(alias)
+            .and_then(|links| links.type_parameters.clone())
+            .unwrap();
+        let [props, element] = parameters.as_slice() else {
+            panic!("expected two authenticated alias parameters")
+        };
+        let (props, element) = (*props, *element);
+        let target = validate_direct_generic_reference(context.store(), left)
+            .unwrap()
+            .target;
+        let store = context.store_mut_for_test();
+        let generic = store
+            .create_direct_generic_reference_type(target, &[element])
+            .unwrap();
+        let declared = store
+            .canonical_deferred_intersection_type(
+                &[generic, props],
+                Some((alias, &[props, element])),
+            )
+            .unwrap();
+        let projection = store.validate_deferred_intersection_type(declared).unwrap();
+        assert_eq!(projection.types, [generic, props]);
+        assert_eq!(projection.alias_symbol, Some(alias));
+        assert_eq!(projection.alias_arguments, [props, element]);
+        let identity = store
+            .type_payload(declared)
+            .and_then(TypeRecord::alias)
+            .and_then(|identity| store.type_alias(identity))
+            .unwrap();
+        assert_eq!(identity.symbol(), Some(alias));
+        assert_eq!(identity.type_arguments(), Some([props, element].as_slice()));
+
+        let reordered = store
+            .canonical_deferred_intersection_type(
+                &[generic, props],
+                Some((alias, &[element, props])),
+            )
+            .unwrap();
+        assert_ne!(declared, reordered);
+        let warm = intersection_cache_state(store);
+        assert_eq!(
+            store.canonical_deferred_intersection_type(
+                &[generic, props],
+                Some((alias, &[props, element])),
+            ),
+            Ok(declared),
+        );
+        assert_eq!(intersection_cache_state(store), warm);
+    }
+
+    #[test]
+    fn deferred_intersections_reject_forged_alias_and_reverse_cache_without_writes() {
+        let source = parse_source_file(concat!(
+            "interface Base<T> { value: T }\n",
+            "type Left = Base<string>;\n",
+            "type Alias<E, T> = E;\n",
+        ));
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let file = FileId::new(4_407);
+        let mut context = generic_intersection_context(&source, file);
+        let left = generic_intersection_alias(&source, &context, file, "Left");
+        let alias = generic_intersection_alias_symbol(&source, &context, file, "Alias");
+        let parameters = context
+            .store()
+            .type_alias_links(alias)
+            .and_then(|links| links.type_parameters.clone())
+            .unwrap();
+        let [first, second] = parameters.as_slice() else {
+            panic!("expected two authenticated alias parameters")
+        };
+        let (first, second) = (*first, *second);
+        let store = context.store_mut_for_test();
+        let intersection = store
+            .canonical_deferred_intersection_type(&[left, first], Some((alias, &[first, second])))
+            .unwrap();
+        let identity = store
+            .type_payload(intersection)
+            .and_then(TypeRecord::alias)
+            .unwrap();
+        let key = store
+            .intersection_keys_by_type
+            .remove(&intersection)
+            .unwrap();
+        let state = intersection_cache_state(store);
+        assert_eq!(
+            store.validate_deferred_intersection_type(intersection),
+            Err(IntersectionTypeError::InvalidCachedIntersection(
+                intersection
+            )),
+        );
+        assert_eq!(
+            store.canonical_deferred_intersection_type(
+                &[left, first],
+                Some((alias, &[first, second])),
+            ),
+            Err(IntersectionTypeError::InvalidCachedIntersection(
+                intersection
+            )),
+        );
+        assert_eq!(intersection_cache_state(store), state);
+        assert!(
+            store
+                .intersection_keys_by_type
+                .insert(intersection, key)
+                .is_none()
+        );
+
+        assert!(store.set_type_alias_arguments(identity, Some(vec![second, first])));
+        let state = intersection_cache_state(store);
+        assert_eq!(
+            store.validate_deferred_intersection_type(intersection),
+            Err(IntersectionTypeError::InvalidCachedIntersection(
+                intersection
+            )),
+        );
+        assert_eq!(
+            store.canonical_deferred_intersection_type(
+                &[left, first],
+                Some((alias, &[first, second])),
+            ),
+            Err(IntersectionTypeError::InvalidCachedIntersection(
+                intersection
+            )),
+        );
+        assert_eq!(intersection_cache_state(store), state);
     }
 
     #[test]

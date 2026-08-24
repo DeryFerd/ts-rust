@@ -19,7 +19,8 @@ use super::{
     CanonicalTypeMapperStore, DeclaredTypeHost, SignatureId, TypeId,
     declared::{cached_ordinary_type_parameter_owner, preflight_node, type_list_key},
     interface_heritage::{
-        DirectInterfaceHeritageError, DirectInterfaceHeritagePlan, plan_direct_interface_heritage,
+        DirectInterfaceBaseKind, DirectInterfaceHeritageError, DirectInterfaceHeritagePlan,
+        plan_direct_interface_heritage,
     },
     links::{ResolvedSignatureState, SignatureLinks, ValueSymbolLinks},
     reference_types::validate_direct_generic_reference,
@@ -1020,7 +1021,7 @@ pub(super) fn plan_interface(
         None => value_declarations.is_empty(),
         Some(value) => value_declarations.contains(&value),
     };
-    if symbol_record.flags() != expected_symbol_flags
+    if symbol_record.flags().without(SymbolFlags::TRANSIENT) != expected_symbol_flags
         || symbol_record.check_flags() != CheckFlags::NONE
         || !valid_value_declaration
         || symbol_record.exports().is_some()
@@ -1122,6 +1123,29 @@ pub(super) fn plan_interface(
     )?;
     plan.heritage = heritage;
     if let Some(heritage) = plan.heritage.as_ref() {
+        if heritage
+            .bases
+            .iter()
+            .any(|base| base.kind == DirectInterfaceBaseKind::DefaultLibraryInterface)
+        {
+            if !matches!(
+                heritage.bases.as_slice(),
+                [base] if base.kind == DirectInterfaceBaseKind::DefaultLibraryInterface
+            ) || !plan.properties.is_empty()
+                || !plan.spreads.is_empty()
+                || !plan.indexes.is_empty()
+                || !plan.call_signatures.is_empty()
+                || !value_declarations.is_empty()
+                || plan.members.is_some()
+                || plan.declarations.len() != 1
+            {
+                return Err(PropertyObjectError::UnsupportedMember {
+                    node: plan.node,
+                    kind: SyntaxKind::InterfaceDeclaration,
+                });
+            }
+            return Ok(plan);
+        }
         if let Some(index) = plan.indexes.first() {
             return Err(PropertyObjectError::UnsupportedMember {
                 node: index.declaration,
@@ -2357,7 +2381,10 @@ fn declared_namespace_type_parent(
             || record.members().is_some()
             || record.exports().is_some()
             || record.parent().is_some()
-            || record.export_symbol() != Some(symbol)
+            || record
+                .export_symbol()
+                .and_then(|export| store.get_merged_symbol(export))
+                != Some(symbol)
         {
             return Err(());
         }
@@ -3369,7 +3396,10 @@ fn plan_index_signature(
         || index_record.value_declaration().is_some()
         || index_record.members().is_some()
         || index_record.exports().is_some()
-        || index_record.parent() != Some(owner_symbol)
+        || index_record
+            .parent()
+            .and_then(|parent| store.get_merged_symbol(parent))
+            != Some(owner_symbol)
         || index_record.export_symbol().is_some()
     {
         return Err(unsupported());
@@ -8515,5 +8545,356 @@ mod generic_publication_tests {
         assert_eq!(store.get_parent_of_symbol(symbol), Some(merged_namespace));
         let plan = plan_interface(&store, &host, symbol).unwrap();
         assert_eq!(plan.symbol, symbol);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Preserve real cross-file binder and export-assignment identities.
+    fn ambient_react_module_augmentations_keep_the_export_equals_namespace_owner() {
+        let library = parse_source_file(concat!(
+            "declare module 'react' { ",
+            "export = React; ",
+            "namespace React { interface Attributes { key?: string; } } ",
+            "}",
+        ));
+        let source = parse_source_file(concat!(
+            "export {}; ",
+            "declare module 'react' { ",
+            "interface Attributes { ",
+            "[key: `do-${string}`]: number; ",
+            "'ns:thing'?: string; ",
+            "} }",
+        ));
+        assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let library_file = FileId::new(3_760);
+        let source_file = FileId::new(3_761);
+        let mut binder = CanonicalBinder::new();
+        for (parsed, file, declaration, module_state) in [
+            (&library, library_file, true, CanonicalModuleState::Script),
+            (&source, source_file, false, CanonicalModuleState::External),
+        ] {
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(format!("\"/react-module-{}.ts\"", file.index())),
+                        CanonicalSourceLanguage::TypeScript,
+                        declaration,
+                        module_state,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let (symbols, mut files) = binder.finish().try_into_parts().unwrap();
+        let library_bound = files.remove(&library_file).unwrap();
+        let source_bound = files.remove(&source_file).unwrap();
+        let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
+        for (parsed, file) in [(&library, library_file), (&source, source_file)] {
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .unwrap();
+        }
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+
+        let react_declaration = library
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::ModuleDeclaration(module) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(name) = &library.arena.get(module.name)?.data else {
+                    return None;
+                };
+                (name.text == "React").then_some(NodeRef::new(
+                    library.arena.id(),
+                    library_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let namespace = library_bound.symbol(react_declaration).unwrap();
+        let namespace_exports = store.symbol(namespace).unwrap().exports().unwrap();
+        let original = store
+            .symbol_table(namespace_exports)
+            .and_then(|exports| exports.get_source("Attributes"))
+            .unwrap();
+        let augmentation = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                matches!(&record.data, NodeData::ModuleDeclaration(_)).then_some(NodeRef::new(
+                    source.arena.id(),
+                    source_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let augmentation_symbol = source_bound.symbol(augmentation).unwrap();
+        let augmentation_exports = store
+            .symbol(augmentation_symbol)
+            .unwrap()
+            .exports()
+            .unwrap();
+        let contributed = store
+            .symbol_table(augmentation_exports)
+            .and_then(|exports| exports.get_source("Attributes"))
+            .unwrap();
+        let merged_namespace = store
+            .merge_symbol(namespace, augmentation_symbol, false)
+            .unwrap();
+        assert_ne!(merged_namespace, namespace);
+        assert_ne!(merged_namespace, augmentation_symbol);
+        assert_eq!(store.get_merged_symbol(namespace), Some(merged_namespace));
+        assert_eq!(
+            store.get_merged_symbol(augmentation_symbol),
+            Some(merged_namespace),
+        );
+        let namespace_exports = store.symbol(merged_namespace).unwrap().exports().unwrap();
+        let symbol = store
+            .symbol_table(namespace_exports)
+            .and_then(|exports| exports.get_source("Attributes"))
+            .unwrap();
+        assert_ne!(symbol, original);
+        assert_ne!(symbol, contributed);
+        assert_eq!(
+            store.symbol(symbol).unwrap().flags(),
+            SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT,
+        );
+        assert_eq!(store.get_parent_of_symbol(symbol), Some(merged_namespace));
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&library.arena, &library_bound),
+                (&source.arena, &source_bound),
+            ],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let before = (
+            store.type_len(),
+            store.symbol_len(),
+            store.checker_link_allocated_lengths(),
+        );
+
+        let plan = plan_interface(&store, &host, symbol).unwrap();
+
+        assert_eq!(plan.symbol, symbol);
+        assert_eq!(plan.declarations.len(), 2);
+        assert_eq!(
+            plan.properties
+                .iter()
+                .map(|property| property.name.as_str())
+                .collect::<Vec<_>>(),
+            ["key", "ns:thing"],
+        );
+        assert_eq!(plan.indexes.len(), 1);
+        assert_eq!(
+            (
+                store.type_len(),
+                store.symbol_len(),
+                store.checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+        assert_eq!(plan_interface(&store, &host, contributed), Ok(plan));
+
+        let original_module = library
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::ModuleDeclaration(module) = &record.data else {
+                    return None;
+                };
+                matches!(
+                    &library.arena.get(module.name)?.data,
+                    NodeData::StringLiteral(_)
+                )
+                .then_some(NodeRef::new(library.arena.id(), library_file, node))
+            })
+            .and_then(|module| library_bound.symbol(module))
+            .unwrap();
+        let owner = store.symbol(symbol).unwrap();
+        let relationships = (owner.members(), owner.exports(), owner.export_symbol());
+        assert!(store.set_symbol_relationships(
+            symbol,
+            relationships.0,
+            relationships.1,
+            Some(original_module),
+            relationships.2,
+        ));
+        let poisoned = (
+            store.type_len(),
+            store.symbol_len(),
+            store.checker_link_allocated_lengths(),
+        );
+        assert!(matches!(
+            plan_interface(&store, &host, symbol),
+            Err(PropertyObjectError::InvalidInterface { .. }),
+        ));
+        assert_eq!(
+            (
+                store.type_len(),
+                store.symbol_len(),
+                store.checker_link_allocated_lengths(),
+            ),
+            poisoned,
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Bind the DOM value owner and validate all lazy boundaries.
+    fn empty_interfaces_keep_authenticated_default_library_dom_bases_cold() {
+        let library = parse_source_file(concat!(
+            "interface DomFirst {} ",
+            "interface DomSecond {} ",
+            "interface DomThird {} ",
+            "interface DomFourth {} ",
+            "interface DomFifth {} ",
+            "interface HTMLElement extends ",
+            "DomFirst, DomSecond, DomThird, DomFourth, DomFifth { ",
+            "addEventListener(value: string): void; ",
+            "[key: string]: unknown; ",
+            "} ",
+            "declare var HTMLElement: unknown;",
+        ));
+        let source = parse_source_file(concat!(
+            "interface HTMLWebViewElement extends HTMLElement {} ",
+            "interface InvalidWebViewElement extends HTMLElement { own: string } ",
+            "interface MultipleWebViewElement extends HTMLElement, DomFirst {}",
+        ));
+        assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let library_file = FileId::new(3_762);
+        let source_file = FileId::new(3_763);
+        let mut binder = CanonicalBinder::new();
+        for (parsed, file, default_library) in [
+            (&library, library_file, true),
+            (&source, source_file, false),
+        ] {
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new_with_default_library(
+                        EscapedName::source(format!("\"/dom-plan-{}.d.ts\"", file.index())),
+                        CanonicalSourceLanguage::TypeScript,
+                        true,
+                        default_library,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let (symbols, mut files) = binder.finish().try_into_parts().unwrap();
+        let library_bound = files.remove(&library_file).unwrap();
+        let source_bound = files.remove(&source_file).unwrap();
+        let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
+        for (parsed, file) in [(&library, library_file), (&source, source_file)] {
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .unwrap();
+        }
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        let globals = store.intrinsic_bootstrap().unwrap().globals;
+        for bound in [&library_bound, &source_bound] {
+            let symbols = store
+                .symbol_table(bound.locals(bound.source_file()).unwrap())
+                .unwrap()
+                .iter()
+                .map(|(_, symbol)| symbol)
+                .collect::<Vec<_>>();
+            for symbol in symbols {
+                store.merge_global_symbol(globals, symbol).unwrap();
+            }
+        }
+        let base = store
+            .symbol_table(globals)
+            .and_then(|globals| globals.get_source("HTMLElement"))
+            .unwrap();
+        let derived = store
+            .symbol_table(globals)
+            .and_then(|globals| globals.get_source("HTMLWebViewElement"))
+            .unwrap();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&library.arena, &library_bound),
+                (&source.arena, &source_bound),
+            ],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let before = (
+            store.type_len(),
+            store.symbol_len(),
+            store.signature_len(),
+            store.index_info_len(),
+            store.checker_link_allocated_lengths(),
+        );
+
+        let plan = plan_interface(&store, &host, derived).unwrap();
+
+        let [inherited] = plan.heritage.as_ref().unwrap().bases.as_slice() else {
+            panic!("the empty DOM extension must retain exactly one authenticated base")
+        };
+        assert_eq!(inherited.symbol, base);
+        assert_eq!(
+            inherited.kind,
+            DirectInterfaceBaseKind::DefaultLibraryInterface,
+        );
+        assert!(plan.properties.is_empty());
+        assert!(plan.indexes.is_empty());
+        assert!(plan.call_signatures.is_empty());
+        assert!(store.declared_type_links(base).is_none());
+        assert_eq!(
+            (
+                store.type_len(),
+                store.symbol_len(),
+                store.signature_len(),
+                store.index_info_len(),
+                store.checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+        assert_eq!(plan_interface(&store, &host, derived), Ok(plan));
+
+        for name in ["InvalidWebViewElement", "MultipleWebViewElement"] {
+            let invalid = store
+                .symbol_table(globals)
+                .and_then(|globals| globals.get_source(name))
+                .unwrap();
+            assert!(
+                matches!(
+                    plan_interface(&store, &host, invalid),
+                    Err(PropertyObjectError::UnsupportedMember {
+                        kind: SyntaxKind::InterfaceDeclaration,
+                        ..
+                    })
+                ),
+                "{name}",
+            );
+            assert_eq!(
+                (
+                    store.type_len(),
+                    store.symbol_len(),
+                    store.signature_len(),
+                    store.index_info_len(),
+                    store.checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+        }
     }
 }

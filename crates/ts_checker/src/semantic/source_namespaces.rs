@@ -115,6 +115,7 @@ struct SourceNamespaceImportPlan {
     name_text: String,
     symbol: SemanticSymbolId,
     reference: NodeRef,
+    ambient_target: Option<SemanticSymbolId>,
     type_only: bool,
 }
 
@@ -1365,8 +1366,363 @@ fn plan_namespace_import(
         name_text: identifier.text.clone(),
         symbol,
         reference,
+        ambient_target: None,
         type_only: import.is_type_only,
     })
+}
+
+fn ambient_module_import_target(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    specifier: NodeRef,
+) -> Result<SemanticSymbolId, SourceCheckError> {
+    let record = owned_node(arena, bound, store, specifier)?;
+    let NodeData::StringLiteral(name) = &record.data else {
+        return Err(unsupported(
+            specifier,
+            record.kind,
+            SourceSyntaxRole::Statement,
+        ));
+    };
+    if record.kind != SyntaxKind::StringLiteral
+        || record.flags.0 != 0
+        || name.token_flags.0 != 0
+        || name.text.is_empty()
+    {
+        return Err(unsupported(
+            specifier,
+            record.kind,
+            SourceSyntaxRole::Statement,
+        ));
+    }
+    let quoted_name = EscapedName::source(format!("\"{}\"", name.text));
+    let module = bound
+        .locals(bound.source_file())
+        .and_then(|locals| store.symbol_table(locals))
+        .and_then(|locals| locals.get(quoted_name.as_ref()))
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        .ok_or(SourceCheckError::Unsupported(
+            UnsupportedSourceSyntax::Import(specifier),
+        ))?;
+    let owner = store
+        .symbol(module)
+        .filter(|owner| owner.flags().intersects(SymbolFlags::MODULE))
+        .ok_or(SourceCheckError::Import(specifier))?;
+    let exports = owner
+        .exports()
+        .and_then(|exports| store.symbol_table(exports))
+        .ok_or(SourceCheckError::Import(specifier))?;
+    let Some(export_assignment) = exports.get(InternalSymbolName::ExportEquals.as_ref()) else {
+        return Ok(module);
+    };
+    let assignment = store
+        .symbol(export_assignment)
+        .ok_or(SourceCheckError::Import(specifier))?;
+    let Some([declaration]) = assignment.declarations() else {
+        return Err(SourceCheckError::Import(specifier));
+    };
+    let declaration = *declaration;
+    let assignment_record = owned_node(arena, bound, store, declaration)?;
+    let NodeData::ExportAssignment(export) = &assignment_record.data else {
+        return Err(SourceCheckError::Import(specifier));
+    };
+    let expression = child(declaration, export.expression);
+    let expression_record = owned_node(arena, bound, store, expression)?;
+    let NodeData::Identifier(identifier) = &expression_record.data else {
+        return Err(SourceCheckError::Import(specifier));
+    };
+    let Some(module_declaration) = owner
+        .declarations()
+        .and_then(|declarations| declarations.first())
+        .copied()
+    else {
+        return Err(SourceCheckError::Import(specifier));
+    };
+    if assignment.flags() != SymbolFlags::ALIAS
+        || assignment_record.kind != SyntaxKind::ExportAssignment
+        || !export.is_export_equals
+        || expression_record.kind != SyntaxKind::Identifier
+        || expression_record.parent != Some(declaration.node)
+        || identifier.flow_node.is_some()
+    {
+        return Err(SourceCheckError::Import(specifier));
+    }
+    let local = bound
+        .locals(module_declaration)
+        .and_then(|locals| store.symbol_table(locals))
+        .and_then(|locals| locals.get_source(&identifier.text))
+        .and_then(|local| store.get_merged_symbol(local))
+        .ok_or(SourceCheckError::Import(specifier))?;
+    let namespace = store
+        .symbol(local)
+        .map(|record| record.export_symbol().unwrap_or(local))
+        .and_then(|namespace| store.get_merged_symbol(namespace))
+        .ok_or(SourceCheckError::Import(specifier))?;
+    if store
+        .symbol(namespace)
+        .is_none_or(|record| !record.flags().intersects(SymbolFlags::NAMESPACE))
+    {
+        return Err(SourceCheckError::Import(specifier));
+    }
+    Ok(namespace)
+}
+
+fn plan_ambient_module_import_binding(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    namespace: (NodeRef, NodeRef),
+    name: NodeRef,
+    reference: NodeRef,
+    target: SemanticSymbolId,
+) -> Result<SourceNamespaceImportPlan, SourceCheckError> {
+    let (namespace, declaration) = namespace;
+    let name_record = owned_node(arena, bound, store, name)?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return Err(unsupported(
+            name,
+            name_record.kind,
+            SourceSyntaxRole::Statement,
+        ));
+    };
+    let symbol = declaration_symbol(bound, store, declaration, SymbolFlags::ALIAS)?;
+    let alias = store
+        .symbol(symbol)
+        .ok_or(SourceCheckError::Import(declaration))?;
+    if name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(declaration.node)
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+        || alias.flags() != SymbolFlags::ALIAS
+        || alias.check_flags() != CheckFlags::NONE
+        || alias.declarations() != Some(&[declaration])
+        || alias.value_declaration().is_some()
+        || alias.members().is_some()
+        || alias.exports().is_some()
+        || alias.parent().is_some()
+        || alias.export_symbol().is_some()
+        || alias.name().as_utf8() != Some(identifier.text.as_str())
+        || bound
+            .locals(namespace)
+            .and_then(|locals| store.symbol_table(locals))
+            .and_then(|locals| locals.get_source(&identifier.text))
+            .and_then(|local| store.get_merged_symbol(local))
+            != Some(symbol)
+        || store.get_merged_symbol(target) != Some(target)
+    {
+        return Err(SourceCheckError::Import(declaration));
+    }
+    Ok(SourceNamespaceImportPlan {
+        declaration,
+        name_text: identifier.text.clone(),
+        symbol,
+        reference,
+        ambient_target: Some(target),
+        type_only: false,
+    })
+}
+
+#[allow(clippy::too_many_lines)] // Validate each binder-owned import shape before publishing aliases.
+fn plan_ambient_module_import(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    namespace: NodeRef,
+    declaration: NodeRef,
+) -> Result<Vec<SourceNamespaceImportPlan>, SourceCheckError> {
+    let record = owned_node(arena, bound, store, declaration)?;
+    let NodeData::ImportDeclaration(import) = &record.data else {
+        return Err(unsupported(
+            declaration,
+            record.kind,
+            SourceSyntaxRole::Statement,
+        ));
+    };
+    let Some(clause) = import.import_clause else {
+        return Err(unsupported(
+            declaration,
+            record.kind,
+            SourceSyntaxRole::Statement,
+        ));
+    };
+    if record.kind != SyntaxKind::ImportDeclaration
+        || record.flags.0 != 0
+        || import.attributes.is_some()
+        || import.flow_node.is_some()
+        || import.symbol.is_some()
+        || import.facts != 0
+        || import.modifiers.is_some()
+    {
+        return Err(unsupported(
+            declaration,
+            record.kind,
+            SourceSyntaxRole::Statement,
+        ));
+    }
+    let reference = child(declaration, import.module_specifier);
+    let reference_record = owned_node(arena, bound, store, reference)?;
+    if reference_record.parent != Some(declaration.node) {
+        return Err(invalid_parent(
+            reference,
+            declaration,
+            reference_record.parent,
+        ));
+    }
+    let module = ambient_module_import_target(arena, bound, store, reference)?;
+    let exports = store
+        .symbol(module)
+        .and_then(ts_binder::semantic::Symbol::exports)
+        .and_then(|exports| store.symbol_table(exports))
+        .ok_or(SourceCheckError::Import(declaration))?;
+
+    let clause = child(declaration, clause);
+    let clause_record = owned_node(arena, bound, store, clause)?;
+    let NodeData::ImportClause(import_clause) = &clause_record.data else {
+        return Err(unsupported(
+            clause,
+            clause_record.kind,
+            SourceSyntaxRole::Statement,
+        ));
+    };
+    let Some(bindings) = import_clause.named_bindings else {
+        return Err(unsupported(
+            clause,
+            clause_record.kind,
+            SourceSyntaxRole::Statement,
+        ));
+    };
+    if clause_record.kind != SyntaxKind::ImportClause
+        || clause_record.flags.0 != 0
+        || clause_record.parent != Some(declaration.node)
+        || import_clause.local_symbol.is_some()
+        || import_clause.phase_modifier.is_some()
+        || import_clause.symbol.is_some()
+        || import_clause.facts != 0
+        || import_clause.name.is_some()
+    {
+        return Err(unsupported(
+            clause,
+            clause_record.kind,
+            SourceSyntaxRole::Statement,
+        ));
+    }
+    let bindings = child(clause, bindings);
+    let bindings_record = owned_node(arena, bound, store, bindings)?;
+    if bindings_record.parent != Some(clause.node) || bindings_record.flags.0 != 0 {
+        return Err(unsupported(
+            bindings,
+            bindings_record.kind,
+            SourceSyntaxRole::Statement,
+        ));
+    }
+
+    match &bindings_record.data {
+        NodeData::NamespaceImport(import)
+            if bindings_record.kind == SyntaxKind::NamespaceImport =>
+        {
+            if import.local_symbol.is_some() || import.symbol.is_some() {
+                return Err(unsupported(
+                    bindings,
+                    bindings_record.kind,
+                    SourceSyntaxRole::Statement,
+                ));
+            }
+            let name = child(bindings, import.name);
+            Ok(vec![plan_ambient_module_import_binding(
+                arena,
+                bound,
+                store,
+                (namespace, bindings),
+                name,
+                reference,
+                module,
+            )?])
+        }
+        NodeData::NamedImports(import) if bindings_record.kind == SyntaxKind::NamedImports => {
+            if import.facts != 0 || import.elements.has_trailing_comma {
+                return Err(unsupported(
+                    bindings,
+                    bindings_record.kind,
+                    SourceSyntaxRole::Statement,
+                ));
+            }
+            let mut planned = Vec::with_capacity(import.elements.nodes.len());
+            let mut aliases = HashSet::with_capacity(import.elements.nodes.len());
+            for &specifier in &import.elements.nodes {
+                let specifier = child(bindings, specifier);
+                let specifier_record = owned_node(arena, bound, store, specifier)?;
+                let NodeData::ImportSpecifier(binding) = &specifier_record.data else {
+                    return Err(unsupported(
+                        specifier,
+                        specifier_record.kind,
+                        SourceSyntaxRole::Statement,
+                    ));
+                };
+                if specifier_record.kind != SyntaxKind::ImportSpecifier
+                    || specifier_record.flags.0 != 0
+                    || specifier_record.parent != Some(bindings.node)
+                    || binding.is_type_only
+                    || binding.local_symbol.is_some()
+                    || binding.symbol.is_some()
+                    || binding.facts != 0
+                {
+                    return Err(unsupported(
+                        specifier,
+                        specifier_record.kind,
+                        SourceSyntaxRole::Statement,
+                    ));
+                }
+                let imported = child(specifier, binding.property_name.unwrap_or(binding.name));
+                let imported_record = owned_node(arena, bound, store, imported)?;
+                let NodeData::Identifier(imported_name) = &imported_record.data else {
+                    return Err(unsupported(
+                        imported,
+                        imported_record.kind,
+                        SourceSyntaxRole::Statement,
+                    ));
+                };
+                if imported_record.kind != SyntaxKind::Identifier
+                    || imported_record.flags.0 != 0
+                    || imported_record.parent != Some(specifier.node)
+                    || imported_name.flow_node.is_some()
+                {
+                    return Err(unsupported(
+                        imported,
+                        imported_record.kind,
+                        SourceSyntaxRole::Statement,
+                    ));
+                }
+                let target = exports
+                    .get_source(&imported_name.text)
+                    .and_then(|symbol| store.get_merged_symbol(symbol))
+                    .ok_or(SourceCheckError::Unsupported(
+                        UnsupportedSourceSyntax::Import(specifier),
+                    ))?;
+                let name = child(specifier, binding.name);
+                let import = plan_ambient_module_import_binding(
+                    arena,
+                    bound,
+                    store,
+                    (namespace, specifier),
+                    name,
+                    reference,
+                    target,
+                )?;
+                if !aliases.insert(import.symbol) {
+                    return Err(SourceCheckError::Import(specifier));
+                }
+                planned.push(import);
+            }
+            Ok(planned)
+        }
+        _ => Err(unsupported(
+            bindings,
+            bindings_record.kind,
+            SourceSyntaxRole::Statement,
+        )),
+    }
 }
 
 fn namespace_object_error(node: NodeRef, error: PropertyObjectError) -> SourceCheckError {
@@ -2433,6 +2789,92 @@ fn plan_invalid_ambient_export_assignment(
     })
 }
 
+fn plan_ambient_export_assignment(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    namespace: (NodeRef, SemanticSymbolId),
+    declaration: NodeRef,
+) -> Result<Option<SourceNamespaceImportPlan>, SourceCheckError> {
+    let (namespace, owner) = namespace;
+    let record = owned_node(arena, bound, store, declaration)?;
+    let NodeData::ExportAssignment(export) = &record.data else {
+        return Err(unsupported(
+            declaration,
+            record.kind,
+            SourceSyntaxRole::Statement,
+        ));
+    };
+    let reference = child(declaration, export.expression);
+    let expression = owned_node(arena, bound, store, reference)?;
+    let NodeData::Identifier(identifier) = &expression.data else {
+        return Ok(None);
+    };
+    if record.kind != SyntaxKind::ExportAssignment
+        || record.flags.0 != 0
+        || !export.is_export_equals
+        || export.flow_node.is_some()
+        || export.symbol.is_some()
+        || export.type_.is_some()
+        || export.facts != 0
+        || export.modifiers.is_some()
+        || expression.kind != SyntaxKind::Identifier
+        || expression.flags.0 != 0
+        || expression.parent != Some(declaration.node)
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+    {
+        return Err(unsupported(
+            declaration,
+            record.kind,
+            SourceSyntaxRole::Statement,
+        ));
+    }
+    let symbol = declaration_symbol(bound, store, declaration, SymbolFlags::ALIAS)?;
+    let alias = store
+        .symbol(symbol)
+        .ok_or(SourceCheckError::Import(declaration))?;
+    if alias.flags() != SymbolFlags::ALIAS
+        || alias.check_flags() != CheckFlags::NONE
+        || alias.name() != InternalSymbolName::ExportEquals.as_ref()
+        || alias.declarations() != Some(&[declaration])
+        || alias.value_declaration() != Some(declaration)
+        || alias.members().is_some()
+        || alias.exports().is_some()
+        || alias.export_symbol().is_some()
+        || store.get_parent_of_symbol(symbol) != Some(owner)
+        || store
+            .symbol(owner)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| store.symbol_table(exports))
+            .and_then(|exports| exports.get(InternalSymbolName::ExportEquals.as_ref()))
+            != Some(symbol)
+    {
+        return Err(SourceCheckError::Import(declaration));
+    }
+    let local = bound
+        .locals(namespace)
+        .and_then(|locals| store.symbol_table(locals))
+        .and_then(|locals| locals.get_source(&identifier.text))
+        .and_then(|local| store.get_merged_symbol(local))
+        .ok_or(SourceCheckError::Unsupported(
+            UnsupportedSourceSyntax::Import(declaration),
+        ))?;
+    let target = store
+        .symbol(local)
+        .map(|record| record.export_symbol().unwrap_or(local))
+        .and_then(|target| store.get_merged_symbol(target))
+        .ok_or(SourceCheckError::Import(declaration))?;
+    Ok(Some(SourceNamespaceImportPlan {
+        declaration,
+        name_text: identifier.text.clone(),
+        symbol,
+        reference,
+        ambient_target: Some(target),
+        type_only: false,
+    }))
+}
+
 fn plan_namespace(
     arena: &NodeArena,
     bound: &BoundFile,
@@ -2682,10 +3124,31 @@ fn plan_namespace(
                                 statement,
                             )?);
                         }
-                        SyntaxKind::ExportAssignment if ambient && is_string_module => {
-                            diagnostics.push(plan_invalid_ambient_export_assignment(
-                                arena, bound, store, symbol, statement,
+                        SyntaxKind::ImportDeclaration
+                            if ambient && is_string_module && facts.is_declaration_file() =>
+                        {
+                            imports.extend(plan_ambient_module_import(
+                                arena,
+                                bound,
+                                store,
+                                declaration,
+                                statement,
                             )?);
+                        }
+                        SyntaxKind::ExportAssignment if ambient && is_string_module => {
+                            if let Some(export) = plan_ambient_export_assignment(
+                                arena,
+                                bound,
+                                store,
+                                (declaration, symbol),
+                                statement,
+                            )? {
+                                imports.push(export);
+                            } else {
+                                diagnostics.push(plan_invalid_ambient_export_assignment(
+                                    arena, bound, store, symbol, statement,
+                                )?);
+                            }
                         }
                         SyntaxKind::EmptyStatement => {}
                         kind => {
@@ -2944,6 +3407,11 @@ fn resolve_namespace_import_target(
     import: &SourceNamespaceImportPlan,
     resolving: &mut HashSet<SemanticSymbolId>,
 ) -> Result<SemanticSymbolId, SourceCheckError> {
+    if let Some(target) = import.ambient_target {
+        return (store.get_merged_symbol(target) == Some(target))
+            .then_some(target)
+            .ok_or(SourceCheckError::Import(import.declaration));
+    }
     let resolution = {
         let mut resolution_host = host.name_resolver_host(store)?;
         resolution_host.resolve_entity_name(import.reference, SymbolFlags::MODULE_MEMBER)
@@ -5148,6 +5616,254 @@ mod tests {
                     .is_some()
             );
         }
+    }
+
+    #[test]
+    fn external_module_augmentation_uses_the_merged_export_assignment_namespace() {
+        let library = parse_source_file(concat!(
+            "declare module 'react' { ",
+            "export = React; ",
+            "namespace React { interface Attributes { key?: string; } } ",
+            "}",
+        ));
+        let source = parse_source_file(concat!(
+            "export {}; ",
+            "declare module 'react' { ",
+            "interface Attributes { 'ns:thing'?: string; } ",
+            "}",
+        ));
+        assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let library_file = FileId::new(7_481);
+        let source_file = FileId::new(7_482);
+        let mut binder = CanonicalBinder::new();
+        for (parsed, file, declaration, module_state) in [
+            (&library, library_file, true, CanonicalModuleState::Script),
+            (&source, source_file, false, CanonicalModuleState::External),
+        ] {
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(format!("\"/react-namespace-{}.ts\"", file.index())),
+                        CanonicalSourceLanguage::TypeScript,
+                        declaration,
+                        module_state,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(library_file, &library.arena), (source_file, &source.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        let (_, bound) = context.file(source_file).unwrap();
+        let source_record = source.arena.get(bound.source_file().node).unwrap();
+        let NodeData::SourceFile(source_data) = &source_record.data else {
+            panic!("the augmentation fixture must retain a source-file root")
+        };
+        let declaration = child(bound.source_file(), source_data.statements.nodes[1]);
+        let raw_namespace = bound.symbol(declaration).unwrap();
+        let namespace = context.store().get_merged_symbol(raw_namespace).unwrap();
+        assert_ne!(namespace, raw_namespace);
+        let before = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+
+        let plan = plan_source_namespace(&source.arena, bound, context.store(), declaration)
+            .expect("the module augmentation must retain its merged React namespace");
+
+        assert_eq!(plan.symbol, namespace);
+        let [
+            SourceNamespaceMemberPlan::Interface {
+                symbol: attributes, ..
+            },
+        ] = plan.members.as_slice()
+        else {
+            panic!("the augmentation must retain its Attributes contribution")
+        };
+        assert_eq!(
+            context.store().get_parent_of_symbol(*attributes),
+            Some(namespace)
+        );
+        assert!(
+            context
+                .store()
+                .symbol(*attributes)
+                .unwrap()
+                .flags()
+                .contains(SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT)
+        );
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+    }
+
+    #[test]
+    fn ambient_module_named_imports_resolve_export_assignment_namespace_members() {
+        let mut fixture = declaration_fixture(
+            concat!(
+                "declare module 'react' { ",
+                "export = React; ",
+                "namespace React { ",
+                "type ReactNode = string; ",
+                "interface ReactElement {} ",
+                "} } ",
+                "declare module 'prop-types' { ",
+                "import { ReactNode, ReactElement } from 'react'; ",
+                "interface Wrapper { node: ReactNode; element: ReactElement; } ",
+                "}",
+            ),
+            CanonicalModuleState::Script,
+        );
+
+        let namespace = plan(&fixture, 1);
+
+        assert_eq!(namespace.imports.len(), 2);
+        assert_eq!(namespace.imports[0].name_text, "ReactNode");
+        assert_eq!(namespace.imports[1].name_text, "ReactElement");
+        let aliases = namespace
+            .imports
+            .iter()
+            .map(|import| import.symbol)
+            .collect::<Vec<_>>();
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        for alias in aliases {
+            assert!(matches!(
+                fixture
+                    .context
+                    .store()
+                    .alias_symbol_links(alias)
+                    .map(|links| links.alias_target),
+                Some(AliasTargetState::Resolved(_))
+            ));
+        }
+        let before = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+    }
+
+    #[test]
+    fn ambient_module_export_assignments_resolve_their_namespace_alias() {
+        let mut fixture = declaration_fixture(
+            concat!(
+                "declare module 'react' { ",
+                "export = React; ",
+                "namespace React { interface Element {} } ",
+                "}",
+            ),
+            CanonicalModuleState::Script,
+        );
+
+        let namespace = plan(&fixture, 0);
+
+        let [export] = namespace.imports.as_slice() else {
+            panic!("the ambient module must retain its export-assignment alias")
+        };
+        let alias = export.symbol;
+        let [SourceNamespaceMemberPlan::Namespace(target)] = namespace.members.as_slice() else {
+            panic!("the ambient module must retain its exported namespace")
+        };
+        let target = target.symbol;
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        assert_eq!(
+            fixture
+                .context
+                .store()
+                .alias_symbol_links(alias)
+                .map(|links| links.alias_target),
+            Some(AliasTargetState::Resolved(target)),
+        );
+    }
+
+    #[test]
+    fn ambient_module_namespace_imports_resolve_same_file_modules() {
+        let mut fixture = declaration_fixture(
+            concat!(
+                "declare module 'prop-types' { export interface Value {} } ",
+                "declare module 'react' { ",
+                "import * as PropTypes from 'prop-types'; ",
+                "interface Wrapper { value: PropTypes.Value; } ",
+                "}",
+            ),
+            CanonicalModuleState::Script,
+        );
+
+        let namespace = plan(&fixture, 1);
+
+        let [import] = namespace.imports.as_slice() else {
+            panic!("the ambient module must retain one namespace import")
+        };
+        assert_eq!(import.name_text, "PropTypes");
+        let alias = import.symbol;
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        assert!(matches!(
+            fixture
+                .context
+                .store()
+                .alias_symbol_links(alias)
+                .map(|links| links.alias_target),
+            Some(AliasTargetState::Resolved(_))
+        ));
+    }
+
+    #[test]
+    fn ambient_module_imports_reject_missing_exports_without_publishing_aliases() {
+        let fixture = declaration_fixture(
+            concat!(
+                "declare module 'target' { export interface Existing {} } ",
+                "declare module 'source' { import { Missing } from 'target'; }",
+            ),
+            CanonicalModuleState::Script,
+        );
+        let declaration = declaration(&fixture, 1);
+        let (arena, bound) = fixture.context.file(fixture.file).unwrap();
+        let before = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+
+        assert!(matches!(
+            plan_source_namespace(arena, bound, fixture.context.store(), declaration),
+            Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Import(_)
+            ))
+        ));
+
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            before,
+        );
     }
 
     #[test]

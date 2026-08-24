@@ -13,7 +13,8 @@
 
 use std::collections::HashSet;
 
-use ts_binder::{SemanticSymbolId, SymbolFlags};
+use ts_ast::SyntaxKind;
+use ts_binder::{CheckFlags, SemanticSymbolId, SymbolFlags};
 
 use super::{
     CanonicalTypeMapperStore, TypeId,
@@ -22,6 +23,7 @@ use super::{
     instantiate::{
         InstantiationLimits, InstantiationSession, instantiate_type_with_vector_and_session,
     },
+    store::SourceNodeParent,
     type_records::{CacheHashKey, TypeCacheState, TypeData, TypeRecord, TypeReferenceData},
     types::{ObjectFlags, TypeFlags},
 };
@@ -360,6 +362,149 @@ fn validate_cached_reference_shell(
     Ok(arguments.to_vec())
 }
 
+fn validate_nongeneric_interface_argument_origin(
+    store: &CanonicalTypeMapperStore,
+    argument: TypeId,
+) -> Result<(), DirectGenericReferenceError> {
+    let invalid = || DirectGenericReferenceError::InvalidTarget(argument);
+    let record = store.type_payload(argument).ok_or_else(invalid)?;
+    let TypeData::Interface(interface) = record.data() else {
+        return Err(invalid());
+    };
+    let owner = record.symbol().ok_or_else(invalid)?;
+    let owner_record = store.symbol(owner).ok_or_else(invalid)?;
+    let declarations = owner_record
+        .declarations()
+        .filter(|declarations| !declarations.is_empty())
+        .ok_or_else(invalid)?;
+    let Some(this_type) = interface.this_type else {
+        return Err(invalid());
+    };
+    let mutable_flags = ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
+        | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES
+        | ObjectFlags::MEMBERS_RESOLVED
+        | ObjectFlags::CONTAINS_SPREAD
+        | ObjectFlags::OBJECT_REST_TYPE
+        | ObjectFlags::IDENTICAL_BASE_TYPE_CALCULATED
+        | ObjectFlags::IDENTICAL_BASE_TYPE_EXISTS
+        | ObjectFlags::UNRESOLVED_MEMBERS;
+    let allowed_flags = ObjectFlags::INTERFACE
+        | ObjectFlags::REFERENCE
+        | ObjectFlags::PROPAGATING_FLAGS
+        | mutable_flags;
+    let allowed_symbol_flags =
+        SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::TRANSIENT;
+    if record.flags() != TypeFlags::OBJECT
+        || record.object_flags() & ObjectFlags::OBJECT_TYPE_KIND_MASK
+            != (ObjectFlags::INTERFACE | ObjectFlags::REFERENCE)
+        || !(record.object_flags() & !allowed_flags).is_empty()
+        || record.alias().is_some()
+        || !owner_record.flags().contains(SymbolFlags::INTERFACE)
+        || owner_record.flags().without(allowed_symbol_flags) != SymbolFlags::NONE
+        || owner_record.check_flags() != CheckFlags::NONE
+        || owner_record.exports().is_some()
+        || owner_record.export_symbol().is_some()
+        || store.get_merged_symbol(owner) != Some(owner)
+        || store
+            .declared_type_links(owner)
+            .and_then(|links| links.declared_type)
+            != Some(argument)
+        || interface.outer_type_parameter_count != 0
+        || interface.all_type_parameters.as_deref() != Some(std::slice::from_ref(&this_type))
+        || interface.reference.object.target != Some(argument)
+        || interface.reference.object.mapper.is_some()
+        || interface.reference.node.is_some()
+        || interface.reference.resolved_type_arguments.as_deref() != Some(&[])
+    {
+        return Err(invalid());
+    }
+
+    let mut seen = HashSet::with_capacity(declarations.len());
+    let mut has_interface = false;
+    let mut value_declaration = None;
+    for &declaration in declarations {
+        if !seen.insert(declaration) || !store.contains_node_ref(declaration) {
+            return Err(invalid());
+        }
+        match store.source_node_kind(declaration) {
+            Some(SyntaxKind::InterfaceDeclaration) => {
+                let Some(SourceNodeParent::Parent(parent)) = store.source_node_parent(declaration)
+                else {
+                    return Err(invalid());
+                };
+                if !matches!(
+                    store.source_node_kind(parent),
+                    Some(SyntaxKind::SourceFile | SyntaxKind::ModuleBlock)
+                ) {
+                    return Err(invalid());
+                }
+                has_interface = true;
+            }
+            Some(SyntaxKind::VariableDeclaration)
+                if value_declaration.replace(declaration).is_none() => {}
+            _ => return Err(invalid()),
+        }
+    }
+    if !has_interface
+        || owner_record.value_declaration() != value_declaration
+        || owner_record
+            .flags()
+            .contains(SymbolFlags::FUNCTION_SCOPED_VARIABLE)
+            != value_declaration.is_some()
+    {
+        return Err(invalid());
+    }
+
+    let authoritative = match store.get_parent_of_symbol(owner) {
+        Some(parent) => store
+            .symbol(parent)
+            .filter(|parent| parent.flags().intersects(SymbolFlags::MODULE))
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| store.symbol_table(exports))
+            .and_then(|exports| exports.get(owner_record.name()))
+            .and_then(|symbol| store.get_merged_symbol(symbol)),
+        None => store
+            .intrinsic_bootstrap()
+            .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+            .and_then(|globals| globals.get(owner_record.name()))
+            .and_then(|symbol| store.get_merged_symbol(symbol)),
+    };
+    if authoritative != Some(owner) {
+        return Err(invalid());
+    }
+
+    let this_record = store.type_payload(this_type).ok_or_else(invalid)?;
+    let allowed_parameter_flags = ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
+        | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES;
+    if this_record.flags() != TypeFlags::TYPE_PARAMETER
+        || !(this_record.object_flags() == ObjectFlags::NONE
+            || this_record.object_flags() == allowed_parameter_flags)
+        || this_record.symbol() != Some(owner)
+        || this_record.alias().is_some()
+        || !matches!(
+            this_record.data(),
+            TypeData::TypeParameter(data)
+                if data.is_this_type
+                    && data.constraint == Some(argument)
+                    && data.target.is_none()
+                    && data.mapper.is_none()
+        )
+    {
+        return Err(invalid());
+    }
+
+    match &interface.reference.object.instantiations {
+        TypeCacheState::Allocated(cache)
+            if cache.len() == 1 && cache.get(&type_list_key(&[])) == Some(&argument) =>
+        {
+            Ok(())
+        }
+        _ => Err(DirectGenericReferenceError::InvalidInstantiationCache(
+            argument,
+        )),
+    }
+}
+
 fn validate_reference_argument_graph(
     store: &CanonicalTypeMapperStore,
     reference: TypeId,
@@ -409,6 +554,14 @@ fn validate_reference_argument_graph(
         _ => return Ok(()),
     };
     if target == reference {
+        if arguments.is_empty()
+            && matches!(record.data(), TypeData::Interface(_))
+            && record.object_flags().contains(ObjectFlags::INTERFACE)
+        {
+            validate_nongeneric_interface_argument_origin(store, reference)?;
+            validated.insert(reference);
+            return Ok(());
+        }
         // The origin's `(type parameters) -> origin` edge is the legal
         // recursive identity installed by declared-type initialization.
         let shape = direct_target_header(store, target)?;
@@ -901,10 +1054,16 @@ fn property_key_type_is_valid(
 mod tests {
     use super::*;
     use crate::semantic::{
-        DeclaredTypeLinks, IntrinsicBootstrapOptions, SemanticStore,
-        instantiate::instantiate_type_with_session, mapper::TypeMapper, type_records::TypeRecord,
+        DeclaredTypeHost, DeclaredTypeLinks, IntrinsicBootstrapOptions, SemanticStore,
+        instantiate::instantiate_type_with_session, mapper::TypeMapper,
+        production::GlobalMergeCompletion, type_records::TypeRecord,
     };
-    use ts_binder::{CheckFlags, EscapedName, SymbolData};
+    use ts_ast::{FileId, NodeData, NodeRef};
+    use ts_binder::{
+        CanonicalBinder, CanonicalModuleState, CanonicalNameResolverOptions,
+        CanonicalSourceFileFacts, CanonicalSourceLanguage, CheckFlags, EscapedName, SymbolData,
+    };
+    use ts_parser::parse_source_file;
 
     fn initialized_store() -> CanonicalTypeMapperStore {
         let mut store = SemanticStore::<TypeRecord, TypeMapper>::new();
@@ -967,6 +1126,250 @@ mod tests {
             type_list_key(&parameters),
         ));
         (target, parameters)
+    }
+
+    fn bound_nongeneric_this_argument() -> (CanonicalTypeMapperStore, TypeId, SemanticSymbolId) {
+        let parsed = parse_source_file(concat!(
+            "interface Element { self: this; } ",
+            "interface HTMLElement extends Element {} ",
+            "interface HTMLDivElement extends HTMLElement { ",
+            "addEventListener(listener: (this: HTMLDivElement) => void): void; ",
+            "} declare var HTMLDivElement: unknown;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(9_401);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new_with_default_library(
+                    EscapedName::source("\"/lib.dom.d.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    true,
+                    true,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let (symbols, mut files) = binder.finish().try_into_parts().unwrap();
+        let bound = files.remove(&file).unwrap();
+        let interface_declaration = |expected: &str| {
+            parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::InterfaceDeclaration(interface) = &record.data else {
+                        return None;
+                    };
+                    let NodeData::Identifier(name) = &parsed.arena.get(interface.name)?.data else {
+                        return None;
+                    };
+                    (name.text == expected).then_some(NodeRef::new(parsed.arena.id(), file, node))
+                })
+                .unwrap()
+        };
+        let declaration = interface_declaration("HTMLDivElement");
+        assert_eq!(
+            bound.contains_this(interface_declaration("Element")),
+            Some(true)
+        );
+        assert_eq!(bound.contains_this(declaration), Some(false));
+        let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
+        assert!(
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .is_some()
+        );
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        let globals = store.intrinsic_bootstrap().unwrap().globals;
+        let symbols = store
+            .symbol_table(bound.locals(bound.source_file()).unwrap())
+            .unwrap()
+            .iter()
+            .map(|(_, symbol)| symbol)
+            .collect::<Vec<_>>();
+        for symbol in symbols {
+            store.merge_global_symbol(globals, symbol).unwrap();
+        }
+        let owner = store
+            .get_merged_symbol(bound.symbol(declaration).unwrap())
+            .unwrap();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let argument = store.get_declared_type_of_symbol(&host, owner).unwrap();
+        (store, argument, owner)
+    }
+
+    #[test]
+    fn nongeneric_this_interface_is_a_canonical_generic_argument() {
+        let (mut store, argument, owner) = bound_nongeneric_this_argument();
+        let (outer, _) = generic_target(&mut store, "HTMLAttributes", ObjectFlags::INTERFACE, 1);
+        let argument_record = store.type_payload(argument).unwrap();
+        let TypeData::Interface(argument_data) = argument_record.data() else {
+            panic!("the DOM argument must retain its declared interface origin")
+        };
+        assert_eq!(
+            argument_record.object_flags() & ObjectFlags::OBJECT_TYPE_KIND_MASK,
+            ObjectFlags::INTERFACE | ObjectFlags::REFERENCE
+        );
+        assert_eq!(argument_data.reference.object.target, Some(argument));
+        assert_eq!(
+            argument_data.reference.resolved_type_arguments.as_deref(),
+            Some(&[][..])
+        );
+        assert_eq!(argument_record.symbol(), Some(owner));
+        assert_eq!(
+            store.symbol(owner).unwrap().flags(),
+            SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE
+        );
+
+        let cold_types = store.type_len();
+        let reference = create_direct_generic_reference(
+            &mut store,
+            outer,
+            &[argument],
+            ObjectFlags::FROM_TYPE_NODE,
+        )
+        .unwrap();
+        assert_eq!(store.type_len(), cold_types + 1);
+        assert_eq!(
+            validate_direct_generic_reference(&store, reference),
+            Ok(DirectGenericReference {
+                target: outer,
+                type_arguments: vec![argument],
+            })
+        );
+        assert_eq!(
+            validate_direct_generic_reference(&store, argument),
+            Err(DirectGenericReferenceError::NonGenericTarget(argument))
+        );
+        assert_eq!(
+            create_direct_generic_reference(&mut store, argument, &[], ObjectFlags::NONE),
+            Err(DirectGenericReferenceError::NonGenericTarget(argument))
+        );
+
+        let warm = (store.type_len(), store.mapper_len(), store.symbol_len());
+        assert_eq!(
+            create_direct_generic_reference(&mut store, outer, &[argument], ObjectFlags::NONE),
+            Ok(reference)
+        );
+        assert_eq!(
+            (store.type_len(), store.mapper_len(), store.symbol_len()),
+            warm
+        );
+    }
+
+    #[test]
+    fn nongeneric_this_interface_arguments_reject_forged_owner_and_cache_state() {
+        for corruption in 0..5 {
+            let (mut store, argument, owner) = bound_nongeneric_this_argument();
+            let (outer, outer_parameters) =
+                generic_target(&mut store, "HTMLAttributes", ObjectFlags::INTERFACE, 1);
+            let string = store.intrinsic_bootstrap().unwrap().string_type;
+            match corruption {
+                0 => {
+                    assert!(store.set_symbol_flags(owner, SymbolFlags::CLASS, CheckFlags::NONE));
+                }
+                1 => {
+                    assert!(store.set_symbol_declarations(owner, None, None));
+                }
+                2 => {
+                    let this_type = match store.type_payload(argument).unwrap().data() {
+                        TypeData::Interface(interface) => interface.this_type.unwrap(),
+                        _ => unreachable!("the fixture produces an interface origin"),
+                    };
+                    let mapper = store
+                        .new_simple_type_mapper(outer_parameters[0], string)
+                        .unwrap();
+                    assert!(store.set_type_parameter_resolution(
+                        this_type,
+                        Some(argument),
+                        None,
+                        Some(mapper),
+                        None,
+                    ));
+                }
+                3 => {
+                    let forged = store
+                        .alloc_type_reference(ObjectFlags::NONE, Some(owner))
+                        .unwrap();
+                    assert!(store.set_object_target_and_mapper(forged, Some(argument), None));
+                    assert!(store.set_type_reference_resolution(forged, None, Some(Vec::new())));
+                    assert!(store.try_reserve_object_instantiations(argument, 1));
+                    assert_eq!(
+                        store.insert_object_instantiation(
+                            argument,
+                            type_list_key(&[string]),
+                            forged,
+                        ),
+                        Some(forged)
+                    );
+                }
+                4 => {
+                    let forged = store
+                        .alloc_symbol(SymbolData::new(
+                            SymbolFlags::INTERFACE,
+                            EscapedName::source("HTMLDivElement"),
+                        ))
+                        .unwrap();
+                    let globals = store.intrinsic_bootstrap().unwrap().globals;
+                    assert_eq!(
+                        store
+                            .insert_symbol(globals, EscapedName::source("HTMLDivElement"), forged,),
+                        Some(Some(owner))
+                    );
+                }
+                _ => unreachable!("the corruption matrix has five entries"),
+            }
+            let before = (store.type_len(), store.mapper_len(), store.symbol_len());
+            let result =
+                create_direct_generic_reference(&mut store, outer, &[argument], ObjectFlags::NONE);
+            assert!(
+                matches!(
+                    result,
+                    Err(
+                        DirectGenericReferenceError::InvalidTarget(target)
+                            | DirectGenericReferenceError::InvalidInstantiationCache(target)
+                    )
+                        if target == argument
+                ),
+                "corruption {corruption}: {result:?}"
+            );
+            assert_eq!(
+                (store.type_len(), store.mapper_len(), store.symbol_len()),
+                before,
+                "corruption {corruption} published an outer reference"
+            );
+        }
+    }
+
+    #[test]
+    fn synthetic_nongeneric_self_reference_cannot_masquerade_as_bound_interface() {
+        let mut store = initialized_store();
+        let (argument, parameters) =
+            generic_target(&mut store, "Synthetic", ObjectFlags::INTERFACE, 0);
+        assert!(parameters.is_empty());
+        let (outer, _) = generic_target(&mut store, "Wrapper", ObjectFlags::INTERFACE, 1);
+        let before = (store.type_len(), store.mapper_len(), store.symbol_len());
+
+        assert_eq!(
+            create_direct_generic_reference(&mut store, outer, &[argument], ObjectFlags::NONE),
+            Err(DirectGenericReferenceError::InvalidTarget(argument))
+        );
+        assert_eq!(
+            (store.type_len(), store.mapper_len(), store.symbol_len()),
+            before
+        );
     }
 
     #[test]
