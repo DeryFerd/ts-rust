@@ -26,6 +26,8 @@
 //! Simple same-file namespaces can merge with a class and contribute numeric
 //! variable exports to its static member table.
 //! A class may extend the literal `null` without acquiring an instance base.
+//! An authenticated class/interface merge with `extends null` and `super()`
+//! retains its exact static-side and constructor diagnostics without publication.
 //! Nonempty executable bodies, general heritage, and non-primitive annotations
 //! remain later class stages.
 
@@ -44,6 +46,7 @@ use super::{
     IndexInfoId, ResolvedSignatureState, SignatureId, SignatureLinks, TypeId,
     bootstrap::LiteralTypeCacheError,
     declared::{preflight_class_or_interface_reference, preflight_node, type_list_key},
+    interface_heritage::{DirectInterfaceBaseKind, plan_direct_interface_heritage},
     links::{TypeNodeLinks, ValueSymbolLinks},
     reference_types::validate_direct_generic_reference,
     signatures::SignatureFlags,
@@ -6995,12 +6998,325 @@ pub(super) fn plan_anonymous_abstract_class_expression_grammar(
     })
 }
 
+fn plan_null_base_super_constructor(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    declaration: NodeRef,
+    constructor: NodeRef,
+) -> Option<NodeRef> {
+    let record = preflight_node(store, host, constructor).ok()?;
+    let NodeData::ConstructorDeclaration(data) = &record.data else {
+        return None;
+    };
+    if record.kind != SyntaxKind::Constructor
+        || record.flags.0 != 0
+        || record.parent != Some(declaration.node)
+        || data.asterisk_token.is_some()
+        || data.end_flow_node.is_some()
+        || data.full_signature.is_some()
+        || data.next_container.is_some()
+        || data.return_flow_node.is_some()
+        || data.symbol.is_some()
+        || data.type_.is_some()
+        || data.type_parameters.is_some()
+        || data.facts != 0
+        || data.modifiers.is_some()
+        || data.parameters.has_trailing_comma
+        || !data.parameters.nodes.is_empty()
+    {
+        return None;
+    }
+
+    let symbol = bound_symbol(store, host, constructor)?;
+    let symbol_record = store.symbol(symbol)?;
+    let members = store
+        .symbol(owner)
+        .and_then(Symbol::members)
+        .and_then(|members| store.symbol_table(members))?;
+    if members.len() != 1
+        || symbol_record.flags() != SymbolFlags::CONSTRUCTOR
+        || symbol_record.check_flags() != CheckFlags::NONE
+        || symbol_record.name() != InternalSymbolName::Constructor.as_ref()
+        || symbol_record.declarations() != Some(&[constructor])
+        || symbol_record.value_declaration().is_some()
+        || symbol_record.members().is_some()
+        || symbol_record.exports().is_some()
+        || symbol_record.parent() != Some(owner)
+        || symbol_record.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || members.get(InternalSymbolName::Constructor.as_ref()) != Some(symbol)
+        || store
+            .signature_links(constructor)
+            .is_some_and(|links| links != &SignatureLinks::default())
+    {
+        return None;
+    }
+
+    let body = NodeRef::new(constructor.arena, constructor.file, data.body?);
+    let body_record = preflight_node(store, host, body).ok()?;
+    let NodeData::Block(block) = &body_record.data else {
+        return None;
+    };
+    let [statement] = block.statements.nodes.as_slice() else {
+        return None;
+    };
+    if body_record.kind != SyntaxKind::Block
+        || body_record.flags.0 != 0
+        || body_record.parent != Some(constructor.node)
+        || body_record.range.start < data.parameters.range.end
+        || body_record.range.end != record.range.end
+        || block.flow_node.is_some()
+        || block.next_container.is_some()
+        || block.statements.has_trailing_comma
+        || block.facts != 0
+    {
+        return None;
+    }
+
+    let statement = NodeRef::new(body.arena, body.file, *statement);
+    let statement_record = preflight_node(store, host, statement).ok()?;
+    let NodeData::ExpressionStatement(expression_statement) = &statement_record.data else {
+        return None;
+    };
+    if statement_record.kind != SyntaxKind::ExpressionStatement
+        || statement_record.flags.0 != 0
+        || statement_record.parent != Some(body.node)
+        || statement_record.range.start < body_record.range.start
+        || statement_record.range.end > body_record.range.end
+        || expression_statement.flow_node.is_some()
+    {
+        return None;
+    }
+
+    let call = NodeRef::new(
+        statement.arena,
+        statement.file,
+        expression_statement.expression,
+    );
+    let call_record = preflight_node(store, host, call).ok()?;
+    let NodeData::CallExpression(expression) = &call_record.data else {
+        return None;
+    };
+    if call_record.kind != SyntaxKind::CallExpression
+        || call_record.flags.0 != 0
+        || call_record.parent != Some(statement.node)
+        || call_record.range.start < statement_record.range.start
+        || call_record.range.end > statement_record.range.end
+        || expression.question_dot_token.is_some()
+        || expression.symbol.is_some()
+        || expression.type_arguments.is_some()
+        || expression.facts != 0
+        || expression.arguments.has_trailing_comma
+        || !expression.arguments.nodes.is_empty()
+    {
+        return None;
+    }
+
+    let callee = NodeRef::new(call.arena, call.file, expression.expression);
+    let callee_record = preflight_node(store, host, callee).ok()?;
+    let NodeData::KeywordExpression(keyword) = &callee_record.data else {
+        return None;
+    };
+    let source_matches = host
+        .source(callee)
+        .and_then(|(arena, _)| arena.source_text())
+        .is_none_or(|source| {
+            source.get(
+                callee_record.range.start.get() as usize..callee_record.range.end.get() as usize,
+            ) == Some("super")
+        });
+    (callee_record.kind == SyntaxKind::SuperKeyword
+        && callee_record.flags.0 == 0
+        && callee_record.parent == Some(call.node)
+        && callee_record.range.start == call_record.range.start
+        && callee_record.range.end <= call_record.range.end
+        && keyword.flow_node.is_none()
+        && source_matches)
+        .then_some(call)
+}
+
+fn plan_merged_null_base_class_grammar_diagnostics(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+) -> Option<ClassGrammarDiagnosticPlan> {
+    if store.get_merged_symbol(symbol)? != symbol {
+        return None;
+    }
+    let owner = store.symbol(symbol)?;
+    let [declaration, interface_declaration] = owner.declarations()? else {
+        return None;
+    };
+    let declaration = *declaration;
+    let interface_declaration = *interface_declaration;
+    if owner.flags() != SymbolFlags::CLASS | SymbolFlags::INTERFACE
+        || owner.check_flags() != CheckFlags::NONE
+        || owner.value_declaration() != Some(declaration)
+        || owner.parent().is_some()
+        || owner.export_symbol().is_some()
+        || !interface_declaration.is_for(declaration.arena, declaration.file)
+        || !host.symbol_matches(store, declaration, symbol)
+        || !host.symbol_matches(store, interface_declaration, symbol)
+        || store
+            .declared_type_links(symbol)
+            .is_some_and(|links| links.declared_type.is_some())
+        || store
+            .value_symbol_links(symbol)
+            .is_some_and(|links| links != &ValueSymbolLinks::default())
+    {
+        return None;
+    }
+
+    let record = preflight_node(store, host, declaration).ok()?;
+    let NodeData::ClassDeclaration(class) = &record.data else {
+        return None;
+    };
+    let interface_record = preflight_node(store, host, interface_declaration).ok()?;
+    let NodeData::InterfaceDeclaration(interface) = &interface_record.data else {
+        return None;
+    };
+    let [constructor] = class.members.nodes.as_slice() else {
+        return None;
+    };
+    if record.kind != SyntaxKind::ClassDeclaration
+        || record.flags.0 & (NODE_FLAG_JSDOC | NODE_FLAG_HAS_ERROR) != 0
+        || class.flow_node.is_some()
+        || class.local_symbol.is_some()
+        || class.symbol.is_some()
+        || class.next_container.is_some()
+        || class.facts != 0
+        || class.modifiers.is_some()
+        || class.type_parameters.is_some()
+        || class.members.has_trailing_comma
+        || class.members.range.start < record.range.start
+        || class.members.range.end != record.range.end
+        || interface_record.kind != SyntaxKind::InterfaceDeclaration
+        || interface_record.flags.0 != 0
+        || interface_record.parent != record.parent
+        || interface_record.range.start < record.range.end
+        || interface.flow_node.is_some()
+        || interface.local_symbol.is_some()
+        || interface.symbol.is_some()
+        || interface.modifiers.is_some()
+        || interface.type_parameters.is_some()
+        || !interface.members.nodes.is_empty()
+        || interface.members.has_trailing_comma
+        || interface.members.range.start < interface_record.range.start
+        || interface.members.range.end != interface_record.range.end
+    {
+        return None;
+    }
+
+    let parent = NodeRef::new(declaration.arena, declaration.file, record.parent?);
+    let parent_record = preflight_node(store, host, parent).ok()?;
+    let NodeData::SourceFile(source) = &parent_record.data else {
+        return None;
+    };
+    if parent_record.kind != SyntaxKind::SourceFile
+        || parent_record.parent.is_some()
+        || [declaration, interface_declaration]
+            .into_iter()
+            .any(|candidate| {
+                source
+                    .statements
+                    .nodes
+                    .iter()
+                    .filter(|statement| **statement == candidate.node)
+                    .count()
+                    != 1
+            })
+    {
+        return None;
+    }
+
+    let (name, class_name) = accessor_name(store, host, declaration, class.name?).ok()?;
+    let (interface_name, interface_name_text) =
+        accessor_name(store, host, interface_declaration, interface.name).ok()?;
+    if owner.name().as_utf8() != Some(class_name.as_str())
+        || interface_name_text != class_name
+        || preflight_node(store, host, name).ok()?.range.start < record.range.start
+        || preflight_node(store, host, interface_name)
+            .ok()?
+            .range
+            .start
+            < interface_record.range.start
+    {
+        return None;
+    }
+
+    let exports = owner.exports()?;
+    validate_prototype(store, symbol, exports).ok()?;
+    if store.symbol_table(exports)?.len() != 1 {
+        return None;
+    }
+    plan_null_class_base(store, host, declaration, class.heritage_clauses.as_ref()?).ok()??;
+
+    let heritage = plan_direct_interface_heritage(
+        store,
+        host,
+        interface_declaration,
+        symbol,
+        interface.heritage_clauses.as_ref()?,
+    )
+    .ok()?;
+    let [base] = heritage.bases.as_slice() else {
+        return None;
+    };
+    if base.kind != DirectInterfaceBaseKind::Interface || !base.type_arguments.is_empty() {
+        return None;
+    }
+    let base_plan = super::object_members::plan_interface(store, host, base.symbol).ok()?;
+    if base_plan.declarations.len() != 1
+        || base_plan.members.is_some()
+        || !base_plan.properties.is_empty()
+        || !base_plan.methods.is_empty()
+        || !base_plan.spreads.is_empty()
+        || !base_plan.indexes.is_empty()
+        || !base_plan.call_signatures.is_empty()
+        || base_plan.heritage.is_some()
+        || !base_plan.node.is_for(declaration.arena, declaration.file)
+        || preflight_node(store, host, base_plan.node).ok()?.range.end > record.range.start
+    {
+        return None;
+    }
+
+    let call = plan_null_base_super_constructor(
+        store,
+        host,
+        symbol,
+        declaration,
+        NodeRef::new(declaration.arena, declaration.file, *constructor),
+    )?;
+    Some(ClassGrammarDiagnosticPlan {
+        declaration,
+        symbol,
+        diagnostics: vec![
+            ClassGrammarDiagnostic {
+                node: name,
+                range_override: None,
+                code: 2417,
+                arguments: vec![format!("typeof {class_name}"), String::from("null")],
+            },
+            ClassGrammarDiagnostic {
+                node: call,
+                range_override: None,
+                code: 17005,
+                arguments: Vec::new(),
+            },
+        ],
+    })
+}
+
 /// Authenticates supported class grammar failures without publishing class types.
 pub(super) fn plan_class_grammar_diagnostics(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     symbol: SemanticSymbolId,
 ) -> Option<ClassGrammarDiagnosticPlan> {
+    if let Some(plan) = plan_merged_null_base_class_grammar_diagnostics(store, host, symbol) {
+        return Some(plan);
+    }
     if store.get_merged_symbol(symbol)? != symbol {
         return None;
     }
@@ -13928,6 +14244,142 @@ mod tests {
             warm_state
         );
         assert_ne!(fixture.store.checker_link_allocated_lengths(), link_counts);
+    }
+
+    #[test]
+    fn merged_null_base_super_call_preserves_exact_diagnostics_without_publication() {
+        let fixture = fixture(concat!(
+            "interface Base {}\n",
+            "class C extends null { constructor() { super(); } }\n",
+            "interface C extends Base {}\n",
+        ));
+        let owner = class_symbol(&fixture, "C");
+        let declaration = class_node(&fixture, "C");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let cold = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        let grammar = plan_class_grammar_diagnostics(&fixture.store, &host, owner)
+            .expect("the merged null-base class retains its exact constructor diagnostics");
+
+        assert_eq!(grammar.declaration, declaration);
+        assert_eq!(grammar.symbol, owner);
+        assert_eq!(
+            fixture.store.symbol(owner).unwrap().flags(),
+            SymbolFlags::CLASS | SymbolFlags::INTERFACE,
+        );
+        assert_eq!(
+            grammar
+                .diagnostics
+                .iter()
+                .map(|diagnostic| (diagnostic.code, diagnostic.arguments.clone()))
+                .collect::<Vec<_>>(),
+            [
+                (2417, vec![String::from("typeof C"), String::from("null")]),
+                (17005, Vec::new()),
+            ],
+        );
+        let source = fixture.parsed.arena.source_text().unwrap();
+        assert_eq!(
+            grammar
+                .diagnostics
+                .iter()
+                .map(|diagnostic| {
+                    assert!(diagnostic.range_override.is_none());
+                    let range = fixture
+                        .parsed
+                        .arena
+                        .get(diagnostic.node.node)
+                        .unwrap()
+                        .range;
+                    &source[range.start.get() as usize..range.end.get() as usize]
+                })
+                .collect::<Vec<_>>(),
+            ["C", "super()"],
+        );
+        assert_eq!(
+            plan_class_grammar_diagnostics(&fixture.store, &host, owner),
+            Some(grammar),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            cold,
+        );
+        assert!(fixture.store.declared_type_links(owner).is_none());
+        assert!(fixture.store.value_symbol_links(owner).is_none());
+    }
+
+    #[test]
+    fn merged_null_base_super_call_rejects_forged_owner_and_constructor_provenance() {
+        for poison in 0..3 {
+            let mut fixture = fixture(concat!(
+                "interface Base {}\n",
+                "class C extends null { constructor() { super(); } }\n",
+                "interface C extends Base {}\n",
+            ));
+            let owner = class_symbol(&fixture, "C");
+            let declaration = class_node(&fixture, "C");
+            let bound = &fixture.files[&fixture.file];
+            let NodeData::ClassDeclaration(class) =
+                &fixture.parsed.arena.get(declaration.node).unwrap().data
+            else {
+                panic!("C retains its class declaration")
+            };
+            let constructor =
+                NodeRef::new(declaration.arena, declaration.file, class.members.nodes[0]);
+            let constructor_symbol = bound.symbol(constructor).unwrap();
+            match poison {
+                0 => assert!(fixture.store.set_symbol_flags(
+                    owner,
+                    SymbolFlags::CLASS,
+                    CheckFlags::NONE,
+                )),
+                1 => assert!(fixture.store.set_symbol_flags(
+                    constructor_symbol,
+                    SymbolFlags::METHOD,
+                    CheckFlags::NONE,
+                )),
+                2 => {
+                    let declarations = fixture.store.symbol(owner).unwrap().declarations().unwrap();
+                    let reordered = vec![declarations[1], declarations[0]];
+                    assert!(fixture.store.set_symbol_declarations(
+                        owner,
+                        Some(reordered),
+                        Some(declaration),
+                    ));
+                }
+                _ => unreachable!("only authenticated owner and constructor poison is visited"),
+            }
+            let host = host(&fixture.parsed.arena, bound);
+            let poisoned = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            assert!(
+                plan_class_grammar_diagnostics(&fixture.store, &host, owner).is_none(),
+                "poison case {poison}",
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                poisoned,
+            );
+            assert!(fixture.store.declared_type_links(owner).is_none());
+            assert!(fixture.store.value_symbol_links(owner).is_none());
+        }
     }
 
     #[test]

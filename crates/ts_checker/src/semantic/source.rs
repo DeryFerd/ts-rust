@@ -2003,6 +2003,29 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         if let Err(error) =
                             super::object_members::plan_interface(store, host, symbol)
                         {
+                            if let Some(owner) = store.symbol(symbol)
+                                && owner.flags() == (SymbolFlags::CLASS | SymbolFlags::INTERFACE)
+                                && let Some([class, interface]) = owner.declarations()
+                                && *interface == statement
+                                && statements.iter().any(|planned| {
+                                    matches!(
+                                        planned,
+                                        PlannedStatement::ClassGrammar(grammar)
+                                            if grammar.symbol == symbol
+                                                && grammar.declaration == *class
+                                                && matches!(
+                                                    grammar.diagnostics.as_slice(),
+                                                    [static_side, constructor]
+                                                        if static_side.code == 2417
+                                                            && constructor.code == 17005
+                                                )
+                                    )
+                                })
+                                && plan_class_grammar_diagnostics(store, host, symbol)
+                                    .is_some_and(|grammar| grammar.declaration == *class)
+                            {
+                                continue;
+                            }
                             if let Some(conflict) =
                                 self.plan_merged_interface_conflict(statement, symbol)?
                             {
@@ -26642,6 +26665,110 @@ mod tests {
         mark_source_unchecked(&mut context, file);
         context.check_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn merged_null_base_class_reports_exact_static_and_super_diagnostics_and_replays_warm() {
+        let source = parsed(concat!(
+            "interface Base {}\n\n",
+            "class C extends null {\n",
+            "  constructor() {\n",
+            "    super();\n",
+            "  }\n",
+            "}\n",
+            "interface C extends Base {}\n",
+        ));
+        let file = FileId::new(8_482);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                no_implicit_any: true,
+                strict_property_initialization: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        let owner = global_symbol(&context, "C");
+        let base = global_symbol(&context, "Base");
+
+        context.check_source_file(file).unwrap();
+
+        let [static_side, constructor] = context.diagnostics().as_slice() else {
+            panic!("a merged null-base class must retain exactly two source diagnostics")
+        };
+        assert_eq!(static_side.diagnostic.code(), 2417);
+        assert_eq!(node_text(&source, static_side.node.unwrap()), "C");
+        assert_eq!(
+            static_side.diagnostic.render().unwrap(),
+            "Class static side 'typeof C' incorrectly extends base class static side 'null'.",
+        );
+        assert!(static_side.range_override.is_none());
+        assert!(static_side.related_information.is_empty());
+        assert_eq!(constructor.diagnostic.code(), 17005);
+        assert_eq!(node_text(&source, constructor.node.unwrap()), "super()");
+        assert_eq!(
+            constructor.diagnostic.render().unwrap(),
+            "A constructor cannot contain a 'super' call when its class extends 'null'.",
+        );
+        assert!(constructor.range_override.is_none());
+        assert!(constructor.related_information.is_empty());
+        assert!(context.store().declared_type_links(base).is_some());
+        assert!(context.store().declared_type_links(owner).is_none());
+        assert!(context.store().value_symbol_links(owner).is_none());
+        assert!(is_type_checked(&context, file));
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn merged_null_base_class_rejects_unsupported_constructor_and_interface_shapes_atomically() {
+        for (index, text) in [
+            concat!(
+                "interface Base {} ",
+                "class C extends null { constructor() {} } ",
+                "interface C extends Base {}",
+            ),
+            concat!(
+                "interface Base {} ",
+                "class C extends null { constructor() { super(1); } } ",
+                "interface C extends Base {}",
+            ),
+            concat!(
+                "interface Base {} ",
+                "class C extends null { constructor() { super(); } } ",
+                "interface C extends Base { value: string; }",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parsed(text);
+            let file = FileId::new(8_483 + u32::try_from(index).unwrap());
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            let owner = global_symbol(&context, "C");
+            let base = global_symbol(&context, "Base");
+            let cold = observable_state(&context, file);
+
+            assert!(
+                matches!(
+                    context.check_source_file(file),
+                    Err(SourceCheckError::Unsupported(
+                        UnsupportedSourceSyntax::Class(_)
+                    ))
+                ),
+                "{text}",
+            );
+            assert_eq!(observable_state(&context, file), cold, "{text}");
+            assert!(context.store().declared_type_links(base).is_none());
+            assert!(context.store().declared_type_links(owner).is_none());
+            assert!(context.store().value_symbol_links(owner).is_none());
+            assert!(context.diagnostics().is_empty());
+        }
     }
 
     #[test]
