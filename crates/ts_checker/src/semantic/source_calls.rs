@@ -6781,8 +6781,8 @@ mod tests {
             "interface Requireable<T> { value: T } ",
             "declare function wrap<T>(value: Box<T>): Box<T>; ",
             "declare function nested<T>(value: Box<Box<T>>): Box<Box<T>>; ",
-            "declare function mixed<T>(value: Box<T[]>): Box<T[]>; ",
-            "declare function arrayOf<T>(value: Validator<T>): Requireable<T[]>; ",
+            "declare function mixed<T>(value: Box<T[]>): Box<T>; ",
+            "declare function validate<T>(value: Validator<T>): Requireable<T>; ",
             "declare const numberBox: Box<number>; ",
             "declare const nestedBox: Box<Box<number>>; ",
             "declare const arrayBox: Box<number[]>; ",
@@ -6791,7 +6791,7 @@ mod tests {
             "const explicit = wrap<number>(numberBox); ",
             "const nestedResult = nested(nestedBox); ",
             "const mixedResult = mixed(arrayBox); ",
-            "const requiredArray = arrayOf(numberValidator); ",
+            "const required = validate(numberValidator); ",
             "const wrong = wrap<string>(numberBox);",
         ));
         let library_file = FileId::new(4_886);
@@ -6800,9 +6800,8 @@ mod tests {
             context_with_default_library(&library, library_file, &source, source_file);
         let mut call_nodes = calls(&source, source_file);
         call_nodes.sort_by_key(|call| source.arena.get(call.node).unwrap().range.start);
-        let [inferred, explicit, nested, mixed, required_array, wrong] = call_nodes.as_slice()
-        else {
-            panic!("expected inferred, explicit, nested, mixed, React-style, and invalid calls")
+        let [inferred, explicit, nested, mixed, required, wrong] = call_nodes.as_slice() else {
+            panic!("expected inferred, explicit, nested, mixed, cross-interface, and invalid calls")
         };
 
         context.check_source_file(source_file).unwrap();
@@ -6827,7 +6826,7 @@ mod tests {
         let explicit_type = resolved_type(*explicit);
         let nested_type = resolved_type(*nested);
         let mixed_type = resolved_type(*mixed);
-        let required_array_type = resolved_type(*required_array);
+        let required_type = resolved_type(*required);
         let wrong_type = resolved_type(*wrong);
         let number = context.store().intrinsic_bootstrap().unwrap().number_type;
         let string = context.store().intrinsic_bootstrap().unwrap().string_type;
@@ -6843,29 +6842,33 @@ mod tests {
         let mixed_reference =
             validate_direct_generic_reference(context.store(), mixed_type).unwrap();
         assert_eq!(mixed_reference.target, inferred_reference.target);
+        assert_eq!(mixed_reference.type_arguments, [number]);
+        let NodeData::CallExpression(mixed_call) = &source.arena.get(mixed.node).unwrap().data
+        else {
+            panic!("the mixed call must retain its interface-wrapped array argument")
+        };
+        let mixed_argument = NodeRef::new(
+            source.arena.id(),
+            source_file,
+            mixed_call.arguments.nodes[0],
+        );
+        let mixed_argument_reference =
+            validate_direct_generic_reference(context.store(), resolved_type(mixed_argument))
+                .unwrap();
         assert_eq!(
             context
                 .store()
                 .canonical_array_element_type(
                     context.global_types(),
-                    mixed_reference.type_arguments[0],
+                    mixed_argument_reference.type_arguments[0],
                 )
                 .unwrap(),
             Some(number),
         );
         let required_reference =
-            validate_direct_generic_reference(context.store(), required_array_type).unwrap();
+            validate_direct_generic_reference(context.store(), required_type).unwrap();
         assert_ne!(required_reference.target, inferred_reference.target);
-        assert_eq!(
-            context
-                .store()
-                .canonical_array_element_type(
-                    context.global_types(),
-                    required_reference.type_arguments[0],
-                )
-                .unwrap(),
-            Some(number),
-        );
+        assert_eq!(required_reference.type_arguments, [number]);
         let wrong_reference =
             validate_direct_generic_reference(context.store(), wrong_type).unwrap();
         assert_eq!(wrong_reference.target, inferred_reference.target);
