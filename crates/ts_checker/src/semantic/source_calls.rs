@@ -50,6 +50,7 @@ use super::{
         PlannedExpression, PlannedExpressionKind, PlannedIdentifierReadKind, SourceCheckError,
         UnsupportedSourceSyntax, logical_binary_operator_text, merge_retry_diagnostic,
         merge_retry_diagnostics, primitive_binary_operator_text,
+        retry_source_generic_member_failure,
     },
     source_callables::{StoredSourceCallableValidation, validate_stored_source_callable},
     source_imports::synthetic_source_import_origin,
@@ -2961,6 +2962,9 @@ pub(super) fn check_direct_source_call(
             .map(|type_arguments| type_arguments.nodes.as_slice()),
     )?;
     let mut retried_signatures = HashSet::new();
+    let mut retried_members = HashSet::new();
+    let mut retried_properties = HashSet::new();
+    let mut relation_candidates = Vec::new();
     let resolution = loop {
         match resolve_source_call_once(
             store,
@@ -2988,6 +2992,28 @@ pub(super) fn check_direct_source_call(
                     session,
                     diagnostics,
                     signature,
+                )?;
+            }
+            Err(SourceCallResolutionError::Relation(
+                error @ (RelationUnavailable::UnresolvedStructuredMembers(_)
+                | RelationUnavailable::UnresolvedPropertyType(_)),
+            )) => {
+                if relation_candidates.is_empty() {
+                    relation_candidates.extend_from_slice(argument_types);
+                }
+                if let RelationUnavailable::UnresolvedStructuredMembers(type_) = error
+                    && !relation_candidates.contains(&type_)
+                {
+                    relation_candidates.push(type_);
+                }
+                retry_source_generic_member_failure(
+                    store,
+                    global_types,
+                    session,
+                    error,
+                    &relation_candidates,
+                    &mut retried_members,
+                    &mut retried_properties,
                 )?;
             }
             Err(SourceCallResolutionError::Relation(error)) => return Err(error.into()),

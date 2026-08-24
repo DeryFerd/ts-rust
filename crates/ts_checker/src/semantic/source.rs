@@ -17128,7 +17128,7 @@ fn source_type_is_assignable_to(
     }
 }
 
-fn retry_source_generic_member_failure(
+pub(super) fn retry_source_generic_member_failure(
     store: &mut CanonicalTypeMapperStore,
     global_types: &CanonicalGlobalTypes,
     session: &mut InstantiationSession,
