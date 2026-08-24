@@ -1935,7 +1935,7 @@ fn diagnostics_mode_counts_a_clean_missing_baseline_as_an_exact_match() {
 }
 
 #[test]
-fn omitted_pinned_boolean_axis_is_enumerated_but_never_counted_exact() {
+fn supported_unchecked_indexed_access_axis_reports_real_diagnostic_mismatches() {
     let repository = TestRepository::new();
     repository.write_case(
         "typeSatisfaction_propertyValueConformance2",
@@ -1987,30 +1987,32 @@ fn omitted_pinned_boolean_axis_is_enumerated_but_never_counted_exact() {
     assert!(stdout.contains("[noUncheckedIndexedAccess=false]"));
     assert!(stdout.contains("executed_variants=2 matched=0 mismatched=2"));
     assert!(stdout.contains("exact_matches=0"));
-    assert!(stdout.contains("unsupported_details=2"));
+    assert!(stdout.contains("unsupported_details=0"));
+    assert!(stdout.contains("header_mismatches=2"));
 
     let scorecard: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(scorecard_path).unwrap()).unwrap();
     assert_eq!(scorecard["summary"]["executedVariants"], 2);
     assert_eq!(scorecard["summary"]["exactMatches"], 0);
-    assert_eq!(scorecard["summary"]["unsupportedDetails"], 2);
+    assert_eq!(scorecard["summary"]["unsupportedDetails"], 0);
+    assert_eq!(scorecard["summary"]["headerMismatches"], 2);
     let variants = scorecard["variants"].as_array().unwrap();
     assert_eq!(variants[0]["options"]["noUncheckedIndexedAccess"], "true");
     assert_eq!(variants[1]["options"]["noUncheckedIndexedAccess"], "false");
     assert!(
         variants
             .iter()
-            .all(|variant| variant["status"] == "unsupported_detail")
+            .all(|variant| variant["status"] == "header_mismatch")
     );
     assert!(
         variants
             .iter()
-            .all(|variant| variant["outcomeClass"] == "harness_config")
+            .all(|variant| variant["outcomeClass"] == "supported_mismatch")
     );
 }
 
 #[test]
-fn emit_mode_never_counts_unsupported_variants_as_clean_exact_matches() {
+fn emit_mode_counts_supported_unchecked_indexed_access_variants_as_exact_matches() {
     let repository = TestRepository::new();
     repository.write_case(
         "unsupportedEmitMatrix",
@@ -2024,12 +2026,9 @@ fn emit_mode_never_counts_unsupported_variants_as_clean_exact_matches() {
     );
 
     let output = run(&repository.0, &["--filter", "unsupportedEmitMatrix"]);
-    assert_eq!(output.status.code(), Some(1));
+    assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("[noUncheckedIndexedAccess=true]"));
-    assert!(stdout.contains("[noUncheckedIndexedAccess=false]"));
-    assert!(stdout.contains("unsupported configuration"));
-    assert!(stdout.contains("executed_variants=2 matched=0 mismatched=2"));
+    assert!(stdout.contains("executed_variants=2 matched=2 mismatched=0"));
 }
 
 #[test]
