@@ -10,8 +10,10 @@
 //! flag. Value preparation supports initialized annotated `const` declarations,
 //! authenticated `CommonJS` variables and named assignments, exact
 //! `export declare const` declarations in retained declaration files, and
-//! annotated `FunctionDeclaration`s. Declaration-file bodies are never source
-//! checked by this leaf; only the final imported annotation is queried.
+//! annotated `FunctionDeclaration`s, and already-published inferred object
+//! constants with authenticated fresh-to-widened provenance. Declaration-file
+//! bodies are never source checked by this leaf; only the final imported
+//! annotation is queried.
 //!
 //! Source integration separates declaration checking from value use. Every
 //! binding is resolved through [`resolve_source_import_binding`], including
@@ -47,6 +49,7 @@ use super::{
         CanonicalAliasTargetHost, CanonicalImmediateAliasTarget,
     },
     array_types::CanonicalArrayTargets,
+    derived_types::DerivedObjectLiteralValidation,
     enums,
     instantiate::InstantiationSession,
     jsdoc::{
@@ -189,6 +192,10 @@ enum PreparedSourceImportTarget {
     ExportedObject {
         expression: NodeRef,
     },
+    PublishedObjectConst {
+        expression: NodeRef,
+        expression_type: TypeId,
+    },
     JavaScriptAnnotatedConst {
         annotation: Option<PlannedJsDocType>,
     },
@@ -234,6 +241,12 @@ enum PlannedSourceImportValueTarget {
     ExportedObject {
         declaration: NodeRef,
         expression: NodeRef,
+        type_: TypeId,
+    },
+    PublishedObjectConst {
+        declaration: NodeRef,
+        expression: NodeRef,
+        expression_type: TypeId,
         type_: TypeId,
     },
     JavaScriptAnnotatedConst {
@@ -2324,6 +2337,7 @@ pub(super) fn prepare_source_import_value(
         | PlannedSourceImportValueTarget::DeclarationNumericConst { declaration, .. }
         | PlannedSourceImportValueTarget::ConstEnum { declaration }
         | PlannedSourceImportValueTarget::ExportedObject { declaration, .. }
+        | PlannedSourceImportValueTarget::PublishedObjectConst { declaration, .. }
         | PlannedSourceImportValueTarget::JavaScriptAnnotatedConst { declaration, .. }
         | PlannedSourceImportValueTarget::CommonJsNamedExport { declaration, .. }
         | PlannedSourceImportValueTarget::ModuleNamespace { declaration, .. } => *declaration,
@@ -2430,6 +2444,18 @@ pub(super) fn prepare_source_import_value(
         } => (
             type_,
             PreparedSourceImportTarget::ExportedObject { expression },
+        ),
+        PlannedSourceImportValueTarget::PublishedObjectConst {
+            expression,
+            expression_type,
+            type_,
+            ..
+        } => (
+            type_,
+            PreparedSourceImportTarget::PublishedObjectConst {
+                expression,
+                expression_type,
+            },
         ),
         PlannedSourceImportValueTarget::JavaScriptAnnotatedConst {
             declaration,
@@ -3297,7 +3323,7 @@ fn plan_direct_import_value_target(
                 flags,
             }));
         }
-        return plan_direct_typescript_const_target(store, host, alias, target);
+        return plan_direct_typescript_const_target(store, host, global_types, alias, target);
     }
     if flags == SymbolFlags::FUNCTION {
         return plan_direct_annotated_function_target(
@@ -4531,6 +4557,7 @@ fn materialize_imported_module_namespace(
                 None,
             ),
             PlannedSourceImportValueTarget::ExportedObject { type_, .. } => (type_, None),
+            PlannedSourceImportValueTarget::PublishedObjectConst { type_, .. } => (type_, None),
             PlannedSourceImportValueTarget::DeclarationNumericConst { literal, .. } => (
                 declaration_numeric_literal_type(store, member.value_symbol, &literal)?,
                 None,
@@ -4687,7 +4714,8 @@ fn preflight_imported_module_namespace_members(
             PlannedSourceImportValueTarget::DeclarationNumericConst { .. }
             | PlannedSourceImportValueTarget::JavaScriptAnnotatedConst { .. }
             | PlannedSourceImportValueTarget::CommonJsNamedExport { .. }
-            | PlannedSourceImportValueTarget::ExportedObject { .. } => {}
+            | PlannedSourceImportValueTarget::ExportedObject { .. }
+            | PlannedSourceImportValueTarget::PublishedObjectConst { .. } => {}
             PlannedSourceImportValueTarget::ConstEnum { .. } => {
                 enums::preflight_enum(store, host, member.value_symbol)
                     .map_err(DeclaredTypeError::from)?;
@@ -5397,6 +5425,7 @@ fn exact_namespace_empty_void_function(
 fn plan_direct_typescript_const_target(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
     alias: SemanticSymbolId,
     target: SemanticSymbolId,
 ) -> Result<PlannedSourceImportValueTarget, SourceImportError> {
@@ -5609,6 +5638,65 @@ fn plan_direct_typescript_const_target(
             literal: literal.text.clone(),
         });
     }
+    if !facts.is_declaration_file() && variable.type_.is_none() {
+        let expression = variable
+            .initializer
+            .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+            .ok_or_else(|| {
+                unsupported(SourceImportUnsupported::MissingTargetInitializer(
+                    declaration,
+                ))
+            })?;
+        let expression_record = checked_node(arena, bound, store, expression)?;
+        let NodeData::ObjectLiteralExpression(object) = &expression_record.data else {
+            return Err(unsupported(
+                SourceImportUnsupported::MissingTargetAnnotation(declaration),
+            ));
+        };
+        if expression_record.kind != SyntaxKind::ObjectLiteralExpression
+            || expression_record.flags.0 != 0
+            || expression_record.parent != Some(declaration.node)
+            || object.symbol.is_some()
+            || object.facts != 0
+        {
+            return Err(unsupported(SourceImportUnsupported::TargetDeclaration(
+                expression,
+            )));
+        }
+        let expression_type = store
+            .type_node_links(expression)
+            .and_then(|links| {
+                (links
+                    == &TypeNodeLinks {
+                        resolved_type: links.resolved_type,
+                        ..TypeNodeLinks::default()
+                    })
+                    .then_some(links.resolved_type)
+                    .flatten()
+            })
+            .ok_or_else(|| {
+                unsupported(SourceImportUnsupported::MissingTargetAnnotation(
+                    declaration,
+                ))
+            })?;
+        let type_ = store
+            .value_symbol_links(target)
+            .and_then(|links| links.resolved_type)
+            .ok_or_else(|| {
+                unsupported(SourceImportUnsupported::MissingTargetAnnotation(
+                    declaration,
+                ))
+            })?;
+        if !published_object_const_type_is_exact(store, global_types, expression_type, type_) {
+            return Err(invariant(SourceImportInvariant::InvalidTargetLinks(target)));
+        }
+        return Ok(PlannedSourceImportValueTarget::PublishedObjectConst {
+            declaration,
+            expression,
+            expression_type,
+            type_,
+        });
+    }
     let type_node = variable
         .type_
         .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
@@ -5651,6 +5739,37 @@ fn plan_direct_typescript_const_target(
         declaration,
         type_node,
     })
+}
+
+fn published_object_const_type_is_exact(
+    store: &CanonicalTypeMapperStore,
+    global_types: &CanonicalGlobalTypes,
+    expression_type: TypeId,
+    value_type: TypeId,
+) -> bool {
+    let Some(expression) = store.type_payload(expression_type) else {
+        return false;
+    };
+    if expression.flags() != TypeFlags::OBJECT
+        || !expression
+            .object_flags()
+            .contains(ObjectFlags::OBJECT_LITERAL | ObjectFlags::MEMBERS_RESOLVED)
+    {
+        return false;
+    }
+    if expression_type == value_type {
+        return true;
+    }
+    let DerivedObjectLiteralValidation::Valid { source, .. } =
+        store.validate_derived_object_literal_with_global_types(value_type, global_types)
+    else {
+        return false;
+    };
+    source == expression_type
+        || matches!(
+            store.validate_derived_object_literal_with_global_types(source, global_types),
+            DerivedObjectLiteralValidation::Valid { source, .. } if source == expression_type
+        )
 }
 
 fn declaration_numeric_literal_type(
@@ -5925,6 +6044,40 @@ fn validate_prepared_import_value(
                     .type_node_links(*expression)
                     .and_then(|links| links.resolved_type)
                     == Some(prepared.type_)
+        }
+        PreparedSourceImportTarget::PublishedObjectConst {
+            expression,
+            expression_type,
+        } => {
+            store.symbol(prepared.target_symbol).is_some_and(|target| {
+                target.flags() == SymbolFlags::BLOCK_SCOPED_VARIABLE
+                    && target.check_flags() == CheckFlags::NONE
+                    && target.declarations() == Some(&[prepared.target_declaration])
+                    && target.value_declaration() == Some(prepared.target_declaration)
+            }) && store.source_node_kind(prepared.target_declaration)
+                == Some(SyntaxKind::VariableDeclaration)
+                && store.source_node_kind(*expression) == Some(SyntaxKind::ObjectLiteralExpression)
+                && store.source_node_parent(*expression)
+                    == Some(SourceNodeParent::Parent(prepared.target_declaration))
+                && store
+                    .type_node_links(*expression)
+                    .and_then(|links| links.resolved_type)
+                    == Some(*expression_type)
+                && store
+                    .value_symbol_links(prepared.target_symbol)
+                    .and_then(|links| links.resolved_type)
+                    == Some(prepared.type_)
+                && (prepared.type_ == *expression_type
+                    || matches!(
+                        store.validate_derived_object_literal_for_relation(prepared.type_),
+                        DerivedObjectLiteralValidation::Valid { source, .. }
+                            if source == *expression_type
+                                || matches!(
+                                    store.validate_derived_object_literal_for_relation(source),
+                                    DerivedObjectLiteralValidation::Valid { source, .. }
+                                        if source == *expression_type
+                                )
+                    ))
         }
         PreparedSourceImportTarget::JavaScriptAnnotatedConst { annotation } => {
             let valid_target = store.symbol(prepared.target_symbol).is_some_and(|target| {
@@ -9193,6 +9346,125 @@ mod tests {
                 .value_symbol_links(plan.bindings[0].alias_symbol)
                 .is_none()
         );
+        publish_for_test(&mut fixture.store, std::slice::from_ref(&prepared));
+        let warm = store_state(&fixture.store);
+        assert_eq!(
+            prepare_one(&mut fixture, &resolved[0], &read).unwrap(),
+            prepared,
+        );
+        assert_eq!(store_state(&fixture.store), warm);
+    }
+
+    #[test]
+    fn inferred_exported_object_const_imports_reuse_published_widened_identity() {
+        let mut fixture = fixture(
+            &[
+                "import { value } from './target'; const result = value;",
+                "export const value = { name: 'ready' };",
+            ],
+            &[Route {
+                source: 0,
+                specifier: 0,
+                target: Some(1),
+            }],
+        );
+        let plan = fixture.plan_import(0, 0);
+        let read_node = identifier_initializer(&fixture, 0, "value");
+        let bound = fixture.bound.get(&fixture.files[0].file).unwrap();
+        let read = plan_source_import_identifier_read(
+            &fixture.files[0].parsed.arena,
+            bound,
+            &fixture.store,
+            &plan.bindings[0],
+            read_node,
+            "value",
+            plan.bindings[0].alias_symbol,
+        )
+        .unwrap();
+        let resolved = resolve_all(&mut fixture, &plan.bindings).unwrap();
+        let target = resolved[0].target_symbol;
+        let cold = store_state(&fixture.store);
+        assert!(matches!(
+            prepare_one(&mut fixture, &resolved[0], &read),
+            Err(SourceImportError::Unsupported(
+                SourceImportUnsupported::MissingTargetAnnotation(_)
+            ))
+        ));
+        assert_eq!(store_state(&fixture.store), cold);
+
+        let (expression, expression_type, value_type) = {
+            let Fixture {
+                files,
+                bound,
+                global_types,
+                store,
+                ..
+            } = &mut fixture;
+            let sources = || {
+                files.iter().map(|file| {
+                    (
+                        &file.parsed.arena,
+                        bound.get(&file.file).expect("fixture bound every file"),
+                    )
+                })
+            };
+            let host = DeclaredTypeHost::new_after_global_merge(
+                sources(),
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            let provider = &files[1];
+            let expression =
+                provider
+                    .parsed
+                    .arena
+                    .iter()
+                    .find_map(|(node, record)| {
+                        (record.kind == SyntaxKind::ObjectLiteralExpression).then_some(
+                            NodeRef::new(provider.parsed.arena.id(), provider.file, node),
+                        )
+                    })
+                    .unwrap();
+            let object =
+                super::super::object_members::plan_object_literal(store, &host, expression)
+                    .unwrap();
+            let regular = store.regular_string_literal_type("ready".into()).unwrap();
+            let fresh = store.fresh_type_of_literal_type(regular).unwrap();
+            let expression_type =
+                super::super::object_members::publish_object_literal(store, &object, &[fresh])
+                    .unwrap();
+            let value_type = store
+                .get_widened_type_with_global_types(expression_type, global_types)
+                .unwrap();
+            assert!(store.set_value_symbol_links(
+                target,
+                ValueSymbolLinks {
+                    resolved_type: Some(value_type),
+                    ..ValueSymbolLinks::default()
+                },
+            ));
+            (expression, expression_type, value_type)
+        };
+
+        let prepared = prepare_one(&mut fixture, &resolved[0], &read).unwrap();
+        assert_eq!(prepared.type_, value_type);
+        assert!(matches!(
+            &prepared.target,
+            PreparedSourceImportTarget::PublishedObjectConst {
+                expression: actual,
+                expression_type: actual_type,
+            } if *actual == expression && *actual_type == expression_type
+        ));
+        assert_eq!(
+            fixture
+                .store
+                .resolved_own_property(value_type, "name")
+                .unwrap()
+                .unwrap()
+                .type_,
+            fixture.store.intrinsic_bootstrap().unwrap().string_type,
+        );
+
         publish_for_test(&mut fixture.store, std::slice::from_ref(&prepared));
         let warm = store_state(&fixture.store);
         assert_eq!(
