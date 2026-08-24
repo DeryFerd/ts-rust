@@ -351,6 +351,23 @@ pub(super) struct SourceSwitchFunctionStatementsSyntax {
     pub(super) no_match_flow: Option<FlowRef>,
 }
 
+/// One direct call retained from a reachable or unreachable switch clause.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceVoidSwitchCallSyntax {
+    pub(super) statement: NodeRef,
+    pub(super) expression: NodeRef,
+    pub(super) unreachable: bool,
+}
+
+/// An inferred-void string switch containing bare returns and direct calls.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceVoidSwitchFunctionStatementsSyntax {
+    pub(super) body: NodeRef,
+    pub(super) switch: SourceControlSwitchSyntax,
+    pub(super) returns: Vec<NodeRef>,
+    pub(super) calls: Vec<SourceVoidSwitchCallSyntax>,
+}
+
 /// One grouped `typeof` case whose expression is followed by an unlabeled break.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SourceTypeofSwitchExpressionSyntax {
@@ -1826,6 +1843,22 @@ pub(super) fn plan_source_switch_function_statements_syntax(
     .plan_switch()
 }
 
+/// Proves a string switch with bare returns and grouped unreachable calls.
+pub(super) fn plan_source_void_switch_function_statements_syntax(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    callable: &SourceCallablePlan,
+) -> Result<SourceVoidSwitchFunctionStatementsSyntax, SourceFunctionStatementsError> {
+    SyntaxPlanner {
+        arena,
+        bound,
+        store,
+        callable,
+    }
+    .plan_void_switch()
+}
+
 /// Proves grouped `typeof` cases that contain one expression and an unlabeled break.
 pub(super) fn plan_source_typeof_switch_function_statements_syntax(
     arena: &NodeArena,
@@ -1871,6 +1904,282 @@ struct SyntaxPlanner<'a> {
 }
 
 impl SyntaxPlanner<'_> {
+    fn plan_void_switch(
+        &self,
+    ) -> Result<SourceVoidSwitchFunctionStatementsSyntax, SourceFunctionStatementsError> {
+        let declaration = self.callable.declaration;
+        if !declaration.is_for(self.arena.id(), self.bound.file_id())
+            || self.bound.node_arena_id() != self.arena.id()
+            || self.bound.node_arena_revision() != self.arena.revision()
+        {
+            return Err(SourceFunctionStatementsInvariant::BoundSourceMismatch(declaration).into());
+        }
+        if self.callable.family != SourceCallableFamily::FunctionDeclaration
+            || !self.callable.return_type.is_inferred()
+            || !self.callable.type_parameters.is_empty()
+        {
+            return Err(self.unsupported(
+                declaration,
+                self.node(declaration)?.kind,
+                SourceFunctionStatementsRole::Callable,
+            ));
+        }
+        let [parameter] = self.callable.parameters.as_slice() else {
+            return Err(self.unsupported(
+                declaration,
+                self.node(declaration)?.kind,
+                SourceFunctionStatementsRole::Callable,
+            ));
+        };
+        let Some(annotation) = parameter.explicit_type_node() else {
+            return Err(self.unsupported(
+                parameter.declaration,
+                self.node(parameter.declaration)?.kind,
+                SourceFunctionStatementsRole::Condition,
+            ));
+        };
+        let annotation_record = self.node(annotation)?;
+        if annotation_record.kind != SyntaxKind::StringKeyword
+            || annotation_record.flags.0 != 0
+            || annotation_record.parent != Some(parameter.declaration.node)
+            || self.bound.symbol(parameter.declaration) != Some(parameter.symbol)
+        {
+            return Err(self.unsupported(
+                annotation,
+                annotation_record.kind,
+                SourceFunctionStatementsRole::Condition,
+            ));
+        }
+
+        let record = self.node(declaration)?;
+        let NodeData::FunctionDeclaration(function) = &record.data else {
+            return Err(self.unsupported(
+                declaration,
+                record.kind,
+                SourceFunctionStatementsRole::Callable,
+            ));
+        };
+        if record.kind != SyntaxKind::FunctionDeclaration
+            || function.body != Some(self.callable.body.node)
+            || function.type_.is_some()
+        {
+            return Err(SourceFunctionStatementsInvariant::InvalidCallableEdge(declaration).into());
+        }
+
+        let body = self.callable.body;
+        self.validate_range(body, declaration)?;
+        let statements = self.plan_body(body, declaration)?;
+        let [statement] = statements.as_slice() else {
+            return Err(self.unsupported(
+                body,
+                self.node(body)?.kind,
+                SourceFunctionStatementsRole::FunctionBody,
+            ));
+        };
+        let switch = plan_source_control_switch_syntax(
+            self.arena,
+            self.bound,
+            self.reference(*statement),
+            body,
+        )?;
+        for node in [switch.statement, switch.expression, switch.case_block] {
+            self.validate_block_scope_container(node, declaration)?;
+        }
+
+        let discriminant = self.node(switch.expression)?;
+        let NodeData::Identifier(identifier) = &discriminant.data else {
+            return Err(self.unsupported(
+                switch.expression,
+                discriminant.kind,
+                SourceFunctionStatementsRole::Condition,
+            ));
+        };
+        let parameter_record = self.node(parameter.declaration)?;
+        let NodeData::ParameterDeclaration(parameter_data) = &parameter_record.data else {
+            return Err(SourceFunctionStatementsInvariant::InvalidCallableEdge(declaration).into());
+        };
+        let parameter_name = self.reference(parameter_data.name);
+        let parameter_name_record = self.node(parameter_name)?;
+        let NodeData::Identifier(parameter_identifier) = &parameter_name_record.data else {
+            return Err(SourceFunctionStatementsInvariant::InvalidCallableEdge(declaration).into());
+        };
+        if discriminant.kind != SyntaxKind::Identifier
+            || discriminant.flags.0 != 0
+            || identifier.flow_node.is_some()
+            || identifier.text != parameter_identifier.text
+            || parameter_name_record.kind != SyntaxKind::Identifier
+            || parameter_name_record.parent != Some(parameter.declaration.node)
+        {
+            return Err(self.unsupported(
+                switch.expression,
+                discriminant.kind,
+                SourceFunctionStatementsRole::Condition,
+            ));
+        }
+
+        let graph = self.bound.flow_graph();
+        let start = graph.container_start(declaration).ok_or(
+            SourceFunctionStatementsInvariant::MissingFlowStart(declaration),
+        )?;
+        if graph.container_is_complete(declaration) != Some(true)
+            || graph.container_end(declaration).is_none()
+            || self.switch_flow_at(switch.statement, declaration)? != start
+            || self.switch_flow_at(switch.expression, declaration)? != start
+        {
+            return Err(Self::incomplete_switch_flow(switch.statement));
+        }
+
+        let mut returns = Vec::new();
+        let mut calls = Vec::new();
+        let mut has_default = false;
+        for clause in &switch.clauses {
+            self.validate_block_scope_container(clause.clause, switch.case_block)?;
+            if let Some(case) = clause.expression {
+                self.validate_block_scope_container(case, switch.case_block)?;
+                let record = self.node(case)?;
+                let NodeData::StringLiteral(literal) = &record.data else {
+                    return Err(self.unsupported(
+                        case,
+                        record.kind,
+                        SourceFunctionStatementsRole::Condition,
+                    ));
+                };
+                if record.kind != SyntaxKind::StringLiteral
+                    || record.flags.0 != 0
+                    || literal.token_flags.0 != 0
+                {
+                    return Err(self.unsupported(
+                        case,
+                        record.kind,
+                        SourceFunctionStatementsRole::Condition,
+                    ));
+                }
+            } else if has_default {
+                return Err(self.unsupported(
+                    clause.clause,
+                    self.node(clause.clause)?.kind,
+                    SourceFunctionStatementsRole::BranchStatement,
+                ));
+            } else {
+                has_default = true;
+            }
+
+            for statement in &clause.statements {
+                self.validate_block_scope_container(*statement, switch.case_block)?;
+                let unreachable = graph.is_unreachable(*statement).ok_or(
+                    SourceFunctionStatementsInvariant::InvalidFlowContainer {
+                        node: *statement,
+                        expected: declaration,
+                        actual: self.bound.flow_container(*statement),
+                    },
+                )?;
+                if self.bound.flow_container(*statement) != Some(declaration)
+                    || !unreachable && self.bound.flow_at(*statement).is_none()
+                {
+                    return Err(SourceFunctionStatementsInvariant::InvalidFlowContainer {
+                        node: *statement,
+                        expected: declaration,
+                        actual: self.bound.flow_container(*statement),
+                    }
+                    .into());
+                }
+
+                let record = self.node(*statement)?;
+                match &record.data {
+                    NodeData::ReturnStatement(returned)
+                        if record.kind == SyntaxKind::ReturnStatement
+                            && record.flags.0 == 0
+                            && record.parent == Some(clause.clause.node)
+                            && returned.expression.is_none()
+                            && returned.flow_node.is_none()
+                            && returned.facts == 0
+                            && !unreachable =>
+                    {
+                        returns.push(*statement);
+                    }
+                    NodeData::ExpressionStatement(expression)
+                        if record.kind == SyntaxKind::ExpressionStatement
+                            && record.flags.0 == 0
+                            && record.parent == Some(clause.clause.node)
+                            && expression.flow_node.is_none() =>
+                    {
+                        let call = self.reference(expression.expression);
+                        self.validate_parent(
+                            call,
+                            Some(statement.node),
+                            SourceFunctionStatementsRole::BranchStatement,
+                        )?;
+                        self.validate_range(call, *statement)?;
+                        self.validate_container(call, declaration)?;
+                        self.validate_block_scope_container(call, switch.case_block)?;
+                        let call_record = self.node(call)?;
+                        let NodeData::CallExpression(call_data) = &call_record.data else {
+                            return Err(self.unsupported(
+                                call,
+                                call_record.kind,
+                                SourceFunctionStatementsRole::BranchStatement,
+                            ));
+                        };
+                        let [argument] = call_data.arguments.nodes.as_slice() else {
+                            return Err(self.unsupported(
+                                call,
+                                call_record.kind,
+                                SourceFunctionStatementsRole::BranchStatement,
+                            ));
+                        };
+                        let argument = self.reference(*argument);
+                        let argument_record = self.node(argument)?;
+                        if call_record.kind != SyntaxKind::CallExpression
+                            || call_record.flags.0 != 0
+                            || call_data.question_dot_token.is_some()
+                            || call_data.symbol.is_some()
+                            || call_data.type_arguments.is_some()
+                            || call_data.arguments.has_trailing_comma
+                            || call_data.facts != 0
+                            || argument_record.kind != SyntaxKind::StringLiteral
+                            || argument_record.flags.0 != 0
+                            || argument_record.parent != Some(call.node)
+                        {
+                            return Err(self.unsupported(
+                                call,
+                                call_record.kind,
+                                SourceFunctionStatementsRole::BranchStatement,
+                            ));
+                        }
+                        self.validate_container(argument, declaration)?;
+                        self.validate_block_scope_container(argument, switch.case_block)?;
+                        calls.push(SourceVoidSwitchCallSyntax {
+                            statement: *statement,
+                            expression: call,
+                            unreachable,
+                        });
+                    }
+                    _ => {
+                        return Err(self.unsupported(
+                            *statement,
+                            record.kind,
+                            SourceFunctionStatementsRole::BranchStatement,
+                        ));
+                    }
+                }
+            }
+        }
+        if returns.is_empty() || calls.is_empty() {
+            return Err(self.unsupported(
+                switch.statement,
+                SyntaxKind::SwitchStatement,
+                SourceFunctionStatementsRole::BodyStatement,
+            ));
+        }
+
+        Ok(SourceVoidSwitchFunctionStatementsSyntax {
+            body,
+            switch,
+            returns,
+            calls,
+        })
+    }
+
     fn plan_typeof_switch(
         &self,
     ) -> Result<SourceTypeofSwitchFunctionStatementsSyntax, SourceFunctionStatementsError> {
@@ -7057,6 +7366,126 @@ mod joined_tests {
                 .iter()
                 .all(|clause| clause.unreachable_ranges.is_empty())
         );
+    }
+
+    #[test]
+    fn void_switch_authenticates_bare_returns_and_grouped_unreachable_calls() {
+        for (index, source, reachability, expected_range) in [
+            (
+                0_u32,
+                concat!(
+                    "function choose(value: string) {\n",
+                    "  switch (value) {\n",
+                    "    case 'first':\n",
+                    "      return;\n",
+                    "      console.log('one');\n",
+                    "      console.log('two');\n",
+                    "    case 'second':\n",
+                    "      console.log('three');\n",
+                    "  }\n",
+                    "}\n",
+                ),
+                [true, true, false, false],
+                "console.log('one');\n      console.log('two');",
+            ),
+            (
+                1,
+                concat!(
+                    "function choose(value: string) {\n",
+                    "  switch (value) {\n",
+                    "    case 'first':\n",
+                    "      console.log('one');\n",
+                    "    default:\n",
+                    "      return;\n",
+                    "      console.log('two');\n",
+                    "      console.log('three');\n",
+                    "    case 'second':\n",
+                    "      console.log('four');\n",
+                    "  }\n",
+                    "}\n",
+                ),
+                [false, true, true, false],
+                "console.log('two');\n      console.log('three');",
+            ),
+        ] {
+            let fixture = JoinedFixture::new(source, FileId::new(1_420 + index));
+            let callable = fixture.callable();
+
+            let syntax = plan_source_void_switch_function_statements_syntax(
+                &fixture.parsed.arena,
+                &fixture.bound,
+                &fixture.store,
+                &callable,
+            )
+            .unwrap();
+
+            assert_eq!(syntax.body, callable.body);
+            assert_eq!(syntax.returns.len(), 1);
+            assert_eq!(
+                syntax
+                    .calls
+                    .iter()
+                    .map(|call| call.unreachable)
+                    .collect::<Vec<_>>(),
+                reachability
+                    .into_iter()
+                    .take(syntax.calls.len())
+                    .collect::<Vec<_>>(),
+            );
+            for call in &syntax.calls {
+                assert_eq!(
+                    fixture.bound.flow_graph().is_unreachable(call.statement),
+                    Some(call.unreachable),
+                );
+            }
+            let ranges = syntax
+                .switch
+                .clauses
+                .iter()
+                .flat_map(|clause| clause.unreachable_ranges.iter())
+                .collect::<Vec<_>>();
+            let [range] = ranges.as_slice() else {
+                panic!("expected one grouped unreachable range")
+            };
+            let range = range.range();
+            let start = usize::try_from(range.start.get()).unwrap();
+            let end = usize::try_from(range.end.get()).unwrap();
+            assert_eq!(source.get(start..end), Some(expected_range));
+        }
+    }
+
+    #[test]
+    fn void_switch_rejects_other_returns_cases_and_call_arguments() {
+        for (index, source) in [
+            "function choose(value: number) { switch (value) { case 'first': return; case 'second': log('x'); } }",
+            "function choose(value: string) { switch (value) { case 'first': return value; case 'second': log('x'); } }",
+            "function choose(value: string) { switch (value) { case 1: return; case 'second': log('x'); } }",
+            "function choose(value: string) { switch (value) { case 'first': return; case 'second': log(value); } }",
+            "function choose(value: string) { switch (value) { case 'first': return; case 'second': value; } }",
+            "function choose(value: string) { switch (value) { case 'first': log('x'); } }",
+            "function choose(value: string) { switch (value) { case 'first': return; } }",
+            "function choose(value: string, other: string) { switch (other) { case 'first': return; case 'second': log('x'); } }",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture =
+                JoinedFixture::new(source, FileId::new(1_430 + u32::try_from(index).unwrap()));
+            let callable = fixture.callable();
+
+            assert!(
+                matches!(
+                    plan_source_void_switch_function_statements_syntax(
+                        &fixture.parsed.arena,
+                        &fixture.bound,
+                        &fixture.store,
+                        &callable,
+                    ),
+                    Err(SourceFunctionStatementsError::Unsupported(_)),
+                ),
+                "unexpectedly admitted void switch: {source}",
+            );
+        }
     }
 
     #[test]
