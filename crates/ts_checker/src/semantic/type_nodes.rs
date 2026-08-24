@@ -58,8 +58,8 @@ use super::{
         resolve_nongeneric_keyof_type,
     },
     mapped_types::{
-        MappedTypeDeclarationPlan, MappedTypeError, MappedTypeModifiers, MappedTypeRequest,
-        plan_mapped_type_declaration,
+        MappedTypeDeclarationPlan, MappedTypeError, MappedTypeKeys, MappedTypeModifiers,
+        MappedTypeRequest, plan_mapped_type_declaration, plan_mapped_type_keys,
     },
     object_diagnostics,
     object_members::{self, PropertyObjectError, PropertyObjectPlan, PropertyObjectState},
@@ -372,6 +372,22 @@ struct PropTypesInferPropsPlan {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DefaultLibraryMappedUtilityKind {
+    Partial,
+    Pick,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DefaultLibraryMappedUtilityPlan {
+    kind: DefaultLibraryMappedUtilityKind,
+    mapped: NodeRef,
+    source_parameter: SemanticSymbolId,
+    key_parameter: Option<SemanticSymbolId>,
+    source_reference: NodeRef,
+    modifiers: MappedTypeModifiers,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PlannedTypeParameter {
     declaration: NodeRef,
     symbol: SemanticSymbolId,
@@ -429,6 +445,8 @@ struct TypeQueryPlan {
     react_detailed_html_props_aliases: BTreeMap<SemanticSymbolId, ReactDetailedHtmlPropsPlan>,
     default_library_non_nullable_aliases: BTreeMap<SemanticSymbolId, DefaultLibraryNonNullablePlan>,
     prop_types_infer_props_aliases: BTreeMap<SemanticSymbolId, PropTypesInferPropsPlan>,
+    default_library_mapped_utility_aliases:
+        BTreeMap<SemanticSymbolId, DefaultLibraryMappedUtilityPlan>,
     recursive_mapped_aliases: BTreeMap<SemanticSymbolId, NodeRef>,
     references: BTreeMap<NodeRef, PlannedTypeReference>,
     recovered_missing_references: BTreeMap<NodeRef, NodeRef>,
@@ -561,6 +579,48 @@ fn valid_record_mapped_alias_identity(
         .is_some_and(|alias| {
             alias.symbol() == Some(symbol) && alias.type_arguments() == Some(arguments)
         })
+}
+
+fn validate_supported_mapped_alias_instantiation(
+    store: &CanonicalTypeMapperStore,
+    alias: SemanticSymbolId,
+    declared_type: TypeId,
+    type_parameters: &[TypeId],
+    type_arguments: &[TypeId],
+    instantiated: TypeId,
+    utility: Option<DefaultLibraryMappedUtilityPlan>,
+) -> Result<(), MappedTypeError> {
+    match utility {
+        Some(DefaultLibraryMappedUtilityPlan {
+            kind: DefaultLibraryMappedUtilityKind::Partial,
+            modifiers,
+            ..
+        }) => store.validate_homomorphic_mapped_alias_instantiation(
+            alias,
+            declared_type,
+            type_parameters,
+            type_arguments,
+            instantiated,
+            modifiers,
+        ),
+        Some(DefaultLibraryMappedUtilityPlan {
+            kind: DefaultLibraryMappedUtilityKind::Pick,
+            ..
+        }) => store.validate_pick_mapped_alias_instantiation(
+            alias,
+            declared_type,
+            type_parameters,
+            type_arguments,
+            instantiated,
+        ),
+        None => store.validate_record_mapped_alias_instantiation(
+            alias,
+            declared_type,
+            type_parameters,
+            type_arguments,
+            instantiated,
+        ),
+    }
 }
 
 fn is_instantiated_mapped_type(store: &CanonicalTypeMapperStore, type_: TypeId) -> bool {
@@ -1914,6 +1974,11 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 .get(&alias)
                 .is_some_and(|alias| !alias.type_parameters.is_empty())
             && recursive_alias.is_none()
+            && !self
+                .plan
+                .default_library_mapped_utility_aliases
+                .get(&alias)
+                .is_some_and(|utility| utility.mapped == node)
             && !self.is_homomorphic_generic_mapped_alias(alias, mapped)?
         {
             self.validate_record_mapped_alias_plan(alias, mapped)?;
@@ -4823,16 +4888,18 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                                     } else {
                                         (symbol, owner_arguments.as_slice())
                                     };
-                                if self
-                                    .store
-                                    .validate_record_mapped_alias_instantiation(
+                                if validate_supported_mapped_alias_instantiation(
+                                    self.store,
+                                    canonical,
+                                    target_cached.declared_type,
+                                    type_parameters,
+                                    &type_arguments,
+                                    declared_type,
+                                    self.authenticated_default_library_mapped_utility_alias(
                                         canonical,
-                                        target_cached.declared_type,
-                                        type_parameters,
-                                        &type_arguments,
-                                        declared_type,
-                                    )
-                                    .is_err()
+                                    ),
+                                )
+                                .is_err()
                                     || !valid_record_mapped_alias_identity(
                                         self.store,
                                         identity_symbol,
@@ -7186,6 +7253,270 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         })
     }
 
+    #[allow(clippy::too_many_lines)] // The utility declaration and every bound parameter are one proof.
+    fn authenticated_default_library_mapped_utility_alias(
+        &self,
+        alias: SemanticSymbolId,
+    ) -> Option<DefaultLibraryMappedUtilityPlan> {
+        let owner = self.store.symbol(alias)?;
+        let kind = match owner.name().as_utf8()? {
+            "Partial" if self.global_symbol_has_name(alias, "Partial") => {
+                DefaultLibraryMappedUtilityKind::Partial
+            }
+            "Pick" if self.global_symbol_has_name(alias, "Pick") => {
+                DefaultLibraryMappedUtilityKind::Pick
+            }
+            _ => return None,
+        };
+        let [declaration] = owner.declarations()? else {
+            return None;
+        };
+        let declaration = *declaration;
+        let bound = self.host.bound_file(declaration)?;
+        let facts = bound.source_facts()?;
+        let record = preflight_node(self.store, self.host, declaration).ok()?;
+        let NodeData::TypeAliasDeclaration(data) = &record.data else {
+            return None;
+        };
+        let name = NodeRef::new(declaration.arena, declaration.file, data.name);
+        let name_record = preflight_node(self.store, self.host, name).ok()?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return None;
+        };
+        let expected_name = match kind {
+            DefaultLibraryMappedUtilityKind::Partial => "Partial",
+            DefaultLibraryMappedUtilityKind::Pick => "Pick",
+        };
+        if owner.flags() != SymbolFlags::TYPE_ALIAS
+            || owner.check_flags() != CheckFlags::NONE
+            || owner.parent().is_some()
+            || owner.value_declaration().is_some()
+            || owner.members().is_some()
+            || owner.exports().is_some()
+            || owner.export_symbol().is_some()
+            || self.store.get_merged_symbol(alias) != Some(alias)
+            || !facts.is_default_library()
+            || !facts.is_declaration_file()
+            || facts.is_javascript_file()
+            || facts.is_external_module()
+            || facts.is_common_js_module()
+            || record.kind != SyntaxKind::TypeAliasDeclaration
+            || record.flags.0 != 0
+            || record.parent != Some(bound.source_file().node)
+            || !self.host.symbol_matches(self.store, declaration, alias)
+            || bound
+                .symbol(declaration)
+                .and_then(|symbol| self.store.get_merged_symbol(symbol))
+                != Some(alias)
+            || data.flow_node.is_some()
+            || data.local_symbol.is_some()
+            || data.next_container.is_some()
+            || data.symbol.is_some()
+            || data.modifiers.is_some()
+            || name_record.kind != SyntaxKind::Identifier
+            || name_record.flags.0 != 0
+            || name_record.parent != Some(declaration.node)
+            || identifier.text != expected_name
+            || identifier.flow_node.is_some()
+        {
+            return None;
+        }
+
+        let metadata = self.plan.aliases.get(&alias);
+        let expected_parameters = match kind {
+            DefaultLibraryMappedUtilityKind::Partial => ["T"].as_slice(),
+            DefaultLibraryMappedUtilityKind::Pick => ["T", "K"].as_slice(),
+        };
+        let parameters = data.type_parameters.as_ref()?;
+        let locals = bound
+            .locals(declaration)
+            .and_then(|locals| self.store.symbol_table(locals))?;
+        if parameters.has_trailing_comma
+            || parameters.nodes.len() != expected_parameters.len()
+            || metadata
+                .is_some_and(|metadata| metadata.type_parameters.len() != expected_parameters.len())
+            || locals.len() != expected_parameters.len()
+        {
+            return None;
+        }
+        let mut planned_parameters = Vec::with_capacity(expected_parameters.len());
+        for (index, (parameter_id, expected)) in
+            parameters.nodes.iter().zip(expected_parameters).enumerate()
+        {
+            let parameter = NodeRef::new(declaration.arena, declaration.file, *parameter_id);
+            let parameter_record = preflight_node(self.store, self.host, parameter).ok()?;
+            let NodeData::TypeParameterDeclaration(parameter_data) = &parameter_record.data else {
+                return None;
+            };
+            let parameter_name = NodeRef::new(parameter.arena, parameter.file, parameter_data.name);
+            let name_record = preflight_node(self.store, self.host, parameter_name).ok()?;
+            let NodeData::Identifier(identifier) = &name_record.data else {
+                return None;
+            };
+            let symbol = bound
+                .symbol(parameter)
+                .and_then(|symbol| self.store.get_merged_symbol(symbol))?;
+            let parameter_owner = self.store.symbol(symbol)?;
+            if parameter_record.kind != SyntaxKind::TypeParameter
+                || parameter_record.flags.0 != 0
+                || parameter_record.parent != Some(declaration.node)
+                || parameter_data.default_type.is_some()
+                || parameter_data.expression.is_some()
+                || parameter_data.symbol.is_some()
+                || parameter_data.modifiers.is_some()
+                || metadata.is_some_and(|metadata| {
+                    metadata.type_parameters[index].declaration != parameter
+                        || metadata.type_parameters[index].symbol != symbol
+                })
+                || parameter_owner.flags() != SymbolFlags::TYPE_PARAMETER
+                || parameter_owner.check_flags() != CheckFlags::NONE
+                || parameter_owner.name().as_utf8() != Some(*expected)
+                || parameter_owner.declarations() != Some(&[parameter])
+                || parameter_owner.parent().is_some()
+                || parameter_owner.value_declaration().is_some()
+                || parameter_owner.members().is_some()
+                || parameter_owner.exports().is_some()
+                || parameter_owner.export_symbol().is_some()
+                || locals.get_source(expected) != Some(symbol)
+                || !self.host.symbol_matches(self.store, parameter, symbol)
+                || name_record.kind != SyntaxKind::Identifier
+                || name_record.flags.0 != 0
+                || name_record.parent != Some(parameter.node)
+                || identifier.text != *expected
+                || identifier.flow_node.is_some()
+            {
+                return None;
+            }
+            planned_parameters.push(PlannedTypeParameter {
+                declaration: parameter,
+                symbol,
+                constraint: parameter_data
+                    .constraint
+                    .map(|node| NodeRef::new(parameter.arena, parameter.file, node)),
+                default_type: None,
+            });
+        }
+
+        let source_parameter = planned_parameters[0];
+        if source_parameter.constraint.is_some() || source_parameter.default_type.is_some() {
+            return None;
+        }
+        let mapped = NodeRef::new(declaration.arena, declaration.file, data.type_);
+        let mapped_record = preflight_node(self.store, self.host, mapped).ok()?;
+        if metadata.is_some_and(|metadata| metadata.type_node != mapped)
+            || mapped_record.kind != SyntaxKind::MappedType
+            || mapped_record.flags.0 != 0
+            || mapped_record.parent != Some(declaration.node)
+        {
+            return None;
+        }
+        let NodeData::MappedTypeNode(mapped_syntax) = &mapped_record.data else {
+            return None;
+        };
+        let mapped_parameter_declaration =
+            NodeRef::new(mapped.arena, mapped.file, mapped_syntax.type_parameter);
+        let mapped_plan = plan_mapped_type_declaration(self.store, self.host, mapped).ok()?;
+        let mapped_parameter = mapped_plan.type_parameter_symbol();
+        if self
+            .store
+            .symbol(mapped_parameter)
+            .and_then(|parameter| parameter.name().as_utf8())
+            != Some("P")
+            || mapped_plan.name_type().is_some()
+        {
+            return None;
+        }
+        let template = mapped_plan.template()?;
+        let template_record = preflight_node(self.store, self.host, template).ok()?;
+        let NodeData::IndexedAccessTypeNode(indexed) = &template_record.data else {
+            return None;
+        };
+        let source_reference = NodeRef::new(template.arena, template.file, indexed.object_type);
+        let parameter_reference = NodeRef::new(template.arena, template.file, indexed.index_type);
+        if template_record.kind != SyntaxKind::IndexedAccessType
+            || template_record.flags.0 != 0
+            || template_record.parent != Some(mapped.node)
+            || !self.react_detailed_html_props_parameter_reference(
+                source_reference,
+                template,
+                "T",
+                source_parameter.symbol,
+            )
+            || !self.react_detailed_html_props_parameter_reference(
+                parameter_reference,
+                template,
+                "P",
+                mapped_parameter,
+            )
+        {
+            return None;
+        }
+
+        let key_parameter = match kind {
+            DefaultLibraryMappedUtilityKind::Partial => {
+                let constraint = mapped_plan.constraint();
+                let constraint_record = preflight_node(self.store, self.host, constraint).ok()?;
+                let NodeData::TypeOperatorNode(operator) = &constraint_record.data else {
+                    return None;
+                };
+                let target = NodeRef::new(constraint.arena, constraint.file, operator.type_);
+                if mapped_plan.modifiers() != MappedTypeModifiers::INCLUDE_OPTIONAL
+                    || constraint_record.kind != SyntaxKind::TypeOperator
+                    || operator.operator != SyntaxKind::KeyOfKeyword
+                    || mapped_plan.modifiers_source() != Some(target)
+                    || !self.react_detailed_html_props_parameter_reference(
+                        target,
+                        constraint,
+                        "T",
+                        source_parameter.symbol,
+                    )
+                {
+                    return None;
+                }
+                None
+            }
+            DefaultLibraryMappedUtilityKind::Pick => {
+                let key = planned_parameters[1];
+                let constraint = key.constraint?;
+                let constraint_record = preflight_node(self.store, self.host, constraint).ok()?;
+                let NodeData::TypeOperatorNode(operator) = &constraint_record.data else {
+                    return None;
+                };
+                let target = NodeRef::new(constraint.arena, constraint.file, operator.type_);
+                if mapped_plan.modifiers() != MappedTypeModifiers::NONE
+                    || mapped_plan.modifiers_source().is_some()
+                    || constraint_record.kind != SyntaxKind::TypeOperator
+                    || constraint_record.parent != Some(key.declaration.node)
+                    || operator.operator != SyntaxKind::KeyOfKeyword
+                    || !self.react_detailed_html_props_parameter_reference(
+                        target,
+                        constraint,
+                        "T",
+                        source_parameter.symbol,
+                    )
+                    || !self.react_detailed_html_props_parameter_reference(
+                        mapped_plan.constraint(),
+                        mapped_parameter_declaration,
+                        "K",
+                        key.symbol,
+                    )
+                {
+                    return None;
+                }
+                Some(key.symbol)
+            }
+        };
+
+        Some(DefaultLibraryMappedUtilityPlan {
+            kind,
+            mapped,
+            source_parameter: source_parameter.symbol,
+            key_parameter,
+            source_reference,
+            modifiers: mapped_plan.modifiers(),
+        })
+    }
+
     fn react_detailed_html_props_identifier(
         &self,
         node: NodeRef,
@@ -9142,13 +9473,37 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 let target = NodeRef::new(node.arena, node.file, operator.type_);
                 let target_record = preflight_node(self.store, self.host, target)?;
                 if operator.operator != SyntaxKind::KeyOfKeyword
-                    || target_record.kind != SyntaxKind::AnyKeyword
                     || target_record.parent != Some(node.node)
-                    || self.store.canonical_property_key_type().is_none()
                 {
                     return Err(unsupported());
                 }
-                Ok(())
+                if target_record.kind == SyntaxKind::AnyKeyword
+                    && self.store.canonical_property_key_type().is_some()
+                {
+                    return Ok(());
+                }
+                if self
+                    .plan
+                    .default_library_mapped_utility_aliases
+                    .get(&alias)
+                    .is_some_and(|utility| {
+                        utility.kind == DefaultLibraryMappedUtilityKind::Pick
+                            && utility.key_parameter == Some(parameter.symbol)
+                            && earlier_parameters.iter().any(|earlier| {
+                                earlier.symbol == utility.source_parameter
+                                    && self.react_detailed_html_props_parameter_reference(
+                                        target,
+                                        node,
+                                        "T",
+                                        utility.source_parameter,
+                                    )
+                            })
+                    })
+                {
+                    Ok(())
+                } else {
+                    Err(unsupported())
+                }
             }
             SyntaxKind::ArrayType => {
                 if self.array_targets.is_none() {
@@ -10130,6 +10485,11 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             self.plan
                 .prop_types_infer_props_aliases
                 .insert(symbol, infer_props_alias);
+        }
+        if let Some(utility) = self.authenticated_default_library_mapped_utility_alias(symbol) {
+            self.plan
+                .default_library_mapped_utility_aliases
+                .insert(symbol, utility);
         }
         if let Some(cached) = cached
             && let Some(alias) = self
@@ -13409,7 +13769,14 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 ))?
                 .any_type
         };
-        let modifiers_source = match mapped.modifiers_source() {
+        let utility_source = plan
+            .default_library_mapped_utility_aliases
+            .values()
+            .find(|utility| {
+                utility.kind == DefaultLibraryMappedUtilityKind::Pick && utility.mapped == node
+            })
+            .map(|utility| utility.source_reference);
+        let modifiers_source = match mapped.modifiers_source().or(utility_source) {
             Some(source) => self.execute_type_node(source, plan, prepared)?,
             None => {
                 self.store
@@ -14975,11 +15342,18 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             &type_parameters,
             &type_arguments,
             plan.react_detailed_html_props_aliases.get(&symbol).copied(),
+            plan.default_library_mapped_utility_aliases
+                .get(&symbol)
+                .copied(),
         )?;
         if matches!(
             self.store.type_payload(declared_type).map(TypeRecord::data),
             Some(TypeData::Mapped(_))
         ) {
+            let utility = plan
+                .default_library_mapped_utility_aliases
+                .get(&symbol)
+                .copied();
             let invalid_cache = || {
                 type_node_unavailable(TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(
                     symbol,
@@ -14996,16 +15370,16 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 .and_then(|instantiations| instantiations.get(&key))
                 .copied()
             {
-                if self
-                    .store
-                    .validate_record_mapped_alias_instantiation(
-                        symbol,
-                        declared_type,
-                        &type_parameters,
-                        &type_arguments,
-                        cached,
-                    )
-                    .is_err()
+                if validate_supported_mapped_alias_instantiation(
+                    self.store,
+                    symbol,
+                    declared_type,
+                    &type_parameters,
+                    &type_arguments,
+                    cached,
+                    utility,
+                )
+                .is_err()
                     || !valid_record_mapped_alias_identity(
                         self.store,
                         identity_symbol,
@@ -15043,7 +15417,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 .try_reserve(1)
                 .map_err(|_| type_node_unavailable(TypeNodeUnavailable::LiteralTypeCapacity))?;
             if !self.store.try_reserve_type_aliases(1)
-                || !self.store.try_reserve_types(2)
+                || !self.store.try_reserve_types(3)
                 || !self.store.try_reserve_mappers(3)
             {
                 return Err(type_node_unavailable(
@@ -15051,25 +15425,43 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 ));
             }
 
-            let instantiation = self
-                .store
-                .instantiate_record_mapped_alias(
+            let instantiation = match utility {
+                Some(utility) if utility.kind == DefaultLibraryMappedUtilityKind::Partial => {
+                    self.store.instantiate_homomorphic_mapped_alias(
+                        symbol,
+                        declared_type,
+                        &type_parameters,
+                        &type_arguments,
+                        utility.modifiers,
+                    )
+                }
+                Some(utility) if utility.kind == DefaultLibraryMappedUtilityKind::Pick => {
+                    self.store.instantiate_pick_mapped_alias(
+                        symbol,
+                        declared_type,
+                        &type_parameters,
+                        &type_arguments,
+                    )
+                }
+                Some(_) => unreachable!("every mapped utility kind has an instantiation path"),
+                None => self.store.instantiate_record_mapped_alias(
                     symbol,
                     declared_type,
                     &type_parameters,
                     &type_arguments,
-                )
-                .map_err(|error| match error {
-                    MappedTypeError::Capacity => {
-                        type_node_unavailable(TypeNodeUnavailable::LiteralTypeCapacity)
-                    }
-                    _ => type_node_unavailable(
-                        TypeNodeUnavailable::GenericAliasInstantiationUnsupported {
-                            alias: symbol,
-                            declared_type,
-                        },
-                    ),
-                })?;
+                ),
+            }
+            .map_err(|error| match error {
+                MappedTypeError::Capacity => {
+                    type_node_unavailable(TypeNodeUnavailable::LiteralTypeCapacity)
+                }
+                _ => type_node_unavailable(
+                    TypeNodeUnavailable::GenericAliasInstantiationUnsupported {
+                        alias: symbol,
+                        declared_type,
+                    },
+                ),
+            })?;
             let identity = self
                 .store
                 .alloc_type_alias(Some(identity_symbol))
@@ -15251,6 +15643,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         type_parameters: &[TypeId],
         type_arguments: &[TypeId],
         dependent_react_alias: Option<ReactDetailedHtmlPropsPlan>,
+        mapped_utility: Option<DefaultLibraryMappedUtilityPlan>,
     ) -> Result<(), DeclaredTypeError> {
         for (index, node) in reference.type_arguments.iter().copied().enumerate() {
             let parameter = metadata.type_parameters[index];
@@ -15271,7 +15664,30 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     reference.symbol,
                 ))
             })?;
-            let constraint = if dependent_react_alias.is_some() {
+            let constraint = if mapped_utility.is_some_and(|utility| {
+                utility.kind == DefaultLibraryMappedUtilityKind::Pick
+                    && utility.key_parameter == Some(parameter.symbol)
+            }) {
+                let source = type_arguments.first().copied().ok_or_else(|| {
+                    type_node_unavailable(
+                        TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(
+                            reference.symbol,
+                        ),
+                    )
+                })?;
+                let key_plan = plan_nongeneric_keyof_type(self.store, source).map_err(|_| {
+                    type_node_unavailable(TypeNodeUnavailable::GenericAliasConstraintUnsupported {
+                        alias: reference.symbol,
+                        parameter: parameter.declaration,
+                    })
+                })?;
+                resolve_nongeneric_keyof_type(self.store, &key_plan).map_err(|_| {
+                    type_node_unavailable(TypeNodeUnavailable::GenericAliasConstraintUnsupported {
+                        alias: reference.symbol,
+                        parameter: parameter.declaration,
+                    })
+                })?
+            } else if dependent_react_alias.is_some() {
                 self.instantiate_dependent_alias_type(
                     reference.symbol,
                     constraint,
@@ -15300,6 +15716,10 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 _ => argument,
             };
             let assignable = if comparison_argument == constraint
+                || mapped_utility.is_some_and(|utility| {
+                    utility.kind == DefaultLibraryMappedUtilityKind::Pick
+                        && self.authenticated_deferred_pick_key(argument, constraint)
+                })
                 || dependent_react_alias.is_some_and(|react_alias| {
                     self.authenticated_react_html_attribute_base(
                         comparison_argument,
@@ -15365,6 +15785,62 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             );
         }
         Ok(())
+    }
+
+    fn authenticated_deferred_pick_key(&self, key: TypeId, constraint: TypeId) -> bool {
+        match self.store.type_payload(key).map(TypeRecord::data) {
+            Some(TypeData::TypeParameter(parameter)) => parameter.constraint == Some(constraint),
+            Some(TypeData::IndexedAccess(indexed)) if indexed.index_type == constraint => {
+                matches!(
+                    plan_mapped_type_keys(self.store, indexed.object_type),
+                    Ok(MappedTypeKeys::Constraint(keys)) if keys == constraint
+                )
+            }
+            Some(TypeData::Conditional(conditional)) if conditional.check_type == constraint => {
+                let Some(root) = self.store.conditional_root(conditional.root) else {
+                    return false;
+                };
+                let Some(NodeData::ConditionalTypeNode(syntax)) =
+                    self.host.node(root.node()).map(|node| &node.data)
+                else {
+                    return false;
+                };
+                let when_true = NodeRef::new(root.node().arena, root.node().file, syntax.true_type);
+                let when_false =
+                    NodeRef::new(root.node().arena, root.node().file, syntax.false_type);
+                let Some(false_record) = self.host.node(when_false) else {
+                    return false;
+                };
+                let NodeData::TypeReferenceNode(reference) = &false_record.data else {
+                    return false;
+                };
+                let name = NodeRef::new(when_false.arena, when_false.file, reference.type_name);
+                let Some(NodeData::Identifier(identifier)) =
+                    self.host.node(name).map(|node| &node.data)
+                else {
+                    return false;
+                };
+                let Some(parameter) =
+                    cached_ordinary_type_parameter_owner(self.store, root.check_type())
+                else {
+                    return false;
+                };
+                root.is_distributive()
+                    && self
+                        .host
+                        .node(when_true)
+                        .is_some_and(|node| node.kind == SyntaxKind::NeverKeyword)
+                    && false_record.kind == SyntaxKind::TypeReference
+                    && false_record.parent == Some(root.node().node)
+                    && reference.type_arguments.is_none()
+                    && self
+                        .store
+                        .symbol(parameter)
+                        .and_then(|parameter| parameter.name().as_utf8())
+                        == Some(identifier.text.as_str())
+            }
+            _ => false,
+        }
     }
 
     #[allow(clippy::too_many_lines)] // Generic arguments and their sole declared base share one proof.
@@ -19944,6 +20420,478 @@ mod tests {
             }
             assert_eq!(store_state(&fixture.store), warm);
             assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One source fixture verifies both mapped utilities and shared origins.
+    fn default_library_pick_and_partial_preserve_property_keys_and_modifiers() {
+        let mut fixture = default_library_fixture(concat!(
+            "type Partial<T> = { [P in keyof T]?: T[P] }; ",
+            "type Pick<T, K extends keyof T> = { [P in K]: T[P] }; ",
+            "interface Shape { readonly fixed: string; optional?: number; other: boolean; } ",
+            "type Weak = Partial<Shape>; ",
+            "type Selected = Pick<Shape, 'fixed' | 'optional'>;",
+        ));
+        let partial = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Partial");
+        let pick = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Pick");
+        let weak = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Weak");
+        let selected = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Selected");
+        let shape = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Shape");
+        let (string, number) = {
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let weak_type = query_declared(
+            &mut fixture,
+            weak,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let selected_type = query_declared(
+            &mut fixture,
+            selected,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let shape_type = fixture
+            .store
+            .declared_type_links(shape)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let source_fixed = fixture
+            .store
+            .symbol(shape)
+            .and_then(|shape| shape.members())
+            .and_then(|members| fixture.store.symbol_table(members))
+            .and_then(|members| members.get_source("fixed"))
+            .unwrap();
+
+        let partial_links = fixture.store.type_alias_links(partial).unwrap();
+        let partial_declared = partial_links.declared_type.unwrap();
+        let partial_parameters = partial_links.type_parameters.as_deref().unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .validate_homomorphic_mapped_alias_instantiation(
+                    partial,
+                    partial_declared,
+                    partial_parameters,
+                    &[shape_type],
+                    weak_type,
+                    MappedTypeModifiers::INCLUDE_OPTIONAL,
+                ),
+            Ok(()),
+        );
+
+        let selected_argument = match &fixture
+            .parsed
+            .arena
+            .get(alias_parts(&fixture, "Selected").2.node)
+            .unwrap()
+            .data
+        {
+            NodeData::TypeReferenceNode(reference) => NodeRef::new(
+                fixture.parsed.arena.id(),
+                fixture.file,
+                reference.type_arguments.as_ref().unwrap().nodes[1],
+            ),
+            _ => unreachable!(),
+        };
+        let selected_keys = fixture
+            .store
+            .type_node_links(selected_argument)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let pick_links = fixture.store.type_alias_links(pick).unwrap();
+        assert_eq!(
+            fixture.store.validate_pick_mapped_alias_instantiation(
+                pick,
+                pick_links.declared_type.unwrap(),
+                pick_links.type_parameters.as_deref().unwrap(),
+                &[shape_type, selected_keys],
+                selected_type,
+            ),
+            Ok(()),
+        );
+
+        let weak_fixed = fixture
+            .store
+            .resolve_mapped_type_property(weak_type, "fixed", MappedTypeModifiers::NONE)
+            .unwrap()
+            .unwrap();
+        assert_eq!(weak_fixed.type_id(), string);
+        assert!(weak_fixed.is_optional());
+        assert!(weak_fixed.is_readonly());
+        assert_eq!(
+            fixture
+                .store
+                .mapped_symbol_links(weak_fixed.symbol())
+                .and_then(|links| links.synthetic_origin),
+            Some(source_fixed),
+        );
+        let weak_optional = fixture
+            .store
+            .resolve_mapped_type_property(weak_type, "optional", MappedTypeModifiers::NONE)
+            .unwrap()
+            .unwrap();
+        assert_eq!(weak_optional.type_id(), number);
+        assert!(weak_optional.is_optional());
+
+        let fixed = fixture
+            .store
+            .resolve_mapped_type_property(selected_type, "fixed", MappedTypeModifiers::NONE)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fixed.type_id(), string);
+        assert!(!fixed.is_optional());
+        assert!(fixed.is_readonly());
+        assert_eq!(
+            fixture
+                .store
+                .mapped_symbol_links(fixed.symbol())
+                .and_then(|links| links.synthetic_origin),
+            Some(source_fixed),
+        );
+        let optional = fixture
+            .store
+            .resolve_mapped_type_property(selected_type, "optional", MappedTypeModifiers::NONE)
+            .unwrap()
+            .unwrap();
+        assert_eq!(optional.type_id(), number);
+        assert!(optional.is_optional());
+        assert_eq!(
+            fixture.store.resolve_mapped_type_property(
+                selected_type,
+                "other",
+                MappedTypeModifiers::NONE,
+            ),
+            Ok(None),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .resolve_mapped_type_members(weak_type, MappedTypeModifiers::EXCLUDE_OPTIONAL),
+            Err(MappedTypeError::InvalidModifiers),
+        );
+
+        let warm = union_state(&fixture.store);
+        for (alias, expected) in [(weak, weak_type), (selected, selected_type)] {
+            assert_eq!(
+                query_declared(
+                    &mut fixture,
+                    alias,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                ),
+                Ok(expected),
+            );
+            assert_eq!(union_state(&fixture.store), warm);
+        }
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn default_library_pick_and_partial_retain_deferred_generic_sources() {
+        let mut fixture = default_library_fixture(concat!(
+            "type Partial<T> = { [P in keyof T]?: T[P] }; ",
+            "type Pick<T, K extends keyof T> = { [P in K]: T[P] }; ",
+            "type Weak<Value> = Partial<Value>; ",
+            "type Nested<Value> = Partial<Pick<Value, keyof Value>>;",
+        ));
+        let weak = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Weak");
+        let nested = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Nested");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        for alias in [weak, nested] {
+            let resolved = query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap();
+            assert!(matches!(
+                fixture.store.type_payload(resolved).map(TypeRecord::data),
+                Some(TypeData::Mapped(_))
+            ));
+            let warm = union_state(&fixture.store);
+            assert_eq!(
+                query_declared(
+                    &mut fixture,
+                    alias,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                ),
+                Ok(resolved),
+            );
+            assert_eq!(union_state(&fixture.store), warm);
+        }
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn default_library_mapped_utilities_preserve_cross_file_declaration_identity() {
+        let library = parse_source_file(concat!(
+            "type Partial<T> = { [P in keyof T]?: T[P] }; ",
+            "type Pick<T, K extends keyof T> = { [P in K]: T[P] };",
+        ));
+        let source = parse_source_file(concat!(
+            "interface Shape { value: string; other: number; } ",
+            "type Weak = Partial<Shape>; ",
+            "type Selected = Pick<Shape, 'value'>;",
+        ));
+        let (mut context, library_file, source_file) =
+            default_library_interface_context(&library, &source, true);
+        let aliases = source
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+                    return None;
+                };
+                let name = identifier_text(&source.arena, alias.name)?;
+                let node = NodeRef::new(source.arena.id(), source_file, node);
+                let symbol = context.file(source_file)?.1.symbol(node)?;
+                Some((name.to_owned(), symbol))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(aliases.len(), 2);
+
+        for (name, symbol) in aliases {
+            let mapped = context.get_declared_type_of_symbol(symbol).unwrap();
+            let TypeData::Mapped(record) = context.store().type_payload(mapped).unwrap().data()
+            else {
+                panic!("{name} must retain its mapped declaration")
+            };
+            assert_eq!(record.declaration.unwrap().file, library_file);
+            let property = context
+                .store_mut_for_test()
+                .resolve_mapped_type_property(mapped, "value", MappedTypeModifiers::NONE)
+                .unwrap()
+                .unwrap();
+            assert_eq!(property.is_optional(), name == "Weak");
+        }
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn default_library_partial_optional_values_follow_strict_optional_modes() {
+        for exact_optional_property_types in [false, true] {
+            let mut fixture = fixture_with_source_facts(
+                concat!(
+                    "type Partial<T> = { [P in keyof T]?: T[P] }; ",
+                    "interface Shape { value: string; } ",
+                    "type Weak = Partial<Shape>;",
+                ),
+                CanonicalModuleState::Script,
+                IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    exact_optional_property_types,
+                },
+                true,
+                |_| {},
+            );
+            let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Weak");
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let mapped = query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap();
+            let property = fixture
+                .store
+                .resolve_mapped_type_property(mapped, "value", MappedTypeModifiers::NONE)
+                .unwrap()
+                .unwrap();
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            assert!(property.is_optional());
+            assert!(
+                union_types(&fixture.store, property.type_id()).contains(&bootstrap.string_type)
+            );
+            assert!(
+                union_types(&fixture.store, property.type_id())
+                    .contains(&bootstrap.undefined_or_missing_type)
+            );
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn default_library_pick_reports_keys_outside_the_source_shape() {
+        let mut fixture = default_library_fixture(concat!(
+            "type Pick<T, K extends keyof T> = { [P in K]: T[P] }; ",
+            "interface Shape { valid: string; } ",
+            "type Invalid = Pick<Shape, 'missing'>;",
+        ));
+        let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Invalid");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let resolved = query_declared(
+            &mut fixture,
+            alias,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("an invalid Pick key must report its exact constraint failure")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2344);
+        assert_eq!(
+            diagnostic.diagnostic.arguments,
+            ["\"missing\"", "\"valid\""]
+        );
+
+        let warm = union_state(&fixture.store);
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(resolved),
+        );
+        assert_eq!(union_state(&fixture.store), warm);
+        assert_eq!(diagnostics.len(), 1);
+    }
+
+    #[test]
+    fn mapped_utilities_require_exact_default_library_declarations() {
+        let cases = [
+            (
+                fixture("type Partial<T> = { [P in keyof T]?: T[P] };"),
+                "Partial",
+            ),
+            (
+                default_library_fixture("type Partial<U> = { [P in keyof U]?: U[P] };"),
+                "Partial",
+            ),
+            (
+                default_library_fixture("type Partial<T> = { [P in keyof T]: T[P] };"),
+                "Partial",
+            ),
+            (
+                fixture("type Pick<T, K extends keyof T> = { [P in K]: T[P] };"),
+                "Pick",
+            ),
+            (
+                default_library_fixture("type Pick<T, K extends keyof any> = { [P in K]: T[P] };"),
+                "Pick",
+            ),
+            (
+                default_library_fixture("type Pick<T, K extends keyof T> = { [P in K]?: T[P] };"),
+                "Pick",
+            ),
+        ];
+        for (mut fixture, name) in cases {
+            let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, name);
+            let before = union_state(&fixture.store);
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+            assert!(
+                query_declared(
+                    &mut fixture,
+                    alias,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                )
+                .is_err(),
+                "utility: {name}",
+            );
+            assert_eq!(union_state(&fixture.store), before, "utility: {name}");
+            assert!(diagnostics.is_empty(), "utility: {name}");
+        }
+    }
+
+    #[test]
+    fn poisoned_default_library_mapped_utility_instances_fail_before_writes() {
+        for (utility, instantiation) in [
+            (
+                "type Partial<T> = { [P in keyof T]?: T[P] }; ",
+                "type Result = Partial<Shape>;",
+            ),
+            (
+                "type Pick<T, K extends keyof T> = { [P in K]: T[P] }; ",
+                "type Result = Pick<Shape, 'fixed'>;",
+            ),
+        ] {
+            let source = format!(
+                "{utility}interface Shape {{ fixed: string; other: number; }} {instantiation}",
+            );
+            let mut fixture = default_library_fixture(&source);
+            let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Result");
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let resolved = query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap();
+            let parameter = match fixture.store.type_payload(resolved).unwrap().data() {
+                TypeData::Mapped(mapped) => mapped.type_parameter.unwrap(),
+                _ => unreachable!(),
+            };
+            let (constraint, target, mapper, default_type) =
+                match fixture.store.type_payload(parameter).unwrap().data() {
+                    TypeData::TypeParameter(parameter) => (
+                        parameter.constraint,
+                        parameter.target,
+                        parameter.mapper,
+                        parameter.resolved_default_type,
+                    ),
+                    _ => unreachable!(),
+                };
+            assert!(mapper.is_some());
+            assert!(fixture.store.set_type_parameter_resolution(
+                parameter,
+                constraint,
+                target,
+                None,
+                default_type,
+            ));
+            let poisoned = union_state(&fixture.store);
+
+            for _ in 0..2 {
+                assert_eq!(
+                    query_declared(
+                        &mut fixture,
+                        alias,
+                        CanonicalTypeQueryOptions::default(),
+                        &mut diagnostics,
+                    ),
+                    Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidCachedTypeAlias(alias),
+                    )),
+                    "utility: {utility}",
+                );
+                assert_eq!(union_state(&fixture.store), poisoned);
+            }
+            assert!(fixture.store.set_type_parameter_resolution(
+                parameter,
+                constraint,
+                target,
+                mapper,
+                default_type,
+            ));
+            assert_eq!(
+                query_declared(
+                    &mut fixture,
+                    alias,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                ),
+                Ok(resolved),
+            );
+            assert!(diagnostics.is_empty(), "utility: {utility}");
         }
     }
 
