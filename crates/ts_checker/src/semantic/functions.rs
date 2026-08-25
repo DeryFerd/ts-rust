@@ -634,6 +634,7 @@ pub(super) fn plan_function_type(
         node,
         function.type_parameters.as_ref(),
         function.parameters.range.start,
+        parameters.len(),
         return_identity_node,
     )?;
     if !type_parameters.is_empty()
@@ -793,6 +794,7 @@ fn plan_function_type_parameters(
     function: NodeRef,
     parameters: Option<&NodeList>,
     value_parameters_start: ts_core::TextPos,
+    value_parameter_count: usize,
     return_type: NodeRef,
 ) -> Result<Vec<FunctionTypeParameterPlan>, FunctionTypeError> {
     let Some(parameters) = parameters else {
@@ -896,7 +898,48 @@ fn plan_function_type_parameters(
         }
         None => (None, None),
     };
-    if function_type_parameter_reference_symbol(store, host, return_type)? != *symbol {
+    let return_record = preflight_node(store, host, return_type)?;
+    let checked_type = match &return_record.data {
+        NodeData::TypeReferenceNode(_) => return_type,
+        NodeData::ConditionalTypeNode(conditional)
+            if return_record.kind == SyntaxKind::ConditionalType
+                && value_parameter_count == 0
+                && constraint.is_none() =>
+        {
+            if return_record.parent != Some(function.node)
+                || return_record.range.start < function_record.range.start
+                || return_record.range.end > function_record.range.end
+            {
+                return Err(invariant(FunctionTypeInvariant::InvalidSyntax(return_type)));
+            }
+
+            let operands = [
+                conditional.check_type,
+                conditional.extends_type,
+                conditional.true_type,
+                conditional.false_type,
+            ]
+            .map(|operand| NodeRef::new(return_type.arena, return_type.file, operand));
+            let mut previous_end = return_record.range.start;
+            for operand in operands {
+                let operand_record = preflight_node(store, host, operand)?;
+                if operand_record.parent != Some(return_type.node)
+                    || operand_record.range.start < previous_end
+                    || operand_record.range.end > return_record.range.end
+                {
+                    return Err(invariant(FunctionTypeInvariant::InvalidSyntax(operand)));
+                }
+                previous_end = operand_record.range.end;
+            }
+            operands[0]
+        }
+        _ => {
+            return Err(FunctionTypeError::Unsupported(
+                FunctionTypeUnsupported::GenericSignature(function),
+            ));
+        }
+    };
+    if function_type_parameter_reference_symbol(store, host, checked_type)? != *symbol {
         return Err(FunctionTypeError::Unsupported(
             FunctionTypeUnsupported::GenericSignature(function),
         ));
@@ -2308,7 +2351,10 @@ fn valid_stored_function_type_parameters(
     if signature.flags() != SignatureFlags::NONE
         || usize::try_from(signature.min_argument_count()).ok()
             != Some(signature.parameters().len())
-        || store.source_node_kind(return_annotation) != Some(SyntaxKind::TypeReference)
+        || !matches!(
+            store.source_node_kind(return_annotation),
+            Some(SyntaxKind::TypeReference | SyntaxKind::ConditionalType)
+        )
         || store.source_node_parent(return_annotation) != Some(SourceNodeParent::Parent(function))
     {
         return None;
@@ -2377,27 +2423,73 @@ fn valid_stored_function_type_parameters(
         None if data.constraint == Some(no_constraint) => None,
         None => return None,
     };
-    if store
-        .symbol_node_links(return_annotation)
-        .is_some_and(|links| {
-            links != &SymbolNodeLinks::default()
-                && links
-                    != &SymbolNodeLinks {
-                        resolved_symbol: Some(symbol),
-                    }
-        })
-        || store
-            .type_node_links(return_annotation)
-            .is_some_and(|links| {
-                links != &TypeNodeLinks::default()
-                    && links
-                        != &TypeNodeLinks {
-                            resolved_type: Some(*type_parameter),
-                            outer_type_parameters: None,
+    match store.source_node_kind(return_annotation)? {
+        SyntaxKind::TypeReference => {
+            if store
+                .symbol_node_links(return_annotation)
+                .is_some_and(|links| {
+                    links != &SymbolNodeLinks::default()
+                        && links
+                            != &SymbolNodeLinks {
+                                resolved_symbol: Some(symbol),
+                            }
+                })
+                || store
+                    .type_node_links(return_annotation)
+                    .is_some_and(|links| {
+                        links != &TypeNodeLinks::default()
+                            && links
+                                != &TypeNodeLinks {
+                                    resolved_type: Some(*type_parameter),
+                                    outer_type_parameters: None,
+                                }
+                    })
+            {
+                return None;
+            }
+        }
+        SyntaxKind::ConditionalType => {
+            if !signature.parameters().is_empty()
+                || outer.is_some()
+                || store
+                    .symbol_node_links(return_annotation)
+                    .is_some_and(|links| links != &SymbolNodeLinks::default())
+                || store
+                    .type_node_links(return_annotation)
+                    .is_some_and(|links| {
+                        if links.outer_type_parameters.is_some() {
+                            return true;
                         }
-            })
-    {
-        return None;
+                        let Some(resolved) = links.resolved_type else {
+                            return links != &TypeNodeLinks::default();
+                        };
+                        let Some(TypeData::Conditional(conditional)) =
+                            store.type_payload(resolved).map(TypeRecord::data)
+                        else {
+                            return true;
+                        };
+                        let Some(root) = store.conditional_root(conditional.root) else {
+                            return true;
+                        };
+                        conditional.check_type != *type_parameter
+                            || root.node() != return_annotation
+                            || root.check_type() != *type_parameter
+                            || root.extends_type() != conditional.extends_type
+                            || signature
+                                .resolved_return_type()
+                                .is_some_and(|return_type| return_type != resolved)
+                    })
+                || signature.resolved_return_type().is_some_and(|return_type| {
+                    store
+                        .type_node_links(return_annotation)
+                        .and_then(|links| links.resolved_type)
+                        != Some(return_type)
+                })
+            {
+                return None;
+            }
+        }
+        _ => return None,
     }
     let mut edges = vec![*type_parameter];
     edges.extend(outer);
@@ -3063,6 +3155,174 @@ mod tests {
     }
 
     #[test]
+    fn generic_conditional_function_returns_preserve_identity_and_lazy_caches() {
+        let mut fixture = fixture(
+            "declare let callback: <Value>() => Value extends string ? 1 : 2;",
+            FileId::new(95_008),
+        );
+        let function = generic_function_node(&fixture);
+        let plan = {
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            plan_function_type(&fixture.store, &host, function, None, false, None).unwrap()
+        };
+        let [planned] = plan.type_parameters.as_slice() else {
+            panic!("the conditional function must retain one generic type parameter")
+        };
+        assert!(planned.constraint.is_none());
+        assert!(planned.outer_symbol.is_none());
+        assert!(plan.parameters.is_empty());
+        assert_eq!(plan.min_argument_count, 0);
+        assert_eq!(
+            fixture.store.source_node_kind(plan.return_identity_node),
+            Some(SyntaxKind::ConditionalType),
+        );
+        assert!(fixture.store.declared_type_links(planned.symbol).is_none());
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let function_type = {
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_from_type_node(function)
+            .unwrap()
+        };
+        let FunctionTypeState::Resolved { signature, .. } =
+            function_type_state(&fixture.store, &plan, false).unwrap()
+        else {
+            panic!("the conditional function must publish its signature")
+        };
+        let signature_record = fixture.store.signature(signature).unwrap();
+        let [type_parameter] = signature_record.type_parameters() else {
+            panic!("the conditional function must retain its binder-owned parameter")
+        };
+        let type_parameter = *type_parameter;
+        assert_eq!(
+            cached_ordinary_type_parameter_owner(&fixture.store, type_parameter),
+            Some(planned.symbol),
+        );
+        assert!(signature_record.parameters().is_empty());
+        assert!(signature_record.resolved_return_type().is_none());
+        assert!(
+            fixture
+                .store
+                .type_node_links(plan.return_identity_node)
+                .is_none()
+        );
+        assert!(matches!(
+            validate_stored_function_type(&fixture.store, function_type),
+            StoredFunctionTypeValidation::Valid(_)
+        ));
+
+        let return_type = {
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_return_type_of_signature(signature)
+            .unwrap()
+        };
+        let TypeData::Conditional(conditional) =
+            fixture.store.type_payload(return_type).unwrap().data()
+        else {
+            panic!("the generic return must resolve to a deferred conditional")
+        };
+        let root = fixture.store.conditional_root(conditional.root).unwrap();
+        assert_eq!(conditional.check_type, type_parameter);
+        assert_eq!(root.node(), plan.return_identity_node);
+        assert_eq!(root.check_type(), type_parameter);
+        assert_eq!(
+            fixture.store.type_node_links(plan.return_identity_node),
+            Some(&TypeNodeLinks {
+                resolved_type: Some(return_type),
+                ..TypeNodeLinks::default()
+            }),
+        );
+        assert!(matches!(
+            validate_stored_function_type(&fixture.store, function_type),
+            StoredFunctionTypeValidation::Valid(_)
+        ));
+
+        let exact_return_links = fixture
+            .store
+            .type_node_links(plan.return_identity_node)
+            .unwrap()
+            .clone();
+        let poison = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        assert!(fixture.store.set_type_node_links(
+            plan.return_identity_node,
+            TypeNodeLinks {
+                resolved_type: Some(poison),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        let poisoned = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            validate_stored_function_type(&fixture.store, function_type),
+            StoredFunctionTypeValidation::Malformed,
+        );
+        assert!(begin_function_type(&mut fixture.store, &plan).is_err());
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            poisoned,
+        );
+        assert!(
+            fixture
+                .store
+                .set_type_node_links(plan.return_identity_node, exact_return_links)
+        );
+
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+            fixture.store.conditional_root_len(),
+        );
+        assert_eq!(
+            begin_function_type(&mut fixture.store, &plan),
+            Ok(Err(function_type)),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+                fixture.store.conditional_root_len(),
+            ),
+            warm,
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
     fn constrained_generic_function_value_parameters_preserve_outer_constraint() {
         let mut fixture = fixture(
             concat!(
@@ -3336,6 +3596,9 @@ mod tests {
             "<o>(value: 'literal') => o",
             "<o extends x = x>() => o",
             "<o extends x, p extends x>() => o",
+            "<o>(value: o) => o extends string ? 1 : 2",
+            "<o extends x>() => o extends string ? 1 : 2",
+            "<o>() => x extends string ? 1 : 2",
         ]
         .into_iter()
         .enumerate()

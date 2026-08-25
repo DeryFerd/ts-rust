@@ -36215,6 +36215,132 @@ mod tests {
     }
 
     #[test]
+    fn generic_function_conditional_returns_support_branded_templates_and_string_mappings() {
+        let mut fixture = fixture(concat!(
+            "type Uppercase<Input extends string> = intrinsic;\n",
+            "let a: (<T>() => T extends `${'a' & { a: 1 }}` ? 1 : 2) = null!;\n",
+            "let b: (<T>() => T extends `${'a' & { a: 1 }}` ? 1 : 2) = null!;\n",
+            "a = b;\n",
+            "let c: (<T>() => T extends Uppercase<'a' & { a: 1 }> ? 1 : 2) = null!;\n",
+            "let d: (<T>() => T extends Uppercase<'a' & { a: 1 }> ? 1 : 2) = null!;\n",
+            "c = d;",
+        ));
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut resolved = Vec::new();
+
+        for name in ["a", "b", "c", "d"] {
+            let annotation = variable_type_node(&fixture, name);
+            let NodeData::ParenthesizedTypeNode(parenthesized) =
+                &fixture.parsed.arena.get(annotation.node).unwrap().data
+            else {
+                panic!("{name} must retain its parenthesized generic function annotation")
+            };
+            let function = NodeRef::new(annotation.arena, annotation.file, parenthesized.type_);
+            let NodeData::FunctionTypeNode(function_data) =
+                &fixture.parsed.arena.get(function.node).unwrap().data
+            else {
+                panic!("{name} must retain its generic function annotation")
+            };
+            let declaration = NodeRef::new(
+                function.arena,
+                function.file,
+                function_data.type_parameters.as_ref().unwrap().nodes[0],
+            );
+            let expected_symbol = node_symbol(&fixture, declaration);
+            let return_annotation = function_return_node(&fixture, function);
+            let NodeData::ConditionalTypeNode(conditional) = &fixture
+                .parsed
+                .arena
+                .get(return_annotation.node)
+                .unwrap()
+                .data
+            else {
+                panic!("{name} must retain its conditional return")
+            };
+            let extends = NodeRef::new(
+                return_annotation.arena,
+                return_annotation.file,
+                conditional.extends_type,
+            );
+            assert_eq!(
+                fixture.store.source_node_kind(extends),
+                Some(if matches!(name, "a" | "b") {
+                    SyntaxKind::TemplateLiteralType
+                } else {
+                    SyntaxKind::TypeReference
+                }),
+            );
+
+            let function_type = query_node(&mut fixture, annotation, &mut diagnostics).unwrap();
+            let signature = function_signature(&fixture.store, function);
+            let record = fixture.store.signature(signature).unwrap();
+            let [type_parameter] = record.type_parameters() else {
+                panic!("{name} must retain one binder-owned generic parameter")
+            };
+            let type_parameter = *type_parameter;
+            assert_eq!(
+                cached_ordinary_type_parameter_owner(&fixture.store, type_parameter),
+                Some(expected_symbol),
+            );
+            assert!(record.parameters().is_empty());
+            assert!(record.resolved_return_type().is_none());
+            assert!(fixture.store.type_node_links(return_annotation).is_none());
+
+            let StoredCallableSetValidation::Valid { projection, .. } =
+                validate_stored_callable_set(&fixture.store, function_type)
+            else {
+                panic!("{name} must publish an authenticated generic callable")
+            };
+            let [callable] = projection.call_signatures.as_ref() else {
+                panic!("{name} must expose exactly one call signature")
+            };
+            assert_eq!(callable.signature, signature);
+            assert!(callable.parameters.is_empty());
+
+            let return_type =
+                query_signature_return(&mut fixture, signature, &mut diagnostics).unwrap();
+            let TypeData::Conditional(conditional) =
+                fixture.store.type_payload(return_type).unwrap().data()
+            else {
+                panic!("{name} must resolve to a deferred conditional return")
+            };
+            assert_eq!(conditional.check_type, type_parameter);
+            assert_eq!(
+                fixture
+                    .store
+                    .conditional_root(conditional.root)
+                    .unwrap()
+                    .node(),
+                return_annotation,
+            );
+            resolved.push((annotation, function_type, signature, return_type));
+        }
+
+        let warm = (
+            function_store_state(&fixture.store),
+            fixture.store.conditional_root_len(),
+        );
+        for (annotation, function_type, signature, return_type) in resolved {
+            assert_eq!(
+                query_node(&mut fixture, annotation, &mut diagnostics),
+                Ok(function_type),
+            );
+            assert_eq!(
+                query_signature_return(&mut fixture, signature, &mut diagnostics),
+                Ok(return_type),
+            );
+        }
+        assert_eq!(
+            (
+                function_store_state(&fixture.store),
+                fixture.store.conditional_root_len(),
+            ),
+            warm,
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
     fn recursive_generic_function_parameter_templates_fail_as_typed_unsupported() {
         let mut fixture = fixture(concat!(
             "type narrow<def> = def extends string\n",
