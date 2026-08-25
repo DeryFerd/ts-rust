@@ -42,6 +42,8 @@
 //! retain the upstream error-recovery `any` type for the source diagnostic.
 //! Simple same-file namespaces can merge with a class and contribute numeric
 //! variable exports to its static member table.
+//! Class namespace augmentations preserve private static visibility and reject
+//! unqualified references to class members.
 //! A class may extend the literal `null` without acquiring an instance base.
 //! An authenticated class/interface merge with `extends null` and `super()`
 //! retains its exact static-side and constructor diagnostics without publication.
@@ -11248,6 +11250,470 @@ fn plan_class_field_variance_modifier_diagnostics(
     Some(diagnostics)
 }
 
+fn plan_clodule_static_member(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    declaration: NodeRef,
+    member: NodeRef,
+    private: bool,
+) -> Option<(String, SemanticSymbolId)> {
+    let record = preflight_node(store, host, member).ok()?;
+    let NodeData::PropertyDeclaration(property) = &record.data else {
+        return None;
+    };
+    let name = NodeRef::new(member.arena, member.file, property.name);
+    let name_record = preflight_node(store, host, name).ok()?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return None;
+    };
+    let modifiers = property.modifiers.as_ref()?;
+    let [visibility, static_modifier] = modifiers.list.nodes.as_slice() else {
+        return None;
+    };
+    let visibility = NodeRef::new(member.arena, member.file, *visibility);
+    let visibility_record = preflight_node(store, host, visibility).ok()?;
+    let static_modifier = NodeRef::new(member.arena, member.file, *static_modifier);
+    let static_record = preflight_node(store, host, static_modifier).ok()?;
+    let initializer = NodeRef::new(member.arena, member.file, property.initializer?);
+    let initializer_record = preflight_node(store, host, initializer).ok()?;
+    let NodeData::NumericLiteral(literal) = &initializer_record.data else {
+        return None;
+    };
+    let expected_visibility = if private {
+        SyntaxKind::PrivateKeyword
+    } else {
+        SyntaxKind::PublicKeyword
+    };
+    if record.kind != SyntaxKind::PropertyDeclaration
+        || record.flags.0 != 0
+        || record.parent != Some(declaration.node)
+        || property.postfix_token.is_some()
+        || property.symbol.is_some()
+        || property.type_.is_some()
+        || property.facts != 0
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(member.node)
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+        || modifiers.flags.0 != 0
+        || modifiers.list.has_trailing_comma
+        || modifiers.list.range.start != record.range.start
+        || modifiers.list.range.end > name_record.range.start
+        || visibility_record.kind != expected_visibility
+        || visibility_record.flags.0 != 0
+        || visibility_record.parent != Some(member.node)
+        || !matches!(visibility_record.data, NodeData::Token(_))
+        || static_record.kind != SyntaxKind::StaticKeyword
+        || static_record.flags.0 != 0
+        || static_record.parent != Some(member.node)
+        || static_record.range.start < visibility_record.range.end
+        || !matches!(static_record.data, NodeData::Token(_))
+        || initializer_record.kind != SyntaxKind::NumericLiteral
+        || initializer_record.flags.0 != 0
+        || initializer_record.parent != Some(member.node)
+        || initializer_record.range.start < name_record.range.end
+        || literal.token_flags.0 != 0
+        || ts_jsnum::from_string(&literal.text).is_nan()
+    {
+        return None;
+    }
+
+    let symbol = bound_symbol(store, host, member)?;
+    let symbol_record = store.symbol(symbol)?;
+    if symbol_record.flags() != SymbolFlags::PROPERTY
+        || symbol_record.check_flags() != CheckFlags::NONE
+        || symbol_record.name().as_utf8() != Some(identifier.text.as_str())
+        || symbol_record.declarations() != Some(&[member])
+        || symbol_record.value_declaration() != Some(member)
+        || symbol_record.members().is_some()
+        || symbol_record.exports().is_some()
+        || symbol_record.parent() != Some(owner)
+        || symbol_record.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || store
+            .symbol(owner)
+            .and_then(Symbol::exports)
+            .and_then(|exports| store.symbol_table(exports))
+            .and_then(|exports| exports.get_source(&identifier.text))
+            != Some(symbol)
+        || store
+            .value_symbol_links(symbol)
+            .is_some_and(|links| links != &ValueSymbolLinks::default())
+    {
+        return None;
+    }
+    Some((identifier.text.clone(), symbol))
+}
+
+fn plan_clodule_namespace_variable(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    namespace: NodeRef,
+    body: NodeRef,
+    statement: NodeRef,
+) -> Option<(SemanticSymbolId, NodeRef)> {
+    let record = preflight_node(store, host, statement).ok()?;
+    let NodeData::VariableStatement(variable_statement) = &record.data else {
+        return None;
+    };
+    let list = NodeRef::new(
+        statement.arena,
+        statement.file,
+        variable_statement.declaration_list,
+    );
+    let list_record = preflight_node(store, host, list).ok()?;
+    let NodeData::VariableDeclarationList(variables) = &list_record.data else {
+        return None;
+    };
+    let [declaration] = variables.declarations.nodes.as_slice() else {
+        return None;
+    };
+    let declaration = NodeRef::new(list.arena, list.file, *declaration);
+    let declaration_record = preflight_node(store, host, declaration).ok()?;
+    let NodeData::VariableDeclaration(variable) = &declaration_record.data else {
+        return None;
+    };
+    let name = NodeRef::new(declaration.arena, declaration.file, variable.name);
+    let name_record = preflight_node(store, host, name).ok()?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return None;
+    };
+    let initializer = NodeRef::new(declaration.arena, declaration.file, variable.initializer?);
+    let initializer_record = preflight_node(store, host, initializer).ok()?;
+    let bound = host.bound_file(declaration)?;
+    let symbol = bound_symbol(store, host, declaration)?;
+    let owner = store.symbol(symbol)?;
+    if record.kind != SyntaxKind::VariableStatement
+        || record.flags.0 != 0
+        || record.parent != Some(body.node)
+        || variable_statement.flow_node.is_some()
+        || variable_statement.facts != 0
+        || variable_statement.modifiers.is_some()
+        || list_record.kind != SyntaxKind::VariableDeclarationList
+        || list_record.flags.0 != 0
+        || list_record.parent != Some(statement.node)
+        || variables.declarations.has_trailing_comma
+        || variables.facts != 0
+        || declaration_record.kind != SyntaxKind::VariableDeclaration
+        || declaration_record.flags.0 != 0
+        || declaration_record.parent != Some(list.node)
+        || variable.exclamation_token.is_some()
+        || variable.local_symbol.is_some()
+        || variable.symbol.is_some()
+        || variable.type_.is_some()
+        || variable.facts != 0
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(declaration.node)
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+        || initializer_record.flags.0 != 0
+        || initializer_record.parent != Some(declaration.node)
+        || owner.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+        || owner.check_flags() != CheckFlags::NONE
+        || owner.name().as_utf8() != Some(identifier.text.as_str())
+        || owner.declarations() != Some(&[declaration])
+        || owner.value_declaration() != Some(declaration)
+        || owner.members().is_some()
+        || owner.exports().is_some()
+        || owner.parent().is_some()
+        || owner.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || bound.local_symbol(declaration).is_some()
+        || bound
+            .locals(namespace)
+            .and_then(|locals| store.symbol_table(locals))
+            .and_then(|locals| locals.get_source(&identifier.text))
+            != Some(symbol)
+        || store
+            .value_symbol_links(symbol)
+            .is_some_and(|links| links != &ValueSymbolLinks::default())
+    {
+        return None;
+    }
+    Some((symbol, initializer))
+}
+
+fn plan_clodule_static_access(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    class: SemanticSymbolId,
+    class_name: &str,
+    initializer: NodeRef,
+    expected_property: &str,
+) -> Option<NodeRef> {
+    let record = preflight_node(store, host, initializer).ok()?;
+    let NodeData::PropertyAccessExpression(access) = &record.data else {
+        return None;
+    };
+    let receiver = NodeRef::new(initializer.arena, initializer.file, access.expression);
+    let receiver_record = preflight_node(store, host, receiver).ok()?;
+    let NodeData::Identifier(receiver_name) = &receiver_record.data else {
+        return None;
+    };
+    let name = NodeRef::new(initializer.arena, initializer.file, access.name);
+    let name_record = preflight_node(store, host, name).ok()?;
+    let NodeData::Identifier(property_name) = &name_record.data else {
+        return None;
+    };
+    let bound = host.bound_file(receiver)?;
+    if record.kind != SyntaxKind::PropertyAccessExpression
+        || record.flags.0 != 0
+        || access.flow_node.is_some()
+        || access.question_dot_token.is_some()
+        || access.facts != 0
+        || receiver_record.kind != SyntaxKind::Identifier
+        || receiver_record.flags.0 != 0
+        || receiver_record.parent != Some(initializer.node)
+        || receiver_name.flow_node.is_some()
+        || receiver_name.text != class_name
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(initializer.node)
+        || property_name.flow_node.is_some()
+        || property_name.text != expected_property
+        || bound
+            .locals(bound.source_file())
+            .and_then(|locals| store.symbol_table(locals))
+            .and_then(|locals| locals.get_source(class_name))
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            != Some(class)
+        || store
+            .symbol(class)
+            .and_then(Symbol::exports)
+            .and_then(|exports| store.symbol_table(exports))
+            .and_then(|exports| exports.get_source(expected_property))
+            .is_none()
+    {
+        return None;
+    }
+    Some(name)
+}
+
+fn plan_clodule_missing_static_name(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    namespace: NodeRef,
+    initializer: NodeRef,
+    expected: &str,
+) -> Option<NodeRef> {
+    let record = preflight_node(store, host, initializer).ok()?;
+    let NodeData::Identifier(identifier) = &record.data else {
+        return None;
+    };
+    let bound = host.bound_file(initializer)?;
+    if record.kind != SyntaxKind::Identifier
+        || record.flags.0 != 0
+        || identifier.flow_node.is_some()
+        || identifier.text != expected
+        || bound
+            .locals(namespace)
+            .and_then(|locals| store.symbol_table(locals))
+            .is_some_and(|locals| locals.get_source(expected).is_some())
+        || bound
+            .locals(bound.source_file())
+            .and_then(|locals| store.symbol_table(locals))
+            .is_some_and(|locals| locals.get_source(expected).is_some())
+    {
+        return None;
+    }
+    Some(initializer)
+}
+
+fn plan_clodule_static_grammar_diagnostics(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+) -> Option<ClassGrammarDiagnosticPlan> {
+    if store.get_merged_symbol(symbol)? != symbol {
+        return None;
+    }
+    let owner = store.symbol(symbol)?;
+    let [declaration, namespace] = owner.declarations()? else {
+        return None;
+    };
+    let declaration = *declaration;
+    let namespace = *namespace;
+    let record = preflight_node(store, host, declaration).ok()?;
+    let NodeData::ClassDeclaration(class) = &record.data else {
+        return None;
+    };
+    let namespace_record = preflight_node(store, host, namespace).ok()?;
+    let NodeData::ModuleDeclaration(module) = &namespace_record.data else {
+        return None;
+    };
+    let [private, public] = class.members.nodes.as_slice() else {
+        return None;
+    };
+    let name = NodeRef::new(declaration.arena, declaration.file, class.name?);
+    let name_record = preflight_node(store, host, name).ok()?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return None;
+    };
+    let namespace_name = NodeRef::new(namespace.arena, namespace.file, module.name);
+    let namespace_name_record = preflight_node(store, host, namespace_name).ok()?;
+    let NodeData::Identifier(namespace_identifier) = &namespace_name_record.data else {
+        return None;
+    };
+    if owner.flags() != (SymbolFlags::CLASS | SymbolFlags::VALUE_MODULE)
+        || owner.check_flags() != CheckFlags::NONE
+        || owner.value_declaration() != Some(declaration)
+        || owner.parent().is_some()
+        || owner.export_symbol().is_some()
+        || owner.members().is_some()
+        || !namespace.is_for(declaration.arena, declaration.file)
+        || !host.symbol_matches(store, declaration, symbol)
+        || !host.symbol_matches(store, namespace, symbol)
+        || record.kind != SyntaxKind::ClassDeclaration
+        || record.flags.0 != 0
+        || class.flow_node.is_some()
+        || class.local_symbol.is_some()
+        || class.symbol.is_some()
+        || class.next_container.is_some()
+        || class.facts != 0
+        || class.modifiers.is_some()
+        || class.type_parameters.is_some()
+        || class.heritage_clauses.is_some()
+        || class.members.has_trailing_comma
+        || namespace_record.kind != SyntaxKind::ModuleDeclaration
+        || namespace_record.flags.0 != 0
+        || namespace_record.parent != record.parent
+        || namespace_record.range.start < record.range.end
+        || module.asterisk_token.is_some()
+        || module.end_flow_node.is_some()
+        || module.flow_node.is_some()
+        || module.keyword != SyntaxKind::NamespaceKeyword
+        || module.local_symbol.is_some()
+        || module.next_container.is_some()
+        || module.symbol.is_some()
+        || module.facts != 0
+        || module.modifiers.is_some()
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(declaration.node)
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+        || owner.name().as_utf8() != Some(identifier.text.as_str())
+        || namespace_name_record.kind != SyntaxKind::Identifier
+        || namespace_name_record.flags.0 != 0
+        || namespace_name_record.parent != Some(namespace.node)
+        || namespace_identifier.flow_node.is_some()
+        || namespace_identifier.text != identifier.text
+        || store
+            .declared_type_links(symbol)
+            .is_some_and(|links| links.declared_type.is_some())
+        || store
+            .value_symbol_links(symbol)
+            .is_some_and(|links| links != &ValueSymbolLinks::default())
+    {
+        return None;
+    }
+    let exports = owner.exports()?;
+    validate_prototype(store, symbol, exports).ok()?;
+    if store.symbol_table(exports)?.len() != 3 {
+        return None;
+    }
+    let private = NodeRef::new(declaration.arena, declaration.file, *private);
+    let public = NodeRef::new(declaration.arena, declaration.file, *public);
+    if preflight_node(store, host, private).ok()?.range.end
+        > preflight_node(store, host, public).ok()?.range.start
+    {
+        return None;
+    }
+    let (private_name, _) =
+        plan_clodule_static_member(store, host, symbol, declaration, private, true)?;
+    let (public_name, _) =
+        plan_clodule_static_member(store, host, symbol, declaration, public, false)?;
+    if private_name == public_name {
+        return None;
+    }
+
+    let body = NodeRef::new(namespace.arena, namespace.file, module.body?);
+    let body_record = preflight_node(store, host, body).ok()?;
+    let NodeData::ModuleBlock(block) = &body_record.data else {
+        return None;
+    };
+    let [first, second, third, fourth] = block.statements.nodes.as_slice() else {
+        return None;
+    };
+    let bound = host.bound_file(namespace)?;
+    let locals = bound
+        .locals(namespace)
+        .and_then(|locals| store.symbol_table(locals))?;
+    if body_record.kind != SyntaxKind::ModuleBlock
+        || body_record.flags.0 != 0
+        || body_record.parent != Some(namespace.node)
+        || block.flow_node.is_some()
+        || block.facts != 0
+        || block.statements.has_trailing_comma
+        || locals.len() != 4
+    {
+        return None;
+    }
+    let first = NodeRef::new(body.arena, body.file, *first);
+    let second = NodeRef::new(body.arena, body.file, *second);
+    let third = NodeRef::new(body.arena, body.file, *third);
+    let fourth = NodeRef::new(body.arena, body.file, *fourth);
+    let (first_symbol, private_access) =
+        plan_clodule_namespace_variable(store, host, namespace, body, first)?;
+    let (second_symbol, private_reference) =
+        plan_clodule_namespace_variable(store, host, namespace, body, second)?;
+    let (third_symbol, public_access) =
+        plan_clodule_namespace_variable(store, host, namespace, body, third)?;
+    let (fourth_symbol, public_reference) =
+        plan_clodule_namespace_variable(store, host, namespace, body, fourth)?;
+    if HashSet::from([first_symbol, second_symbol, third_symbol, fourth_symbol]).len() != 4 {
+        return None;
+    }
+    let private_access = plan_clodule_static_access(
+        store,
+        host,
+        symbol,
+        &identifier.text,
+        private_access,
+        &private_name,
+    )?;
+    let private_reference =
+        plan_clodule_missing_static_name(store, host, namespace, private_reference, &private_name)?;
+    plan_clodule_static_access(
+        store,
+        host,
+        symbol,
+        &identifier.text,
+        public_access,
+        &public_name,
+    )?;
+    let public_reference =
+        plan_clodule_missing_static_name(store, host, namespace, public_reference, &public_name)?;
+
+    Some(ClassGrammarDiagnosticPlan {
+        declaration,
+        symbol,
+        diagnostics: vec![
+            ClassGrammarDiagnostic {
+                node: private_access,
+                range_override: None,
+                code: 2341,
+                arguments: vec![private_name.clone(), identifier.text.clone()],
+            },
+            ClassGrammarDiagnostic {
+                node: private_reference,
+                range_override: None,
+                code: 2304,
+                arguments: vec![private_name],
+            },
+            ClassGrammarDiagnostic {
+                node: public_reference,
+                range_override: None,
+                code: 2304,
+                arguments: vec![public_name],
+            },
+        ],
+    })
+}
+
 /// Authenticates supported class grammar failures without publishing class types.
 pub(super) fn plan_class_grammar_diagnostics(
     store: &CanonicalTypeMapperStore,
@@ -11255,6 +11721,9 @@ pub(super) fn plan_class_grammar_diagnostics(
     symbol: SemanticSymbolId,
 ) -> Option<ClassGrammarDiagnosticPlan> {
     if let Some(plan) = plan_merged_null_base_class_grammar_diagnostics(store, host, symbol) {
+        return Some(plan);
+    }
+    if let Some(plan) = plan_clodule_static_grammar_diagnostics(store, host, symbol) {
         return Some(plan);
     }
     if store.get_merged_symbol(symbol)? != symbol {
@@ -17650,6 +18119,210 @@ mod tests {
                 "{source}",
             );
         }
+    }
+
+    #[test]
+    fn class_namespace_static_reads_preserve_private_and_lexical_diagnostics() {
+        let source = concat!(
+            "class Clod { private static x = 10; public static y = 10; } ",
+            "namespace Clod { ",
+            "var first = Clod.x; ",
+            "var second = x; ",
+            "var third = Clod.y; ",
+            "var fourth = y; ",
+            "}",
+        );
+        let fixture = fixture(source);
+        let owner = class_symbol(&fixture, "Clod");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        let record = fixture.store.symbol(owner).unwrap();
+        assert_eq!(
+            record.flags(),
+            SymbolFlags::CLASS | SymbolFlags::VALUE_MODULE,
+        );
+        assert_eq!(record.declarations().unwrap().len(), 2);
+        assert!(record.members().is_none());
+
+        let grammar = plan_class_grammar_diagnostics(&fixture.store, &host, owner)
+            .expect("the merged class namespace must retain its exact access diagnostics");
+
+        assert_eq!(
+            grammar
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [2341, 2304, 2304],
+        );
+        assert_eq!(grammar.diagnostics[0].arguments, ["x", "Clod"]);
+        assert_eq!(grammar.diagnostics[1].arguments, ["x"]);
+        assert_eq!(grammar.diagnostics[2].arguments, ["y"]);
+        let spans = grammar
+            .diagnostics
+            .iter()
+            .map(|diagnostic| {
+                let range = fixture
+                    .parsed
+                    .arena
+                    .get(diagnostic.node.node)
+                    .unwrap()
+                    .range;
+                &source[range.start.get() as usize..range.end.get() as usize]
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(spans, ["x", "x", "y"]);
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+        assert!(fixture.store.declared_type_links(owner).is_none());
+        assert!(fixture.store.value_symbol_links(owner).is_none());
+    }
+
+    #[test]
+    fn class_namespace_static_reads_reject_unrelated_and_forged_ownership() {
+        for source in [
+            concat!(
+                "class Clod { public static x = 10; public static y = 10; } ",
+                "namespace Clod { ",
+                "var p = Clod.x; var q = x; var s = Clod.y; var t = y; }",
+            ),
+            concat!(
+                "class Clod { private static x = 10; public static y = 10; } ",
+                "namespace Clod { ",
+                "var p = Other.x; var q = x; var s = Clod.y; var t = y; }",
+            ),
+            concat!(
+                "class Clod { private static x = 10; public static y = 10; } ",
+                "namespace Clod { ",
+                "var p = Clod.x; var q = y; var s = Clod.y; var t = y; }",
+            ),
+            concat!(
+                "class Clod { private static x = 10; public static y = 10; } ",
+                "namespace Clod { ",
+                "export var p = Clod.x; var q = x; var s = Clod.y; var t = y; }",
+            ),
+        ] {
+            let fixture = fixture(source);
+            let owner = class_symbol(&fixture, "Clod");
+            let bound = &fixture.files[&fixture.file];
+            let host = host(&fixture.parsed.arena, bound);
+
+            assert!(
+                plan_clodule_static_grammar_diagnostics(&fixture.store, &host, owner).is_none(),
+                "{source}",
+            );
+            assert!(fixture.store.declared_type_links(owner).is_none());
+            assert!(fixture.store.value_symbol_links(owner).is_none());
+        }
+
+        let mut fixture = fixture(concat!(
+            "class Clod { private static x = 10; public static y = 10; } ",
+            "namespace Clod { ",
+            "var p = Clod.x; var q = x; var s = Clod.y; var t = y; }",
+        ));
+        let owner = class_symbol(&fixture, "Clod");
+        let property = fixture
+            .store
+            .symbol(owner)
+            .and_then(Symbol::exports)
+            .and_then(|exports| fixture.store.symbol_table(exports))
+            .and_then(|exports| exports.get_source("x"))
+            .unwrap();
+        assert!(
+            fixture
+                .store
+                .set_symbol_relationships(property, None, None, None, None),
+        );
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+
+        assert!(plan_clodule_static_grammar_diagnostics(&fixture.store, &host, owner).is_none());
+        assert!(fixture.store.declared_type_links(owner).is_none());
+        assert!(fixture.store.value_symbol_links(owner).is_none());
+    }
+
+    #[test]
+    fn class_namespace_static_diagnostics_check_source_and_replay_warm() {
+        let parsed = parse_source_file(concat!(
+            "class Clod { private static x = 10; public static y = 10; }\n",
+            "namespace Clod {\n",
+            "  var p = Clod.x;\n",
+            "  var q = x;\n",
+            "  var s = Clod.y;\n",
+            "  var t = y;\n",
+            "}\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(8_805);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/clodule-static-members.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            [(file, &parsed.arena)].into_iter().collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+
+        context.check_source_file(file).unwrap();
+
+        assert_eq!(
+            context
+                .diagnostics()
+                .as_slice()
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2341, 2304, 2304],
+        );
+        assert_eq!(
+            context.diagnostics().as_slice()[0]
+                .diagnostic
+                .render()
+                .unwrap(),
+            "Property 'x' is private and only accessible within class 'Clod'.",
+        );
+        let warm = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().checker_link_allocated_lengths(),
+            context.diagnostics().len(),
+        );
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.diagnostics().len(),
+            ),
+            warm,
+        );
     }
 
     #[test]

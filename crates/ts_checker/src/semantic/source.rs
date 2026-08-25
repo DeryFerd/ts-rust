@@ -2313,13 +2313,35 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     statements.push(PlannedStatement::Break(statement));
                 }
                 SyntaxKind::ModuleDeclaration => {
-                    let Some((store, _)) = self.semantic else {
+                    let Some((store, host)) = self.semantic else {
                         return Err(self.unsupported(
                             statement,
                             SyntaxKind::ModuleDeclaration,
                             SourceSyntaxRole::Statement,
                         ));
                     };
+                    if let Some(PlannedStatement::ClassGrammar(previous)) = statements.last()
+                        && self
+                            .bound
+                            .symbol(statement)
+                            .and_then(|symbol| store.get_merged_symbol(symbol))
+                            == Some(previous.symbol)
+                        && store
+                            .symbol(previous.symbol)
+                            .and_then(ts_binder::semantic::Symbol::declarations)
+                            == Some(&[previous.declaration, statement])
+                        && matches!(
+                            previous.diagnostics.as_slice(),
+                            [private, first_missing, second_missing]
+                                if private.code == 2341
+                                    && first_missing.code == 2304
+                                    && second_missing.code == 2304
+                        )
+                        && plan_class_grammar_diagnostics(store, host, previous.symbol).as_ref()
+                            == Some(previous)
+                    {
+                        continue;
+                    }
                     let namespace =
                         plan_source_namespace(self.arena, self.bound, store, statement)?;
                     if namespace.ambient {
