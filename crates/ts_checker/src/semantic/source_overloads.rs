@@ -20,8 +20,9 @@ use super::{
     },
     signatures::SignatureFlags,
     source_callables::{
-        SourceCallableError, SourceCallablePlan, SourceCallableReturnPlan,
-        cached_annotation_identity, plan_source_ambient_overload_declaration, valid_optional_type,
+        CallableTypePredicatePlan, SourceCallableError, SourceCallablePlan,
+        SourceCallableReturnPlan, cached_annotation_identity, plan_callable_type_predicate,
+        plan_source_ambient_overload_declaration, valid_optional_type,
     },
     store::{
         PreparedSourceOverloadParameter, PreparedSourceOverloadPublication,
@@ -64,6 +65,7 @@ pub(super) struct SourceNamespaceAmbientOverloadDeclaration {
     pub(super) type_parameters: Vec<SourceNamespaceAmbientOverloadTypeParameter>,
     pub(super) parameters: Vec<SourceNamespaceAmbientOverloadParameter>,
     pub(super) return_type: NodeRef,
+    pub(super) type_predicate: Option<CallableTypePredicatePlan>,
 }
 
 /// An authenticated ambient namespace overload group with its export-local alias.
@@ -95,7 +97,11 @@ impl SourceNamespaceAmbientOverloadPlan {
                         .iter()
                         .map(|parameter| parameter.annotation),
                 )
-                .chain(std::iter::once(declaration.return_type))
+                .chain(std::iter::once(
+                    declaration
+                        .type_predicate
+                        .map_or(declaration.return_type, |predicate| predicate.node),
+                ))
         })
     }
 }
@@ -610,11 +616,25 @@ fn plan_namespace_ambient_overload_declaration(
     if namespace_overload_node(host, return_type)?.parent != Some(declaration.node) {
         return Err(namespace_overload_group_error(return_type));
     }
+    let type_predicate = if store.source_node_kind(return_type) == Some(SyntaxKind::TypePredicate) {
+        let predicate = plan_callable_type_predicate(store, host, return_type)?;
+        if predicate.owner != declaration
+            || parameters
+                .get(usize::try_from(predicate.parameter_index).unwrap_or(usize::MAX))
+                .is_none_or(|parameter| parameter.symbol != predicate.parameter_symbol)
+        {
+            return Err(namespace_overload_group_error(return_type));
+        }
+        Some(predicate)
+    } else {
+        None
+    };
     Ok(SourceNamespaceAmbientOverloadDeclaration {
         declaration,
         type_parameters,
         parameters,
         return_type,
+        type_predicate,
     })
 }
 
@@ -1335,7 +1355,7 @@ mod tests {
     use super::*;
     use crate::semantic::{
         CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions,
-        SourceCheckError, TypeNodeLinks, bootstrap::UnionReduction,
+        SourceCheckError, TypeNodeLinks, bootstrap::UnionReduction, signatures::TypePredicateKind,
     };
 
     fn namespace_overload_context(
@@ -1401,6 +1421,69 @@ mod tests {
                 .map(|(_, declaration)| declaration)
                 .collect(),
         )
+    }
+
+    #[test]
+    fn ambient_namespace_predicate_overloads_retain_generic_and_assertion_ownership() {
+        let source = concat!(
+            "declare namespace Guards { ",
+            "function select<Value>(value: Value): value is Value; ",
+            "function select(value: unknown): value is string; ",
+            "function select(value: unknown): asserts value is string; ",
+            "}",
+        );
+        let parsed = parse_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(2_550);
+        let context = namespace_overload_context(&parsed, file, true);
+        let (namespace, declarations) = namespace_overload_nodes(&parsed, file);
+        let (_, bound) = context.file(file).unwrap();
+        let namespace_symbol = bound.symbol(namespace).unwrap();
+        let owner = bound.symbol(declarations[0]).unwrap();
+        let host = DeclaredTypeHost::new([(&parsed.arena, bound)]).unwrap();
+        let before = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().type_predicate_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+
+        let plan = plan_source_namespace_ambient_overload_group(
+            context.store(),
+            &host,
+            (namespace, namespace_symbol),
+            owner,
+            &declarations,
+        )
+        .unwrap();
+        assert_eq!(plan.declarations.len(), 3);
+        assert_eq!(plan.declarations[0].type_parameters.len(), 1);
+        assert_eq!(
+            plan.declarations
+                .iter()
+                .map(|declaration| {
+                    let predicate = declaration.type_predicate.unwrap();
+                    assert_eq!(predicate.owner, declaration.declaration);
+                    assert_eq!(predicate.parameter_index, 0);
+                    assert_eq!(predicate.parameter_symbol, declaration.parameters[0].symbol);
+                    predicate.kind
+                })
+                .collect::<Vec<_>>(),
+            [
+                TypePredicateKind::Identifier,
+                TypePredicateKind::Identifier,
+                TypePredicateKind::AssertsIdentifier,
+            ],
+        );
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().type_predicate_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            before,
+        );
     }
 
     #[test]

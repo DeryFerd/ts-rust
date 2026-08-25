@@ -60636,6 +60636,81 @@ class Foo2 {
     }
 
     #[test]
+    fn source_number_guards_and_assertions_preserve_boolean_and_void_returns() {
+        let source = parsed(concat!(
+            "function isNumber(value: any): value is number { ",
+            "return typeof value === 'number'; } ",
+            "function assertString(value: unknown): asserts value is string {} ",
+            "function assertTruthy(value: unknown): asserts value { return; } ",
+            "const accepted: boolean = isNumber(1);",
+        ));
+        let file = FileId::new(9_873);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        for (name, kind, narrowed, expected_return) in [
+            (
+                "isNumber",
+                TypePredicateKind::Identifier,
+                Some(bootstrap.number_type),
+                bootstrap.boolean_type,
+            ),
+            (
+                "assertString",
+                TypePredicateKind::AssertsIdentifier,
+                Some(bootstrap.string_type),
+                bootstrap.void_type,
+            ),
+            (
+                "assertTruthy",
+                TypePredicateKind::AssertsIdentifier,
+                None,
+                bootstrap.void_type,
+            ),
+        ] {
+            let owner = function_symbol(&context, &source, file, name);
+            let callable = context
+                .store()
+                .source_callable_type_for_owner(owner)
+                .unwrap();
+            let signature = context
+                .store()
+                .source_callable_provenance(callable)
+                .and_then(|provenance| context.store().signature(provenance.signature))
+                .unwrap();
+            let predicate = signature
+                .resolved_type_predicate()
+                .and_then(|predicate| context.store().type_predicate(predicate))
+                .unwrap();
+            assert_eq!(signature.resolved_return_type(), Some(expected_return));
+            assert_eq!(predicate.kind(), kind);
+            assert_eq!(predicate.parameter_index(), 0);
+            assert_eq!(predicate.parameter_name(), "value");
+            assert_eq!(predicate.type_id(), narrowed);
+        }
+        assert_eq!(
+            variable_value_type(&context, &source, file, "accepted"),
+            bootstrap.boolean_type,
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = (
+            observable_state(&context, file),
+            context.store().type_predicate_len(),
+        );
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(
+            (
+                observable_state(&context, file),
+                context.store().type_predicate_len(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
     fn linear_function_bodies_publish_locals_and_preserve_return_types() {
         let source = parsed(concat!(
             "function inferred() { var hidden = 1; } ",

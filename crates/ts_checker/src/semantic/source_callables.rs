@@ -2774,7 +2774,6 @@ fn plan_source_callable_with_owner_shape(
         let identity_node = peel_parenthesized_type(store, host, type_node)?;
         if preflight_node(store, host, identity_node)?.kind == SyntaxKind::TypePredicate {
             if view.family != SourceCallableFamily::FunctionDeclaration
-                || !type_parameters.is_empty()
                 || matches!(owner_shape, SourceCallableOwnerShape::AmbientOverload(_))
             {
                 return Err(SourceCallableError::Unsupported(
@@ -4830,6 +4829,10 @@ fn validate_exact_generic_annotation_shape(
             SourceCallableUnsupported::GenericInferredReturn(plan.declaration),
         ));
     };
+    let generic_return_identity = plan
+        .type_predicate
+        .and_then(|predicate| predicate.narrowed_type)
+        .unwrap_or(return_identity_node);
     let ambient_namespace = plan.body_mode.is_ambient()
         && plan.owner_parent.is_some()
         && host
@@ -4896,12 +4899,17 @@ fn validate_exact_generic_annotation_shape(
             ));
         }
     }
+    if plan.type_predicate.is_some_and(|predicate| {
+        predicate.kind == TypePredicateKind::AssertsIdentifier && predicate.narrowed_type.is_none()
+    }) {
+        return Ok(None);
+    }
     let mut return_type_parameter = None;
     for (index, type_parameter) in plan.type_parameters.iter().enumerate() {
         if is_naked_source_type_parameter_annotation(
             store,
             host,
-            return_identity_node,
+            generic_return_identity,
             type_parameter,
         )? {
             return_type_parameter = Some(index);
@@ -4911,7 +4919,7 @@ fn validate_exact_generic_annotation_shape(
         && !is_exact_source_generic_mapper_annotation(
             store,
             host,
-            return_identity_node,
+            generic_return_identity,
             &plan.type_parameters,
         )?
     {
@@ -4919,7 +4927,11 @@ fn validate_exact_generic_annotation_shape(
             SourceCallableUnsupported::GenericSignature(plan.declaration),
         ));
     }
-    Ok(return_type_parameter)
+    Ok(if plan.type_predicate.is_some() {
+        None
+    } else {
+        return_type_parameter
+    })
 }
 
 fn is_exact_jsdoc_generic_union_annotation(
@@ -9205,7 +9217,7 @@ fn valid_source_generic_mapper_type(
 ) -> bool {
     if store
         .intrinsic_bootstrap()
-        .is_some_and(|bootstrap| type_ == bootstrap.boolean_type)
+        .is_some_and(|bootstrap| type_ == bootstrap.boolean_type || type_ == bootstrap.void_type)
     {
         return true;
     }
@@ -9250,6 +9262,17 @@ fn valid_stored_source_generic_return_annotation(
         return store
             .intrinsic_bootstrap()
             .is_some_and(|bootstrap| return_type == bootstrap.null_type);
+    }
+    if store.source_node_kind(annotation) == Some(SyntaxKind::TypePredicate) {
+        let Some(bootstrap) = store.intrinsic_bootstrap() else {
+            return false;
+        };
+        return (return_type == bootstrap.boolean_type || return_type == bootstrap.void_type)
+            && store.type_node_links(annotation)
+                == Some(&TypeNodeLinks {
+                    resolved_type: Some(return_type),
+                    outer_type_parameters: None,
+                });
     }
     if store.source_node_kind(annotation) == Some(SyntaxKind::TypeReference) {
         return valid_named_source_generic_reference(
@@ -10480,6 +10503,117 @@ mod tests {
                 SourceCallableInvariant::InvalidOwnerSymbol(declaration),
             )),
         );
+    }
+
+    #[test]
+    fn generic_source_predicates_and_assertions_preserve_type_parameter_identity() {
+        for (index, (source, expected_kind, minimum_arguments, narrows_type_parameter)) in [
+            (
+                "declare function select<Value>(value: Value): value is Value;",
+                TypePredicateKind::Identifier,
+                1,
+                true,
+            ),
+            (
+                "declare function assertValue<Value>(value: Value): asserts value is Value;",
+                TypePredicateKind::AssertsIdentifier,
+                1,
+                true,
+            ),
+            (
+                "declare function assertTruthy<Value>(value: Value): asserts value;",
+                TypePredicateKind::AssertsIdentifier,
+                1,
+                false,
+            ),
+            (
+                "declare function selectOptional<Value>(value?: Value): value is Value;",
+                TypePredicateKind::Identifier,
+                0,
+                true,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut fixture =
+                QueryFixture::new(source, FileId::new(9_870 + u32::try_from(index).unwrap()));
+            let declaration = fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::FunctionDeclaration).then_some(NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let owner = fixture.bound.symbol(declaration).unwrap();
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let callable = fixture
+                .query_callable(declaration, owner, &mut diagnostics)
+                .unwrap();
+            let signature = fixture
+                .store
+                .source_callable_provenance(callable)
+                .unwrap()
+                .signature;
+            let expected_return = {
+                let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+                if expected_kind == TypePredicateKind::Identifier {
+                    bootstrap.boolean_type
+                } else {
+                    bootstrap.void_type
+                }
+            };
+            assert_eq!(
+                fixture.query_return(signature, &mut diagnostics),
+                Ok(expected_return),
+            );
+            let record = fixture.store.signature(signature).unwrap();
+            let [type_parameter] = record.type_parameters() else {
+                panic!("the generic source predicate must retain one type parameter")
+            };
+            let predicate = record
+                .resolved_type_predicate()
+                .and_then(|predicate| fixture.store.type_predicate(predicate))
+                .unwrap();
+            assert_eq!(record.min_argument_count(), minimum_arguments);
+            assert_eq!(predicate.kind(), expected_kind);
+            assert_eq!(predicate.parameter_index(), 0);
+            assert_eq!(predicate.parameter_name(), "value");
+            assert_eq!(
+                predicate.type_id(),
+                narrows_type_parameter.then_some(*type_parameter),
+            );
+            assert!(matches!(
+                validate_stored_source_callable(&fixture.store, callable),
+                StoredSourceCallableValidation::Valid(_),
+            ));
+
+            let warm = (
+                generic_transaction_state(&fixture.store),
+                fixture.store.type_predicate_len(),
+            );
+            assert_eq!(
+                fixture.query_return(signature, &mut diagnostics),
+                Ok(expected_return),
+            );
+            assert_eq!(
+                fixture.query_callable(declaration, owner, &mut diagnostics),
+                Ok(callable),
+            );
+            assert_eq!(
+                (
+                    generic_transaction_state(&fixture.store),
+                    fixture.store.type_predicate_len(),
+                ),
+                warm,
+            );
+            assert!(diagnostics.is_empty());
+        }
     }
 
     #[test]

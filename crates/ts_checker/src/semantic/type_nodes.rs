@@ -732,6 +732,7 @@ struct PlannedArrayType {
     element_type: NodeRef,
     fallback: Option<TypeId>,
     target: TypeId,
+    readonly_operator: Option<NodeRef>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2995,17 +2996,60 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         node: NodeRef,
         alias_owner: Option<SemanticSymbolId>,
     ) -> Result<(), DeclaredTypeError> {
-        let array_type = self.array_type.ok_or_else(|| {
-            type_node_unavailable(TypeNodeUnavailable::UnsupportedSyntax {
-                node,
-                kind: SyntaxKind::ArrayType,
-            })
-        })?;
         let record = preflight_node(self.store, self.host, node)?;
         let NodeData::ArrayTypeNode(array) = &record.data else {
             return Err(type_node_unavailable(
                 TypeNodeUnavailable::InvalidTypeReference(node),
             ));
+        };
+        let readonly_operator = record
+            .parent
+            .map(|parent| NodeRef::new(node.arena, node.file, parent))
+            .filter(|parent| {
+                self.host.node(*parent).is_some_and(|record| {
+                    matches!(
+                        &record.data,
+                        NodeData::TypeOperatorNode(operator)
+                            if record.kind == SyntaxKind::TypeOperator
+                                && operator.operator == SyntaxKind::ReadonlyKeyword
+                                && operator.type_ == node.node
+                    )
+                })
+            });
+        let array_type = if let Some(operator) = readonly_operator {
+            let operator_record = preflight_node(self.store, self.host, operator)?;
+            if operator_record.flags.0 != 0
+                || record.parent != Some(operator.node)
+                || record.range.start <= operator_record.range.start
+                || record.range.end != operator_record.range.end
+                || self
+                    .store
+                    .symbol_node_links(operator)
+                    .is_some_and(|links| links != &SymbolNodeLinks::default())
+                || self
+                    .store
+                    .type_node_links(operator)
+                    .is_some_and(|links| links.outer_type_parameters.is_some())
+            {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(operator),
+                ));
+            }
+            self.array_targets
+                .map(CanonicalArrayTargets::readonly_array_type)
+                .ok_or_else(|| {
+                    type_node_unavailable(TypeNodeUnavailable::UnsupportedSyntax {
+                        node: operator,
+                        kind: SyntaxKind::TypeOperator,
+                    })
+                })?
+        } else {
+            self.array_type.ok_or_else(|| {
+                type_node_unavailable(TypeNodeUnavailable::UnsupportedSyntax {
+                    node,
+                    kind: SyntaxKind::ArrayType,
+                })
+            })?
         };
         let element_type = NodeRef::new(node.arena, node.file, array.element_type);
         let element_record = preflight_node(self.store, self.host, element_type)?;
@@ -3024,6 +3068,18 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             .store
             .type_node_links(node)
             .and_then(|links| links.resolved_type);
+        let readonly_cached = readonly_operator
+            .and_then(|operator| self.store.type_node_links(operator))
+            .and_then(|links| links.resolved_type);
+        if cached
+            .zip(readonly_cached)
+            .is_some_and(|(inner, outer)| inner != outer)
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTypeReference(node),
+            ));
+        }
+        let cached = cached.or(readonly_cached);
         if let Some(cached) = cached {
             validate_generic_global_type_instantiation(self.store, array_type, cached).map_err(
                 |_| type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node)),
@@ -3079,6 +3135,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             element_type,
             fallback,
             target: array_type,
+            readonly_operator,
         };
         if let Some(existing) = self.plan.arrays.insert(node, planned)
             && existing != planned
@@ -3105,104 +3162,22 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         node: NodeRef,
         alias_owner: Option<SemanticSymbolId>,
     ) -> Result<(), DeclaredTypeError> {
-        let target = self
-            .array_targets
-            .map(CanonicalArrayTargets::readonly_array_type)
-            .ok_or_else(|| {
-                type_node_unavailable(TypeNodeUnavailable::UnsupportedSyntax {
-                    node,
-                    kind: SyntaxKind::TypeOperator,
-                })
-            })?;
         let record = preflight_node(self.store, self.host, node)?;
         let NodeData::TypeOperatorNode(operator) = &record.data else {
             return Err(type_node_unavailable(
                 TypeNodeUnavailable::InvalidTypeReference(node),
             ));
         };
-        let array = NodeRef::new(node.arena, node.file, operator.type_);
-        let array_record = preflight_node(self.store, self.host, array)?;
-        let NodeData::ArrayTypeNode(array_data) = &array_record.data else {
-            return Err(type_node_unavailable(
-                TypeNodeUnavailable::InvalidTypeReference(node),
-            ));
-        };
-        let element_type = NodeRef::new(array.arena, array.file, array_data.element_type);
-        let element_record = preflight_node(self.store, self.host, element_type)?;
         if record.kind != SyntaxKind::TypeOperator
             || operator.operator != SyntaxKind::ReadonlyKeyword
-            || array_record.kind != SyntaxKind::ArrayType
-            || array_record.parent != Some(node.node)
-            || array_record.range.start <= record.range.start
-            || array_record.range.end != record.range.end
-            || element_record.parent != Some(array.node)
-            || element_record.range.start != array_record.range.start
-            || element_record.range.end >= array_record.range.end
+            || !self.is_readonly_array_type(node, operator.type_)?
         {
             return Err(type_node_unavailable(
                 TypeNodeUnavailable::InvalidTypeReference(node),
             ));
         }
-        let fallback = preflight_generic_global_type_target(self.store, target)
-            .map_err(|_| type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node)))?;
-        let cached = self
-            .store
-            .type_node_links(node)
-            .and_then(|links| links.resolved_type);
-        if let Some(cached) = cached {
-            validate_generic_global_type_instantiation(self.store, target, cached).map_err(
-                |_| type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node)),
-            )?;
-        }
-        if fallback.is_none() {
-            if let Some(alias) = alias_owner
-                && self
-                    .plan
-                    .aliases
-                    .get(&alias)
-                    .is_some_and(|plan| !plan.type_parameters.is_empty())
-            {
-                return Err(type_node_unavailable(
-                    TypeNodeUnavailable::GenericReferenceUnsupported {
-                        node,
-                        symbol: alias,
-                    },
-                ));
-            }
-            self.plan_type_node_in_context(element_type, None, false)?;
-            if let Some(cached) = cached {
-                let TypeData::TypeReference(reference) = self
-                    .store
-                    .type_payload(cached)
-                    .expect("the generic-global cache was preflighted")
-                    .data()
-                else {
-                    unreachable!("an initialized generic-global cache owns references")
-                };
-                let cached_element = reference
-                    .resolved_type_arguments
-                    .as_deref()
-                    .expect("the generic-global cache was preflighted")[0];
-                if self.cached_array_element_identity(element_type)? != Some(cached_element) {
-                    return Err(type_node_unavailable(
-                        TypeNodeUnavailable::InvalidTypeReference(node),
-                    ));
-                }
-            }
-        }
-        let planned = PlannedArrayType {
-            element_type,
-            fallback,
-            target,
-        };
-        if let Some(existing) = self.plan.arrays.insert(node, planned)
-            && existing != planned
-        {
-            return Err(type_node_unavailable(
-                TypeNodeUnavailable::InvalidTypeReference(node),
-            ));
-        }
-        Ok(())
+        let array = NodeRef::new(node.arena, node.file, operator.type_);
+        self.plan_array_type(array, alias_owner)
     }
 
     fn type_node_contains_import_alias_reference(
@@ -14558,6 +14533,16 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 }
                 self.collect_type_reference_alias_root_graph(child, visited, references)?;
             }
+            NodeData::TypeOperatorNode(operator)
+                if record.kind == SyntaxKind::TypeOperator
+                    && operator.operator == SyntaxKind::ReadonlyKeyword =>
+            {
+                let child = NodeRef::new(node.arena, node.file, operator.type_);
+                if preflight_node(self.store, self.host, child)?.parent != Some(node.node) {
+                    return Err(unsupported());
+                }
+                self.collect_type_reference_alias_root_graph(child, visited, references)?;
+            }
             NodeData::TypePredicateNode(predicate) if record.kind == SyntaxKind::TypePredicate => {
                 if let Some(narrowed) = predicate.type_ {
                     let narrowed = NodeRef::new(node.arena, node.file, narrowed);
@@ -15826,10 +15811,16 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                         .and_then(|additional| count.checked_add(additional))
                         .ok_or_else(|| Self::literal_cache_error(LiteralTypeCacheError::Capacity))
                 })?;
+        let readonly_array_operators = plan
+            .arrays
+            .values()
+            .filter(|array| array.readonly_operator.is_some())
+            .count();
         let capacity = plan
             .arrays
             .len()
-            .checked_add(plan.indexed_accesses.len())
+            .checked_add(readonly_array_operators)
+            .and_then(|count| count.checked_add(plan.indexed_accesses.len()))
             .and_then(|count| count.checked_add(plan.recovered_indexed_accesses.len()))
             .and_then(|count| count.checked_add(plan.keyofs.len()))
             .and_then(|count| count.checked_add(plan.references.len()))
@@ -15893,6 +15884,13 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 if !nodes.contains(&node) {
                     nodes.push(node);
                 }
+            }
+        }
+        for array in plan.arrays.values() {
+            if let Some(operator) = array.readonly_operator
+                && !nodes.contains(&operator)
+            {
+                nodes.push(operator);
             }
         }
         for tuple in plan.tuples.values() {
@@ -16978,8 +16976,13 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 NodeData::TypeOperatorNode(operator)
                     if operator.operator == SyntaxKind::ReadonlyKeyword =>
                 {
-                    if plan.arrays.contains_key(&node) {
-                        self.execute_array_type(node, plan, prepared)
+                    let target = NodeRef::new(node.arena, node.file, operator.type_);
+                    if plan
+                        .arrays
+                        .get(&target)
+                        .is_some_and(|array| array.readonly_operator == Some(node))
+                    {
+                        self.execute_readonly_array_type(node, target, plan, prepared)
                     } else {
                         self.execute_tuple_type(node, plan, prepared)
                     }
@@ -18428,6 +18431,31 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             ));
         }
         Ok(resolved_type)
+    }
+
+    fn execute_readonly_array_type(
+        &mut self,
+        node: NodeRef,
+        array: NodeRef,
+        plan: &TypeQueryPlan,
+        prepared: &mut PreparedTypeQueryTypes,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let resolved = self.execute_array_type(array, plan, prepared)?;
+        let expected = TypeNodeLinks {
+            resolved_type: Some(resolved),
+            outer_type_parameters: None,
+        };
+        if self
+            .store
+            .type_node_links(node)
+            .is_some_and(|links| links != &TypeNodeLinks::default() && links != &expected)
+            || !self.store.set_type_node_links(node, expected)
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTypeReference(node),
+            ));
+        }
+        Ok(resolved)
     }
 
     fn direct_type_literal_plan_node(
@@ -39615,6 +39643,116 @@ mod tests {
         assert_eq!(function_store_state(&fixture.store), before);
         assert!(fixture.store.type_node_links(function).is_none());
         assert!(fixture.store.signature_links(function).is_none());
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn readonly_array_predicate_callbacks_preserve_readonly_targets_and_warm_identity() {
+        let mut fixture = global_array_fixture(concat!(
+            "type MutableGuard = ",
+            "(value: number, index: number, values: number[]) => value is number; ",
+            "type ReadonlyGuard = ",
+            "(value: number, index: number, values: readonly number[]) => value is number;",
+        ));
+        let global_types = initialize_fixture_global_types(&mut fixture);
+        let mutable = function_type_node(&fixture, "MutableGuard");
+        let readonly = function_type_node(&fixture, "ReadonlyGuard");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let mutable_type =
+            query_global_node(&mut fixture, &global_types, mutable, &mut diagnostics).unwrap();
+        let readonly_type =
+            query_global_node(&mut fixture, &global_types, readonly, &mut diagnostics).unwrap();
+        let mutable_signature = function_signature(&fixture.store, mutable);
+        let readonly_signature = function_signature(&fixture.store, readonly);
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        let boolean = fixture.store.intrinsic_bootstrap().unwrap().boolean_type;
+        assert_eq!(
+            query_global_signature_return(
+                &mut fixture,
+                &global_types,
+                mutable_signature,
+                &mut diagnostics,
+            ),
+            Ok(boolean),
+        );
+        assert_eq!(
+            query_global_signature_return(
+                &mut fixture,
+                &global_types,
+                readonly_signature,
+                &mut diagnostics,
+            ),
+            Ok(boolean),
+        );
+
+        let mutable_parameter = fixture
+            .store
+            .callable_signature_parameter_types(mutable_signature)
+            .unwrap()[2];
+        let readonly_parameter = fixture
+            .store
+            .callable_signature_parameter_types(readonly_signature)
+            .unwrap()[2];
+        let mutable_reference =
+            validate_direct_generic_reference(&fixture.store, mutable_parameter).unwrap();
+        let readonly_reference =
+            validate_direct_generic_reference(&fixture.store, readonly_parameter).unwrap();
+        assert_eq!(mutable_reference.target, global_types.array_type);
+        assert_eq!(readonly_reference.target, global_types.readonly_array_type);
+        assert_eq!(mutable_reference.type_arguments.as_slice(), &[number]);
+        assert_eq!(readonly_reference.type_arguments.as_slice(), &[number]);
+        assert_ne!(mutable_parameter, readonly_parameter);
+
+        let parameters = function_parameter_nodes(&fixture, readonly);
+        let annotation = parameter_type_node(&fixture, parameters[2]);
+        let NodeData::TypeOperatorNode(operator) =
+            &fixture.parsed.arena.get(annotation.node).unwrap().data
+        else {
+            panic!("the readonly callback parameter must retain its readonly operator")
+        };
+        let inner = NodeRef::new(annotation.arena, annotation.file, operator.type_);
+        assert_eq!(
+            fixture
+                .store
+                .type_node_links(annotation)
+                .and_then(|links| links.resolved_type),
+            Some(readonly_parameter),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .type_node_links(inner)
+                .and_then(|links| links.resolved_type),
+            Some(readonly_parameter),
+        );
+        let predicate = fixture
+            .store
+            .signature(readonly_signature)
+            .and_then(Signature::resolved_type_predicate)
+            .and_then(|predicate| fixture.store.type_predicate(predicate))
+            .unwrap();
+        assert_eq!(predicate.type_id(), Some(number));
+
+        let warm = (
+            function_store_state(&fixture.store),
+            fixture.store.type_predicate_len(),
+        );
+        assert_eq!(
+            query_global_node(&mut fixture, &global_types, mutable, &mut diagnostics),
+            Ok(mutable_type),
+        );
+        assert_eq!(
+            query_global_node(&mut fixture, &global_types, readonly, &mut diagnostics),
+            Ok(readonly_type),
+        );
+        assert_eq!(
+            (
+                function_store_state(&fixture.store),
+                fixture.store.type_predicate_len(),
+            ),
+            warm,
+        );
         assert!(diagnostics.is_empty());
     }
 

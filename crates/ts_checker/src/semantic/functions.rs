@@ -29,7 +29,7 @@ use super::{
         DecoratorSignatureState, EffectsSignatureState, ResolvedSignatureState, SignatureLinks,
         SymbolNodeLinks, TypeAliasLinks, TypeNodeLinks, ValueSymbolLinks,
     },
-    signatures::{ElementFlags, Signature, SignatureFlags},
+    signatures::{ElementFlags, Signature, SignatureFlags, TypePredicateKind},
     source_callables::{
         CallableTypePredicatePlan, SourceCallableError, implicit_any_array_type,
         plan_callable_type_predicate, valid_planned_callable_type_predicate,
@@ -743,6 +743,7 @@ pub(super) fn plan_function_type(
     if !type_parameters.is_empty()
         && (flags != SignatureFlags::NONE
             || usize::try_from(min_argument_count).ok() != Some(parameters.len())
+                && type_predicate.is_none()
             || parameters
                 .iter()
                 .any(|parameter| parameter.rest_tuple_element.is_some()))
@@ -1078,6 +1079,24 @@ fn plan_function_type_parameters(
     let return_record = preflight_node(store, host, return_type)?;
     let checked_type = match &return_record.data {
         NodeData::TypeReferenceNode(_) => return_type,
+        NodeData::TypePredicateNode(predicate)
+            if return_record.kind == SyntaxKind::TypePredicate && value_parameter_count != 0 =>
+        {
+            let narrowed = predicate
+                .type_
+                .map(|node| NodeRef::new(return_type.arena, return_type.file, node))
+                .ok_or(FunctionTypeError::Unsupported(
+                    FunctionTypeUnsupported::GenericSignature(function),
+                ))?;
+            let narrowed_record = preflight_node(store, host, narrowed)?;
+            if narrowed_record.parent != Some(return_type.node)
+                || narrowed_record.range.start < return_record.range.start
+                || narrowed_record.range.end > return_record.range.end
+            {
+                return Err(invariant(FunctionTypeInvariant::InvalidSyntax(narrowed)));
+            }
+            narrowed
+        }
         NodeData::ConditionalTypeNode(conditional)
             if return_record.kind == SyntaxKind::ConditionalType
                 && value_parameter_count == 0
@@ -2572,12 +2591,14 @@ fn valid_stored_function_type_parameters(
     let [type_parameter] = signature.type_parameters() else {
         return signature.type_parameters().is_empty().then(Vec::new);
     };
+    let return_kind = store.source_node_kind(return_annotation)?;
+    let minimum = usize::try_from(signature.min_argument_count()).ok()?;
     if signature.flags() != SignatureFlags::NONE
-        || usize::try_from(signature.min_argument_count()).ok()
-            != Some(signature.parameters().len())
+        || minimum > signature.parameters().len()
+        || minimum != signature.parameters().len() && return_kind != SyntaxKind::TypePredicate
         || !matches!(
-            store.source_node_kind(return_annotation),
-            Some(SyntaxKind::TypeReference | SyntaxKind::ConditionalType)
+            return_kind,
+            SyntaxKind::TypeReference | SyntaxKind::ConditionalType | SyntaxKind::TypePredicate
         )
         || store.source_node_parent(return_annotation) != Some(SourceNodeParent::Parent(function))
     {
@@ -2647,7 +2668,7 @@ fn valid_stored_function_type_parameters(
         None if data.constraint == Some(no_constraint) => None,
         None => return None,
     };
-    match store.source_node_kind(return_annotation)? {
+    match return_kind {
         SyntaxKind::TypeReference => {
             if store
                 .symbol_node_links(return_annotation)
@@ -2709,6 +2730,21 @@ fn valid_stored_function_type_parameters(
                         .and_then(|links| links.resolved_type)
                         != Some(return_type)
                 })
+            {
+                return None;
+            }
+        }
+        SyntaxKind::TypePredicate => {
+            if signature.parameters().is_empty()
+                || signature
+                    .resolved_type_predicate()
+                    .and_then(|predicate| store.type_predicate(predicate))
+                    .is_some_and(|predicate| {
+                        !matches!(
+                            predicate.kind(),
+                            TypePredicateKind::Identifier | TypePredicateKind::AssertsIdentifier
+                        ) || predicate.type_id() != Some(*type_parameter)
+                    })
             {
                 return None;
             }
@@ -3098,7 +3134,7 @@ mod tests {
         CanonicalCheckerDiagnostics, IntrinsicBootstrapOptions,
         global_types::initialize_global_library_types,
         production::GlobalMergeCompletion,
-        type_nodes::{CanonicalTypeQuery, CanonicalTypeQueryOptions},
+        type_nodes::{CanonicalTypeQuery, CanonicalTypeQueryOptions, TypeNodeUnavailable},
     };
 
     struct Fixture {
@@ -3383,6 +3419,164 @@ mod tests {
             warm,
         );
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn generic_type_predicate_returns_preserve_parameter_identity_and_warm_caches() {
+        for (index, (source, expected_kind, minimum_arguments)) in [
+            (
+                "declare let callback: <Value>(value: Value) => value is Value;",
+                TypePredicateKind::Identifier,
+                1,
+            ),
+            (
+                "declare let callback: <Value>(value: Value) => asserts value is Value;",
+                TypePredicateKind::AssertsIdentifier,
+                1,
+            ),
+            (
+                "declare let callback: <Value>(value?: Value) => value is Value;",
+                TypePredicateKind::Identifier,
+                0,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut fixture = fixture(source, FileId::new(95_090 + u32::try_from(index).unwrap()));
+            let function = generic_function_node(&fixture);
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+            let (function_type, signature) = {
+                let host = DeclaredTypeHost::new_after_global_merge(
+                    [(&fixture.parsed.arena, &fixture.bound)],
+                    GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+                )
+                .unwrap();
+                let function_type = CanonicalTypeQuery::new(
+                    &mut fixture.store,
+                    &host,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_type_from_type_node(function)
+                .unwrap();
+                let signature = fixture
+                    .store
+                    .signature_links(function)
+                    .and_then(|links| links.resolved_signature.signature())
+                    .unwrap();
+                (function_type, signature)
+            };
+            let expected_return = {
+                let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+                if expected_kind == TypePredicateKind::Identifier {
+                    bootstrap.boolean_type
+                } else {
+                    bootstrap.void_type
+                }
+            };
+            {
+                let host = DeclaredTypeHost::new_after_global_merge(
+                    [(&fixture.parsed.arena, &fixture.bound)],
+                    GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+                )
+                .unwrap();
+                assert_eq!(
+                    CanonicalTypeQuery::new(
+                        &mut fixture.store,
+                        &host,
+                        CanonicalTypeQueryOptions::default(),
+                        &mut diagnostics,
+                    )
+                    .unwrap()
+                    .get_return_type_of_signature(signature),
+                    Ok(expected_return),
+                );
+            }
+            let record = fixture.store.signature(signature).unwrap();
+            let [type_parameter] = record.type_parameters() else {
+                panic!("the generic predicate must retain its declared type parameter")
+            };
+            assert_eq!(record.min_argument_count(), minimum_arguments);
+            let predicate = record
+                .resolved_type_predicate()
+                .and_then(|predicate| fixture.store.type_predicate(predicate))
+                .unwrap();
+            assert_eq!(predicate.kind(), expected_kind);
+            assert_eq!(predicate.parameter_index(), 0);
+            assert_eq!(predicate.parameter_name(), "value");
+            assert_eq!(predicate.type_id(), Some(*type_parameter));
+            assert!(matches!(
+                validate_stored_function_type(&fixture.store, function_type),
+                StoredFunctionTypeValidation::Valid(_),
+            ));
+
+            let warm = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.type_predicate_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            assert_eq!(
+                CanonicalTypeQuery::new(
+                    &mut fixture.store,
+                    &host,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_return_type_of_signature(signature),
+                Ok(expected_return),
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.type_predicate_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                warm,
+            );
+            let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+            let forged = fixture
+                .store
+                .alloc_type_predicate(expected_kind, 0, "value", Some(string))
+                .unwrap();
+            assert!(
+                fixture
+                    .store
+                    .set_signature_resolved_type_predicate(signature, Some(forged))
+            );
+            assert_eq!(
+                validate_stored_function_type(&fixture.store, function_type),
+                StoredFunctionTypeValidation::Malformed,
+            );
+            let host = DeclaredTypeHost::new_after_global_merge(
+                [(&fixture.parsed.arena, &fixture.bound)],
+                GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+            )
+            .unwrap();
+            assert!(matches!(
+                CanonicalTypeQuery::new(
+                    &mut fixture.store,
+                    &host,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_return_type_of_signature(signature),
+                Err(DeclaredTypeError::TypeNodeUnavailable(
+                    TypeNodeUnavailable::InvalidFunctionSignature(cached),
+                )) if cached == signature
+            ));
+            assert!(diagnostics.is_empty());
+        }
     }
 
     #[test]
