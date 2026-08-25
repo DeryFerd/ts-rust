@@ -2795,7 +2795,18 @@ pub(super) fn prepare_source_import_value(
         PlannedSourceImportValueTarget::AnnotatedFunction(callable) => callable.declaration,
         PlannedSourceImportValueTarget::AmbientClass(class) => class.declaration(),
     };
-    if target_declaration.file == binding.declaration.file {
+    let same_source_namespace = matches!(
+        &planned_target,
+        PlannedSourceImportValueTarget::ModuleNamespace { declaration, .. }
+            if binding.imported_text == "*"
+                && store.source_node_kind(binding.declaration)
+                    == Some(SyntaxKind::NamespaceImport)
+                && store.source_node_kind(*declaration) == Some(SyntaxKind::SourceFile)
+                && declared_host
+                    .bound_file(binding.declaration)
+                    .is_some_and(|bound| bound.source_file() == *declaration)
+    );
+    if target_declaration.file == binding.declaration.file && !same_source_namespace {
         return Err(unsupported(SourceImportUnsupported::SameSourceTarget {
             binding: binding.declaration,
             target: target_declaration,
@@ -10150,6 +10161,157 @@ mod tests {
                 .is_none()
         );
         assert!(fixture.store.value_symbol_links(module).is_none());
+    }
+
+    #[test]
+    fn package_self_namespace_imports_preserve_source_module_identity_cold_and_warm() {
+        let mut fixture = fixture(
+            &[concat!(
+                "import * as namespace from 'package'; ",
+                "export const value: number = 1; ",
+                "const copied = namespace;",
+            )],
+            &[Route {
+                source: 0,
+                specifier: 0,
+                target: Some(0),
+            }],
+        );
+        let plan = fixture.plan_import(0, 0);
+        let [binding] = plan.bindings.as_slice() else {
+            panic!("the package self import must retain one namespace binding")
+        };
+        let source_file = fixture.files[0].file;
+        let source = &fixture.files[0];
+        let bound = fixture.bound.get(&source.file).unwrap();
+        let module = bound.symbol(bound.source_file()).unwrap();
+        let read = plan_source_import_identifier_read(
+            &source.parsed.arena,
+            bound,
+            &fixture.store,
+            binding,
+            identifier_initializer(&fixture, 0, "namespace"),
+            "namespace",
+            binding.alias_symbol,
+        )
+        .unwrap();
+        let resolved = resolve_all(&mut fixture, &plan.bindings).unwrap();
+        assert_eq!(resolved[0].target_symbol, module);
+
+        let prepared = prepare_one(&mut fixture, &resolved[0], &read).unwrap();
+
+        assert_eq!(prepared.target_symbol, module);
+        assert_eq!(prepared.target_declaration.file, source_file);
+        let PreparedSourceImportTarget::ModuleNamespace { properties } = &prepared.target else {
+            panic!("a package self import must retain its source module namespace")
+        };
+        let [property] = properties.as_slice() else {
+            panic!("the package self import must expose its annotated export")
+        };
+        assert_eq!(property.name.as_utf8(), Some("value"));
+        assert_eq!(property.value_symbol, direct_export(&fixture, 0, "value"));
+        assert_eq!(
+            property.type_,
+            fixture.store.intrinsic_bootstrap().unwrap().number_type,
+        );
+        assert!(
+            fixture
+                .store
+                .value_symbol_links(binding.alias_symbol)
+                .is_none()
+        );
+
+        publish_for_test(&mut fixture.store, std::slice::from_ref(&prepared));
+        let warm = (store_state(&fixture.store), fixture.store.symbol_len());
+        assert_eq!(
+            prepare_one(&mut fixture, &resolved[0], &read).unwrap(),
+            prepared
+        );
+        assert_eq!(
+            (store_state(&fixture.store), fixture.store.symbol_len()),
+            warm
+        );
+
+        let source = parsed(concat!(
+            "import * as namespace from 'package'; ",
+            "export const value: number = 1; ",
+            "const copied = namespace;",
+        ));
+        let file = FileId::new(9_780);
+        let mut context = context_with_routes(
+            &[(file, &source)],
+            &[Route {
+                source: 0,
+                specifier: 0,
+                target: Some(0),
+            }],
+        );
+
+        context.check_source_file(file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
+        assert_eq!(
+            context_exported_type(&context, file, "value"),
+            context.store().intrinsic_bootstrap().unwrap().number_type,
+        );
+        let warm = (store_state(context.store()), context.store().symbol_len());
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(
+            (store_state(context.store()), context.store().symbol_len()),
+            warm
+        );
+    }
+
+    #[test]
+    fn package_self_named_imports_remain_an_unsupported_value_target() {
+        let mut fixture = fixture(
+            &[concat!(
+                "import { value as imported } from 'package'; ",
+                "export const value: number = 1; ",
+                "const copied = imported;",
+            )],
+            &[Route {
+                source: 0,
+                specifier: 0,
+                target: Some(0),
+            }],
+        );
+        let plan = fixture.plan_import(0, 0);
+        let [binding] = plan.bindings.as_slice() else {
+            panic!("the package self import must retain one named binding")
+        };
+        let source_file = fixture.files[0].file;
+        let source = &fixture.files[0];
+        let bound = fixture.bound.get(&source.file).unwrap();
+        let read = plan_source_import_identifier_read(
+            &source.parsed.arena,
+            bound,
+            &fixture.store,
+            binding,
+            identifier_initializer(&fixture, 0, "imported"),
+            "imported",
+            binding.alias_symbol,
+        )
+        .unwrap();
+        let resolved = resolve_all(&mut fixture, &plan.bindings).unwrap();
+        let before = store_state(&fixture.store);
+
+        assert!(matches!(
+            prepare_one(&mut fixture, &resolved[0], &read),
+            Err(SourceImportError::Unsupported(
+                SourceImportUnsupported::SameSourceTarget {
+                    binding: declaration,
+                    target,
+                }
+            )) if declaration == binding.declaration && target.file == source_file
+        ));
+        assert_eq!(store_state(&fixture.store), before);
+        assert!(
+            fixture
+                .store
+                .value_symbol_links(binding.alias_symbol)
+                .is_none()
+        );
     }
 
     #[test]
