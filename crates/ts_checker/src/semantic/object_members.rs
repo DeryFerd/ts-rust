@@ -5,10 +5,10 @@
 //! and executes property, index, and signature annotations so one query
 //! retains a single dependency graph and resolution stack. Call and construct
 //! signatures retain authenticated generic parameters, overload order, and
-//! supported rest parameters. Nongeneric interface call signatures can appear
-//! beside ordinary properties. Type-literal calls may retain an implicit `any`
-//! return and trailing implicit `any[]` rest parameter. Construct signatures
-//! can also retain trailing optional `any` parameters.
+//! supported rest parameters. Interface and type-literal call signatures can
+//! appear beside ordinary properties. Type-literal calls may retain an implicit
+//! `any` return and trailing implicit `any[]` rest parameter. Construct
+//! signatures can also retain trailing optional `any` parameters.
 //! Named interface and type-literal methods retain their own binder symbols,
 //! authenticated method type parameters, annotated required or optional
 //! parameters, and authenticated array, tuple, or inferred rest parameters.
@@ -692,7 +692,10 @@ pub(super) fn validate_stored_declared_call_set(
         || !properties.is_empty()
             && (call_signature_count != signatures.len()
                 || inherited_base.is_some()
-                || !matches!(record.data(), TypeData::Interface(_)))
+                || !matches!(
+                    store.source_node_kind(owner_declaration),
+                    Some(SyntaxKind::InterfaceDeclaration | SyntaxKind::TypeLiteral)
+                ))
     {
         return StoredDeclaredCallSetValidation::Malformed;
     }
@@ -769,6 +772,12 @@ pub(super) fn validate_stored_declared_call_set(
         else {
             return StoredDeclaredCallSetValidation::Malformed;
         };
+        let Some(annotation) = declarations
+            .first()
+            .and_then(|declaration| store.source_direct_type_annotation(*declaration))
+        else {
+            return StoredDeclaredCallSetValidation::Malformed;
+        };
         let Some(links) = store.value_symbol_links(property) else {
             return StoredDeclaredCallSetValidation::Malformed;
         };
@@ -791,6 +800,8 @@ pub(super) fn validate_stored_declared_call_set(
             || store.get_merged_symbol(property) != Some(property)
             || members.get(property_record.name()) != Some(property)
             || store.type_payload(type_).is_none()
+            || store.source_node_kind(owner_declaration) == Some(SyntaxKind::TypeLiteral)
+                && !store.source_direct_type_annotation_is_exact(annotation, type_)
             || links
                 != &(ValueSymbolLinks {
                     resolved_type: Some(type_),
@@ -6177,8 +6188,10 @@ fn plan_members(
     if !call_signatures.is_empty()
         && (!indexes.is_empty()
             || !properties.is_empty()
-                && (kind != PropertyObjectKind::Interface
-                    || policy == TypeLiteralMemberPolicy::GenericInterface
+                && (!matches!(
+                    kind,
+                    PropertyObjectKind::Interface | PropertyObjectKind::TypeLiteral
+                ) || policy == TypeLiteralMemberPolicy::GenericInterface
                     || !additional_members.is_empty()
                     || !methods.is_empty()
                     || !accessors.is_empty()
@@ -10247,8 +10260,10 @@ fn valid_planned_call_signature_set(
     );
     members.len() == plan.properties.len().saturating_add(family_count)
         && (plan.properties.is_empty()
-            || plan.kind == PropertyObjectKind::Interface
-                && plan.methods.is_empty()
+            || matches!(
+                plan.kind,
+                PropertyObjectKind::Interface | PropertyObjectKind::TypeLiteral
+            ) && plan.methods.is_empty()
                 && plan.accessors.is_empty()
                 && plan.indexes.is_empty()
                 && !plan
