@@ -17,6 +17,8 @@
 //! authenticated `...args: any[]` rest parameter. Ambient classes also admit
 //! bodyless methods with direct primitive parameter and return annotations,
 //! plus unannotated private instance fields with the implicit `any` type.
+//! Invalid method overload chains preserve their merged binder symbols and
+//! report exact implementation-name, missing-body, and duplicate-body errors.
 //! Direct classes can also retain one string-to-number index signature.
 //! Annotated fields admit one authenticated ambient-function decorator.
 //! One direct getter/setter pair can expose an annotated numeric property.
@@ -153,6 +155,16 @@ struct ClassMethodPlan {
     return_type_node: Option<NodeRef>,
     parameters: Vec<ClassMethodParameterPlan>,
     rest_parameter: Option<ClassMethodRestParameterPlan>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ClassMethodOverloadDeclaration {
+    declaration: NodeRef,
+    name_node: NodeRef,
+    name: String,
+    symbol: SemanticSymbolId,
+    side: ClassPropertySide,
+    implementation: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2589,15 +2601,40 @@ fn plan_method(
     let symbol_record = store
         .symbol(symbol)
         .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(declaration)))?;
-    if ambient
-        && symbol_record
-            .declarations()
-            .is_some_and(|declarations| declarations.len() > 1)
+    if let Some(declarations) = symbol_record.declarations()
+        && declarations.len() > 1
+        && declarations.contains(&declaration)
     {
-        return Err(unsupported(ClassUnsupported::Member {
-            node: declaration,
-            kind: SyntaxKind::MethodDeclaration,
-        }));
+        let owner_declaration = store
+            .symbol(owner)
+            .and_then(Symbol::value_declaration)
+            .ok_or_else(|| invariant(ClassInvariant::InvalidPropertySymbol(declaration)))?;
+        let owner_record = preflight_node(store, host, owner_declaration)?;
+        let NodeData::ClassDeclaration(class) = &owner_record.data else {
+            return Err(invariant(ClassInvariant::InvalidPropertySymbol(
+                declaration,
+            )));
+        };
+        let expected = class.members.nodes.iter().filter_map(|member| {
+            let member = NodeRef::new(owner_declaration.arena, owner_declaration.file, *member);
+            (host
+                .node(member)
+                .is_some_and(|record| record.kind == SyntaxKind::MethodDeclaration)
+                && bound_symbol(store, host, member) == Some(symbol))
+            .then_some(member)
+        });
+        if symbol_record.flags() == SymbolFlags::METHOD
+            && symbol_record.check_flags() == CheckFlags::NONE
+            && declarations.iter().copied().eq(expected)
+        {
+            return Err(unsupported(ClassUnsupported::Member {
+                node: declaration,
+                kind: SyntaxKind::MethodDeclaration,
+            }));
+        }
+        return Err(invariant(ClassInvariant::InvalidPropertySymbol(
+            declaration,
+        )));
     }
     let table = match side {
         ClassPropertySide::Instance => instance_members,
@@ -9472,6 +9509,350 @@ fn plan_factory_derived_property_initialization(
     })
 }
 
+fn validate_class_overload_parameters(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    parameters: &ts_ast::NodeList,
+) -> Option<()> {
+    let bound = host.bound_file(declaration)?;
+    let locals = bound
+        .locals(declaration)
+        .and_then(|locals| store.symbol_table(locals));
+    if parameters.has_trailing_comma
+        || locals.map_or(0, ts_binder::semantic::SymbolTable::len) != parameters.nodes.len()
+    {
+        return None;
+    }
+
+    let mut previous_end = parameters.range.start;
+    let mut seen = HashSet::new();
+    for parameter in &parameters.nodes {
+        let parameter = NodeRef::new(declaration.arena, declaration.file, *parameter);
+        let record = preflight_node(store, host, parameter).ok()?;
+        let NodeData::ParameterDeclaration(data) = &record.data else {
+            return None;
+        };
+        let name = NodeRef::new(parameter.arena, parameter.file, data.name);
+        let name_record = preflight_node(store, host, name).ok()?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return None;
+        };
+        let symbol = bound_symbol(store, host, parameter)?;
+        let owner = store.symbol(symbol)?;
+        if record.kind != SyntaxKind::Parameter
+            || record.flags.0 != 0
+            || record.parent != Some(declaration.node)
+            || record.range.start < previous_end
+            || record.range.end > parameters.range.end
+            || data.dot_dot_dot_token.is_some()
+            || data.initializer.is_some()
+            || data.symbol.is_some()
+            || data.modifiers.is_some()
+            || data.facts != 0
+            || name_record.kind != SyntaxKind::Identifier
+            || name_record.flags.0 != 0
+            || name_record.parent != Some(parameter.node)
+            || identifier.flow_node.is_some()
+            || identifier.text.is_empty()
+            || owner.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
+            || owner.check_flags() != CheckFlags::NONE
+            || owner.name().as_utf8() != Some(identifier.text.as_str())
+            || owner.declarations() != Some(&[parameter])
+            || owner.value_declaration() != Some(parameter)
+            || owner.members().is_some()
+            || owner.exports().is_some()
+            || owner.parent().is_some()
+            || owner.export_symbol().is_some()
+            || store.get_merged_symbol(symbol) != Some(symbol)
+            || locals.and_then(|locals| locals.get_source(&identifier.text)) != Some(symbol)
+            || !seen.insert(symbol)
+        {
+            return None;
+        }
+        if let Some(question) = data.question_token {
+            let question = NodeRef::new(parameter.arena, parameter.file, question);
+            let question_record = preflight_node(store, host, question).ok()?;
+            if question_record.kind != SyntaxKind::QuestionToken
+                || question_record.flags.0 != 0
+                || question_record.parent != Some(parameter.node)
+                || !matches!(question_record.data, NodeData::Token(_))
+            {
+                return None;
+            }
+        }
+        if let Some(annotation) = data.type_ {
+            let annotation = NodeRef::new(parameter.arena, parameter.file, annotation);
+            let annotation_record = preflight_node(store, host, annotation).ok()?;
+            if !annotation_record.kind.is_keyword_type()
+                || annotation_record.flags.0 != 0
+                || annotation_record.parent != Some(parameter.node)
+                || !matches!(annotation_record.data, NodeData::KeywordTypeNode(_))
+            {
+                return None;
+            }
+        }
+        previous_end = record.range.end;
+    }
+    Some(())
+}
+
+fn plan_class_method_overload_declaration(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    class: NodeRef,
+    declaration: NodeRef,
+) -> Option<ClassMethodOverloadDeclaration> {
+    let record = preflight_node(store, host, declaration).ok()?;
+    let NodeData::MethodDeclaration(method) = &record.data else {
+        return None;
+    };
+    if record.kind != SyntaxKind::MethodDeclaration
+        || record.flags.0 != 0
+        || record.parent != Some(class.node)
+        || method.asterisk_token.is_some()
+        || method.end_flow_node.is_some()
+        || method.flow_node.is_some()
+        || method.full_signature.is_some()
+        || method.next_container.is_some()
+        || method.postfix_token.is_some()
+        || method.symbol.is_some()
+        || method.type_parameters.is_some()
+        || method.facts != 0
+    {
+        return None;
+    }
+
+    let (name_node, name) = accessor_name(store, host, declaration, method.name).ok()?;
+    let name_record = preflight_node(store, host, name_node).ok()?;
+    let (side, readonly) = class_property_modifiers(
+        store,
+        host,
+        declaration,
+        name_node,
+        method.modifiers.as_ref(),
+        None,
+    )
+    .ok()?;
+    if readonly || name_record.range.end > method.parameters.range.start || name_record.flags.0 != 0
+    {
+        return None;
+    }
+    validate_class_overload_parameters(store, host, declaration, &method.parameters)?;
+
+    let mut body_start = method.parameters.range.end;
+    if let Some(annotation) = method.type_ {
+        let annotation = NodeRef::new(declaration.arena, declaration.file, annotation);
+        let annotation_record = preflight_node(store, host, annotation).ok()?;
+        if !annotation_record.kind.is_keyword_type()
+            || annotation_record.flags.0 != 0
+            || annotation_record.parent != Some(declaration.node)
+            || annotation_record.range.start < method.parameters.range.end
+            || annotation_record.range.end > record.range.end
+            || !matches!(annotation_record.data, NodeData::KeywordTypeNode(_))
+        {
+            return None;
+        }
+        body_start = annotation_record.range.end;
+    }
+    let implementation = if let Some(body) = method.body {
+        validate_empty_class_grammar_body(store, host, declaration, body, body_start)?;
+        true
+    } else {
+        false
+    };
+
+    let symbol = bound_symbol(store, host, declaration)?;
+    let symbol_record = store.symbol(symbol)?;
+    let table = match side {
+        ClassPropertySide::Instance => store.symbol(owner)?.members(),
+        ClassPropertySide::Static => store.symbol(owner)?.exports(),
+    }
+    .and_then(|table| store.symbol_table(table))?;
+    if symbol_record.flags() != SymbolFlags::METHOD
+        || symbol_record.check_flags() != CheckFlags::NONE
+        || symbol_record.name().as_utf8() != Some(name.as_str())
+        || symbol_record
+            .declarations()
+            .is_none_or(|declarations| !declarations.contains(&declaration))
+        || symbol_record.members().is_some()
+        || symbol_record.exports().is_some()
+        || symbol_record.parent() != Some(owner)
+        || symbol_record.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || table.get_source(&name) != Some(symbol)
+        || store
+            .signature_links(declaration)
+            .is_some_and(|links| links != &SignatureLinks::default())
+        || store
+            .value_symbol_links(symbol)
+            .is_some_and(|links| links != &ValueSymbolLinks::default())
+    {
+        return None;
+    }
+
+    Some(ClassMethodOverloadDeclaration {
+        declaration,
+        name_node,
+        name,
+        symbol,
+        side,
+        implementation,
+    })
+}
+
+fn class_overload_diagnostic(
+    method: &ClassMethodOverloadDeclaration,
+    code: u32,
+    arguments: Vec<String>,
+) -> ClassGrammarDiagnostic {
+    ClassGrammarDiagnostic {
+        node: method.name_node,
+        range_override: None,
+        code,
+        arguments,
+    }
+}
+
+fn plan_class_method_overload_diagnostics(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    declaration: NodeRef,
+    members: &ts_ast::NodeList,
+) -> Option<Vec<ClassGrammarDiagnostic>> {
+    if !(2..=8).contains(&members.nodes.len()) {
+        return None;
+    }
+    let owner_record = store.symbol(owner)?;
+    let exports = owner_record.exports()?;
+    let mut overloads = Vec::with_capacity(members.nodes.len());
+    let mut diagnostics = Vec::new();
+    let mut pending = None::<ClassMethodOverloadDeclaration>;
+    let mut implementations = Vec::<ClassMethodOverloadDeclaration>::new();
+    let mut duplicate_symbols = HashSet::new();
+    let mut instance_symbols = HashSet::new();
+    let mut static_symbols = HashSet::new();
+    let mut property_symbols = HashSet::new();
+    let mut previous_end = members.range.start;
+
+    for &member_id in &members.nodes {
+        let member = NodeRef::new(declaration.arena, declaration.file, member_id);
+        let record = preflight_node(store, host, member).ok()?;
+        if record.parent != Some(declaration.node)
+            || record.range.start < previous_end
+            || record.range.end > members.range.end
+        {
+            return None;
+        }
+        previous_end = record.range.end;
+
+        if record.kind == SyntaxKind::PropertyDeclaration {
+            let property =
+                plan_property(store, host, owner, member, owner_record.members(), exports).ok()?;
+            if property.side != ClassPropertySide::Instance
+                || property.initializer_text.is_none()
+                || !property_symbols.insert(property.symbol)
+            {
+                return None;
+            }
+            if let Some(previous) = pending.take() {
+                diagnostics.push(class_overload_diagnostic(&previous, 2391, Vec::new()));
+            }
+            continue;
+        }
+
+        let method =
+            plan_class_method_overload_declaration(store, host, owner, declaration, member)?;
+        match method.side {
+            ClassPropertySide::Instance => {
+                instance_symbols.insert(method.symbol);
+            }
+            ClassPropertySide::Static => {
+                static_symbols.insert(method.symbol);
+            }
+        }
+
+        if method.implementation {
+            if let Some(previous) = pending.take() {
+                if method.name != previous.name {
+                    diagnostics.push(class_overload_diagnostic(
+                        &method,
+                        2389,
+                        vec![previous.name],
+                    ));
+                } else if method.side != previous.side {
+                    diagnostics.push(class_overload_diagnostic(
+                        &method,
+                        if previous.side == ClassPropertySide::Static {
+                            2387
+                        } else {
+                            2388
+                        },
+                        Vec::new(),
+                    ));
+                }
+            } else if let Some(previous) = implementations
+                .iter()
+                .find(|previous| previous.symbol == method.symbol)
+            {
+                if duplicate_symbols.insert(method.symbol) {
+                    diagnostics.push(class_overload_diagnostic(previous, 2393, Vec::new()));
+                }
+                diagnostics.push(class_overload_diagnostic(&method, 2393, Vec::new()));
+            }
+            implementations.push(method.clone());
+        } else {
+            if let Some(previous) = pending.take() {
+                if method.name != previous.name {
+                    diagnostics.push(class_overload_diagnostic(&previous, 2391, Vec::new()));
+                } else if method.side != previous.side {
+                    diagnostics.push(class_overload_diagnostic(
+                        &method,
+                        if previous.side == ClassPropertySide::Static {
+                            2387
+                        } else {
+                            2388
+                        },
+                        Vec::new(),
+                    ));
+                }
+            }
+            pending = Some(method.clone());
+        }
+        overloads.push(method);
+    }
+    if let Some(previous) = pending {
+        diagnostics.push(class_overload_diagnostic(&previous, 2391, Vec::new()));
+    }
+    if diagnostics.is_empty()
+        || owner_record
+            .members()
+            .and_then(|members| store.symbol_table(members))
+            .map_or(0, ts_binder::semantic::SymbolTable::len)
+            != instance_symbols.len().checked_add(property_symbols.len())?
+        || store.symbol_table(exports)?.len() != static_symbols.len().checked_add(1)?
+    {
+        return None;
+    }
+
+    for symbol in instance_symbols.iter().chain(&static_symbols) {
+        let record = store.symbol(*symbol)?;
+        let declarations = overloads
+            .iter()
+            .filter(|method| method.symbol == *symbol)
+            .map(|method| method.declaration)
+            .collect::<Vec<_>>();
+        if record.declarations() != Some(declarations.as_slice())
+            || record.value_declaration() != declarations.first().copied()
+        {
+            return None;
+        }
+    }
+    Some(diagnostics)
+}
+
 /// Authenticates supported class grammar failures without publishing class types.
 pub(super) fn plan_class_grammar_diagnostics(
     store: &CanonicalTypeMapperStore,
@@ -9572,6 +9953,18 @@ pub(super) fn plan_class_grammar_diagnostics(
     let exports = owner.exports()?;
     validate_prototype(store, symbol, exports).ok()?;
     let export_table = store.symbol_table(exports)?;
+
+    if !ambient
+        && class.heritage_clauses.is_none()
+        && let Some(diagnostics) =
+            plan_class_method_overload_diagnostics(store, host, symbol, declaration, &class.members)
+    {
+        return Some(ClassGrammarDiagnosticPlan {
+            declaration,
+            symbol,
+            diagnostics,
+        });
+    }
 
     let mut diagnostics = Vec::new();
     if ambient {
@@ -16232,6 +16625,220 @@ mod tests {
             );
             assert!(fixture.store.declared_type_links(owner).is_none());
             assert!(fixture.store.value_symbol_links(owner).is_none());
+        }
+    }
+
+    #[test]
+    fn invalid_method_overload_chains_preserve_merged_symbols_and_diagnostics() {
+        let cases = [
+            (
+                "class C { foo(): string; foo(x): number; bar(x): any {} }",
+                &[2389][..],
+                &["bar"][..],
+            ),
+            (
+                "class C { foo(): string; bar(x): any {} foo(x): number; }",
+                &[2389, 2391][..],
+                &["bar", "foo"][..],
+            ),
+            (
+                "class C { foo(): string; foo(x): number; x = 1; }",
+                &[2391][..],
+                &["foo"][..],
+            ),
+            (
+                "class C { static foo() {} static foo(value: string) {} }",
+                &[2393, 2393][..],
+                &["foo", "foo"][..],
+            ),
+            (
+                "class C { foo(value: number); static foo(value) {} }",
+                &[2388][..],
+                &["foo"][..],
+            ),
+            (
+                "class C { static foo(value: number); foo(value) {} }",
+                &[2387][..],
+                &["foo"][..],
+            ),
+        ];
+
+        for (source, expected_codes, expected_names) in cases {
+            let fixture = fixture(source);
+            let owner = class_symbol(&fixture, "C");
+            let bound = &fixture.files[&fixture.file];
+            let host = host(&fixture.parsed.arena, bound);
+            let before = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            let grammar = plan_class_grammar_diagnostics(&fixture.store, &host, owner)
+                .unwrap_or_else(|| panic!("expected overload diagnostics for {source}"));
+
+            assert_eq!(
+                grammar
+                    .diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.code)
+                    .collect::<Vec<_>>(),
+                expected_codes,
+                "{source}",
+            );
+            assert_eq!(
+                grammar
+                    .diagnostics
+                    .iter()
+                    .map(|diagnostic| {
+                        let NodeData::Identifier(identifier) =
+                            &fixture.parsed.arena.get(diagnostic.node.node).unwrap().data
+                        else {
+                            panic!("overload diagnostics must retain exact method-name nodes")
+                        };
+                        identifier.text.as_str()
+                    })
+                    .collect::<Vec<_>>(),
+                expected_names,
+                "{source}",
+            );
+            if expected_codes.contains(&2389) {
+                assert_eq!(grammar.diagnostics[0].arguments, ["foo"], "{source}");
+            }
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                before,
+                "{source}",
+            );
+            assert!(fixture.store.declared_type_links(owner).is_none());
+            assert!(fixture.store.value_symbol_links(owner).is_none());
+        }
+    }
+
+    #[test]
+    fn overload_grammar_rejects_valid_groups_and_forged_merged_declarations() {
+        let valid = fixture("class C { foo(): void; foo(): void {} }");
+        let owner = class_symbol(&valid, "C");
+        let bound = &valid.files[&valid.file];
+        let host = host(&valid.parsed.arena, bound);
+        assert!(plan_class_grammar_diagnostics(&valid.store, &host, owner).is_none());
+
+        let mut invalid = fixture("class C { foo(): string; foo(x): number; bar(x): any {} }");
+        let owner = class_symbol(&invalid, "C");
+        let declaration = class_node(&invalid, "C");
+        let NodeData::ClassDeclaration(class) =
+            &invalid.parsed.arena.get(declaration.node).unwrap().data
+        else {
+            panic!("the fixture must retain its class declaration")
+        };
+        let first = NodeRef::new(declaration.arena, declaration.file, class.members.nodes[0]);
+        let second = NodeRef::new(declaration.arena, declaration.file, class.members.nodes[1]);
+        let bound = &invalid.files[&invalid.file];
+        let overload = bound.symbol(first).unwrap();
+        assert_eq!(bound.symbol(second), Some(overload));
+        assert!(invalid.store.set_symbol_declarations(
+            overload,
+            Some(vec![second, first]),
+            Some(first),
+        ));
+        let host = host(&invalid.parsed.arena, bound);
+        let before = (
+            invalid.store.type_len(),
+            invalid.store.signature_len(),
+            invalid.store.checker_link_allocated_lengths(),
+        );
+
+        assert!(plan_class_grammar_diagnostics(&invalid.store, &host, owner).is_none());
+        assert_eq!(
+            (
+                invalid.store.type_len(),
+                invalid.store.signature_len(),
+                invalid.store.checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+        assert!(invalid.store.declared_type_links(owner).is_none());
+        assert!(invalid.store.value_symbol_links(owner).is_none());
+    }
+
+    #[test]
+    fn wrong_and_missing_method_implementations_publish_exact_source_diagnostics() {
+        let cases = [
+            (
+                "class C { foo(): string; foo(x): number; bar(x): any {} }",
+                &[2389][..],
+            ),
+            (
+                "class C { foo(): string; bar(x): any {} foo(x): number; }",
+                &[2389, 2391][..],
+            ),
+            (
+                "class C { foo(): string; foo(x): number; x = 1; }",
+                &[2391][..],
+            ),
+        ];
+
+        for (index, (source, expected)) in cases.into_iter().enumerate() {
+            let parsed = parse_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(3_901 + u32::try_from(index).unwrap());
+            let mut binder = CanonicalBinder::new();
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source("\"/class-overloads.ts\""),
+                        CanonicalSourceLanguage::TypeScript,
+                        false,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+            let mut context = CanonicalCheckerContext::new(
+                binder.finish(),
+                [(file, &parsed.arena)].into_iter().collect(),
+                CanonicalCheckerOptions::default(),
+            )
+            .unwrap();
+
+            context.check_source_file(file).unwrap();
+
+            assert_eq!(
+                context
+                    .diagnostics()
+                    .as_slice()
+                    .iter()
+                    .map(|diagnostic| diagnostic.diagnostic.code())
+                    .collect::<Vec<_>>(),
+                expected,
+                "{source}",
+            );
+            let warm = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.diagnostics().len(),
+            );
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    context.diagnostics().len(),
+                ),
+                warm,
+                "{source}",
+            );
         }
     }
 
