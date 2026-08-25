@@ -3999,9 +3999,33 @@ fn jsx_child_assignability_display(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     global_types: Option<&CanonicalGlobalTypes>,
-    source: TypeId,
+    mut source: TypeId,
     target: TypeId,
 ) -> Result<AssignabilityErrorDisplay, SourceCheckError> {
+    if let Some(record) = store.type_payload(source)
+        && record.flags().intersects(TypeFlags::STRING_LITERAL)
+        && matches!(
+            record.data(),
+            super::TypeData::Literal(literal)
+                if literal.fresh_type == Some(source) && literal.regular_type != source
+        )
+        && let Some(super::TypeData::Union(union)) = store
+            .type_payload(target)
+            .map(super::type_records::TypeRecord::data)
+        && union.union.types.iter().all(|constituent| {
+            store
+                .type_payload(*constituent)
+                .is_some_and(|record| !record.flags().intersects(TypeFlags::STRING_LITERAL))
+        })
+    {
+        store.validate_union_constituent(source)?;
+        source = store
+            .intrinsic_bootstrap()
+            .ok_or(SourceCheckError::LiteralCache(
+                SourceLiteralCacheError::BootstrapUninitialized,
+            ))?
+            .string_type;
+    }
     let mut display = if let Some(global_types) = global_types {
         get_type_names_for_assignability_error_with_host_global_types_and_flags(
             store,
