@@ -2339,7 +2339,14 @@ pub(super) fn resolve_source_type_import_binding(
         binding.alias_symbol,
         resolved.target_symbol,
     )?;
-    if target_declaration.file == binding.declaration.file {
+    if target_declaration.file == binding.declaration.file
+        && !authenticated_declaration_self_type_import(
+            store,
+            declared_host,
+            &resolved,
+            target_declaration,
+        )
+    {
         return Err(unsupported(SourceImportUnsupported::SameSourceTarget {
             binding: binding.declaration,
             target: target_declaration,
@@ -2351,6 +2358,100 @@ pub(super) fn resolve_source_type_import_binding(
         target_symbol: resolved.target_symbol,
         target_declaration,
     })
+}
+
+/// Admits an inherited interface reached through its declaration module's own direct export.
+fn authenticated_declaration_self_type_import(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    resolved: &ResolvedSourceImportBinding,
+    declaration: NodeRef,
+) -> bool {
+    let binding = &resolved.binding;
+    let Some((arena, bound)) = host.source(binding.declaration) else {
+        return false;
+    };
+    let Some(facts) = bound.source_facts() else {
+        return false;
+    };
+    let source = bound.source_file();
+    let Some(module) = bound.symbol(source) else {
+        return false;
+    };
+    let Some(module_record) = store.symbol(module) else {
+        return false;
+    };
+    let target = resolved.target_symbol;
+    let Some(target_record) = store.symbol(target) else {
+        return false;
+    };
+    let Some(local) = bound.local_symbol(declaration) else {
+        return false;
+    };
+    let Some(local_record) = store.symbol(local) else {
+        return false;
+    };
+    let Some(links) = store.alias_symbol_links(binding.alias_symbol) else {
+        return false;
+    };
+    let Some(record) = arena.get(declaration.node) else {
+        return false;
+    };
+    let NodeData::InterfaceDeclaration(interface) = &record.data else {
+        return false;
+    };
+
+    facts.is_declaration_file()
+        && facts.is_external_module()
+        && !facts.is_common_js_module()
+        && !facts.is_javascript_file()
+        && declaration.is_for(arena.id(), bound.file_id())
+        && bound.contains(declaration)
+        && store.contains_node_ref(declaration)
+        && store.source_node_kind(binding.declaration) == Some(SyntaxKind::ImportSpecifier)
+        && bound.symbol(binding.declaration) == Some(binding.alias_symbol)
+        && resolved.immediate_target_symbol == target
+        && links.immediate_target == Some(target)
+        && links.alias_target == AliasTargetState::Resolved(target)
+        && links.type_only_declaration == Some(binding.declaration)
+        && module_record.flags() == SymbolFlags::VALUE_MODULE
+        && module_record.check_flags() == CheckFlags::NONE
+        && module_record.name() == facts.source_file_symbol_name()
+        && module_record.declarations() == Some(&[source])
+        && module_record.value_declaration() == Some(source)
+        && module_record.members().is_none()
+        && module_record.parent().is_none()
+        && module_record.export_symbol().is_none()
+        && store.get_merged_symbol(module) == Some(module)
+        && target_record.flags() == SymbolFlags::INTERFACE
+        && target_record.check_flags() == CheckFlags::NONE
+        && target_record.name().as_utf8() == Some(binding.imported_text.as_str())
+        && target_record.declarations() == Some(&[declaration])
+        && target_record.value_declaration().is_none()
+        && target_record.parent() == Some(module)
+        && target_record.export_symbol().is_none()
+        && store.get_merged_symbol(target) == Some(target)
+        && bound.symbol(declaration) == Some(target)
+        && local != target
+        && local_record.flags() == SymbolFlags::NONE
+        && local_record.check_flags() == CheckFlags::NONE
+        && local_record.name() == target_record.name()
+        && local_record.declarations() == Some(&[declaration])
+        && local_record.value_declaration().is_none()
+        && local_record.members().is_none()
+        && local_record.exports().is_none()
+        && local_record.parent().is_none()
+        && local_record.export_symbol() == Some(target)
+        && store.get_merged_symbol(local) == Some(local)
+        && module_record
+            .exports()
+            .and_then(|exports| store.symbol_table(exports))
+            .and_then(|exports| exports.get_source(&binding.imported_text))
+            == Some(target)
+        && record.kind == SyntaxKind::InterfaceDeclaration
+        && record.flags.0 == 0
+        && record.parent == Some(source.node)
+        && interface.heritage_clauses.is_some()
 }
 
 fn resolve_source_import_binding_phase(
@@ -12939,6 +13040,184 @@ mod tests {
                 imported,
             );
             assert_eq!(store_state(&fixture.store), warm);
+        }
+    }
+
+    #[test]
+    fn package_self_type_imports_preserve_inherited_declaration_interfaces() {
+        let mut fixture = fixture_with_declaration_files(
+            &[concat!(
+                "import type { Model as Imported } from 'package'; ",
+                "export interface Base { inherited: number; } ",
+                "export interface Model extends Base { own: string; } ",
+                "export declare const value: Imported;",
+            )],
+            &[Route {
+                source: 0,
+                specifier: 0,
+                target: Some(0),
+            }],
+            &[0],
+        );
+        let plan = fixture.plan_type_import(0, 0);
+        let model = direct_export(&fixture, 0, "Model");
+        let base = direct_export(&fixture, 0, "Base");
+
+        let resolved = resolve_all_types(&mut fixture, &plan.bindings).unwrap();
+        assert_eq!(resolved[0].immediate_target_symbol, model);
+        assert_eq!(resolved[0].target_symbol, model);
+        assert_eq!(resolved[0].target_declaration.file, fixture.files[0].file);
+        for symbol in [model, base] {
+            assert!(fixture.store.declared_type_links(symbol).is_none());
+            assert!(fixture.store.value_symbol_links(symbol).is_none());
+        }
+
+        let reference = type_reference(&fixture, 0, "Imported");
+        let capability = plan_type_reference_capability(&fixture, &resolved[0], reference);
+        let imported =
+            query_type_with_import_capability(&mut fixture, reference, capability).unwrap();
+        let TypeData::Interface(interface) = fixture.store.type_payload(imported).unwrap().data()
+        else {
+            panic!("a package self import must retain the inherited interface identity")
+        };
+        let [inherited] = interface.resolved_base_types.as_deref().unwrap() else {
+            panic!("a package self import must retain its one authenticated base")
+        };
+        assert_eq!(
+            fixture
+                .store
+                .type_payload(*inherited)
+                .and_then(TypeRecord::symbol),
+            Some(base),
+        );
+        assert!(
+            fixture
+                .store
+                .value_symbol_links(plan.bindings[0].alias_symbol)
+                .is_none(),
+        );
+
+        let warm = store_state(&fixture.store);
+        assert_eq!(
+            resolve_all_types(&mut fixture, &plan.bindings).unwrap(),
+            resolved,
+        );
+        let capability = plan_type_reference_capability(&fixture, &resolved[0], reference);
+        assert_eq!(
+            query_type_with_import_capability(&mut fixture, reference, capability).unwrap(),
+            imported,
+        );
+        assert_eq!(store_state(&fixture.store), warm);
+    }
+
+    #[test]
+    fn package_self_type_imports_require_declaration_heritage_and_direct_exports() {
+        for (source, declaration_file) in [
+            (
+                concat!(
+                    "import type { Model as Imported } from 'package'; ",
+                    "export interface Model { value: number; }",
+                ),
+                false,
+            ),
+            (
+                concat!(
+                    "import type { Model as Imported } from 'package'; ",
+                    "export interface Model { value: number; }",
+                ),
+                true,
+            ),
+            (
+                concat!(
+                    "import type { Public as Imported } from 'package'; ",
+                    "export interface Base { inherited: number; } ",
+                    "export interface Model extends Base { own: string; } ",
+                    "export { Model as Public };",
+                ),
+                true,
+            ),
+        ] {
+            let declaration_files: &[usize] = if declaration_file { &[0] } else { &[] };
+            let mut fixture = fixture_with_declaration_files(
+                &[source],
+                &[Route {
+                    source: 0,
+                    specifier: 0,
+                    target: Some(0),
+                }],
+                declaration_files,
+            );
+            let plan = fixture.plan_type_import(0, 0);
+            let alias = plan.bindings[0].alias_symbol;
+
+            assert!(matches!(
+                resolve_all_types(&mut fixture, &plan.bindings),
+                Err(SourceImportError::Unsupported(
+                    SourceImportUnsupported::SameSourceTarget { .. }
+                ))
+            ));
+            assert!(fixture.store.value_symbol_links(alias).is_none());
+        }
+    }
+
+    #[test]
+    fn package_self_inherited_type_imports_reject_forged_aliases_and_export_owners() {
+        for poison_alias in [true, false] {
+            let mut fixture = fixture_with_declaration_files(
+                &[concat!(
+                    "import type { Model as Imported } from 'package'; ",
+                    "export interface Base { inherited: number; } ",
+                    "export interface Model extends Base { own: string; }",
+                )],
+                &[Route {
+                    source: 0,
+                    specifier: 0,
+                    target: Some(0),
+                }],
+                &[0],
+            );
+            let plan = fixture.plan_type_import(0, 0);
+            let resolved = resolve_all_types(&mut fixture, &plan.bindings).unwrap();
+            let alias = plan.bindings[0].alias_symbol;
+            let model = resolved[0].target_symbol;
+
+            if poison_alias {
+                let mut links = fixture.store.alias_symbol_links(alias).unwrap().clone();
+                links.immediate_target = Some(direct_export(&fixture, 0, "Base"));
+                assert!(fixture.store.set_alias_symbol_links(alias, links));
+            } else {
+                let bound = fixture.bound.get(&fixture.files[0].file).unwrap();
+                let local = bound.local_symbol(resolved[0].target_declaration).unwrap();
+                let record = fixture.store.symbol(local).unwrap();
+                let (members, exports, parent) =
+                    (record.members(), record.exports(), record.parent());
+                assert!(
+                    fixture
+                        .store
+                        .set_symbol_relationships(local, members, exports, parent, None,)
+                );
+            }
+
+            let poisoned = store_state(&fixture.store);
+            let result = resolve_all_types(&mut fixture, &plan.bindings);
+            if poison_alias {
+                assert_eq!(
+                    result,
+                    Err(SourceImportError::Invariant(
+                        SourceImportInvariant::InvalidAliasLinks(alias),
+                    )),
+                );
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(SourceImportError::Unsupported(
+                        SourceImportUnsupported::SameSourceTarget { .. }
+                    ))
+                ));
+            }
+            assert_eq!(store_state(&fixture.store), poisoned);
+            assert!(fixture.store.declared_type_links(model).is_none());
+            assert!(fixture.store.value_symbol_links(alias).is_none());
         }
     }
 
