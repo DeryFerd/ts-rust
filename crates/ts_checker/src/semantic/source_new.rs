@@ -5,12 +5,12 @@
 //! `getResolvedSignature`, `resolveNewExpression`, and `resolveCall`.
 //! An admitted constructor belongs to one preceding local class, an imported
 //! exported ambient class, an earlier ambient variable, or an authenticated
-//! global `Object`, `Array`, `Date`, or `Promise` constructor. Imported ambient
-//! classes retain primitive constructor arguments and canonical generic
-//! instantiations. Global arrays retain their real length and generic-item
-//! overloads, including authenticated empty object literals. Planning proves
-//! syntax, resolver routes, provider provenance, and cold/warm caches before
-//! source execution may publish class or expression state.
+//! global `Object`, `Boolean`, `Array`, `Date`, or `Promise` constructor.
+//! Imported ambient classes retain primitive constructor arguments and
+//! canonical generic instantiations. Global arrays retain their real length
+//! and generic-item overloads, including authenticated empty object literals.
+//! Planning proves syntax, resolver routes, provider provenance, and cold/warm
+//! caches before source execution may publish class or expression state.
 
 use std::collections::{HashMap, HashSet};
 
@@ -294,6 +294,7 @@ struct SourceNewTypeArgument {
 enum SourceNewArgumentValue {
     String(String),
     Number(Number),
+    Boolean(bool),
     EmptyObject(Box<PropertyObjectPlan>),
 }
 
@@ -718,6 +719,16 @@ pub(super) fn plan_direct_default_new(
                         }
                         SourceNewArgumentValue::Number(value)
                     }
+                    NodeData::KeywordExpression(keyword)
+                        if matches!(
+                            argument_record.kind,
+                            SyntaxKind::TrueKeyword | SyntaxKind::FalseKeyword
+                        ) && keyword.flow_node.is_none() =>
+                    {
+                        SourceNewArgumentValue::Boolean(
+                            argument_record.kind == SyntaxKind::TrueKeyword,
+                        )
+                    }
                     NodeData::ObjectLiteralExpression(object)
                         if argument_record.kind == SyntaxKind::ObjectLiteralExpression
                             && object.properties.nodes.is_empty()
@@ -829,11 +840,11 @@ pub(super) fn plan_direct_default_new(
             symbol,
         }));
     }
-    let global_object = identifier.text == "Object"
+    let global_wrapper = matches!(identifier.text.as_str(), "Object" | "Boolean")
         && store
             .intrinsic_bootstrap()
             .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
-            .and_then(|globals| globals.get_source("Object"))
+            .and_then(|globals| globals.get_source(&identifier.text))
             .and_then(|global| store.get_merged_symbol(global))
             == Some(symbol);
     let global_array = identifier.text == "Array"
@@ -896,7 +907,7 @@ pub(super) fn plan_direct_default_new(
             SourceNewTarget::ImportedClass(Box::new(binding.clone())),
             None,
         )
-    } else if global_object {
+    } else if global_wrapper {
         let global = plan_global_object_constructor(store, host, constructor, symbol)?;
         (
             SourceNewTarget::GlobalObject(global),
@@ -1339,8 +1350,13 @@ fn plan_global_object_constructor(
     let NodeData::Identifier(annotation_identifier) = &annotation_name_record.data else {
         return Err(reject());
     };
+    let (instance_name, constructor_name) = match object.name().as_utf8() {
+        Some("Object") => ("Object", "ObjectConstructor"),
+        Some("Boolean") => ("Boolean", "BooleanConstructor"),
+        _ => return Err(reject()),
+    };
     let owner = globals
-        .get_source("ObjectConstructor")
+        .get_source(constructor_name)
         .and_then(|owner| store.get_merged_symbol(owner))
         .ok_or_else(reject)?;
     let owner_record = store.symbol(owner).ok_or_else(reject)?;
@@ -1359,12 +1375,12 @@ fn plan_global_object_constructor(
             .contains(SymbolFlags::FUNCTION_SCOPED_VARIABLE)
         || object.flags().without(allowed_object_flags) != SymbolFlags::NONE
         || object.check_flags() != CheckFlags::NONE
-        || object.name().as_utf8() != Some("Object")
+        || object.name().as_utf8() != Some(instance_name)
         || object.parent().is_some()
         || object.exports().is_some()
         || object.export_symbol().is_some()
         || globals
-            .get_source("Object")
+            .get_source(instance_name)
             .and_then(|global| store.get_merged_symbol(global))
             != Some(symbol)
         || store.get_merged_symbol(symbol) != Some(symbol)
@@ -1385,10 +1401,10 @@ fn plan_global_object_constructor(
         || reference.type_arguments.is_some()
         || annotation_name_record.kind != SyntaxKind::Identifier
         || annotation_name_record.parent != Some(annotation.node)
-        || annotation_identifier.text != "ObjectConstructor"
+        || annotation_identifier.text != constructor_name
         || !owner_record.flags().contains(SymbolFlags::INTERFACE)
         || owner_record.check_flags() != CheckFlags::NONE
-        || owner_record.name().as_utf8() != Some("ObjectConstructor")
+        || owner_record.name().as_utf8() != Some(constructor_name)
         || owner_record.parent().is_some()
         || owner_record.exports().is_some()
         || owner_record.export_symbol().is_some()
@@ -1494,7 +1510,7 @@ fn plan_global_object_constructor(
             || return_reference.type_arguments.is_some()
             || return_name_record.kind != SyntaxKind::Identifier
             || return_name_record.parent != Some(return_node.node)
-            || return_identifier.text != "Object"
+            || return_identifier.text != instance_name
             || parameter_symbol_record.flags() != SymbolFlags::FUNCTION_SCOPED_VARIABLE
             || parameter_symbol_record.check_flags() != CheckFlags::NONE
             || parameter_symbol_record.declarations() != Some(&[parameter])
@@ -2293,6 +2309,7 @@ fn plan_global_array_constructor(
             let inferred = match &argument.value {
                 SourceNewArgumentValue::String(_) => bootstrap.string_type,
                 SourceNewArgumentValue::Number(_) => bootstrap.number_type,
+                SourceNewArgumentValue::Boolean(_) => bootstrap.boolean_type,
                 SourceNewArgumentValue::EmptyObject(_) => bootstrap.empty_type_literal_type,
             };
             let element = explicit.unwrap_or(inferred);
@@ -2302,6 +2319,7 @@ fn plan_global_array_constructor(
                     let actual = match &argument.value {
                         SourceNewArgumentValue::String(_) => bootstrap.string_type,
                         SourceNewArgumentValue::Number(_) => bootstrap.number_type,
+                        SourceNewArgumentValue::Boolean(_) => bootstrap.boolean_type,
                         SourceNewArgumentValue::EmptyObject(_) => bootstrap.empty_type_literal_type,
                     };
                     element != bootstrap.any_type && element != actual
@@ -2821,6 +2839,7 @@ fn argument_matches_parameter(
         let argument_type = match &argument.value {
             SourceNewArgumentValue::String(_) => bootstrap.string_type,
             SourceNewArgumentValue::Number(_) => bootstrap.number_type,
+            SourceNewArgumentValue::Boolean(_) => bootstrap.boolean_type,
             SourceNewArgumentValue::EmptyObject(_) => bootstrap.empty_type_literal_type,
         };
         parameter.type_ == argument_type
@@ -3042,7 +3061,7 @@ pub(super) fn prepare_direct_default_news(
         match &argument.value {
             SourceNewArgumentValue::String(value) => strings.push(value.clone()),
             SourceNewArgumentValue::Number(value) => numbers.push(*value),
-            SourceNewArgumentValue::EmptyObject(_) => {}
+            SourceNewArgumentValue::Boolean(_) | SourceNewArgumentValue::EmptyObject(_) => {}
         }
     }
     if !strings.is_empty() || !numbers.is_empty() {
@@ -3282,7 +3301,7 @@ fn materialize_imported_generic_constructor(
     Ok(())
 }
 
-/// Publishes the bound Object constructor without resolving unrelated members.
+/// Publishes a bound Object or Boolean constructor without resolving other members.
 fn materialize_global_object_constructor(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -3380,7 +3399,7 @@ fn materialize_global_object_constructor(
             None,
             0,
         )
-        .expect("the authenticated Object constructor reserved its bound signature");
+        .expect("the authenticated global constructor reserved its bound signature");
     assert!(store.set_type_node_links(
         global.annotation,
         TypeNodeLinks {
@@ -4119,6 +4138,20 @@ pub(super) fn check_direct_default_new(
                     store.regular_string_literal_type(value.clone())
                 }
                 SourceNewArgumentValue::Number(value) => store.regular_number_literal_type(*value),
+                SourceNewArgumentValue::Boolean(value) => {
+                    return store
+                        .intrinsic_bootstrap()
+                        .map(|bootstrap| {
+                            if *value {
+                                bootstrap.true_type
+                            } else {
+                                bootstrap.false_type
+                            }
+                        })
+                        .ok_or_else(|| {
+                            invariant(SourceNewInvariant::InvalidExpressionCache(argument.node))
+                        });
+                }
                 SourceNewArgumentValue::EmptyObject(object) => {
                     return object_literal_state(store, object)
                         .map_err(|_| {
@@ -5078,6 +5111,11 @@ fn cached_argument_type(
     let regular = match &argument.value {
         SourceNewArgumentValue::String(value) => bootstrap.cached_string_literal_type(value),
         SourceNewArgumentValue::Number(value) => bootstrap.cached_number_literal_type(*value),
+        SourceNewArgumentValue::Boolean(value) => Some(if *value {
+            bootstrap.regular_true_type
+        } else {
+            bootstrap.regular_false_type
+        }),
         SourceNewArgumentValue::EmptyObject(object) => {
             return object_literal_state(store, object)
                 .map(|state| {
@@ -5554,6 +5592,18 @@ mod tests {
             "readonly prototype: any[]; ",
             "} ",
             "declare var Array: ArrayConstructor;",
+        ))
+    }
+
+    fn global_boolean_constructor_library() -> ParseResult {
+        parse_source_file(concat!(
+            "interface Boolean { valueOf(): boolean; } ",
+            "interface BooleanConstructor { ",
+            "new(value?: any): Boolean; ",
+            "<Value>(value?: Value): boolean; ",
+            "readonly prototype: Boolean; ",
+            "} ",
+            "declare var Boolean: BooleanConstructor;",
         ))
     }
 
@@ -6087,6 +6137,170 @@ mod tests {
             assert!(context.store().type_node_links(construction).is_none());
             assert!(context.store().symbol_node_links(constructor).is_none());
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Verify wrapper ownership, both literal forms, and warm identity.
+    fn global_boolean_constructor_preserves_optional_signature_and_fresh_literals() {
+        let library = global_boolean_constructor_library();
+        assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+
+        for (index, (argument, expected_boolean)) in
+            [("", None), ("true", Some(true)), ("false", Some(false))]
+                .into_iter()
+                .enumerate()
+        {
+            let source = parse_source_file(&format!("const result = new Boolean({argument});"));
+            assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+            let library_file = FileId::new(1_850 + u32::try_from(index).unwrap() * 2);
+            let source_file = FileId::new(1_851 + u32::try_from(index).unwrap() * 2);
+            let mut context =
+                global_object_constructor_context(&library, &source, library_file, source_file);
+            let (construction, constructor) = variable_new(&source, source_file, "result");
+            let (boolean, owner, call, prototype) = {
+                let store = context.store();
+                let globals = store
+                    .symbol_table(store.intrinsic_bootstrap().unwrap().globals)
+                    .unwrap();
+                let boolean = globals
+                    .get_source("Boolean")
+                    .and_then(|symbol| store.get_merged_symbol(symbol))
+                    .unwrap();
+                let owner = globals
+                    .get_source("BooleanConstructor")
+                    .and_then(|symbol| store.get_merged_symbol(symbol))
+                    .unwrap();
+                let members = store
+                    .symbol(owner)
+                    .and_then(ts_binder::semantic::Symbol::members)
+                    .and_then(|members| store.symbol_table(members))
+                    .unwrap();
+                (
+                    boolean,
+                    owner,
+                    members.get(InternalSymbolName::Call.as_ref()).unwrap(),
+                    members.get_source("prototype").unwrap(),
+                )
+            };
+
+            context.check_source_file(source_file).unwrap();
+
+            let store = context.store();
+            let expected_instance = context.global_types().boolean_type;
+            let value = store
+                .declared_type_links(owner)
+                .and_then(|links| links.declared_type)
+                .unwrap();
+            let TypeData::Interface(interface) = store.type_payload(value).unwrap().data() else {
+                panic!("BooleanConstructor must retain its library interface")
+            };
+            assert!(!interface.declared_members_resolved);
+            assert!(interface.reference.object.structured.signatures.is_none());
+            assert!(store.value_symbol_links(prototype).is_none());
+            let call_declaration = store.symbol(call).unwrap().declarations().unwrap()[0];
+            assert!(store.signature_links(call_declaration).is_none());
+            let signature = store
+                .signature_links(construction)
+                .and_then(|links| links.resolved_signature.signature())
+                .unwrap();
+            let record = store.signature(signature).unwrap();
+            assert_eq!(record.min_argument_count(), 0);
+            assert_eq!(record.resolved_return_type(), Some(expected_instance));
+            assert_eq!(
+                store
+                    .symbol_node_links(constructor)
+                    .and_then(|links| links.resolved_symbol),
+                Some(boolean),
+            );
+            assert_eq!(
+                store
+                    .type_node_links(construction)
+                    .and_then(|links| links.resolved_type),
+                Some(expected_instance),
+            );
+            if let Some(boolean) = expected_boolean {
+                let argument = constructor_argument(&source, construction);
+                let bootstrap = store.intrinsic_bootstrap().unwrap();
+                assert_eq!(
+                    store
+                        .type_node_links(argument)
+                        .and_then(|links| links.resolved_type),
+                    Some(if boolean {
+                        bootstrap.true_type
+                    } else {
+                        bootstrap.false_type
+                    }),
+                );
+            }
+            assert!(context.diagnostics().is_empty());
+            let warm = (
+                store.type_len(),
+                store.signature_len(),
+                store.symbol_len(),
+                store.checker_link_allocated_lengths(),
+            );
+
+            context.recheck_source_file(source_file).unwrap();
+
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().symbol_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                warm,
+            );
+        }
+    }
+
+    #[test]
+    fn global_boolean_constructor_rejects_poisoned_literal_before_publication() {
+        let library = global_boolean_constructor_library();
+        let source = parse_source_file("const result = new Boolean(true);");
+        let library_file = FileId::new(1_856);
+        let source_file = FileId::new(1_857);
+        let mut context =
+            global_object_constructor_context(&library, &source, library_file, source_file);
+        let (construction, constructor) = variable_new(&source, source_file, "result");
+        let argument = constructor_argument(&source, construction);
+        let owner = context
+            .store()
+            .symbol_table(context.store().intrinsic_bootstrap().unwrap().globals)
+            .and_then(|globals| globals.get_source("BooleanConstructor"))
+            .unwrap();
+        let poison = context.store().intrinsic_bootstrap().unwrap().false_type;
+        assert!(context.store_mut_for_test().set_type_node_links(
+            argument,
+            TypeNodeLinks {
+                resolved_type: Some(poison),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        let before = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().symbol_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+
+        assert_eq!(
+            context.check_source_file(source_file),
+            Err(SourceCheckError::Call(argument)),
+        );
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+        assert!(context.store().declared_type_links(owner).is_none());
+        assert!(context.store().type_node_links(construction).is_none());
+        assert!(context.store().symbol_node_links(constructor).is_none());
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]
