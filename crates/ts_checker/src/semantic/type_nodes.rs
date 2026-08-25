@@ -46,8 +46,9 @@ use super::{
         validate_generic_global_type_instantiation,
     },
     indexed_access_types::{
-        ConcreteIndexedAccessError, ConcreteIndexedAccessPlan, finish_concrete_indexed_access,
-        get_deferred_indexed_access_type, plan_concrete_indexed_access,
+        ConcreteIndexedAccessError, ConcreteIndexedAccessPlan, RecursiveIndexedAccessPlan,
+        finish_concrete_indexed_access, get_deferred_indexed_access_type,
+        plan_concrete_indexed_access, plan_recursive_indexed_access,
     },
     instantiate::{
         InstantiationLimits, InstantiationSession, instantiate_type_with_session,
@@ -675,6 +676,7 @@ struct TypeQueryPlan {
     arrays: BTreeMap<NodeRef, PlannedArrayType>,
     indexed_accesses: BTreeMap<NodeRef, ConcreteIndexedAccessPlan>,
     recovered_indexed_accesses: BTreeMap<NodeRef, PlannedRecoveredIndexedAccess>,
+    recursive_indexed_aliases: BTreeMap<SemanticSymbolId, PlannedRecursiveIndexedAlias>,
     keyofs: BTreeMap<NodeRef, NodeRef>,
     aliases: BTreeMap<SemanticSymbolId, TypeAliasPlan>,
     react_detailed_html_props_aliases: BTreeMap<SemanticSymbolId, ReactDetailedHtmlPropsPlan>,
@@ -778,6 +780,16 @@ struct PlannedMappedIndexedAccess {
 struct PlannedRecoveredIndexedAccess {
     object: NodeRef,
     index: NodeRef,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct PlannedRecursiveIndexedAlias {
+    root: NodeRef,
+    access: RecursiveIndexedAccessPlan,
+    diagnostic: NodeRef,
+    diagnostic_code: u32,
+    generic_symbol: Option<SemanticSymbolId>,
+    generic_name: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3252,6 +3264,175 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         })
     }
 
+    /// Authenticates a direct self-index inside generic or tuple arguments.
+    ///
+    /// Type argument cycles belong to the generic reference or the innermost
+    /// enclosing tuple instead of the alias declaration itself.
+    fn authenticated_recursive_indexed_alias(
+        &self,
+        alias: SemanticSymbolId,
+        root: NodeRef,
+    ) -> Result<Option<PlannedRecursiveIndexedAlias>, DeclaredTypeError> {
+        let root_record = preflight_node(self.store, self.host, root)?;
+        if !matches!(
+            root_record.kind,
+            SyntaxKind::TypeReference | SyntaxKind::ArrayType | SyntaxKind::TupleType
+        ) {
+            return Ok(None);
+        }
+
+        let mut pending = vec![root];
+        let mut visited = HashSet::new();
+        while let Some(node) = pending.pop() {
+            if !visited.insert(node) {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(root),
+                ));
+            }
+            let record = preflight_node(self.store, self.host, node)?;
+            if record.kind == SyntaxKind::IndexedAccessType {
+                let Some(access) = plan_recursive_indexed_access(self.store, self.host, node)
+                    .map_err(|error| indexed_access_error(error, node))?
+                else {
+                    record.for_each_child(|child| {
+                        pending.push(NodeRef::new(node.arena, node.file, child));
+                    });
+                    continue;
+                };
+                if access.accesses().len() != access.indexes().len() {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidIndexedAccessType(node),
+                    ));
+                }
+                let referenced =
+                    self.resolve_uncached_type_reference_symbol(access.root_reference())?;
+                if self.store.get_merged_symbol(referenced) != Some(alias) {
+                    record.for_each_child(|child| {
+                        pending.push(NodeRef::new(node.arena, node.file, child));
+                    });
+                    continue;
+                }
+
+                let (diagnostic, diagnostic_code, generic_symbol, generic_name) =
+                    match root_record.kind {
+                        SyntaxKind::TypeReference => {
+                            let NodeData::TypeReferenceNode(reference) = &root_record.data else {
+                                return Err(type_node_unavailable(
+                                    TypeNodeUnavailable::InvalidTypeReference(root),
+                                ));
+                            };
+                            let Some(arguments) = &reference.type_arguments else {
+                                return Ok(None);
+                            };
+                            let symbol = self.resolve_uncached_type_reference_symbol(root)?;
+                            let owner = self.store.symbol(symbol).ok_or({
+                                DeclaredTypeError::Unavailable(
+                                    DeclaredTypeUnavailable::SymbolNotOwned(symbol),
+                                )
+                            })?;
+                            let flags = owner.flags();
+                            if !flags.contains(SymbolFlags::INTERFACE)
+                                || flags.intersects(SymbolFlags::CLASS)
+                                || preflight_class_or_interface_reference(
+                                    self.store, self.host, symbol, flags,
+                                )? != arguments.nodes.len()
+                            {
+                                return Ok(None);
+                            }
+                            let Some(name) = owner.name().as_utf8() else {
+                                return Ok(None);
+                            };
+                            (root, 4109, Some(symbol), Some(name.to_owned()))
+                        }
+                        SyntaxKind::ArrayType | SyntaxKind::TupleType => {
+                            let mut current = node;
+                            let mut ancestors = HashSet::new();
+                            let mut tuple = None;
+                            while current != root {
+                                if !ancestors.insert(current) {
+                                    return Err(type_node_unavailable(
+                                        TypeNodeUnavailable::InvalidIndexedAccessType(node),
+                                    ));
+                                }
+                                let parent = preflight_node(self.store, self.host, current)?
+                                    .parent
+                                    .ok_or_else(|| {
+                                        type_node_unavailable(
+                                            TypeNodeUnavailable::InvalidIndexedAccessType(node),
+                                        )
+                                    })?;
+                                current = NodeRef::new(current.arena, current.file, parent);
+                                if tuple.is_none()
+                                    && preflight_node(self.store, self.host, current)?.kind
+                                        == SyntaxKind::TupleType
+                                {
+                                    tuple = Some(current);
+                                }
+                            }
+                            let Some(tuple) = tuple else {
+                                return Ok(None);
+                            };
+                            (tuple, 4110, None, None)
+                        }
+                        _ => unreachable!("the recursive alias root was authenticated"),
+                    };
+
+                let error_type = self
+                    .store
+                    .intrinsic_bootstrap()
+                    .ok_or(DeclaredTypeError::Unavailable(
+                        DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
+                    ))?
+                    .error_type;
+                for cached in std::iter::once(root)
+                    .chain(std::iter::once(diagnostic))
+                    .chain(std::iter::once(access.root_reference()))
+                    .chain(access.accesses().iter().copied())
+                {
+                    if self.store.type_node_links(cached).is_some_and(|links| {
+                        links.outer_type_parameters.is_some()
+                            || links.resolved_type.is_some_and(|type_| type_ != error_type)
+                    }) {
+                        return Err(type_node_unavailable(
+                            TypeNodeUnavailable::InvalidIndexedAccessType(cached),
+                        ));
+                    }
+                }
+                if self
+                    .store
+                    .symbol_node_links(access.root_reference())
+                    .and_then(|links| links.resolved_symbol)
+                    .is_some_and(|symbol| self.store.get_merged_symbol(symbol) != Some(alias))
+                    || generic_symbol.is_some_and(|expected| {
+                        self.store
+                            .symbol_node_links(root)
+                            .and_then(|links| links.resolved_symbol)
+                            .is_some_and(|symbol| {
+                                self.store.get_merged_symbol(symbol) != Some(expected)
+                            })
+                    })
+                {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidCachedTypeAlias(alias),
+                    ));
+                }
+
+                return Ok(Some(PlannedRecursiveIndexedAlias {
+                    root,
+                    access,
+                    diagnostic,
+                    diagnostic_code,
+                    generic_symbol,
+                    generic_name,
+                }));
+            }
+            record.for_each_child(|child| {
+                pending.push(NodeRef::new(node.arena, node.file, child));
+            });
+        }
+        Ok(None)
+    }
+
     fn plan_concrete_indexed_access_type(
         &mut self,
         node: NodeRef,
@@ -4687,6 +4868,62 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         union_constituent: bool,
     ) -> Result<(), DeclaredTypeError> {
         let declared_type = cached.declared_type;
+        if self
+            .store
+            .intrinsic_bootstrap()
+            .is_some_and(|bootstrap| declared_type == bootstrap.error_type)
+            && let Some(declaration) = self
+                .store
+                .symbol(root_symbol)
+                .and_then(ts_binder::semantic::Symbol::declarations)
+                .and_then(|declarations| declarations.first())
+                .copied()
+                .filter(|declaration| self.host.source(*declaration).is_some())
+            && let Some(alias) = authenticated_type_alias_declaration(
+                self.store,
+                self.host,
+                declaration,
+                root_symbol,
+            )?
+            && let Some(recovered) = self.authenticated_recursive_indexed_alias(
+                root_symbol,
+                NodeRef::new(declaration.arena, declaration.file, alias.type_),
+            )?
+        {
+            let mut nodes = recovered
+                .access
+                .accesses()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>();
+            nodes.extend([
+                recovered.root,
+                recovered.diagnostic,
+                recovered.access.root_reference(),
+            ]);
+            if nodes.iter().any(|node| {
+                self.store
+                    .type_node_links(*node)
+                    .and_then(|links| links.resolved_type)
+                    != Some(declared_type)
+            }) || self
+                .store
+                .symbol_node_links(recovered.access.root_reference())
+                .and_then(|links| links.resolved_symbol)
+                != Some(root_symbol)
+                || recovered.generic_symbol.is_some_and(|generic| {
+                    self.store
+                        .symbol_node_links(recovered.root)
+                        .and_then(|links| links.resolved_symbol)
+                        != Some(generic)
+                })
+            {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidCachedTypeAlias(root_symbol),
+                ));
+            }
+            return Ok(());
+        }
         let declared_data = self.store.type_payload(declared_type).map(TypeRecord::data);
         let remains_union = matches!(declared_data, Some(TypeData::Union(_)));
         let canonical_enum_owner = enums::canonical_enum_type_owner(self.store, declared_type);
@@ -11737,6 +11974,22 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 type_parameters,
             },
         );
+        if planned_parameters.is_empty()
+            && let Some(recovered) =
+                self.authenticated_recursive_indexed_alias(symbol, type_node)?
+        {
+            if let Some(existing) = self
+                .plan
+                .recursive_indexed_aliases
+                .insert(symbol, recovered.clone())
+                && existing != recovered
+            {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidCachedTypeAlias(symbol),
+                ));
+            }
+            return Ok(type_parameter_count);
+        }
         if let Some(react_alias) = self.authenticated_react_detailed_html_props_alias(symbol) {
             self.plan
                 .react_detailed_html_props_aliases
@@ -13655,6 +13908,18 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         &self,
         plan: &TypeQueryPlan,
     ) -> Result<usize, DeclaredTypeError> {
+        let recursive_nodes =
+            plan.recursive_indexed_aliases
+                .values()
+                .try_fold(0usize, |count, recovered| {
+                    recovered
+                        .access
+                        .accesses()
+                        .len()
+                        .checked_add(3)
+                        .and_then(|additional| count.checked_add(additional))
+                        .ok_or_else(|| Self::literal_cache_error(LiteralTypeCacheError::Capacity))
+                })?;
         let capacity = plan
             .arrays
             .len()
@@ -13675,6 +13940,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .and_then(|count| count.checked_add(plan.functions.len()))
             .and_then(|count| count.checked_add(plan.templates.len()))
             .and_then(|count| count.checked_add(plan.unique_symbols.len()))
+            .and_then(|count| count.checked_add(recursive_nodes))
             .and_then(|count| {
                 plan.tuples
                     .len()
@@ -13710,6 +13976,17 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         {
             if !nodes.contains(node) {
                 nodes.push(*node);
+            }
+        }
+        for recovered in plan.recursive_indexed_aliases.values() {
+            for node in recovered.access.accesses().iter().copied().chain([
+                recovered.root,
+                recovered.diagnostic,
+                recovered.access.root_reference(),
+            ]) {
+                if !nodes.contains(&node) {
+                    nodes.push(node);
+                }
             }
         }
         for tuple in plan.tuples.values() {
@@ -13955,8 +14232,18 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .values()
             .filter(|target| self.store.symbol_node_links(target.imported_name).is_none())
             .count();
+        let recursive_symbol_node_links = plan
+            .recursive_indexed_aliases
+            .values()
+            .flat_map(|recovered| {
+                std::iter::once(recovered.access.root_reference())
+                    .chain(recovered.generic_symbol.map(|_| recovered.root))
+            })
+            .filter(|node| self.store.symbol_node_links(*node).is_none())
+            .count();
         let symbol_node_links = query_symbol_node_links
             .checked_add(imported_symbol_node_links)
+            .and_then(|count| count.checked_add(recursive_symbol_node_links))
             .ok_or_else(|| Self::literal_cache_error(LiteralTypeCacheError::Capacity))?;
         if !self.store.try_reserve_index_infos(index_infos)
             || !self.store.try_reserve_types(additional_types)
@@ -14297,6 +14584,9 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         let alias = plan.aliases.get(&symbol).cloned().ok_or_else(|| {
             type_node_unavailable(TypeNodeUnavailable::MissingPlannedTypeAlias(symbol))
         })?;
+        if let Some(recovered) = plan.recursive_indexed_aliases.get(&symbol) {
+            return self.execute_recursive_indexed_type_alias(symbol, &alias, recovered);
+        }
         if plan.recursive_mapped_aliases.contains_key(&symbol) {
             return self.execute_recursive_mapped_type_alias(symbol, &alias, plan, prepared);
         }
@@ -14388,6 +14678,120 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             ));
         }
         Ok(published)
+    }
+
+    fn execute_recursive_indexed_type_alias(
+        &mut self,
+        symbol: SemanticSymbolId,
+        alias: &TypeAliasPlan,
+        recovered: &PlannedRecursiveIndexedAlias,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        if !alias.type_parameters.is_empty() || alias.type_node != recovered.root {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidCachedTypeAlias(symbol),
+            ));
+        }
+        let error_type = self.error_type()?;
+        let mut nodes = recovered
+            .access
+            .accesses()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        nodes.extend([
+            recovered.root,
+            recovered.diagnostic,
+            recovered.access.root_reference(),
+        ]);
+        nodes.sort_unstable();
+        nodes.dedup();
+        for node in nodes {
+            let mut links = self
+                .store
+                .type_node_links(node)
+                .cloned()
+                .unwrap_or_default();
+            if links.outer_type_parameters.is_some()
+                || links
+                    .resolved_type
+                    .is_some_and(|cached| cached != error_type)
+            {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidIndexedAccessType(node),
+                ));
+            }
+            links.resolved_type = Some(error_type);
+            if !self.store.set_type_node_links(node, links) {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidIndexedAccessType(node),
+                ));
+            }
+        }
+
+        for (reference, target) in std::iter::once((recovered.access.root_reference(), symbol))
+            .chain(
+                recovered
+                    .generic_symbol
+                    .map(|generic| (recovered.root, generic)),
+            )
+        {
+            let mut links = self
+                .store
+                .symbol_node_links(reference)
+                .cloned()
+                .unwrap_or_default();
+            if links
+                .resolved_symbol
+                .is_some_and(|cached| self.store.get_merged_symbol(cached) != Some(target))
+            {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidCachedSymbol {
+                        node: reference,
+                        symbol: target,
+                    },
+                ));
+            }
+            links.resolved_symbol = Some(target);
+            if !self.store.set_symbol_node_links(reference, links) {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidCachedSymbol {
+                        node: reference,
+                        symbol: target,
+                    },
+                ));
+            }
+        }
+
+        let mut links = self
+            .store
+            .type_alias_links(symbol)
+            .cloned()
+            .unwrap_or_default();
+        if links.type_parameters.is_some()
+            || links.instantiations.is_some()
+            || links
+                .declared_type
+                .is_some_and(|cached| cached != error_type)
+        {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidCachedTypeAlias(symbol),
+            ));
+        }
+        links.declared_type = Some(error_type);
+        if !self.store.set_type_alias_links(symbol, links) {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidTypeAliasSymbol(symbol),
+            ));
+        }
+
+        let message = message_by_code(recovered.diagnostic_code)
+            .expect("recursive type-argument diagnostics are in the pinned catalog");
+        let diagnostic = match &recovered.generic_name {
+            Some(name) => Diagnostic::with_arguments(message, [name.clone()]),
+            None => Diagnostic::new(message),
+        };
+        self.diagnostics.add(Some(recovered.diagnostic), diagnostic);
+        Ok(error_type)
     }
 
     fn execute_recursive_mapped_type_alias(
@@ -26165,6 +26569,292 @@ mod tests {
         );
         assert_eq!(store_state(&fixture.store), state);
         assert_eq!(diagnostics.len(), 3);
+    }
+
+    #[test]
+    fn recursive_interface_index_arguments_report_ts4109_once_and_replay_warm() {
+        let mut fixture = fixture(concat!(
+            "type Recursive = Box<'value', Recursive['item']>; ",
+            "interface Box<Value, Result> { item: Value; result: Result; }",
+        ));
+        let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Recursive");
+        let (_, _, reference) = alias_parts(&fixture, "Recursive");
+        let error_type = fixture.store.intrinsic_bootstrap().unwrap().error_type;
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(error_type),
+        );
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("a recursive generic argument must issue exactly one diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 4109);
+        assert_eq!(diagnostic.diagnostic.arguments, ["Box"]);
+        assert_eq!(diagnostic.node, Some(reference));
+        assert!(fixture.store.type_resolution_is_empty());
+
+        let warm = store_state(&fixture.store);
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(error_type),
+        );
+        assert_eq!(store_state(&fixture.store), warm);
+        assert_eq!(diagnostics.len(), 1);
+    }
+
+    #[test]
+    fn recursive_array_and_tuple_indexes_report_ts4110_on_the_innermost_tuple() {
+        for (source, alias_name) in [
+            (
+                "type Recursive = ['value', Recursive[number][0]][];",
+                "Recursive",
+            ),
+            (
+                "type Recursive = [['value', Recursive[0][0]]];",
+                "Recursive",
+            ),
+        ] {
+            let mut fixture = global_array_fixture(source);
+            let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, alias_name);
+            let error_type = fixture.store.intrinsic_bootstrap().unwrap().error_type;
+            let indexed = fixture
+                .parsed
+                .arena
+                .iter()
+                .filter_map(|(node, record)| {
+                    (record.kind == SyntaxKind::IndexedAccessType).then_some(NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        node,
+                    ))
+                })
+                .find(|node| {
+                    fixture
+                        .parsed
+                        .arena
+                        .get(node.node)
+                        .and_then(|record| record.parent)
+                        .and_then(|parent| fixture.parsed.arena.get(parent))
+                        .is_none_or(|parent| parent.kind != SyntaxKind::IndexedAccessType)
+                })
+                .expect("the recursive alias must contain an outer indexed-access node");
+            let mut parent = fixture.parsed.arena.get(indexed.node).unwrap().parent;
+            let tuple = loop {
+                let current = parent.expect("the indexed access must be nested in a tuple");
+                let record = fixture.parsed.arena.get(current).unwrap();
+                if record.kind == SyntaxKind::TupleType {
+                    break NodeRef::new(fixture.parsed.arena.id(), fixture.file, current);
+                }
+                parent = record.parent;
+            };
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+            assert_eq!(
+                query_declared(
+                    &mut fixture,
+                    alias,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                ),
+                Ok(error_type),
+                "source: {source}",
+            );
+            let [diagnostic] = diagnostics.as_slice() else {
+                panic!("a recursive tuple must issue exactly one diagnostic: {source}")
+            };
+            assert_eq!(diagnostic.diagnostic.code(), 4110, "source: {source}");
+            assert_eq!(diagnostic.node, Some(tuple), "source: {source}");
+            assert!(fixture.store.type_resolution_is_empty());
+
+            let warm = store_state(&fixture.store);
+            assert_eq!(
+                query_declared(
+                    &mut fixture,
+                    alias,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                ),
+                Ok(error_type),
+            );
+            assert_eq!(store_state(&fixture.store), warm);
+            assert_eq!(diagnostics.len(), 1);
+        }
+    }
+
+    #[test]
+    fn upstream_circular_interface_access_reports_all_recursive_index_diagnostics() {
+        let mut fixture = global_array_fixture(concat!(
+            "type Mxs = Mx<'list', Mxs['p1']>; ",
+            "interface Mx<T, K> { p1: T; p2: K; } ",
+            "type ArrElem = ['list', ArrElem[number][0]][]; ",
+            "type TupleElem = [['list', TupleElem[0][0]]];",
+        ));
+        let error_type = fixture.store.intrinsic_bootstrap().unwrap().error_type;
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let cases = [("Mxs", 4109), ("ArrElem", 4110), ("TupleElem", 4110)];
+
+        for (index, (alias_name, code)) in cases.iter().copied().enumerate() {
+            let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, alias_name);
+            let (_, _, root) = alias_parts(&fixture, alias_name);
+            let diagnostic_node = match alias_name {
+                "Mxs" => root,
+                "ArrElem" => {
+                    let NodeData::ArrayTypeNode(array) =
+                        &fixture.parsed.arena.get(root.node).unwrap().data
+                    else {
+                        panic!("ArrElem must retain its array type")
+                    };
+                    NodeRef::new(root.arena, root.file, array.element_type)
+                }
+                "TupleElem" => {
+                    let NodeData::TupleTypeNode(tuple) =
+                        &fixture.parsed.arena.get(root.node).unwrap().data
+                    else {
+                        panic!("TupleElem must retain its outer tuple")
+                    };
+                    NodeRef::new(root.arena, root.file, tuple.elements.nodes[0])
+                }
+                _ => unreachable!("the upstream fixture contains three aliases"),
+            };
+
+            assert_eq!(
+                query_declared(
+                    &mut fixture,
+                    alias,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                ),
+                Ok(error_type),
+                "alias: {alias_name}",
+            );
+            assert_eq!(diagnostics.len(), index + 1, "alias: {alias_name}");
+            let diagnostic = &diagnostics.as_slice()[index];
+            assert_eq!(diagnostic.diagnostic.code(), code, "alias: {alias_name}");
+            assert_eq!(
+                diagnostic.node,
+                Some(diagnostic_node),
+                "alias: {alias_name}"
+            );
+            if alias_name == "Mxs" {
+                assert_eq!(diagnostic.diagnostic.arguments, ["Mx"]);
+            }
+        }
+
+        let warm = store_state(&fixture.store);
+        for (alias_name, _) in cases {
+            let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, alias_name);
+            assert_eq!(
+                query_declared(
+                    &mut fixture,
+                    alias,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                ),
+                Ok(error_type),
+            );
+        }
+        assert_eq!(store_state(&fixture.store), warm);
+        assert_eq!(diagnostics.len(), 3);
+    }
+
+    #[test]
+    fn upstream_recursive_index_simplification_keeps_generic_aliases_outside_recovery() {
+        let fixture = global_array_fixture(concat!(
+            "type Recur<T> = ",
+            "(T extends (unknown[]) ? {} : { [K in keyof T]?: Recur<T[K]> }) | ",
+            "[...Recur<T>[number][]]; ",
+            "function join<T>(l: Recur<T>[]): Recur<T> { ",
+            "return ['marker', ...l]; ",
+            "} ",
+            "function a<T>(l: Recur<T>[]): void { ",
+            "const x: Recur<T> | undefined = join(l); ",
+            "}",
+        ));
+        let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Recur");
+        let (_, _, root) = alias_parts(&fixture, "Recur");
+        let host = post_global_host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        let aliases = HashMap::new();
+        let planner = TypeQueryPlanner::new(&fixture.store, &host, None, None, false, &aliases);
+        let before = store_state(&fixture.store);
+
+        assert_eq!(
+            planner.authenticated_recursive_indexed_alias(alias, root),
+            Ok(None),
+        );
+        assert_eq!(store_state(&fixture.store), before);
+        assert!(fixture.store.type_alias_links(alias).is_none());
+    }
+
+    #[test]
+    fn recursive_indexed_aliases_reject_poisoned_warm_node_identities() {
+        let mut fixture = fixture(concat!(
+            "type Recursive = Box<'value', Recursive['item']>; ",
+            "interface Box<Value, Result> { item: Value; result: Result; }",
+        ));
+        let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Recursive");
+        let (_, _, reference) = alias_parts(&fixture, "Recursive");
+        let (error_type, number) = {
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            (bootstrap.error_type, bootstrap.number_type)
+        };
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(error_type),
+        );
+        let original = fixture.store.type_node_links(reference).unwrap().clone();
+        assert!(fixture.store.set_type_node_links(
+            reference,
+            TypeNodeLinks {
+                resolved_type: Some(number),
+                ..original.clone()
+            },
+        ));
+        let poisoned = store_state(&fixture.store);
+
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::InvalidIndexedAccessType(reference),
+            )),
+        );
+        assert_eq!(store_state(&fixture.store), poisoned);
+
+        assert!(fixture.store.set_type_node_links(reference, original));
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(error_type),
+        );
+        assert_eq!(diagnostics.len(), 1);
     }
 
     #[test]

@@ -7,15 +7,18 @@
 //! own properties and string/number/template-pattern index signatures are
 //! supported, including mixed surfaces: an exact literal property wins, then
 //! one applicable number or template index wins over a string index. Generic
-//! type-parameter pairs have a separate deferred constructor. Other named
-//! operands, optional properties, overlapping non-string indexes, union keys,
-//! tuples, apparent types, and diagnostic recovery remain explicit
-//! concrete-planner boundaries.
+//! type-parameter pairs have a separate deferred constructor. Recursive named
+//! operands retain an authenticated, allocation-free syntax proof so the
+//! type-node owner can issue the pinned generic and tuple cycle diagnostics.
+//! Other named operands, optional properties, overlapping non-string indexes,
+//! union keys, tuples, and apparent types remain explicit concrete boundaries.
 //!
 //! Planning chooses the exact property symbol or index-info slot before any
 //! semantic child executes. Finishing only validates the already-resolved
 //! object and returns an existing value type, so this concrete path never
 //! allocates an `IndexedAccessType` or mutates a checker cache.
+
+use std::collections::HashSet;
 
 use ts_ast::{NodeData, NodeRef, SyntaxKind};
 use ts_binder::SemanticSymbolId;
@@ -105,6 +108,33 @@ pub(super) struct ConcreteIndexedAccessPlan {
     key: ConcreteIndexKey,
     selection: ConcreteIndexedSelection,
     cached_type: Option<TypeId>,
+}
+
+/// Authenticated nested indexing rooted at one unqualified named type.
+///
+/// The type-node planner owns name resolution and determines whether this
+/// syntactic path actually references its enclosing alias. This leaf only
+/// proves node ownership, exact parent edges, supported keys, and cold/warm
+/// indexed-access cache shapes.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct RecursiveIndexedAccessPlan {
+    root_reference: NodeRef,
+    accesses: Vec<NodeRef>,
+    indexes: Vec<NodeRef>,
+}
+
+impl RecursiveIndexedAccessPlan {
+    pub(super) const fn root_reference(&self) -> NodeRef {
+        self.root_reference
+    }
+
+    pub(super) fn accesses(&self) -> &[NodeRef] {
+        &self.accesses
+    }
+
+    pub(super) fn indexes(&self) -> &[NodeRef] {
+        &self.indexes
+    }
 }
 
 impl ConcreteIndexedAccessPlan {
@@ -206,6 +236,83 @@ pub(super) fn get_deferred_indexed_access_type(
     }
 
     cached.or_else(|| store.alloc_indexed_access_type(object_type, index_type, persistent_flags))
+}
+
+/// Preflights a nested indexed-access path without resolving its named root.
+///
+/// Returns `None` for ordinary inline-object or otherwise unsupported roots.
+/// Malformed parent relationships and poisoned existing node links remain
+/// invariant failures instead of being mistaken for recursive syntax.
+pub(super) fn plan_recursive_indexed_access(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    node: NodeRef,
+) -> Result<Option<RecursiveIndexedAccessPlan>, ConcreteIndexedAccessError> {
+    let mut current = node;
+    let mut accesses = Vec::new();
+    let mut indexes = Vec::new();
+    let mut visited = HashSet::new();
+
+    loop {
+        if !visited.insert(current) {
+            return Err(ConcreteIndexedAccessError::InvalidSyntax(current));
+        }
+        let record = preflight_node(store, host, current)?;
+        let NodeData::IndexedAccessTypeNode(indexed) = &record.data else {
+            return Err(ConcreteIndexedAccessError::InvalidSyntax(current));
+        };
+        if record.kind != SyntaxKind::IndexedAccessType || record.flags.0 & NODE_FLAG_JSDOC != 0 {
+            return Err(ConcreteIndexedAccessError::InvalidSyntax(current));
+        }
+
+        let object = NodeRef::new(current.arena, current.file, indexed.object_type);
+        let index = NodeRef::new(current.arena, current.file, indexed.index_type);
+        let object_record = preflight_node(store, host, object)?;
+        let index_record = preflight_node(store, host, index)?;
+        if object == index
+            || object_record.parent != Some(current.node)
+            || index_record.parent != Some(current.node)
+            || object_record.range.start != record.range.start
+            || object_record.range.end > index_record.range.start
+            || index_record.range.end >= record.range.end
+        {
+            return Err(ConcreteIndexedAccessError::InvalidSyntax(current));
+        }
+
+        let key = classify_index(store, host, index)?;
+        validate_existing_index_links(store, index, &key)?;
+        validate_parent_links(store, current)?;
+        accesses.push(current);
+        indexes.push(index);
+
+        match (&object_record.data, object_record.kind) {
+            (NodeData::IndexedAccessTypeNode(_), SyntaxKind::IndexedAccessType) => {
+                current = object;
+            }
+            (NodeData::TypeReferenceNode(reference), SyntaxKind::TypeReference) => {
+                let name = NodeRef::new(object.arena, object.file, reference.type_name);
+                let name_record = preflight_node(store, host, name)?;
+                let NodeData::Identifier(identifier) = &name_record.data else {
+                    return Ok(None);
+                };
+                if reference.type_arguments.is_some()
+                    || name_record.kind != SyntaxKind::Identifier
+                    || name_record.parent != Some(object.node)
+                    || name_record.flags.0 & NODE_FLAG_JSDOC != 0
+                    || identifier.text.is_empty()
+                    || identifier.flow_node.is_some()
+                {
+                    return Ok(None);
+                }
+                return Ok(Some(RecursiveIndexedAccessPlan {
+                    root_reference: object,
+                    accesses,
+                    indexes,
+                }));
+            }
+            _ => return Ok(None),
+        }
+    }
 }
 
 /// Preflights one complete concrete indexed-access dependency closure.
@@ -1293,11 +1400,11 @@ mod tests {
 
     use super::{
         AccessFlags, get_deferred_indexed_access_type, is_template_pattern_index_key,
-        template_pattern_index_matches_name,
+        plan_recursive_indexed_access, template_pattern_index_matches_name,
     };
     use crate::semantic::{
         CanonicalCheckerContext, CanonicalCheckerOptions, CanonicalTypeMapperStore,
-        DeclaredTypeLinks, IntrinsicBootstrapOptions, TypeData, TypeId,
+        DeclaredTypeHost, DeclaredTypeLinks, IntrinsicBootstrapOptions, TypeData, TypeId,
     };
 
     fn checker_context(parsed: &ParseResult) -> CanonicalCheckerContext<'_> {
@@ -1432,6 +1539,55 @@ mod tests {
             None,
         );
         assert_eq!(store.type_len(), poisoned);
+    }
+
+    #[test]
+    fn recursive_named_index_paths_retain_nested_keys_without_checker_writes() {
+        let parsed = parse_source_file("type Recursive = Recursive[number][0];");
+        let context = checker_context(&parsed);
+        let indexed = parsed
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::TypeAliasDeclaration(alias) = &record.data else {
+                    return None;
+                };
+                Some(NodeRef::new(parsed.arena.id(), FileId::new(0), alias.type_))
+            })
+            .unwrap();
+        let (_, bound) = context.file(FileId::new(0)).unwrap();
+        let host = DeclaredTypeHost::new([(&parsed.arena, bound)]).unwrap();
+        let before = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+
+        let planned = plan_recursive_indexed_access(context.store(), &host, indexed)
+            .unwrap()
+            .unwrap();
+        assert_eq!(planned.accesses().len(), 2);
+        assert_eq!(planned.indexes().len(), 2);
+        assert_eq!(
+            parsed
+                .arena
+                .get(planned.root_reference().node)
+                .unwrap()
+                .kind,
+            SyntaxKind::TypeReference,
+        );
+        assert_eq!(
+            plan_recursive_indexed_access(context.store(), &host, indexed),
+            Ok(Some(planned)),
+        );
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            before,
+        );
     }
 
     #[test]
