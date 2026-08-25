@@ -62,6 +62,29 @@ pub(super) struct PrimitiveBinaryResolution {
     pub(super) diagnostics: Vec<CanonicalCheckerDiagnostic>,
 }
 
+/// Maps supported arithmetic assignment tokens to their underlying binary operator.
+pub(super) const fn compound_assignment_binary_operator(kind: SyntaxKind) -> Option<SyntaxKind> {
+    match kind {
+        SyntaxKind::PlusEqualsToken => Some(SyntaxKind::PlusToken),
+        SyntaxKind::MinusEqualsToken => Some(SyntaxKind::MinusToken),
+        SyntaxKind::AsteriskEqualsToken => Some(SyntaxKind::AsteriskToken),
+        SyntaxKind::SlashEqualsToken => Some(SyntaxKind::SlashToken),
+        SyntaxKind::PercentEqualsToken => Some(SyntaxKind::PercentToken),
+        SyntaxKind::AsteriskAsteriskEqualsToken => Some(SyntaxKind::AsteriskAsteriskToken),
+        SyntaxKind::BarEqualsToken => Some(SyntaxKind::BarToken),
+        SyntaxKind::AmpersandEqualsToken => Some(SyntaxKind::AmpersandToken),
+        SyntaxKind::CaretEqualsToken => Some(SyntaxKind::CaretToken),
+        SyntaxKind::LessThanLessThanEqualsToken => Some(SyntaxKind::LessThanLessThanToken),
+        SyntaxKind::GreaterThanGreaterThanEqualsToken => {
+            Some(SyntaxKind::GreaterThanGreaterThanToken)
+        }
+        SyntaxKind::GreaterThanGreaterThanGreaterThanEqualsToken => {
+            Some(SyntaxKind::GreaterThanGreaterThanGreaterThanToken)
+        }
+        _ => None,
+    }
+}
+
 /// Valid TypeScript behavior outside the atomic scalar kernel.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum PrimitiveBinaryUnsupported {

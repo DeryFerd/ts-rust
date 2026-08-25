@@ -1,7 +1,8 @@
 //! Read-only planning for the first assignment-expression source slice.
 //!
 //! The installed slice is deliberately narrow: a top-level expression statement
-//! containing `identifier = expression`, where the identifier resolves to one
+//! containing a simple or arithmetic compound identifier assignment, where the
+//! identifier resolves to one
 //! unique, same-file, explicitly typed and initialized ordinary `var` declaration.
 //! Source planning may additionally supply exact capabilities for mutable ambient
 //! declarations or admitted annotated uninitialized variables. Those
@@ -26,7 +27,10 @@ use ts_binder::{
     CheckFlags, InternalSymbolName, SemanticSymbolId, SymbolFlags,
 };
 
-use super::{CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost};
+use super::{
+    CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost,
+    primitive_operators::compound_assignment_binary_operator,
+};
 
 const NODE_FLAG_LET: u32 = 1 << 0;
 const NODE_FLAG_CONST: u32 = 1 << 1;
@@ -36,6 +40,7 @@ const NODE_FLAG_CONST: u32 = 1 << 1;
 pub(super) struct SimpleAssignmentPlan {
     pub expression: NodeRef,
     pub left: NodeRef,
+    pub operator: SyntaxKind,
     pub right: NodeRef,
     pub target_symbol: SemanticSymbolId,
     pub target_type_node: Option<NodeRef>,
@@ -2448,7 +2453,9 @@ impl AssignmentPlanner<'_, '_> {
                 AssignmentInvariant::InvalidOperatorToken(operator),
             ));
         }
-        if operator_node.kind != SyntaxKind::EqualsToken {
+        if operator_node.kind != SyntaxKind::EqualsToken
+            && compound_assignment_binary_operator(operator_node.kind).is_none()
+        {
             return Err(Self::unsupported(
                 operator,
                 operator_node.kind,
@@ -2602,6 +2609,7 @@ impl AssignmentPlanner<'_, '_> {
         Ok(SimpleAssignmentPlan {
             expression,
             left,
+            operator: operator_node.kind,
             right,
             target_symbol: target,
             target_type_node,
@@ -3564,6 +3572,7 @@ mod tests {
             Ok(SimpleAssignmentPlan {
                 expression,
                 left,
+                operator: SyntaxKind::EqualsToken,
                 right,
                 target_symbol: fixture
                     .bound
@@ -5311,10 +5320,34 @@ mod tests {
     }
 
     #[test]
-    fn compound_and_chained_assignments_are_unsupported() {
-        let compound = Fixture::new("var target: number = 0; target += 1;");
+    fn compound_assignments_preserve_the_authenticated_operator() {
+        for (source, operator) in [
+            (
+                "var target: number = 0; target += 1;",
+                SyntaxKind::PlusEqualsToken,
+            ),
+            (
+                "var target: number = 0; target -= 1;",
+                SyntaxKind::MinusEqualsToken,
+            ),
+            (
+                "var target: number = 0; target <<= 1;",
+                SyntaxKind::LessThanLessThanEqualsToken,
+            ),
+        ] {
+            let fixture = Fixture::new(source);
+            let before = observable_state(&fixture.store);
+
+            assert_eq!(fixture.plan(0).unwrap().operator, operator);
+            assert_eq!(observable_state(&fixture.store), before);
+        }
+    }
+
+    #[test]
+    fn chained_and_logical_compound_assignments_remain_unsupported() {
+        let logical = Fixture::new("var target: number = 0; target ||= 1;");
         assert!(matches!(
-            compound.plan(0),
+            logical.plan(0),
             Err(AssignmentPlanError::Unsupported(
                 AssignmentUnsupported::Syntax {
                     role: AssignmentSyntaxRole::Operator,

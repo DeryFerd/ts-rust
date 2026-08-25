@@ -25,11 +25,13 @@
 //! authenticated shorthand object-assignment defaults inside bounded function bodies,
 //! strict top-level call expression statements, exhaustive grouped literal
 //! switch returns, inferred-void string switches with exact unreachable ranges,
-//! atomic primitive/literal scalar binary operators, direct top-level and function-local
+//! atomic primitive/literal scalar binary and comma operators, flattened long
+//! top-level literal addition chains, direct top-level and function-local
 //! conditional initializers, required own-property reads (including exact
 //! two-constituent declared unions), direct indexed reads over supported
 //! objects, arrays, and strings, strict direct-identifier `typeof` flow checks,
-//! and direct assignments back to supported mutable declarations or
+//! and direct simple or arithmetic compound assignments to supported mutable
+//! declarations or
 //! binder-authenticated `CommonJS` exports and function or arrow expandos.
 //! The complete source tree and complete supported-statement plan are validated
 //! before semantic execution begins. Execution may retain safe canonical memo
@@ -107,6 +109,7 @@ use super::{
     primitive_operators::{
         PrimitiveBigIntExponentiationTarget, PrimitiveBinaryError, PrimitiveBinaryRecovery,
         PrimitiveBinaryRequest, PrimitiveBinaryUnsupported, check_primitive_binary,
+        compound_assignment_binary_operator,
     },
     signatures::{ElementFlags, SignatureFlags},
     source_arrows::{
@@ -594,11 +597,19 @@ impl PlannedExpression {
     }
 }
 
-/// Fully preflighted scalar-binary source shape with recursive operands.
+/// Fully preflighted scalar-binary source shape with an optional flattened prefix.
 #[derive(Clone, Debug)]
 pub(super) struct PrimitiveBinaryPlan {
     node: NodeRef,
     left: PlannedExpression,
+    operator: SyntaxKind,
+    right: PlannedExpression,
+    prefix: Vec<PrimitiveBinaryChainStep>,
+}
+
+#[derive(Clone, Debug)]
+struct PrimitiveBinaryChainStep {
+    node: NodeRef,
     operator: SyntaxKind,
     right: PlannedExpression,
 }
@@ -1172,6 +1183,7 @@ struct PlannedFallthroughBranch {
 struct PlannedAssignment {
     expression: NodeRef,
     left: NodeRef,
+    operator: SyntaxKind,
     target_symbol: SemanticSymbolId,
     target_type_node: Option<NodeRef>,
     right: PlannedExpression,
@@ -2834,14 +2846,10 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         continue;
                     }
                     if let NodeData::BinaryExpression(binary) = &self.node(expression)?.data
-                        && primitive_binary_operator_text(
+                        && binary_operator_text(
                             self.node(self.reference(binary.operator_token))?.kind,
                         )
                         .is_some()
-                        && self.node(self.reference(binary.left))?.kind
-                            != SyntaxKind::BinaryExpression
-                        && self.node(self.reference(binary.right))?.kind
-                            != SyntaxKind::BinaryExpression
                     {
                         self.primitive_binary_position_roots.insert(expression);
                         let expression = self.plan_expression(expression)?;
@@ -3039,6 +3047,23 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         )
                     }
                     .map_err(Self::assignment_plan_error)?;
+                    if let Some(binary_operator) =
+                        compound_assignment_binary_operator(assignment.operator)
+                    {
+                        let record = self.node(assignment.expression)?;
+                        let NodeData::BinaryExpression(binary) = &record.data else {
+                            return Err(SourceCheckError::PrimitiveOperator(assignment.expression));
+                        };
+                        let operator = self.reference(binary.operator_token);
+                        let spelling = format!(
+                            "{}=",
+                            primitive_binary_operator_text(binary_operator)
+                                .ok_or(SourceCheckError::PrimitiveOperator(operator))?
+                        );
+                        if !self.source_spelling_matches(operator, &spelling) {
+                            return Err(SourceCheckError::PrimitiveOperator(operator));
+                        }
+                    }
                     if !self.prior_variables.contains(&assignment.target_symbol) {
                         return Err(SourceCheckError::Unsupported(
                             UnsupportedSourceSyntax::Assignment(
@@ -3066,6 +3091,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     statements.push(PlannedStatement::Assignment(PlannedAssignment {
                         expression: assignment.expression,
                         left: assignment.left,
+                        operator: assignment.operator,
                         target_symbol: assignment.target_symbol,
                         target_type_node: assignment.target_type_node,
                         right,
@@ -13124,6 +13150,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             PlannedExpressionKind::Parenthesized(inner) => {
                 return self.conditional_scalar_expectation(inner);
             }
+            PlannedExpressionKind::Binary(binary) if binary.operator == SyntaxKind::CommaToken => {
+                return self.conditional_scalar_expectation(&binary.right);
+            }
             PlannedExpressionKind::Identifier(read)
                 if read.kind == PlannedIdentifierReadKind::Unresolved =>
             {
@@ -13497,6 +13526,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 | SyntaxKind::BarBarToken
                 | SyntaxKind::QuestionQuestionToken
         );
+        let comma = operator_kind == SyntaxKind::CommaToken;
         let Some(operator_text) = binary_operator_text(operator_kind) else {
             return Err(self.unsupported(
                 operator,
@@ -13512,12 +13542,33 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             });
         }
 
+        let top_level_chain = self.is_direct_top_level_variable_initializer(expression)?
+            || self
+                .node(expression)?
+                .parent
+                .map(|parent| self.reference(parent))
+                .map(|parent| self.node(parent))
+                .transpose()?
+                .is_some_and(|parent| {
+                    parent.kind == SyntaxKind::ExpressionStatement
+                        && parent.parent == Some(self.source.node_ref().node)
+                });
+        if operator_kind == SyntaxKind::PlusToken
+            && top_level_chain
+            && let Some(chain) = self.plan_literal_plus_chain(expression)?
+        {
+            return Ok(PlannedExpression::new(
+                expression,
+                PlannedExpressionKind::Binary(Box::new(chain)),
+            ));
+        }
+
         let mut left_plan = self.plan_expression(left)?;
-        if !logical && !primitive_binary_operand_plan_is_supported(&left_plan) {
+        if !logical && !comma && !primitive_binary_operand_plan_is_supported(&left_plan) {
             return Err(self.unsupported(left, left_kind, SourceSyntaxRole::BinaryOperand));
         }
         let mut right_plan = self.plan_expression(right)?;
-        if !logical && !primitive_binary_operand_plan_is_supported(&right_plan) {
+        if !logical && !comma && !primitive_binary_operand_plan_is_supported(&right_plan) {
             return Err(self.unsupported(right, right_kind, SourceSyntaxRole::BinaryOperand));
         }
         let parent = DirectBinaryParent {
@@ -13544,9 +13595,113 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 left: left_plan,
                 operator: operator_kind,
                 right: right_plan,
+                prefix: Vec::new(),
             }))
         };
         Ok(PlannedExpression::new(expression, kind))
+    }
+
+    fn plan_literal_plus_chain(
+        &mut self,
+        expression: NodeRef,
+    ) -> Result<Option<PrimitiveBinaryPlan>, SourceCheckError> {
+        let mut current = expression;
+        let mut steps = Vec::new();
+        let mut family = None;
+
+        loop {
+            let record = self.node(current)?;
+            let NodeData::BinaryExpression(binary) = &record.data else {
+                return Ok(None);
+            };
+            let left = self.reference(binary.left);
+            let operator = self.reference(binary.operator_token);
+            let right = self.reference(binary.right);
+            let left_record = self.node(left)?;
+            let operator_record = self.node(operator)?;
+            let right_record = self.node(right)?;
+            if record.kind != SyntaxKind::BinaryExpression
+                || record.flags.0 != 0
+                || binary.symbol.is_some()
+                || binary.type_.is_some()
+                || binary.facts != 0
+                || binary.modifiers.is_some()
+                || left_record.parent != Some(current.node)
+                || operator_record.parent != Some(current.node)
+                || right_record.parent != Some(current.node)
+                || left_record.range.end > operator_record.range.start
+                || operator_record.range.end > right_record.range.start
+                || operator_record.kind != SyntaxKind::PlusToken
+                || operator_record.flags.0 != 0
+                || !matches!(operator_record.data, NodeData::Token(_))
+                || !self.source_spelling_matches(operator, "+")
+            {
+                return Ok(None);
+            }
+            let right_family = match right_record.kind {
+                SyntaxKind::StringLiteral | SyntaxKind::NoSubstitutionTemplateLiteral => {
+                    ConditionalScalarFamily::String
+                }
+                SyntaxKind::NumericLiteral => ConditionalScalarFamily::Number,
+                _ => return Ok(None),
+            };
+            if family.is_some_and(|expected| expected != right_family) {
+                return Ok(None);
+            }
+            family = Some(right_family);
+            steps.push((current, right));
+
+            if left_record.kind != SyntaxKind::BinaryExpression {
+                let left_family = match left_record.kind {
+                    SyntaxKind::StringLiteral | SyntaxKind::NoSubstitutionTemplateLiteral => {
+                        ConditionalScalarFamily::String
+                    }
+                    SyntaxKind::NumericLiteral => ConditionalScalarFamily::Number,
+                    _ => return Ok(None),
+                };
+                if left_family != right_family || steps.len() < 32 {
+                    return Ok(None);
+                }
+
+                let left = self.plan_expression(left)?;
+                let mut steps = steps.into_iter().rev().peekable();
+                let mut prefix = Vec::with_capacity(steps.len().saturating_sub(1));
+                while let Some((node, right)) = steps.next() {
+                    if let Some((store, _)) = self.semantic
+                        && let Some(links) = store.type_node_links(node)
+                    {
+                        let expected = TypeNodeLinks {
+                            resolved_type: links.resolved_type,
+                            ..TypeNodeLinks::default()
+                        };
+                        if links != &expected
+                            || links
+                                .resolved_type
+                                .is_some_and(|type_| store.type_payload(type_).is_none())
+                        {
+                            return Err(SourceCheckError::PrimitiveOperator(node));
+                        }
+                    }
+                    let right = self.plan_expression(right)?;
+                    if steps.peek().is_none() {
+                        return Ok(Some(PrimitiveBinaryPlan {
+                            node,
+                            left,
+                            operator: SyntaxKind::PlusToken,
+                            right,
+                            prefix,
+                        }));
+                    }
+                    prefix.push(PrimitiveBinaryChainStep {
+                        node,
+                        operator: SyntaxKind::PlusToken,
+                        right,
+                    });
+                }
+                return Ok(None);
+            }
+            current = left;
+        }
     }
 
     fn primitive_binary_position_is_supported(
@@ -13571,6 +13726,12 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 }
                 NodeData::BinaryExpression(binary)
                     if binary.left == current.node || binary.right == current.node =>
+                {
+                    current = parent;
+                }
+                NodeData::ConditionalExpression(conditional)
+                    if conditional.when_true == current.node
+                        || conditional.when_false == current.node =>
                 {
                     current = parent;
                 }
@@ -14785,6 +14946,9 @@ fn conditional_scalar_operand_plan_is_supported(expression: &PlannedExpression) 
         PlannedExpressionKind::Parenthesized(inner) => {
             conditional_scalar_operand_plan_is_supported(inner)
         }
+        PlannedExpressionKind::Binary(binary) if binary.operator == SyntaxKind::CommaToken => {
+            conditional_scalar_operand_plan_is_supported(&binary.right)
+        }
         PlannedExpressionKind::TypeImportValueUse(_)
         | PlannedExpressionKind::Assertion { .. }
         | PlannedExpressionKind::Array(_)
@@ -14808,6 +14972,49 @@ fn planned_expression_reads_symbol(
             planned_expression_reads_symbol(inner, symbol)
         }
         _ => false,
+    }
+}
+
+fn comma_left_is_side_effect_free(expression: &PlannedExpression) -> bool {
+    let expression = expression.unparenthesized();
+    if expression.non_null_assertion {
+        return true;
+    }
+    match &expression.kind {
+        PlannedExpressionKind::Null
+        | PlannedExpressionKind::String(_)
+        | PlannedExpressionKind::Number { .. }
+        | PlannedExpressionKind::BigInt { .. }
+        | PlannedExpressionKind::Boolean(_)
+        | PlannedExpressionKind::GlobalUndefined
+        | PlannedExpressionKind::Identifier(_)
+        | PlannedExpressionKind::Array(_)
+        | PlannedExpressionKind::Object { .. }
+        | PlannedExpressionKind::Arrow(_) => true,
+        PlannedExpressionKind::Binary(binary) => {
+            !binary.operator.is_assignment_operator()
+                && comma_left_is_side_effect_free(&binary.left)
+                && binary
+                    .prefix
+                    .iter()
+                    .all(|step| comma_left_is_side_effect_free(&step.right))
+                && comma_left_is_side_effect_free(&binary.right)
+        }
+        PlannedExpressionKind::Logical(logical) => {
+            comma_left_is_side_effect_free(&logical.left)
+                && comma_left_is_side_effect_free(&logical.right)
+        }
+        PlannedExpressionKind::Conditional(conditional) => {
+            comma_left_is_side_effect_free(&conditional.when_true)
+                && comma_left_is_side_effect_free(&conditional.when_false)
+        }
+        PlannedExpressionKind::TypeImportValueUse(_)
+        | PlannedExpressionKind::Parenthesized(_)
+        | PlannedExpressionKind::Assertion { .. }
+        | PlannedExpressionKind::Property(_)
+        | PlannedExpressionKind::Element(_)
+        | PlannedExpressionKind::Call(_)
+        | PlannedExpressionKind::New(_) => false,
     }
 }
 
@@ -14925,6 +15132,19 @@ fn preflight_uncached_conditional_operand_links(
     store: &CanonicalTypeMapperStore,
     expression: &PlannedExpression,
 ) -> Result<(), SourceCheckError> {
+    if matches!(
+        &expression.unparenthesized().kind,
+        PlannedExpressionKind::Binary(binary) if binary.operator == SyntaxKind::CommaToken
+    ) {
+        if let Some(links) = store.type_node_links(expression.node) {
+            let expected = links
+                .resolved_type
+                .ok_or(SourceCheckError::PrimitiveOperator(expression.node))?;
+            preflight_source_expression_cache(store, expression.node, expected)?;
+        }
+        return Ok(());
+    }
+
     match &expression.kind {
         PlannedExpressionKind::Identifier(read)
             if read.kind == PlannedIdentifierReadKind::Unresolved =>
@@ -15366,6 +15586,9 @@ pub(super) const fn logical_binary_operator_text(kind: SyntaxKind) -> Option<&'s
 }
 
 const fn binary_operator_text(kind: SyntaxKind) -> Option<&'static str> {
+    if matches!(kind, SyntaxKind::CommaToken) {
+        return Some(",");
+    }
     match logical_binary_operator_text(kind) {
         Some(text) => Some(text),
         None => primitive_binary_operator_text(kind),
@@ -17072,6 +17295,11 @@ fn check_expression_type(
                 && matches!(
                     conditional.when_true.unparenthesized().kind,
                     PlannedExpressionKind::Conditional(_)
+                )
+                || matches!(
+                    &conditional.when_true.unparenthesized().kind,
+                    PlannedExpressionKind::Binary(binary)
+                        if binary.operator == SyntaxKind::CommaToken
                 ) {
                 check_expression_type(
                     store,
@@ -17111,6 +17339,11 @@ fn check_expression_type(
                 && matches!(
                     conditional.when_false.unparenthesized().kind,
                     PlannedExpressionKind::Conditional(_)
+                )
+                || matches!(
+                    &conditional.when_false.unparenthesized().kind,
+                    PlannedExpressionKind::Binary(binary)
+                        if binary.operator == SyntaxKind::CommaToken
                 ) {
                 check_expression_type(
                     store,
@@ -17331,7 +17564,7 @@ fn check_expression_type(
             ))
         }
         PlannedExpressionKind::Binary(binary) => {
-            let left = check_expression_type(
+            let mut left = check_expression_type(
                 store,
                 host,
                 global_types,
@@ -17345,61 +17578,87 @@ fn check_expression_type(
                 None,
                 deferred,
             )?;
-            let right = check_expression_type(
-                store,
-                host,
-                global_types,
-                source,
-                options,
-                session,
-                diagnostics,
-                current_flow_types,
-                preflighted_type_import_value_uses,
-                &binary.right,
-                None,
-                deferred,
-            )?;
-            let left_recovery = left.primitive_binary_recovery.or_else(|| {
-                shorthand_default_arrow_any_operand_recovery(
-                    store,
-                    host,
-                    binary,
-                    &binary.left,
-                    left.result,
-                )
-            });
-            let right_recovery = right.primitive_binary_recovery.or_else(|| {
-                shorthand_default_arrow_any_operand_recovery(
-                    store,
-                    host,
-                    binary,
+            let mut left_node = binary.left.node;
+            let steps = binary
+                .prefix
+                .iter()
+                .map(|step| (step.node, step.operator, &step.right))
+                .chain(std::iter::once((
+                    binary.node,
+                    binary.operator,
                     &binary.right,
-                    right.result,
-                )
-            });
-            let resolution = check_primitive_binary(
-                store,
-                PrimitiveBinaryRequest {
-                    expression: binary.node,
-                    left: binary.left.node,
-                    operator: binary.operator,
-                    right: binary.right.node,
-                    left_type: left.result,
-                    right_type: right.result,
-                    left_recovery,
-                    right_recovery,
-                    bigint_exponentiation_target: PrimitiveBigIntExponentiationTarget::Unknown,
-                },
-            )
-            .map_err(|error| primitive_binary_check_error(host, binary.node, &error))?;
-            for diagnostic in resolution.diagnostics {
-                merge_retry_diagnostic(diagnostics, diagnostic);
+                )));
+            for (node, operator, right_expression) in steps {
+                let comma = operator == SyntaxKind::CommaToken;
+                let right = check_expression_type(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    current_flow_types,
+                    preflighted_type_import_value_uses,
+                    right_expression,
+                    if comma { contextual_type } else { None },
+                    deferred,
+                )?;
+                if comma {
+                    if options.allow_unreachable_code == Some(false)
+                        && comma_left_is_side_effect_free(&binary.left)
+                    {
+                        issue_node_diagnostic(diagnostics, left_node, 2695)?;
+                    }
+                    publish_expression_type(store, node, right.raw)?;
+                    left = CheckedExpressionTypes::leaf(right.raw, right.result);
+                } else {
+                    let left_recovery = left.primitive_binary_recovery.or_else(|| {
+                        shorthand_default_arrow_any_operand_recovery(
+                            store,
+                            host,
+                            binary,
+                            &binary.left,
+                            left.result,
+                        )
+                    });
+                    let right_recovery = right.primitive_binary_recovery.or_else(|| {
+                        shorthand_default_arrow_any_operand_recovery(
+                            store,
+                            host,
+                            binary,
+                            right_expression,
+                            right.result,
+                        )
+                    });
+                    let resolution = check_primitive_binary(
+                        store,
+                        PrimitiveBinaryRequest {
+                            expression: node,
+                            left: left_node,
+                            operator,
+                            right: right_expression.node,
+                            left_type: left.result,
+                            right_type: right.result,
+                            left_recovery,
+                            right_recovery,
+                            bigint_exponentiation_target:
+                                PrimitiveBigIntExponentiationTarget::Unknown,
+                        },
+                    )
+                    .map_err(|error| primitive_binary_check_error(host, node, &error))?;
+                    for diagnostic in resolution.diagnostics {
+                        merge_retry_diagnostic(diagnostics, diagnostic);
+                    }
+                    publish_expression_type(store, node, resolution.result_type)?;
+                    left = CheckedExpressionTypes::primitive_binary(
+                        resolution.result_type,
+                        resolution.recovery,
+                    );
+                }
+                left_node = node;
             }
-            publish_expression_type(store, binary.node, resolution.result_type)?;
-            Ok(CheckedExpressionTypes::primitive_binary(
-                resolution.result_type,
-                resolution.recovery,
-            ))
+            Ok(left)
         }
         PlannedExpressionKind::Arrow(arrow) => check_planned_arrow_argument(
             store,
@@ -19341,6 +19600,111 @@ fn check_assignment_to_type(
     Ok(CheckedAssignment {
         declared_type: target,
         assigned_type: source_type,
+    })
+}
+
+#[allow(clippy::too_many_arguments)] // Compound writes share the source assignment context.
+fn check_compound_assignment(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source: SourceFileRef,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    flow_types: &HashMap<SemanticSymbolId, TypeId>,
+    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    deferred: &mut Vec<DeferredAssertion>,
+    assignment: &PlannedAssignment,
+    declared_type: TypeId,
+) -> Result<CheckedAssignment, SourceCheckError> {
+    let operator = compound_assignment_binary_operator(assignment.operator)
+        .ok_or(SourceCheckError::PrimitiveOperator(assignment.expression))?;
+    let left_type =
+        flow_types
+            .get(&assignment.target_symbol)
+            .copied()
+            .ok_or(SourceCheckError::Variable(
+                VariableInvariant::MissingCurrentFlowType(assignment.target_symbol),
+            ))?;
+    publish_expression_type(store, assignment.left, left_type)?;
+    let right = check_expression_type(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        session,
+        diagnostics,
+        flow_types,
+        preflighted_type_import_value_uses,
+        &assignment.right,
+        None,
+        deferred,
+    )?;
+    let resolution = check_primitive_binary(
+        store,
+        PrimitiveBinaryRequest {
+            expression: assignment.expression,
+            left: assignment.left,
+            operator,
+            right: assignment.right.node,
+            left_type,
+            right_type: right.result,
+            left_recovery: None,
+            right_recovery: right.primitive_binary_recovery,
+            bigint_exponentiation_target: PrimitiveBigIntExponentiationTarget::Unknown,
+        },
+    )
+    .map_err(|error| primitive_binary_check_error(host, assignment.expression, &error))?;
+    for mut diagnostic in resolution.diagnostics {
+        if diagnostic.diagnostic.code() == 2365
+            && let Some(text) = primitive_binary_operator_text(operator)
+            && let Some(argument) = diagnostic.diagnostic.arguments.first_mut()
+        {
+            *argument = format!("{text}=");
+        }
+        merge_retry_diagnostic(diagnostics, diagnostic);
+    }
+    publish_expression_type(store, assignment.expression, resolution.result_type)?;
+    if !source_type_is_assignable_to(
+        store,
+        host,
+        global_types,
+        options,
+        session,
+        diagnostics,
+        resolution.result_type,
+        declared_type,
+    )? {
+        let mut flags = CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT;
+        if options.no_error_truncation {
+            flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
+        }
+        let display = get_type_names_for_assignability_error_with_host_global_types_and_flags(
+            store,
+            host,
+            global_types,
+            resolution.result_type,
+            declared_type,
+            flags,
+        )?;
+        merge_retry_diagnostic(
+            diagnostics,
+            CanonicalCheckerDiagnostic {
+                node: Some(assignment.left),
+                range_override: None,
+                diagnostic: Diagnostic::with_arguments(
+                    message_by_code(2322).ok_or(SourceCheckError::MissingDiagnostic(2322))?,
+                    [display.source, display.target],
+                ),
+                related_information: Vec::new(),
+            },
+        );
+    }
+    Ok(CheckedAssignment {
+        declared_type,
+        assigned_type: resolution.result_type,
     })
 }
 
@@ -27824,8 +28188,45 @@ pub(super) fn check_source_file(
                         VariableInvariant::MissingCurrentFlowType(assignment.target_symbol),
                     ));
                 }
-                let checked = match assignment.target_type_node {
-                    Some(type_node) => check_planned_assignment(
+                let checked = if assignment.operator == SyntaxKind::EqualsToken {
+                    match assignment.target_type_node {
+                        Some(type_node) => check_planned_assignment(
+                            store,
+                            host,
+                            global_types,
+                            source,
+                            options,
+                            session,
+                            diagnostics,
+                            &current_flow_types,
+                            &preflighted_type_import_value_uses,
+                            &mut deferred,
+                            type_node,
+                            &[],
+                            &assignment.right,
+                            assignment.left,
+                            Some(assignment.expression),
+                        ),
+                        None => check_assignment_to_type(
+                            store,
+                            host,
+                            global_types,
+                            source,
+                            options,
+                            session,
+                            diagnostics,
+                            &current_flow_types,
+                            &preflighted_type_import_value_uses,
+                            &mut deferred,
+                            staged_declared_type,
+                            None,
+                            &assignment.right,
+                            assignment.left,
+                            Some(assignment.expression),
+                        ),
+                    }?
+                } else {
+                    check_compound_assignment(
                         store,
                         host,
                         global_types,
@@ -27836,30 +28237,10 @@ pub(super) fn check_source_file(
                         &current_flow_types,
                         &preflighted_type_import_value_uses,
                         &mut deferred,
-                        type_node,
-                        &[],
-                        &assignment.right,
-                        assignment.left,
-                        Some(assignment.expression),
-                    ),
-                    None => check_assignment_to_type(
-                        store,
-                        host,
-                        global_types,
-                        source,
-                        options,
-                        session,
-                        diagnostics,
-                        &current_flow_types,
-                        &preflighted_type_import_value_uses,
-                        &mut deferred,
+                        &assignment,
                         staged_declared_type,
-                        None,
-                        &assignment.right,
-                        assignment.left,
-                        Some(assignment.expression),
-                    ),
-                }?;
+                    )?
+                };
                 if checked.declared_type != staged_declared_type {
                     return Err(SourceCheckError::Variable(
                         VariableInvariant::AssignmentDeclaredTypeMismatch {
@@ -36651,6 +37032,159 @@ mod tests {
             variable_value_type(&context, &source, file, "result"),
             context.store().intrinsic_bootstrap().unwrap().string_type,
         );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn compound_assignments_preserve_operator_results_flow_and_warm_caches() {
+        let source = parsed(concat!(
+            "var count: number = 1; ",
+            "count += 2; ",
+            "count *= 3; ",
+            "var text: string = 'ready'; ",
+            "text += 4;",
+        ));
+        let file = FileId::new(8_815);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        assert_eq!(
+            variable_value_type(&context, &source, file, "count"),
+            bootstrap.number_type,
+        );
+        assert_eq!(
+            variable_value_type(&context, &source, file, "text"),
+            bootstrap.string_type,
+        );
+        for (index, expected) in [
+            bootstrap.number_type,
+            bootstrap.number_type,
+            bootstrap.string_type,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (left, _) = assignment_parts(&source, file, index);
+            let expression = NodeRef::new(
+                source.arena.id(),
+                file,
+                source.arena.get(left.node).unwrap().parent.unwrap(),
+            );
+            assert_eq!(resolved_node_type(&context, left), expected);
+            assert_eq!(resolved_node_type(&context, expression), expected);
+        }
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn compound_assignment_operator_diagnostics_retain_assignment_spelling() {
+        let source = parsed("var count: number = 0; count += true;");
+        let file = FileId::new(8_816);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected one compound operator diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2365);
+        assert_eq!(diagnostic.diagnostic.arguments, ["+=", "number", "boolean"]);
+        assert_eq!(
+            variable_value_type(&context, &source, file, "count"),
+            context.store().intrinsic_bootstrap().unwrap().number_type,
+        );
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn comma_expressions_preserve_conditionals_and_non_null_assertions() {
+        let source = parsed(concat!(
+            "function effect(): number { return 1; } ",
+            "const observed = (effect(), 2); ",
+            "const selected = true ? (effect(), 3) : 4; ",
+            "const warned = (1, 'done'); ",
+            "const discarded = (2!, 5);",
+        ));
+        let file = FileId::new(8_817);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                allow_unreachable_code: Some(false),
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        for (name, expected) in [
+            ("observed", "2"),
+            ("selected", "3 | 4"),
+            ("warned", "\"done\""),
+            ("discarded", "5"),
+        ] {
+            assert_eq!(
+                context
+                    .type_to_string(variable_value_type(&context, &source, file, name))
+                    .unwrap(),
+                expected,
+                "variable {name}",
+            );
+        }
+        let [plain, non_null] = context.diagnostics().as_slice() else {
+            panic!("expected one warning for each unused side-effect-free operand")
+        };
+        assert_eq!(plain.diagnostic.code(), 2695);
+        assert_eq!(node_text(&source, plain.node.unwrap()), "1");
+        assert_eq!(non_null.diagnostic.code(), 2695);
+        assert_eq!(node_text(&source, non_null.node.unwrap()), "2!");
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn upstream_shaped_binary_stress_chains_preserve_every_cached_node() {
+        let numeric = (0..1_500)
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let strings = (0..4_960).map(|_| "''").collect::<Vec<_>>().join(" +\n");
+        let source = parsed(&format!("{numeric};\nvar caps =\n{strings};"));
+        let file = FileId::new(8_818);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        assert_eq!(
+            variable_value_type(&context, &source, file, "caps"),
+            context.store().intrinsic_bootstrap().unwrap().string_type,
+        );
+        for (node, record) in source.arena.iter() {
+            if record.kind == SyntaxKind::BinaryExpression {
+                assert!(
+                    context
+                        .store()
+                        .type_node_links(NodeRef::new(source.arena.id(), file, node))
+                        .and_then(|links| links.resolved_type)
+                        .is_some(),
+                    "every intermediate binary node must retain its checked type",
+                );
+            }
+        }
         assert!(context.diagnostics().is_empty());
 
         let warm = observable_state(&context, file);
