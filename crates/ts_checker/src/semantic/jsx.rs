@@ -63,7 +63,7 @@ enum JsxElementPlanKind {
         attributes_node: NodeRef,
         attributes: JsxAttributesPlan,
         type_arguments: Vec<NodeRef>,
-        closing: Option<JsxClosingPlan>,
+        closing: Option<Box<JsxClosingPlan>>,
     },
     Fragment,
 }
@@ -619,10 +619,10 @@ fn plan_jsx_element(
             )? {
                 None
             } else {
-                Some(JsxClosingPlan {
+                Some(Box::new(JsxClosingPlan {
                     node: closing_node,
                     tag: plan_jsx_tag(arena, bound, store, closing_node, closing_data.tag_name)?,
-                })
+                }))
             };
             Ok(JsxElementPlan {
                 expression,
@@ -888,9 +888,7 @@ fn plan_jsx_tag(
                 || value.name().as_utf8() != Some(member_name.text.as_str())
                 || store.get_parent_of_symbol(member) != Some(namespace)
                 || value.value_declaration().is_none()
-                || value
-                    .declarations()
-                    .is_none_or(|declarations| declarations.is_empty())
+                || value.declarations().is_none_or(<[NodeRef]>::is_empty)
             {
                 return Err(SourceCheckError::Property(member_node));
             }
@@ -3612,7 +3610,7 @@ fn jsx_child_is_assignable(
 
     let Some(owner) = store
         .type_payload(source)
-        .and_then(|record| record.symbol())
+        .and_then(super::type_records::TypeRecord::symbol)
     else {
         return Err(error.into());
     };
@@ -3696,7 +3694,7 @@ fn jsx_child_assignability_display(
     if display.target == "React.ReactNode"
         && contextual_react_node_alias(store, host, target).is_some()
     {
-        display.target = "ReactNode".to_owned();
+        "ReactNode".clone_into(&mut display.target);
     }
     Ok(display)
 }
