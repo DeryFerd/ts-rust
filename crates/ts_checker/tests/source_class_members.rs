@@ -1193,7 +1193,7 @@ fn unannotated_non_private_and_non_ambient_fields_remain_unsupported() {
 #[test]
 fn unsupported_ambient_class_shapes_leave_class_publication_cold() {
     let cases = [
-        ("declare class Generic<T> {}", "Generic"),
+        ("declare class Generic<T extends string> {}", "Generic"),
         (
             "declare class Private { private value: number; }",
             "Private",
