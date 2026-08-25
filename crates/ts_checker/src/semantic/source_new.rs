@@ -372,7 +372,7 @@ impl SourceDefaultNewPlan {
         self.argument.iter().chain(&self.additional_arguments)
     }
 
-    /// Returns the exact access diagnostic for an authenticated class constructor.
+    /// Returns the exact access or abstract-instantiation diagnostic for a class.
     pub(super) fn constructor_accessibility_diagnostic(
         &self,
         arena: &NodeArena,
@@ -389,10 +389,11 @@ impl SourceDefaultNewPlan {
             }
             _ => return Ok(None),
         };
-        let code = match class.constructor_visibility() {
-            ClassConstructorVisibility::Private => Some(2673),
-            ClassConstructorVisibility::Protected => Some(2674),
-            ClassConstructorVisibility::Public => {
+        let code = match (class.is_abstract(), class.constructor_visibility()) {
+            (true, _) => Some(2511),
+            (false, ClassConstructorVisibility::Private) => Some(2673),
+            (false, ClassConstructorVisibility::Protected) => Some(2674),
+            (false, ClassConstructorVisibility::Public) => {
                 if !bound
                     .source_facts()
                     .is_some_and(ts_binder::CanonicalSourceFileFacts::is_javascript_file)
@@ -5118,10 +5119,13 @@ fn validate_selected_default_signature(
     let signature_record = store
         .signature(signature)
         .ok_or_else(|| invariant(SourceNewInvariant::InvalidConstructSignature(signature)))?;
-    if signature_record.flags() != SignatureFlags::CONSTRUCT
-        || signature_record
-            .flags()
-            .intersects(SignatureFlags::ABSTRACT)
+    let expected_flags = SignatureFlags::CONSTRUCT
+        | if class.is_abstract() {
+            SignatureFlags::ABSTRACT
+        } else {
+            SignatureFlags::NONE
+        };
+    if signature_record.flags() != expected_flags
         || signature_record.declaration() != class.constructor_declaration()
         || signature_record.type_parameters() != type_parameters
         || signature_record.parameters() != class.constructor_parameter_symbol().as_slice()

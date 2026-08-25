@@ -2997,7 +2997,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         )));
                         continue;
                     }
-                    if class.modifiers.as_ref().is_some_and(|modifiers| {
+                    let abstract_class = class.modifiers.as_ref().is_some_and(|modifiers| {
                         matches!(
                             modifiers.list.nodes.as_slice(),
                             [modifier]
@@ -3006,7 +3006,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                                     .get(*modifier)
                                     .is_some_and(|node| node.kind == SyntaxKind::AbstractKeyword)
                         )
-                    }) {
+                    });
+                    if abstract_class {
                         let Some((store, host)) = self.semantic else {
                             return Err(SourceCheckError::Unsupported(
                                 UnsupportedSourceSyntax::Class(statement),
@@ -3029,17 +3030,18 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             statements.push(PlannedStatement::ClassGrammar(grammar));
                             continue;
                         }
-                        return Err(SourceCheckError::Unsupported(
-                            UnsupportedSourceSyntax::Class(statement),
-                        ));
                     }
-                    let export_modifier = self.validate_class_declaration_modifiers(
-                        statement,
-                        node.range,
-                        name,
-                        class.modifiers.as_ref(),
-                        is_external_module,
-                    )?;
+                    let export_modifier = if abstract_class {
+                        None
+                    } else {
+                        self.validate_class_declaration_modifiers(
+                            statement,
+                            node.range,
+                            name,
+                            class.modifiers.as_ref(),
+                            is_external_module,
+                        )?
+                    };
                     let Some((store, host)) = self.semantic else {
                         return Err(SourceCheckError::Unsupported(
                             UnsupportedSourceSyntax::Class(statement),
@@ -25392,16 +25394,18 @@ fn check_expression_type(
                 .constructor_accessibility_diagnostic(arena, bound, store, host)
                 .map_err(|error| SourcePlanner::new_plan_error(construction.node(), error))?
             {
+                let message =
+                    message_by_code(code).ok_or(SourceCheckError::MissingDiagnostic(code))?;
                 merge_retry_diagnostic(
                     diagnostics,
                     CanonicalCheckerDiagnostic {
                         node: Some(construction.node()),
                         range_override: None,
-                        diagnostic: Diagnostic::with_arguments(
-                            message_by_code(code)
-                                .ok_or(SourceCheckError::MissingDiagnostic(code))?,
-                            [name],
-                        ),
+                        diagnostic: if code == 2511 {
+                            Diagnostic::new(message)
+                        } else {
+                            Diagnostic::with_arguments(message, [name])
+                        },
                         related_information: Vec::new(),
                     },
                 );
@@ -43694,8 +43698,10 @@ pub(super) fn check_source_file(
                         let node = host.node(*property).ok_or(SourceCheckError::Provenance(
                             SourceCheckProvenanceError::MissingNode(*property),
                         ))?;
-                        let NodeData::Identifier(identifier) = &node.data else {
-                            return Err(SourceCheckError::Class(declaration));
+                        let name = match &node.data {
+                            NodeData::Identifier(identifier) => identifier.text.as_str(),
+                            NodeData::PrivateIdentifier(identifier) => identifier.text.as_str(),
+                            _ => return Err(SourceCheckError::Class(declaration)),
                         };
                         merge_retry_diagnostic(
                             diagnostics,
@@ -43705,7 +43711,7 @@ pub(super) fn check_source_file(
                                 diagnostic: Diagnostic::with_arguments(
                                     message_by_code(2564)
                                         .ok_or(SourceCheckError::MissingDiagnostic(2564))?,
-                                    [identifier.text.clone()],
+                                    [name],
                                 ),
                                 related_information: Vec::new(),
                             },
@@ -52717,6 +52723,77 @@ mod tests {
                 .is_some_and(|field| field.name().is_private_identifier())
         );
         assert!(context.diagnostics().is_empty());
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn abstract_classes_report_exact_private_initialization_and_construction_diagnostics() {
+        let source = parsed(concat!(
+            "abstract class Model { ",
+            "abstract value: string; ",
+            "abstract label(): string; ",
+            "#missing: number; ",
+            "#text = 'ready'; ",
+            "} ",
+            "new Model();",
+        ));
+        let file = FileId::new(8_397);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                strict_property_initialization: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let [uninitialized, construction] = context.diagnostics().as_slice() else {
+            panic!("expected the private initialization and abstract construction diagnostics")
+        };
+        assert_eq!(uninitialized.diagnostic.code(), 2564);
+        assert_eq!(uninitialized.diagnostic.arguments, ["#missing"]);
+        assert_eq!(node_text(&source, uninitialized.node.unwrap()), "#missing");
+        assert_eq!(
+            uninitialized.diagnostic.render().unwrap(),
+            "Property '#missing' has no initializer and is not definitely assigned in the constructor.",
+        );
+        assert_eq!(construction.diagnostic.code(), 2511);
+        assert!(construction.diagnostic.arguments.is_empty());
+        assert_eq!(
+            node_text(&source, construction.node.unwrap()),
+            "new Model()"
+        );
+        assert_eq!(
+            construction.diagnostic.render().unwrap(),
+            "Cannot create an instance of an abstract class.",
+        );
+
+        let owner = global_symbol(&context, "Model");
+        let value = context
+            .store()
+            .value_symbol_links(owner)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let signature = context
+            .store()
+            .type_payload(value)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.signatures.as_deref())
+            .and_then(|signatures| signatures.first())
+            .copied()
+            .unwrap();
+        assert_eq!(
+            context.store().signature(signature).unwrap().flags(),
+            SignatureFlags::CONSTRUCT | SignatureFlags::ABSTRACT,
+        );
+
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);

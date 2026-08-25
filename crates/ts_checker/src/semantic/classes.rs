@@ -19,7 +19,8 @@
 //! plus unannotated private instance fields with the implicit `any` type.
 //! Invalid method overload chains preserve their merged binder symbols and
 //! report exact implementation-name, missing-body, and duplicate-body errors.
-//! Abstract methods retain exact invalid-class and implemented-method errors.
+//! Abstract classes retain annotated abstract members and abstract constructors;
+//! invalid abstract methods retain their exact modifier and implementation errors.
 //! Invalid class-field variance modifiers retain their exact TS1274 spans.
 //! Direct classes can also retain one string-to-number index signature.
 //! Annotated fields admit one authenticated ambient-function decorator.
@@ -42,9 +43,10 @@
 //! any authenticated string-literal directive prologue.
 //! Numeric and string instance and static fields retain direct literal
 //! initializers, including inferred readonly literal types.
-//! Private fields, empty methods, and paired accessors retain their class brand.
-//! Private fields also admit `null as any`; methods can return private members
-//! or evaluate one authenticated private tagged-template console call.
+//! Private numeric, string, and declaration-only fields, empty methods, and
+//! paired accessors retain their class brand. Private fields also admit
+//! `null as any`; methods can return private members or evaluate one
+//! authenticated private tagged-template console call.
 //! One authenticated class/interface merge can retain a string auto-accessor
 //! and its shared binder-owned property symbol in either declaration order.
 //! An instance field may also reference its own constructor parameter and
@@ -367,6 +369,7 @@ pub(super) struct ClassPropertyPlan {
     side: ClassPropertySide,
     optional: bool,
     definite: bool,
+    abstract_property: bool,
     readonly: bool,
     ambient_private_modifier: Option<NodeRef>,
     parameter_property: bool,
@@ -420,6 +423,7 @@ pub(super) struct ClassDeclarationPlan {
     declaration: NodeRef,
     symbol: SemanticSymbolId,
     ambient: bool,
+    abstract_class: bool,
     export_local: Option<SemanticSymbolId>,
     base: Option<DirectClassBasePlan>,
     null_base: Option<NullClassBasePlan>,
@@ -1133,6 +1137,34 @@ fn class_property_modifiers(
             (ClassPropertySide::Instance, false)
         }
         [SyntaxKind::PublicKeyword] => (ClassPropertySide::Instance, false),
+        [SyntaxKind::AbstractKeyword] => {
+            let declaration_record = preflight_node(store, host, declaration)?;
+            let owner = declaration_record
+                .parent
+                .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+                .ok_or_else(|| unsupported(ClassUnsupported::PropertyModifiers(declaration)))?;
+            let owner_record = preflight_node(store, host, owner)?;
+            let NodeData::ClassDeclaration(class) = &owner_record.data else {
+                return Err(unsupported(ClassUnsupported::PropertyModifiers(
+                    declaration,
+                )));
+            };
+            let abstract_class = class.modifiers.as_ref().is_some_and(|modifiers| {
+                matches!(
+                    modifiers.list.nodes.as_slice(),
+                    [modifier]
+                        if host
+                            .node(NodeRef::new(owner.arena, owner.file, *modifier))
+                            .is_some_and(|modifier| modifier.kind == SyntaxKind::AbstractKeyword)
+                )
+            });
+            if !abstract_class {
+                return Err(unsupported(ClassUnsupported::PropertyModifiers(
+                    declaration,
+                )));
+            }
+            (ClassPropertySide::Instance, false)
+        }
         [SyntaxKind::AccessorKeyword]
             if auto_accessor.is_some_and(|accessor| accessor.class_property == declaration) =>
         {
@@ -2178,6 +2210,7 @@ fn plan_javascript_constructor_boolean_property(
         side: ClassPropertySide::Instance,
         optional: false,
         definite: false,
+        abstract_property: false,
         readonly: false,
         ambient_private_modifier: None,
         parameter_property: false,
@@ -3985,6 +4018,16 @@ fn plan_method(
     let NodeData::MethodDeclaration(method) = &record.data else {
         return Err(invariant(ClassInvariant::InvalidProperty(declaration)));
     };
+    let abstract_method = method.modifiers.as_ref().is_some_and(|modifiers| {
+        matches!(
+            modifiers.list.nodes.as_slice(),
+            [modifier]
+                if host
+                    .node(NodeRef::new(declaration.arena, declaration.file, *modifier))
+                    .is_some_and(|modifier| modifier.kind == SyntaxKind::AbstractKeyword)
+        )
+    });
+    let ambient = ambient || abstract_method;
     if record.kind != SyntaxKind::MethodDeclaration
         || record.flags.0 != 0
         || method.asterisk_token.is_some()
@@ -4823,10 +4866,21 @@ fn plan_property(
         property.modifiers.as_ref(),
         merged_auto_accessor,
     )?;
+    let abstract_property = property.modifiers.as_ref().is_some_and(|modifiers| {
+        matches!(
+            modifiers.list.nodes.as_slice(),
+            [modifier]
+                if host
+                    .node(NodeRef::new(member.arena, member.file, *modifier))
+                    .is_some_and(|modifier| modifier.kind == SyntaxKind::AbstractKeyword)
+        )
+    });
+    if abstract_property && (private || property.initializer.is_some()) {
+        return Err(unsupported(ClassUnsupported::PropertyModifiers(member)));
+    }
     if private
         && (merged_auto_accessor.is_some()
             || property.postfix_token.is_some()
-            || property.initializer.is_none()
             || property.modifiers.as_ref().is_some_and(|modifiers| {
                 modifiers.list.nodes.iter().any(|modifier| {
                     host.node(NodeRef::new(member.arena, member.file, *modifier))
@@ -4935,8 +4989,7 @@ fn plan_property(
                     (None, None, Some(identifier.text.clone()), None)
                 }
                 NodeData::StringLiteral(literal) => {
-                    if private
-                        || initializer_record.kind != SyntaxKind::StringLiteral
+                    if initializer_record.kind != SyntaxKind::StringLiteral
                         || literal.token_flags.0 != 0
                         || initializer_node != type_node
                             && (type_record.kind != SyntaxKind::StringKeyword
@@ -5128,6 +5181,7 @@ fn plan_property(
         side,
         optional,
         definite,
+        abstract_property,
         readonly,
         ambient_private_modifier: None,
         parameter_property: false,
@@ -5257,6 +5311,7 @@ fn plan_ambient_private_implicit_any_property(
         side: ClassPropertySide::Instance,
         optional: false,
         definite: false,
+        abstract_property: false,
         readonly: false,
         ambient_private_modifier: Some(modifier),
         parameter_property: false,
@@ -6498,7 +6553,7 @@ fn plan_class_declaration_modifiers(
     owner: &Symbol,
     name: NodeRef,
     modifiers: Option<&ts_ast::ModifierList>,
-) -> Result<(bool, Option<SemanticSymbolId>), ClassError> {
+) -> Result<(bool, bool, Option<SemanticSymbolId>), ClassError> {
     let bound = host
         .bound_file(declaration)
         .ok_or_else(|| invariant(ClassInvariant::InvalidOwnerSymbol(symbol)))?;
@@ -6506,7 +6561,7 @@ fn plan_class_declaration_modifiers(
         if owner.parent().is_some() || bound.local_symbol(declaration).is_some() {
             return Err(invariant(ClassInvariant::InvalidOwnerSymbol(symbol)));
         }
-        return Ok((false, None));
+        return Ok((false, false, None));
     };
     let declaration_record = preflight_node(store, host, declaration)?;
     let name_record = preflight_node(store, host, name)?;
@@ -6518,12 +6573,13 @@ fn plan_class_declaration_modifiers(
         return Err(invariant(ClassInvariant::InvalidDeclaration(declaration)));
     }
 
-    let (expected, ambient) = match modifiers.list.nodes.as_slice() {
+    let (expected, ambient, abstract_class) = match modifiers.list.nodes.as_slice() {
         [modifier] => {
             let modifier = NodeRef::new(declaration.arena, declaration.file, *modifier);
             match preflight_node(store, host, modifier)?.kind {
-                SyntaxKind::DeclareKeyword => (&[SyntaxKind::DeclareKeyword][..], true),
-                SyntaxKind::ExportKeyword => (&[SyntaxKind::ExportKeyword][..], false),
+                SyntaxKind::DeclareKeyword => (&[SyntaxKind::DeclareKeyword][..], true, false),
+                SyntaxKind::AbstractKeyword => (&[SyntaxKind::AbstractKeyword][..], false, true),
+                SyntaxKind::ExportKeyword => (&[SyntaxKind::ExportKeyword][..], false, false),
                 _ => {
                     return Err(unsupported(ClassUnsupported::DeclarationModifiers(
                         declaration,
@@ -6539,11 +6595,13 @@ fn plan_class_declaration_modifiers(
             (
                 &[SyntaxKind::ExportKeyword, SyntaxKind::DefaultKeyword][..],
                 true,
+                false,
             )
         }
         [_, _] => (
             &[SyntaxKind::ExportKeyword, SyntaxKind::DeclareKeyword][..],
             true,
+            false,
         ),
         _ => {
             return Err(unsupported(ClassUnsupported::DeclarationModifiers(
@@ -6562,8 +6620,9 @@ fn plan_class_declaration_modifiers(
         let spelling = match kind {
             SyntaxKind::ExportKeyword => "export",
             SyntaxKind::DeclareKeyword => "declare",
+            SyntaxKind::AbstractKeyword => "abstract",
             SyntaxKind::DefaultKeyword => "default",
-            _ => unreachable!("only export, default, and ambient class modifiers are planned"),
+            _ => unreachable!("only export, default, abstract, and ambient modifiers are planned"),
         };
         if record.kind != *kind {
             return Err(unsupported(ClassUnsupported::DeclarationModifiers(
@@ -6583,11 +6642,11 @@ fn plan_class_declaration_modifiers(
         previous_end = record.range.end;
     }
 
-    if expected.len() == 1 && ambient {
+    if expected.len() == 1 && (ambient || abstract_class) {
         if owner.parent().is_some() || bound.local_symbol(declaration).is_some() {
             return Err(invariant(ClassInvariant::InvalidOwnerSymbol(symbol)));
         }
-        return Ok((true, None));
+        return Ok((ambient, abstract_class, None));
     }
 
     let Some(parent) = owner.parent() else {
@@ -6654,7 +6713,7 @@ fn plan_class_declaration_modifiers(
         return Err(invariant(ClassInvariant::InvalidOwnerSymbol(symbol)));
     }
 
-    Ok((ambient, Some(local)))
+    Ok((ambient, abstract_class, Some(local)))
 }
 
 /// Produces the opaque syntax/binder proof consumed by the class shell
@@ -6709,7 +6768,7 @@ fn plan_class_declaration(
         return Err(invariant(ClassInvariant::InvalidDeclaration(declaration)));
     };
     let name = NodeRef::new(declaration.arena, declaration.file, name);
-    let (ambient, export_local) = plan_class_declaration_modifiers(
+    let (ambient, abstract_class, export_local) = plan_class_declaration_modifiers(
         store,
         host,
         declaration,
@@ -6928,6 +6987,7 @@ fn plan_class_declaration(
                     side: ClassPropertySide::Instance,
                     optional: false,
                     definite: false,
+                    abstract_property: false,
                     readonly: parameter_property.readonly,
                     ambient_private_modifier: None,
                     parameter_property: true,
@@ -7237,6 +7297,7 @@ fn plan_class_declaration(
         declaration,
         symbol,
         ambient,
+        abstract_class,
         export_local,
         base,
         null_base,
@@ -7366,6 +7427,12 @@ impl ClassMemberQueryPlan {
     pub(super) const fn symbol(&self) -> SemanticSymbolId {
         match self {
             Self::Direct(plan) | Self::Derived { class: plan, .. } => plan.symbol(),
+        }
+    }
+
+    pub(super) const fn is_abstract(&self) -> bool {
+        match self {
+            Self::Direct(plan) | Self::Derived { class: plan, .. } => plan.class.abstract_class,
         }
     }
 
@@ -8690,6 +8757,7 @@ fn uninitialized_instance_properties(
         if property.side != ClassPropertySide::Instance
             || property.optional
             || property.definite
+            || property.abstract_property
             || property.parameter_property
             || property.initializer_node.is_some()
         {
@@ -14227,6 +14295,31 @@ fn exact_construct_signature(
     let Some(type_parameters) = instance.reference.resolved_type_arguments.as_deref() else {
         return false;
     };
+    let Some(owner) = store
+        .type_payload(instance_type)
+        .and_then(TypeRecord::symbol)
+    else {
+        return false;
+    };
+    let Some(class) = store.symbol(owner).and_then(Symbol::value_declaration) else {
+        return false;
+    };
+    let abstract_class = (0..class.node.index()).any(|index| {
+        u32::try_from(index)
+            .ok()
+            .map(ts_ast::NodeId::new)
+            .map(|node| NodeRef::new(class.arena, class.file, node))
+            .is_some_and(|node| {
+                store.source_node_kind(node) == Some(SyntaxKind::AbstractKeyword)
+                    && store.source_node_parent(node) == Some(SourceNodeParent::Parent(class))
+            })
+    });
+    let expected_flags = SignatureFlags::CONSTRUCT
+        | if abstract_class {
+            SignatureFlags::ABSTRACT
+        } else {
+            SignatureFlags::NONE
+        };
     let minimum_argument_count = if let Some(parameter) = parameter {
         let Some(parameter_record) = store.symbol(parameter) else {
             return false;
@@ -14262,7 +14355,7 @@ fn exact_construct_signature(
         0
     };
     store.signature(signature).is_some_and(|signature| {
-        signature.flags() == SignatureFlags::CONSTRUCT
+        signature.flags() == expected_flags
             && signature.min_argument_count() == minimum_argument_count
             && signature.resolved_min_argument_count() == -1
             && signature.declaration() == declaration
@@ -16255,7 +16348,12 @@ pub(super) fn execute_nongeneric_class_members(
         .unwrap_or_else(|| {
             store
                 .alloc_signature(
-                    SignatureFlags::CONSTRUCT,
+                    SignatureFlags::CONSTRUCT
+                        | if plan.class.abstract_class {
+                            SignatureFlags::ABSTRACT
+                        } else {
+                            SignatureFlags::NONE
+                        },
                     plan.constructor_declaration(),
                     type_parameters,
                     None,
@@ -16829,7 +16927,12 @@ fn execute_direct_derived_class_members(
         });
     let default_construct_signature = store
         .alloc_signature(
-            SignatureFlags::CONSTRUCT,
+            SignatureFlags::CONSTRUCT
+                | if plan.class.abstract_class {
+                    SignatureFlags::ABSTRACT
+                } else {
+                    SignatureFlags::NONE
+                },
             constructor_declaration,
             Vec::new(),
             None,
@@ -18264,9 +18367,7 @@ fn exact_stored_property(
                     };
                 let annotation_valid = match store.source_node_kind(previous) {
                     Some(SyntaxKind::Identifier) => private_name.is_none(),
-                    Some(SyntaxKind::PrivateIdentifier) => {
-                        private_name.is_some() && initializer_kind == SyntaxKind::NumericLiteral
-                    }
+                    Some(SyntaxKind::PrivateIdentifier) => private_name.is_some(),
                     Some(kind) if kind == annotation_kind => {
                         store.type_node_links(previous)
                             == Some(&TypeNodeLinks {
@@ -18275,25 +18376,24 @@ fn exact_stored_property(
                             })
                             && store.source_type_node_result_is_exact(previous, primitive_type, &[])
                             && (private_name.is_none()
-                                || initializer_kind == SyntaxKind::NumericLiteral
-                                    && previous
-                                        .node
-                                        .index()
-                                        .checked_sub(1)
-                                        .and_then(|index| u32::try_from(index).ok())
-                                        .map(|index| {
-                                            NodeRef::new(
-                                                declaration.arena,
-                                                declaration.file,
-                                                ts_ast::NodeId::new(index),
-                                            )
-                                        })
-                                        .is_some_and(|name| {
-                                            store.source_node_kind(name)
-                                                == Some(SyntaxKind::PrivateIdentifier)
-                                                && store.source_node_parent(name)
-                                                    == Some(SourceNodeParent::Parent(*declaration))
-                                        }))
+                                || previous
+                                    .node
+                                    .index()
+                                    .checked_sub(1)
+                                    .and_then(|index| u32::try_from(index).ok())
+                                    .map(|index| {
+                                        NodeRef::new(
+                                            declaration.arena,
+                                            declaration.file,
+                                            ts_ast::NodeId::new(index),
+                                        )
+                                    })
+                                    .is_some_and(|name| {
+                                        store.source_node_kind(name)
+                                            == Some(SyntaxKind::PrivateIdentifier)
+                                            && store.source_node_parent(name)
+                                                == Some(SourceNodeParent::Parent(*declaration))
+                                    }))
                     }
                     _ => false,
                 };
@@ -18334,10 +18434,7 @@ fn exact_stored_property(
                             })
                     })
             },
-            |annotation| {
-                private_name.is_none()
-                    && store.source_type_node_result_is_exact(annotation, property_type, &[])
-            },
+            |annotation| store.source_type_node_result_is_exact(annotation, property_type, &[]),
         );
     ((flags == SymbolFlags::PROPERTY || flags == (SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL))
         && matches!(check_flags, CheckFlags::NONE | CheckFlags::READONLY)
@@ -22690,6 +22787,99 @@ mod tests {
                 ..ValueSymbolLinks::default()
             }),
         );
+        assert_eq!(
+            validate_class_heritage_members(&fixture.store, members.shells().instance_type()),
+            ClassHeritageMembersValidation::Valid,
+        );
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        assert_eq!(
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan),
+            Ok(members),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn abstract_classes_preserve_private_fields_and_abstract_constructor_identity() {
+        let mut fixture = fixture(concat!(
+            "abstract class Model { ",
+            "abstract value: string; ",
+            "abstract label(): string; ",
+            "#missing: number; ",
+            "#text = 'ready'; ",
+            "static readonly #kind = 'fixed'; ",
+            "}",
+        ));
+        let owner = class_symbol(&fixture, "Model");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
+        let ClassMemberQueryPlan::Direct(class) = &plan else {
+            panic!("an abstract class without heritage retains one direct member plan")
+        };
+        let abstract_property = class.class.instance_properties[0].symbol;
+        let missing = class.class.instance_properties[1].symbol;
+        let text = class.class.instance_properties[2].symbol;
+        let kind = class.class.static_properties[0].symbol;
+
+        assert!(plan.is_abstract());
+        assert!(class.class.instance_properties[0].abstract_property);
+        assert_eq!(class.uninitialized_instance_properties().len(), 1);
+        assert_eq!(
+            class.uninitialized_instance_properties()[0],
+            class.class.instance_properties[1].name_node,
+        );
+
+        let members =
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan).unwrap();
+
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .signature(members.default_construct_signature())
+                .unwrap()
+                .flags(),
+            SignatureFlags::CONSTRUCT | SignatureFlags::ABSTRACT,
+        );
+        for (symbol, expected) in [
+            (abstract_property, bootstrap.string_type),
+            (missing, bootstrap.number_type),
+            (text, bootstrap.string_type),
+        ] {
+            assert_eq!(
+                fixture
+                    .store
+                    .value_symbol_links(symbol)
+                    .and_then(|links| links.resolved_type),
+                Some(expected),
+            );
+        }
+        assert_eq!(
+            fixture
+                .store
+                .value_symbol_links(kind)
+                .and_then(|links| links.resolved_type),
+            bootstrap.cached_string_literal_type("fixed"),
+        );
+        for (symbol, spelling) in [(missing, "#missing"), (text, "#text"), (kind, "#kind")] {
+            assert_eq!(
+                authenticated_private_class_symbol_name(&fixture.store, owner, symbol),
+                Some(spelling),
+            );
+        }
         assert_eq!(
             validate_class_heritage_members(&fixture.store, members.shells().instance_type()),
             ClassHeritageMembersValidation::Valid,
