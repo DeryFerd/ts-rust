@@ -999,6 +999,44 @@ fn missing_default_reexports_remain_typed_boundaries() {
     assert_module_reexport_shape_is_closed("export { default as publicValue } from './base';");
 }
 
+fn star_reexport_context<'arena>(
+    consumer: &'arena ParseResult,
+    barrel: &'arena ParseResult,
+    base: &'arena ParseResult,
+) -> (CanonicalCheckerContext<'arena>, [FileId; 3]) {
+    let files = [FileId::new(24), FileId::new(25), FileId::new(26)];
+    let sources = [
+        Source {
+            parsed: consumer,
+            file: files[0],
+            path: "\"/project/star-consumer.ts\"",
+        },
+        Source {
+            parsed: barrel,
+            file: files[1],
+            path: "\"/project/star-barrel.ts\"",
+        },
+        Source {
+            parsed: base,
+            file: files[2],
+            path: "\"/project/star-base.ts\"",
+        },
+    ];
+    let routes = [
+        Route {
+            source: 0,
+            specifier: 0,
+            target: 1,
+        },
+        Route {
+            source: 1,
+            specifier: 0,
+            target: 2,
+        },
+    ];
+    (make_context(&sources, &routes), files)
+}
+
 #[test]
 fn star_reexports_preserve_binder_identity_and_imported_value_types() {
     let consumer = parse_source_file(concat!(
@@ -1007,41 +1045,8 @@ fn star_reexports_preserve_binder_identity_and_imported_value_types() {
     ));
     let barrel = parse_source_file("export * from './base';");
     let base = parse_source_file("export const value: number = 1;");
-    let consumer_file = FileId::new(24);
-    let barrel_file = FileId::new(25);
-    let base_file = FileId::new(26);
-    let sources = [
-        Source {
-            parsed: &consumer,
-            file: consumer_file,
-            path: "\"/project/star-consumer.ts\"",
-        },
-        Source {
-            parsed: &barrel,
-            file: barrel_file,
-            path: "\"/project/star-barrel.ts\"",
-        },
-        Source {
-            parsed: &base,
-            file: base_file,
-            path: "\"/project/star-base.ts\"",
-        },
-    ];
-    let mut context = make_context(
-        &sources,
-        &[
-            Route {
-                source: 0,
-                specifier: 0,
-                target: 1,
-            },
-            Route {
-                source: 1,
-                specifier: 0,
-                target: 2,
-            },
-        ],
-    );
+    let (mut context, [consumer_file, barrel_file, base_file]) =
+        star_reexport_context(&consumer, &barrel, &base);
     let imported = bound_symbol(
         &context,
         named_import_binding(&consumer, consumer_file, "selected"),
