@@ -3127,6 +3127,148 @@ fn plan_interface_member(
     })
 }
 
+/// Keeps React's exact merged-class instance alias cold until a real consumer requests it.
+#[allow(clippy::too_many_lines)] // Alias, namespace exports, merged component, and global Element share one proof.
+fn authenticated_deferred_react_instance_alias(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    namespace: SemanticSymbolId,
+    alias: SemanticSymbolId,
+    declaration: NodeRef,
+    annotation: NodeRef,
+) -> bool {
+    let Some(facts) = bound.source_facts() else {
+        return false;
+    };
+    let Some(namespace_owner) = store.symbol(namespace) else {
+        return false;
+    };
+    let Some(alias_owner) = store.symbol(alias) else {
+        return false;
+    };
+    let Some(exports) = namespace_owner
+        .exports()
+        .and_then(|exports| store.symbol_table(exports))
+    else {
+        return false;
+    };
+    let Some(alias_record) = arena.get(declaration.node) else {
+        return false;
+    };
+    let NodeData::TypeAliasDeclaration(alias_data) = &alias_record.data else {
+        return false;
+    };
+    let Some(union_record) = arena.get(annotation.node) else {
+        return false;
+    };
+    let NodeData::UnionTypeNode(union) = &union_record.data else {
+        return false;
+    };
+    let [component, element] = union.types.nodes.as_slice() else {
+        return false;
+    };
+    let component = child(annotation, *component);
+    let element = child(annotation, *element);
+    let Some(component_record) = arena.get(component.node) else {
+        return false;
+    };
+    let NodeData::TypeReferenceNode(component_reference) = &component_record.data else {
+        return false;
+    };
+    let Some([argument]) = component_reference
+        .type_arguments
+        .as_ref()
+        .map(|arguments| arguments.nodes.as_slice())
+    else {
+        return false;
+    };
+    let argument = child(component, *argument);
+    let component_name = child(component, component_reference.type_name);
+    let Some(component_name_record) = arena.get(component_name.node) else {
+        return false;
+    };
+    let NodeData::Identifier(component_identifier) = &component_name_record.data else {
+        return false;
+    };
+    let Some(component_symbol) = exports
+        .get_source("Component")
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+    else {
+        return false;
+    };
+    let Some(component_owner) = store.symbol(component_symbol) else {
+        return false;
+    };
+    let Some(element_record) = arena.get(element.node) else {
+        return false;
+    };
+    let NodeData::TypeReferenceNode(element_reference) = &element_record.data else {
+        return false;
+    };
+    let element_name = child(element, element_reference.type_name);
+    let Some(element_name_record) = arena.get(element_name.node) else {
+        return false;
+    };
+    let NodeData::Identifier(element_identifier) = &element_name_record.data else {
+        return false;
+    };
+    let Some(element_symbol) = store
+        .intrinsic_bootstrap()
+        .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+        .and_then(|globals| globals.get_source("Element"))
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+    else {
+        return false;
+    };
+    let Some(element_owner) = store.symbol(element_symbol) else {
+        return false;
+    };
+
+    facts.is_declaration_file()
+        && !facts.is_default_library()
+        && namespace_owner.name().as_utf8() == Some("React")
+        && namespace_owner.flags().intersects(SymbolFlags::NAMESPACE)
+        && namespace_owner.check_flags() == CheckFlags::NONE
+        && store.get_merged_symbol(namespace) == Some(namespace)
+        && alias_owner.name().as_utf8() == Some("ReactInstance")
+        && alias_owner.flags() == SymbolFlags::TYPE_ALIAS
+        && alias_owner.check_flags() == CheckFlags::NONE
+        && alias_owner.declarations() == Some(&[declaration])
+        && store.get_parent_of_symbol(alias) == Some(namespace)
+        && exports
+            .get_source("ReactInstance")
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            == Some(alias)
+        && alias_record.kind == SyntaxKind::TypeAliasDeclaration
+        && alias_data.type_parameters.is_none()
+        && alias_data.type_ == annotation.node
+        && union_record.kind == SyntaxKind::UnionType
+        && union_record.parent == Some(declaration.node)
+        && !union.types.has_trailing_comma
+        && component_record.kind == SyntaxKind::TypeReference
+        && component_record.parent == Some(annotation.node)
+        && component_name_record.kind == SyntaxKind::Identifier
+        && component_name_record.parent == Some(component.node)
+        && component_identifier.text == "Component"
+        && component_owner.name().as_utf8() == Some("Component")
+        && component_owner.flags() == SymbolFlags::CLASS | SymbolFlags::INTERFACE
+        && component_owner.check_flags() == CheckFlags::NONE
+        && store.get_parent_of_symbol(component_symbol) == Some(namespace)
+        && arena.get(argument.node).is_some_and(|record| {
+            record.kind == SyntaxKind::AnyKeyword && record.parent == Some(component.node)
+        })
+        && element_record.kind == SyntaxKind::TypeReference
+        && element_record.parent == Some(annotation.node)
+        && element_reference.type_arguments.is_none()
+        && element_name_record.kind == SyntaxKind::Identifier
+        && element_name_record.parent == Some(element.node)
+        && element_identifier.text == "Element"
+        && element_owner.name().as_utf8() == Some("Element")
+        && element_owner.flags().contains(SymbolFlags::INTERFACE)
+        && element_owner.parent().is_none()
+}
+
 fn plan_type_alias_member(
     arena: &NodeArena,
     bound: &BoundFile,
@@ -3205,7 +3347,16 @@ fn plan_type_alias_member(
             Err(error) => return Err(error),
         }
     } else {
-        false
+        declaration_file
+            && authenticated_deferred_react_instance_alias(
+                arena,
+                bound,
+                store,
+                owner,
+                symbol,
+                declaration,
+                annotation,
+            )
     };
     let mut parameter_annotations = Vec::new();
     if declaration_file && !deferred {
@@ -13080,6 +13231,70 @@ mod tests {
                 "mutation {mutation}",
             );
         }
+    }
+
+    #[test]
+    fn ambient_react_instance_alias_remains_deferred_with_merged_component() {
+        let fixture = declaration_fixture(
+            concat!(
+                "interface Element {} declare var Element: unknown; ",
+                "declare module 'react' { export = React; namespace React { ",
+                "type ReactInstance = Component<any> | Element; ",
+                "interface Component<P = {}, S = {}> {} ",
+                "class Component<P, S> { constructor(props: P); } ",
+                "} }",
+            ),
+            CanonicalModuleState::Script,
+        );
+        let module = plan(&fixture, 2);
+        let react = module
+            .members
+            .iter()
+            .find_map(|member| match member {
+                SourceNamespaceMemberPlan::Namespace(namespace)
+                    if fixture
+                        .context
+                        .store()
+                        .symbol(namespace.symbol)
+                        .and_then(|symbol| symbol.name().as_utf8())
+                        == Some("React") =>
+                {
+                    Some(namespace)
+                }
+                _ => None,
+            })
+            .expect("the ambient module must retain its React namespace");
+        let (alias, annotation, deferred) = react
+            .members
+            .iter()
+            .find_map(|member| match member {
+                SourceNamespaceMemberPlan::TypeAlias {
+                    symbol,
+                    annotation,
+                    deferred,
+                    ..
+                } if fixture
+                    .context
+                    .store()
+                    .symbol(*symbol)
+                    .and_then(|symbol| symbol.name().as_utf8())
+                    == Some("ReactInstance") =>
+                {
+                    Some((*symbol, *annotation, *deferred))
+                }
+                _ => None,
+            })
+            .expect("React must retain its merged-class instance alias");
+
+        assert!(deferred);
+        assert!(fixture.context.store().type_alias_links(alias).is_none());
+        assert!(
+            fixture
+                .context
+                .store()
+                .type_node_links(annotation)
+                .is_none()
+        );
     }
 
     #[test]
