@@ -1691,7 +1691,7 @@ fn plan_global_date_constructor(
         || owner_record.exports().is_some()
         || owner_record.export_symbol().is_some()
         || owner_declarations.is_empty()
-        || signature_record.flags() != SymbolFlags::SIGNATURE
+        || signature_record.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::SIGNATURE
         || signature_record.check_flags() != CheckFlags::NONE
         || signature_record
             .parent()
@@ -5659,7 +5659,8 @@ pub(super) fn authenticated_global_date_constructor_return(
     let constructor_symbol = owner_record
         .members()
         .and_then(|members| store.symbol_table(members))
-        .and_then(|members| members.get(InternalSymbolName::New.as_ref()))?;
+        .and_then(|members| members.get(InternalSymbolName::New.as_ref()))
+        .and_then(|symbol| store.get_merged_symbol(symbol))?;
     let symbol_record = store.symbol(constructor_symbol)?;
     let return_annotation = store.source_direct_type_annotation(declaration)?;
 
@@ -5681,9 +5682,12 @@ pub(super) fn authenticated_global_date_constructor_return(
             .declarations()
             .is_none_or(|declarations| !declarations.contains(&owner_declaration))
         || store.source_node_kind(owner_declaration) != Some(SyntaxKind::InterfaceDeclaration)
-        || symbol_record.flags() != SymbolFlags::SIGNATURE
+        || symbol_record.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::SIGNATURE
         || symbol_record.check_flags() != CheckFlags::NONE
-        || symbol_record.parent() != Some(owner)
+        || symbol_record
+            .parent()
+            .and_then(|parent| store.get_merged_symbol(parent))
+            != Some(owner)
         || symbol_record
             .declarations()
             .is_none_or(|declarations| !declarations.contains(&declaration))
@@ -7994,6 +7998,170 @@ mod tests {
                 ..SignatureLinks::default()
             }),
         );
+        let warm = (
+            store.type_len(),
+            store.signature_len(),
+            store.symbol_len(),
+            store.checker_link_allocated_lengths(),
+        );
+
+        context.recheck_source_file(source_file).unwrap();
+
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn reopened_global_date_constructors_preserve_merged_signature_ownership() {
+        let library = global_date_constructor_library();
+        let extension = parse_source_file(concat!(
+            "interface Date { toISOString(): string; } ",
+            "interface DateConstructor { new(value: Date): Date; now(): number; }",
+        ));
+        let source = parse_source_file(concat!(
+            "export class SomeClass { ",
+            "constructor(readonly timestamp = new Date()) {} ",
+            "}",
+        ));
+        assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+        assert!(
+            extension.diagnostics.is_empty(),
+            "{:?}",
+            extension.diagnostics
+        );
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let library_file = FileId::new(1_870);
+        let extension_file = FileId::new(1_871);
+        let source_file = FileId::new(1_872);
+        let mut binder = CanonicalBinder::new();
+        for (parsed, file, path, default_library, module_state) in [
+            (
+                &library,
+                library_file,
+                "\"/lib/es5.d.ts\"",
+                true,
+                CanonicalModuleState::Script,
+            ),
+            (
+                &extension,
+                extension_file,
+                "\"/lib/es2015.core.d.ts\"",
+                true,
+                CanonicalModuleState::Script,
+            ),
+            (
+                &source,
+                source_file,
+                "\"/project/date.ts\"",
+                false,
+                CanonicalModuleState::External,
+            ),
+        ] {
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new_with_default_library(
+                        EscapedName::source(path),
+                        CanonicalSourceLanguage::TypeScript,
+                        default_library,
+                        default_library,
+                        module_state,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![
+                (library_file, &library.arena),
+                (extension_file, &extension.arena),
+                (source_file, &source.arena),
+            ],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        let (date, owner, constructor_symbol) = {
+            let store = context.store();
+            let globals = store
+                .symbol_table(store.intrinsic_bootstrap().unwrap().globals)
+                .unwrap();
+            let date = globals
+                .get_source("Date")
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+                .unwrap();
+            let owner = globals
+                .get_source("DateConstructor")
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+                .unwrap();
+            let constructor = store
+                .symbol(owner)
+                .and_then(ts_binder::semantic::Symbol::members)
+                .and_then(|members| store.symbol_table(members))
+                .and_then(|members| members.get(InternalSymbolName::New.as_ref()))
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+                .unwrap();
+            let record = store.symbol(constructor).unwrap();
+            assert_eq!(
+                record.flags(),
+                SymbolFlags::SIGNATURE | SymbolFlags::TRANSIENT,
+            );
+            assert_ne!(record.parent(), Some(owner));
+            assert_eq!(
+                record
+                    .parent()
+                    .and_then(|parent| store.get_merged_symbol(parent)),
+                Some(owner),
+            );
+            (date, owner, constructor)
+        };
+        let expression = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::NewExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    source_file,
+                    node,
+                ))
+            })
+            .unwrap();
+
+        context.check_source_file(source_file).unwrap();
+
+        let store = context.store();
+        let instance = store
+            .declared_type_links(date)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let signature = store
+            .signature_links(expression)
+            .and_then(|links| links.resolved_signature.signature())
+            .unwrap();
+        assert_eq!(
+            authenticated_global_date_constructor_return(store, signature),
+            Some(instance),
+        );
+        assert_eq!(
+            store
+                .symbol(constructor_symbol)
+                .and_then(ts_binder::semantic::Symbol::declarations)
+                .map(<[NodeRef]>::len),
+            Some(3),
+        );
+        assert!(store.declared_type_links(owner).is_some());
         let warm = (
             store.type_len(),
             store.signature_len(),
