@@ -7053,10 +7053,24 @@ fn valid_unresolved_react_node_array_interface(
     let Some([alias_declaration]) = alias.declarations() else {
         return false;
     };
+    let valid_interface_identity = match record.object_flags() {
+        ObjectFlags::INTERFACE => valid_unresolved_interface_members(interface),
+        flags if flags == ObjectFlags::INTERFACE | ObjectFlags::REFERENCE => {
+            validate_nongeneric_interface_argument_origin(store, type_).is_ok()
+                && interface.reference.object.structured == StructuredTypeData::default()
+                && interface.resolved_base_constructor_type.is_none()
+                && interface.resolved_base_types.is_none()
+                && !interface.declared_members_resolved
+                && interface.declared_members.is_none()
+                && interface.declared_call_signatures.is_none()
+                && interface.declared_construct_signatures.is_none()
+                && interface.declared_index_infos.is_none()
+        }
+        _ => false,
+    };
     if record.flags() != TypeFlags::OBJECT
-        || record.object_flags() != ObjectFlags::INTERFACE
+        || !valid_interface_identity
         || record.alias().is_some()
-        || !valid_unresolved_interface_members(interface)
         || interface.base_types_resolved
         || store.direct_interface_heritage_provenance(type_).is_some()
         || owner_record.flags() != SymbolFlags::INTERFACE

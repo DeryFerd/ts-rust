@@ -1873,7 +1873,9 @@ mod tests {
     use crate::semantic::{
         AliasTargetState, CanonicalCheckerContext, CanonicalCheckerDiagnostics,
         CanonicalCheckerOptions, SourceCheckError, TypeData, bootstrap::LiteralTypeCacheError,
-        production::GlobalMergeCompletion, type_nodes::CanonicalTypeQuery,
+        production::GlobalMergeCompletion,
+        reference_types::validate_nongeneric_interface_argument_origin,
+        type_nodes::CanonicalTypeQuery,
     };
 
     fn checker_context(parsed: &ParseResult, file: FileId) -> CanonicalCheckerContext<'_> {
@@ -2163,11 +2165,17 @@ mod tests {
             .declared_type_links(react_array)
             .and_then(|links| links.declared_type)
             .unwrap();
-        let TypeData::Interface(interface) =
-            context.store().type_payload(array_shell).unwrap().data()
-        else {
+        let array_record = context.store().type_payload(array_shell).unwrap();
+        let TypeData::Interface(interface) = array_record.data() else {
             panic!("ReactNodeArray must retain an authenticated interface shell")
         };
+        assert_eq!(
+            array_record.object_flags(),
+            ObjectFlags::INTERFACE | ObjectFlags::REFERENCE,
+        );
+        assert!(
+            validate_nongeneric_interface_argument_origin(context.store(), array_shell).is_ok()
+        );
         assert!(!interface.base_types_resolved);
         assert!(!interface.declared_members_resolved);
         assert_eq!(
