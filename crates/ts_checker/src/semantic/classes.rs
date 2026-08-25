@@ -13,7 +13,8 @@
 //! signature. The public query
 //! additionally admits one direct local base whose own completed graph is in
 //! the same supported family; plain generic classes can forward their exact
-//! declaration-owned parameters through direct generic heritage.
+//! declaration-owned parameters through direct generic heritage. Parameters
+//! admit authenticated `{}` constraints and `any` or earlier-parameter defaults.
 //! Empty methods retain their canonical callable identities, including one
 //! authenticated `...args: any[]` rest parameter. Ambient classes also admit
 //! bodyless methods with direct primitive parameter and return annotations,
@@ -90,7 +91,7 @@ use super::{
     links::{SymbolNodeLinks, TypeNodeLinks, ValueSymbolLinks},
     object_members::{
         DeclaredPropertyObjectProof, DeclaredPropertyObjectValidation, plan_interface,
-        validate_resolved_declared_property_object,
+        plan_type_literal, validate_resolved_declared_property_object,
     },
     reference_types::validate_direct_generic_reference,
     signatures::SignatureFlags,
@@ -6819,6 +6820,153 @@ fn plan_class_declaration_modifiers(
     Ok((ambient, abstract_class, Some(local)))
 }
 
+fn validate_plain_class_type_parameter_constraint(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    parameter: NodeRef,
+    constraint: NodeRef,
+    earliest_start: ts_core::TextPos,
+) -> Result<TypeId, ClassError> {
+    let reject = || unsupported(ClassUnsupported::Generic(declaration));
+    let parameter_record = preflight_node(store, host, parameter)?;
+    let record = preflight_node(store, host, constraint)?;
+    let NodeData::TypeLiteralNode(literal) = &record.data else {
+        return Err(reject());
+    };
+    if record.kind != SyntaxKind::TypeLiteral
+        || record.flags.0 != 0
+        || record.parent != Some(parameter.node)
+        || record.range.start < earliest_start
+        || record.range.end > parameter_record.range.end
+        || literal.members.has_trailing_comma
+        || !literal.members.nodes.is_empty()
+        || literal.members.range != record.range
+        || literal.symbol.is_some()
+    {
+        return Err(reject());
+    }
+    plan_type_literal(store, host, constraint, None)
+        .map_err(|_| invariant(ClassInvariant::InvalidPropertyTypeCache(constraint)))?;
+    let expected = store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| bootstrap.empty_type_literal_type)
+        .ok_or_else(|| invariant(ClassInvariant::BootstrapUnavailable(constraint)))?;
+    validate_index_type_cache(store, constraint, expected)?;
+    Ok(expected)
+}
+
+#[allow(clippy::too_many_arguments)] // Each default must retain its parameter and class ownership.
+fn validate_plain_class_type_parameter_default(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    declaration: NodeRef,
+    parameter: NodeRef,
+    symbol: SemanticSymbolId,
+    default: NodeRef,
+    previous_symbols: &HashSet<SemanticSymbolId>,
+    earliest_start: ts_core::TextPos,
+) -> Result<Option<TypeId>, ClassError> {
+    let reject = || unsupported(ClassUnsupported::Generic(declaration));
+    let parameter_record = preflight_node(store, host, parameter)?;
+    let record = preflight_node(store, host, default)?;
+    if record.flags.0 != 0
+        || record.parent != Some(parameter.node)
+        || record.range.start < earliest_start
+        || record.range.end != parameter_record.range.end
+    {
+        return Err(reject());
+    }
+
+    let expected = match &record.data {
+        NodeData::KeywordTypeNode(_) if record.kind == SyntaxKind::AnyKeyword => Some(
+            store
+                .intrinsic_bootstrap()
+                .map(|bootstrap| bootstrap.any_type)
+                .ok_or_else(|| invariant(ClassInvariant::BootstrapUnavailable(default)))?,
+        ),
+        NodeData::TypeReferenceNode(reference)
+            if record.kind == SyntaxKind::TypeReference && reference.type_arguments.is_none() =>
+        {
+            let name = NodeRef::new(default.arena, default.file, reference.type_name);
+            let name_record = preflight_node(store, host, name)?;
+            let NodeData::Identifier(identifier) = &name_record.data else {
+                return Err(reject());
+            };
+            if name_record.kind != SyntaxKind::Identifier
+                || name_record.flags.0 != 0
+                || name_record.parent != Some(default.node)
+                || identifier.flow_node.is_some()
+                || identifier.text.is_empty()
+            {
+                return Err(reject());
+            }
+
+            let (arena, bound) = host.source(default).ok_or_else(reject)?;
+            let mut callback_host = host.name_resolver_host(store)?;
+            let raw =
+                CanonicalNameResolver::new(arena, bound, store.symbol_store(), &mut callback_host)
+                    .map_err(|_| reject())?
+                    .resolve(
+                        Some(CanonicalResolutionLocation::Bound(name)),
+                        &identifier.text,
+                        SymbolFlags::TYPE,
+                        None,
+                        true,
+                        false,
+                    )
+                    .map_err(|_| reject())?
+                    .ok_or_else(reject)?;
+            let earlier = store.get_merged_symbol(raw).ok_or_else(reject)?;
+            if raw != earlier
+                || earlier == symbol
+                || !previous_symbols.contains(&earlier)
+                || store.get_parent_of_symbol(earlier) != Some(owner)
+                || store
+                    .symbol(earlier)
+                    .and_then(|parameter| parameter.name().as_utf8())
+                    != Some(identifier.text.as_str())
+                || store
+                    .symbol(owner)
+                    .and_then(Symbol::members)
+                    .and_then(|members| store.symbol_table(members))
+                    .and_then(|members| members.get_source(&identifier.text))
+                    != Some(earlier)
+            {
+                return Err(reject());
+            }
+            if store.symbol_node_links(default).is_some_and(|links| {
+                links != &SymbolNodeLinks::default()
+                    && links
+                        != &(SymbolNodeLinks {
+                            resolved_symbol: Some(earlier),
+                        })
+            }) {
+                return Err(invariant(ClassInvariant::InvalidPropertyTypeCache(default)));
+            }
+            store
+                .declared_type_links(earlier)
+                .and_then(|links| links.declared_type)
+        }
+        _ => return Err(reject()),
+    };
+    if store.type_node_links(default).is_some_and(|links| {
+        links != &TypeNodeLinks::default()
+            && expected.is_none_or(|type_| {
+                links
+                    != &(TypeNodeLinks {
+                        resolved_type: Some(type_),
+                        ..TypeNodeLinks::default()
+                    })
+            })
+    }) {
+        return Err(invariant(ClassInvariant::InvalidPropertyTypeCache(default)));
+    }
+    Ok(expected)
+}
+
+#[allow(clippy::too_many_lines)] // Parameter ownership, constraints, defaults, and caches share one proof.
 fn validate_plain_class_type_parameters(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -6841,6 +6989,7 @@ fn validate_plain_class_type_parameters(
         .try_reserve(parameters.nodes.len())
         .map_err(|_| invariant(ClassInvariant::Capacity(declaration)))?;
     let mut previous_end = parameters.range.start;
+    let mut default_seen = false;
     for parameter in &parameters.nodes {
         let parameter = NodeRef::new(declaration.arena, declaration.file, *parameter);
         let record = preflight_node(store, host, parameter)?;
@@ -6859,8 +7008,6 @@ fn validate_plain_class_type_parameters(
             || record.parent != Some(declaration.node)
             || record.range.start < previous_end
             || record.range.end > parameters.range.end
-            || data.constraint.is_some()
-            || data.default_type.is_some()
             || data.expression.is_some()
             || data.symbol.is_some()
             || data.modifiers.is_some()
@@ -6883,6 +7030,82 @@ fn validate_plain_class_type_parameters(
             || !symbols.insert(symbol)
         {
             return Err(reject());
+        }
+
+        let constraint = data
+            .constraint
+            .map(|constraint| NodeRef::new(parameter.arena, parameter.file, constraint));
+        let expected_constraint = constraint
+            .map(|constraint| {
+                validate_plain_class_type_parameter_constraint(
+                    store,
+                    host,
+                    declaration,
+                    parameter,
+                    constraint,
+                    name_record.range.end,
+                )
+            })
+            .transpose()?;
+        let default = data
+            .default_type
+            .map(|default| NodeRef::new(parameter.arena, parameter.file, default));
+        if default_seen && default.is_none() {
+            return Err(reject());
+        }
+        default_seen |= default.is_some();
+        let expected_default = default
+            .map(|default| {
+                validate_plain_class_type_parameter_default(
+                    store,
+                    host,
+                    owner,
+                    declaration,
+                    parameter,
+                    symbol,
+                    default,
+                    &symbols,
+                    constraint
+                        .and_then(|constraint| host.node(constraint))
+                        .map_or(name_record.range.end, |record| record.range.end),
+                )
+            })
+            .transpose()?;
+
+        if let Some(parameter_type) = store
+            .declared_type_links(symbol)
+            .and_then(|links| links.declared_type)
+        {
+            let Some(TypeData::TypeParameter(cached)) =
+                store.type_payload(parameter_type).map(TypeRecord::data)
+            else {
+                return Err(invariant(ClassInvariant::InvalidProperty(parameter)));
+            };
+            if cached_ordinary_type_parameter_owner(store, parameter_type) != Some(symbol) {
+                return Err(invariant(ClassInvariant::InvalidProperty(parameter)));
+            }
+            if cached.constraint.is_some_and(|cached| {
+                expected_constraint != Some(cached)
+                    || constraint.is_none_or(|constraint| {
+                        store.type_node_links(constraint)
+                            != Some(&TypeNodeLinks {
+                                resolved_type: Some(cached),
+                                ..TypeNodeLinks::default()
+                            })
+                    })
+            }) {
+                return Err(invariant(ClassInvariant::InvalidPropertyTypeCache(
+                    constraint.unwrap_or(parameter),
+                )));
+            }
+            if cached
+                .resolved_default_type
+                .is_some_and(|cached| expected_default.flatten() != Some(cached))
+            {
+                return Err(invariant(ClassInvariant::InvalidPropertyTypeCache(
+                    default.unwrap_or(parameter),
+                )));
+            }
         }
         previous_end = record.range.end;
     }
@@ -20957,6 +21180,23 @@ mod tests {
             .unwrap()
     }
 
+    fn class_type_parameter_nodes(fixture: &Fixture, name: &str) -> Vec<NodeRef> {
+        let declaration = class_node(fixture, name);
+        let NodeData::ClassDeclaration(class) =
+            &fixture.parsed.arena.get(declaration.node).unwrap().data
+        else {
+            panic!("the generic class retains its declaration")
+        };
+        class
+            .type_parameters
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .map(|parameter| NodeRef::new(declaration.arena, declaration.file, *parameter))
+            .collect()
+    }
+
     fn warm_class_method(
         store: &mut TestStore,
         method: &ClassMethodPlan,
@@ -27085,6 +27325,562 @@ mod tests {
     }
 
     #[test]
+    fn constrained_and_defaulted_generic_classes_preserve_lazy_parameter_identities() {
+        for (source, count, abstract_class) in [
+            ("class Model<Value extends {}> {}", 1, false),
+            ("class Model<Value = any> {}", 1, false),
+            (
+                "class Model<Attrs extends {} = any, Create extends {} = Attrs> {}",
+                2,
+                false,
+            ),
+            (
+                concat!(
+                    "abstract class Model<Attrs extends {} = any, ",
+                    "Create extends {} = Attrs> { abstract value: string; }",
+                ),
+                2,
+                true,
+            ),
+        ] {
+            let mut fixture = fixture(source);
+            let owner = class_symbol(&fixture, "Model");
+            let parameters = class_type_parameter_nodes(&fixture, "Model");
+            let bound = &fixture.files[&fixture.file];
+            let host = host(&fixture.parsed.arena, bound);
+            let mut annotations = Vec::new();
+            for parameter in &parameters {
+                let NodeData::TypeParameterDeclaration(data) =
+                    &fixture.parsed.arena.get(parameter.node).unwrap().data
+                else {
+                    panic!("the generic class retains its parameter declaration")
+                };
+                annotations.extend(
+                    [data.constraint, data.default_type]
+                        .into_iter()
+                        .flatten()
+                        .map(|node| NodeRef::new(parameter.arena, parameter.file, node)),
+                );
+                assert!(
+                    fixture
+                        .store
+                        .declared_type_links(bound.symbol(*parameter).unwrap())
+                        .is_none(),
+                    "{source}",
+                );
+            }
+            let cold = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
+
+            assert_eq!(parameters.len(), count, "{source}");
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                cold,
+                "{source}",
+            );
+            for annotation in &annotations {
+                assert!(fixture.store.type_node_links(*annotation).is_none());
+            }
+
+            let members =
+                execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan).unwrap();
+
+            for parameter in &parameters {
+                let symbol = bound.symbol(*parameter).unwrap();
+                let type_ = fixture
+                    .store
+                    .declared_type_links(symbol)
+                    .and_then(|links| links.declared_type)
+                    .unwrap();
+                let TypeData::TypeParameter(parameter) =
+                    fixture.store.type_payload(type_).unwrap().data()
+                else {
+                    panic!("the generic class retains its canonical parameter identity")
+                };
+                assert!(parameter.constraint.is_none());
+                assert!(parameter.resolved_default_type.is_none());
+            }
+            for annotation in &annotations {
+                assert!(fixture.store.type_node_links(*annotation).is_none());
+            }
+            let signature = fixture
+                .store
+                .signature(members.default_construct_signature())
+                .unwrap();
+            assert_eq!(signature.type_parameters().len(), count);
+            assert_eq!(
+                signature.flags(),
+                SignatureFlags::CONSTRUCT
+                    | if abstract_class {
+                        SignatureFlags::ABSTRACT
+                    } else {
+                        SignatureFlags::NONE
+                    },
+            );
+            assert_eq!(
+                validate_class_heritage_members(&fixture.store, members.shells().instance_type()),
+                ClassHeritageMembersValidation::Valid,
+            );
+            let warm = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            assert_eq!(
+                execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan),
+                Ok(members),
+                "{source}",
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                warm,
+                "{source}",
+            );
+        }
+    }
+
+    #[test]
+    fn generic_class_parameters_accept_exact_warm_constraints_and_forwarded_defaults() {
+        let mut fixture =
+            fixture("class Model<Attrs extends {} = any, Create extends {} = Attrs> {}");
+        let owner = class_symbol(&fixture, "Model");
+        let parameters = class_type_parameter_nodes(&fixture, "Model");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
+        let members =
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan).unwrap();
+        let first_symbol = bound.symbol(parameters[0]).unwrap();
+        let second_symbol = bound.symbol(parameters[1]).unwrap();
+        let first = fixture
+            .store
+            .declared_type_links(first_symbol)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let second = fixture
+            .store
+            .declared_type_links(second_symbol)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let (first_constraint, second_constraint, second_default) = {
+            let NodeData::TypeParameterDeclaration(first_data) =
+                &fixture.parsed.arena.get(parameters[0].node).unwrap().data
+            else {
+                panic!("the class retains its first generic parameter")
+            };
+            let NodeData::TypeParameterDeclaration(second_data) =
+                &fixture.parsed.arena.get(parameters[1].node).unwrap().data
+            else {
+                panic!("the class retains its second generic parameter")
+            };
+            (
+                NodeRef::new(
+                    parameters[0].arena,
+                    parameters[0].file,
+                    first_data.constraint.unwrap(),
+                ),
+                NodeRef::new(
+                    parameters[1].arena,
+                    parameters[1].file,
+                    second_data.constraint.unwrap(),
+                ),
+                NodeRef::new(
+                    parameters[1].arena,
+                    parameters[1].file,
+                    second_data.default_type.unwrap(),
+                ),
+            )
+        };
+        let (empty, any) = {
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            (bootstrap.empty_type_literal_type, bootstrap.any_type)
+        };
+        for constraint in [first_constraint, second_constraint] {
+            assert!(fixture.store.set_type_node_links(
+                constraint,
+                TypeNodeLinks {
+                    resolved_type: Some(empty),
+                    ..TypeNodeLinks::default()
+                },
+            ));
+        }
+        assert!(fixture.store.set_type_node_links(
+            second_default,
+            TypeNodeLinks {
+                resolved_type: Some(first),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        assert!(fixture.store.set_symbol_node_links(
+            second_default,
+            SymbolNodeLinks {
+                resolved_symbol: Some(first_symbol),
+            },
+        ));
+        assert!(fixture.store.set_type_parameter_resolution(
+            first,
+            Some(empty),
+            None,
+            None,
+            Some(any),
+        ));
+        assert!(fixture.store.set_type_parameter_resolution(
+            second,
+            Some(empty),
+            None,
+            None,
+            Some(first),
+        ));
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        assert_eq!(
+            plan_nongeneric_class_member_query(&fixture.store, &host, owner),
+            Ok(plan.clone()),
+        );
+        assert_eq!(
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan),
+            Ok(members),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn constrained_generic_class_defaults_check_from_source_and_forward_reference_types() {
+        let parsed = parse_source_file(concat!(
+            "class Model<Attrs extends {} = any, Create extends {} = Attrs> {} ",
+            "interface Payload { value: string; } ",
+            "let defaults: Model; ",
+            "let forwarded: Model<Payload>;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(9_184);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/generic-class-defaults.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            [(file, &parsed.arena)].into_iter().collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+
+        context.check_source_file(file).unwrap();
+
+        let owner = context
+            .store()
+            .intrinsic_bootstrap()
+            .and_then(|bootstrap| context.store().symbol_table(bootstrap.globals))
+            .and_then(|globals| globals.get_source("Model"))
+            .unwrap();
+        let instance = context
+            .store()
+            .declared_type_links(owner)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let TypeData::Interface(instance) = context.store().type_payload(instance).unwrap().data()
+        else {
+            panic!("the constrained generic class retains its interface origin")
+        };
+        let [first, second] = instance
+            .reference
+            .resolved_type_arguments
+            .as_deref()
+            .unwrap()
+        else {
+            panic!("the generic class retains both declaration-owned parameters")
+        };
+        let first = *first;
+        let second = *second;
+        let TypeData::TypeParameter(first_data) =
+            context.store().type_payload(first).unwrap().data()
+        else {
+            panic!("the first generic class parameter retains its canonical identity")
+        };
+        let TypeData::TypeParameter(second_data) =
+            context.store().type_payload(second).unwrap().data()
+        else {
+            panic!("the second generic class parameter retains its canonical identity")
+        };
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        assert_eq!(
+            first_data.constraint,
+            Some(bootstrap.empty_type_literal_type)
+        );
+        assert_eq!(
+            second_data.constraint,
+            Some(bootstrap.empty_type_literal_type)
+        );
+        assert_eq!(first_data.resolved_default_type, Some(bootstrap.any_type));
+        assert_eq!(second_data.resolved_default_type, Some(first));
+        assert!(context.diagnostics().is_empty());
+        let warm = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+
+        context.recheck_source_file(file).unwrap();
+
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn constrained_generic_classes_preserve_readonly_date_constructor_defaults() {
+        let mut fixture = date_constructor_fixture(concat!(
+            "class Model<Value extends {} = any> { ",
+            "constructor(readonly timestamp = new Date()) {} ",
+            "}",
+        ));
+        let owner = class_symbol(&fixture, "Model");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
+        let ClassMemberQueryPlan::Direct(class) = &plan else {
+            panic!("the constrained Date constructor belongs to one direct class")
+        };
+        let constructor = class.class.constructor.unwrap();
+        let parameter = constructor.inferred_date_parameter.unwrap();
+
+        let members =
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan).unwrap();
+
+        let date_type = fixture
+            .store
+            .declared_type_links(parameter.initializer.symbol())
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let signature = fixture
+            .store
+            .signature(members.default_construct_signature())
+            .unwrap();
+        assert_eq!(signature.type_parameters().len(), 1);
+        assert_eq!(signature.parameters(), &[parameter.local_symbol]);
+        assert_eq!(signature.min_argument_count(), 0);
+        for symbol in [parameter.local_symbol, parameter.property_symbol] {
+            assert_eq!(
+                fixture.store.value_symbol_links(symbol),
+                Some(&ValueSymbolLinks {
+                    resolved_type: Some(date_type),
+                    ..ValueSymbolLinks::default()
+                }),
+            );
+        }
+        assert_eq!(
+            validate_class_heritage_members(&fixture.store, members.shells().instance_type()),
+            ClassHeritageMembersValidation::Valid,
+        );
+    }
+
+    #[test]
+    fn constrained_generic_heritage_preserves_forwarded_class_parameter_identity() {
+        let mut fixture = fixture(concat!(
+            "class Base<Value extends {}> { inherited: string; } ",
+            "class Derived<Value extends {}> extends Base<Value> {}",
+        ));
+        let base = class_symbol(&fixture, "Base");
+        let owner = class_symbol(&fixture, "Derived");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let base_plan = plan_nongeneric_class_member_query(&fixture.store, &host, base).unwrap();
+        let base_members =
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &base_plan).unwrap();
+        let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
+
+        let members =
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan).unwrap();
+
+        let TypeData::Interface(instance) = fixture
+            .store
+            .type_payload(members.shells().instance_type())
+            .unwrap()
+            .data()
+        else {
+            panic!("the constrained derived class retains its interface identity")
+        };
+        let [parameter] = instance
+            .reference
+            .resolved_type_arguments
+            .as_deref()
+            .unwrap()
+        else {
+            panic!("the constrained derived class retains one type parameter")
+        };
+        let [base_reference] = instance.resolved_base_types.as_deref().unwrap() else {
+            panic!("the constrained class retains its direct generic base")
+        };
+        let base_reference =
+            validate_direct_generic_reference(&fixture.store, *base_reference).unwrap();
+        assert_eq!(base_reference.target, base_members.shells().instance_type());
+        assert_eq!(base_reference.type_arguments, [*parameter]);
+        assert_eq!(
+            validate_class_heritage_members(&fixture.store, members.shells().instance_type()),
+            ClassHeritageMembersValidation::Valid,
+        );
+    }
+
+    #[test]
+    fn generic_class_parameter_cache_poison_fails_before_class_publication() {
+        for poison in 0..6 {
+            let mut fixture =
+                fixture("class Model<Attrs extends {} = any, Create extends {} = Attrs> {}");
+            let owner = class_symbol(&fixture, "Model");
+            let parameters = class_type_parameter_nodes(&fixture, "Model");
+            let bound = &fixture.files[&fixture.file];
+            let host = host(&fixture.parsed.arena, bound);
+            let first_symbol = bound.symbol(parameters[0]).unwrap();
+            let second_symbol = bound.symbol(parameters[1]).unwrap();
+            let (constraint, any_default, forwarded_default) = {
+                let NodeData::TypeParameterDeclaration(first) =
+                    &fixture.parsed.arena.get(parameters[0].node).unwrap().data
+                else {
+                    panic!("the class retains its first generic parameter")
+                };
+                let NodeData::TypeParameterDeclaration(second) =
+                    &fixture.parsed.arena.get(parameters[1].node).unwrap().data
+                else {
+                    panic!("the class retains its second generic parameter")
+                };
+                (
+                    NodeRef::new(
+                        parameters[0].arena,
+                        parameters[0].file,
+                        first.constraint.unwrap(),
+                    ),
+                    NodeRef::new(
+                        parameters[0].arena,
+                        parameters[0].file,
+                        first.default_type.unwrap(),
+                    ),
+                    NodeRef::new(
+                        parameters[1].arena,
+                        parameters[1].file,
+                        second.default_type.unwrap(),
+                    ),
+                )
+            };
+            let wrong = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+            let expected = match poison {
+                0..=2 => {
+                    let node = [constraint, any_default, forwarded_default][poison];
+                    assert!(fixture.store.set_type_node_links(
+                        node,
+                        TypeNodeLinks {
+                            resolved_type: Some(wrong),
+                            ..TypeNodeLinks::default()
+                        },
+                    ));
+                    invariant(ClassInvariant::InvalidPropertyTypeCache(node))
+                }
+                3 => {
+                    assert!(fixture.store.set_symbol_node_links(
+                        forwarded_default,
+                        SymbolNodeLinks {
+                            resolved_symbol: Some(second_symbol),
+                        },
+                    ));
+                    invariant(ClassInvariant::InvalidPropertyTypeCache(forwarded_default))
+                }
+                4 => {
+                    let first = fixture
+                        .store
+                        .get_declared_type_of_symbol(&host, first_symbol)
+                        .unwrap();
+                    assert!(fixture.store.set_type_parameter_resolution(
+                        first,
+                        Some(wrong),
+                        None,
+                        None,
+                        None,
+                    ));
+                    invariant(ClassInvariant::InvalidPropertyTypeCache(constraint))
+                }
+                5 => {
+                    let second = fixture
+                        .store
+                        .get_declared_type_of_symbol(&host, second_symbol)
+                        .unwrap();
+                    assert!(fixture.store.set_type_parameter_resolution(
+                        second,
+                        None,
+                        None,
+                        None,
+                        Some(wrong),
+                    ));
+                    invariant(ClassInvariant::InvalidPropertyTypeCache(forwarded_default))
+                }
+                _ => unreachable!("generic parameters retain six poisoned-cache cases"),
+            };
+            let poisoned = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            assert_eq!(
+                plan_nongeneric_class_member_query(&fixture.store, &host, owner),
+                Err(expected),
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                poisoned,
+            );
+            assert!(fixture.store.declared_type_links(owner).is_none());
+            assert!(fixture.store.value_symbol_links(owner).is_none());
+        }
+    }
+
+    #[test]
     fn plain_generic_classes_preserve_type_parameters_private_fields_and_abstract_signatures() {
         for (source, abstract_class) in [
             ("class Model<Value> { value: string; #secret = 1; }", false),
@@ -27475,7 +28271,17 @@ mod tests {
     fn generic_classes_reject_unsupported_constraints_and_forged_heritage_arguments() {
         for (source, name) in [
             ("class Model<Value extends string> {}", "Model"),
+            ("class Model<Value extends { item: string }> {}", "Model"),
+            ("class Model<Value extends any> {}", "Model"),
             ("class Model<Value = string> {}", "Model"),
+            ("class Model<Value extends {} = unknown> {}", "Model"),
+            ("class Model<Value = Value> {}", "Model"),
+            ("class Model<First = Second, Second = any> {}", "Model"),
+            ("class Other {} class Model<Value = Other> {}", "Model"),
+            (
+                "class Model<First = any, Second = First<string>> {}",
+                "Model",
+            ),
             (
                 "class Base<Value> {} class Derived<Value> extends Base<string> {}",
                 "Derived",
