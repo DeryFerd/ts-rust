@@ -15,6 +15,7 @@ use super::{
     array_types::CanonicalArrayTargets,
     bootstrap::LiteralTypeCacheError,
     constraints::{self, ConstraintError},
+    declared::cached_ordinary_type_parameter_owner,
     instantiate::{
         InstantiationError, InstantiationLimits, InstantiationSession, canonical_anonymous_union,
         instantiate_type_with_session, instantiate_type_with_vector_and_session,
@@ -1117,18 +1118,103 @@ fn trivial_conditional_identity(
         .intrinsic_bootstrap()
         .ok_or(ConditionalTypeError::MissingBootstrap)?
         .never_type;
+    let check_flags = type_flags(store, check_type)?;
     let extends_flags = type_flags(store, extends_type)?;
-    if true_type == check_type
-        && false_type == never
-        && (check_type == extends_type || extends_flags.intersects(TypeFlags::ANY_OR_UNKNOWN))
-        || true_type == never
-            && false_type == check_type
-            && extends_flags.intersects(TypeFlags::NEVER)
-    {
-        return Ok(Some(check_type));
+    let disjoint = extends_flags.intersects(TypeFlags::NEVER)
+        || conditional_operands_have_disjoint_primitive_domains(store, check_type, extends_type);
+    if true_type == check_type && false_type == never {
+        if check_flags.intersects(TypeFlags::ANY)
+            || check_type == extends_type
+            || extends_flags.intersects(TypeFlags::ANY_OR_UNKNOWN)
+        {
+            return Ok(Some(check_type));
+        }
+        if disjoint {
+            return Ok(Some(never));
+        }
+    }
+    if true_type == never && false_type == check_type {
+        if check_type == extends_type || extends_flags.intersects(TypeFlags::ANY_OR_UNKNOWN) {
+            return Ok(Some(never));
+        }
+        if check_flags.intersects(TypeFlags::ANY) || disjoint {
+            return Ok(Some(check_type));
+        }
     }
 
     Ok(None)
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ConditionalPrimitiveDomain {
+    String,
+    Number,
+    BigInt,
+    Boolean,
+    Symbol,
+}
+
+pub(super) fn conditional_operands_have_disjoint_primitive_domains(
+    store: &CanonicalTypeMapperStore,
+    check_type: TypeId,
+    extends_type: TypeId,
+) -> bool {
+    let Some((check, check_domain)) = conditional_primitive_operand(store, check_type) else {
+        return false;
+    };
+    let Some((extends, extends_domain)) = conditional_primitive_operand(store, extends_type) else {
+        return false;
+    };
+    if check_domain != extends_domain {
+        return true;
+    }
+
+    matches!(
+        (
+            store.type_payload(check).map(TypeRecord::data),
+            store.type_payload(extends).map(TypeRecord::data),
+        ),
+        (Some(TypeData::Literal(check)), Some(TypeData::Literal(extends)))
+            if check.value != extends.value
+    )
+}
+
+fn conditional_primitive_operand(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Option<(TypeId, ConditionalPrimitiveDomain)> {
+    let record = store.type_payload(type_)?;
+    let primitive = match record.data() {
+        TypeData::TypeParameter(parameter) => {
+            cached_ordinary_type_parameter_owner(store, type_)?;
+            let constraint = parameter.constraint?;
+            let bootstrap = store.intrinsic_bootstrap()?;
+            if [
+                bootstrap.no_constraint_type,
+                bootstrap.circular_constraint_type,
+                bootstrap.error_type,
+                bootstrap.wildcard_type,
+            ]
+            .contains(&constraint)
+            {
+                return None;
+            }
+            constraint
+        }
+        _ => type_,
+    };
+    let domain = match store.type_payload(primitive)?.flags() {
+        TypeFlags::STRING | TypeFlags::STRING_LITERAL => ConditionalPrimitiveDomain::String,
+        TypeFlags::NUMBER | TypeFlags::NUMBER_LITERAL => ConditionalPrimitiveDomain::Number,
+        TypeFlags::BIG_INT | TypeFlags::BIG_INT_LITERAL => ConditionalPrimitiveDomain::BigInt,
+        TypeFlags::BOOLEAN | TypeFlags::BOOLEAN_LITERAL => ConditionalPrimitiveDomain::Boolean,
+        TypeFlags::ES_SYMBOL | TypeFlags::UNIQUE_ES_SYMBOL => ConditionalPrimitiveDomain::Symbol,
+        _ => return None,
+    };
+    if store.validate_union_constituent(primitive).is_err() {
+        return None;
+    }
+    Some((primitive, domain))
 }
 
 #[allow(clippy::too_many_arguments)] // Tail recursion retains the current root and active mapper.
@@ -3113,13 +3199,14 @@ mod tests {
 
     use super::*;
     use crate::semantic::{
-        CanonicalCheckerDiagnostics, CanonicalCheckerOptions, DeclaredTypeHost,
+        CanonicalCheckerDiagnostics, CanonicalCheckerOptions, DeclaredTypeHost, DeclaredTypeLinks,
         IntrinsicBootstrapOptions, SemanticStore, ValueSymbolLinks,
         declared::execute_type_parameter,
         mapper::TypeMapper,
         production::GlobalMergeCompletion,
         signatures::IndexFlags,
         type_nodes::CanonicalTypeQuery,
+        type_records::RegularLiteralLink,
         types::{AccessFlags, ObjectFlags},
     };
 
@@ -3610,6 +3697,383 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Impossible bounds share one root and warm-cache matrix.
+    fn trivial_distributive_instantiations_reduce_impossible_branches_to_never() {
+        #[derive(Clone, Copy)]
+        enum Bound {
+            Never,
+            Checked,
+            Any,
+            Unknown,
+        }
+
+        for (keep_true, bound) in [
+            (true, Bound::Never),
+            (false, Bound::Checked),
+            (false, Bound::Any),
+            (false, Bound::Unknown),
+        ] {
+            let source = if keep_true {
+                "type Select<T, U> = T extends U ? T : never; type Caller<Value> = Value;"
+            } else {
+                "type Select<T, U> = T extends U ? never : T; type Caller<Value> = Value;"
+            };
+            let mut fixture = Fixture::new(source);
+            let node = fixture.conditional();
+            let parameter = fixture.type_parameter("T");
+            let bound_parameter = fixture.type_parameter("U");
+            let checked = fixture.type_parameter("Value");
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            let never = bootstrap.never_type;
+            let actual_bound = match bound {
+                Bound::Never => never,
+                Bound::Checked => checked,
+                Bound::Any => bootstrap.any_type,
+                Bound::Unknown => bootstrap.unknown_type,
+            };
+            let branch_types = if keep_true {
+                branches(parameter, never)
+            } else {
+                branches(never, parameter)
+            };
+            let conditional = get_type_from_conditional_type(
+                &mut fixture.store,
+                ConditionalTypeRequest {
+                    node,
+                    check_type: parameter,
+                    extends_type: bound_parameter,
+                    branches: branch_types,
+                    infer_type_parameters: &[],
+                    outer_type_parameters: &[parameter, bound_parameter],
+                    alias: None,
+                },
+                None,
+            )
+            .unwrap();
+            let mapper_count = fixture.store.mapper_len();
+
+            assert_eq!(
+                get_conditional_type_instantiation(
+                    &mut fixture.store,
+                    ConditionalTypeInstantiation {
+                        conditional_type: conditional,
+                        type_arguments: &[checked, actual_bound],
+                        branches: branch_types,
+                        alias: None,
+                        for_constraint: false,
+                    },
+                    None,
+                    None,
+                ),
+                Ok(never),
+            );
+            assert_eq!(fixture.store.mapper_len(), mapper_count);
+            let warm = (
+                fixture.store.type_len(),
+                fixture.store.conditional_root_len(),
+                fixture.store.mapper_len(),
+            );
+            assert_eq!(
+                get_conditional_type_instantiation(
+                    &mut fixture.store,
+                    ConditionalTypeInstantiation {
+                        conditional_type: conditional,
+                        type_arguments: &[checked, actual_bound],
+                        branches: branch_types,
+                        alias: None,
+                        for_constraint: false,
+                    },
+                    None,
+                    None,
+                ),
+                Ok(never),
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.conditional_root_len(),
+                    fixture.store.mapper_len(),
+                ),
+                warm,
+            );
+        }
+    }
+
+    #[test]
+    fn trivial_conditional_never_reductions_preserve_any_semantics() {
+        for (keep_true, use_any_bound, expected_any) in [
+            (true, false, true),
+            (true, true, true),
+            (false, false, true),
+            (false, true, false),
+        ] {
+            let source = if keep_true {
+                "type Select<T, U> = T extends U ? T : never;"
+            } else {
+                "type Select<T, U> = T extends U ? never : T;"
+            };
+            let mut fixture = Fixture::new(source);
+            let node = fixture.conditional();
+            let parameter = fixture.type_parameter("T");
+            let bound = fixture.type_parameter("U");
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            let (any, never) = (bootstrap.any_type, bootstrap.never_type);
+            let branch_types = if keep_true {
+                branches(parameter, never)
+            } else {
+                branches(never, parameter)
+            };
+            let conditional = get_type_from_conditional_type(
+                &mut fixture.store,
+                ConditionalTypeRequest {
+                    node,
+                    check_type: parameter,
+                    extends_type: bound,
+                    branches: branch_types,
+                    infer_type_parameters: &[],
+                    outer_type_parameters: &[parameter, bound],
+                    alias: None,
+                },
+                None,
+            )
+            .unwrap();
+
+            assert_eq!(
+                get_conditional_type_instantiation(
+                    &mut fixture.store,
+                    ConditionalTypeInstantiation {
+                        conditional_type: conditional,
+                        type_arguments: &[any, if use_any_bound { any } else { never }],
+                        branches: branch_types,
+                        alias: None,
+                        for_constraint: false,
+                    },
+                    None,
+                    None,
+                ),
+                Ok(if expected_any { any } else { never }),
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Literal and primitive constraints share one safety matrix.
+    fn constrained_primitive_conditionals_reduce_only_when_domains_are_disjoint() {
+        for (keep_true, use_literals) in [(true, false), (false, false), (true, true)] {
+            let source = if keep_true {
+                concat!(
+                    "type Select<T, U> = T extends U ? T : never; ",
+                    "type Caller<Value> = Value;",
+                )
+            } else {
+                concat!(
+                    "type Select<T, U> = T extends U ? never : T; ",
+                    "type Caller<Value> = Value;",
+                )
+            };
+            let mut fixture = Fixture::new(source);
+            let node = fixture.conditional();
+            let parameter = fixture.type_parameter("T");
+            let bound = fixture.type_parameter("U");
+            let checked = fixture.type_parameter("Value");
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            let (string, number, never) = (
+                bootstrap.string_type,
+                bootstrap.number_type,
+                bootstrap.never_type,
+            );
+            let (constraint, disjoint_bound, compatible_bound) = if use_literals {
+                (
+                    fixture
+                        .store
+                        .regular_string_literal_type("left".to_owned())
+                        .unwrap(),
+                    fixture
+                        .store
+                        .regular_string_literal_type("right".to_owned())
+                        .unwrap(),
+                    string,
+                )
+            } else {
+                (string, number, string)
+            };
+            assert!(fixture.store.set_type_parameter_resolution(
+                checked,
+                Some(constraint),
+                None,
+                None,
+                None,
+            ));
+            assert!(conditional_operands_have_disjoint_primitive_domains(
+                &fixture.store,
+                checked,
+                disjoint_bound,
+            ));
+            assert!(!conditional_operands_have_disjoint_primitive_domains(
+                &fixture.store,
+                checked,
+                compatible_bound,
+            ));
+            let branch_types = if keep_true {
+                branches(parameter, never)
+            } else {
+                branches(never, parameter)
+            };
+            let conditional = get_type_from_conditional_type(
+                &mut fixture.store,
+                ConditionalTypeRequest {
+                    node,
+                    check_type: parameter,
+                    extends_type: bound,
+                    branches: branch_types,
+                    infer_type_parameters: &[],
+                    outer_type_parameters: &[parameter, bound],
+                    alias: None,
+                },
+                None,
+            )
+            .unwrap();
+
+            assert_eq!(
+                get_conditional_type_instantiation(
+                    &mut fixture.store,
+                    ConditionalTypeInstantiation {
+                        conditional_type: conditional,
+                        type_arguments: &[checked, disjoint_bound],
+                        branches: branch_types,
+                        alias: None,
+                        for_constraint: false,
+                    },
+                    None,
+                    None,
+                ),
+                Ok(if keep_true { never } else { checked }),
+            );
+            let unresolved = get_conditional_type_instantiation(
+                &mut fixture.store,
+                ConditionalTypeInstantiation {
+                    conditional_type: conditional,
+                    type_arguments: &[checked, compatible_bound],
+                    branches: branch_types,
+                    alias: None,
+                    for_constraint: false,
+                },
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(matches!(
+                fixture.store.type_payload(unresolved).map(TypeRecord::data),
+                Some(TypeData::Conditional(_))
+            ));
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One proof covers forged literals, owners, and cycles.
+    fn disjoint_primitive_conditional_proofs_reject_forged_caches() {
+        let mut fixture = Fixture::new("type Caller<Value, Other> = Value;");
+        let checked = fixture.type_parameter("Value");
+        let other = fixture.type_parameter("Other");
+        let left = fixture
+            .store
+            .regular_string_literal_type("left".to_owned())
+            .unwrap();
+        let right = fixture
+            .store
+            .regular_string_literal_type("right".to_owned())
+            .unwrap();
+        assert!(
+            fixture
+                .store
+                .set_type_parameter_resolution(checked, Some(left), None, None, None,)
+        );
+        assert!(conditional_operands_have_disjoint_primitive_domains(
+            &fixture.store,
+            checked,
+            right,
+        ));
+
+        let forged = fixture
+            .store
+            .alloc_literal_type(
+                TypeFlags::STRING_LITERAL,
+                LiteralValue::String("left".to_owned()),
+                RegularLiteralLink::SelfType,
+            )
+            .unwrap();
+        assert!(fixture.store.set_type_parameter_resolution(
+            checked,
+            Some(forged),
+            None,
+            None,
+            None,
+        ));
+        assert!(!conditional_operands_have_disjoint_primitive_domains(
+            &fixture.store,
+            checked,
+            right,
+        ));
+        assert!(
+            fixture
+                .store
+                .set_type_parameter_resolution(checked, Some(left), None, None, None,)
+        );
+
+        let owner = cached_ordinary_type_parameter_owner(&fixture.store, checked).unwrap();
+        let links = fixture.store.declared_type_links(owner).unwrap().clone();
+        assert!(
+            fixture
+                .store
+                .set_declared_type_links(owner, DeclaredTypeLinks::default())
+        );
+        assert!(!conditional_operands_have_disjoint_primitive_domains(
+            &fixture.store,
+            checked,
+            right,
+        ));
+        assert!(fixture.store.set_declared_type_links(owner, links));
+        assert!(conditional_operands_have_disjoint_primitive_domains(
+            &fixture.store,
+            checked,
+            right,
+        ));
+
+        assert!(fixture.store.set_type_parameter_resolution(
+            other,
+            Some(checked),
+            None,
+            None,
+            None,
+        ));
+        assert!(fixture.store.set_type_parameter_resolution(
+            checked,
+            Some(other),
+            None,
+            None,
+            None,
+        ));
+        let cyclic = (
+            fixture.store.type_len(),
+            fixture.store.mapper_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert!(!conditional_operands_have_disjoint_primitive_domains(
+            &fixture.store,
+            checked,
+            right,
+        ));
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.mapper_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            cyclic,
+        );
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)] // One root covers identity, keyof, and deferred cases.
     fn templated_conditional_identity_simplifies_only_proven_branches() {
         let mut fixture = Fixture::new(concat!(
@@ -3852,6 +4316,156 @@ mod tests {
                 warm,
             );
         }
+    }
+
+    #[test]
+    fn impossible_conditional_alias_type_nodes_reduce_to_never() {
+        for source in [
+            concat!(
+                "type Extract<T, U> = T extends U ? T : never; ",
+                "type Result<Value> = Extract<Value, never>;",
+            ),
+            concat!(
+                "type Exclude<T, U> = T extends U ? never : T; ",
+                "type Result<Value> = Exclude<Value, Value>;",
+            ),
+            concat!(
+                "type Exclude<T, U> = T extends U ? never : T; ",
+                "type Result<Value> = Exclude<Value, any>;",
+            ),
+            concat!(
+                "type Exclude<T, U> = T extends U ? never : T; ",
+                "type Result<Value> = Exclude<Value, unknown>;",
+            ),
+            concat!(
+                "type ExtractWithDefault<T, U, D = never> = T extends U ? T : D; ",
+                "type Result<Value> = ExtractWithDefault<Value, never>;",
+            ),
+            concat!(
+                "type ExcludeWithDefault<T, U, D = never> = T extends U ? D : T; ",
+                "type Result<Value> = ExcludeWithDefault<Value, Value>;",
+            ),
+            concat!(
+                "type Select<Check, Bound, WhenTrue, WhenFalse> = ",
+                "Check extends Bound ? WhenTrue : WhenFalse; ",
+                "type Result<Value> = Select<Value, never, Value, never>;",
+            ),
+            concat!(
+                "type Select<Check, Bound, WhenTrue, WhenFalse> = ",
+                "Check extends Bound ? WhenTrue : WhenFalse; ",
+                "type Result<Value> = Select<Value, Value, never, Value>;",
+            ),
+        ] {
+            let mut fixture = Fixture::new(source);
+            let never = fixture.store.intrinsic_bootstrap().unwrap().never_type;
+            assert_eq!(fixture.declared_alias("Result"), never);
+
+            let warm = (
+                fixture.store.type_len(),
+                fixture.store.conditional_root_len(),
+                fixture.store.mapper_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+            assert_eq!(fixture.declared_alias("Result"), never);
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.conditional_root_len(),
+                    fixture.store.mapper_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                warm,
+            );
+        }
+    }
+
+    #[test]
+    fn constrained_conditional_alias_type_nodes_use_only_disjoint_primitive_proofs() {
+        for (source, preserves_parameter) in [
+            (
+                concat!(
+                    "type Extract<T, U> = T extends U ? T : never; ",
+                    "type Result<Value extends string> = Extract<Value, number>;",
+                ),
+                false,
+            ),
+            (
+                concat!(
+                    "type Exclude<T, U> = T extends U ? never : T; ",
+                    "type Result<Value extends string> = Exclude<Value, number>;",
+                ),
+                true,
+            ),
+            (
+                concat!(
+                    "type Extract<T, U> = T extends U ? T : never; ",
+                    "type Result<Value extends string, Bound extends number> = ",
+                    "Extract<Value, Bound>;",
+                ),
+                false,
+            ),
+            (
+                concat!(
+                    "type Exclude<T, U> = T extends U ? never : T; ",
+                    "type Result<Value extends string, Bound extends number> = ",
+                    "Exclude<Value, Bound>;",
+                ),
+                true,
+            ),
+            (
+                concat!(
+                    "type Extract<T, U> = T extends U ? T : never; ",
+                    "type Result<Value extends 'left'> = Extract<Value, 'right'>;",
+                ),
+                false,
+            ),
+            (
+                concat!(
+                    "type Exclude<T, U> = T extends U ? never : T; ",
+                    "type Result<Value extends 'left'> = Exclude<Value, 'right'>;",
+                ),
+                true,
+            ),
+        ] {
+            let mut fixture = Fixture::new(source);
+            let checked = fixture.type_parameter("Value");
+            let expected = if preserves_parameter {
+                checked
+            } else {
+                fixture.store.intrinsic_bootstrap().unwrap().never_type
+            };
+            assert_eq!(fixture.declared_alias("Result"), expected);
+
+            let warm = (
+                fixture.store.type_len(),
+                fixture.store.conditional_root_len(),
+                fixture.store.mapper_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+            assert_eq!(fixture.declared_alias("Result"), expected);
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.conditional_root_len(),
+                    fixture.store.mapper_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                warm,
+            );
+        }
+
+        let mut uncertain = Fixture::new(concat!(
+            "type Extract<T, U> = T extends U ? T : never; ",
+            "type Result<Value extends string> = Extract<Value, string>;",
+        ));
+        let unresolved = uncertain.declared_alias("Result");
+        assert!(matches!(
+            uncertain
+                .store
+                .type_payload(unresolved)
+                .map(TypeRecord::data),
+            Some(TypeData::Conditional(_))
+        ));
     }
 
     #[test]

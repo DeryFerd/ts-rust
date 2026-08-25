@@ -20,8 +20,8 @@ use super::{
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
     conditional_types::{
         ConditionalTypeBranches, ConditionalTypeInstantiation, ConditionalTypeRequest,
-        conditional_check_is_assignable, get_conditional_type_instantiation,
-        get_type_from_conditional_type,
+        conditional_check_is_assignable, conditional_operands_have_disjoint_primitive_domains,
+        get_conditional_type_instantiation, get_type_from_conditional_type,
     },
     declared::{
         cached_ordinary_type_parameter_owner, execute_type_parameter,
@@ -19716,7 +19716,12 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     | TypeFlags::SUBSTITUTION,
             )
             && (check_type == extends_type
-                || extends_flags.intersects(TypeFlags::NEVER | TypeFlags::ANY | TypeFlags::UNKNOWN))
+                || extends_flags.intersects(TypeFlags::NEVER | TypeFlags::ANY | TypeFlags::UNKNOWN)
+                || conditional_operands_have_disjoint_primitive_domains(
+                    self.store,
+                    check_type,
+                    extends_type,
+                ))
             && [conditional.true_type, conditional.false_type]
                 .into_iter()
                 .all(|branch| match self.store.source_node_kind(branch) {
