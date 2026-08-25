@@ -22449,13 +22449,16 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         ) else {
             return false;
         };
-        matches!(
-            heritage.bases.as_slice(),
-            [base]
-                if base.kind == DirectInterfaceBaseKind::DefaultLibraryInterface
-                    && base.symbol == element_constraint_symbol
-                    && base.type_arguments.is_empty()
-        )
+        heritage.bases.iter().all(|base| {
+            matches!(
+                base.kind,
+                DirectInterfaceBaseKind::Interface
+                    | DirectInterfaceBaseKind::DefaultLibraryInterface
+            ) && base.type_arguments.is_empty()
+        }) && heritage.bases.iter().any(|base| {
+            base.kind == DirectInterfaceBaseKind::DefaultLibraryInterface
+                && base.symbol == element_constraint_symbol
+        })
     }
 
     fn execute_generic_alias_instantiation(
@@ -35291,7 +35294,8 @@ mod tests {
         let library = parse_source_file(concat!(
             "interface HTMLElement { self: this; } ",
             "declare var HTMLElement: unknown; ",
-            "interface HTMLAnchorElement extends HTMLElement { ",
+            "interface HTMLHyperlinkElementUtils { href: string; } ",
+            "interface HTMLAnchorElement extends HTMLElement, HTMLHyperlinkElementUtils { ",
             "addEventListener<Value extends string>(type: Value): void; ",
             "} declare var HTMLAnchorElement: unknown;",
         ));
