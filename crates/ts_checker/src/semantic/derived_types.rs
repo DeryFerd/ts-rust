@@ -494,6 +494,11 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         self.validate_derived_object_literal(type_, None)
     }
 
+    /// Reuses the complete source-owned fresh-object proof for readonly relations.
+    pub(super) fn validate_fresh_object_literal_for_relation(&self, type_: TypeId) -> bool {
+        self.fresh_object_shape(type_).is_some()
+    }
+
     /// Validates a cached regular or widened object literal while retaining
     /// the authoritative array identities needed by nested widened arrays.
     pub(super) fn validate_derived_object_literal_with_global_types(

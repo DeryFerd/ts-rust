@@ -4555,7 +4555,7 @@ impl<'store> RelaterSession<'store> {
     ) -> bool {
         let name = record.name();
         if record.flags() != SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT
-            || record.check_flags() != CheckFlags::NONE
+            || record.check_flags().bits() & !CheckFlags::READONLY.bits() != 0
             || name.is_internal()
             || name.is_private_identifier()
             || name.is_late_bound()
@@ -5382,6 +5382,18 @@ impl<'store> RelaterSession<'store> {
             return Err(RelationUnavailable::StructuredSignatures(type_id));
         }
         let properties = structured.properties.clone().unwrap_or_default();
+        if matches!(property_origin, ObjectPropertyOrigin::FreshObjectLiteral(_))
+            && let Some(readonly) = properties.iter().copied().find(|property| {
+                self.store
+                    .symbol(*property)
+                    .is_some_and(|record| record.check_flags() == CheckFlags::READONLY)
+            })
+            && !self
+                .store
+                .validate_fresh_object_literal_for_relation(type_id)
+        {
+            return Err(RelationUnavailable::UnsupportedProperty(readonly));
+        }
         let index_infos =
             self.validated_declared_index_infos(type_id, record_symbol, &structured)?;
         let class_members = if property_origin.is_declared() {
@@ -16156,6 +16168,36 @@ mod tests {
             property,
             SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL | SymbolFlags::TRANSIENT,
             CheckFlags::NONE,
+        ));
+        let poisoned = store.relation_state_snapshot();
+        assert_eq!(
+            store.is_type_assignable_to(fixture.type_, target),
+            Err(RelationUnavailable::UnsupportedProperty(property))
+        );
+        assert_eq!(store.relation_state_snapshot(), poisoned);
+
+        assert!(store.set_symbol_flags(
+            property,
+            SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT,
+            CheckFlags::NONE,
+        ));
+        assert_eq!(store.is_type_assignable_to(fixture.type_, target), Ok(true));
+    }
+
+    #[test]
+    fn readonly_object_literal_clones_require_an_authenticated_const_source() {
+        let mut store = initialized(true);
+        let literal = store.regular_string_literal_type("ready".into()).unwrap();
+        let raw_seed = alloc_typed_property(&mut store, "value", literal, false);
+        let fixture = alloc_fresh_property_object_fixture(&mut store, vec![raw_seed]);
+        let property = fixture.properties[0];
+        let target_property = alloc_typed_property(&mut store, "value", literal, false);
+        let target = alloc_property_object(&mut store, vec![target_property]);
+
+        assert!(store.set_symbol_flags(
+            property,
+            SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT,
+            CheckFlags::READONLY,
         ));
         let poisoned = store.relation_state_snapshot();
         assert_eq!(
