@@ -26748,7 +26748,9 @@ pub(super) fn check_source_file(
                 }
                 if valid_index {
                     let base = widened_fresh_literal_type(store, assigned.assigned_type)?;
-                    let element = store.get_regular_type_of_object_literal(base)?;
+                    let regular = store.get_regular_type_of_object_literal(base)?;
+                    let element =
+                        store.get_widened_type_with_global_types(regular, global_types)?;
                     let previous = store.evolving_array_element_type(evolving)?;
                     let previous_is_empty = store
                         .type_payload(previous)
