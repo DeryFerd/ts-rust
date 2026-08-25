@@ -4093,6 +4093,15 @@ impl Program {
                 )?,
             );
         }
+        if self.options.isolated_declarations
+            && (self.options.declaration || self.options.composite)
+        {
+            for source in &self.source_files {
+                if checked_sources.contains(&source.id) {
+                    self.add_isolated_declaration_function_diagnostics(source, &mut diagnostics)?;
+                }
+            }
+        }
 
         diagnostics.extend(
             self.module_resolution_diagnostics
@@ -4111,6 +4120,66 @@ impl Program {
         let mut canonical_queries = CanonicalProgramQueries { context };
         let result = queries(self, &mut canonical_queries);
         Ok((diagnostics, result))
+    }
+
+    fn add_isolated_declaration_function_diagnostics(
+        &self,
+        source: &SourceFile,
+        diagnostics: &mut Vec<ProgramDiagnostic>,
+    ) -> Result<(), CanonicalProgramCheckError> {
+        if ts_path::is_declaration_file(&source.file_name)
+            || is_javascript_file_name(&source.file_name)
+        {
+            return Ok(());
+        }
+        let Some(NodeData::SourceFile(file)) = source
+            .parse
+            .arena
+            .get(source.parse.source_file)
+            .map(|node| &node.data)
+        else {
+            return Ok(());
+        };
+        for statement in &file.statements.nodes {
+            let Some(NodeData::FunctionDeclaration(function)) =
+                source.parse.arena.get(*statement).map(|node| &node.data)
+            else {
+                continue;
+            };
+            if function.type_.is_some()
+                || function.body.is_none()
+                || !node_has_modifier(
+                    &source.parse.arena,
+                    function.modifiers.as_ref(),
+                    SyntaxKind::ExportKeyword,
+                )
+            {
+                continue;
+            }
+            let Some(name) = function.name.and_then(|name| source.node_ref(name)) else {
+                continue;
+            };
+            let error = Diagnostic::new(
+                message_by_code(9007).expect("TS9007 must be in the generated catalog"),
+            );
+            let suggestion = Diagnostic::new(
+                message_by_code(9031).expect("TS9031 must be in the generated catalog"),
+            );
+            let diagnostic = self.canonical_program_diagnostic(
+                Some(name),
+                None,
+                &error,
+                [(Some(name), &suggestion)],
+            )?;
+            if !diagnostics.iter().any(|existing| {
+                existing.code == diagnostic.code
+                    && existing.file_name == diagnostic.file_name
+                    && existing.range == diagnostic.range
+            }) {
+                diagnostics.push(diagnostic);
+            }
+        }
+        Ok(())
     }
 
     fn add_missing_jsx_option_diagnostics(
@@ -16648,6 +16717,70 @@ export function create() { return new M.Value(); }"#,
                 .files
                 .iter()
                 .any(|file| file.file_name == "/project/main.d.ts")
+        );
+    }
+
+    #[test]
+    fn canonical_isolated_declarations_report_only_inferred_exported_return_types() {
+        let fs = MemoryFileSystem::new(true);
+        let source = concat!(
+            "export function isString(value: unknown) {\n",
+            "  return typeof value === \"string\";\n",
+            "}\n",
+            "export function isExplicitString(value: unknown): value is string {\n",
+            "  return typeof value === \"string\";\n",
+            "}\n",
+            "function local(value: unknown) {\n",
+            "  return typeof value === \"string\";\n",
+            "}\n",
+        );
+        fs.write_file("/project/predicate.ts", source).unwrap();
+
+        let program = Program::try_new_with_canonical_checker(
+            &fs,
+            "/project",
+            &["predicate.ts".to_owned()],
+            CompilerOptions {
+                declaration: true,
+                isolated_declarations: true,
+                lib: Some(vec!["es5".to_owned()]),
+                ..CompilerOptions::default()
+            },
+        )
+        .unwrap();
+
+        let [diagnostic] = program.diagnostics() else {
+            panic!(
+                "expected one isolated declaration diagnostic: {:?}",
+                program.diagnostics()
+            )
+        };
+        assert_eq!(diagnostic.code, Some(9007));
+        assert_eq!(
+            diagnostic.file_name.as_deref(),
+            Some("/project/predicate.ts")
+        );
+        assert_eq!(
+            diagnostic.message,
+            "Function must have an explicit return type annotation with --isolatedDeclarations.",
+        );
+        let range = diagnostic.range.unwrap();
+        assert_eq!(range.start.get(), 16);
+        assert_eq!(
+            &source[usize::try_from(range.start.get()).unwrap()
+                ..usize::try_from(range.end.get()).unwrap()],
+            "isString",
+        );
+
+        let [suggestion] = diagnostic.related_information.as_slice() else {
+            panic!("expected the upstream return-type suggestion")
+        };
+        assert_eq!(suggestion.code, Some(9031));
+        assert_eq!(suggestion.file_name, diagnostic.file_name);
+        assert_eq!(suggestion.range, diagnostic.range);
+        assert_eq!(
+            suggestion.message,
+            "Add a return type to the function declaration.",
         );
     }
 
