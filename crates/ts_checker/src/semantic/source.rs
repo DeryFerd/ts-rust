@@ -32513,9 +32513,10 @@ fn check_planned_array_binding_element(
                 tuple.element_types().to_vec(),
                 tuple.element_infos().to_vec(),
                 tuple.combined_flags(),
+                tuple.min_length(),
             )
         });
-    if let Some((types, infos, flags)) = tuple {
+    if let Some((types, infos, flags, minimum_length)) = tuple {
         if flags.intersects(ElementFlags::VARIADIC) {
             return Err(SourceCheckError::Unsupported(
                 UnsupportedSourceSyntax::Syntax {
@@ -32551,6 +32552,42 @@ fn check_planned_array_binding_element(
                         .with_array_targets(CanonicalArrayTargets::from_global_types(global_types)),
                 )
                 .map_err(|error| source_contextual_tuple_error(receiver, error))?;
+            return Ok(CheckedSourceElement {
+                type_,
+                diagnostic: None,
+            });
+        }
+
+        if let Some(rest_position) = infos
+            .iter()
+            .position(|info| info.flags().contains(ElementFlags::REST))
+            && binding.index >= rest_position
+        {
+            let mut candidates = Vec::with_capacity(types.len() - rest_position + 1);
+            candidates.push(types[rest_position]);
+            let suffix_count =
+                (binding.index - rest_position + 1).min(types.len() - rest_position - 1);
+            for candidate in &types[rest_position + 1..rest_position + 1 + suffix_count] {
+                if !candidates.contains(candidate) {
+                    candidates.push(*candidate);
+                }
+            }
+            if options.intrinsic.strict_null_checks
+                && options.no_unchecked_indexed_access
+                && binding.index >= minimum_length
+                && !candidates.contains(&undefined)
+            {
+                candidates.push(undefined);
+            }
+            let type_ = if let [only] = candidates.as_slice() {
+                *only
+            } else {
+                store.expression_union_type_with_global_types(
+                    global_types,
+                    &candidates,
+                    UnionReduction::Subtype,
+                )?
+            };
             return Ok(CheckedSourceElement {
                 type_,
                 diagnostic: None,
@@ -74752,6 +74789,97 @@ class Foo2 {
         let warm = observable_state(&missing_context, missing_file);
         missing_context.recheck_source_file(missing_file).unwrap();
         assert_eq!(observable_state(&missing_context, missing_file), warm);
+    }
+
+    #[test]
+    fn tuple_bindings_preserve_required_suffixes_after_non_trailing_rest_elements() {
+        let library = parsed("interface Array<T> { [index: number]: T; }");
+        let source = parsed(concat!(
+            "declare var trailing: [string, ...string[]]; ",
+            "declare var suffixed: [string, ...string[], string]; ",
+            "declare var mixed: [boolean, ...number[], string]; ",
+            "const [first, trailingNext, trailingLater] = trailing; ",
+            "const [head, guaranteed, uncertain, distant] = suffixed; ",
+            "const [, mixedGuaranteed, mixedUncertain, mixedDistant] = mixed; ",
+            "const [, ...mixedRest] = mixed;",
+        ));
+
+        for (index, unchecked) in [false, true].into_iter().enumerate() {
+            let offset = u32::try_from(index).unwrap() * 2;
+            let library_file = FileId::new(9_980 + offset);
+            let file = FileId::new(9_981 + offset);
+            let mut context = context(
+                &[(library_file, &library), (file, &source)],
+                CanonicalCheckerOptions {
+                    intrinsic: IntrinsicBootstrapOptions {
+                        strict_null_checks: true,
+                        ..IntrinsicBootstrapOptions::default()
+                    },
+                    no_unchecked_indexed_access: unchecked,
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+
+            context.check_source_file(file).unwrap();
+
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            let string = bootstrap.string_type;
+            let number = bootstrap.number_type;
+            let undefined = bootstrap.undefined_type;
+            let assert_binding = |name: &str, expected: &[TypeId]| {
+                let actual = object_binding_value_type(&context, &source, file, name);
+                if let [expected] = expected {
+                    assert_eq!(actual, *expected, "{name}");
+                    return;
+                }
+                let TypeData::Union(union) = context.store().type_payload(actual).unwrap().data()
+                else {
+                    panic!("{name} must retain every possible rest or suffix type")
+                };
+                assert_eq!(union.union.types.len(), expected.len(), "{name}");
+                assert!(
+                    expected
+                        .iter()
+                        .all(|expected| union.union.types.contains(expected)),
+                    "{name}",
+                );
+            };
+
+            for name in ["first", "head", "guaranteed"] {
+                assert_binding(name, &[string]);
+            }
+            for name in ["trailingNext", "trailingLater", "uncertain", "distant"] {
+                if unchecked {
+                    assert_binding(name, &[string, undefined]);
+                } else {
+                    assert_binding(name, &[string]);
+                }
+            }
+            assert_binding("mixedGuaranteed", &[number, string]);
+            for name in ["mixedUncertain", "mixedDistant"] {
+                if unchecked {
+                    assert_binding(name, &[number, string, undefined]);
+                } else {
+                    assert_binding(name, &[number, string]);
+                }
+            }
+            assert_eq!(
+                context
+                    .type_to_string(object_binding_value_type(
+                        &context,
+                        &source,
+                        file,
+                        "mixedRest",
+                    ))
+                    .unwrap(),
+                "[...number[], string]",
+            );
+            assert!(context.diagnostics().is_empty());
+
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
     }
 
     #[test]
