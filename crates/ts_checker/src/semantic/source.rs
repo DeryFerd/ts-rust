@@ -26717,6 +26717,15 @@ fn strict_arguments_signature_annotation(
             NodeData::PropertySignatureDeclaration(property) => {
                 record.kind == SyntaxKind::PropertySignature && property.modifiers.is_none()
             }
+            NodeData::PropertyDeclaration(property) => {
+                record.kind == SyntaxKind::PropertyDeclaration
+                    && property.type_.is_some()
+                    && property.initializer.is_none()
+                    && property.postfix_token.is_none()
+                    && property.modifiers.is_none()
+                    && property.symbol.is_none()
+                    && property.facts == 0
+            }
             NodeData::ParameterDeclaration(parameter) => {
                 record.kind == SyntaxKind::Parameter
                     && parameter.initializer.is_none()
@@ -26791,6 +26800,248 @@ fn strict_arguments_signature_collisions(
     includes_failure && observed == *diagnostics
 }
 
+fn strict_arguments_default_library_has_iterator(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    declarations: &[NodeRef],
+) -> bool {
+    let mut has_iterator = false;
+    for declaration in declarations {
+        let Some((arena, bound)) = host.source(*declaration) else {
+            return false;
+        };
+        let Some(facts) = bound.source_facts() else {
+            return false;
+        };
+        let Some(record) = arena.get(declaration.node) else {
+            return false;
+        };
+        let NodeData::InterfaceDeclaration(interface) = &record.data else {
+            return false;
+        };
+        if !facts.is_default_library()
+            || !facts.is_declaration_file()
+            || facts.is_external_module()
+            || record.kind != SyntaxKind::InterfaceDeclaration
+            || record.parent != Some(bound.source_file().node)
+            || interface.type_parameters.is_some()
+            || interface.heritage_clauses.is_some()
+            || !host.symbol_matches(store, *declaration, owner)
+        {
+            return false;
+        }
+        for member in &interface.members.nodes {
+            let Some(member_record) = arena.get(*member) else {
+                return false;
+            };
+            let NodeData::MethodSignatureDeclaration(method) = &member_record.data else {
+                continue;
+            };
+            let Some(name_record) = arena.get(method.name) else {
+                return false;
+            };
+            let NodeData::ComputedPropertyName(computed) = &name_record.data else {
+                continue;
+            };
+            let Some(expression_record) = arena.get(computed.expression) else {
+                return false;
+            };
+            let NodeData::PropertyAccessExpression(access) = &expression_record.data else {
+                continue;
+            };
+            let (Some(object), Some(property)) =
+                (arena.get(access.expression), arena.get(access.name))
+            else {
+                return false;
+            };
+            has_iterator |= matches!(
+                (&object.data, &property.data),
+                (NodeData::Identifier(object), NodeData::Identifier(property))
+                    if object.text == "Symbol" && property.text == "iterator"
+            );
+        }
+    }
+    has_iterator
+}
+
+fn strict_arguments_global_wrapper_lacks_length(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    globals: SymbolTableId,
+    type_: TypeId,
+    name: &str,
+) -> bool {
+    let Some(record) = store.type_payload(type_) else {
+        return false;
+    };
+    let TypeData::Interface(interface) = record.data() else {
+        return false;
+    };
+    let Some(symbol) = record.symbol() else {
+        return false;
+    };
+    let Some(owner) = store.symbol(symbol) else {
+        return false;
+    };
+    let Some(declarations) = owner.declarations() else {
+        return false;
+    };
+    if owner.name().as_utf8() != Some(name)
+        || !owner.flags().contains(SymbolFlags::INTERFACE)
+        || owner.flags().contains(SymbolFlags::CLASS)
+        || store
+            .symbol_table(globals)
+            .and_then(|globals| globals.get_source(name))
+            .and_then(|global| store.get_merged_symbol(global))
+            != Some(symbol)
+        || store
+            .declared_type_links(symbol)
+            .and_then(|links| links.declared_type)
+            != Some(type_)
+        || owner
+            .members()
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get_source("length"))
+            .is_some()
+        || name == "Object"
+            && (!interface.base_types_resolved
+                || interface.resolved_base_constructor_type.is_some()
+                || interface.resolved_base_types.is_some())
+    {
+        return false;
+    }
+    let mut saw_interface = false;
+    for declaration in declarations {
+        let Some((arena, bound)) = host.source(*declaration) else {
+            return false;
+        };
+        if !bound
+            .source_facts()
+            .is_some_and(|facts| facts.is_default_library() && facts.is_declaration_file())
+        {
+            return false;
+        }
+        match arena.get(declaration.node).map(|record| &record.data) {
+            Some(NodeData::InterfaceDeclaration(interface)) => {
+                if interface.heritage_clauses.is_some()
+                    || !host.symbol_matches(store, *declaration, symbol)
+                {
+                    return false;
+                }
+                saw_interface = true;
+            }
+            Some(NodeData::VariableDeclaration(_)) => {}
+            _ => return false,
+        }
+    }
+    saw_interface
+}
+
+fn strict_arguments_merged_library_number_mismatch(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    owner: SemanticSymbolId,
+) -> bool {
+    let Some(bootstrap) = store.intrinsic_bootstrap() else {
+        return false;
+    };
+    let Some(arguments_record) = store.type_payload(global_types.arguments_type) else {
+        return false;
+    };
+    let Some(arguments_owner) = store.symbol(owner) else {
+        return false;
+    };
+    let Some(declarations) = arguments_owner.declarations() else {
+        return false;
+    };
+    if arguments_record.symbol() != Some(owner)
+        || !matches!(arguments_record.data(), TypeData::Interface(_))
+        || arguments_owner.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
+        || arguments_owner.check_flags() != CheckFlags::NONE
+        || arguments_owner.name().as_utf8() != Some("IArguments")
+        || arguments_owner.parent().is_some()
+        || arguments_owner.value_declaration().is_some()
+        || arguments_owner.exports().is_some()
+        || arguments_owner.export_symbol().is_some()
+        || declarations.len() < 2
+        || store
+            .symbol_table(bootstrap.globals)
+            .and_then(|globals| globals.get_source("IArguments"))
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            != Some(owner)
+        || store
+            .declared_type_links(owner)
+            .and_then(|links| links.declared_type)
+            != Some(global_types.arguments_type)
+        || !strict_arguments_default_library_has_iterator(store, host, owner, declarations)
+    {
+        return false;
+    }
+
+    let Some(length) = arguments_owner
+        .members()
+        .and_then(|members| store.symbol_table(members))
+        .and_then(|members| members.get_source("length"))
+    else {
+        return false;
+    };
+    let Some(length_record) = store.symbol(length) else {
+        return false;
+    };
+    if !length_record.flags().contains(SymbolFlags::PROPERTY)
+        || length_record.flags().contains(SymbolFlags::OPTIONAL)
+        || store.get_parent_of_symbol(length) != Some(owner)
+    {
+        return false;
+    }
+
+    [
+        (global_types.number_type, "Number"),
+        (global_types.object_type, "Object"),
+    ]
+    .into_iter()
+    .all(|(type_, name)| {
+        strict_arguments_global_wrapper_lacks_length(store, host, bootstrap.globals, type_, name)
+    })
+}
+
+fn strict_arguments_assignment_display(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    number: TypeId,
+    arguments: TypeId,
+    merged_owner: Option<SemanticSymbolId>,
+    flags: CanonicalTypeFormatFlags,
+) -> Result<[String; 2], TypeDisplayUnavailable> {
+    if let Some(owner) = merged_owner {
+        let source = type_to_string_with_host_global_types_and_flags(
+            store,
+            host,
+            global_types,
+            number,
+            flags,
+        )?;
+        let target = store
+            .symbol(owner)
+            .and_then(|symbol| symbol.name().as_utf8())
+            .ok_or(TypeDisplayUnavailable::MalformedType(arguments))?
+            .to_owned();
+        return Ok([source, target]);
+    }
+    let display = get_type_names_for_assignability_error_with_host_global_types_and_flags(
+        store,
+        host,
+        global_types,
+        number,
+        arguments,
+        flags,
+    )?;
+    Ok([display.source, display.target])
+}
+
 #[allow(clippy::too_many_arguments)] // Reuses the authoritative relation and diagnostic context.
 fn issue_strict_arguments_assignment_diagnostic(
     store: &mut CanonicalTypeMapperStore,
@@ -26808,6 +27059,7 @@ fn issue_strict_arguments_assignment_diagnostic(
         ))?
         .number_type;
     let arguments = global_types.arguments_type;
+    let mut merged_library_arguments_owner = None;
     session.reset_query();
     let assignable = match source_type_is_assignable_to(
         store,
@@ -26826,32 +27078,37 @@ fn issue_strict_arguments_assignment_diagnostic(
                 .type_payload(arguments)
                 .and_then(TypeRecord::symbol)
                 .ok_or(RelationUnavailable::UnresolvedStructuredMembers(arguments))?;
-            session.reset_query();
-            let mut resolution_diagnostics = CanonicalCheckerDiagnostics::default();
-            let resolved = CanonicalTypeQuery::new_with_global_types_and_session(
-                store,
-                host,
-                global_types,
-                options,
-                session,
-                &mut resolution_diagnostics,
-            )
-            .and_then(|mut query| query.get_declared_type_of_symbol(symbol));
-            merge_retry_diagnostics(diagnostics, resolution_diagnostics);
-            if resolved? != arguments {
-                return Err(RelationUnavailable::InvalidStructuredMembers(arguments).into());
+            if strict_arguments_merged_library_number_mismatch(store, host, global_types, symbol) {
+                merged_library_arguments_owner = Some(symbol);
+                false
+            } else {
+                session.reset_query();
+                let mut resolution_diagnostics = CanonicalCheckerDiagnostics::default();
+                let resolved = CanonicalTypeQuery::new_with_global_types_and_session(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    &mut resolution_diagnostics,
+                )
+                .and_then(|mut query| query.get_declared_type_of_symbol(symbol));
+                merge_retry_diagnostics(diagnostics, resolution_diagnostics);
+                if resolved? != arguments {
+                    return Err(RelationUnavailable::InvalidStructuredMembers(arguments).into());
+                }
+                session.reset_query();
+                source_type_is_assignable_to(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    session,
+                    diagnostics,
+                    number,
+                    arguments,
+                )?
             }
-            session.reset_query();
-            source_type_is_assignable_to(
-                store,
-                host,
-                global_types,
-                options,
-                session,
-                diagnostics,
-                number,
-                arguments,
-            )?
         }
         result => result?,
     };
@@ -26863,12 +27120,13 @@ fn issue_strict_arguments_assignment_diagnostic(
     if options.no_error_truncation {
         format_flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
     }
-    let display = get_type_names_for_assignability_error_with_host_global_types_and_flags(
+    let display = strict_arguments_assignment_display(
         store,
         host,
         global_types,
         number,
         arguments,
+        merged_library_arguments_owner,
         format_flags,
     )?;
     merge_retry_diagnostic(
@@ -26878,7 +27136,7 @@ fn issue_strict_arguments_assignment_diagnostic(
             range_override: None,
             diagnostic: Diagnostic::with_arguments(
                 message_by_code(2322).ok_or(SourceCheckError::MissingDiagnostic(2322))?,
-                [display.source, display.target],
+                display,
             ),
             related_information: Vec::new(),
         },

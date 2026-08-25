@@ -1072,13 +1072,12 @@ fn display_object_type(
             visiting,
         );
     }
-    if let Some(reason) = unsupported_callable_shape(store, type_id, record)? {
-        return Err(TypeDisplayUnavailable::FunctionType { type_id, reason });
-    }
-
     let kind = record.object_flags() & ObjectFlags::OBJECT_TYPE_KIND_MASK;
     if kind == ObjectFlags::INTERFACE {
         return display_interface_name(store, host, type_id, record, state);
+    }
+    if let Some(reason) = unsupported_callable_shape(store, type_id, record)? {
+        return Err(TypeDisplayUnavailable::FunctionType { type_id, reason });
     }
     if kind != ObjectFlags::ANONYMOUS || !matches!(record.data(), TypeData::Object(_)) {
         return Err(TypeDisplayUnavailable::UnsupportedType {
