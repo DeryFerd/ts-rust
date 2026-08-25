@@ -16412,7 +16412,7 @@ fn check_expression_type(
         PlannedExpressionKind::Property(property)
             if matches!(
                 property.receiver.unparenthesized().kind,
-                PlannedExpressionKind::Call(_)
+                PlannedExpressionKind::Call(_) | PlannedExpressionKind::New(_)
             ) || source_global_wrapper_method_name(host, property.node).is_some()
                 || source_is_global_array_concat_method(host, property.node) =>
         {

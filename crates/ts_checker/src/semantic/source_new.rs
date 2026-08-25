@@ -290,35 +290,24 @@ impl SourceDefaultNewPlan {
                 let comment = source
                     .get(start..end)
                     .ok_or_else(|| invariant(SourceNewInvariant::InvalidClassPlan(constructor)))?;
-                let parsed = ts_parser::parse_jsdoc_comment(comment);
-                if !parsed.diagnostics.is_empty() {
-                    return Err(invariant(SourceNewInvariant::InvalidClassPlan(constructor)));
-                }
-                let root = parsed
-                    .arena
-                    .get(parsed.jsdoc)
-                    .ok_or_else(|| invariant(SourceNewInvariant::InvalidClassPlan(constructor)))?;
-                let NodeData::JsDoc(jsdoc) = &root.data else {
-                    return Err(invariant(SourceNewInvariant::InvalidClassPlan(constructor)));
-                };
-                let Some(tags) = jsdoc.tags.as_ref() else {
-                    return Ok(None);
-                };
                 let mut accessibility = None;
-                for tag in &tags.nodes {
-                    let record = parsed.arena.get(*tag).ok_or_else(|| {
-                        invariant(SourceNewInvariant::InvalidClassPlan(constructor))
-                    })?;
-                    let NodeData::JsDocUnknownTag(tag) = &record.data else {
-                        return Err(invariant(SourceNewInvariant::InvalidClassPlan(constructor)));
-                    };
-                    let name = parsed.arena.get(tag.tag_name).ok_or_else(|| {
-                        invariant(SourceNewInvariant::InvalidClassPlan(constructor))
-                    })?;
-                    let NodeData::Identifier(identifier) = &name.data else {
-                        return Err(invariant(SourceNewInvariant::InvalidClassPlan(constructor)));
-                    };
-                    let code = match identifier.text.as_str() {
+                for (position, _) in comment.match_indices('@') {
+                    if position < 3
+                        || position + 1 >= comment.len().saturating_sub(2)
+                        || comment
+                            .get(..position)
+                            .and_then(|prefix| prefix.chars().next_back())
+                            .is_none_or(|character| !character.is_whitespace())
+                    {
+                        continue;
+                    }
+                    let name = comment[position + 1..]
+                        .split(|character: char| {
+                            !character.is_alphanumeric() && !matches!(character, '_' | '$' | '-')
+                        })
+                        .next()
+                        .unwrap_or_default();
+                    let code = match name {
                         "private" => 2673,
                         "protected" => 2674,
                         _ => continue,
@@ -5107,6 +5096,48 @@ mod tests {
             ),
             (
                 "class Base { /** @protected */ constructor() {} } new Base();",
+                true,
+                2674,
+                "Base",
+            ),
+            (
+                concat!(
+                    "// https://github.com/microsoft/typescript-go/issues/4219\n",
+                    "\n",
+                    "class C {\n",
+                    "  /** @private */\n",
+                    "  constructor() {}\n",
+                    "}\n",
+                    "new C();",
+                ),
+                true,
+                2673,
+                "C",
+            ),
+            (
+                concat!(
+                    "class Secret {\n",
+                    "  /**\n",
+                    "   * @private\n",
+                    "   */\n",
+                    "  constructor() {}\n",
+                    "}\n",
+                    "new Secret();",
+                ),
+                true,
+                2673,
+                "Secret",
+            ),
+            (
+                concat!(
+                    "class Base {\n",
+                    "  /**\n",
+                    "   * @protected\n",
+                    "   */\n",
+                    "  constructor() {}\n",
+                    "}\n",
+                    "new Base();",
+                ),
                 true,
                 2674,
                 "Base",
