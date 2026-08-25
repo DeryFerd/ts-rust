@@ -1363,6 +1363,7 @@ fn resolve_published_canonical_array_property(
         validate_published_canonical_array_method(store, plan.node, symbol, declarations, type_)?;
     }
     let requires_method_instantiation = is_method
+        && !matches!(plan.name.as_str(), "map" | "filter" | "find" | "forEach")
         && store
             .type_payload(type_)
             .and_then(|record| record.data().structured())

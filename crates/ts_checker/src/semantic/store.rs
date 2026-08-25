@@ -1327,15 +1327,41 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         let Some(SourceNodeParent::Parent(call)) = self.source_node_parent(declaration) else {
             return false;
         };
-        let Some(SourceNodeParent::Parent(statement)) = self.source_node_parent(call) else {
+        let Some(SourceNodeParent::Parent(container)) = self.source_node_parent(call) else {
             return false;
         };
-        let Some(SourceNodeParent::Parent(source)) = self.source_node_parent(statement) else {
-            return false;
+        let source = match self.source_node_kind(container) {
+            Some(SyntaxKind::ExpressionStatement) => {
+                let Some(SourceNodeParent::Parent(source)) = self.source_node_parent(container)
+                else {
+                    return false;
+                };
+                source
+            }
+            Some(SyntaxKind::VariableDeclaration) => {
+                let Some(SourceNodeParent::Parent(list)) = self.source_node_parent(container)
+                else {
+                    return false;
+                };
+                let Some(SourceNodeParent::Parent(statement)) = self.source_node_parent(list)
+                else {
+                    return false;
+                };
+                let Some(SourceNodeParent::Parent(source)) = self.source_node_parent(statement)
+                else {
+                    return false;
+                };
+                if self.source_node_kind(list) != Some(SyntaxKind::VariableDeclarationList)
+                    || self.source_node_kind(statement) != Some(SyntaxKind::VariableStatement)
+                {
+                    return false;
+                }
+                source
+            }
+            _ => return false,
         };
         if self.source_node_kind(declaration) != Some(SyntaxKind::ArrowFunction)
             || self.source_node_kind(call) != Some(SyntaxKind::CallExpression)
-            || self.source_node_kind(statement) != Some(SyntaxKind::ExpressionStatement)
             || self.source_node_kind(source) != Some(SyntaxKind::SourceFile)
             || owner.flags() != SymbolFlags::FUNCTION
             || owner.check_flags() != CheckFlags::NONE
@@ -1415,14 +1441,14 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             if !function_type && !source_callable {
                 continue;
             }
-            let Some([target_parameter]) = self
+            let Some(target_parameters) = self
                 .callable_signature_parameter_types
                 .get(&target_signature)
                 .map(Vec::as_slice)
             else {
                 return false;
             };
-            let [target_parameter_symbol] = target_record.parameters() else {
+            let Some(target_parameter) = target_parameters.first().copied() else {
                 return false;
             };
             if self.signature_links(target_declaration)
@@ -1432,29 +1458,135 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 })
                 || !target_record.type_parameters().is_empty()
                 || target_record.has_rest_parameter()
-                || target_record.min_argument_count() != 1
-                || self.types.get(*target_parameter).is_none()
-                || self.value_symbol_links(*target_parameter_symbol)
-                    != Some(&ValueSymbolLinks {
-                        resolved_type: Some(*target_parameter),
-                        ..ValueSymbolLinks::default()
+                || target_record.min_argument_count() < 1
+                || target_record.parameters().len() != target_parameters.len()
+                || usize::try_from(target_record.min_argument_count())
+                    .ok()
+                    .is_none_or(|minimum| minimum > target_parameters.len())
+                || target_record
+                    .parameters()
+                    .iter()
+                    .copied()
+                    .zip(target_parameters)
+                    .any(|(parameter, type_)| {
+                        self.types.get(*type_).is_none()
+                            || self.value_symbol_links(parameter)
+                                != Some(&ValueSymbolLinks {
+                                    resolved_type: Some(*type_),
+                                    ..ValueSymbolLinks::default()
+                                })
                     })
-                || expected_parameter.replace(*target_parameter).is_some()
+                || expected_parameter
+                    .replace((target_parameter, target_declaration))
+                    .is_some()
             {
                 return false;
             }
         }
-        let Some(expected_parameter) = expected_parameter else {
+        let Some((expected_parameter, target_declaration)) = expected_parameter else {
             return false;
         };
         self.value_symbol_links(*parameter).is_none_or(|links| {
             links == &ValueSymbolLinks::default()
-                || links
-                    == &ValueSymbolLinks {
-                        resolved_type: Some(expected_parameter),
-                        ..ValueSymbolLinks::default()
-                    }
+                || links.resolved_type.is_some_and(|actual| {
+                    links
+                        == &ValueSymbolLinks {
+                            resolved_type: Some(actual),
+                            ..ValueSymbolLinks::default()
+                        }
+                        && (actual == expected_parameter
+                            || self.source_direct_array_callback_parameter_is_exact(
+                                contextual_target,
+                                target_declaration,
+                                expected_parameter,
+                                actual,
+                            ))
+                })
         })
+    }
+
+    fn source_direct_array_callback_parameter_is_exact(
+        &self,
+        contextual_target: TypeId,
+        callback_declaration: NodeRef,
+        source_parameter: TypeId,
+        actual_parameter: TypeId,
+    ) -> bool {
+        let Some(parameter_symbol) = self
+            .links
+            .declared_type
+            .find_key(|symbol| {
+                self.links
+                    .declared_type
+                    .try_get(symbol)
+                    .is_some_and(|links| links.declared_type == Some(source_parameter))
+                    && self.symbol(*symbol).is_some_and(|record| {
+                        record.flags().contains(SymbolFlags::TYPE_PARAMETER)
+                            && !record
+                                .flags()
+                                .intersects(SymbolFlags::TYPE_PARAMETER_EXCLUDES)
+                    })
+            })
+            .copied()
+        else {
+            return false;
+        };
+        let Some(owner) = self.get_parent_of_symbol(parameter_symbol) else {
+            return false;
+        };
+        let Some(owner_record) = self.symbol(owner) else {
+            return false;
+        };
+        let Some(owner_name) = owner_record.name().as_utf8() else {
+            return false;
+        };
+        let Some(SourceNodeParent::Parent(parameter_declaration)) =
+            self.source_node_parent(callback_declaration)
+        else {
+            return false;
+        };
+        let Some(SourceNodeParent::Parent(method_declaration)) =
+            self.source_node_parent(parameter_declaration)
+        else {
+            return false;
+        };
+        let Some(members) = owner_record
+            .members()
+            .and_then(|members| self.symbol_table(members))
+        else {
+            return false;
+        };
+        matches!(owner_name, "Array" | "ReadonlyArray")
+            && self
+                .intrinsic_bootstrap
+                .as_ref()
+                .and_then(|bootstrap| self.symbol_table(bootstrap.globals))
+                .and_then(|globals| globals.get_source(owner_name))
+                .and_then(|symbol| self.get_merged_symbol(symbol))
+                == Some(owner)
+            && self.types.get(actual_parameter).is_some()
+            && self.function_type_provenance.contains(&contextual_target)
+            && self.source_node_kind(callback_declaration) == Some(SyntaxKind::FunctionType)
+            && self.source_direct_type_annotation(parameter_declaration)
+                == Some(callback_declaration)
+            && self
+                .type_node_links(callback_declaration)
+                .and_then(|links| links.resolved_type)
+                == Some(contextual_target)
+            && members.iter().any(|(_, method)| {
+                self.get_merged_symbol(method).is_some_and(|method| {
+                    self.symbol(method).is_some_and(|record| {
+                        record.flags() == SymbolFlags::METHOD
+                            && record.name().as_utf8().is_some_and(|name| {
+                                matches!(name, "map" | "filter" | "find" | "forEach")
+                            })
+                            && record.declarations().is_some_and(|declarations| {
+                                declarations.contains(&method_declaration)
+                            })
+                            && self.get_parent_of_symbol(method) == Some(owner)
+                    })
+                })
+            })
     }
 
     /// Proves the exact variable or object-property owner of a contextual arrow.

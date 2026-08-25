@@ -3155,6 +3155,7 @@ pub(super) fn source_object_property_arrow_symbol(
 }
 
 /// Authenticates one unparenthesized callback in a direct or array method call.
+#[allow(clippy::too_many_lines)] // Validate the callback, array owner, and top-level container.
 pub(super) fn source_direct_call_argument_arrow_is_exact(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -3191,13 +3192,6 @@ pub(super) fn source_direct_call_argument_arrow_is_exact(
     if callee_record.parent != Some(call.node) || callee_record.flags.0 != 0 {
         return Ok(false);
     }
-    let Some(SourceNodeParent::Parent(statement)) = store.source_node_parent(call) else {
-        return Ok(false);
-    };
-    let statement_record = preflight_node(store, host, statement)?;
-    let NodeData::ExpressionStatement(statement_data) = &statement_record.data else {
-        return Ok(false);
-    };
     let Some(bound) = host.bound_file(declaration) else {
         return Ok(false);
     };
@@ -3252,12 +3246,54 @@ pub(super) fn source_direct_call_argument_arrow_is_exact(
         }
         _ => false,
     };
-    Ok(statement_record.kind == SyntaxKind::ExpressionStatement
-        && statement_record.flags.0 == 0
-        && statement_data.expression == call.node
-        && statement_data.flow_node.is_none()
-        && store.source_node_parent(statement)
-            == Some(SourceNodeParent::Parent(bound.source_file()))
+    let Some(SourceNodeParent::Parent(container)) = store.source_node_parent(call) else {
+        return Ok(false);
+    };
+    let container_record = preflight_node(store, host, container)?;
+    let container_valid = match &container_record.data {
+        NodeData::ExpressionStatement(statement) => {
+            container_record.kind == SyntaxKind::ExpressionStatement
+                && container_record.flags.0 == 0
+                && statement.expression == call.node
+                && statement.flow_node.is_none()
+                && store.source_node_parent(container)
+                    == Some(SourceNodeParent::Parent(bound.source_file()))
+        }
+        NodeData::VariableDeclaration(variable)
+            if matches!(&callee_record.data, NodeData::PropertyAccessExpression(_)) =>
+        {
+            let Some(SourceNodeParent::Parent(list)) = store.source_node_parent(container) else {
+                return Ok(false);
+            };
+            let list_record = preflight_node(store, host, list)?;
+            let NodeData::VariableDeclarationList(declarations) = &list_record.data else {
+                return Ok(false);
+            };
+            let Some(SourceNodeParent::Parent(statement)) = store.source_node_parent(list) else {
+                return Ok(false);
+            };
+            let statement_record = preflight_node(store, host, statement)?;
+            let NodeData::VariableStatement(statement_data) = &statement_record.data else {
+                return Ok(false);
+            };
+            container_record.kind == SyntaxKind::VariableDeclaration
+                && variable.initializer == Some(call.node)
+                && list_record.kind == SyntaxKind::VariableDeclarationList
+                && declarations
+                    .declarations
+                    .nodes
+                    .iter()
+                    .filter(|declaration| **declaration == container.node)
+                    .count()
+                    == 1
+                && statement_record.kind == SyntaxKind::VariableStatement
+                && statement_data.declaration_list == list.node
+                && store.source_node_parent(statement)
+                    == Some(SourceNodeParent::Parent(bound.source_file()))
+        }
+        _ => false,
+    };
+    Ok(container_valid
         && bound
             .source_facts()
             .is_some_and(|facts| !facts.is_javascript_file() && !facts.is_declaration_file())
@@ -3412,15 +3448,37 @@ fn stored_direct_call_argument_arrow_is_exact(
     let Some(SourceNodeParent::Parent(call)) = store.source_node_parent(declaration) else {
         return false;
     };
-    let Some(SourceNodeParent::Parent(statement)) = store.source_node_parent(call) else {
+    let Some(SourceNodeParent::Parent(container)) = store.source_node_parent(call) else {
         return false;
     };
-    let Some(SourceNodeParent::Parent(source)) = store.source_node_parent(statement) else {
-        return false;
+    let source = match store.source_node_kind(container) {
+        Some(SyntaxKind::ExpressionStatement) => {
+            let Some(SourceNodeParent::Parent(source)) = store.source_node_parent(container) else {
+                return false;
+            };
+            source
+        }
+        Some(SyntaxKind::VariableDeclaration) => {
+            let Some(SourceNodeParent::Parent(list)) = store.source_node_parent(container) else {
+                return false;
+            };
+            let Some(SourceNodeParent::Parent(statement)) = store.source_node_parent(list) else {
+                return false;
+            };
+            let Some(SourceNodeParent::Parent(source)) = store.source_node_parent(statement) else {
+                return false;
+            };
+            if store.source_node_kind(list) != Some(SyntaxKind::VariableDeclarationList)
+                || store.source_node_kind(statement) != Some(SyntaxKind::VariableStatement)
+            {
+                return false;
+            }
+            source
+        }
+        _ => return false,
     };
     store.source_node_kind(declaration) == Some(SyntaxKind::ArrowFunction)
         && store.source_node_kind(call) == Some(SyntaxKind::CallExpression)
-        && store.source_node_kind(statement) == Some(SyntaxKind::ExpressionStatement)
         && store.source_node_kind(source) == Some(SyntaxKind::SourceFile)
         && owner.flags() == SymbolFlags::FUNCTION
         && owner.check_flags() == CheckFlags::NONE

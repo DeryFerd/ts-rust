@@ -22,12 +22,14 @@ use super::{
     CanonicalCheckerOptions, CanonicalCheckerRelatedInformation, CanonicalGlobalTypes,
     CanonicalTypeFormatFlags, CanonicalTypeMapperStore, DeclaredTypeHost, RelationUnavailable,
     ResolvedSignatureState, SignatureId, SignatureLinks, TypeId, TypeNodeLinks, ValueSymbolLinks,
+    bootstrap::UnionReduction,
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
     callables::{StoredSingleCallableValidation, validate_stored_single_callable},
     calls::{
         DirectCallApplicability, DirectCallError, DirectCallForm, DirectCallRequest,
         DirectCallUnsupported, resolve_direct_call,
     },
+    declared::{cached_ordinary_type_parameter_owner, execute_type_parameter},
     formatter::{
         get_type_names_for_assignability_error_with_host_global_types_and_flags,
         type_to_string_with_host_global_types_and_flags,
@@ -48,7 +50,7 @@ use super::{
         callable_assignability_details, exact_optional_property_mismatch_details,
         excess_object_argument_diagnostic, missing_mapped_index_signature_details,
     },
-    signatures::SignatureFlags,
+    signatures::{SignatureFlags, TypePredicateKind},
     source::{
         PlannedExpression, PlannedExpressionKind, PlannedIdentifierReadKind, SourceCheckError,
         UnsupportedSourceSyntax, logical_binary_operator_text, merge_retry_diagnostic,
@@ -56,8 +58,9 @@ use super::{
         retry_source_generic_member_failure,
     },
     source_callables::{
-        StoredSourceCallableValidation, valid_fixed_generic_source_parameter_type,
-        validate_stored_source_callable,
+        CallableTypePredicatePlan, StoredSourceCallableValidation, plan_callable_type_predicate,
+        valid_fixed_generic_source_parameter_type, valid_planned_callable_type_predicate,
+        valid_stored_callable_type_predicate, validate_stored_source_callable,
     },
     source_imports::synthetic_source_import_origin,
     store::SourceNodeParent,
@@ -146,15 +149,36 @@ struct GlobalArrayCallbackParameter {
     optional: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct GlobalArrayCallbackTypeParameter {
+    declaration: NodeRef,
+    symbol: SemanticSymbolId,
+    constraint: Option<NodeRef>,
+}
+
+#[derive(Clone, Debug)]
+struct GlobalArrayCallbackOverload {
+    declaration: NodeRef,
+    callback_annotation: NodeRef,
+    callback_predicate: Option<CallableTypePredicatePlan>,
+    return_annotation: NodeRef,
+    parameters: Vec<GlobalArrayCallbackParameter>,
+    type_parameters: Vec<GlobalArrayCallbackTypeParameter>,
+}
+
 #[derive(Clone, Debug)]
 struct GlobalArrayCallbackMethod {
     owner: SemanticSymbolId,
     target: TypeId,
     symbol: SemanticSymbolId,
-    declaration: NodeRef,
-    callback_annotation: NodeRef,
-    return_annotation: NodeRef,
-    parameters: Vec<GlobalArrayCallbackParameter>,
+    overloads: Vec<GlobalArrayCallbackOverload>,
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedGlobalArrayCallbackOverload {
+    type_parameters: Vec<TypeId>,
+    parameter_types: Vec<TypeId>,
+    return_type: TypeId,
 }
 
 /// Returns an exact `Array` callback method name from a property access.
@@ -176,7 +200,7 @@ pub(super) fn source_global_array_callback_method_name(
     .then(|| identifier.text.clone())
 }
 
-#[allow(clippy::too_many_lines)] // Authenticate the complete binder-owned method before mutation.
+#[allow(clippy::too_many_lines)] // Authenticate every declaration before exposing the method.
 fn plan_global_array_callback_method(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -185,7 +209,7 @@ fn plan_global_array_callback_method(
     name: &str,
     site: NodeRef,
 ) -> Result<Option<GlobalArrayCallbackMethod>, SourceCheckError> {
-    if !matches!(name, "map" | "filter" | "find" | "forEach" | "reduce") {
+    if !matches!(name, "map" | "filter" | "find" | "forEach") {
         return Ok(None);
     }
     let Some(array) = store
@@ -219,21 +243,11 @@ fn plan_global_array_callback_method(
         return Ok(None);
     };
     let method = store.symbol(symbol).ok_or(SourceCheckError::Call(site))?;
-    let Some([declaration]) = method.declarations() else {
+    let Some(declarations) = method
+        .declarations()
+        .filter(|declarations| !declarations.is_empty())
+    else {
         return Ok(None);
-    };
-    let declaration = *declaration;
-    let Some(bound) = host.bound_file(declaration) else {
-        return Err(SourceCheckError::Call(site));
-    };
-    let Some(record) = host.node(declaration) else {
-        return Err(SourceCheckError::Call(site));
-    };
-    let NodeData::MethodSignatureDeclaration(syntax) = &record.data else {
-        return Err(SourceCheckError::Call(site));
-    };
-    let Some(SourceNodeParent::Parent(interface)) = store.source_node_parent(declaration) else {
-        return Err(SourceCheckError::Call(site));
     };
     let allowed_owner_flags =
         SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::TRANSIENT;
@@ -248,17 +262,90 @@ fn plan_global_array_callback_method(
         || method.flags() != SymbolFlags::METHOD
         || method.check_flags() != CheckFlags::NONE
         || method.name().as_utf8() != Some(name)
-        || method.value_declaration() != Some(declaration)
+        || method.value_declaration() != declarations.first().copied()
         || method.members().is_some()
         || method.exports().is_some()
         || method.export_symbol().is_some()
         || store.get_parent_of_symbol(symbol) != Some(owner)
         || store.get_merged_symbol(symbol) != Some(symbol)
-        || !owner_record
+    {
+        return Err(SourceCheckError::Call(site));
+    }
+
+    let mut overloads = Vec::with_capacity(declarations.len());
+    let mut seen_declarations = HashSet::with_capacity(declarations.len());
+    for declaration in declarations {
+        if !seen_declarations.insert(*declaration) {
+            return Err(SourceCheckError::Call(site));
+        }
+        let Some(SourceNodeParent::Parent(interface)) = store.source_node_parent(*declaration)
+        else {
+            return Err(SourceCheckError::Call(site));
+        };
+        if !owner_record
             .declarations()
             .is_some_and(|declarations| declarations.contains(&interface))
-        || store.source_node_kind(interface) != Some(SyntaxKind::InterfaceDeclaration)
-        || record.kind != SyntaxKind::MethodSignature
+            || store.source_node_kind(interface) != Some(SyntaxKind::InterfaceDeclaration)
+        {
+            return Err(SourceCheckError::Call(site));
+        }
+        overloads.push(plan_global_array_callback_overload(
+            store,
+            host,
+            symbol,
+            *declaration,
+            site,
+        )?);
+    }
+
+    let supported = match (name, overloads.as_slice()) {
+        ("forEach", [overload]) => {
+            overload.type_parameters.is_empty() && overload.callback_predicate.is_none()
+        }
+        ("map", [overload]) => {
+            overload.type_parameters.len() == 1
+                && overload.type_parameters[0].constraint.is_none()
+                && overload.callback_predicate.is_none()
+        }
+        ("filter" | "find", [predicate, ordinary]) => {
+            predicate.type_parameters.len() == 1
+                && predicate.type_parameters[0].constraint.is_some()
+                && predicate.callback_predicate.is_some()
+                && ordinary.type_parameters.is_empty()
+                && ordinary.callback_predicate.is_none()
+        }
+        _ => false,
+    };
+    if !supported {
+        return Ok(None);
+    }
+
+    Ok(Some(GlobalArrayCallbackMethod {
+        owner,
+        target,
+        symbol,
+        overloads,
+    }))
+}
+
+#[allow(clippy::too_many_lines)] // One overload retains all binder-owned parameter identities.
+fn plan_global_array_callback_overload(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    method: SemanticSymbolId,
+    declaration: NodeRef,
+    site: NodeRef,
+) -> Result<GlobalArrayCallbackOverload, SourceCheckError> {
+    let Some(bound) = host.bound_file(declaration) else {
+        return Err(SourceCheckError::Call(site));
+    };
+    let Some(record) = host.node(declaration) else {
+        return Err(SourceCheckError::Call(site));
+    };
+    let NodeData::MethodSignatureDeclaration(syntax) = &record.data else {
+        return Err(SourceCheckError::Call(site));
+    };
+    if record.kind != SyntaxKind::MethodSignature
         || record.flags.0 != 0
         || syntax.full_signature.is_some()
         || syntax.next_container.is_some()
@@ -270,13 +357,80 @@ fn plan_global_array_callback_method(
         || bound
             .source_facts()
             .is_none_or(|facts| !facts.is_default_library() || !facts.is_declaration_file())
-        || !host.symbol_matches(store, declaration, symbol)
+        || !host.symbol_matches(store, declaration, method)
     {
         return Err(SourceCheckError::Call(site));
     }
-    if syntax.type_parameters.is_some() {
-        return Ok(None);
+
+    let mut type_parameters = Vec::new();
+    if let Some(parameters) = syntax.type_parameters.as_ref() {
+        if parameters.nodes.len() != 1 || parameters.has_trailing_comma {
+            return Err(SourceCheckError::Call(site));
+        }
+        let parameter = NodeRef::new(declaration.arena, declaration.file, parameters.nodes[0]);
+        let Some(parameter_record) = host.node(parameter) else {
+            return Err(SourceCheckError::Call(site));
+        };
+        let NodeData::TypeParameterDeclaration(parameter_data) = &parameter_record.data else {
+            return Err(SourceCheckError::Call(site));
+        };
+        let name = NodeRef::new(parameter.arena, parameter.file, parameter_data.name);
+        let Some(name_record) = host.node(name) else {
+            return Err(SourceCheckError::Call(site));
+        };
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Err(SourceCheckError::Call(site));
+        };
+        let symbol = bound
+            .symbol(parameter)
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            .ok_or(SourceCheckError::Call(site))?;
+        let symbol_record = store.symbol(symbol).ok_or(SourceCheckError::Call(site))?;
+        let constraint = parameter_data
+            .constraint
+            .map(|node| NodeRef::new(parameter.arena, parameter.file, node));
+        if parameter_record.kind != SyntaxKind::TypeParameter
+            || parameter_record.flags.0 != 0
+            || parameter_record.parent != Some(declaration.node)
+            || parameter_data.default_type.is_some()
+            || parameter_data.expression.is_some()
+            || parameter_data.symbol.is_some()
+            || parameter_data.modifiers.is_some()
+            || name_record.kind != SyntaxKind::Identifier
+            || name_record.flags.0 != 0
+            || name_record.parent != Some(parameter.node)
+            || identifier.text.is_empty()
+            || identifier.flow_node.is_some()
+            || symbol_record.flags() != SymbolFlags::TYPE_PARAMETER
+            || symbol_record.check_flags() != CheckFlags::NONE
+            || symbol_record.name().as_utf8() != Some(identifier.text.as_str())
+            || symbol_record.declarations() != Some(&[parameter])
+            || symbol_record.value_declaration().is_some()
+            || symbol_record.members().is_some()
+            || symbol_record.exports().is_some()
+            || symbol_record.parent().is_some()
+            || symbol_record.export_symbol().is_some()
+            || store.get_merged_symbol(symbol) != Some(symbol)
+            || bound
+                .locals(declaration)
+                .and_then(|locals| store.symbol_table(locals))
+                .and_then(|locals| locals.get(symbol_record.name()))
+                != Some(symbol)
+            || constraint.is_some_and(|constraint| {
+                host.node(constraint).is_none_or(|record| {
+                    record.flags.0 != 0 || record.parent != Some(parameter.node)
+                })
+            })
+        {
+            return Err(SourceCheckError::Call(site));
+        }
+        type_parameters.push(GlobalArrayCallbackTypeParameter {
+            declaration: parameter,
+            symbol,
+            constraint,
+        });
     }
+
     let return_annotation = syntax
         .type_
         .map(|annotation| NodeRef::new(declaration.arena, declaration.file, annotation))
@@ -339,23 +493,46 @@ fn plan_global_array_callback_method(
             .skip(1)
             .any(|parameter| !parameter.optional)
     {
-        return Ok(None);
+        return Err(SourceCheckError::Call(site));
     }
-    Ok(Some(GlobalArrayCallbackMethod {
-        owner,
-        target,
-        symbol,
+
+    let Some(callback_record) = host.node(callback_annotation) else {
+        return Err(SourceCheckError::Call(site));
+    };
+    let NodeData::FunctionTypeNode(callback) = &callback_record.data else {
+        return Err(SourceCheckError::Call(site));
+    };
+    let callback_return = callback
+        .type_
+        .map(|node| NodeRef::new(callback_annotation.arena, callback_annotation.file, node))
+        .ok_or(SourceCheckError::Call(site))?;
+    let callback_predicate =
+        if store.source_node_kind(callback_return) == Some(SyntaxKind::TypePredicate) {
+            let predicate = plan_callable_type_predicate(store, host, callback_return)
+                .map_err(|_| SourceCheckError::Call(site))?;
+            if predicate.owner != callback_annotation
+                || predicate.kind != TypePredicateKind::Identifier
+                || predicate.parameter_index != 0
+                || predicate.narrowed_type.is_none()
+            {
+                return Err(SourceCheckError::Call(site));
+            }
+            Some(predicate)
+        } else {
+            None
+        };
+
+    Ok(GlobalArrayCallbackOverload {
         declaration,
         callback_annotation,
+        callback_predicate,
         return_annotation,
         parameters,
-    }))
+        type_parameters,
+    })
 }
 
-/// Publishes an authenticated, nongeneric `Array` callback method on demand.
-///
-/// Generic and predicate overloads stay cold until their real signatures are
-/// supported; no fallback symbols or signatures are invented.
+/// Publishes every authenticated `Array` callback overload in declaration order.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Keep source and publication proofs together.
 pub(super) fn materialize_global_array_callback_method(
     store: &mut CanonicalTypeMapperStore,
@@ -378,63 +555,199 @@ pub(super) fn materialize_global_array_callback_method(
         let type_ = links.resolved_type.ok_or(SourceCheckError::Call(site))?;
         return match validate_stored_callable_set(store, type_) {
             StoredCallableSetValidation::Valid { projection, .. }
-                if projection.call_signatures.len() == 1
-                    && projection.call_signatures[0].parameters.first().copied()
-                        == store
-                            .type_node_links(plan.callback_annotation)
-                            .and_then(|links| links.resolved_type) =>
+                if projection.call_signatures.len() == plan.overloads.len()
+                    && projection.call_signatures.iter().zip(&plan.overloads).all(
+                        |(signature, overload)| {
+                            store.signature(signature.signature).is_some_and(|record| {
+                                record.declaration() == Some(overload.declaration)
+                                    && record.type_parameters().len()
+                                        == overload.type_parameters.len()
+                                    && record
+                                        .type_parameters()
+                                        .iter()
+                                        .zip(&overload.type_parameters)
+                                        .all(|(type_, parameter)| {
+                                            cached_ordinary_type_parameter_owner(store, *type_)
+                                                == Some(parameter.symbol)
+                                        })
+                            }) && signature.parameters.first().copied()
+                                == store
+                                    .type_node_links(overload.callback_annotation)
+                                    .and_then(|links| links.resolved_type)
+                                && valid_global_array_callback_predicate(
+                                    store,
+                                    overload,
+                                    signature.parameters.first().copied(),
+                                )
+                        },
+                    ) =>
             {
                 Ok(Some(type_))
             }
             _ => Err(SourceCheckError::Call(site)),
         };
     }
-    if store
-        .signature_links(plan.declaration)
-        .is_some_and(|links| links != &SignatureLinks::default())
-        || plan.parameters.iter().any(|parameter| {
+    if plan.overloads.iter().any(|overload| {
+        store
+            .signature_links(overload.declaration)
+            .is_some_and(|links| links != &SignatureLinks::default())
+            || overload.parameters.iter().any(|parameter| {
+                store
+                    .value_symbol_links(parameter.symbol)
+                    .is_some_and(|links| links != &ValueSymbolLinks::default())
+            })
+            || overload.type_parameters.iter().any(|parameter| {
+                store
+                    .declared_type_links(parameter.symbol)
+                    .is_some_and(|links| {
+                        links.declared_type.is_some_and(|type_| {
+                            cached_ordinary_type_parameter_owner(store, type_)
+                                != Some(parameter.symbol)
+                        })
+                    })
+            })
+    }) {
+        return Err(SourceCheckError::Call(site));
+    }
+
+    let cold_type_parameters = plan
+        .overloads
+        .iter()
+        .flat_map(|overload| &overload.type_parameters)
+        .filter(|parameter| {
             store
-                .value_symbol_links(parameter.symbol)
-                .is_some_and(|links| links != &ValueSymbolLinks::default())
+                .declared_type_links(parameter.symbol)
+                .and_then(|links| links.declared_type)
+                .is_none()
         })
+        .count();
+    let missing_declared_links = plan
+        .overloads
+        .iter()
+        .flat_map(|overload| &overload.type_parameters)
+        .filter(|parameter| store.declared_type_links(parameter.symbol).is_none())
+        .count();
+    if !store.try_reserve_types(cold_type_parameters)
+        || !store.try_reserve_declared_type_links(missing_declared_links)
     {
         return Err(SourceCheckError::Call(site));
     }
 
     let mut annotation_diagnostics = CanonicalCheckerDiagnostics::default();
-    let resolved = (|| {
-        let mut parameter_types = Vec::with_capacity(plan.parameters.len());
-        for parameter in &plan.parameters {
-            let type_ = CanonicalTypeQuery::new_with_global_types(
-                store,
-                host,
-                global_types,
-                options,
-                &mut annotation_diagnostics,
-            )?
-            .get_type_from_type_node(parameter.annotation)?;
-            parameter_types.push(type_);
-        }
-        let return_type = CanonicalTypeQuery::new_with_global_types(
-            store,
-            host,
-            global_types,
-            options,
-            &mut annotation_diagnostics,
-        )?
-        .get_type_from_type_node(plan.return_annotation)?;
-        Ok::<_, super::DeclaredTypeError>((parameter_types, return_type))
-    })();
+    let resolved = resolve_global_array_callback_overloads(
+        store,
+        host,
+        global_types,
+        options,
+        &mut annotation_diagnostics,
+        &plan,
+        site,
+    );
     merge_retry_diagnostics(diagnostics, annotation_diagnostics);
-    let (parameter_types, return_type) = resolved?;
-    let callback = parameter_types[0];
-    let StoredSingleCallableValidation::Valid {
-        callable: callback_signature,
-        ..
-    } = validate_stored_single_callable(store, callback)
-    else {
+    let resolved = resolved?;
+
+    if !store.try_reserve_types(1)
+        || !store.try_reserve_signatures(plan.overloads.len())
+        || !store.try_reserve_signature_links(
+            plan.overloads
+                .iter()
+                .filter(|overload| store.signature_links(overload.declaration).is_none())
+                .count(),
+        )
+        || !store.try_reserve_value_symbol_links(
+            usize::from(store.value_symbol_links(plan.symbol).is_none())
+                + plan
+                    .overloads
+                    .iter()
+                    .flat_map(|overload| &overload.parameters)
+                    .filter(|parameter| store.value_symbol_links(parameter.symbol).is_none())
+                    .count(),
+        )
+        || !store.try_reserve_function_signature_return_annotations(plan.overloads.len())
+        || !store.try_reserve_callable_signature_parameter_types(plan.overloads.len())
+    {
         return Err(SourceCheckError::Call(site));
-    };
+    }
+    let type_ = store
+        .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(plan.symbol))
+        .ok_or(SourceCheckError::Call(site))?;
+    let mut signatures = Vec::with_capacity(plan.overloads.len());
+    let mut parameter_batches = Vec::with_capacity(plan.overloads.len());
+    for (overload, resolved) in plan.overloads.iter().zip(resolved) {
+        let signature = store
+            .alloc_signature(
+                SignatureFlags::NONE,
+                Some(overload.declaration),
+                resolved.type_parameters,
+                None,
+                overload
+                    .parameters
+                    .iter()
+                    .map(|parameter| parameter.symbol)
+                    .collect(),
+                Some(resolved.return_type),
+                None,
+                1,
+            )
+            .ok_or(SourceCheckError::Call(site))?;
+        assert!(store.set_signature_links(
+            overload.declaration,
+            SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(signature),
+                ..SignatureLinks::default()
+            },
+        ));
+        for (parameter, type_) in overload.parameters.iter().zip(&resolved.parameter_types) {
+            assert!(store.set_value_symbol_links(
+                parameter.symbol,
+                ValueSymbolLinks {
+                    resolved_type: Some(*type_),
+                    ..ValueSymbolLinks::default()
+                },
+            ));
+        }
+        signatures.push(signature);
+        parameter_batches.push((signature, resolved.parameter_types));
+    }
+    assert!(store.set_value_symbol_links(
+        plan.symbol,
+        ValueSymbolLinks {
+            resolved_type: Some(type_),
+            ..ValueSymbolLinks::default()
+        },
+    ));
+    assert!(store.set_structured_type_members(type_, None, None, Some(signatures), None, None,));
+    assert!(store.set_callable_signature_parameter_types_batch(parameter_batches));
+    for overload in &plan.overloads {
+        let signature = store
+            .signature_links(overload.declaration)
+            .and_then(|links| links.resolved_signature.signature())
+            .ok_or(SourceCheckError::Call(site))?;
+        assert!(store.set_function_signature_return_annotation(
+            signature,
+            overload.return_annotation,
+            false,
+        ));
+    }
+    if !matches!(
+        validate_stored_callable_set(store, type_),
+        StoredCallableSetValidation::Valid { .. }
+    ) {
+        return Err(SourceCheckError::Call(site));
+    }
+    Ok(Some(type_))
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Resolve real generic dependencies before publication.
+fn resolve_global_array_callback_overloads(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    plan: &GlobalArrayCallbackMethod,
+    site: NodeRef,
+) -> Result<Vec<ResolvedGlobalArrayCallbackOverload>, SourceCheckError> {
     let [element] = store
         .type_payload(plan.target)
         .and_then(|record| match record.data() {
@@ -447,96 +760,226 @@ pub(super) fn materialize_global_array_callback_method(
     else {
         return Err(SourceCheckError::Call(site));
     };
-    if callback_signature.parameters.first().copied() != Some(*element)
-        || callback_signature.rest_parameter.is_some()
-        || store
-            .type_payload(plan.target)
-            .and_then(TypeRecord::symbol)
-            .and_then(|symbol| store.get_merged_symbol(symbol))
-            != Some(plan.owner)
+    let element = *element;
+    if store
+        .type_payload(plan.target)
+        .and_then(TypeRecord::symbol)
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+        != Some(plan.owner)
     {
         return Err(SourceCheckError::Call(site));
     }
-    if !store.try_reserve_types(1)
-        || !store.try_reserve_signatures(1)
-        || !store.try_reserve_signature_links(usize::from(
-            store.signature_links(plan.declaration).is_none(),
-        ))
-        || !store.try_reserve_value_symbol_links(
-            usize::from(store.value_symbol_links(plan.symbol).is_none())
-                + plan
-                    .parameters
-                    .iter()
-                    .filter(|parameter| store.value_symbol_links(parameter.symbol).is_none())
-                    .count(),
-        )
-        || !store.try_reserve_function_signature_return_annotations(1)
-        || !store.try_reserve_callable_signature_parameter_types(1)
-    {
-        return Err(SourceCheckError::Call(site));
+
+    let mut resolved = Vec::with_capacity(plan.overloads.len());
+    for overload in &plan.overloads {
+        let mut type_parameters = Vec::with_capacity(overload.type_parameters.len());
+        for parameter in &overload.type_parameters {
+            if store.source_node_parent(parameter.declaration)
+                != Some(SourceNodeParent::Parent(overload.declaration))
+            {
+                return Err(SourceCheckError::Call(site));
+            }
+            let type_ = execute_type_parameter(store, parameter.symbol);
+            let constraint = parameter
+                .constraint
+                .map(|constraint| {
+                    CanonicalTypeQuery::new_with_global_types(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        diagnostics,
+                    )?
+                    .get_type_from_type_node(constraint)
+                })
+                .transpose()?;
+            let Some(TypeData::TypeParameter(data)) =
+                store.type_payload(type_).map(TypeRecord::data)
+            else {
+                return Err(SourceCheckError::Call(site));
+            };
+            if data.is_this_type
+                || data.target.is_some()
+                || data.mapper.is_some()
+                || data.resolved_default_type.is_some()
+                || data
+                    .constraint
+                    .is_some_and(|existing| Some(existing) != constraint)
+                || constraint.is_some_and(|constraint| constraint != element)
+            {
+                return Err(SourceCheckError::Call(site));
+            }
+            if data.constraint != constraint
+                && !store.set_type_parameter_resolution(type_, constraint, None, None, None)
+            {
+                return Err(SourceCheckError::Call(site));
+            }
+            type_parameters.push(type_);
+        }
+
+        let mut parameter_types = Vec::with_capacity(overload.parameters.len());
+        for parameter in &overload.parameters {
+            let type_ = CanonicalTypeQuery::new_with_global_types(
+                store,
+                host,
+                global_types,
+                options,
+                diagnostics,
+            )?
+            .get_type_from_type_node(parameter.annotation)?;
+            parameter_types.push(type_);
+        }
+        let return_type = resolve_global_array_callback_return_annotation(
+            store,
+            host,
+            global_types,
+            options,
+            diagnostics,
+            overload.return_annotation,
+            site,
+        )?;
+        let callback = parameter_types[0];
+        let StoredSingleCallableValidation::Valid {
+            callable: callback_signature,
+            ..
+        } = validate_stored_single_callable(store, callback)
+        else {
+            return Err(SourceCheckError::Call(site));
+        };
+        if callback_signature.parameters.first().copied() != Some(element)
+            || callback_signature.rest_parameter.is_some()
+            || !valid_global_array_callback_predicate(store, overload, Some(callback))
+        {
+            return Err(SourceCheckError::Call(site));
+        }
+        if let Some(predicate) = overload.callback_predicate {
+            let callback_record = store
+                .signature(callback_signature.signature)
+                .ok_or(SourceCheckError::Call(site))?;
+            let narrowed = callback_record
+                .resolved_type_predicate()
+                .and_then(|predicate| store.type_predicate(predicate))
+                .and_then(super::signatures::TypePredicate::type_id);
+            if type_parameters.as_slice() != narrowed.as_slice()
+                || predicate.narrowed_type.is_none()
+            {
+                return Err(SourceCheckError::Call(site));
+            }
+        }
+        resolved.push(ResolvedGlobalArrayCallbackOverload {
+            type_parameters,
+            parameter_types,
+            return_type,
+        });
     }
-    let type_ = store
-        .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(plan.symbol))
-        .ok_or(SourceCheckError::Call(site))?;
-    let signature = store
-        .alloc_signature(
-            SignatureFlags::NONE,
-            Some(plan.declaration),
-            Vec::new(),
-            None,
-            plan.parameters
-                .iter()
-                .map(|parameter| parameter.symbol)
-                .collect(),
-            Some(return_type),
-            None,
-            1,
-        )
-        .ok_or(SourceCheckError::Call(site))?;
-    assert!(store.set_signature_links(
-        plan.declaration,
-        SignatureLinks {
-            resolved_signature: ResolvedSignatureState::Resolved(signature),
-            ..SignatureLinks::default()
-        },
-    ));
-    for (parameter, type_) in plan.parameters.iter().zip(&parameter_types) {
-        assert!(store.set_value_symbol_links(
-            parameter.symbol,
-            ValueSymbolLinks {
-                resolved_type: Some(*type_),
-                ..ValueSymbolLinks::default()
-            },
-        ));
+    Ok(resolved)
+}
+
+#[allow(clippy::too_many_arguments)] // Method roots must not materialize every Array member.
+fn resolve_global_array_callback_return_annotation(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    annotation: NodeRef,
+    site: NodeRef,
+) -> Result<TypeId, SourceCheckError> {
+    let record = host.node(annotation).ok_or(SourceCheckError::Call(site))?;
+    let type_ = match &record.data {
+        NodeData::ArrayTypeNode(array) if record.kind == SyntaxKind::ArrayType => {
+            let element = NodeRef::new(annotation.arena, annotation.file, array.element_type);
+            if store.source_node_parent(element) != Some(SourceNodeParent::Parent(annotation)) {
+                return Err(SourceCheckError::Call(site));
+            }
+            let element = CanonicalTypeQuery::new_with_global_types(
+                store,
+                host,
+                global_types,
+                options,
+                diagnostics,
+            )?
+            .get_type_from_type_node(element)?;
+            store
+                .create_canonical_array_type(global_types, element, false)
+                .map_err(|_| SourceCheckError::Call(site))?
+        }
+        NodeData::UnionTypeNode(union) if record.kind == SyntaxKind::UnionType => {
+            if union.types.nodes.len() != 2 || union.types.has_trailing_comma {
+                return Err(SourceCheckError::Call(site));
+            }
+            let mut types = Vec::with_capacity(union.types.nodes.len());
+            for member in &union.types.nodes {
+                let member = NodeRef::new(annotation.arena, annotation.file, *member);
+                if store.source_node_parent(member) != Some(SourceNodeParent::Parent(annotation)) {
+                    return Err(SourceCheckError::Call(site));
+                }
+                types.push(
+                    CanonicalTypeQuery::new_with_global_types(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        diagnostics,
+                    )?
+                    .get_type_from_type_node(member)?,
+                );
+            }
+            store
+                .expression_union_type_with_global_types(
+                    global_types,
+                    &types,
+                    UnionReduction::Literal,
+                )
+                .map_err(|_| SourceCheckError::Call(site))?
+        }
+        NodeData::KeywordTypeNode(_) if record.kind == SyntaxKind::VoidKeyword => store
+            .intrinsic_bootstrap()
+            .map(|bootstrap| bootstrap.void_type)
+            .ok_or(SourceCheckError::Call(site))?,
+        _ => return Err(SourceCheckError::Call(site)),
+    };
+    let expected = TypeNodeLinks {
+        resolved_type: Some(type_),
+        ..TypeNodeLinks::default()
+    };
+    match store.type_node_links(annotation) {
+        Some(existing) if existing == &expected => {}
+        Some(existing) if existing != &TypeNodeLinks::default() => {
+            return Err(SourceCheckError::Call(site));
+        }
+        _ => {
+            if !store.try_reserve_type_node_links(usize::from(
+                store.type_node_links(annotation).is_none(),
+            )) || !store.set_type_node_links(annotation, expected)
+            {
+                return Err(SourceCheckError::Call(site));
+            }
+        }
     }
-    assert!(store.set_value_symbol_links(
-        plan.symbol,
-        ValueSymbolLinks {
-            resolved_type: Some(type_),
-            ..ValueSymbolLinks::default()
-        },
-    ));
-    assert!(store.set_structured_type_members(
-        type_,
-        None,
-        None,
-        Some(vec![signature]),
-        None,
-        None,
-    ));
-    assert!(store.set_callable_signature_parameter_types_batch(vec![(signature, parameter_types)]));
-    assert!(store.set_function_signature_return_annotation(
-        signature,
-        plan.return_annotation,
-        false,
-    ));
-    if !matches!(
-        validate_stored_callable_set(store, type_),
-        StoredCallableSetValidation::Valid { .. }
-    ) {
-        return Err(SourceCheckError::Call(site));
-    }
-    Ok(Some(type_))
+    Ok(type_)
+}
+
+fn valid_global_array_callback_predicate(
+    store: &CanonicalTypeMapperStore,
+    overload: &GlobalArrayCallbackOverload,
+    callback: Option<TypeId>,
+) -> bool {
+    let Some(callback) = callback else {
+        return false;
+    };
+    let StoredSingleCallableValidation::Valid { callable, .. } =
+        validate_stored_single_callable(store, callback)
+    else {
+        return false;
+    };
+    let Some(signature) = store.signature(callable.signature) else {
+        return false;
+    };
+    let annotation = store
+        .function_signature_return_annotation(callable.signature)
+        .map(|(annotation, _)| annotation);
+    valid_planned_callable_type_predicate(store, signature, annotation, overload.callback_predicate)
 }
 
 /// Maps a real `Array` callback's first generic parameter to its typed receiver.
@@ -703,6 +1146,7 @@ pub(super) fn authenticated_array_callback_contextual_target(
         })
 }
 
+#[allow(clippy::too_many_lines)] // Select and validate every supported array callback overload.
 fn check_authenticated_array_callback_call(
     store: &mut CanonicalTypeMapperStore,
     global_types: &CanonicalGlobalTypes,
@@ -712,7 +1156,7 @@ fn check_authenticated_array_callback_call(
 ) -> Result<Option<CheckedSourceCall>, SourceCheckError> {
     if plan.form != DirectCallForm::Call
         || plan.type_arguments.is_some()
-        || argument_types.len() != 1
+        || !(1..=2).contains(&argument_types.len())
     {
         return Ok(None);
     }
@@ -725,8 +1169,11 @@ fn check_authenticated_array_callback_call(
     let Some(method_record) = store.symbol(method) else {
         return Err(SourceCheckError::Call(plan.node));
     };
+    let Some(method_name) = method_record.name().as_utf8() else {
+        return Ok(None);
+    };
     if method_record.flags() != SymbolFlags::METHOD
-        || method_record.name().as_utf8() != Some("forEach")
+        || !matches!(method_name, "map" | "filter" | "find" | "forEach")
         || store
             .value_symbol_links(method)
             .and_then(|links| links.resolved_type)
@@ -734,6 +1181,7 @@ fn check_authenticated_array_callback_call(
     {
         return Ok(None);
     }
+    let method_name = method_name.to_owned();
     let receiver = store
         .type_node_links(property.receiver.node)
         .and_then(|links| links.resolved_type)
@@ -760,32 +1208,175 @@ fn check_authenticated_array_callback_call(
     else {
         return Err(SourceCheckError::Call(plan.node));
     };
-    let [signature] = projection.call_signatures.as_ref() else {
-        return Err(SourceCheckError::Call(plan.node));
-    };
     let callback = *argument_types
         .first()
         .ok_or(SourceCheckError::Call(plan.node))?;
-    let Some(callback_provenance) = store.source_callable_provenance(callback) else {
+    let StoredCallableSetValidation::Valid {
+        projection: callback_projection,
+        ..
+    } = validate_stored_callable_set(store, callback)
+    else {
         return Ok(None);
     };
-    let Some(callback_signature) = store.signature(callback_provenance.signature) else {
+    let Some(callback_callable) = callback_projection.call_signatures.first() else {
+        return Ok(None);
+    };
+    let Some(callback_signature) = store.signature(callback_callable.signature) else {
         return Err(SourceCheckError::Call(plan.node));
     };
-    if callback_provenance.contextual_target != signature.parameters.first().copied()
-        || callback_signature.parameters().len() != 1
-        || store.callable_signature_parameter_types(callback_provenance.signature)
-            != Some([array.element_type].as_slice())
-        || signature.return_type
-            != store
-                .intrinsic_bootstrap()
-                .map(|bootstrap| bootstrap.void_type)
-    {
+    let annotation = store
+        .function_signature_return_annotation(callback_callable.signature)
+        .map(|(annotation, _)| annotation);
+    if !valid_stored_callable_type_predicate(store, callback_signature, annotation) {
         return Err(SourceCheckError::Call(plan.node));
     }
-    let return_type = signature
+    let callback_predicate = callback_signature
+        .resolved_type_predicate()
+        .map(|predicate| {
+            let predicate = store
+                .type_predicate(predicate)
+                .ok_or(SourceCheckError::Call(plan.node))?;
+            if predicate.kind() != TypePredicateKind::Identifier || predicate.parameter_index() != 0
+            {
+                return Err(SourceCheckError::Call(plan.node));
+            }
+            predicate.type_id().ok_or(SourceCheckError::Call(plan.node))
+        })
+        .transpose()?;
+    let callback_parameter = callback_callable.parameters.first().copied();
+    let callback_return = callback_callable.return_type;
+    let callback_context = store
+        .source_callable_provenance(callback)
+        .and_then(|provenance| provenance.contextual_target);
+    if callback_context.is_some_and(|context| {
+        projection
+            .call_signatures
+            .iter()
+            .all(|signature| signature.parameters.first().copied() != Some(context))
+    }) {
+        return Err(SourceCheckError::Call(plan.node));
+    }
+    if let Some(callback_parameter) = callback_parameter
+        && !store
+            .is_type_assignable_to_with_global_types(
+                array.element_type,
+                callback_parameter,
+                global_types,
+            )
+            .map_err(SourceCheckError::RelationUnavailable)?
+    {
+        return Ok(None);
+    }
+    if let Some(narrowed) = callback_predicate
+        && !store
+            .is_type_assignable_to_with_global_types(narrowed, array.element_type, global_types)
+            .map_err(SourceCheckError::RelationUnavailable)?
+    {
+        return Ok(None);
+    }
+
+    let mut selected = None;
+    for candidate in &projection.call_signatures {
+        if argument_types.len() > candidate.parameters.len() {
+            continue;
+        }
+        let Some(context) = candidate.parameters.first().copied() else {
+            return Err(SourceCheckError::Call(plan.node));
+        };
+        let StoredSingleCallableValidation::Valid {
+            callable: target, ..
+        } = validate_stored_single_callable(store, context)
+        else {
+            return Err(SourceCheckError::Call(plan.node));
+        };
+        let target_signature = store
+            .signature(target.signature)
+            .ok_or(SourceCheckError::Call(plan.node))?;
+        if target_signature.resolved_type_predicate().is_some() == callback_predicate.is_some() {
+            selected = Some((candidate, target));
+            break;
+        }
+    }
+    let Some((signature, callback_target)) = selected else {
+        return Ok(None);
+    };
+    let declaration_signature = store
+        .signature(signature.signature)
+        .ok_or(SourceCheckError::Call(plan.node))?;
+    let source_element = callback_target
+        .parameters
+        .first()
+        .copied()
+        .ok_or(SourceCheckError::Call(plan.node))?;
+    let generic_parameter = declaration_signature.type_parameters().first().copied();
+    let template_return = signature
         .return_type
         .ok_or(SourceCheckError::Call(plan.node))?;
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(SourceCheckError::Call(plan.node))?;
+    let (undefined, void) = (bootstrap.undefined_type, bootstrap.void_type);
+    let expected_element = callback_predicate.map_or(source_element, |_| {
+        generic_parameter.unwrap_or(source_element)
+    });
+
+    let return_type = match method_name.as_str() {
+        "forEach" if generic_parameter.is_none() && template_return == void => void,
+        "map" => {
+            let mapped = callback_return.ok_or(SourceCheckError::Call(plan.node))?;
+            let Some(parameter) = generic_parameter else {
+                return Err(SourceCheckError::Call(plan.node));
+            };
+            if callback_target.return_type != Some(parameter)
+                || store
+                    .canonical_array_reference(global_types, template_return)
+                    .map_err(|_| SourceCheckError::Call(plan.node))?
+                    .is_none_or(|array| array.readonly || array.element_type != parameter)
+            {
+                return Err(SourceCheckError::Call(plan.node));
+            }
+            store
+                .create_canonical_array_type(global_types, mapped, false)
+                .map_err(|_| SourceCheckError::Call(plan.node))?
+        }
+        "filter" => {
+            if store
+                .canonical_array_reference(global_types, template_return)
+                .map_err(|_| SourceCheckError::Call(plan.node))?
+                .is_none_or(|array| array.readonly || array.element_type != expected_element)
+            {
+                return Err(SourceCheckError::Call(plan.node));
+            }
+            store
+                .create_canonical_array_type(
+                    global_types,
+                    callback_predicate.unwrap_or(array.element_type),
+                    false,
+                )
+                .map_err(|_| SourceCheckError::Call(plan.node))?
+        }
+        "find" => {
+            let valid_return = template_return == expected_element
+                || matches!(
+                    store.type_payload(template_return).map(TypeRecord::data),
+                    Some(TypeData::Union(union))
+                        if union.union.types.len() == 2
+                            && union.union.types.contains(&expected_element)
+                            && union.union.types.contains(&undefined)
+                );
+            if !valid_return {
+                return Err(SourceCheckError::Call(plan.node));
+            }
+            store
+                .expression_union_type_with_global_types(
+                    global_types,
+                    &[callback_predicate.unwrap_or(array.element_type), undefined],
+                    UnionReduction::Literal,
+                )
+                .map_err(|_| SourceCheckError::Call(plan.node))?
+        }
+        _ => return Err(SourceCheckError::Call(plan.node)),
+    };
     if preflight_call_publication(store, plan.node, return_type)?
         .is_some_and(|existing| existing != signature.signature)
     {
@@ -4650,6 +5241,44 @@ mod tests {
         .unwrap()
     }
 
+    fn array_callback_default_library() -> ParseResult {
+        parsed(concat!(
+            "interface Array<T> { ",
+            "map<U>(callbackfn: ",
+            "(value: T, index: number, array: T[]) => U, thisArg?: any): U[]; ",
+            "filter<S extends T>(predicate: ",
+            "(value: T, index: number, array: T[]) => value is S, thisArg?: any): S[]; ",
+            "filter(predicate: ",
+            "(value: T, index: number, array: T[]) => unknown, thisArg?: any): T[]; ",
+            "untouched(value: T): void; ",
+            "} interface ReadonlyArray<T> { ",
+            "map<U>(callbackfn: ",
+            "(value: T, index: number, array: readonly T[]) => U, ",
+            "thisArg?: any): U[]; ",
+            "filter<S extends T>(predicate: ",
+            "(value: T, index: number, array: readonly T[]) => value is S, ",
+            "thisArg?: any): S[]; ",
+            "filter(predicate: ",
+            "(value: T, index: number, array: readonly T[]) => unknown, ",
+            "thisArg?: any): T[]; ",
+            "} interface Array<T> { ",
+            "find<S extends T>(predicate: ",
+            "(value: T, index: number, array: T[]) => value is S, ",
+            "thisArg?: any): S | undefined; ",
+            "find(predicate: ",
+            "(value: T, index: number, array: T[]) => unknown, ",
+            "thisArg?: any): T | undefined; ",
+            "} interface ReadonlyArray<T> { ",
+            "find<S extends T>(predicate: ",
+            "(value: T, index: number, array: readonly T[]) => value is S, ",
+            "thisArg?: any): S | undefined; ",
+            "find(predicate: ",
+            "(value: T, index: number, array: readonly T[]) => unknown, ",
+            "thisArg?: any): T | undefined; ",
+            "}",
+        ))
+    }
+
     fn imported_context<'arena>(
         importer: &'arena ParseResult,
         importer_file: FileId,
@@ -6343,6 +6972,278 @@ mod tests {
                 warm,
             );
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Verify both owners, real overload order, and warm identity.
+    fn array_find_and_filter_narrow_named_predicates_cold_and_warm() {
+        let library = array_callback_default_library();
+        for (index, declaration) in [
+            concat!(
+                "function isNumber(value: any): value is number { ",
+                "return typeof value === \"number\"; } ",
+                "declare const values: (string | number)[]; ",
+                "const found: number | undefined = values.find(isNumber); ",
+                "const filtered: number[] = values.filter(isNumber);",
+            ),
+            concat!(
+                "function isNumber(value: any): value is number { ",
+                "return typeof value === \"number\"; } ",
+                "declare const values: ReadonlyArray<string | number>; ",
+                "const found: number | undefined = values.find(isNumber); ",
+                "const filtered: number[] = values.filter(isNumber);",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parsed(declaration);
+            let library_file = FileId::new(4_920 + u32::try_from(index * 2).unwrap());
+            let source_file = FileId::new(4_921 + u32::try_from(index * 2).unwrap());
+            let mut context =
+                context_with_default_library(&library, library_file, &source, source_file);
+
+            context.check_source_file(source_file).unwrap();
+
+            assert!(
+                context.diagnostics().is_empty(),
+                "{:?}",
+                context.diagnostics()
+            );
+            let call_nodes = calls(&source, source_file);
+            let [find, filter] = call_nodes.as_slice() else {
+                panic!("the predicate fixture must retain both callback calls")
+            };
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            let (number, undefined) = (bootstrap.number_type, bootstrap.undefined_type);
+            let found = context
+                .store()
+                .type_node_links(*find)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            assert!(
+                found == number
+                    || matches!(
+                        context.store().type_payload(found).map(TypeRecord::data),
+                        Some(TypeData::Union(union))
+                            if union.union.types.contains(&number)
+                                && union.union.types.contains(&undefined)
+                    )
+            );
+            let filtered = context
+                .store()
+                .type_node_links(*filter)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            let array = context
+                .store()
+                .canonical_array_reference(context.global_types(), filtered)
+                .unwrap()
+                .unwrap();
+            assert_eq!(array.element_type, number);
+            assert!(!array.readonly);
+
+            let owner = if index == 0 {
+                context.global_types().array_type
+            } else {
+                context.global_types().readonly_array_type
+            };
+            let owner = context
+                .store()
+                .type_payload(owner)
+                .and_then(TypeRecord::symbol)
+                .unwrap();
+            let members = context.store().symbol(owner).unwrap().members().unwrap();
+            for name in ["find", "filter"] {
+                let method = context
+                    .store()
+                    .symbol_table(members)
+                    .and_then(|members| members.get_source(name))
+                    .unwrap();
+                let callable = context
+                    .store()
+                    .value_symbol_links(method)
+                    .and_then(|links| links.resolved_type)
+                    .unwrap();
+                let [predicate, ordinary] = context
+                    .store()
+                    .type_payload(callable)
+                    .and_then(|record| record.data().structured())
+                    .and_then(|structured| structured.signatures.as_deref())
+                    .unwrap()
+                else {
+                    panic!("the callback method must retain both real overloads")
+                };
+                assert_eq!(
+                    context
+                        .store()
+                        .signature(*predicate)
+                        .unwrap()
+                        .type_parameters()
+                        .len(),
+                    1,
+                );
+                assert!(
+                    context
+                        .store()
+                        .signature(*ordinary)
+                        .unwrap()
+                        .type_parameters()
+                        .is_empty()
+                );
+            }
+            if index == 0 {
+                let untouched = context
+                    .store()
+                    .symbol_table(members)
+                    .and_then(|members| members.get_source("untouched"))
+                    .unwrap();
+                assert!(context.store().value_symbol_links(untouched).is_none());
+            }
+
+            let warm = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().mapper_len(),
+                context.store().type_predicate_len(),
+                call_publication_state(&context, *find),
+                call_publication_state(&context, *filter),
+            );
+            context.recheck_source_file(source_file).unwrap();
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().mapper_len(),
+                    context.store().type_predicate_len(),
+                    call_publication_state(&context, *find),
+                    call_publication_state(&context, *filter),
+                ),
+                warm,
+            );
+        }
+    }
+
+    #[test]
+    fn array_map_infers_callback_returns_and_filter_keeps_truthy_elements() {
+        let library = array_callback_default_library();
+        for (index, declaration) in [
+            concat!(
+                "declare const values: number[]; ",
+                "const mapped = values.map(value => \"mapped\"); ",
+                "const filtered = values.filter(value => value, undefined);",
+            ),
+            concat!(
+                "declare const values: ReadonlyArray<number>; ",
+                "const mapped = values.map(value => \"mapped\"); ",
+                "const filtered = values.filter(value => value, undefined);",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parsed(declaration);
+            let library_file = FileId::new(4_924 + u32::try_from(index * 2).unwrap());
+            let source_file = FileId::new(4_925 + u32::try_from(index * 2).unwrap());
+            let mut context =
+                context_with_default_library(&library, library_file, &source, source_file);
+
+            context.check_source_file(source_file).unwrap();
+
+            assert!(
+                context.diagnostics().is_empty(),
+                "{:?}",
+                context.diagnostics()
+            );
+            let call_nodes = calls(&source, source_file);
+            let [mapped, filtered] = call_nodes.as_slice() else {
+                panic!("the callback fixture must retain map and filter")
+            };
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            for (call, expected) in [
+                (*mapped, bootstrap.string_type),
+                (*filtered, bootstrap.number_type),
+            ] {
+                let result = context
+                    .store()
+                    .type_node_links(call)
+                    .and_then(|links| links.resolved_type)
+                    .unwrap();
+                let array = context
+                    .store()
+                    .canonical_array_reference(context.global_types(), result)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(array.element_type, expected);
+                assert!(!array.readonly);
+            }
+        }
+    }
+
+    #[test]
+    fn array_callback_materialization_rejects_forged_predicate_metadata() {
+        let library = array_callback_default_library();
+        let source = parsed(concat!(
+            "function isNumber(value: any): value is number { ",
+            "return typeof value === \"number\"; } ",
+            "declare const values: (string | number)[]; ",
+            "values.filter(isNumber);",
+        ));
+        let library_file = FileId::new(4_928);
+        let source_file = FileId::new(4_929);
+        let mut context =
+            context_with_default_library(&library, library_file, &source, source_file);
+        context.check_source_file(source_file).unwrap();
+
+        let owner = context
+            .store()
+            .type_payload(context.global_types().array_type)
+            .and_then(TypeRecord::symbol)
+            .unwrap();
+        let method = context
+            .store()
+            .symbol(owner)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| context.store().symbol_table(members))
+            .and_then(|members| members.get_source("filter"))
+            .unwrap();
+        let callable = context
+            .store()
+            .value_symbol_links(method)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let method_signature = context
+            .store()
+            .type_payload(callable)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.signatures.as_deref())
+            .and_then(|signatures| signatures.first())
+            .copied()
+            .unwrap();
+        let callback = context
+            .store()
+            .callable_signature_parameter_types(method_signature)
+            .and_then(|parameters| parameters.first())
+            .copied()
+            .unwrap();
+        let StoredSingleCallableValidation::Valid {
+            callable: callback, ..
+        } = validate_stored_single_callable(context.store(), callback)
+        else {
+            panic!("the predicate overload must retain its callback signature")
+        };
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let forged = context
+            .store_mut_for_test()
+            .alloc_type_predicate(TypePredicateKind::Identifier, 0, "value", Some(string))
+            .unwrap();
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_signature_resolved_type_predicate(callback.signature, Some(forged))
+        );
+
+        assert!(context.recheck_source_file(source_file).is_err());
     }
 
     #[test]
