@@ -12575,6 +12575,37 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     self.node(declaration)
                         .is_ok_and(|record| record.range.end <= statement_node.range.start)
                 });
+            let prior_default_variable_symbol = (!binding_type_only
+                && exports.elements.nodes.len() == 1
+                && specifier.property_name.is_some()
+                && exported_name_record.kind == SyntaxKind::Identifier
+                && exported_text == "default"
+                && local_record.flags() == SymbolFlags::EXPORT_VALUE)
+                .then(|| local_record.export_symbol())
+                .flatten()
+                .filter(|symbol| {
+                    self.prior_variables.contains(symbol)
+                        && self.readable_variables.contains(symbol)
+                        && module_record
+                            .exports()
+                            .and_then(|exports| store.symbol_table(exports))
+                            .and_then(|exports| exports.get_source(&local_identifier.text))
+                            == Some(*symbol)
+                        && authenticated_named_export_variable(
+                            self.arena,
+                            self.bound,
+                            store,
+                            *symbol,
+                            Some(&local_identifier.text),
+                            true,
+                        )
+                        .is_some_and(|declaration| {
+                            self.bound.local_symbol(declaration) == Some(local_symbol)
+                                && self.node(declaration).is_ok_and(|record| {
+                                    record.range.end <= statement_node.range.start
+                                })
+                        })
+                });
             let is_prior_type_alias = binding_type_only
                 && local_record.flags() == SymbolFlags::TYPE_ALIAS
                 && local_record.declarations().is_some_and(|declarations| {
@@ -12596,7 +12627,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     && prior_class_symbol.is_none()
                     && !is_prior_namespace
                     && !is_prior_named_value_import
-                    && !is_prior_variable)
+                    && !is_prior_variable
+                    && prior_default_variable_symbol.is_none())
             {
                 return Err(self.unsupported(
                     clause,
@@ -12612,7 +12644,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             let alias_record = store
                 .symbol(alias)
                 .ok_or(SourceCheckError::Import(binding))?;
-            let resolved_local = prior_class_symbol.unwrap_or(local_symbol);
+            let resolved_local = prior_class_symbol
+                .or(prior_default_variable_symbol)
+                .unwrap_or(local_symbol);
             if !aliases.insert(alias)
                 || module_record
                     .exports()
@@ -37174,13 +37208,22 @@ pub(super) fn check_source_file(
                                 let imported = store
                                     .symbol(export.local_symbol)
                                     .is_some_and(|local| local.flags() == SymbolFlags::ALIAS);
+                                let exported_default_variable = export.binding.exported_text
+                                    == "default"
+                                    && export.binding.imported_name != export.binding.exported_name
+                                    && !export.binding.syntactic_type_only
+                                    && matches!(
+                                        target.flags(),
+                                        SymbolFlags::FUNCTION_SCOPED_VARIABLE
+                                            | SymbolFlags::BLOCK_SCOPED_VARIABLE
+                                    );
                                 authenticated_named_export_variable(
                                     target_arena,
                                     target_bound,
                                     store,
                                     resolved.target_symbol,
                                     (!imported).then_some(export.binding.imported_text.as_str()),
-                                    imported,
+                                    imported || exported_default_variable,
                                 )
                                 .is_some()
                             })
@@ -59097,6 +59140,196 @@ mod tests {
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Preserve the local proxy, both import forms, and poisoned replay.
+    fn local_named_default_exports_preserve_exported_variable_and_import_identity() {
+        for (index, check_provider_first) in [false, true].into_iter().enumerate() {
+            let provider = parsed("export const value: number = 1; export { value as default };");
+            let direct = parsed(concat!(
+                "import selected from './provider'; ",
+                "export const copied = selected;",
+            ));
+            let grouped = parsed(concat!(
+                "import selected, * as namespace from './provider'; ",
+                "export const copied = selected; ",
+                "export const namespaced = namespace.default;",
+            ));
+            let offset = u32::try_from(index).unwrap() * 3;
+            let provider_file = FileId::new(9_140 + offset);
+            let direct_file = FileId::new(9_141 + offset);
+            let grouped_file = FileId::new(9_142 + offset);
+            let files = [
+                (provider_file, &provider),
+                (direct_file, &direct),
+                (grouped_file, &grouped),
+            ];
+            let mut context = external_context_with_import_routes(
+                &files,
+                &[
+                    SourceImportRoute {
+                        source: 1,
+                        specifier: 0,
+                        target: 0,
+                    },
+                    SourceImportRoute {
+                        source: 2,
+                        specifier: 0,
+                        target: 0,
+                    },
+                ],
+            );
+            let declaration = variable_declaration(&provider, provider_file, "value");
+            let (_, provider_bound) = context.file(provider_file).unwrap();
+            let value = provider_bound.symbol(declaration).unwrap();
+            let local = provider_bound.local_symbol(declaration).unwrap();
+            let module = provider_bound.symbol(provider_bound.source_file()).unwrap();
+            let exports = context
+                .store()
+                .symbol(module)
+                .and_then(ts_binder::semantic::Symbol::exports)
+                .unwrap();
+            let export_table = context.store().symbol_table(exports).unwrap();
+            let default = export_table
+                .get(ts_binder::InternalSymbolName::Default.as_ref())
+                .unwrap();
+            let export_declaration = context
+                .store()
+                .symbol(default)
+                .and_then(ts_binder::semantic::Symbol::value_declaration)
+                .or_else(|| {
+                    context
+                        .store()
+                        .symbol(default)
+                        .and_then(ts_binder::semantic::Symbol::declarations)
+                        .and_then(|declarations| declarations.first().copied())
+                })
+                .unwrap();
+            assert_eq!(export_table.get_source("value"), Some(value));
+            assert_eq!(
+                context.store().symbol(local).unwrap().flags(),
+                SymbolFlags::EXPORT_VALUE,
+            );
+            assert_eq!(
+                context.store().symbol(local).unwrap().export_symbol(),
+                Some(value),
+            );
+
+            if check_provider_first {
+                context.check_source_file(provider_file).unwrap();
+            }
+            context.check_source_file(direct_file).unwrap();
+            context.check_source_file(grouped_file).unwrap();
+            context.check_source_file(provider_file).unwrap();
+
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            assert_eq!(
+                context
+                    .store()
+                    .alias_symbol_links(default)
+                    .map(|links| (links.immediate_target, links.alias_target)),
+                Some((Some(value), AliasTargetState::Resolved(value))),
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(value)
+                    .and_then(|links| links.resolved_type),
+                Some(number),
+            );
+            assert!(context.store().value_symbol_links(default).is_none());
+            assert!(context.store().value_symbol_links(local).is_none());
+            assert_eq!(
+                context
+                    .store()
+                    .symbol(module)
+                    .and_then(ts_binder::semantic::Symbol::exports),
+                Some(exports),
+            );
+            assert_eq!(
+                variable_value_type(&context, &direct, direct_file, "copied"),
+                number,
+            );
+            for name in ["copied", "namespaced"] {
+                assert_eq!(
+                    variable_value_type(&context, &grouped, grouped_file, name),
+                    number,
+                );
+            }
+            assert_eq!(
+                context
+                    .store()
+                    .symbol_node_links(variable_initializer(&grouped, grouped_file, "namespaced"))
+                    .and_then(|links| links.resolved_symbol),
+                Some(default),
+            );
+            assert!(context.diagnostics().is_empty());
+
+            let warm = observable_state(&context, grouped_file);
+            context.recheck_source_file(provider_file).unwrap();
+            context.recheck_source_file(direct_file).unwrap();
+            context.recheck_source_file(grouped_file).unwrap();
+            assert_eq!(observable_state(&context, grouped_file), warm);
+
+            let mut poisoned = context.store().alias_symbol_links(default).unwrap().clone();
+            poisoned.immediate_target = Some(local);
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_alias_symbol_links(default, poisoned)
+            );
+            let poisoned_state = (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+            assert!(matches!(
+                context.recheck_source_file(provider_file),
+                Err(SourceCheckError::Import(node)) if node == export_declaration
+            ));
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                poisoned_state,
+            );
+        }
+    }
+
+    #[test]
+    fn exported_variable_named_aliases_remain_unsupported_outside_one_default_binding() {
+        for (index, source) in [
+            "export const value: number = 1; export { value as renamed };",
+            "export const value: number = 1; export { value as default, value as another };",
+            "export const value: number = 1; export type { value as default };",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parsed(source);
+            let file = FileId::new(9_150 + u32::try_from(index).unwrap());
+            let mut context = context_with_module_state(
+                &[(file, &source)],
+                CanonicalModuleState::External,
+                CanonicalCheckerOptions::default(),
+            );
+            let before = observable_state(&context, file);
+
+            assert!(matches!(
+                context.check_source_file(file),
+                Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Syntax {
+                        kind: SyntaxKind::NamedExports,
+                        role: SourceSyntaxRole::ExportClause,
+                        ..
+                    }
+                ))
+            ));
+            assert_eq!(observable_state(&context, file), before);
+        }
     }
 
     #[test]
