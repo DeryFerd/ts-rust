@@ -8789,6 +8789,57 @@ export = equalsValue;
     }
 
     #[test]
+    fn value_and_type_export_stars_share_one_exact_binder_owned_symbol() {
+        let parsed = parse_source_file(concat!(
+            "export * from './first'; ",
+            "export type * from './second'; ",
+            "export { value as selected } from './third';",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(156);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/export-stars\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::External,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+
+        let bound = binder.file(file).unwrap();
+        let module = bound.symbol(bound.source_file()).unwrap();
+        let exports = binder
+            .symbol_store()
+            .symbol(module)
+            .and_then(|record| record.exports())
+            .and_then(|exports| binder.symbol_store().symbol_table(exports))
+            .unwrap();
+        let star = exports
+            .get(InternalSymbolName::ExportStar.as_ref())
+            .unwrap();
+        let record = binder.symbol_store().symbol(star).unwrap();
+        let declarations = record.declarations().unwrap();
+        assert_eq!(record.flags(), SymbolFlags::EXPORT_STAR);
+        assert_eq!(record.parent(), Some(module));
+        assert!(record.value_declaration().is_none());
+        assert_eq!(declarations.len(), 2);
+        for declaration in declarations {
+            assert_eq!(bound.symbol(*declaration), Some(star));
+        }
+        assert!(exports.get_source("selected").is_some());
+        assert!(bound.diagnostics().is_empty());
+    }
+
+    #[test]
     fn module_instance_state_resolves_local_export_alias_targets() {
         let parsed = parse_source_file(
             r#"

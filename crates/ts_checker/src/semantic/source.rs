@@ -180,11 +180,12 @@ use super::{
         SourceNamedReexportPlan, plan_source_import_identifier_read,
         plan_source_jsdoc_typedef_import, plan_source_type_import_reference,
         plan_top_level_import_equals, plan_top_level_named_reexport,
-        plan_top_level_named_type_import, plan_top_level_named_value_import,
-        preflight_prepared_source_import_publications, prepare_source_import_value,
-        reject_source_type_import_value_use, resolve_source_import_binding,
-        resolve_source_import_namespace_exports, resolve_source_jsdoc_typedef_import,
-        resolve_source_named_reexport_binding, resolve_source_type_import_binding,
+        plan_top_level_named_specifier_type_import, plan_top_level_named_type_import,
+        plan_top_level_named_value_import, preflight_prepared_source_import_publications,
+        prepare_source_import_value, reject_source_type_import_value_use,
+        resolve_source_import_binding, resolve_source_import_namespace_exports,
+        resolve_source_jsdoc_typedef_import, resolve_source_named_reexport_binding,
+        resolve_source_type_import_binding,
     },
     source_namespaces::{
         SourceNamespaceMemberPlan, SourceNamespacePlan, execute_source_namespace,
@@ -1760,6 +1761,26 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     type_imports.push(import);
                 } else {
                     value_imports.push(import);
+                    if kind == SyntaxKind::ImportDeclaration
+                        && let Some(type_import) = plan_top_level_named_specifier_type_import(
+                            self.arena, self.bound, store, statement,
+                        )
+                        .map_err(|error| Self::import_plan_error(statement, &error))?
+                    {
+                        for binding in &type_import.bindings {
+                            if self
+                                .value_import_bindings
+                                .contains_key(&binding.alias_symbol)
+                                || self
+                                    .type_import_bindings
+                                    .insert(binding.alias_symbol, binding.clone())
+                                    .is_some()
+                            {
+                                return Err(SourceCheckError::Import(binding.declaration));
+                            }
+                        }
+                        type_imports.push(type_import);
+                    }
                 }
             }
         }
@@ -9284,7 +9305,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             || clause_node.flags.0 != 0
             || clause_node.parent != Some(statement.node)
             || exports.elements.range != clause_node.range
-            || exports.elements.has_trailing_comma
+            || exports.elements.has_trailing_comma && exports.elements.nodes.is_empty()
             || exports.facts != 0
         {
             return Err(self.unsupported(clause, clause_node.kind, SourceSyntaxRole::ExportClause));
@@ -9330,7 +9351,6 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 || binding_record.parent != Some(clause.node)
                 || binding_record.range.start < previous_end
                 || binding_record.range.end > clause_node.range.end
-                || specifier.is_type_only
                 || specifier.local_symbol.is_some()
                 || specifier.symbol.is_some()
                 || specifier.facts != 0
@@ -9342,6 +9362,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 ));
             }
             previous_end = binding_record.range.end;
+            let binding_type_only = export.is_type_only || specifier.is_type_only;
 
             let local_name = self.reference(specifier.property_name.unwrap_or(specifier.name));
             let local_name_record = self.node(local_name)?;
@@ -9492,10 +9513,30 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         && local_record.declarations() == Some(&[import.declaration])
                         && self.bound.symbol(import.declaration) == Some(local_symbol)
                         && self.node(import.declaration).is_ok_and(|declaration| {
-                            declaration.kind == SyntaxKind::ImportSpecifier
-                                && declaration.range.end <= statement_node.range.start
+                            matches!(
+                                declaration.kind,
+                                SyntaxKind::ImportSpecifier
+                                    | SyntaxKind::ImportClause
+                                    | SyntaxKind::NamespaceImport
+                            ) && declaration.range.end <= statement_node.range.start
                         })
                 });
+            let is_prior_named_type_import = binding_type_only
+                && self
+                    .type_import_bindings
+                    .get(&local_symbol)
+                    .is_some_and(|import| {
+                        local_record.flags() == SymbolFlags::ALIAS
+                            && import.local_text == local_identifier.text
+                            && local_record.declarations() == Some(&[import.declaration])
+                            && self.bound.symbol(import.declaration) == Some(local_symbol)
+                            && self.node(import.declaration).is_ok_and(|declaration| {
+                                matches!(
+                                    declaration.kind,
+                                    SyntaxKind::ImportSpecifier | SyntaxKind::ImportClause
+                                ) && declaration.range.end <= statement_node.range.start
+                            })
+                    });
             let is_prior_variable = self.prior_variables.contains(&local_symbol)
                 && self.readable_variables.contains(&local_symbol)
                 && authenticated_named_export_variable(
@@ -9510,7 +9551,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     self.node(declaration)
                         .is_ok_and(|record| record.range.end <= statement_node.range.start)
                 });
-            let is_prior_type_alias = export.is_type_only
+            let is_prior_type_alias = binding_type_only
                 && local_record.flags() == SymbolFlags::TYPE_ALIAS
                 && local_record.declarations().is_some_and(|declarations| {
                     matches!(
@@ -9524,8 +9565,8 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                                 })
                     )
                 });
-            if (export.is_type_only && !is_prior_type_alias)
-                || (!export.is_type_only
+            if (binding_type_only && !is_prior_type_alias && !is_prior_named_type_import)
+                || (!binding_type_only
                     && !is_prior_enum
                     && !is_prior_function
                     && prior_class_symbol.is_none()
@@ -9570,7 +9611,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         .is_some_and(|target| target != resolved_local)
                         || links
                             .type_only_declaration
-                            .is_some_and(|marker| !export.is_type_only || marker != binding)
+                            .is_some_and(|marker| !binding_type_only || marker != binding)
                         || links
                             .alias_target
                             .symbol()
@@ -9590,7 +9631,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     imported_text: local_identifier.text.clone(),
                     exported_text: exported_text.to_owned(),
                     alias_symbol: alias,
-                    syntactic_type_only: export.is_type_only,
+                    syntactic_type_only: binding_type_only,
                 },
             });
         }
@@ -33382,6 +33423,38 @@ mod tests {
     }
 
     #[test]
+    fn specifier_level_type_import_value_use_reports_ts1361_without_value_links() {
+        let importer = parsed(concat!(
+            "import { type User as Local } from './target'; ",
+            "const invalid = Local;",
+        ));
+        let target = parsed("export type User = { id: number };");
+        let importer_file = FileId::new(9_615);
+        let target_file = FileId::new(9_616);
+        let files = [(importer_file, &importer), (target_file, &target)];
+        let mut context = external_context_with_import_routes(
+            &files,
+            &[SourceImportRoute {
+                source: 0,
+                specifier: 0,
+                target: 1,
+            }],
+        );
+
+        context.check_source_file(importer_file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected one specifier-level type-only value-use diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 1361);
+        let alias = source_import_alias_symbol(&context, &importer, importer_file, "Local");
+        assert!(context.store().value_symbol_links(alias).is_none());
+        let warm = observable_state(&context, importer_file);
+        context.recheck_source_file(importer_file).unwrap();
+        assert_eq!(observable_state(&context, importer_file), warm);
+    }
+
+    #[test]
     fn poisoned_type_only_value_use_fails_before_earlier_publications_and_retries_in_order() {
         let importer = parsed(
             r#"
@@ -33518,6 +33591,142 @@ mod tests {
         assert!(!is_type_checked(&context, target_file));
         context.check_source_file(target_file).unwrap();
         assert!(is_type_checked(&context, target_file));
+    }
+
+    #[test]
+    fn mixed_import_and_export_specifiers_preserve_value_and_type_aliases_cold_and_warm() {
+        let importer = parsed(concat!(
+            "import { count as value, type Model as LocalModel, } from './target'; ",
+            "const copied = value; ",
+            "const model: LocalModel = { id: value }; ",
+            "export { value, type LocalModel as PublicModel, };",
+        ));
+        let target = parsed(concat!(
+            "export const count: number = 1; ",
+            "export type Model = { id: number };",
+        ));
+        let importer_file = FileId::new(9_610);
+        let target_file = FileId::new(9_611);
+        let files = [(importer_file, &importer), (target_file, &target)];
+        let mut context = external_context_with_import_routes(
+            &files,
+            &[SourceImportRoute {
+                source: 0,
+                specifier: 0,
+                target: 1,
+            }],
+        );
+        let value_alias = source_import_alias_symbol(&context, &importer, importer_file, "value");
+        let type_alias =
+            source_import_alias_symbol(&context, &importer, importer_file, "LocalModel");
+        let (_, bound) = context.file(importer_file).unwrap();
+        let module = bound.symbol(bound.source_file()).unwrap();
+        let exports = context
+            .store()
+            .symbol(module)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| context.store().symbol_table(exports))
+            .unwrap();
+        let exported_value = exports.get_source("value").unwrap();
+        let exported_type = exports.get_source("PublicModel").unwrap();
+
+        context.check_source_file(importer_file).unwrap();
+
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(
+            variable_value_type(&context, &importer, importer_file, "copied"),
+            number,
+        );
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(value_alias)
+                .and_then(|links| links.resolved_type),
+            Some(number),
+        );
+        assert!(context.store().value_symbol_links(type_alias).is_none());
+        assert_eq!(
+            context
+                .store()
+                .alias_symbol_links(exported_value)
+                .and_then(|links| links.immediate_target),
+            Some(value_alias),
+        );
+        assert_eq!(
+            context
+                .store()
+                .alias_symbol_links(exported_type)
+                .and_then(|links| links.immediate_target),
+            Some(type_alias),
+        );
+        assert!(
+            context
+                .store()
+                .alias_symbol_links(exported_type)
+                .and_then(|links| links.type_only_declaration)
+                .is_some()
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, importer_file);
+        context.recheck_source_file(importer_file).unwrap();
+        assert_eq!(observable_state(&context, importer_file), warm);
+    }
+
+    #[test]
+    fn named_imports_through_export_stars_retain_target_identity_cold_and_warm() {
+        let importer = parsed(concat!(
+            "import { value } from './barrel'; ",
+            "const copied = value;",
+        ));
+        let barrel = parsed("export * from './target';");
+        let target = parsed("export const value: number = 1;");
+        let importer_file = FileId::new(9_612);
+        let barrel_file = FileId::new(9_613);
+        let target_file = FileId::new(9_614);
+        let files = [
+            (importer_file, &importer),
+            (barrel_file, &barrel),
+            (target_file, &target),
+        ];
+        let mut context = external_context_with_import_routes(
+            &files,
+            &[
+                SourceImportRoute {
+                    source: 0,
+                    specifier: 0,
+                    target: 1,
+                },
+                SourceImportRoute {
+                    source: 1,
+                    specifier: 0,
+                    target: 2,
+                },
+            ],
+        );
+        let alias = source_import_alias_symbol(&context, &importer, importer_file, "value");
+        let value = variable_symbol(&context, &target, target_file, "value");
+
+        context.check_source_file(importer_file).unwrap();
+        context.check_source_file(barrel_file).unwrap();
+
+        assert_eq!(
+            context
+                .store()
+                .alias_symbol_links(alias)
+                .map(|links| (links.immediate_target, links.alias_target)),
+            Some((Some(value), AliasTargetState::Resolved(value))),
+        );
+        assert_eq!(
+            variable_value_type(&context, &importer, importer_file, "copied"),
+            context.store().intrinsic_bootstrap().unwrap().number_type,
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, importer_file);
+        context.recheck_source_file(barrel_file).unwrap();
+        context.recheck_source_file(importer_file).unwrap();
+        assert_eq!(observable_state(&context, importer_file), warm);
     }
 
     #[test]
@@ -42245,7 +42454,7 @@ mod tests {
         let near_misses = [
             ("export { A };", SourceSyntaxRole::ExportClause),
             (
-                r#"export * from "./dependency";"#,
+                r#"export { value } from "./dependency" with { type: "json" };"#,
                 SourceSyntaxRole::ExportDeclaration,
             ),
             ("export type {};", SourceSyntaxRole::ExportDeclaration),

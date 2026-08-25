@@ -4360,13 +4360,6 @@ fn plan_ambient_module_import(
             SourceSyntaxRole::Statement,
         ));
     };
-    let Some(clause) = import.import_clause else {
-        return Err(unsupported(
-            declaration,
-            record.kind,
-            SourceSyntaxRole::Statement,
-        ));
-    };
     if record.kind != SyntaxKind::ImportDeclaration
         || record.flags.0 != 0
         || import.attributes.is_some()
@@ -4390,6 +4383,24 @@ fn plan_ambient_module_import(
             reference_record.parent,
         ));
     }
+    let Some(clause) = import.import_clause else {
+        if reference_record.kind != SyntaxKind::StringLiteral
+            || reference_record.flags.0 != 0
+            || !matches!(
+                &reference_record.data,
+                NodeData::StringLiteral(literal)
+                    if literal.token_flags.0 == 0 && !literal.text.is_empty()
+            )
+            || bound.symbol(declaration).is_some()
+        {
+            return Err(unsupported(
+                declaration,
+                record.kind,
+                SourceSyntaxRole::Statement,
+            ));
+        }
+        return Ok(Vec::new());
+    };
     let module = match ambient_module_import_target(arena, bound, store, reference) {
         Ok(module) => Some(module),
         Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::Import(node)))
@@ -13681,6 +13692,54 @@ mod tests {
                 fixture.context.store().checker_link_allocated_lengths(),
             ),
             before,
+        );
+    }
+
+    #[test]
+    fn ambient_module_side_effect_imports_keep_target_and_alias_state_lazy() {
+        let mut fixture = declaration_fixture(
+            concat!(
+                "declare module 'dependency' { export interface Value {} } ",
+                "declare module 'consumer' { ",
+                "import 'dependency'; ",
+                "interface Wrapper { label: string; } ",
+                "}",
+            ),
+            CanonicalModuleState::Script,
+        );
+        let namespace = plan(&fixture, 1);
+        let import = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ImportDeclaration).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let (_, bound) = fixture.context.file(fixture.file).unwrap();
+        assert!(bound.symbol(import).is_none());
+        assert!(namespace.imports.is_empty());
+        assert_eq!(namespace.members.len(), 1);
+
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+
+        let warm = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
         );
     }
 
