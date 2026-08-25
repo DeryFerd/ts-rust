@@ -33462,7 +33462,7 @@ fn materialize_contextual_source_arrow(
                 .with_type_reference_alias_targets(
                     type_import_capabilities
                         .get(&type_node)
-                        .map_or(&[], Vec::as_slice)
+                        .map_or([].as_slice(), Vec::as_slice)
                         .iter()
                         .copied(),
                 )?
@@ -36888,7 +36888,7 @@ pub(super) fn check_source_file(
             .with_type_reference_alias_targets(
                 type_import_capabilities
                     .get(&annotation)
-                    .map_or(&[], Vec::as_slice)
+                    .map_or([].as_slice(), Vec::as_slice)
                     .iter()
                     .copied(),
             )?

@@ -2435,7 +2435,7 @@ pub(super) fn source_call_argument_contextual_type(
     }
 
     if matches!(argument.kind, PlannedExpressionKind::Template(_))
-        && let [callable] = projection.call_signatures.as_slice()
+        && let [callable] = projection.call_signatures.as_ref()
     {
         let Some(signature) = store.signature(callable.signature) else {
             return Err(SourceCheckError::Call(plan.node));
