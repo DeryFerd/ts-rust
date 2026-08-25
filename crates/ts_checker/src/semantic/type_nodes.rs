@@ -13256,7 +13256,13 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         };
         let root_dom_interface = matches!(
             identifier.text.as_str(),
-            "Document" | "Element" | "Event" | "EventTarget" | "HTMLElement" | "SVGElement"
+            "DataTransfer"
+                | "Document"
+                | "Element"
+                | "Event"
+                | "EventTarget"
+                | "HTMLElement"
+                | "SVGElement"
         );
         let intrinsic_element = (identifier.text.starts_with("HTML")
             || identifier.text.starts_with("SVG"))
@@ -37701,7 +37707,11 @@ mod tests {
             "interface EventTarget { ",
             "addEventListener(type: string, callback: Event | null, options?: boolean): void; ",
             "dispatchEvent(event: Event): boolean; ",
-            "} declare var EventTarget: unknown;",
+            "} declare var EventTarget: unknown; ",
+            "interface DataTransfer { ",
+            "clearData(format?: string): void; ",
+            "setData(format: string, data: string): void; ",
+            "} declare var DataTransfer: unknown;",
         ));
         let source = parse_source_file(concat!(
             "interface Box<Value> {} ",
@@ -37711,7 +37721,11 @@ mod tests {
             "type DomDocument = Box<Document>; ",
             "type NativeEvent = Box<Event>; ",
             "type EventReceiver = Box<EventTarget>; ",
-            "interface AbstractView { document: Document; event: Event; target: EventTarget; }",
+            "type ClipboardData = Box<DataTransfer>; ",
+            "interface AbstractView { ",
+            "document: Document; event: Event; target: EventTarget; ",
+            "clipboardData: DataTransfer; ",
+            "}",
         ));
 
         for is_default_library in [false, true] {
@@ -37725,6 +37739,7 @@ mod tests {
                 ("DomDocument", "Document"),
                 ("NativeEvent", "Event"),
                 ("EventReceiver", "EventTarget"),
+                ("ClipboardData", "DataTransfer"),
             ]
             .map(|(alias, element)| {
                 let symbols = context.store().symbol_table(globals).unwrap();
@@ -37745,6 +37760,8 @@ mod tests {
                 ("Event", "stopPropagation"),
                 ("EventTarget", "addEventListener"),
                 ("EventTarget", "dispatchEvent"),
+                ("DataTransfer", "clearData"),
+                ("DataTransfer", "setData"),
             ]
             .map(|(owner, name)| {
                 context
@@ -37788,6 +37805,7 @@ mod tests {
                 ("document", "Document"),
                 ("event", "Event"),
                 ("target", "EventTarget"),
+                ("clipboardData", "DataTransfer"),
             ] {
                 let expected = context
                     .store()
