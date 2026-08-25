@@ -22409,30 +22409,22 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         {
             return false;
         }
-        if derived.target != base.target {
-            let Some(TypeData::Interface(interface)) = self
-                .store
-                .type_payload(derived.target)
-                .map(TypeRecord::data)
-            else {
-                return false;
-            };
-            let Some([parameter]) = interface.reference.resolved_type_arguments.as_deref() else {
-                return false;
-            };
-            let Some([inherited]) = interface.resolved_base_types.as_deref() else {
-                return false;
-            };
-            let Ok(inherited) = validate_direct_generic_reference(self.store, *inherited) else {
-                return false;
-            };
-            if inherited.target != base.target
-                || inherited.type_arguments.as_slice() != [*parameter]
-            {
-                return false;
-            }
+        if derived.target != base.target
+            && !self.authenticated_react_html_factory_attribute_heritage(
+                derived.target,
+                base.target,
+                namespace,
+            )
+        {
+            return false;
         }
         if element == element_constraint {
+            return true;
+        }
+        if self.authenticated_react_html_factory_dom_heritage(
+            element_symbol,
+            element_constraint_symbol,
+        ) {
             return true;
         }
 
@@ -22478,6 +22470,191 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             base.kind == DirectInterfaceBaseKind::DefaultLibraryInterface
                 && base.symbol == element_constraint_symbol
         })
+    }
+
+    /// Follows forwarded generic bases inside the authenticated React namespace.
+    fn authenticated_react_html_factory_attribute_heritage(
+        &self,
+        source: TypeId,
+        target: TypeId,
+        namespace: SemanticSymbolId,
+    ) -> bool {
+        let Some(exports) = self
+            .store
+            .symbol(namespace)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| self.store.symbol_table(exports))
+        else {
+            return false;
+        };
+        let planner = TypeQueryPlanner::new(
+            self.store,
+            self.host,
+            self.array_type,
+            self.global_types
+                .as_ref()
+                .map(CanonicalArrayTargets::from_global_types),
+            self.options.strict_builtin_iterator_return,
+            &self.type_reference_alias_targets,
+        );
+        let mut current = source;
+        let mut visited = HashSet::new();
+        while current != target {
+            if visited.len() == 16 || !visited.insert(current) {
+                return false;
+            }
+            let Some(record) = self.store.type_payload(current) else {
+                return false;
+            };
+            let TypeData::Interface(interface) = record.data() else {
+                return false;
+            };
+            let Some(symbol) = record.symbol() else {
+                return false;
+            };
+            let Some(owner) = self.store.symbol(symbol) else {
+                return false;
+            };
+            let Some([declaration]) = owner.declarations() else {
+                return false;
+            };
+            if owner.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
+                || owner.check_flags() != CheckFlags::NONE
+                || self.store.get_merged_symbol(symbol) != Some(symbol)
+                || self.store.get_parent_of_symbol(symbol) != Some(namespace)
+                || exports
+                    .get(owner.name())
+                    .and_then(|export| self.store.get_merged_symbol(export))
+                    != Some(symbol)
+                || !planner.is_react_ambient_module_namespace(namespace, *declaration)
+            {
+                return false;
+            }
+            let Some([parameter]) = interface.reference.resolved_type_arguments.as_deref() else {
+                return false;
+            };
+            let Some([inherited]) = interface.resolved_base_types.as_deref() else {
+                return false;
+            };
+            let Ok(inherited) = validate_direct_generic_reference(self.store, *inherited) else {
+                return false;
+            };
+            if inherited.type_arguments.as_slice() != [*parameter] {
+                return false;
+            }
+            current = inherited.target;
+        }
+        true
+    }
+
+    /// Proves bounded DOM inheritance without resolving inherited interface members.
+    #[allow(clippy::too_many_lines)] // Each global owner and declaration is authenticated before traversal.
+    fn authenticated_react_html_factory_dom_heritage(
+        &self,
+        source: SemanticSymbolId,
+        target: SemanticSymbolId,
+    ) -> bool {
+        let Some(globals) = self
+            .store
+            .intrinsic_bootstrap()
+            .and_then(|bootstrap| self.store.symbol_table(bootstrap.globals))
+        else {
+            return false;
+        };
+        let mut pending = vec![source];
+        let mut visited = HashSet::new();
+        while let Some(symbol) = pending.pop() {
+            if visited.len() == 16 || !visited.insert(symbol) {
+                return false;
+            }
+            let Some(owner) = self.store.symbol(symbol) else {
+                return false;
+            };
+            let allowed = SymbolFlags::INTERFACE
+                | SymbolFlags::FUNCTION_SCOPED_VARIABLE
+                | SymbolFlags::TRANSIENT;
+            if !owner.flags().contains(SymbolFlags::INTERFACE)
+                || owner.flags().without(allowed) != SymbolFlags::NONE
+                || owner.check_flags() != CheckFlags::NONE
+                || owner.parent().is_some()
+                || owner.exports().is_some()
+                || owner.export_symbol().is_some()
+                || self.store.get_merged_symbol(symbol) != Some(symbol)
+                || globals
+                    .get(owner.name())
+                    .and_then(|global| self.store.get_merged_symbol(global))
+                    != Some(symbol)
+            {
+                return false;
+            }
+            let Some(declarations) = owner.declarations() else {
+                return false;
+            };
+            let mut interface = None;
+            for &declaration in declarations {
+                let Some(bound) = self.host.bound_file(declaration) else {
+                    return false;
+                };
+                let Some(facts) = bound.source_facts() else {
+                    return false;
+                };
+                let Some(record) = self.host.node(declaration) else {
+                    return false;
+                };
+                if !facts.is_default_library()
+                    || !facts.is_declaration_file()
+                    || !self.host.symbol_matches(self.store, declaration, symbol)
+                {
+                    return false;
+                }
+                if let NodeData::InterfaceDeclaration(data) = &record.data
+                    && interface.replace((declaration, data)).is_some()
+                {
+                    return false;
+                }
+            }
+            let Some((declaration, interface)) = interface else {
+                return false;
+            };
+            let Some(clauses) = interface.heritage_clauses.as_ref() else {
+                return false;
+            };
+            let Ok(heritage) = super::interface_heritage::plan_direct_interface_heritage(
+                self.store,
+                self.host,
+                declaration,
+                symbol,
+                clauses,
+            ) else {
+                return false;
+            };
+            for base in heritage.bases {
+                let Some(base_owner) = self.store.symbol(base.symbol) else {
+                    return false;
+                };
+                let Some(NodeData::Identifier(identifier)) =
+                    self.host.node(base.expression).map(|record| &record.data)
+                else {
+                    return false;
+                };
+                if !matches!(
+                    base.kind,
+                    DirectInterfaceBaseKind::Interface
+                        | DirectInterfaceBaseKind::DefaultLibraryInterface
+                ) || !base.type_arguments.is_empty()
+                    || base_owner.name().as_utf8() != Some(identifier.text.as_str())
+                {
+                    return false;
+                }
+                if base.symbol == target {
+                    return base.kind == DirectInterfaceBaseKind::DefaultLibraryInterface;
+                }
+                if identifier.text.starts_with("HTML") && identifier.text.ends_with("Element") {
+                    pending.push(base.symbol);
+                }
+            }
+        }
+        false
     }
 
     fn execute_generic_alias_instantiation(
@@ -35568,6 +35745,201 @@ mod tests {
         assert_eq!(
             context.get_type_from_type_node(head_annotation),
             Ok(head_resolved),
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Transitive React and DOM ownership share cold and poisoned proofs.
+    fn react_html_factory_transitive_attribute_and_dom_bases_remain_authenticated() {
+        let library = parse_source_file(concat!(
+            "interface HTMLElement { self: this; } declare var HTMLElement: unknown; ",
+            "interface HTMLMediaElement extends HTMLElement { media: string; } ",
+            "declare var HTMLMediaElement: unknown; ",
+            "interface HTMLAudioElement extends HTMLMediaElement { ",
+            "addEventListener<Value extends string>(type: Value): void; ",
+            "} declare var HTMLAudioElement: unknown; ",
+            "interface HTMLVideoElement extends HTMLMediaElement { ",
+            "addEventListener<Value extends string>(type: Value): void; ",
+            "} declare var HTMLVideoElement: unknown; ",
+            "interface HTMLTableCellElement extends HTMLElement { cell: string; } ",
+            "declare var HTMLTableCellElement: unknown; ",
+            "interface HTMLTableDataCellElement extends HTMLTableCellElement { ",
+            "addEventListener<Value extends string>(type: Value): void; } ",
+            "interface HTMLTableHeaderCellElement extends HTMLTableCellElement { ",
+            "addEventListener<Value extends string>(type: Value): void; }",
+        ));
+        let react = parse_source_file(concat!(
+            "declare module 'react' { export = React; namespace React { ",
+            "interface DOMAttributes<T> {} ",
+            "interface HTMLAttributes<T> extends DOMAttributes<T> {} ",
+            "interface HTMLAttributes<T> extends DOMAttributes<T> {} ",
+            "interface MediaHTMLAttributes<T> extends HTMLAttributes<T> {} ",
+            "interface AudioHTMLAttributes<T> extends MediaHTMLAttributes<T> {} ",
+            "interface VideoHTMLAttributes<T> extends MediaHTMLAttributes<T> {} ",
+            "interface TdHTMLAttributes<T> extends HTMLAttributes<T> {} ",
+            "interface ThHTMLAttributes<T> extends HTMLAttributes<T> {} ",
+            "interface ClassAttributes<T> {} type ReactNode = unknown; ",
+            "type DOMFactory<P, T> = ",
+            "(props?: ClassAttributes<T> & P | null, ...children: ReactNode[]) => unknown; ",
+            "interface DetailedHTMLFactory<",
+            "P extends HTMLAttributes<T>, T extends HTMLElement",
+            "> extends DOMFactory<P, T> { ",
+            "(props?: ClassAttributes<T> & P | null, ...children: ReactNode[]): unknown; } ",
+            "interface ReactHTML { ",
+            "audio: DetailedHTMLFactory<AudioHTMLAttributes<HTMLAudioElement>, HTMLAudioElement>; ",
+            "video: DetailedHTMLFactory<VideoHTMLAttributes<HTMLVideoElement>, HTMLVideoElement>; ",
+            "td: DetailedHTMLFactory<TdHTMLAttributes<HTMLTableDataCellElement>, HTMLTableDataCellElement>; ",
+            "th: DetailedHTMLFactory<ThHTMLAttributes<HTMLTableHeaderCellElement>, HTMLTableHeaderCellElement>; ",
+            "} } }",
+        ));
+        let (mut context, library_file, react_file) =
+            default_library_interface_context(&library, &react, true);
+        let library_bound = context.file(library_file).unwrap().1.clone();
+        let react_bound = context.file(react_file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&library.arena, &library_bound),
+                (&react.arena, &react_bound),
+            ],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let globals = context.store().intrinsic_bootstrap().unwrap().globals;
+        let html = context
+            .store()
+            .symbol_table(globals)
+            .and_then(|globals| globals.get_source("HTMLElement"))
+            .unwrap();
+        let media = context
+            .store()
+            .symbol_table(globals)
+            .and_then(|globals| globals.get_source("HTMLMediaElement"))
+            .unwrap();
+        let audio_annotation = react_dom_property_annotation(&react, react_file, "audio");
+        assert_eq!(
+            context.store_mut_for_test().insert_symbol(
+                globals,
+                EscapedName::source("HTMLMediaElement"),
+                html,
+            ),
+            Some(Some(media)),
+        );
+        let poisoned = store_state(context.store());
+        assert!(context.get_type_from_type_node(audio_annotation).is_err());
+        assert_eq!(store_state(context.store()), poisoned);
+        assert_eq!(
+            context.store_mut_for_test().insert_symbol(
+                globals,
+                EscapedName::source("HTMLMediaElement"),
+                media,
+            ),
+            Some(Some(html)),
+        );
+
+        let mut resolved = Vec::new();
+        for (property, element) in [
+            ("audio", "HTMLAudioElement"),
+            ("video", "HTMLVideoElement"),
+            ("td", "HTMLTableDataCellElement"),
+            ("th", "HTMLTableHeaderCellElement"),
+        ] {
+            let annotation = react_dom_property_annotation(&react, react_file, property);
+            let actual = context.get_type_from_type_node(annotation).unwrap();
+            let element_symbol = context
+                .store()
+                .symbol_table(globals)
+                .and_then(|globals| globals.get_source(element))
+                .unwrap();
+            let element_type = context
+                .store()
+                .declared_type_links(element_symbol)
+                .and_then(|links| links.declared_type)
+                .unwrap();
+            let factory = validate_direct_generic_reference(context.store(), actual).unwrap();
+            assert_eq!(factory.type_arguments[1], element_type);
+            assert_eq!(
+                validate_direct_generic_reference(context.store(), factory.type_arguments[0])
+                    .unwrap()
+                    .type_arguments,
+                [element_type],
+            );
+            let method = context
+                .store()
+                .symbol(element_symbol)
+                .and_then(ts_binder::semantic::Symbol::members)
+                .and_then(|members| context.store().symbol_table(members))
+                .and_then(|members| members.get_source("addEventListener"))
+                .unwrap();
+            assert!(context.store().value_symbol_links(method).is_none());
+            let references = react_dom_type_references(&react, react_file, element);
+            assert_eq!(references.len(), 2);
+            let aliases = HashMap::new();
+            for reference in references {
+                assert!(
+                    TypeQueryPlanner::new(context.store(), &host, None, None, false, &aliases)
+                        .is_default_library_dom_interface_argument(reference, element_symbol)
+                );
+            }
+            resolved.push((annotation, actual));
+        }
+        for intermediate in ["HTMLMediaElement", "HTMLTableCellElement"] {
+            let symbol = context
+                .store()
+                .symbol_table(globals)
+                .and_then(|globals| globals.get_source(intermediate))
+                .unwrap();
+            assert!(context.store().declared_type_links(symbol).is_none());
+        }
+        let warm = store_state(context.store());
+        for (annotation, expected) in &resolved {
+            assert_eq!(context.get_type_from_type_node(*annotation), Ok(*expected));
+        }
+        assert_eq!(store_state(context.store()), warm);
+
+        let factory = context
+            .store()
+            .symbol_node_links(audio_annotation)
+            .and_then(|links| links.resolved_symbol)
+            .unwrap();
+        let namespace = context.store().get_parent_of_symbol(factory).unwrap();
+        let exports = context
+            .store()
+            .symbol(namespace)
+            .unwrap()
+            .exports()
+            .unwrap();
+        let media_attributes = context
+            .store()
+            .symbol_table(exports)
+            .and_then(|exports| exports.get_source("MediaHTMLAttributes"))
+            .unwrap();
+        let html_attributes = context
+            .store()
+            .symbol_table(exports)
+            .and_then(|exports| exports.get_source("HTMLAttributes"))
+            .unwrap();
+        assert_eq!(
+            context.store_mut_for_test().insert_symbol(
+                exports,
+                EscapedName::source("MediaHTMLAttributes"),
+                html_attributes,
+            ),
+            Some(Some(media_attributes)),
+        );
+        let poisoned = store_state(context.store());
+        assert!(context.get_type_from_type_node(audio_annotation).is_err());
+        assert_eq!(store_state(context.store()), poisoned);
+        assert_eq!(
+            context.store_mut_for_test().insert_symbol(
+                exports,
+                EscapedName::source("MediaHTMLAttributes"),
+                media_attributes,
+            ),
+            Some(Some(html_attributes)),
+        );
+        assert_eq!(
+            context.get_type_from_type_node(audio_annotation),
+            Ok(resolved[0].1),
         );
     }
 
