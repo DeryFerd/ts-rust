@@ -54,7 +54,7 @@ use super::{
         callable_assignability_details, exact_optional_property_mismatch_details,
         excess_object_argument_diagnostic, missing_mapped_index_signature_details,
     },
-    signatures::{SignatureFlags, TypePredicateKind},
+    signatures::{ElementFlags, SignatureFlags, TypePredicateKind},
     source::{
         PlannedExpression, PlannedExpressionKind, PlannedIdentifierReadKind, SourceCheckError,
         UnsupportedSourceSyntax, logical_binary_operator_text, merge_retry_diagnostic,
@@ -5484,7 +5484,16 @@ fn prepare_source_argument_mismatch_diagnostics(
             options,
         )?;
         if details.is_empty() {
-            missing_mapped_index_signature_details(store, argument_type, parameter_type)?
+            if let Some(detail) = short_rest_tuple_argument_detail(
+                store,
+                argument.unparenthesized().node,
+                argument_type,
+                parameter_type,
+            )? {
+                vec![detail]
+            } else {
+                missing_mapped_index_signature_details(store, argument_type, parameter_type)?
+            }
         } else {
             details
         }
@@ -5500,6 +5509,49 @@ fn prepare_source_argument_mismatch_diagnostics(
         .with_details(details),
         related_information: Vec::new(),
     }])
+}
+
+fn short_rest_tuple_argument_detail(
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+    source: TypeId,
+    target: TypeId,
+) -> Result<Option<String>, SourceCheckError> {
+    let Some(source_tuple) = store
+        .canonical_tuple_shape(source)
+        .map_err(|_| SourceCheckError::Call(node))?
+    else {
+        return Ok(None);
+    };
+    let Some(target_tuple) = store
+        .canonical_tuple_shape(target)
+        .map_err(|_| SourceCheckError::Call(node))?
+    else {
+        return Ok(None);
+    };
+    let [rest, required] = target_tuple.element_infos() else {
+        return Ok(None);
+    };
+    if source_tuple
+        .combined_flags()
+        .intersects(ElementFlags::VARIABLE)
+        || rest.flags() != ElementFlags::REST
+        || required.flags() != ElementFlags::REQUIRED
+        || source_tuple.element_types().len() >= target_tuple.min_length()
+    {
+        return Ok(None);
+    }
+
+    let detail = Diagnostic::with_arguments(
+        message_by_code(2618).ok_or(SourceCheckError::MissingDiagnostic(2618))?,
+        [
+            source_tuple.element_types().len().to_string(),
+            target_tuple.min_length().to_string(),
+        ],
+    )
+    .render()
+    .expect("TS2618 has exactly two formatting arguments");
+    Ok(Some(format!("  {detail}")))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11456,6 +11508,101 @@ mod tests {
                 context.store().intrinsic_bootstrap().unwrap().string_type
             );
         }
+    }
+
+    #[test]
+    fn short_rest_tuple_argument_details_preserve_exact_output_and_authenticate_caches() {
+        let parsed = parsed("const value = [];");
+        let file = FileId::new(42_103);
+        let node = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ArrayLiteralExpression)
+                    .then(|| NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .unwrap();
+        let mut context = context(&parsed, file);
+        let (source, target) = {
+            let store = context.store_mut_for_test();
+            let string = store.intrinsic_bootstrap().unwrap().string_type;
+            let source = store.create_canonical_empty_tuple_type().unwrap();
+            let rest = store
+                .create_tuple_element_info(ElementFlags::REST, None)
+                .unwrap();
+            let required = store
+                .create_tuple_element_info(ElementFlags::REQUIRED, None)
+                .unwrap();
+            let target = store
+                .create_canonical_tuple_type(CanonicalTupleTypeRequest::new(
+                    &[string, string],
+                    &[rest, required],
+                    false,
+                ))
+                .unwrap();
+            (source, target)
+        };
+        let before = (
+            context.store().type_len(),
+            context.store().mapper_len(),
+            context.store().signature_len(),
+            context.store().cached_signature_len(),
+        );
+
+        let detail = short_rest_tuple_argument_detail(context.store(), node, source, target)
+            .unwrap()
+            .unwrap();
+        let diagnostic = Diagnostic::with_arguments(
+            message_by_code(2345).unwrap(),
+            ["[]", "[...string[], string]"],
+        )
+        .with_details([detail.as_str()]);
+        assert_eq!(
+            diagnostic.render().unwrap(),
+            concat!(
+                "Argument of type '[]' is not assignable to parameter of type ",
+                "'[...string[], string]'.\n",
+                "  Source has 0 element(s) but target requires 1.",
+            )
+        );
+        assert_eq!(
+            short_rest_tuple_argument_detail(context.store(), node, source, target),
+            Ok(Some(detail)),
+        );
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().mapper_len(),
+                context.store().signature_len(),
+                context.store().cached_signature_len(),
+            ),
+            before,
+        );
+
+        let tuple_target = context
+            .store()
+            .canonical_tuple_shape(target)
+            .unwrap()
+            .unwrap()
+            .target();
+        let Some(TypeData::Tuple(tuple)) = context
+            .store()
+            .type_payload(tuple_target)
+            .map(TypeRecord::data)
+        else {
+            panic!("the rest tuple must retain its canonical target")
+        };
+        let this_type = tuple.interface.this_type.unwrap();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_resolved_base_constraint(this_type, Some(number))
+        );
+        assert_eq!(
+            short_rest_tuple_argument_detail(context.store(), node, source, target),
+            Err(SourceCheckError::Call(node)),
+        );
     }
 
     #[test]
