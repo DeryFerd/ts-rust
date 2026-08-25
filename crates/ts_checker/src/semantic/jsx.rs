@@ -3748,6 +3748,21 @@ fn jsx_child_is_assignable(
                 options,
                 diagnostics,
             )?;
+            if base == target {
+                return Ok(true);
+            }
+            let includes_base = matches!(
+                store.type_payload(target).map(super::type_records::TypeRecord::data),
+                Some(super::TypeData::Union(union)) if union.union.types.contains(&base)
+            );
+            if includes_base {
+                if let Some(global_types) = global_types {
+                    store.validate_union_constituent_with_global_types(global_types, target)?;
+                } else {
+                    store.validate_union_constituent(target)?;
+                }
+                return Ok(true);
+            }
             return relation(store, base).map_err(Into::into);
         }
     };
