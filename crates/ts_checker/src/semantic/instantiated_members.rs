@@ -4998,6 +4998,111 @@ mod tests {
     }
 
     #[test]
+    fn merged_generic_heritage_subsets_preserve_concrete_member_substitutions() {
+        let parsed = parse_source_file(concat!(
+            "interface Base<Item> { inherited: Item }\n",
+            "interface Derived<Unused, Value> extends Base<Value> { own: Unused }\n",
+            "interface Derived<Unused, Value> extends Base<Value> { extra: boolean }\n",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(6_221);
+        let mut context = checker_context(&parsed, file, CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let base_symbol = source_symbol(&parsed, file, &context, "Base");
+        let derived_symbol = source_symbol(&parsed, file, &context, "Derived");
+        let base = context
+            .store()
+            .declared_type_links(base_symbol)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let target = context
+            .store()
+            .declared_type_links(derived_symbol)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let TypeData::Interface(interface) = context.store().type_payload(target).unwrap().data()
+        else {
+            panic!("the merged generic interface must retain its target")
+        };
+        let [_, value] = interface
+            .reference
+            .resolved_type_arguments
+            .as_deref()
+            .unwrap()
+        else {
+            panic!("the derived target must retain both type parameters")
+        };
+        let value = *value;
+        let [base_reference] = interface.resolved_base_types.as_deref().unwrap() else {
+            panic!("the merged interface must retain one forwarded base")
+        };
+        let inherited = validate_direct_generic_reference(context.store(), *base_reference)
+            .expect("the forwarded base must remain canonical");
+        assert_eq!(inherited.target, base);
+        assert_eq!(inherited.type_arguments, [value]);
+
+        let (string, number, boolean) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.string_type,
+                bootstrap.number_type,
+                bootstrap.boolean_type,
+            )
+        };
+        let concrete = context
+            .store_mut_for_test()
+            .create_direct_generic_reference_type(target, &[string, number])
+            .unwrap();
+        let members = context
+            .store_mut_for_test()
+            .resolve_generic_interface_members(concrete, None)
+            .unwrap();
+        assert_eq!(
+            members
+                .properties()
+                .iter()
+                .map(|property| context.store().symbol(*property).unwrap().name().as_utf8())
+                .collect::<Vec<_>>(),
+            [Some("own"), Some("extra"), Some("inherited")],
+        );
+        for (name, expected) in [("own", string), ("extra", boolean), ("inherited", number)] {
+            assert_eq!(
+                context
+                    .store_mut_for_test()
+                    .resolve_generic_interface_property(concrete, name, None)
+                    .unwrap()
+                    .unwrap()
+                    .type_id(),
+                expected,
+                "{name}",
+            );
+        }
+        assert!(context.diagnostics().is_empty());
+
+        let warm = (
+            context.store().type_len(),
+            context.store().mapper_len(),
+            context.store().symbol_len(),
+            context.store().symbol_store().symbol_table_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().mapper_len(),
+                context.store().symbol_len(),
+                context.store().symbol_store().symbol_table_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
     fn indexed_generic_member_substitution_selects_the_instantiated_property_type() {
         let parsed = parse_source_file(concat!(
             "interface Shape { value: string }\n",

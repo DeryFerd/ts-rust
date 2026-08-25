@@ -10993,15 +10993,35 @@ fn valid_generic_publication_target(
             let Ok(base_reference) = validate_direct_generic_reference(store, *base) else {
                 return false;
             };
-            let arguments_match = base_reference.type_arguments == reference.type_arguments
-                || planned.type_arguments.len() == base_reference.type_arguments.len()
+            let arguments_match = if base_reference.type_arguments == reference.type_arguments {
+                true
+            } else {
+                let mut previous_position = None;
+                planned.type_arguments.len() == base_reference.type_arguments.len()
                     && planned
                         .type_arguments
                         .iter()
                         .zip(&base_reference.type_arguments)
                         .all(|(annotation, argument)| {
-                            cached_planned_type_identity(store, *annotation) == Some(*argument)
-                        });
+                            if cached_planned_type_identity(store, *annotation) != Some(*argument) {
+                                return false;
+                            }
+                            let Some(position) = reference
+                                .type_arguments
+                                .iter()
+                                .position(|parameter| parameter == argument)
+                            else {
+                                return true;
+                            };
+                            if previous_position.is_some_and(|previous| position <= previous) {
+                                return false;
+                            }
+                            previous_position = Some(position);
+                            cached_ordinary_type_parameter_owner(store, *argument)
+                                .and_then(|parameter| store.get_parent_of_symbol(parameter))
+                                == Some(plan.symbol)
+                        })
+            };
             if planned.kind != DirectInterfaceBaseKind::Interface
                 || planned.type_arguments.is_empty()
                 || !arguments_match
@@ -18950,6 +18970,193 @@ mod generic_publication_tests {
             Ok(derived),
         );
         assert_eq!(state(&fixture.store, &plan, derived), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn reopened_generic_interfaces_substitute_forwarded_parameter_subsets() {
+        let mut fixture = interface_fixture(
+            concat!(
+                "interface Derived<Unused, Value> extends Base<Value> { own: Unused } ",
+                "interface Derived<Unused, Value> extends Base<Value> { extra: boolean } ",
+                "interface Base<Item> { inherited: Item }",
+            ),
+            3_819,
+        );
+        let locals = fixture.bound.locals(fixture.bound.source_file()).unwrap();
+        let base_symbol = fixture
+            .store
+            .symbol_table(locals)
+            .and_then(|locals| locals.get_source("Base"))
+            .unwrap();
+        let globals = fixture.store.intrinsic_bootstrap().unwrap().globals;
+        fixture
+            .store
+            .merge_global_symbol(globals, base_symbol)
+            .unwrap();
+        let host = host(&fixture.parsed, &fixture.bound);
+        let derived_plan = plan_generic_interface(&fixture.store, &host, fixture.symbol).unwrap();
+        assert_eq!(derived_plan.declarations.len(), 2);
+        let [heritage] = derived_plan.heritage.as_ref().unwrap().bases.as_slice() else {
+            panic!("the reopened interface must retain one shared base")
+        };
+        assert_eq!(heritage.type_arguments.len(), 1);
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let derived = CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalCheckerOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_declared_type_of_symbol(fixture.symbol)
+        .unwrap();
+        let base = fixture
+            .store
+            .declared_type_links(base_symbol)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let base_parameter = validate_direct_generic_reference(&fixture.store, base)
+            .unwrap()
+            .type_arguments[0];
+        let derived_parameters = validate_direct_generic_reference(&fixture.store, derived)
+            .unwrap()
+            .type_arguments;
+        let [unused, value] = derived_parameters.as_slice() else {
+            panic!("the derived interface must retain both source parameters")
+        };
+        let (unused, value) = (*unused, *value);
+        let expected_base = fixture
+            .store
+            .type_payload(derived)
+            .and_then(|record| match record.data() {
+                TypeData::Interface(interface) => interface
+                    .resolved_base_types
+                    .as_deref()
+                    .and_then(|bases| bases.first())
+                    .copied(),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            validate_direct_generic_reference(&fixture.store, expected_base)
+                .unwrap()
+                .type_arguments,
+            [value],
+        );
+
+        let base_plan = plan_generic_interface(&fixture.store, &host, base_symbol).unwrap();
+        assert!(fixture.store.publish_interface_no_base_resolution(base));
+        assert_eq!(
+            publish_generic_interface_declared_members(
+                &mut fixture.store,
+                &base_plan,
+                base,
+                &[base_parameter],
+            ),
+            Ok(base),
+        );
+
+        let boolean = fixture.store.intrinsic_bootstrap().unwrap().boolean_type;
+        let forged_base = fixture
+            .store
+            .create_direct_generic_reference_type(base, &[unused])
+            .unwrap();
+        assert!(fixture.store.set_interface_base_resolution(
+            derived,
+            true,
+            None,
+            Some(vec![forged_base]),
+        ));
+        let poisoned = state(&fixture.store, &derived_plan, derived);
+        assert_eq!(
+            publish_generic_interface_declared_members(
+                &mut fixture.store,
+                &derived_plan,
+                derived,
+                &[unused, boolean],
+            ),
+            Err(PropertyObjectError::InvalidCachedInterface {
+                symbol: fixture.symbol,
+                type_: derived,
+            }),
+        );
+        assert_eq!(state(&fixture.store, &derived_plan, derived), poisoned);
+        assert!(fixture.store.set_interface_base_resolution(
+            derived,
+            true,
+            None,
+            Some(vec![expected_base]),
+        ));
+
+        assert_eq!(
+            publish_generic_interface_declared_members(
+                &mut fixture.store,
+                &derived_plan,
+                derived,
+                &[unused, boolean],
+            ),
+            Ok(derived),
+        );
+        let members = fixture
+            .store
+            .resolve_generic_interface_members(derived, None)
+            .unwrap();
+        assert_eq!(
+            members
+                .properties()
+                .iter()
+                .map(|property| fixture.store.symbol(*property).unwrap().name().as_utf8())
+                .collect::<Vec<_>>(),
+            [Some("own"), Some("extra"), Some("inherited")],
+        );
+
+        let (string, number) = {
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let concrete = fixture
+            .store
+            .create_direct_generic_reference_type(derived, &[string, number])
+            .unwrap();
+        for (name, expected) in [("own", string), ("extra", boolean), ("inherited", number)] {
+            assert_eq!(
+                fixture
+                    .store
+                    .resolve_generic_interface_property(concrete, name, None)
+                    .unwrap()
+                    .unwrap()
+                    .type_id(),
+                expected,
+                "{name}",
+            );
+        }
+
+        let warm = (
+            state(&fixture.store, &derived_plan, derived),
+            fixture.store.type_len(),
+            fixture.store.mapper_len(),
+            fixture.store.symbol_len(),
+        );
+        assert_eq!(
+            publish_generic_interface_declared_members(
+                &mut fixture.store,
+                &derived_plan,
+                derived,
+                &[unused, boolean],
+            ),
+            Ok(derived),
+        );
+        assert_eq!(
+            (
+                state(&fixture.store, &derived_plan, derived),
+                fixture.store.type_len(),
+                fixture.store.mapper_len(),
+                fixture.store.symbol_len(),
+            ),
+            warm,
+        );
         assert!(diagnostics.is_empty());
     }
 
