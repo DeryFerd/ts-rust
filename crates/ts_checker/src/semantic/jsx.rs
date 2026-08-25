@@ -4984,8 +4984,12 @@ fn resolve_component_tag(
         {
             return resolve_construct_component_signature(
                 store,
+                host,
+                namespace,
                 opening,
                 projection.construct_signatures[0],
+                options,
+                diagnostics,
             );
         }
         StoredCallableSetValidation::NotCallable
@@ -5086,20 +5090,30 @@ fn resolve_component_tag(
 }
 
 fn resolve_construct_component_signature(
-    store: &CanonicalTypeMapperStore,
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    namespace: &JsxNamespace,
     opening: NodeRef,
     signature: SignatureId,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
 ) -> Result<(TypeId, SignatureId), SourceCheckError> {
     let invalid = || SourceCheckError::Call(opening);
     let record = store.signature(signature).ok_or_else(invalid)?;
-    let [parameter] = record.parameters() else {
-        return Err(unsupported(opening, SyntaxKind::JsxOpeningElement));
+    let parameter = match record.parameters() {
+        [] => None,
+        [parameter] => Some(*parameter),
+        _ => return Err(unsupported(opening, SyntaxKind::JsxOpeningElement)),
     };
-    let attributes = store
-        .value_symbol_links(*parameter)
-        .and_then(|links| links.resolved_type)
-        .filter(|type_| store.type_payload(*type_).is_some())
-        .ok_or_else(invalid)?;
+    let attributes = parameter
+        .map(|parameter| {
+            store
+                .value_symbol_links(parameter)
+                .and_then(|links| links.resolved_type)
+                .filter(|type_| store.type_payload(*type_).is_some())
+                .ok_or_else(invalid)
+        })
+        .transpose()?;
     let result = record.resolved_return_type().ok_or_else(invalid)?;
     let allowed = SignatureFlags::CONSTRUCT | SignatureFlags::HAS_LITERAL_TYPES;
     if !record.flags().contains(SignatureFlags::CONSTRUCT)
@@ -5107,12 +5121,101 @@ fn resolve_construct_component_signature(
         || record.this_parameter().is_some()
         || !record.type_parameters().is_empty()
         || !(0..=1).contains(&record.min_argument_count())
-        || store.callable_signature_parameter_types(signature) != Some([attributes].as_slice())
+        || record.min_argument_count() == 1 && attributes.is_none()
+        || store.callable_signature_parameter_types(signature) != Some(attributes.as_slice())
         || store.type_payload(result).is_none()
     {
         return Err(invalid());
     }
+
+    if let Some(name) = resolve_construct_component_attributes_property(
+        store,
+        host,
+        namespace,
+        opening,
+        options,
+        diagnostics,
+    )? {
+        if let Some(property) = store.resolved_own_property(result, &name)? {
+            return Ok((property.type_, signature));
+        }
+        add_diagnostic(diagnostics, opening, 2607, [name])?;
+        return Ok((namespace.error_type, signature));
+    }
+
+    let attributes = attributes.unwrap_or_else(|| {
+        store
+            .intrinsic_bootstrap()
+            .expect("the checker bootstrap was validated")
+            .empty_object_type
+    });
     Ok((attributes, signature))
+}
+
+fn resolve_construct_component_attributes_property(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    namespace: &JsxNamespace,
+    opening: NodeRef,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+) -> Result<Option<String>, SourceCheckError> {
+    let Some(element) = store
+        .type_payload(namespace.element_type)
+        .and_then(super::type_records::TypeRecord::symbol)
+    else {
+        return Ok(None);
+    };
+    let Some(owner) = store.get_parent_of_symbol(element) else {
+        return Ok(None);
+    };
+    let Some(marker) = store
+        .symbol(owner)
+        .and_then(ts_binder::semantic::Symbol::exports)
+        .and_then(|exports| store.symbol_table(exports))
+        .and_then(|exports| exports.get_source("ElementAttributesProperty"))
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+    else {
+        return Ok(None);
+    };
+    validate_jsx_namespace_type_symbol(store, marker, opening)?;
+    let marker_type =
+        resolve_namespace_export_type(store, host, owner, marker, None, options, diagnostics)?;
+    let properties = store
+        .type_payload(marker_type)
+        .and_then(|record| record.data().structured())
+        .ok_or(SourceCheckError::Property(opening))?
+        .properties
+        .as_deref()
+        .unwrap_or_default();
+    match properties {
+        [] => Ok(None),
+        [property] => {
+            let record = store
+                .symbol(*property)
+                .ok_or(SourceCheckError::Property(opening))?;
+            if !record.flags().contains(SymbolFlags::PROPERTY)
+                || record.name().as_utf8().is_none_or(str::is_empty)
+            {
+                return Err(SourceCheckError::Property(opening));
+            }
+            Ok(record.name().as_utf8().map(str::to_owned))
+        }
+        _ => {
+            let declaration = store
+                .symbol(marker)
+                .and_then(ts_binder::semantic::Symbol::declarations)
+                .and_then(|declarations| declarations.first().copied())
+                .ok_or(SourceCheckError::Property(opening))?;
+            add_diagnostic(
+                diagnostics,
+                declaration,
+                2608,
+                ["ElementAttributesProperty"],
+            )?;
+            Ok(None)
+        }
+    }
 }
 
 fn resolve_namespace_component_type(
@@ -14451,6 +14554,178 @@ mod runtime_tests {
             signatures
                 .iter()
                 .all(|signature| *signature == signatures[0])
+        );
+
+        let warm = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().signature_len(),
+            context.store().checker_link_allocated_lengths(),
+            context.diagnostics().as_slice().to_vec(),
+        );
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.diagnostics().as_slice().to_vec(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Instance props, constructor identity, and diagnostics share one contract.
+    fn class_jsx_components_select_element_attributes_property_and_replay_warm() {
+        let source = concat!(
+            "declare namespace JSX { ",
+            "interface Element {} ",
+            "interface ElementAttributesProperty { props: {}; } ",
+            "interface ElementChildrenAttribute { children: {}; } ",
+            "}\n",
+            "interface Props { label: string; children?: string; }\n",
+            "interface Instance { props: Props; }\n",
+            "declare const EmptyWidget: { new(): Instance; };\n",
+            "declare const LegacyWidget: { new(value: { ignored: boolean }): Instance; };\n",
+            "const empty = <EmptyWidget label=\"ready\">okay</EmptyWidget>;\n",
+            "const legacy = <LegacyWidget label=\"ready\">okay</LegacyWidget>;\n",
+            "const wrongAttribute = <EmptyWidget label={123}>okay</EmptyWidget>;\n",
+            "const wrongChild = <LegacyWidget label=\"ready\">{123}</LegacyWidget>;\n",
+        );
+        let parsed = parse_jsx_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(8_230);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/jsx-instance-props.tsx\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = crate::semantic::CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 2);
+        for (diagnostic, expected) in diagnostics.iter().zip(["label", "{123}"]) {
+            assert_eq!(diagnostic.diagnostic.code(), 2322);
+            assert_eq!(
+                diagnostic.diagnostic.render().unwrap(),
+                "Type 'number' is not assignable to type 'string'.",
+            );
+            let range = parsed
+                .arena
+                .get(diagnostic.node.unwrap().node)
+                .unwrap()
+                .range;
+            assert_eq!(
+                source.get(range.start.get() as usize..range.end.get() as usize),
+                Some(expected),
+            );
+        }
+
+        let mut constructors = Vec::new();
+        for (node, record) in parsed.arena.iter() {
+            if record.kind != SyntaxKind::JsxOpeningElement {
+                continue;
+            }
+            let opening = NodeRef::new(parsed.arena.id(), file, node);
+            let signature = context
+                .store()
+                .signature_links(opening)
+                .and_then(|links| links.resolved_signature.signature())
+                .unwrap();
+            let constructor = context.store().signature(signature).unwrap();
+            assert!(constructor.flags().contains(SignatureFlags::CONSTRUCT));
+            constructors.push(constructor.parameters().len());
+        }
+        assert_eq!(constructors, [0, 1, 0, 1]);
+
+        let warm = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().signature_len(),
+            context.store().checker_link_allocated_lengths(),
+            context.diagnostics().as_slice().to_vec(),
+        );
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.diagnostics().as_slice().to_vec(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn class_jsx_components_report_missing_element_attributes_property() {
+        let source = concat!(
+            "declare namespace JSX { ",
+            "interface Element {} ",
+            "interface ElementAttributesProperty { props: {}; } ",
+            "}\n",
+            "interface Instance {}\n",
+            "declare const Widget: { new(): Instance; };\n",
+            "const invalid = <Widget label=\"ready\" />;\n",
+        );
+        let parsed = parse_jsx_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(8_231);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/jsx-missing-instance-props.tsx\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = crate::semantic::CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("a missing instance props property must produce exactly one diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2607);
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "JSX element class does not support attributes because it does not have a 'props' property.",
         );
 
         let warm = (
