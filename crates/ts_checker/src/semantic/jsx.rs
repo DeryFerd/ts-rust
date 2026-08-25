@@ -4190,6 +4190,11 @@ fn check_jsx_implicit_children(
     } else {
         None
     };
+    let constructor_overload = if expected_children.is_some() {
+        jsx_constructor_overload_declaration(store, source.2, plan)?
+    } else {
+        None
+    };
     let mut individual_errors = false;
     for (index, child) in plan.children.iter().enumerate() {
         let (node, type_) = match child {
@@ -4229,7 +4234,16 @@ fn check_jsx_implicit_children(
         {
             let display =
                 jsx_child_assignability_display(store, source.2, source.3, type_, expected)?;
-            add_diagnostic(diagnostics, node, 2322, [display.source, display.target])?;
+            if let Some(declaration) = constructor_overload {
+                add_jsx_constructor_overload_child_diagnostic(
+                    diagnostics,
+                    node,
+                    declaration,
+                    display,
+                )?;
+            } else {
+                add_diagnostic(diagnostics, node, 2322, [display.source, display.target])?;
+            }
             individual_errors = true;
         }
         child_types.push(type_);
@@ -4270,6 +4284,91 @@ fn check_jsx_implicit_children(
         name,
         individual_errors,
     }))
+}
+
+fn jsx_constructor_overload_declaration(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &JsxElementPlan,
+) -> Result<Option<NodeRef>, SourceCheckError> {
+    let JsxElementPlanKind::Element { tag, .. } = &plan.kind else {
+        return Ok(None);
+    };
+    if tag.intrinsic {
+        return Ok(None);
+    }
+    let component = store
+        .type_node_links(tag.node)
+        .and_then(|links| links.resolved_type)
+        .ok_or(SourceCheckError::Call(plan.opening))?;
+    let StoredCallableSetValidation::Valid { projection, .. } =
+        validate_stored_callable_set(store, component)
+    else {
+        return Ok(None);
+    };
+    if !projection.call_signatures.is_empty() || projection.construct_signatures.len() < 2 {
+        return Ok(None);
+    }
+    let signature = *projection
+        .construct_signatures
+        .last()
+        .ok_or(SourceCheckError::Call(plan.opening))?;
+    if store
+        .signature_links(plan.opening)
+        .and_then(|links| links.resolved_signature.signature())
+        != Some(signature)
+    {
+        return Err(SourceCheckError::Call(plan.opening));
+    }
+    let declaration = store
+        .signature(signature)
+        .and_then(super::signatures::Signature::declaration)
+        .ok_or(SourceCheckError::Call(plan.opening))?;
+    if host.node(declaration).is_none_or(|record| {
+        !matches!(
+            record.kind,
+            SyntaxKind::Constructor | SyntaxKind::ConstructSignature
+        )
+    }) {
+        return Err(SourceCheckError::Call(plan.opening));
+    }
+    Ok(Some(declaration))
+}
+
+fn add_jsx_constructor_overload_child_diagnostic(
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    node: NodeRef,
+    declaration: NodeRef,
+    display: AssignabilityErrorDisplay,
+) -> Result<(), SourceCheckError> {
+    let overload =
+        Diagnostic::new(message_by_code(2770).ok_or(SourceCheckError::MissingDiagnostic(2770))?)
+            .render()
+            .map_err(|_| SourceCheckError::MissingDiagnostic(2770))?;
+    let child = Diagnostic::with_arguments(
+        message_by_code(2322).ok_or(SourceCheckError::MissingDiagnostic(2322))?,
+        [display.source, display.target],
+    )
+    .render()
+    .map_err(|_| SourceCheckError::MissingDiagnostic(2322))?;
+    merge_retry_diagnostic(
+        diagnostics,
+        CanonicalCheckerDiagnostic {
+            node: Some(node),
+            range_override: None,
+            diagnostic: Diagnostic::new(
+                message_by_code(2769).ok_or(SourceCheckError::MissingDiagnostic(2769))?,
+            )
+            .with_details([format!("  {overload}"), format!("    {child}")]),
+            related_information: vec![CanonicalCheckerRelatedInformation {
+                node: Some(declaration),
+                diagnostic: Diagnostic::new(
+                    message_by_code(2771).ok_or(SourceCheckError::MissingDiagnostic(2771))?,
+                ),
+            }],
+        },
+    );
+    Ok(())
 }
 
 fn automatic_jsx_children_array_type(
@@ -4991,14 +5090,19 @@ fn resolve_component_tag(
         }
         StoredCallableSetValidation::Valid { projection, .. }
             if projection.call_signatures.is_empty()
-                && projection.construct_signatures.len() == 1 =>
+                && !projection.construct_signatures.is_empty() =>
         {
+            let overload_count = projection.construct_signatures.len();
+            let signature = *projection
+                .construct_signatures
+                .last()
+                .ok_or(SourceCheckError::Call(opening))?;
             return resolve_construct_component_signature(
                 store,
                 host,
                 namespace,
                 opening,
-                projection.construct_signatures[0],
+                (signature, overload_count),
                 options,
                 diagnostics,
             );
@@ -5105,17 +5209,23 @@ fn resolve_construct_component_signature(
     host: &DeclaredTypeHost<'_>,
     namespace: &JsxNamespace,
     opening: NodeRef,
-    signature: SignatureId,
+    constructor: (SignatureId, usize),
     options: CanonicalCheckerOptions,
     diagnostics: &mut CanonicalCheckerDiagnostics,
 ) -> Result<(TypeId, SignatureId), SourceCheckError> {
     let invalid = || SourceCheckError::Call(opening);
+    let (signature, overload_count) = constructor;
     let record = store.signature(signature).ok_or_else(invalid)?;
-    let parameter = match record.parameters() {
-        [] => None,
-        [parameter] => Some(*parameter),
-        _ => return Err(unsupported(opening, SyntaxKind::JsxOpeningElement)),
+    let (parameter, remaining) = match record.parameters().split_first() {
+        Some((parameter, remaining)) => (Some(*parameter), remaining),
+        None => (None, &[][..]),
     };
+    if overload_count == 0
+        || overload_count == 1 && !remaining.is_empty()
+        || overload_count > 1 && (parameter.is_none() || remaining.len() > 1)
+    {
+        return Err(unsupported(opening, SyntaxKind::JsxOpeningElement));
+    }
     let attributes = parameter
         .map(|parameter| {
             store
@@ -5126,14 +5236,30 @@ fn resolve_construct_component_signature(
         })
         .transpose()?;
     let result = record.resolved_return_type().ok_or_else(invalid)?;
+    let parameter_types = store
+        .callable_signature_parameter_types(signature)
+        .ok_or_else(invalid)?;
     let allowed = SignatureFlags::CONSTRUCT | SignatureFlags::HAS_LITERAL_TYPES;
     if !record.flags().contains(SignatureFlags::CONSTRUCT)
         || record.flags().bits() & !allowed.bits() != 0
         || record.this_parameter().is_some()
         || !record.type_parameters().is_empty()
-        || !(0..=1).contains(&record.min_argument_count())
-        || record.min_argument_count() == 1 && attributes.is_none()
-        || store.callable_signature_parameter_types(signature) != Some(attributes.as_slice())
+        || record.min_argument_count() < 0
+        || usize::try_from(record.min_argument_count())
+            .ok()
+            .is_none_or(|minimum| minimum > record.parameters().len())
+        || parameter_types.len() != record.parameters().len()
+        || parameter_types.first().copied() != attributes
+        || record
+            .parameters()
+            .iter()
+            .zip(parameter_types)
+            .any(|(parameter, type_)| {
+                store
+                    .value_symbol_links(*parameter)
+                    .and_then(|links| links.resolved_type)
+                    != Some(*type_)
+            })
         || store.type_payload(result).is_none()
     {
         return Err(invalid());
@@ -15034,6 +15160,168 @@ mod runtime_tests {
             ),
             warm,
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Preserve overload identity, tuple positions, and warm diagnostics.
+    fn overloaded_construct_jsx_components_report_indexed_tuple_child_diagnostics() {
+        let source = concat!(
+            "interface Array<T> {}\n",
+            "interface ReadonlyArray<T> {}\n",
+            "declare var React: any;\n",
+            "declare namespace JSX {\n",
+            "  interface Element {}\n",
+            "  interface ElementChildrenAttribute { children: {}; }\n",
+            "  interface IntrinsicElements { div: {}; }\n",
+            "}\n",
+            "interface Props { children: [string, number] | boolean[]; }\n",
+            "interface WidgetConstructor {\n",
+            "  new(props: Props): JSX.Element;\n",
+            "  new(props: Props, context: any): JSX.Element;\n",
+            "}\n",
+            "declare const Widget: WidgetConstructor;\n",
+            "const valid = <Widget>ready{123}</Widget>;\n",
+            "const invalid = <Widget>{(<div />) as unknown}{\"wrong\"}</Widget>;\n",
+        );
+
+        for (index, runtime) in [CanonicalJsxRuntime::Classic, CanonicalJsxRuntime::Preserve]
+            .into_iter()
+            .enumerate()
+        {
+            let parsed = parse_jsx_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(8_230 + u32::try_from(index).unwrap());
+            let mut binder = CanonicalBinder::new();
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source("\"/project/jsx-overloaded-tuple-children.tsx\""),
+                        CanonicalSourceLanguage::TypeScript,
+                        false,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+            let mut context = crate::semantic::CanonicalCheckerContext::new(
+                binder.finish(),
+                vec![(file, &parsed.arena)],
+                CanonicalCheckerOptions {
+                    jsx_runtime: runtime,
+                    ..CanonicalCheckerOptions::default()
+                },
+            )
+            .unwrap();
+
+            context.check_source_file(file).unwrap();
+
+            let overload = parsed
+                .arena
+                .iter()
+                .filter_map(|(node, record)| {
+                    (record.kind == SyntaxKind::ConstructSignature).then_some(NodeRef::new(
+                        parsed.arena.id(),
+                        file,
+                        node,
+                    ))
+                })
+                .last()
+                .expect("the component retains its final constructor overload");
+            let [first, second] = context.diagnostics().as_slice() else {
+                panic!("both invalid tuple positions must report TS2769 in {runtime:?} mode")
+            };
+            for (diagnostic, expected, expression) in [
+                (
+                    first,
+                    concat!(
+                        "No overload matches this call.\n",
+                        "  The last overload gave the following error.\n",
+                        "    Type 'unknown' is not assignable to type 'string | boolean'.",
+                    ),
+                    "{(<div />) as unknown}",
+                ),
+                (
+                    second,
+                    concat!(
+                        "No overload matches this call.\n",
+                        "  The last overload gave the following error.\n",
+                        "    Type 'string' is not assignable to type 'number | boolean'.",
+                    ),
+                    "{\"wrong\"}",
+                ),
+            ] {
+                assert_eq!(diagnostic.diagnostic.code(), 2769);
+                assert_eq!(diagnostic.diagnostic.render().unwrap(), expected);
+                let range = parsed
+                    .arena
+                    .get(diagnostic.node.unwrap().node)
+                    .unwrap()
+                    .range;
+                assert_eq!(
+                    source.get(range.start.get() as usize..range.end.get() as usize),
+                    Some(expression),
+                );
+                let [related] = diagnostic.related_information.as_slice() else {
+                    panic!("constructor failures must retain their final overload declaration")
+                };
+                assert_eq!(related.node, Some(overload));
+                assert_eq!(related.diagnostic.code(), 2771);
+                assert_eq!(
+                    related.diagnostic.render().unwrap(),
+                    "The last overload is declared here.",
+                );
+            }
+
+            let selected = context
+                .store()
+                .signature_links(overload)
+                .and_then(|links| links.resolved_signature.signature())
+                .unwrap();
+            let record = context.store().signature(selected).unwrap();
+            assert!(record.flags().contains(SignatureFlags::CONSTRUCT));
+            assert_eq!(record.parameters().len(), 2);
+            assert_eq!(record.min_argument_count(), 2);
+            for (node, record) in parsed.arena.iter() {
+                if record.kind == SyntaxKind::JsxOpeningElement {
+                    let opening = NodeRef::new(parsed.arena.id(), file, node);
+                    assert_eq!(
+                        context
+                            .store()
+                            .signature_links(opening)
+                            .and_then(|links| links.resolved_signature.signature()),
+                        Some(selected),
+                    );
+                }
+            }
+
+            let warm = (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().mapper_len(),
+                context.store().signature_len(),
+                context.store().canonical_tuple_target_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.diagnostics().as_slice().to_vec(),
+            );
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().mapper_len(),
+                    context.store().signature_len(),
+                    context.store().canonical_tuple_target_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    context.diagnostics().as_slice().to_vec(),
+                ),
+                warm,
+            );
+        }
     }
 
     #[test]
