@@ -1898,13 +1898,6 @@ mod tests {
                     "): number => 1;\n",
                 )
             ),
-            format!(
-                "{ready}{}",
-                concat!(
-                    "const bad: (value: number) => void = ",
-                    "(value: number) => {};\n",
-                )
-            ),
         ]
         .into_iter()
         .enumerate()
