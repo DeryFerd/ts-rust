@@ -170,6 +170,7 @@ use super::{
         PreparedContextualSourceCallable, SourceCallableBodyMode, SourceCallableError,
         SourceCallableFamily, SourceCallableParameterPlan, SourceCallablePlan,
         SourceCallableReturnPlan, StoredSourceCallableValidation,
+        authenticated_typed_function_array_parameter_bindings,
         materialize_anonymous_source_function_expression, materialize_global_wrapper_method,
         plan_callable_type_predicate, plan_javascript_duplicate_function_implementation,
         plan_source_callable, publish_array_filter_predicate_source_callable,
@@ -9411,7 +9412,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
     ) -> Result<Vec<PlannedParameterInitializer>, SourceCheckError> {
         let mut initializers = Vec::new();
         for (entered, parameter) in callable.parameters.iter().enumerate() {
-            let bindings = match self.callable_parameter_binding_symbols(parameter) {
+            let bindings = match self.callable_parameter_binding_symbols(callable, parameter) {
                 Ok(bindings) => bindings,
                 Err(error) => {
                     self.leave_callable_parameter_prefix_scope(callable, entered)?;
@@ -9476,17 +9477,37 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
 
     fn callable_parameter_binding_symbols(
         &self,
+        callable: &SourceCallablePlan,
         parameter: &SourceCallableParameterPlan,
     ) -> Result<Vec<SemanticSymbolId>, SourceCheckError> {
         let record = self.node(parameter.declaration)?;
         let NodeData::ParameterDeclaration(syntax) = &record.data else {
-            return Err(SourceCheckError::Arrow(parameter.declaration));
+            return Err(callable_parameter_execution_error(
+                callable,
+                parameter.declaration,
+            ));
         };
         let name = self.reference(syntax.name);
         let name_record = self.node(name)?;
         let NodeData::BindingPattern(pattern) = &name_record.data else {
             return Ok(Vec::new());
         };
+        let Some((store, host)) = self.semantic else {
+            return Err(callable_parameter_execution_error(
+                callable,
+                parameter.declaration,
+            ));
+        };
+        if callable.family == SourceCallableFamily::FunctionDeclaration {
+            return authenticated_typed_function_array_parameter_bindings(
+                store,
+                host,
+                callable.declaration,
+                parameter.declaration,
+            )
+            .map(|bindings| bindings.into_iter().map(|(_, symbol)| symbol).collect())
+            .ok_or_else(|| callable_parameter_execution_error(callable, parameter.declaration));
+        }
         if name_record.kind != SyntaxKind::ArrayBindingPattern
             || !super::source_calls::is_authenticated_sort_tuple_binding(
                 self.arena, name.node, pattern,
@@ -9494,9 +9515,6 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         {
             return Err(SourceCheckError::Arrow(parameter.declaration));
         }
-        let Some((store, _)) = self.semantic else {
-            return Err(SourceCheckError::Arrow(parameter.declaration));
-        };
         let mut bindings = Vec::with_capacity(pattern.elements.nodes.len());
         for element in &pattern.elements.nodes {
             let element = self.reference(*element);
@@ -9542,7 +9560,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
     ) -> Result<(), SourceCheckError> {
         let mut invalid = None;
         for parameter in callable.parameters.iter().take(entered) {
-            for binding in self.callable_parameter_binding_symbols(parameter)? {
+            for binding in self.callable_parameter_binding_symbols(callable, parameter)? {
                 let removed_prior = self.prior_variables.remove(&binding);
                 let removed_readable = self.readable_variables.remove(&binding);
                 if (!removed_prior || !removed_readable) && invalid.is_none() {
@@ -22876,6 +22894,8 @@ fn preflight_uncached_conditional_operand_links(
 /// flow. This is deliberately a dependency gate, not a second expression
 /// planner: every admitted expression was already proven by `SourcePlanner`.
 fn preflight_inferred_function_return_dependencies(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
     functions: &[PlannedFunction],
 ) -> Result<(), SourceCheckError> {
     fn expression_is_closed(
@@ -23032,6 +23052,16 @@ fn preflight_inferred_function_return_dependencies(
             continue;
         }
         let mut locals = HashSet::new();
+        for parameter in &function.callable.parameters {
+            if let Some(bindings) = authenticated_typed_function_array_parameter_bindings(
+                store,
+                host,
+                function.callable.declaration,
+                parameter.declaration,
+            ) {
+                locals.extend(bindings.into_iter().map(|(_, symbol)| symbol));
+            }
+        }
         let initializers_supported = function.parameter_initializers.iter().all(|initializer| {
             expression_is_closed(
                 &initializer.expression,
@@ -30327,6 +30357,69 @@ fn check_callable_parameter_initializers(
             return Err(SourceCheckError::Variable(
                 VariableInvariant::DuplicateCurrentFlowType(parameter.symbol),
             ));
+        }
+        if callable.family != SourceCallableFamily::FunctionDeclaration {
+            continue;
+        }
+        let Some(bindings) = authenticated_typed_function_array_parameter_bindings(
+            store,
+            host,
+            callable.declaration,
+            parameter.declaration,
+        ) else {
+            continue;
+        };
+        let mut binding_types = Vec::with_capacity(bindings.len());
+        for (declaration, symbol) in bindings {
+            let checked = check_array_binding_element(
+                store,
+                host,
+                global_types,
+                options,
+                declaration,
+                body_type,
+            )
+            .map_err(|error| SourcePlanner::element_plan_error(declaration, error))?;
+            if let Some(diagnostic) = checked.diagnostic {
+                merge_retry_diagnostic(diagnostics, diagnostic);
+            }
+            let expected = ValueSymbolLinks {
+                resolved_type: Some(checked.type_),
+                ..ValueSymbolLinks::default()
+            };
+            if store
+                .value_symbol_links(symbol)
+                .is_some_and(|links| links != &ValueSymbolLinks::default() && links != &expected)
+            {
+                return Err(callable_parameter_execution_error(
+                    callable,
+                    parameter.declaration,
+                ));
+            }
+            if flow_types.insert(symbol, checked.type_).is_some() {
+                return Err(SourceCheckError::Variable(
+                    VariableInvariant::DuplicateCurrentFlowType(symbol),
+                ));
+            }
+            binding_types.push((symbol, expected));
+        }
+        let missing = binding_types
+            .iter()
+            .filter(|(symbol, _)| store.value_symbol_links(*symbol).is_none())
+            .count();
+        if !store.try_reserve_value_symbol_links(missing) {
+            return Err(callable_parameter_execution_error(
+                callable,
+                parameter.declaration,
+            ));
+        }
+        for (symbol, links) in binding_types {
+            if !store.set_value_symbol_links(symbol, links) {
+                return Err(callable_parameter_execution_error(
+                    callable,
+                    parameter.declaration,
+                ));
+            }
         }
     }
     if initializer_index != initializers.len() {
@@ -45869,7 +45962,7 @@ pub(super) fn check_source_file(
     }
     let deferred_inferred_functions =
         deferred_inferred_javascript_functions(&statements, &functions, javascript_jsdoc.is_some());
-    preflight_inferred_function_return_dependencies(&functions)?;
+    preflight_inferred_function_return_dependencies(store, host, &functions)?;
 
     let mut reexport_aliases = HashSet::new();
     for reexport in &named_reexports {
@@ -86111,6 +86204,94 @@ class Foo2 {
             context.recheck_source_file(file).unwrap();
             assert_eq!(observable_state(&context, file), warm);
         }
+    }
+
+    #[test]
+    fn typed_function_array_parameters_preserve_omitted_positions_and_warm_binding_types() {
+        for (index, (unchecked, expected)) in [(false, "string"), (true, "string | undefined")]
+            .into_iter()
+            .enumerate()
+        {
+            let library = parsed("interface Array<T> { [index: number]: T; }");
+            let source = parsed(concat!(
+                "function select([, second, , fourth, ,]: string[]) { ",
+                "return fourth; }",
+            ));
+            let offset = u32::try_from(index).unwrap() * 2;
+            let library_file = FileId::new(9_984 + offset);
+            let file = FileId::new(9_985 + offset);
+            let mut context = context(
+                &[(library_file, &library), (file, &source)],
+                CanonicalCheckerOptions {
+                    intrinsic: IntrinsicBootstrapOptions {
+                        strict_null_checks: unchecked,
+                        ..IntrinsicBootstrapOptions::default()
+                    },
+                    no_unchecked_indexed_access: unchecked,
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+
+            context.check_source_file(file).unwrap();
+
+            for name in ["second", "fourth"] {
+                let type_ = object_binding_value_type(&context, &source, file, name);
+                assert_eq!(context.type_to_string(type_).unwrap(), expected, "{name}");
+            }
+            let reads = identifier_expressions(&source, file, "fourth");
+            let [read] = reads.as_slice() else {
+                panic!("expected one function-body read of the fourth array position")
+            };
+            assert_eq!(
+                resolved_node_type(&context, *read),
+                object_binding_value_type(&context, &source, file, "fourth"),
+            );
+            let owner = function_symbol(&context, &source, file, "select");
+            let callable = context
+                .store()
+                .source_callable_type_for_owner(owner)
+                .unwrap();
+            assert_eq!(
+                context.type_to_string(callable).unwrap(),
+                format!("(__0: string[]) => {expected}"),
+            );
+            assert!(context.diagnostics().is_empty());
+
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
+    fn typed_function_array_parameters_report_actual_omitted_binding_positions() {
+        let library = parsed("interface Array<T> {}");
+        let source = parsed("function select([, second, , fourth,]: string[]): void {}");
+        let library_file = FileId::new(9_988);
+        let file = FileId::new(9_989);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions::default(),
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+        for (diagnostic, (name, position)) in
+            diagnostics.iter().zip([("second", "1"), ("fourth", "3")])
+        {
+            assert_eq!(diagnostic.diagnostic.code(), 2339);
+            assert_eq!(node_text(&source, diagnostic.node.unwrap()), name);
+            assert_eq!(
+                diagnostic.diagnostic.render().unwrap(),
+                format!("Property '{position}' does not exist on type 'string[]'."),
+            );
+        }
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
     }
 
     #[test]
