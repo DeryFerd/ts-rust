@@ -46,7 +46,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use ts_ast::{FileId, ModifierList, Node, NodeArena, NodeData, NodeId, NodeRef, SyntaxKind};
+use ts_ast::{
+    FileId, ModifierList, Node, NodeArena, NodeData, NodeFlags, NodeId, NodeRef, SyntaxKind,
+};
 use ts_binder::{
     BoundFile, CanonicalNameResolver, CanonicalResolutionLocation, CheckFlags, SemanticSymbolId,
     SymbolFlags, SymbolTableId,
@@ -83,7 +85,10 @@ use super::{
         prepare_expression_context_with_global_types,
         prepare_expression_without_context_with_global_types,
     },
-    declared::preflight_class_or_interface_reference,
+    declared::{
+        cached_ordinary_type_parameter_owner, execute_type_parameter,
+        preflight_class_or_interface_reference,
+    },
     diagnostics::missing_name_diagnostic_code,
     formatter::{
         CanonicalTypeFormatFlags,
@@ -92,9 +97,10 @@ use super::{
     },
     instantiate::InstantiationSession,
     jsdoc::{
-        JsDocImportType, JsDocType, PlannedJavaScriptDeclaration, PlannedJavaScriptJsDoc,
-        PlannedJsDocType, ResolvedJsDocSatisfiesSignature, ResolvedJsDocSignature,
-        append_javascript_jsdoc_diagnostics, leading_jsdoc_comment, plan_javascript_source_jsdoc,
+        JsDocImportType, JsDocType, JsDocTypeParameterBinding, PlannedJavaScriptDeclaration,
+        PlannedJavaScriptJsDoc, PlannedJsDocType, ResolvedJsDocSatisfiesSignature,
+        ResolvedJsDocSignature, append_javascript_jsdoc_diagnostics,
+        bind_planned_jsdoc_type_parameters, leading_jsdoc_comment, plan_javascript_source_jsdoc,
         preflight_planned_jsdoc_type, preflight_source_jsdoc_function_type,
         preflight_source_jsdoc_satisfies_type, resolve_planned_jsdoc_callback_signature,
         resolve_planned_jsdoc_signature, resolve_planned_jsdoc_type,
@@ -10676,6 +10682,10 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 parent_range,
                 source_range,
                 self.arena.source_text(),
+            ) && !self.is_reparsed_jsdoc_signature_range(
+                reference,
+                expected_parent,
+                source_range,
             ) {
                 return Err(SourceCheckError::Provenance(
                     SourceCheckProvenanceError::InvalidRange {
@@ -10695,6 +10705,93 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             );
         }
         Ok(())
+    }
+
+    fn is_reparsed_jsdoc_signature_range(
+        &self,
+        node: NodeRef,
+        parent: Option<NodeId>,
+        source_range: TextRange,
+    ) -> bool {
+        let Some(record) = self.arena.get(node.node) else {
+            return false;
+        };
+        if record.flags != NodeFlags::REPARSED
+            || !valid_range(record.range, None, source_range, self.arena.source_text())
+            || self
+                .bound
+                .source_facts()
+                .is_none_or(|facts| !facts.is_javascript_file())
+        {
+            return false;
+        }
+        let Some(parent) = parent else {
+            return false;
+        };
+        let Some(parent_record) = self.arena.get(parent) else {
+            return false;
+        };
+        let arrow = match &parent_record.data {
+            NodeData::ArrowFunction(function)
+                if parent_record.kind == SyntaxKind::ArrowFunction
+                    && (function.type_ == Some(node.node)
+                        || function
+                            .type_parameters
+                            .as_ref()
+                            .is_some_and(|parameters| parameters.nodes.contains(&node.node))) =>
+            {
+                parent
+            }
+            NodeData::ParameterDeclaration(parameter)
+                if parent_record.kind == SyntaxKind::Parameter
+                    && parameter.type_ == Some(node.node) =>
+            {
+                let Some(arrow) = parent_record.parent else {
+                    return false;
+                };
+                let Some(NodeData::ArrowFunction(function)) =
+                    self.arena.get(arrow).map(|record| &record.data)
+                else {
+                    return false;
+                };
+                if !function.parameters.nodes.contains(&parent) {
+                    return false;
+                }
+                arrow
+            }
+            _ => return false,
+        };
+        let Some(variable) = self.arena.get(arrow).and_then(|record| record.parent) else {
+            return false;
+        };
+        let Some(NodeData::VariableDeclaration(declaration)) =
+            self.arena.get(variable).map(|record| &record.data)
+        else {
+            return false;
+        };
+        if declaration.initializer != Some(arrow) {
+            return false;
+        }
+        let Some(statement) = self
+            .arena
+            .get(variable)
+            .and_then(|record| record.parent)
+            .and_then(|list| self.arena.get(list))
+            .and_then(|list| list.parent)
+        else {
+            return false;
+        };
+        let statement = self.reference(statement);
+        let Some(statement_record) = self.arena.get(statement.node) else {
+            return false;
+        };
+        let Ok(Some(comment)) = leading_jsdoc_comment(self.arena, statement) else {
+            return false;
+        };
+        statement_record.kind == SyntaxKind::VariableStatement
+            && comment.range().start <= record.range.start
+            && record.range.end <= comment.range().end
+            && record.range.end <= statement_record.range.start
     }
 
     fn store_source_shape_matches(&self) -> bool {
@@ -19628,10 +19725,14 @@ fn issue_arrow_line_terminator_diagnostic(
     let previous_end = match arrow.type_ {
         Some(annotation) => {
             let annotation = NodeRef::new(declaration.arena, declaration.file, annotation);
-            host.node(annotation)
-                .ok_or(SourceCheckError::Arrow(annotation))?
-                .range
-                .end
+            let record = host
+                .node(annotation)
+                .ok_or(SourceCheckError::Arrow(annotation))?;
+            if record.flags == NodeFlags::REPARSED {
+                arrow.parameters.range.end
+            } else {
+                record.range.end
+            }
         }
         None => arrow.parameters.range.end,
     };
@@ -20113,6 +20214,59 @@ fn check_planned_assignment(
     )
 }
 
+fn is_unconstrained_jsdoc_arrow_type_parameter(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    target: TypeId,
+) -> bool {
+    let Some(TypeData::TypeParameter(parameter)) = store.type_payload(target).map(TypeRecord::data)
+    else {
+        return false;
+    };
+    if parameter.constraint.is_some_and(|constraint| {
+        store
+            .intrinsic_bootstrap()
+            .is_none_or(|bootstrap| constraint != bootstrap.no_constraint_type)
+    }) {
+        return false;
+    }
+    let Some(symbol) = cached_ordinary_type_parameter_owner(store, target) else {
+        return false;
+    };
+    let Some([declaration]) = store
+        .symbol(symbol)
+        .and_then(|symbol| symbol.declarations())
+    else {
+        return false;
+    };
+    let Some(record) = host.node(*declaration) else {
+        return false;
+    };
+    let Some(arrow) = record
+        .parent
+        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+    else {
+        return false;
+    };
+    let Some(arrow_record) = host.node(arrow) else {
+        return false;
+    };
+    let NodeData::ArrowFunction(function) = &arrow_record.data else {
+        return false;
+    };
+    record.kind == SyntaxKind::TypeParameter
+        && record.flags == NodeFlags::REPARSED
+        && arrow_record.kind == SyntaxKind::ArrowFunction
+        && function
+            .type_parameters
+            .as_ref()
+            .is_some_and(|parameters| parameters.nodes.contains(&declaration.node))
+        && host
+            .bound_file(arrow)
+            .and_then(BoundFile::source_facts)
+            .is_some_and(ts_binder::CanonicalSourceFileFacts::is_javascript_file)
+}
+
 #[allow(clippy::too_many_arguments)] // Shares exact assignment checks across TS and JSDoc types.
 fn check_assignment_to_type(
     store: &mut CanonicalTypeMapperStore,
@@ -20183,6 +20337,8 @@ fn check_assignment_to_type(
             target,
             options,
         )?;
+        let unconstrained_jsdoc_type_parameter =
+            is_unconstrained_jsdoc_arrow_type_parameter(store, host, target);
         for mut diagnostic in staged {
             if diagnostic.diagnostic.code() == 2322
                 && diagnostic.diagnostic.details.is_empty()
@@ -20196,6 +20352,19 @@ fn check_assignment_to_type(
                 && let Some(target) = diagnostic.diagnostic.arguments.get_mut(1)
             {
                 target_display_name.clone_into(target);
+            }
+            if diagnostic.diagnostic.code() == 2322
+                && diagnostic.diagnostic.details.is_empty()
+                && unconstrained_jsdoc_type_parameter
+                && let [source, target] = diagnostic.diagnostic.arguments.as_slice()
+            {
+                let detail = Diagnostic::with_arguments(
+                    message_by_code(5082).ok_or(SourceCheckError::MissingDiagnostic(5082))?,
+                    [target.as_str(), source.as_str()],
+                )
+                .render()
+                .map_err(|_| SourceCheckError::MissingDiagnostic(5082))?;
+                diagnostic.diagnostic.details.push(format!("  {detail}"));
             }
             merge_retry_diagnostic(diagnostics, diagnostic);
         }
@@ -20410,6 +20579,16 @@ fn source_type_is_assignable_to(
                     &mut resolved_members,
                     &mut resolved_properties,
                 )?;
+            }
+            Err(RelationUnavailable::StructuralRelation {
+                source: actual_source,
+                target: actual_target,
+                ..
+            }) if actual_source == source
+                && actual_target == target
+                && is_unconstrained_jsdoc_arrow_type_parameter(store, host, target) =>
+            {
+                return Ok(false);
             }
             Err(error) => return Err(error.into()),
         }
@@ -20761,6 +20940,28 @@ fn check_source_jsdoc_arrow_satisfies(
             },
         );
         break;
+    }
+    Ok(())
+}
+
+fn bind_jsdoc_arrow_expression_types(
+    store: &CanonicalTypeMapperStore,
+    expression: &mut PlannedExpression,
+    bindings: &[(String, TypeId)],
+) -> Result<(), SourceCheckError> {
+    if let Some(annotation) = &expression.jsdoc_type {
+        let bindings = bindings
+            .iter()
+            .map(|(name, type_)| JsDocTypeParameterBinding::new(name, *type_))
+            .collect::<Vec<_>>();
+        expression.jsdoc_type = Some(
+            bind_planned_jsdoc_type_parameters(store, annotation, &bindings).map_err(|_| {
+                SourceCheckError::Unsupported(UnsupportedSourceSyntax::JsDoc(expression.node))
+            })?,
+        );
+    }
+    if let PlannedExpressionKind::Parenthesized(inner) = &mut expression.kind {
+        bind_jsdoc_arrow_expression_types(store, inner, bindings)?;
     }
     Ok(())
 }
@@ -25321,7 +25522,7 @@ pub(super) fn check_source_file(
         ambient_namespace_reads,
         overloads,
         mut functions,
-        arrows,
+        mut arrows,
         nested_arrow_callables,
         contextual_arrows,
         identifier_reads,
@@ -25341,6 +25542,71 @@ pub(super) fn check_source_file(
         options,
     )
     .finish()?;
+    let mut jsdoc_template_bindings = HashMap::<NodeRef, Vec<(String, TypeId)>>::new();
+    if let Some(jsdoc) = &javascript_jsdoc {
+        for arrow in &mut arrows {
+            let Some(declaration) = jsdoc.declaration(arrow.source.variable_declaration) else {
+                continue;
+            };
+            if declaration.template_parameters().is_empty() {
+                continue;
+            }
+            if declaration.template_parameters().len()
+                != arrow.source.callable.type_parameters.len()
+            {
+                return Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::JsDoc(declaration.node()),
+                ));
+            }
+            let missing = arrow
+                .source
+                .callable
+                .type_parameters
+                .iter()
+                .filter(|parameter| {
+                    store
+                        .declared_type_links(parameter.symbol)
+                        .and_then(|links| links.declared_type)
+                        .is_none()
+                })
+                .count();
+            if !store.try_reserve_types(missing) || !store.try_reserve_declared_type_links(missing)
+            {
+                return Err(SourceCheckError::Arrow(arrow.source.callable.declaration));
+            }
+            let mut bindings = Vec::with_capacity(declaration.template_parameters().len());
+            for (template, parameter) in declaration
+                .template_parameters()
+                .iter()
+                .zip(&arrow.source.callable.type_parameters)
+            {
+                if bound.symbol(parameter.declaration) != Some(parameter.symbol)
+                    || arena
+                        .get(parameter.declaration.node)
+                        .is_none_or(|record| record.range != template.range())
+                    || store
+                        .symbol(parameter.symbol)
+                        .and_then(|symbol| symbol.name().as_utf8())
+                        != Some(template.name())
+                {
+                    return Err(SourceCheckError::Arrow(parameter.declaration));
+                }
+                bindings.push((
+                    template.name().to_owned(),
+                    execute_type_parameter(store, parameter.symbol),
+                ));
+            }
+            if let PlannedArrowBody::Return { expression, .. } = &mut arrow.body {
+                bind_jsdoc_arrow_expression_types(store, expression, &bindings)?;
+            }
+            if jsdoc_template_bindings
+                .insert(declaration.node(), bindings)
+                .is_some()
+            {
+                return Err(SourceCheckError::Arrow(arrow.source.callable.declaration));
+            }
+        }
+    }
     for statement in &statements {
         if let PlannedStatement::Namespace(namespace) = statement {
             resolve_source_namespace_external_imports(store, alias_host, namespace)?;
@@ -25435,6 +25701,27 @@ pub(super) fn check_source_file(
                         .filter_map(super::jsdoc::PlannedJsDocTypedef::type_),
                 );
             for annotation in annotations {
+                if let Some(bindings) = jsdoc_template_bindings.get(&declaration.node()) {
+                    let bindings = bindings
+                        .iter()
+                        .map(|(name, type_)| JsDocTypeParameterBinding::new(name, *type_))
+                        .collect::<Vec<_>>();
+                    let annotation = bind_planned_jsdoc_type_parameters(
+                        store, annotation, &bindings,
+                    )
+                    .map_err(|_| {
+                        SourceCheckError::Unsupported(UnsupportedSourceSyntax::JsDoc(
+                            declaration.node(),
+                        ))
+                    })?;
+                    preflight_planned_jsdoc_type(store, global_types, options, &annotation)
+                        .map_err(|_| {
+                            SourceCheckError::Unsupported(UnsupportedSourceSyntax::JsDoc(
+                                declaration.node(),
+                            ))
+                        })?;
+                    continue;
+                }
                 if functions.iter().any(|function| {
                     source_jsdoc_function_parameter(arena, bound, function, declaration, annotation)
                         .is_some()
@@ -25486,9 +25773,28 @@ pub(super) fn check_source_file(
             }) {
                 return Err(SourceCheckError::Arrow(expression));
             }
-            preflight_planned_jsdoc_type(store, global_types, options, annotation).map_err(
-                |_| SourceCheckError::Unsupported(UnsupportedSourceSyntax::JsDoc(expression)),
-            )?;
+            let bound_annotation = jsdoc_template_bindings
+                .get(&declaration)
+                .map(|bindings| {
+                    let bindings = bindings
+                        .iter()
+                        .map(|(name, type_)| JsDocTypeParameterBinding::new(name, *type_))
+                        .collect::<Vec<_>>();
+                    bind_planned_jsdoc_type_parameters(store, annotation, &bindings)
+                })
+                .transpose()
+                .map_err(|_| {
+                    SourceCheckError::Unsupported(UnsupportedSourceSyntax::JsDoc(expression))
+                })?;
+            preflight_planned_jsdoc_type(
+                store,
+                global_types,
+                options,
+                bound_annotation.as_ref().unwrap_or(annotation),
+            )
+            .map_err(|_| {
+                SourceCheckError::Unsupported(UnsupportedSourceSyntax::JsDoc(expression))
+            })?;
         }
         append_javascript_jsdoc_diagnostics(jsdoc, diagnostics);
     }
@@ -45560,6 +45866,172 @@ class Foo2 {
                 .and_then(super::super::signatures::Signature::resolved_return_type),
             Some(context.store().intrinsic_bootstrap().unwrap().void_type),
         );
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn javascript_jsdoc_generic_arrows_publish_real_template_signatures_and_replay_warm() {
+        let text = concat!(
+            "/**\n",
+            " * @template T\n",
+            " * @param {T|undefined} value value or not\n",
+            " * @returns {T} result value\n",
+            " */\n",
+            "const cloneObjectGood = value => /** @type {T} */({ ...value });",
+        );
+        let source = parse_javascript_source_file(text);
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let file = FileId::new(8_968);
+        let mut context = javascript_context(
+            file,
+            &source,
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                no_implicit_any: true,
+                strict_function_types: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+
+        let arrow = variable_initializer(&source, file, "cloneObjectGood");
+        let NodeData::ArrowFunction(function) = &source.arena.get(arrow.node).unwrap().data else {
+            panic!("expected the generic JSDoc arrow")
+        };
+        let [template] = function.type_parameters.as_ref().unwrap().nodes.as_slice() else {
+            panic!("expected one binder-owned template declaration")
+        };
+        let template = NodeRef::new(source.arena.id(), file, *template);
+        let (_, bound) = context.file(file).unwrap();
+        let symbol = bound.symbol(template).unwrap();
+        let type_parameter = context
+            .store()
+            .declared_type_links(symbol)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let callable = variable_value_type(&context, &source, file, "cloneObjectGood");
+        let signature = context
+            .store()
+            .source_callable_provenance(callable)
+            .unwrap()
+            .signature;
+        assert_eq!(
+            context
+                .store()
+                .signature(signature)
+                .unwrap()
+                .type_parameters(),
+            [type_parameter],
+        );
+        assert_eq!(
+            context
+                .store()
+                .signature(signature)
+                .and_then(super::super::signatures::Signature::resolved_return_type),
+            Some(type_parameter),
+        );
+        assert_eq!(
+            context.type_to_string(callable).unwrap(),
+            "<T>(value: T | undefined) => T",
+        );
+        assert_eq!(
+            resolved_node_type(
+                &context,
+                NodeRef::new(source.arena.id(), file, function.body),
+            ),
+            type_parameter,
+        );
+        let object = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ObjectLiteralExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let object_type = resolved_node_type(&context, object);
+        let object_record = context.store().type_payload(object_type).unwrap();
+        let TypeData::Object(object_data) = object_record.data() else {
+            panic!("the generic spread must publish an actual synthetic object")
+        };
+        assert!(object_record.symbol().is_none());
+        assert!(object_data.structured.properties.is_none());
+        assert!(
+            context
+                .store()
+                .symbol_table(object_data.structured.members.unwrap())
+                .unwrap()
+                .is_empty()
+        );
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn javascript_jsdoc_generic_arrow_returns_report_exact_template_assignment_details() {
+        let text = concat!(
+            "/**\n",
+            " * @template T\n",
+            " * @param {T|undefined} value value or not\n",
+            " * @returns {T} result value\n",
+            " */\n",
+            "const foo1 = value => /** @type {string} */({ ...value });\n\n",
+            "/**\n",
+            " * @template T\n",
+            " * @param {T|undefined} value value or not\n",
+            " * @returns {T} result value\n",
+            " */\n",
+            "const foo2 = value => /** @type {string} */(/** @type {T} */({ ...value }));",
+        );
+        let source = parse_javascript_source_file(text);
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let file = FileId::new(8_969);
+        let mut context = javascript_context(
+            file,
+            &source,
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                no_implicit_any: true,
+                strict_function_types: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 2);
+        for (diagnostic, expected) in diagnostics
+            .iter()
+            .zip(["({ ...value })", "(/** @type {T} */({ ...value }))"])
+        {
+            assert_eq!(diagnostic.diagnostic.code(), 2322);
+            assert_eq!(
+                diagnostic.diagnostic.render().unwrap(),
+                concat!(
+                    "Type 'string' is not assignable to type 'T'.\n",
+                    "  'T' could be instantiated with an arbitrary type which ",
+                    "could be unrelated to 'string'.",
+                ),
+            );
+            assert_eq!(node_text(&source, diagnostic.node.unwrap()), expected);
+        }
 
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();

@@ -135,6 +135,23 @@ struct JavaScriptJsDocProperty {
     quoted: bool,
 }
 
+struct JavaScriptJsDocCallableType {
+    range: TextRange,
+    closing_brace: TextPos,
+}
+
+struct JavaScriptJsDocCallableParameter {
+    name: String,
+    type_: JavaScriptJsDocCallableType,
+}
+
+struct JavaScriptJsDocCallableSignature {
+    template_name: String,
+    template_range: TextRange,
+    parameters: Vec<JavaScriptJsDocCallableParameter>,
+    return_type: JavaScriptJsDocCallableType,
+}
+
 /// Parse a TypeScript source file into the generated arena-backed AST.
 #[must_use]
 pub fn parse_source_file(source: &str) -> ParseResult {
@@ -465,6 +482,125 @@ fn javascript_jsdoc_typedefs(
         }
     }
     typedefs
+}
+
+fn javascript_jsdoc_callable_signature(
+    source: &str,
+    trivia_start: usize,
+    statement_start: usize,
+) -> Option<JavaScriptJsDocCallableSignature> {
+    let prefix = source.get(trivia_start..statement_start)?.trim_end();
+    if !prefix.ends_with("*/") {
+        return None;
+    }
+    let comment_start = trivia_start.checked_add(prefix.rfind("/**")?)?;
+    let comment_end = trivia_start.checked_add(prefix.len())?;
+    let comment = source.get(comment_start..comment_end)?;
+    if comment.find("*/") != Some(comment.len().checked_sub(2)?) {
+        return None;
+    }
+    let parsed = parse_jsdoc_comment(comment);
+    if !parsed.diagnostics.is_empty() {
+        return None;
+    }
+    let NodeData::JsDoc(jsdoc) = &parsed.arena.get(parsed.jsdoc)?.data else {
+        return None;
+    };
+    let tags = jsdoc.tags.as_ref()?;
+    let mut template = None;
+    let mut parameters = Vec::new();
+    let mut return_type = None;
+    for tag in &tags.nodes {
+        let node = parsed.arena.get(*tag)?;
+        let NodeData::JsDocUnknownTag(tag) = &node.data else {
+            return None;
+        };
+        let NodeData::Identifier(identifier) = &parsed.arena.get(tag.tag_name)?.data else {
+            return None;
+        };
+        let start = usize::try_from(node.range.start.get()).ok()?;
+        if !javascript_jsdoc_tag_is_top_level(comment, start) {
+            continue;
+        }
+        let body_start = comment_start
+            .checked_add(usize::try_from(parsed.arena.get(tag.tag_name)?.range.end.get()).ok()?)?;
+        match identifier.text.as_str() {
+            "typedef" | "callback" => return None,
+            "template" => {
+                if template.is_some() {
+                    return None;
+                }
+                let name = javascript_jsdoc_identifier(source, body_start, comment_end)?;
+                template = Some((token_value(&name), name.range));
+            }
+            "param" | "arg" | "argument" => {
+                let type_ = javascript_jsdoc_callable_type(source, body_start, comment_end)?;
+                let next = usize::try_from(type_.closing_brace.get())
+                    .ok()?
+                    .checked_add(1)?;
+                let name = javascript_jsdoc_identifier(source, next, comment_end)?;
+                parameters.push(JavaScriptJsDocCallableParameter {
+                    name: token_value(&name),
+                    type_,
+                });
+            }
+            "returns" | "return" => {
+                if return_type.is_some() {
+                    return None;
+                }
+                return_type = Some(javascript_jsdoc_callable_type(
+                    source,
+                    body_start,
+                    comment_end,
+                )?);
+            }
+            _ => {}
+        }
+    }
+    let (template_name, template_range) = template?;
+    Some(JavaScriptJsDocCallableSignature {
+        template_name,
+        template_range,
+        parameters,
+        return_type: return_type?,
+    })
+}
+
+fn javascript_jsdoc_identifier(source: &str, start: usize, end: usize) -> Option<Token<'_>> {
+    let suffix = source.get(start..end)?;
+    let offset = suffix.len().checked_sub(suffix.trim_start().len())?;
+    let mut scanner = Scanner::new(source);
+    scanner.reset_pos(start.checked_add(offset)?);
+    let token = scanner.scan();
+    (token.kind == SyntaxKind::Identifier && usize::try_from(token.range.end.get()).ok()? <= end)
+        .then_some(token)
+}
+
+fn javascript_jsdoc_callable_type(
+    source: &str,
+    start: usize,
+    comment_end: usize,
+) -> Option<JavaScriptJsDocCallableType> {
+    let content_end = comment_end.checked_sub(2)?;
+    let body = source.get(start..content_end)?;
+    let open = start.checked_add(body.len().checked_sub(body.trim_start().len())?)?;
+    if source.as_bytes().get(open) != Some(&b'{') {
+        return None;
+    }
+    let close = javascript_jsdoc_matching_brace(source, open, content_end)?;
+    let enclosed = source.get(open.checked_add(1)?..close)?;
+    let trimmed = enclosed.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let type_start = open
+        .checked_add(1)?
+        .checked_add(enclosed.len().checked_sub(enclosed.trim_start().len())?)?;
+    let type_end = type_start.checked_add(trimmed.len())?;
+    Some(JavaScriptJsDocCallableType {
+        range: text_range(type_start, type_end),
+        closing_brace: TextPos::new(u32::try_from(close).ok()?),
+    })
 }
 
 fn javascript_jsdoc_tag_is_top_level(comment: &str, position: usize) -> bool {
@@ -999,6 +1135,7 @@ impl<'a> Parser<'a> {
                 continue;
             }
             let before = (self.current.kind, self.current.range);
+            let mut jsdoc_signature = None;
             if self.javascript_file
                 && terminator == SyntaxKind::EndOfFile
                 && self
@@ -1011,13 +1148,20 @@ impl<'a> Parser<'a> {
                 let typedefs = self.arena.source_text().map_or_else(Vec::new, |source| {
                     javascript_jsdoc_typedefs(source, trivia_start, statement_start)
                 });
+                jsdoc_signature = self.arena.source_text().and_then(|source| {
+                    javascript_jsdoc_callable_signature(source, trivia_start, statement_start)
+                });
                 for typedef in typedefs {
                     if let Some(alias) = self.parse_javascript_jsdoc_typedef(typedef) {
                         statements.push(alias);
                     }
                 }
             }
-            statements.push(self.parse_statement());
+            let statement = self.parse_statement();
+            if let Some(signature) = jsdoc_signature {
+                self.attach_javascript_jsdoc_arrow_signature(statement, signature);
+            }
+            statements.push(statement);
             if before == (self.current.kind, self.current.range) {
                 self.error_current("Parser made no progress while parsing a statement.");
                 self.bump();
@@ -1065,6 +1209,137 @@ impl<'a> Parser<'a> {
             })),
             &[name, type_node],
         ))
+    }
+
+    fn attach_javascript_jsdoc_arrow_signature(
+        &mut self,
+        statement: NodeId,
+        signature: JavaScriptJsDocCallableSignature,
+    ) {
+        let Some(NodeData::VariableStatement(statement_data)) =
+            self.arena.get(statement).map(|node| &node.data)
+        else {
+            return;
+        };
+        let Some(NodeData::VariableDeclarationList(declarations)) = self
+            .arena
+            .get(statement_data.declaration_list)
+            .map(|node| &node.data)
+        else {
+            return;
+        };
+        let [declaration] = declarations.declarations.nodes.as_slice() else {
+            return;
+        };
+        let Some(NodeData::VariableDeclaration(variable)) =
+            self.arena.get(*declaration).map(|node| &node.data)
+        else {
+            return;
+        };
+        let Some(arrow) = variable.initializer else {
+            return;
+        };
+        let Some(NodeData::ArrowFunction(function)) = self.arena.get(arrow).map(|node| &node.data)
+        else {
+            return;
+        };
+        if function.type_parameters.is_some()
+            || function.type_.is_some()
+            || function.parameters.nodes.len() != signature.parameters.len()
+        {
+            return;
+        }
+        let parameters = function.parameters.nodes.clone();
+        if parameters
+            .iter()
+            .zip(&signature.parameters)
+            .any(|(parameter, annotation)| {
+                let Some(NodeData::ParameterDeclaration(parameter)) =
+                    self.arena.get(*parameter).map(|node| &node.data)
+                else {
+                    return true;
+                };
+                let Some(NodeData::Identifier(name)) =
+                    self.arena.get(parameter.name).map(|node| &node.data)
+                else {
+                    return true;
+                };
+                parameter.type_.is_some() || name.text != annotation.name
+            })
+        {
+            return;
+        }
+
+        let mut annotations = Vec::with_capacity(signature.parameters.len());
+        for annotation in &signature.parameters {
+            let Some(type_) = self.parse_javascript_jsdoc_type(
+                annotation.type_.range,
+                annotation.type_.closing_brace,
+            ) else {
+                return;
+            };
+            annotations.push(type_);
+        }
+        let Some(return_type) = self.parse_javascript_jsdoc_type(
+            signature.return_type.range,
+            signature.return_type.closing_brace,
+        ) else {
+            return;
+        };
+        let name = self.alloc_node(
+            SyntaxKind::Identifier,
+            signature.template_range,
+            NodeData::Identifier(Box::new(IdentifierData {
+                flow_node: None,
+                text: signature.template_name,
+            })),
+            &[],
+        );
+        let type_parameter = self.alloc_node_with_flags(
+            SyntaxKind::TypeParameter,
+            NodeFlags::REPARSED,
+            signature.template_range,
+            NodeData::TypeParameterDeclaration(Box::new(TypeParameterDeclarationData {
+                constraint: None,
+                default_type: None,
+                expression: None,
+                symbol: None,
+                modifiers: None,
+                name,
+            })),
+            &[name],
+        );
+        for (parameter, annotation) in parameters.iter().copied().zip(annotations) {
+            let Some(annotation_node) = self.arena.get_mut(annotation) else {
+                return;
+            };
+            annotation_node.flags = NodeFlags::REPARSED;
+            annotation_node.parent = Some(parameter);
+            let Some(NodeData::ParameterDeclaration(parameter_data)) =
+                self.arena.get_mut(parameter).map(|node| &mut node.data)
+            else {
+                return;
+            };
+            parameter_data.type_ = Some(annotation);
+        }
+        if let Some(node) = self.arena.get_mut(return_type) {
+            node.flags = NodeFlags::REPARSED;
+            node.parent = Some(arrow);
+        }
+        if let Some(node) = self.arena.get_mut(type_parameter) {
+            node.parent = Some(arrow);
+        }
+        let Some(NodeData::ArrowFunction(function)) =
+            self.arena.get_mut(arrow).map(|node| &mut node.data)
+        else {
+            return;
+        };
+        function.type_parameters = Some(NodeList {
+            range: signature.template_range,
+            nodes: vec![type_parameter],
+            has_trailing_comma: false,
+        });
+        function.type_ = Some(return_type);
     }
 
     fn parse_javascript_jsdoc_type(
@@ -18317,6 +18592,75 @@ export as namespace GlobalName;
                 .parent,
             Some(result.jsdoc)
         );
+    }
+
+    #[test]
+    fn javascript_jsdoc_templates_reparse_source_owned_arrow_signature_nodes() {
+        let source = concat!(
+            "/**\n",
+            " * @template T\n",
+            " * @param {T|undefined} value value or not\n",
+            " * @returns {T} result value\n",
+            " */\n",
+            "const cloneObjectGood = value => /** @type {T} */({ ...value });",
+        );
+        let parsed = parse_javascript_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let arrow = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| (record.kind == SyntaxKind::ArrowFunction).then_some(node))
+            .unwrap();
+        let NodeData::ArrowFunction(function) = &parsed.arena.get(arrow).unwrap().data else {
+            panic!("expected the documented arrow initializer")
+        };
+        let [template] = function.type_parameters.as_ref().unwrap().nodes.as_slice() else {
+            panic!("expected one source-owned JSDoc template parameter")
+        };
+        let template_node = parsed.arena.get(*template).unwrap();
+        assert_eq!(template_node.kind, SyntaxKind::TypeParameter);
+        assert_eq!(template_node.flags, NodeFlags::REPARSED);
+        assert_eq!(template_node.parent, Some(arrow));
+        assert_eq!(
+            &source
+                [template_node.range.start.get() as usize..template_node.range.end.get() as usize],
+            "T",
+        );
+        let [parameter] = function.parameters.nodes.as_slice() else {
+            panic!("expected one documented value parameter")
+        };
+        let NodeData::ParameterDeclaration(value) = &parsed.arena.get(*parameter).unwrap().data
+        else {
+            panic!("expected the source-owned value parameter")
+        };
+        let annotation = parsed.arena.get(value.type_.unwrap()).unwrap();
+        assert_eq!(annotation.kind, SyntaxKind::UnionType);
+        assert_eq!(annotation.flags, NodeFlags::REPARSED);
+        assert_eq!(annotation.parent, Some(*parameter));
+        assert_eq!(
+            &source[annotation.range.start.get() as usize..annotation.range.end.get() as usize],
+            "T|undefined",
+        );
+        let returned = parsed.arena.get(function.type_.unwrap()).unwrap();
+        assert_eq!(returned.kind, SyntaxKind::TypeReference);
+        assert_eq!(returned.flags, NodeFlags::REPARSED);
+        assert_eq!(returned.parent, Some(arrow));
+        assert_eq!(
+            &source[returned.range.start.get() as usize..returned.range.end.get() as usize],
+            "T",
+        );
+
+        let mut pending = vec![parsed.source_file];
+        let mut reached = std::collections::HashSet::new();
+        while let Some(node) = pending.pop() {
+            assert!(reached.insert(node));
+            parsed
+                .arena
+                .get(node)
+                .unwrap()
+                .for_each_child(|child| pending.push(child));
+        }
+        assert_eq!(reached.len(), parsed.arena.len());
     }
 
     #[test]

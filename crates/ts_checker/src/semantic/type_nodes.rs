@@ -3628,6 +3628,105 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         self.is_authenticated_bivariant_generic_union_alias(body, alias_symbol)
     }
 
+    fn is_authenticated_jsdoc_arrow_union_type_parameter(
+        &self,
+        node: NodeRef,
+        symbol: SemanticSymbolId,
+    ) -> Result<bool, DeclaredTypeError> {
+        let Some(owner) = self.store.symbol(symbol) else {
+            return Ok(false);
+        };
+        let Some([template]) = owner.declarations() else {
+            return Ok(false);
+        };
+        let template = *template;
+        let template_record = preflight_node(self.store, self.host, template)?;
+        let Some(arrow) = template_record
+            .parent
+            .map(|parent| NodeRef::new(template.arena, template.file, parent))
+        else {
+            return Ok(false);
+        };
+        let arrow_record = preflight_node(self.store, self.host, arrow)?;
+        let NodeData::ArrowFunction(function) = &arrow_record.data else {
+            return Ok(false);
+        };
+        let Some(templates) = function.type_parameters.as_ref() else {
+            return Ok(false);
+        };
+        let Some(bound) = self.host.bound_file(arrow) else {
+            return Ok(false);
+        };
+        let node_record = preflight_node(self.store, self.host, node)?;
+        let Some(union) = node_record
+            .parent
+            .map(|parent| NodeRef::new(node.arena, node.file, parent))
+        else {
+            return Ok(false);
+        };
+        let union_record = preflight_node(self.store, self.host, union)?;
+        let NodeData::UnionTypeNode(union_data) = &union_record.data else {
+            return Ok(false);
+        };
+        let [first, second] = union_data.types.nodes.as_slice() else {
+            return Ok(false);
+        };
+        let undefined = if *first == node.node {
+            *second
+        } else if *second == node.node {
+            *first
+        } else {
+            return Ok(false);
+        };
+        let undefined = NodeRef::new(union.arena, union.file, undefined);
+        let undefined_record = preflight_node(self.store, self.host, undefined)?;
+        let Some(parameter) = union_record
+            .parent
+            .map(|parent| NodeRef::new(union.arena, union.file, parent))
+        else {
+            return Ok(false);
+        };
+        let parameter_record = preflight_node(self.store, self.host, parameter)?;
+        let NodeData::ParameterDeclaration(parameter_data) = &parameter_record.data else {
+            return Ok(false);
+        };
+        if owner.flags() != SymbolFlags::TYPE_PARAMETER
+            || owner.check_flags() != CheckFlags::NONE
+            || owner.value_declaration().is_some()
+            || owner.members().is_some()
+            || owner.exports().is_some()
+            || owner.parent().is_some()
+            || owner.export_symbol().is_some()
+            || self.store.get_merged_symbol(symbol) != Some(symbol)
+            || !self.host.symbol_matches(self.store, template, symbol)
+            || template_record.kind != SyntaxKind::TypeParameter
+            || template_record.flags != NodeFlags::REPARSED
+            || arrow_record.kind != SyntaxKind::ArrowFunction
+            || !templates.nodes.contains(&template.node)
+            || bound
+                .source_facts()
+                .is_none_or(|facts| !facts.is_javascript_file())
+            || bound
+                .locals(arrow)
+                .and_then(|locals| self.store.symbol_table(locals))
+                .and_then(|locals| locals.get(owner.name()))
+                != Some(symbol)
+            || union_record.kind != SyntaxKind::UnionType
+            || union_record.flags != NodeFlags::REPARSED
+            || union_data.types.has_trailing_comma
+            || undefined_record.kind != SyntaxKind::UndefinedKeyword
+            || undefined_record.parent != Some(union.node)
+            || parameter_record.kind != SyntaxKind::Parameter
+            || parameter_record.parent != Some(arrow.node)
+            || parameter_data.type_ != Some(union.node)
+            || !function.parameters.nodes.contains(&parameter.node)
+        {
+            return Ok(false);
+        }
+        source_callables::is_reparsed_jsdoc_generic_arrow(self.store, self.host, arrow, templates)
+            .map_err(|error| source_callable_error(error, SourceCallableFamily::ArrowFunction))
+    }
+
     #[allow(clippy::too_many_lines)] // Method, interface, and parameter ownership form one proof.
     fn is_authenticated_method_union_type_parameter(
         &self,
@@ -7508,7 +7607,8 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             && !flags.intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE)
             && (!flags.contains(SymbolFlags::TYPE_PARAMETER)
                 || !self.is_authenticated_bivariant_alias_type_parameter(node, symbol)?
-                    && !self.is_authenticated_method_union_type_parameter(node, symbol)?)
+                    && !self.is_authenticated_method_union_type_parameter(node, symbol)?
+                    && !self.is_authenticated_jsdoc_arrow_union_type_parameter(node, symbol)?)
         {
             return Err(type_node_unavailable(
                 TypeNodeUnavailable::UnsupportedUnionConstituent(node),

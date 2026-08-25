@@ -11780,6 +11780,92 @@ fn merge_spread_property(
     }
 }
 
+fn jsdoc_generic_arrow_spread_donor(
+    store: &CanonicalTypeMapperStore,
+    plan: &PropertyObjectPlan,
+    type_: TypeId,
+) -> bool {
+    if !plan.properties.is_empty() || plan.spreads.len() != 1 {
+        return false;
+    }
+    let Some(bootstrap) = store.intrinsic_bootstrap() else {
+        return false;
+    };
+    let generic = match store.type_payload(type_).map(TypeRecord::data) {
+        Some(TypeData::TypeParameter(_)) => type_,
+        Some(TypeData::Union(union)) if union.union.types.len() == 2 => {
+            let Some(generic) = union
+                .union
+                .types
+                .iter()
+                .copied()
+                .find(|candidate| *candidate != bootstrap.undefined_type)
+            else {
+                return false;
+            };
+            if !union.union.types.contains(&bootstrap.undefined_type)
+                || !matches!(
+                    store.type_payload(generic).map(TypeRecord::data),
+                    Some(TypeData::TypeParameter(_))
+                )
+            {
+                return false;
+            }
+            generic
+        }
+        _ => return false,
+    };
+    let Some(symbol) = cached_ordinary_type_parameter_owner(store, generic) else {
+        return false;
+    };
+    let Some([declaration]) = store
+        .symbol(symbol)
+        .and_then(|symbol| symbol.declarations())
+    else {
+        return false;
+    };
+    let Some(SourceNodeParent::Parent(arrow)) = store.source_node_parent(*declaration) else {
+        return false;
+    };
+    if store.source_node_kind(*declaration) != Some(SyntaxKind::TypeParameter)
+        || store.source_node_kind(arrow) != Some(SyntaxKind::ArrowFunction)
+    {
+        return false;
+    }
+    let mut current = plan.node;
+    let mut parenthesized = false;
+    loop {
+        let Some(SourceNodeParent::Parent(parent)) = store.source_node_parent(current) else {
+            return false;
+        };
+        if parent == arrow {
+            break;
+        }
+        if store.source_node_kind(parent) != Some(SyntaxKind::ParenthesizedExpression) {
+            return false;
+        }
+        parenthesized = true;
+        current = parent;
+    }
+    let Some(callable) = store.source_callable_type_for_declaration(arrow) else {
+        return false;
+    };
+    let Some(signature) = store
+        .source_callable_provenance(callable)
+        .and_then(|provenance| store.signature(provenance.signature))
+    else {
+        return false;
+    };
+    parenthesized
+        && signature.type_parameters().contains(&generic)
+        && signature.parameters().iter().any(|parameter| {
+            store
+                .value_symbol_links(*parameter)
+                .and_then(|links| links.resolved_type)
+                == Some(type_)
+        })
+}
+
 /// Publishes authenticated concrete spreads, with canonical `any` absorption.
 pub(super) fn publish_object_literal_with_spreads(
     store: &mut CanonicalTypeMapperStore,
@@ -11819,6 +11905,11 @@ pub(super) fn publish_object_literal_with_spreads(
         }
         match validate_spread_donor(store, *type_) {
             SpreadDonorValidation::Valid(properties) => donors.push(Some(properties)),
+            SpreadDonorValidation::Unsupported
+                if jsdoc_generic_arrow_spread_donor(store, plan, *type_) =>
+            {
+                donors.push(Some(Vec::new()));
+            }
             SpreadDonorValidation::Unsupported => {
                 return Err(PropertyObjectError::UnsupportedMember {
                     node: spread.declaration,

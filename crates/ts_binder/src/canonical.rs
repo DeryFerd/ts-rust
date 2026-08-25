@@ -10461,6 +10461,64 @@ Merged.fresh = 1;
     }
 
     #[test]
+    fn javascript_jsdoc_template_parameters_bind_to_their_arrow_scope() {
+        let source = concat!(
+            "/**\n",
+            " * @template T\n",
+            " * @param {T|undefined} value value or not\n",
+            " * @returns {T} result value\n",
+            " */\n",
+            "const cloneObjectGood = value => /** @type {T} */({ ...value });",
+        );
+        let parsed = parse_javascript_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(9_371);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/jsdoc-template.js\""),
+                    CanonicalSourceLanguage::JavaScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_javascript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+
+        let bound = binder.file(file).unwrap();
+        let arrow = nodes_of_kind(&parsed.arena, SyntaxKind::ArrowFunction)[0];
+        let arrow = node_ref(&parsed.arena, file, arrow);
+        let NodeData::ArrowFunction(function) = &parsed.arena.get(arrow.node).unwrap().data else {
+            panic!("expected the JSDoc-owned arrow")
+        };
+        let [parameter] = function.type_parameters.as_ref().unwrap().nodes.as_slice() else {
+            panic!("expected one source-owned template parameter")
+        };
+        let parameter = node_ref(&parsed.arena, file, *parameter);
+        let symbol = bound.symbol(parameter).unwrap();
+        let owner = binder.symbol_store().symbol(symbol).unwrap();
+        assert_eq!(owner.flags(), SymbolFlags::TYPE_PARAMETER);
+        assert_eq!(owner.name().as_utf8(), Some("T"));
+        assert_eq!(owner.declarations(), Some(&[parameter][..]));
+        assert!(owner.value_declaration().is_none());
+        assert!(owner.parent().is_none());
+        assert_eq!(bound.container(parameter), Some(arrow));
+        assert_eq!(
+            binder
+                .symbol_store()
+                .symbol_table(bound.locals(arrow).unwrap())
+                .and_then(|locals| locals.get_source("T")),
+            Some(symbol),
+        );
+    }
+
+    #[test]
     fn parsed_javascript_typedefs_keep_script_symbols_and_es_module_export_pairs() {
         for (index, (source, module_state, exported)) in [
             (

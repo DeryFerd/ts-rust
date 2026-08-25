@@ -11,7 +11,7 @@
 
 use std::collections::HashSet;
 
-use ts_ast::{ModifierList, NodeData, NodeList, NodeRef, SyntaxKind};
+use ts_ast::{ModifierList, NodeData, NodeFlags, NodeList, NodeRef, SyntaxKind};
 use ts_binder::{
     CanonicalNameResolver, CanonicalResolutionLocation, CanonicalSourceFileFacts, CheckFlags,
     InternalSymbolName, SemanticSymbolId, SymbolFlags,
@@ -2257,6 +2257,11 @@ fn plan_source_callable_with_owner_shape(
     let bound = host
         .bound_file(declaration)
         .ok_or_else(|| invariant(SourceCallableInvariant::InvalidOwnerSymbol(declaration)))?;
+    let javascript_jsdoc_generic_arrow = view.family == SourceCallableFamily::ArrowFunction
+        && !type_parameters.is_empty()
+        && bound
+            .source_facts()
+            .is_some_and(CanonicalSourceFileFacts::is_javascript_file);
     if body_mode.is_ambient() && bound.source_facts().is_none() {
         return Err(SourceCallableError::Unsupported(
             SourceCallableUnsupported::Modifiers(declaration),
@@ -2568,9 +2573,13 @@ fn plan_source_callable_with_owner_shape(
             if let Some(type_id) = data.type_ {
                 let type_node = NodeRef::new(declaration.arena, declaration.file, type_id);
                 let type_record = preflight_node(store, host, type_node)?;
+                let reparsed_jsdoc =
+                    javascript_jsdoc_generic_arrow && type_record.flags == NodeFlags::REPARSED;
                 if type_record.parent != Some(parameter.node)
-                    || type_record.range.start < name_record.range.end
-                    || type_record.range.end > parameter_record.range.end
+                    || !reparsed_jsdoc
+                        && (type_record.range.start < name_record.range.end
+                            || type_record.range.end > parameter_record.range.end)
+                    || reparsed_jsdoc && type_record.range.end >= record.range.start
                 {
                     return Err(invariant(SourceCallableInvariant::InvalidParameter(
                         parameter,
@@ -2750,9 +2759,13 @@ fn plan_source_callable_with_owner_shape(
     let (return_type, return_end) = if let Some(return_id) = view.return_type {
         let type_node = NodeRef::new(declaration.arena, declaration.file, return_id);
         let return_record = preflight_node(store, host, type_node)?;
+        let reparsed_jsdoc =
+            javascript_jsdoc_generic_arrow && return_record.flags == NodeFlags::REPARSED;
         if return_record.parent != Some(declaration.node)
-            || return_record.range.start < view.parameters.range.end
-            || return_record.range.end > record.range.end
+            || !reparsed_jsdoc
+                && (return_record.range.start < view.parameters.range.end
+                    || return_record.range.end > record.range.end)
+            || reparsed_jsdoc && return_record.range.end >= record.range.start
         {
             return Err(invariant(SourceCallableInvariant::InvalidSyntax(
                 declaration,
@@ -3890,9 +3903,12 @@ fn plan_exact_source_type_parameters(
         return Ok(Vec::new());
     };
     let declaration_record = preflight_node(store, host, declaration)?;
-    if family != SourceCallableFamily::FunctionDeclaration
+    let jsdoc_arrow = family == SourceCallableFamily::ArrowFunction
+        && is_reparsed_jsdoc_generic_arrow(store, host, declaration, type_parameters)?;
+    if family != SourceCallableFamily::FunctionDeclaration && !jsdoc_arrow
         || type_parameters.nodes.is_empty()
-        || type_parameters.range.start < declaration_record.range.start
+        || !jsdoc_arrow && type_parameters.range.start < declaration_record.range.start
+        || jsdoc_arrow && type_parameters.range.end >= declaration_record.range.start
         || type_parameters.range.end > parameters.range.start
         || type_parameters.range.start >= type_parameters.range.end
     {
@@ -4027,6 +4043,105 @@ fn plan_exact_source_type_parameters(
         previous_end = record.range.end;
     }
     Ok(result)
+}
+
+pub(super) fn is_reparsed_jsdoc_generic_arrow(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    parameters: &NodeList,
+) -> Result<bool, SourceCallableError> {
+    let (arena, bound) = host
+        .source(declaration)
+        .ok_or_else(|| invariant(SourceCallableInvariant::InvalidOwnerSymbol(declaration)))?;
+    if bound
+        .source_facts()
+        .is_none_or(|facts| !facts.is_javascript_file())
+        || store.source_node_kind(declaration) != Some(SyntaxKind::ArrowFunction)
+        || parameters.nodes.is_empty()
+    {
+        return Ok(false);
+    }
+    let comments = plan_javascript_source_jsdoc(arena, bound.source_file())
+        .map_err(|_| invariant(SourceCallableInvariant::InvalidSyntax(declaration)))?;
+    let Some(jsdoc) = comments.callable_declaration(arena, declaration) else {
+        return Ok(false);
+    };
+    let declaration_record = preflight_node(store, host, declaration)?;
+    let NodeData::ArrowFunction(function) = &declaration_record.data else {
+        return Ok(false);
+    };
+    let Some(return_type) = jsdoc.return_type() else {
+        return Ok(false);
+    };
+    let Some(return_node) = function
+        .type_
+        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+    else {
+        return Ok(false);
+    };
+    let return_record = preflight_node(store, host, return_node)?;
+    if jsdoc.template_parameters().len() != parameters.nodes.len()
+        || jsdoc.parameters().len() != function.parameters.nodes.len()
+        || jsdoc.parameters().is_empty()
+        || return_record.flags != NodeFlags::REPARSED
+        || return_record.parent != Some(declaration.node)
+        || return_record.range != return_type.range()
+    {
+        return Ok(false);
+    }
+    for (node, template) in parameters.nodes.iter().zip(jsdoc.template_parameters()) {
+        let parameter = NodeRef::new(declaration.arena, declaration.file, *node);
+        let record = preflight_node(store, host, parameter)?;
+        let NodeData::TypeParameterDeclaration(data) = &record.data else {
+            return Ok(false);
+        };
+        let name = NodeRef::new(parameter.arena, parameter.file, data.name);
+        let name_record = preflight_node(store, host, name)?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Ok(false);
+        };
+        if record.kind != SyntaxKind::TypeParameter
+            || record.flags != NodeFlags::REPARSED
+            || record.parent != Some(declaration.node)
+            || record.range != template.range()
+            || name_record.range != template.range()
+            || identifier.text != template.name()
+        {
+            return Ok(false);
+        }
+    }
+    for (node, documented) in function.parameters.nodes.iter().zip(jsdoc.parameters()) {
+        let parameter = NodeRef::new(declaration.arena, declaration.file, *node);
+        let parameter_record = preflight_node(store, host, parameter)?;
+        let NodeData::ParameterDeclaration(data) = &parameter_record.data else {
+            return Ok(false);
+        };
+        let name = NodeRef::new(parameter.arena, parameter.file, data.name);
+        let name_record = preflight_node(store, host, name)?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Ok(false);
+        };
+        let Some(annotation) = data
+            .type_
+            .map(|node| NodeRef::new(parameter.arena, parameter.file, node))
+        else {
+            return Ok(false);
+        };
+        let annotation_record = preflight_node(store, host, annotation)?;
+        if parameter_record.kind != SyntaxKind::Parameter
+            || parameter_record.parent != Some(declaration.node)
+            || identifier.text != documented.name()
+            || annotation_record.flags != NodeFlags::REPARSED
+            || annotation_record.parent != Some(parameter.node)
+            || documented
+                .type_()
+                .is_none_or(|documented| annotation_record.range != documented.range())
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn is_exact_source_type_parameter_bound(
@@ -4763,6 +4878,14 @@ fn validate_exact_generic_annotation_shape(
                 plan.array_targets,
             )?;
         }
+        if !exact && plan.family == SourceCallableFamily::ArrowFunction {
+            exact = is_exact_jsdoc_generic_union_annotation(
+                store,
+                host,
+                parameter.identity_node,
+                &plan.type_parameters,
+            )?;
+        }
         if parameter.is_implicit_any()
             || parameter.initializer.is_some()
             || parameter.rest
@@ -4797,6 +4920,51 @@ fn validate_exact_generic_annotation_shape(
         ));
     }
     Ok(return_type_parameter)
+}
+
+fn is_exact_jsdoc_generic_union_annotation(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    annotation: NodeRef,
+    parameters: &[SourceCallableTypeParameterPlan],
+) -> Result<bool, SourceCallableError> {
+    let record = preflight_node(store, host, annotation)?;
+    let NodeData::UnionTypeNode(union) = &record.data else {
+        return Ok(false);
+    };
+    if record.kind != SyntaxKind::UnionType
+        || record.flags != NodeFlags::REPARSED
+        || union.types.nodes.len() != 2
+        || union.types.has_trailing_comma
+    {
+        return Ok(false);
+    }
+    let mut undefined = false;
+    let mut generic = false;
+    for node in &union.types.nodes {
+        let member = NodeRef::new(annotation.arena, annotation.file, *node);
+        let member_record = preflight_node(store, host, member)?;
+        if member_record.parent != Some(annotation.node) {
+            return Ok(false);
+        }
+        if member_record.kind == SyntaxKind::UndefinedKeyword {
+            if undefined {
+                return Ok(false);
+            }
+            undefined = true;
+        } else {
+            let mut matched = false;
+            for parameter in parameters {
+                matched |=
+                    is_naked_source_type_parameter_annotation(store, host, member, parameter)?;
+            }
+            if !matched || generic {
+                return Ok(false);
+            }
+            generic = true;
+        }
+    }
+    Ok(undefined && generic)
 }
 
 fn exact_ambient_generic_constructor_parameter(
@@ -7606,7 +7774,13 @@ pub(super) fn publish_source_callable_parameter_types(
                             callable.plan.array_targets,
                             supplied_base,
                             type_parameters,
-                        )
+                        ) && !(callable.plan.family == SourceCallableFamily::ArrowFunction
+                            && valid_optional_generic_source_parameter_type(
+                                store,
+                                callable.plan.array_targets,
+                                supplied_base,
+                                type_parameters,
+                            ))
                     })
             {
                 return Err(invariant(SourceCallableInvariant::InvalidParameterCache(
@@ -8735,6 +8909,9 @@ fn valid_stored_generic_source_signature(
     let Ok(minimum_argument_count) = usize::try_from(signature.min_argument_count()) else {
         return false;
     };
+    let generic_arrow = signature.declaration().is_some_and(|declaration| {
+        store.source_node_kind(declaration) == Some(SyntaxKind::ArrowFunction)
+    });
     signature.flags() == SignatureFlags::NONE
         && minimum_argument_count <= signature.parameters().len()
         && parameter_types.is_none_or(|types| {
@@ -8745,7 +8922,7 @@ fn valid_stored_generic_source_signature(
                         array_targets,
                         *type_,
                         type_parameters,
-                    ) || index >= minimum_argument_count
+                    ) || (index >= minimum_argument_count || generic_arrow)
                         && valid_optional_generic_source_parameter_type(
                             store,
                             array_targets,
@@ -9099,7 +9276,10 @@ fn valid_stored_source_type_parameters(
             .is_none()
             .then(Vec::new);
     }
-    if contextual || family != SourceCallableFamily::FunctionDeclaration {
+    if contextual
+        || family != SourceCallableFamily::FunctionDeclaration
+            && family != SourceCallableFamily::ArrowFunction
+    {
         return None;
     }
     let provenances = store.source_callable_type_parameters(signature)?;
@@ -13367,6 +13547,162 @@ mod tests {
             assert_eq!(publication_state(&fixture.store), warm);
             assert!(diagnostics.is_empty());
         }
+    }
+
+    #[test]
+    fn javascript_jsdoc_generic_arrows_publish_required_union_parameters_cold_and_warm() {
+        let parsed = parse_javascript_source_file(concat!(
+            "/**\n",
+            " * @template T\n",
+            " * @param {T|undefined} value value or not\n",
+            " * @returns {T} result value\n",
+            " */\n",
+            "const cloneObjectGood = value => /** @type {T} */({ ...value });",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(1_317);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/jsdoc-generic.js\""),
+                    CanonicalSourceLanguage::JavaScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_javascript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &parsed.arena)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        )
+        .unwrap();
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ArrowFunction).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let bound = context.file(file).unwrap().1.clone();
+        let owner = bound.symbol(declaration).unwrap();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&parsed.arena, &bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let global_types = context.global_types().clone();
+        let targets = CanonicalArrayTargets::from_global_types(&global_types);
+        let cold = generic_transaction_state(context.store());
+        let plan = plan_source_callable(context.store(), &host, declaration, owner, Some(targets))
+            .unwrap();
+        assert_eq!(plan.family, SourceCallableFamily::ArrowFunction);
+        assert_eq!(plan.type_parameters.len(), 1);
+        assert_eq!(plan.parameters.len(), 1);
+        assert_eq!(plan.min_argument_count, 1);
+        assert!(!plan.parameters[0].optional);
+        assert_eq!(generic_transaction_state(context.store()), cold);
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let callable = CanonicalTypeQuery::new_with_global_types(
+            context.store_mut_for_test(),
+            &host,
+            &global_types,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_type_of_source_callable(declaration, owner)
+        .unwrap();
+        let provenance = context
+            .store()
+            .source_callable_provenance(callable)
+            .unwrap();
+        let signature = context.store().signature(provenance.signature).unwrap();
+        let [type_parameter] = signature.type_parameters() else {
+            panic!("expected the binder-owned JSDoc template identity")
+        };
+        let type_parameter = *type_parameter;
+        let [parameter_type] = context
+            .store()
+            .callable_signature_parameter_types(provenance.signature)
+            .unwrap()
+        else {
+            panic!("expected the documented required parameter")
+        };
+        let TypeData::Union(union) = context
+            .store()
+            .type_payload(*parameter_type)
+            .unwrap()
+            .data()
+        else {
+            panic!("the required parameter must retain T | undefined")
+        };
+        let undefined = context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .undefined_type;
+        assert_eq!(signature.min_argument_count(), 1);
+        assert_eq!(union.union.types.len(), 2);
+        assert!(union.union.types.contains(&type_parameter));
+        assert!(union.union.types.contains(&undefined));
+        assert_eq!(
+            provenance.generic_return_type_parameter,
+            Some(type_parameter)
+        );
+
+        let return_type = CanonicalTypeQuery::new_with_global_types(
+            context.store_mut_for_test(),
+            &host,
+            &global_types,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_return_type_of_signature(provenance.signature)
+        .unwrap();
+        assert_eq!(return_type, type_parameter);
+        assert_eq!(
+            context.type_to_string(callable).unwrap(),
+            "<T>(value: T | undefined) => T",
+        );
+        assert!(matches!(
+            validate_stored_source_callable(context.store(), callable),
+            StoredSourceCallableValidation::Valid(_)
+        ));
+
+        let warm = generic_transaction_state(context.store());
+        let replay = CanonicalTypeQuery::new_with_global_types(
+            context.store_mut_for_test(),
+            &host,
+            &global_types,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_type_of_source_callable(declaration, owner)
+        .unwrap();
+        assert_eq!(replay, callable);
+        assert_eq!(generic_transaction_state(context.store()), warm);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 
     #[test]

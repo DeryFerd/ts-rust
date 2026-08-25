@@ -47,6 +47,7 @@ pub enum JsDocTagKind {
     Satisfies,
     This,
     Augments,
+    Implements,
 }
 
 /// Intrinsic types accepted by the pinned `JSDoc` type grammar.
@@ -345,7 +346,7 @@ impl PlannedJsDocType {
     pub fn resolved_alias_name(&self) -> Option<&str> {
         match (&self.type_, self.resolved_type.as_deref()) {
             (
-                JsDocType::Named(name),
+                JsDocType::Named(name) | JsDocType::GenericReference { name, .. },
                 Some(
                     JsDocType::Intrinsic(_)
                     | JsDocType::StringLiteral(_)
@@ -762,6 +763,7 @@ pub struct PlannedJavaScriptDeclaration {
     satisfies: Option<PlannedJsDocSatisfies>,
     this_type: Option<PlannedJsDocType>,
     augments_type: Option<PlannedJsDocType>,
+    implements_types: Vec<PlannedJsDocType>,
 }
 
 impl PlannedJavaScriptDeclaration {
@@ -820,6 +822,11 @@ impl PlannedJavaScriptDeclaration {
     #[must_use]
     pub const fn augments_type(&self) -> Option<&PlannedJsDocType> {
         self.augments_type.as_ref()
+    }
+
+    #[must_use]
+    pub fn implements_types(&self) -> &[PlannedJsDocType] {
+        &self.implements_types
     }
 }
 
@@ -1334,6 +1341,7 @@ pub fn plan_javascript_source_jsdoc(
                     satisfies: None,
                     this_type: None,
                     augments_type: None,
+                    implements_types: Vec::new(),
                 };
                 for comment in comments {
                     for diagnostic in comment.diagnostics() {
@@ -2543,41 +2551,77 @@ fn bind_jsdoc_function_type(
     })))
 }
 
+#[derive(Clone, Debug)]
+struct LocalGenericJsDocDefinition {
+    parameters: Vec<PlannedJsDocTemplateParameter>,
+    type_: JsDocType,
+}
+
+#[allow(clippy::too_many_lines)] // Keep typedef, callback, and declaration ownership synchronized.
 fn attach_local_typedef_resolutions(
     declarations: &mut [PlannedJavaScriptDeclaration],
     expressions: &mut [PlannedJsDocArrowExpression],
 ) {
     let mut aliases = HashMap::new();
+    let mut generic_aliases = HashMap::new();
     let mut duplicates = HashSet::new();
     for declaration in declarations.iter() {
         for alias in &declaration.typedefs {
-            if !alias.template_parameters.is_empty() {
-                continue;
-            }
             let Some(annotation) = &alias.type_ else {
                 continue;
             };
-            if aliases
-                .insert(alias.name.clone(), annotation.type_.clone())
-                .is_some()
-            {
+            let duplicate = if alias.template_parameters.is_empty() {
+                aliases
+                    .insert(alias.name.clone(), annotation.type_.clone())
+                    .is_some()
+                    || generic_aliases.contains_key(&alias.name)
+            } else {
+                generic_aliases
+                    .insert(
+                        alias.name.clone(),
+                        LocalGenericJsDocDefinition {
+                            parameters: alias.template_parameters.clone(),
+                            type_: annotation.type_.clone(),
+                        },
+                    )
+                    .is_some()
+                    || aliases.contains_key(&alias.name)
+            };
+            if duplicate {
                 duplicates.insert(alias.name.clone());
             }
         }
     }
+
+    for declaration in declarations.iter() {
+        for callback in &declaration.callbacks {
+            if callback.template_parameters.is_empty() || !supports_local_callback_alias(callback) {
+                continue;
+            }
+            if generic_aliases
+                .insert(
+                    callback.name.clone(),
+                    LocalGenericJsDocDefinition {
+                        parameters: callback.template_parameters.clone(),
+                        type_: JsDocType::Callback(Box::new(callback.clone())),
+                    },
+                )
+                .is_some()
+                || aliases.contains_key(&callback.name)
+            {
+                duplicates.insert(callback.name.clone());
+            }
+        }
+    }
+
     for name in &duplicates {
         aliases.remove(name);
+        generic_aliases.remove(name);
     }
 
     for declaration in declarations.iter() {
         for callback in &declaration.callbacks {
-            if !callback.template_parameters.is_empty()
-                || callback.this_type.is_some()
-                || callback.return_type.is_none()
-                || callback
-                    .parameters
-                    .iter()
-                    .any(|parameter| parameter.type_.is_none())
+            if !callback.template_parameters.is_empty() || !supports_local_callback_alias(callback)
             {
                 continue;
             }
@@ -2585,11 +2629,16 @@ fn attach_local_typedef_resolutions(
             let shadowed = HashSet::new();
             for parameter in &mut resolved.parameters {
                 if let Some(annotation) = &mut parameter.type_ {
-                    attach_local_typedef_resolution(annotation, &aliases, &shadowed);
+                    attach_local_typedef_resolution(
+                        annotation,
+                        &aliases,
+                        &generic_aliases,
+                        &shadowed,
+                    );
                 }
             }
             if let Some(annotation) = &mut resolved.return_type {
-                attach_local_typedef_resolution(annotation, &aliases, &shadowed);
+                attach_local_typedef_resolution(annotation, &aliases, &generic_aliases, &shadowed);
             }
             if aliases
                 .insert(
@@ -2597,6 +2646,7 @@ fn attach_local_typedef_resolutions(
                     JsDocType::Callback(Box::new(resolved)),
                 )
                 .is_some()
+                || generic_aliases.contains_key(&callback.name)
             {
                 duplicates.insert(callback.name.clone());
             }
@@ -2604,48 +2654,86 @@ fn attach_local_typedef_resolutions(
     }
     for name in duplicates {
         aliases.remove(&name);
+        generic_aliases.remove(&name);
     }
-    if aliases.is_empty() {
+    if aliases.is_empty() && generic_aliases.is_empty() {
         return;
     }
 
     for declaration in declarations.iter_mut() {
         let declaration_templates = shadowed_type_parameters(&declaration.template_parameters);
         if let Some(annotation) = &mut declaration.type_ {
-            attach_local_typedef_resolution(annotation, &aliases, &declaration_templates);
+            attach_local_typedef_resolution(
+                annotation,
+                &aliases,
+                &generic_aliases,
+                &declaration_templates,
+            );
         }
         if let Some(annotation) = &mut declaration.return_type {
-            attach_local_typedef_resolution(annotation, &aliases, &declaration_templates);
+            attach_local_typedef_resolution(
+                annotation,
+                &aliases,
+                &generic_aliases,
+                &declaration_templates,
+            );
         }
         if let Some(annotation) = &mut declaration.this_type {
-            attach_local_typedef_resolution(annotation, &aliases, &declaration_templates);
+            attach_local_typedef_resolution(
+                annotation,
+                &aliases,
+                &generic_aliases,
+                &declaration_templates,
+            );
         }
         if let Some(satisfies) = &mut declaration.satisfies {
-            attach_local_typedef_resolution(&mut satisfies.type_, &aliases, &declaration_templates);
+            attach_local_typedef_resolution(
+                &mut satisfies.type_,
+                &aliases,
+                &generic_aliases,
+                &declaration_templates,
+            );
         }
         attach_template_typedef_resolutions(
             &mut declaration.template_parameters,
             &aliases,
+            &generic_aliases,
             &declaration_templates,
         );
         for parameter in &mut declaration.parameters {
             if let Some(annotation) = &mut parameter.type_ {
-                attach_local_typedef_resolution(annotation, &aliases, &declaration_templates);
+                attach_local_typedef_resolution(
+                    annotation,
+                    &aliases,
+                    &generic_aliases,
+                    &declaration_templates,
+                );
             }
         }
         for alias in &mut declaration.typedefs {
             let alias_templates = shadowed_type_parameters(&alias.template_parameters);
             if let Some(annotation) = &mut alias.type_ {
-                attach_local_typedef_resolution(annotation, &aliases, &alias_templates);
+                attach_local_typedef_resolution(
+                    annotation,
+                    &aliases,
+                    &generic_aliases,
+                    &alias_templates,
+                );
             }
             for property in &mut alias.properties {
                 if let Some(annotation) = &mut property.type_ {
-                    attach_local_typedef_resolution(annotation, &aliases, &alias_templates);
+                    attach_local_typedef_resolution(
+                        annotation,
+                        &aliases,
+                        &generic_aliases,
+                        &alias_templates,
+                    );
                 }
             }
             attach_template_typedef_resolutions(
                 &mut alias.template_parameters,
                 &aliases,
+                &generic_aliases,
                 &alias_templates,
             );
         }
@@ -2653,18 +2741,34 @@ fn attach_local_typedef_resolutions(
             let callback_templates = shadowed_type_parameters(&callback.template_parameters);
             for parameter in &mut callback.parameters {
                 if let Some(annotation) = &mut parameter.type_ {
-                    attach_local_typedef_resolution(annotation, &aliases, &callback_templates);
+                    attach_local_typedef_resolution(
+                        annotation,
+                        &aliases,
+                        &generic_aliases,
+                        &callback_templates,
+                    );
                 }
             }
             if let Some(annotation) = &mut callback.return_type {
-                attach_local_typedef_resolution(annotation, &aliases, &callback_templates);
+                attach_local_typedef_resolution(
+                    annotation,
+                    &aliases,
+                    &generic_aliases,
+                    &callback_templates,
+                );
             }
             if let Some(annotation) = &mut callback.this_type {
-                attach_local_typedef_resolution(annotation, &aliases, &callback_templates);
+                attach_local_typedef_resolution(
+                    annotation,
+                    &aliases,
+                    &generic_aliases,
+                    &callback_templates,
+                );
             }
             attach_template_typedef_resolutions(
                 &mut callback.template_parameters,
                 &aliases,
+                &generic_aliases,
                 &callback_templates,
             );
         }
@@ -2676,8 +2780,22 @@ fn attach_local_typedef_resolutions(
             .find(|declaration| declaration.node == expression.declaration)
             .map(|declaration| shadowed_type_parameters(&declaration.template_parameters))
             .unwrap_or_default();
-        attach_local_typedef_resolution(&mut expression.type_, &aliases, &shadowed);
+        attach_local_typedef_resolution(
+            &mut expression.type_,
+            &aliases,
+            &generic_aliases,
+            &shadowed,
+        );
     }
+}
+
+fn supports_local_callback_alias(callback: &PlannedJsDocCallback) -> bool {
+    callback.this_type.is_none()
+        && callback.return_type.is_some()
+        && callback
+            .parameters
+            .iter()
+            .all(|parameter| parameter.type_.is_some())
 }
 
 fn shadowed_type_parameters(parameters: &[PlannedJsDocTemplateParameter]) -> HashSet<String> {
@@ -2690,14 +2808,15 @@ fn shadowed_type_parameters(parameters: &[PlannedJsDocTemplateParameter]) -> Has
 fn attach_template_typedef_resolutions(
     parameters: &mut [PlannedJsDocTemplateParameter],
     aliases: &HashMap<String, JsDocType>,
+    generic_aliases: &HashMap<String, LocalGenericJsDocDefinition>,
     shadowed: &HashSet<String>,
 ) {
     for parameter in parameters {
         if let Some(constraint) = &mut parameter.constraint {
-            attach_local_typedef_resolution(constraint, aliases, shadowed);
+            attach_local_typedef_resolution(constraint, aliases, generic_aliases, shadowed);
         }
         if let Some(default_type) = &mut parameter.default_type {
-            attach_local_typedef_resolution(default_type, aliases, shadowed);
+            attach_local_typedef_resolution(default_type, aliases, generic_aliases, shadowed);
         }
     }
 }
@@ -2705,10 +2824,381 @@ fn attach_template_typedef_resolutions(
 fn attach_local_typedef_resolution(
     annotation: &mut PlannedJsDocType,
     aliases: &HashMap<String, JsDocType>,
+    generic_aliases: &HashMap<String, LocalGenericJsDocDefinition>,
     shadowed: &HashSet<String>,
 ) {
-    if let Some(resolved) = substitute_local_typedefs(&annotation.type_, aliases, shadowed) {
+    let expanded = expand_local_generic_typedefs(
+        &annotation.type_,
+        aliases,
+        generic_aliases,
+        shadowed,
+        &mut HashSet::new(),
+    );
+    let resolved = substitute_local_typedefs(
+        expanded.as_ref().unwrap_or(&annotation.type_),
+        aliases,
+        shadowed,
+    )
+    .or(expanded);
+    if let Some(resolved) = resolved {
         annotation.resolved_type = Some(Box::new(resolved));
+    }
+}
+
+#[allow(clippy::too_many_lines)] // Generic arguments and nested type shapes share one cycle guard.
+fn expand_local_generic_typedefs(
+    type_: &JsDocType,
+    aliases: &HashMap<String, JsDocType>,
+    generic_aliases: &HashMap<String, LocalGenericJsDocDefinition>,
+    shadowed: &HashSet<String>,
+    visiting: &mut HashSet<String>,
+) -> Option<JsDocType> {
+    match type_ {
+        JsDocType::GenericReference { name, arguments } => {
+            let alias = generic_aliases.get(name)?;
+            if shadowed.contains(name)
+                || arguments.len() > alias.parameters.len()
+                || !visiting.insert(name.clone())
+            {
+                return None;
+            }
+
+            let resolved = (|| {
+                let mut bindings = HashMap::with_capacity(alias.parameters.len());
+                for (index, parameter) in alias.parameters.iter().enumerate() {
+                    let argument = arguments.get(index).or_else(|| {
+                        parameter
+                            .default_type
+                            .as_ref()
+                            .map(PlannedJsDocType::resolution_type)
+                    })?;
+                    let argument = substitute_jsdoc_template_names(argument, &bindings);
+                    let argument = expand_local_generic_typedefs(
+                        &argument,
+                        aliases,
+                        generic_aliases,
+                        shadowed,
+                        visiting,
+                    )
+                    .unwrap_or(argument);
+                    let argument =
+                        substitute_local_typedefs(&argument, aliases, shadowed).unwrap_or(argument);
+                    if let Some(constraint) = &parameter.constraint {
+                        let constraint = substitute_jsdoc_template_names(
+                            constraint.resolution_type(),
+                            &bindings,
+                        );
+                        let constraint = expand_local_generic_typedefs(
+                            &constraint,
+                            aliases,
+                            generic_aliases,
+                            shadowed,
+                            visiting,
+                        )
+                        .unwrap_or(constraint);
+                        let constraint = substitute_local_typedefs(&constraint, aliases, shadowed)
+                            .unwrap_or(constraint);
+                        if !jsdoc_template_constraint_accepts(&argument, &constraint) {
+                            return None;
+                        }
+                    }
+                    if bindings.insert(parameter.name.clone(), argument).is_some() {
+                        return None;
+                    }
+                }
+
+                if let JsDocType::Callback(callback) = &alias.type_ {
+                    return instantiate_local_generic_callback(
+                        callback,
+                        &bindings,
+                        aliases,
+                        generic_aliases,
+                        shadowed,
+                        visiting,
+                    );
+                }
+
+                let resolved = substitute_jsdoc_template_names(&alias.type_, &bindings);
+                let resolved = expand_local_generic_typedefs(
+                    &resolved,
+                    aliases,
+                    generic_aliases,
+                    shadowed,
+                    visiting,
+                )
+                .unwrap_or(resolved);
+                Some(substitute_local_typedefs(&resolved, aliases, shadowed).unwrap_or(resolved))
+            })();
+            visiting.remove(name);
+            resolved
+        }
+        JsDocType::Parenthesized(inner) => {
+            expand_local_generic_typedefs(inner, aliases, generic_aliases, shadowed, visiting)
+                .map(Box::new)
+                .map(JsDocType::Parenthesized)
+        }
+        JsDocType::Nullable(inner) => {
+            expand_local_generic_typedefs(inner, aliases, generic_aliases, shadowed, visiting)
+                .map(Box::new)
+                .map(JsDocType::Nullable)
+        }
+        JsDocType::NonNullable(inner) => {
+            expand_local_generic_typedefs(inner, aliases, generic_aliases, shadowed, visiting)
+                .map(Box::new)
+                .map(JsDocType::NonNullable)
+        }
+        JsDocType::Optional(inner) => {
+            expand_local_generic_typedefs(inner, aliases, generic_aliases, shadowed, visiting)
+                .map(Box::new)
+                .map(JsDocType::Optional)
+        }
+        JsDocType::Variadic(inner) => {
+            expand_local_generic_typedefs(inner, aliases, generic_aliases, shadowed, visiting)
+                .map(Box::new)
+                .map(JsDocType::Variadic)
+        }
+        JsDocType::Array(inner) => {
+            expand_local_generic_typedefs(inner, aliases, generic_aliases, shadowed, visiting)
+                .map(Box::new)
+                .map(JsDocType::Array)
+        }
+        JsDocType::ReadonlyArray(inner) => {
+            expand_local_generic_typedefs(inner, aliases, generic_aliases, shadowed, visiting)
+                .map(Box::new)
+                .map(JsDocType::ReadonlyArray)
+        }
+        JsDocType::Union(members) => {
+            let mut changed = false;
+            let members = members
+                .iter()
+                .map(|member| {
+                    expand_local_generic_typedefs(
+                        member,
+                        aliases,
+                        generic_aliases,
+                        shadowed,
+                        visiting,
+                    )
+                    .map_or_else(
+                        || member.clone(),
+                        |member| {
+                            changed = true;
+                            member
+                        },
+                    )
+                })
+                .collect();
+            changed.then_some(JsDocType::Union(members))
+        }
+        JsDocType::ObjectLiteral(properties) => {
+            let mut changed = false;
+            let properties = properties
+                .iter()
+                .map(|property| {
+                    let type_ = expand_local_generic_typedefs(
+                        &property.type_,
+                        aliases,
+                        generic_aliases,
+                        shadowed,
+                        visiting,
+                    )
+                    .map_or_else(
+                        || property.type_.clone(),
+                        |type_| {
+                            changed = true;
+                            type_
+                        },
+                    );
+                    JsDocObjectProperty {
+                        name: property.name.clone(),
+                        type_,
+                        optional: property.optional,
+                        readonly: property.readonly,
+                    }
+                })
+                .collect();
+            changed.then_some(JsDocType::ObjectLiteral(properties))
+        }
+        _ => None,
+    }
+}
+
+fn instantiate_local_generic_callback(
+    callback: &PlannedJsDocCallback,
+    bindings: &HashMap<String, JsDocType>,
+    aliases: &HashMap<String, JsDocType>,
+    generic_aliases: &HashMap<String, LocalGenericJsDocDefinition>,
+    shadowed: &HashSet<String>,
+    visiting: &mut HashSet<String>,
+) -> Option<JsDocType> {
+    let mut resolved = callback.clone();
+    resolved.template_parameters.clear();
+
+    for parameter in &mut resolved.parameters {
+        instantiate_local_generic_callback_annotation(
+            parameter.type_.as_mut()?,
+            bindings,
+            aliases,
+            generic_aliases,
+            shadowed,
+            visiting,
+        )?;
+    }
+    instantiate_local_generic_callback_annotation(
+        resolved.return_type.as_mut()?,
+        bindings,
+        aliases,
+        generic_aliases,
+        shadowed,
+        visiting,
+    )?;
+
+    Some(JsDocType::Callback(Box::new(resolved)))
+}
+
+fn instantiate_local_generic_callback_annotation(
+    annotation: &mut PlannedJsDocType,
+    bindings: &HashMap<String, JsDocType>,
+    aliases: &HashMap<String, JsDocType>,
+    generic_aliases: &HashMap<String, LocalGenericJsDocDefinition>,
+    shadowed: &HashSet<String>,
+    visiting: &mut HashSet<String>,
+) -> Option<()> {
+    let substituted = substitute_jsdoc_template_names(annotation.resolution_type(), bindings);
+    let expanded =
+        expand_local_generic_typedefs(&substituted, aliases, generic_aliases, shadowed, visiting);
+    if expanded.is_none()
+        && matches!(
+            &substituted,
+            JsDocType::GenericReference { name, .. } if generic_aliases.contains_key(name)
+        )
+    {
+        return None;
+    }
+
+    let resolved = expanded.unwrap_or(substituted);
+    let resolved = substitute_local_typedefs(&resolved, aliases, shadowed).unwrap_or(resolved);
+    annotation.resolved_type = Some(Box::new(resolved));
+    Some(())
+}
+
+fn substitute_jsdoc_template_names(
+    type_: &JsDocType,
+    bindings: &HashMap<String, JsDocType>,
+) -> JsDocType {
+    match type_ {
+        JsDocType::Named(name) => bindings.get(name).cloned().unwrap_or_else(|| type_.clone()),
+        JsDocType::Parenthesized(inner) => {
+            JsDocType::Parenthesized(Box::new(substitute_jsdoc_template_names(inner, bindings)))
+        }
+        JsDocType::Nullable(inner) => {
+            JsDocType::Nullable(Box::new(substitute_jsdoc_template_names(inner, bindings)))
+        }
+        JsDocType::NonNullable(inner) => {
+            JsDocType::NonNullable(Box::new(substitute_jsdoc_template_names(inner, bindings)))
+        }
+        JsDocType::Optional(inner) => {
+            JsDocType::Optional(Box::new(substitute_jsdoc_template_names(inner, bindings)))
+        }
+        JsDocType::Variadic(inner) => {
+            JsDocType::Variadic(Box::new(substitute_jsdoc_template_names(inner, bindings)))
+        }
+        JsDocType::Array(inner) => {
+            JsDocType::Array(Box::new(substitute_jsdoc_template_names(inner, bindings)))
+        }
+        JsDocType::ReadonlyArray(inner) => {
+            JsDocType::ReadonlyArray(Box::new(substitute_jsdoc_template_names(inner, bindings)))
+        }
+        JsDocType::Union(members) => JsDocType::Union(
+            members
+                .iter()
+                .map(|member| substitute_jsdoc_template_names(member, bindings))
+                .collect(),
+        ),
+        JsDocType::ObjectLiteral(properties) => JsDocType::ObjectLiteral(
+            properties
+                .iter()
+                .map(|property| JsDocObjectProperty {
+                    name: property.name.clone(),
+                    type_: substitute_jsdoc_template_names(&property.type_, bindings),
+                    optional: property.optional,
+                    readonly: property.readonly,
+                })
+                .collect(),
+        ),
+        JsDocType::GenericReference { name, arguments } => JsDocType::GenericReference {
+            name: name.clone(),
+            arguments: arguments
+                .iter()
+                .map(|argument| substitute_jsdoc_template_names(argument, bindings))
+                .collect(),
+        },
+        JsDocType::IndexedAccess { object, index } => JsDocType::IndexedAccess {
+            object: Box::new(substitute_jsdoc_template_names(object, bindings)),
+            index: Box::new(substitute_jsdoc_template_names(index, bindings)),
+        },
+        JsDocType::KeyOf(inner) => {
+            JsDocType::KeyOf(Box::new(substitute_jsdoc_template_names(inner, bindings)))
+        }
+        JsDocType::Function(function) => JsDocType::Function(Box::new(JsDocFunctionType {
+            parameters: function
+                .parameters
+                .iter()
+                .map(|parameter| JsDocFunctionParameter {
+                    name: parameter.name.clone(),
+                    type_: parameter
+                        .type_
+                        .as_ref()
+                        .map(|type_| substitute_jsdoc_template_names(type_, bindings)),
+                    optional: parameter.optional,
+                    rest: parameter.rest,
+                })
+                .collect(),
+            return_type: substitute_jsdoc_template_names(&function.return_type, bindings),
+        })),
+        _ => type_.clone(),
+    }
+}
+
+fn jsdoc_template_constraint_accepts(argument: &JsDocType, constraint: &JsDocType) -> bool {
+    if argument == constraint {
+        return true;
+    }
+    if let JsDocType::Union(arguments) = argument {
+        return arguments
+            .iter()
+            .all(|argument| jsdoc_template_constraint_accepts(argument, constraint));
+    }
+    match constraint {
+        JsDocType::Intrinsic(JsDocIntrinsicType::Any | JsDocIntrinsicType::Unknown) => true,
+        JsDocType::Intrinsic(JsDocIntrinsicType::String) => {
+            matches!(argument, JsDocType::StringLiteral(_))
+        }
+        JsDocType::Intrinsic(JsDocIntrinsicType::Number) => {
+            matches!(argument, JsDocType::NumberLiteral(_))
+        }
+        JsDocType::Intrinsic(JsDocIntrinsicType::BigInt) => {
+            matches!(argument, JsDocType::BigIntLiteral(_))
+        }
+        JsDocType::Intrinsic(JsDocIntrinsicType::Boolean) => matches!(
+            argument,
+            JsDocType::Intrinsic(JsDocIntrinsicType::True | JsDocIntrinsicType::False)
+        ),
+        JsDocType::Intrinsic(JsDocIntrinsicType::Object) => matches!(
+            argument,
+            JsDocType::ObjectLiteral(_)
+                | JsDocType::Array(_)
+                | JsDocType::ReadonlyArray(_)
+                | JsDocType::Function(_)
+                | JsDocType::Callback(_)
+        ),
+        JsDocType::Parenthesized(inner) | JsDocType::NonNullable(inner) => {
+            jsdoc_template_constraint_accepts(argument, inner)
+        }
+        JsDocType::Union(members) => members
+            .iter()
+            .any(|member| jsdoc_template_constraint_accepts(argument, member)),
+        _ => false,
     }
 }
 
@@ -3095,6 +3585,11 @@ fn apply_jsdoc_tag(
                 declaration.augments_type = Some(annotation.planned());
             }
         }
+        JsDocTagKind::Implements => {
+            if let Some(annotation) = tag.type_expression() {
+                declaration.implements_types.push(annotation.planned());
+            }
+        }
     }
     Ok(())
 }
@@ -3259,7 +3754,7 @@ fn append_augments_diagnostic(
     let Some(annotation) = tag.type_expression() else {
         return Ok(());
     };
-    let JsDocType::Named(expected) = annotation.type_() else {
+    let Some(expected) = jsdoc_heritage_base_name(annotation.type_()) else {
         return Ok(());
     };
     let Some(actual) = class_extends_name(arena, class.heritage_clauses.as_ref()) else {
@@ -3270,8 +3765,11 @@ fn append_augments_diagnostic(
     if expected_name == actual_name {
         return Ok(());
     }
-    let relative_start = annotation
+    let base_text = annotation
         .text()
+        .split_once('<')
+        .map_or(annotation.text(), |(base, _)| base);
+    let relative_start = base_text
         .rfind(expected_name)
         .ok_or(JsDocCommentError::InvalidParserTree(annotation.range()))?;
     let start = (annotation.range().start.get() as usize)
@@ -3291,6 +3789,14 @@ fn append_augments_diagnostic(
         ],
     )?);
     Ok(())
+}
+
+fn jsdoc_heritage_base_name(type_: &JsDocType) -> Option<&str> {
+    match type_ {
+        JsDocType::Named(name) | JsDocType::GenericReference { name, .. } => Some(name),
+        JsDocType::Parenthesized(inner) => jsdoc_heritage_base_name(inner),
+        _ => None,
+    }
 }
 
 fn class_extends_name(arena: &NodeArena, clauses: Option<&ts_ast::NodeList>) -> Option<String> {
@@ -3402,6 +3908,7 @@ fn tag_kind(name: &str) -> Option<JsDocTagKind> {
         "satisfies" => Some(JsDocTagKind::Satisfies),
         "this" => Some(JsDocTagKind::This),
         "extends" | "augments" => Some(JsDocTagKind::Augments),
+        "implements" => Some(JsDocTagKind::Implements),
         _ => None,
     }
 }
@@ -3429,8 +3936,10 @@ fn recover_keyword_tags<'source>(comment: &'source str, tags: &mut Vec<ScannedTa
         let Some(name) = rest.get(..name_length) else {
             continue;
         };
-        if !matches!(name, "type" | "return" | "extends" | "satisfies" | "this")
-            || tags.iter().any(|existing| existing.start == start)
+        if !matches!(
+            name,
+            "type" | "return" | "extends" | "implements" | "satisfies" | "this"
+        ) || tags.iter().any(|existing| existing.start == start)
         {
             continue;
         }
@@ -3510,7 +4019,11 @@ fn parse_supported_tag<'source>(
         cursor = skip_doc_whitespace(source, type_end, absolute_end);
     } else if matches!(
         kind,
-        JsDocTagKind::Type | JsDocTagKind::Augments | JsDocTagKind::Satisfies | JsDocTagKind::This
+        JsDocTagKind::Type
+            | JsDocTagKind::Augments
+            | JsDocTagKind::Implements
+            | JsDocTagKind::Satisfies
+            | JsDocTagKind::This
     ) {
         diagnostics.push(type_expected_diagnostic(source, cursor, absolute_end)?);
     }
@@ -5297,6 +5810,294 @@ mod tests {
     }
 
     #[test]
+    fn generic_local_typedefs_apply_constraints_defaults_and_canonical_array_caches() {
+        let javascript = parse_javascript_source_file(concat!(
+            "/**\n",
+            " * @template {string | number} T\n",
+            " * @template [U=T]\n",
+            " * @typedef {(T | U)[]} NS.List\n",
+            " */\n",
+            "/** @type {NS.List<string>} */\n",
+            "const first = [];\n",
+            "/** @type {NS.List<number, string>} */\n",
+            "const second = [];",
+        ));
+        assert!(
+            javascript.diagnostics.is_empty(),
+            "{:?}",
+            javascript.diagnostics
+        );
+        let root = NodeRef::new(
+            javascript.arena.id(),
+            FileId::new(102),
+            javascript.source_file,
+        );
+        let plan = plan_javascript_source_jsdoc(&javascript.arena, root).unwrap();
+        assert!(plan.diagnostics().is_empty(), "{:?}", plan.diagnostics());
+        let [first, second] = plan.declarations() else {
+            panic!("expected both generic typedef consumers")
+        };
+        let [definition] = first.typedefs() else {
+            panic!("expected the source-owned generic typedef")
+        };
+        let [constrained, defaulted] = definition.template_parameters() else {
+            panic!("expected the constrained and defaulted template parameters")
+        };
+        assert!(constrained.constraint().is_some());
+        assert_eq!(
+            defaulted.default_type().unwrap().type_(),
+            &JsDocType::Named("T".to_owned()),
+        );
+
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} ",
+            "interface ReadonlyArray<T> {} ",
+            "const marker = 1;",
+        ));
+        let options = CanonicalCheckerOptions::default();
+        let mut context = context(&parsed, options);
+        let globals = context.global_types().clone();
+        for (declaration, direct) in [
+            (first, "/** @type {Array<string>} */"),
+            (second, "/** @type {Array<string | number>} */"),
+        ] {
+            let annotation = declaration.type_().unwrap();
+            assert_eq!(annotation.resolved_alias_name(), Some("NS.List"));
+            let before = context.store().type_len();
+            preflight_planned_jsdoc_type(context.store(), &globals, options, annotation).unwrap();
+            assert_eq!(context.store().type_len(), before);
+
+            let resolved = resolve_planned_jsdoc_type(
+                context.store_mut_for_test(),
+                &globals,
+                options,
+                annotation,
+            )
+            .unwrap();
+            let direct = type_tag(direct);
+            let direct = direct.type_tag().unwrap().type_expression().unwrap();
+            assert_eq!(
+                resolve_jsdoc_type(context.store_mut_for_test(), &globals, options, direct),
+                Ok(resolved),
+            );
+
+            let warm = context.store().type_len();
+            assert_eq!(
+                resolve_planned_jsdoc_type(
+                    context.store_mut_for_test(),
+                    &globals,
+                    options,
+                    annotation,
+                ),
+                Ok(resolved),
+            );
+            assert_eq!(context.store().type_len(), warm);
+        }
+    }
+
+    #[test]
+    fn nested_generic_typedefs_preserve_structural_members_and_dependent_defaults() {
+        let javascript = parse_javascript_source_file(concat!(
+            "/** @template T @typedef {{ readonly value: T }} NS.Box */\n",
+            "/** @template [T=number] @typedef {NS.Box<T>} NS.Holder */\n",
+            "/** @type {NS.Holder<string>} */\n",
+            "var text;\n",
+            "/** @type {NS.Holder<number>} */\n",
+            "var count;",
+        ));
+        assert!(
+            javascript.diagnostics.is_empty(),
+            "{:?}",
+            javascript.diagnostics
+        );
+        let root = NodeRef::new(
+            javascript.arena.id(),
+            FileId::new(103),
+            javascript.source_file,
+        );
+        let plan = plan_javascript_source_jsdoc(&javascript.arena, root).unwrap();
+        let parsed = parse_source_file("const marker = 1;");
+        let options = CanonicalCheckerOptions::default();
+        let mut context = context(&parsed, options);
+        let globals = context.global_types().clone();
+
+        for (declaration, expected) in plan
+            .declarations()
+            .iter()
+            .zip(["{ readonly value: string; }", "{ readonly value: number; }"])
+        {
+            let annotation = declaration.type_().unwrap();
+            assert_eq!(annotation.resolved_alias_name(), Some("NS.Holder"));
+            let resolved = resolve_planned_jsdoc_type(
+                context.store_mut_for_test(),
+                &globals,
+                options,
+                annotation,
+            )
+            .unwrap();
+            assert_eq!(context.type_to_string(resolved).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn generic_typedef_arguments_keep_host_template_parameters_shadowed() {
+        let javascript = parse_javascript_source_file(concat!(
+            "/** @template T @typedef {T[]} Box */\n",
+            "/**\n",
+            " * @template T\n",
+            " * @param {Box<T>} values\n",
+            " * @returns {T}\n",
+            " */\n",
+            "function first(values) {}",
+        ));
+        let root = NodeRef::new(
+            javascript.arena.id(),
+            FileId::new(104),
+            javascript.source_file,
+        );
+        let plan = plan_javascript_source_jsdoc(&javascript.arena, root).unwrap();
+        let [declaration] = plan.declarations() else {
+            panic!("expected one template-annotated JavaScript function")
+        };
+        let annotation = declaration.parameter("values").unwrap().type_().unwrap();
+        assert_eq!(annotation.resolved_alias_name(), Some("Box"));
+
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} ",
+            "interface ReadonlyArray<T> {} ",
+            "interface Carrier<T> {}",
+        ));
+        let options = CanonicalCheckerOptions::default();
+        let mut context = context(&parsed, options);
+        let parameter = parsed
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                if record.kind != SyntaxKind::InterfaceDeclaration {
+                    return None;
+                }
+                let NodeData::InterfaceDeclaration(interface) = &record.data else {
+                    return None;
+                };
+                let NodeData::Identifier(name) = &parsed.arena.get(interface.name)?.data else {
+                    return None;
+                };
+                (name.text == "Carrier").then(|| {
+                    NodeRef::new(
+                        parsed.arena.id(),
+                        FileId::new(0),
+                        interface.type_parameters.as_ref().unwrap().nodes[0],
+                    )
+                })
+            })
+            .unwrap();
+        let symbol = context
+            .file(FileId::new(0))
+            .unwrap()
+            .1
+            .symbol(parameter)
+            .unwrap();
+        let template = context.get_declared_type_of_symbol(symbol).unwrap();
+        let globals = context.global_types().clone();
+        let signature = resolve_planned_jsdoc_signature(
+            context.store_mut_for_test(),
+            &globals,
+            options,
+            declaration,
+            &[JsDocTypeParameterBinding::new("T", template)],
+        )
+        .unwrap();
+        let array = context
+            .store_mut_for_test()
+            .create_canonical_array_type(&globals, template, false)
+            .unwrap();
+        assert_eq!(signature.parameters()[0].type_(), Some(array));
+        assert_eq!(signature.return_type(), Some(template));
+    }
+
+    #[test]
+    fn invalid_generic_typedef_constraints_arity_and_cycles_fail_without_allocations() {
+        for source in [
+            concat!(
+                "/** @template {string} T @typedef {T[]} Box */\n",
+                "/** @type {Box<number>} */ var value;",
+            ),
+            concat!(
+                "/** @template T @typedef {T[]} Box */\n",
+                "/** @type {Box<string, number>} */ var value;",
+            ),
+            concat!(
+                "/** @template T @typedef {Loop<T>} Loop */\n",
+                "/** @type {Loop<string>} */ var value;",
+            ),
+            concat!(
+                "/** @template T @typedef {T[]} Box */\n",
+                "/** @template T @typedef {T} Box */\n",
+                "/** @type {Box<string>} */ var value;",
+            ),
+        ] {
+            let javascript = parse_javascript_source_file(source);
+            assert!(
+                javascript.diagnostics.is_empty(),
+                "{source}: {:?}",
+                javascript.diagnostics
+            );
+            let root = NodeRef::new(
+                javascript.arena.id(),
+                FileId::new(105),
+                javascript.source_file,
+            );
+            let plan = plan_javascript_source_jsdoc(&javascript.arena, root).unwrap();
+            let annotation = plan
+                .declarations()
+                .iter()
+                .find_map(PlannedJavaScriptDeclaration::type_)
+                .unwrap();
+            let parsed = parse_source_file(concat!(
+                "interface Array<T> {} ",
+                "interface ReadonlyArray<T> {}",
+            ));
+            let options = CanonicalCheckerOptions::default();
+            let mut context = context(&parsed, options);
+            let globals = context.global_types().clone();
+            let before = (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().symbol_store().symbol_table_len(),
+            );
+            let expected = JsDocTypeResolutionError::UnsupportedType {
+                kind: SyntaxKind::TypeReference,
+                range: annotation.range(),
+            };
+
+            assert_eq!(
+                preflight_planned_jsdoc_type(context.store(), &globals, options, annotation),
+                Err(expected.clone()),
+                "{source}",
+            );
+            assert_eq!(
+                resolve_planned_jsdoc_type(
+                    context.store_mut_for_test(),
+                    &globals,
+                    options,
+                    annotation,
+                ),
+                Err(expected),
+                "{source}",
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().symbol_store().symbol_table_len(),
+                ),
+                before,
+                "{source}",
+            );
+        }
+    }
+
+    #[test]
     fn optional_structural_properties_use_the_configured_missing_type() {
         for exact_optional_property_types in [false, true] {
             let parsed = parse_source_file("const marker = 1;");
@@ -5751,6 +6552,43 @@ mod tests {
     }
 
     #[test]
+    fn arrow_body_type_comments_expand_generic_typedefs_without_losing_template_ownership() {
+        let javascript = parse_javascript_source_file(concat!(
+            "/** @template T @typedef {T[]} Box */\n",
+            "/**\n",
+            " * @template T\n",
+            " * @param {T} value\n",
+            " * @returns {T}\n",
+            " */\n",
+            "const read = value => /** @type {Box<T>} */ (value);",
+        ));
+        assert!(
+            javascript.diagnostics.is_empty(),
+            "{:?}",
+            javascript.diagnostics,
+        );
+        let root = NodeRef::new(
+            javascript.arena.id(),
+            FileId::new(113),
+            javascript.source_file,
+        );
+        let plan = plan_javascript_source_jsdoc(&javascript.arena, root).unwrap();
+        assert!(plan.diagnostics().is_empty(), "{:?}", plan.diagnostics());
+        let [declaration] = plan.declarations() else {
+            panic!("expected one source-owned generic arrow declaration")
+        };
+        let [expression] = plan.expressions.as_slice() else {
+            panic!("expected one generic arrow-body type comment")
+        };
+        assert_eq!(expression.declaration, declaration.node());
+        assert_eq!(expression.type_.resolved_alias_name(), Some("Box"));
+        assert_eq!(
+            expression.type_.resolution_type(),
+            &JsDocType::Array(Box::new(JsDocType::Named("T".to_owned()))),
+        );
+    }
+
+    #[test]
     fn callback_signature_tags_do_not_become_host_function_parameters() {
         for declaration in ["function f1() {}", "export function f1() {}"] {
             let source = format!(
@@ -5956,6 +6794,397 @@ mod tests {
                 range: parameter.range(),
             })
         );
+    }
+
+    #[test]
+    fn generic_callback_aliases_apply_constraints_defaults_and_preserve_source_ranges() {
+        let javascript = parse_javascript_source_file(concat!(
+            "/** @typedef {boolean} T */\n",
+            "/**\n",
+            " * @template {string | number} T\n",
+            " * @template [U=T]\n",
+            " * @callback NS.Mapper\n",
+            " * @param {T} value\n",
+            " * @returns {U}\n",
+            " */\n",
+            "/** @type {NS.Mapper<string>} */\n",
+            "const first = value => value;\n",
+            "/** @type {NS.Mapper<number, string>} */\n",
+            "const second = value => value;",
+        ));
+        assert!(
+            javascript.diagnostics.is_empty(),
+            "{:?}",
+            javascript.diagnostics
+        );
+        let root = NodeRef::new(
+            javascript.arena.id(),
+            FileId::new(106),
+            javascript.source_file,
+        );
+        let plan = plan_javascript_source_jsdoc(&javascript.arena, root).unwrap();
+        assert!(plan.diagnostics().is_empty(), "{:?}", plan.diagnostics());
+        let [first, second] = plan.declarations() else {
+            panic!("expected both generic callback consumers")
+        };
+        let [definition] = first.callbacks() else {
+            panic!("expected one source-owned generic callback")
+        };
+        assert_eq!(definition.template_parameters().len(), 2);
+        assert!(
+            definition.parameters()[0]
+                .type_()
+                .unwrap()
+                .resolved_alias_name()
+                .is_none()
+        );
+
+        let parsed = parse_source_file("const marker = 1;");
+        let options = CanonicalCheckerOptions::default();
+        let mut context = context(&parsed, options);
+        let globals = context.global_types().clone();
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let string = bootstrap.string_type;
+        let number = bootstrap.number_type;
+
+        for (declaration, expected_parameter, expected_return) in
+            [(first, string, string), (second, number, string)]
+        {
+            let annotation = declaration.type_().unwrap();
+            assert_eq!(annotation.resolved_alias_name(), Some("NS.Mapper"));
+            let callback = annotation.resolved_callback().unwrap();
+            assert_eq!(callback.name(), definition.name());
+            assert_eq!(callback.range(), definition.range());
+            assert!(callback.template_parameters().is_empty());
+            assert_eq!(callback.parameters()[0].name(), "value");
+            assert_eq!(
+                callback.parameters()[0].range(),
+                definition.parameters()[0].range(),
+            );
+            assert_eq!(
+                callback.parameters()[0].type_().unwrap().range(),
+                definition.parameters()[0].type_().unwrap().range(),
+            );
+            assert_eq!(
+                callback.return_type().unwrap().range(),
+                definition.return_type().unwrap().range(),
+            );
+
+            let before = (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().signature_len(),
+            );
+            preflight_planned_jsdoc_type(context.store(), &globals, options, annotation).unwrap();
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().signature_len(),
+                ),
+                before,
+            );
+
+            let signature = resolve_planned_jsdoc_callback_signature(
+                context.store_mut_for_test(),
+                &globals,
+                options,
+                callback,
+                &[],
+            )
+            .unwrap();
+            assert_eq!(signature.parameters()[0].type_(), Some(expected_parameter));
+            assert_eq!(signature.return_type(), Some(expected_return));
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().signature_len(),
+                ),
+                before,
+            );
+        }
+    }
+
+    #[test]
+    fn generic_callback_arguments_expand_nested_generic_typedefs() {
+        let javascript = parse_javascript_source_file(concat!(
+            "/** @template T @typedef {T[]} NS.List */\n",
+            "/**\n",
+            " * @template T\n",
+            " * @callback NS.Mapper\n",
+            " * @param {T} value\n",
+            " * @returns {NS.List<T>}\n",
+            " */\n",
+            "/** @type {NS.Mapper<NS.List<string>>} */\n",
+            "const mapper = value => [value];",
+        ));
+        assert!(
+            javascript.diagnostics.is_empty(),
+            "{:?}",
+            javascript.diagnostics
+        );
+        let root = NodeRef::new(
+            javascript.arena.id(),
+            FileId::new(107),
+            javascript.source_file,
+        );
+        let plan = plan_javascript_source_jsdoc(&javascript.arena, root).unwrap();
+        assert!(plan.diagnostics().is_empty(), "{:?}", plan.diagnostics());
+        let [declaration] = plan.declarations() else {
+            panic!("expected one generic callback and typedef consumer")
+        };
+        let annotation = declaration.type_().unwrap();
+        assert_eq!(annotation.resolved_alias_name(), Some("NS.Mapper"));
+        let callback = annotation.resolved_callback().unwrap();
+
+        let parsed = parse_source_file(concat!(
+            "interface Array<T> {} ",
+            "interface ReadonlyArray<T> {} ",
+            "const marker = 1;",
+        ));
+        let options = CanonicalCheckerOptions::default();
+        let mut context = context(&parsed, options);
+        let globals = context.global_types().clone();
+        let before = context.store().type_len();
+        preflight_planned_jsdoc_type(context.store(), &globals, options, annotation).unwrap();
+        assert_eq!(context.store().type_len(), before);
+
+        let signature = resolve_planned_jsdoc_callback_signature(
+            context.store_mut_for_test(),
+            &globals,
+            options,
+            callback,
+            &[],
+        )
+        .unwrap();
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let strings = context
+            .store_mut_for_test()
+            .create_canonical_array_type(&globals, string, false)
+            .unwrap();
+        let nested = context
+            .store_mut_for_test()
+            .create_canonical_array_type(&globals, strings, false)
+            .unwrap();
+        assert_eq!(signature.parameters()[0].type_(), Some(strings));
+        assert_eq!(signature.return_type(), Some(nested));
+
+        let warm = context.store().type_len();
+        assert_eq!(
+            resolve_planned_jsdoc_callback_signature(
+                context.store_mut_for_test(),
+                &globals,
+                options,
+                callback,
+                &[],
+            ),
+            Ok(signature),
+        );
+        assert_eq!(context.store().type_len(), warm);
+    }
+
+    #[test]
+    fn invalid_generic_callback_definitions_fail_before_checker_allocations() {
+        for source in [
+            concat!(
+                "/** @template {string} T\n",
+                " * @callback Mapper\n",
+                " * @param {T} value\n",
+                " * @returns {T}\n",
+                " */\n",
+                "/** @type {Mapper<number>} */ var value;",
+            ),
+            concat!(
+                "/** @template T\n",
+                " * @callback Mapper\n",
+                " * @param {T} value\n",
+                " * @returns {T}\n",
+                " */\n",
+                "/** @type {Mapper<string, number>} */ var value;",
+            ),
+            concat!(
+                "/** @template T, U\n",
+                " * @callback Mapper\n",
+                " * @param {T} value\n",
+                " * @returns {U}\n",
+                " */\n",
+                "/** @type {Mapper<string>} */ var value;",
+            ),
+            concat!(
+                "/** @template T, T\n",
+                " * @callback Mapper\n",
+                " * @param {T} value\n",
+                " * @returns {T}\n",
+                " */\n",
+                "/** @type {Mapper<string, string>} */ var value;",
+            ),
+            concat!(
+                "/** @template T\n",
+                " * @callback Mapper\n",
+                " * @param {Mapper<T>} value\n",
+                " * @returns {T}\n",
+                " */\n",
+                "/** @type {Mapper<string>} */ var value;",
+            ),
+            concat!(
+                "/** @template T\n",
+                " * @callback Mapper\n",
+                " * @this {object}\n",
+                " * @param {T} value\n",
+                " * @returns {T}\n",
+                " */\n",
+                "/** @type {Mapper<string>} */ var value;",
+            ),
+            concat!(
+                "/** @template T @typedef {T} Mapper */\n",
+                "/** @template T\n",
+                " * @callback Mapper\n",
+                " * @param {T} value\n",
+                " * @returns {T}\n",
+                " */\n",
+                "/** @type {Mapper<string>} */ var value;",
+            ),
+            concat!(
+                "/** @template T\n",
+                " * @callback Mapper\n",
+                " * @param {T} value\n",
+                " * @returns {T}\n",
+                " */\n",
+                "/** @template U\n",
+                " * @callback Mapper\n",
+                " * @param {U} value\n",
+                " * @returns {U}\n",
+                " */\n",
+                "/** @type {Mapper<string>} */ var value;",
+            ),
+        ] {
+            let javascript = parse_javascript_source_file(source);
+            assert!(
+                javascript.diagnostics.is_empty(),
+                "{source}: {:?}",
+                javascript.diagnostics,
+            );
+            let root = NodeRef::new(
+                javascript.arena.id(),
+                FileId::new(108),
+                javascript.source_file,
+            );
+            let plan = plan_javascript_source_jsdoc(&javascript.arena, root).unwrap();
+            let annotation = plan
+                .declarations()
+                .iter()
+                .find_map(PlannedJavaScriptDeclaration::type_)
+                .unwrap();
+            assert!(annotation.resolved_callback().is_none(), "{source}");
+
+            let parsed = parse_source_file("const marker = 1;");
+            let options = CanonicalCheckerOptions::default();
+            let mut context = context(&parsed, options);
+            let globals = context.global_types().clone();
+            let before = (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().signature_len(),
+            );
+            let expected = JsDocTypeResolutionError::UnsupportedType {
+                kind: SyntaxKind::TypeReference,
+                range: annotation.range(),
+            };
+            assert_eq!(
+                preflight_planned_jsdoc_type(context.store(), &globals, options, annotation),
+                Err(expected.clone()),
+                "{source}",
+            );
+            assert_eq!(
+                resolve_planned_jsdoc_type(
+                    context.store_mut_for_test(),
+                    &globals,
+                    options,
+                    annotation,
+                ),
+                Err(expected),
+                "{source}",
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().signature_len(),
+                ),
+                before,
+                "{source}",
+            );
+        }
+    }
+
+    #[test]
+    fn forged_generic_callback_signatures_stay_rejected_without_allocations() {
+        let javascript = parse_javascript_source_file(concat!(
+            "/** @template T\n",
+            " * @callback Mapper\n",
+            " * @param {T} value\n",
+            " * @returns {T}\n",
+            " */\n",
+            "/** @type {Mapper<string>} */ var value;",
+        ));
+        let root = NodeRef::new(
+            javascript.arena.id(),
+            FileId::new(109),
+            javascript.source_file,
+        );
+        let plan = plan_javascript_source_jsdoc(&javascript.arena, root).unwrap();
+        let [declaration] = plan.declarations() else {
+            panic!("expected one generic callback consumer")
+        };
+        let annotation = declaration.type_().unwrap();
+        let definition = &declaration.callbacks()[0];
+
+        let parsed = parse_source_file("const marker = 1;");
+        let options = CanonicalCheckerOptions::default();
+        let mut context = context(&parsed, options);
+        let globals = context.global_types().clone();
+        for corruption in 0..2 {
+            let mut forged = annotation.clone();
+            let Some(JsDocType::Callback(callback)) = forged.resolved_type.as_deref_mut() else {
+                panic!("expected one instantiated callback signature")
+            };
+            match corruption {
+                0 => callback.template_parameters = definition.template_parameters.clone(),
+                1 => callback.this_type = callback.return_type.clone(),
+                _ => unreachable!(),
+            }
+            let before = (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().signature_len(),
+            );
+            let expected = JsDocTypeResolutionError::UnsupportedType {
+                kind: SyntaxKind::FunctionType,
+                range: forged.range(),
+            };
+            assert_eq!(
+                preflight_planned_jsdoc_type(context.store(), &globals, options, &forged),
+                Err(expected.clone()),
+            );
+            assert_eq!(
+                resolve_planned_jsdoc_type(
+                    context.store_mut_for_test(),
+                    &globals,
+                    options,
+                    &forged,
+                ),
+                Err(expected),
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().signature_len(),
+                ),
+                before,
+            );
+        }
     }
 
     #[test]
@@ -6520,6 +7749,136 @@ mod tests {
             assert!(resolved.parameters[1].rest);
             assert_eq!(resolved.parameters[1].array_rest, array_rest);
             assert_eq!(resolved.return_type, bootstrap.void_type);
+        }
+    }
+
+    #[test]
+    fn generic_jsdoc_heritage_preserves_exact_ts8023_ranges_and_matching_bases() {
+        let source = concat!(
+            "/** @extends {React.Component<React.Component>} */\n",
+            "class First extends React.PureComponent {}\n",
+            "/** @augments {(React.Component<string>)} */\n",
+            "class Second extends React.PureComponent {}\n",
+            "/** @extends {React.Component<string>} */\n",
+            "class Third extends React.Component {}\n",
+            "/** @augments {(React.Component<number>)} */\n",
+            "class Fourth extends React.Component {}",
+        );
+        let javascript = parse_javascript_source_file(source);
+        assert!(
+            javascript.diagnostics.is_empty(),
+            "{:?}",
+            javascript.diagnostics
+        );
+        let root = NodeRef::new(
+            javascript.arena.id(),
+            FileId::new(110),
+            javascript.source_file,
+        );
+        let plan = plan_javascript_source_jsdoc(&javascript.arena, root).unwrap();
+        assert_eq!(plan.declarations().len(), 4);
+        let [first, second] = plan.diagnostics() else {
+            panic!("expected only two mismatched generic superclass diagnostics")
+        };
+
+        let first_start = source.find("React.Component<React.Component>").unwrap() + "React.".len();
+        let second_start =
+            source.find("(React.Component<string>)").unwrap() + "(".len() + "React.".len();
+        for (diagnostic, tag, start) in [
+            (first, "extends", first_start),
+            (second, "augments", second_start),
+        ] {
+            assert_eq!(diagnostic.diagnostic.code(), 8023);
+            assert_eq!(
+                diagnostic.diagnostic.arguments,
+                [tag, "Component", "PureComponent"],
+            );
+            assert_eq!(
+                diagnostic.diagnostic.render().unwrap(),
+                format!(
+                    "JSDoc '@{tag} Component' does not match the 'extends PureComponent' clause."
+                ),
+            );
+            let range = diagnostic.range_override.unwrap().range();
+            assert_eq!(range.start.get() as usize, start);
+            assert_eq!(range.end.get() as usize, start + "Component".len());
+        }
+    }
+
+    #[test]
+    fn implements_tags_stay_separate_from_generic_superclass_annotations() {
+        let source = concat!(
+            "/**\n",
+            " * @implements {Contracts.Readable<string>}\n",
+            " * @extends {React.Component<string>}\n",
+            " * @implements Contracts.Writable\n",
+            " */\n",
+            "class Reader extends React.Component {}",
+        );
+        let javascript = parse_javascript_source_file(source);
+        assert!(
+            javascript.diagnostics.is_empty(),
+            "{:?}",
+            javascript.diagnostics
+        );
+        let root = NodeRef::new(
+            javascript.arena.id(),
+            FileId::new(111),
+            javascript.source_file,
+        );
+        let plan = plan_javascript_source_jsdoc(&javascript.arena, root).unwrap();
+        assert!(plan.diagnostics().is_empty(), "{:?}", plan.diagnostics());
+        let [declaration] = plan.declarations() else {
+            panic!("expected one class with separate heritage annotations")
+        };
+        assert_eq!(
+            declaration.augments_type().unwrap().type_(),
+            &JsDocType::GenericReference {
+                name: "React.Component".to_owned(),
+                arguments: vec![JsDocType::Intrinsic(JsDocIntrinsicType::String)],
+            },
+        );
+        let [readable, writable] = declaration.implements_types() else {
+            panic!("expected both ordered interface annotations")
+        };
+        assert_eq!(
+            readable.type_(),
+            &JsDocType::GenericReference {
+                name: "Contracts.Readable".to_owned(),
+                arguments: vec![JsDocType::Intrinsic(JsDocIntrinsicType::String)],
+            },
+        );
+        assert_eq!(
+            writable.type_(),
+            &JsDocType::Named("Contracts.Writable".to_owned()),
+        );
+    }
+
+    #[test]
+    fn empty_jsdoc_class_heritage_does_not_fabricate_superclass_mismatches() {
+        let source = concat!(
+            "/** @augments X */\nclass First extends {}\n",
+            "/** @extends X */\nclass Second extends {}",
+        );
+        let javascript = parse_javascript_source_file(source);
+        assert!(
+            javascript.diagnostics.is_empty(),
+            "{:?}",
+            javascript.diagnostics
+        );
+        let root = NodeRef::new(
+            javascript.arena.id(),
+            FileId::new(112),
+            javascript.source_file,
+        );
+        let plan = plan_javascript_source_jsdoc(&javascript.arena, root).unwrap();
+        assert!(plan.diagnostics().is_empty(), "{:?}", plan.diagnostics());
+        assert_eq!(plan.declarations().len(), 2);
+        for declaration in plan.declarations() {
+            assert_eq!(
+                declaration.augments_type().unwrap().type_(),
+                &JsDocType::Named("X".to_owned()),
+            );
         }
     }
 }

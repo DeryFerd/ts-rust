@@ -6386,10 +6386,19 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         let signature_links_cold = self
             .signature_links(prepared.declaration)
             .is_none_or(|links| links == &SignatureLinks::default());
+        let source_family_matches = matches!(
+            (prepared.family, self.source_node_kind(prepared.declaration)),
+            (
+                SourceCallableFamily::FunctionDeclaration,
+                Some(SyntaxKind::FunctionDeclaration)
+            ) | (
+                SourceCallableFamily::ArrowFunction,
+                Some(SyntaxKind::ArrowFunction)
+            )
+        );
         if prepared.type_parameters.is_empty()
-            || prepared.family != SourceCallableFamily::FunctionDeclaration
             || prepared.syntax.declaration() != prepared.declaration
-            || self.source_node_kind(prepared.declaration) != Some(SyntaxKind::FunctionDeclaration)
+            || !source_family_matches
             || prepared.flags != SignatureFlags::NONE
             || !minimum_argument_count_valid
             || !owner_valid
