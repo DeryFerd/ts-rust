@@ -46,6 +46,7 @@
 //! variable exports to its static member table.
 //! Class namespace augmentations preserve private static visibility and reject
 //! unqualified references to class members.
+//! Inherited arrow fields retain exact inaccessible `super` property diagnostics.
 //! A class may extend the literal `null` without acquiring an instance base.
 //! An authenticated class/interface merge with `extends null` and `super()`
 //! retains its exact static-side and constructor diagnostics without publication.
@@ -11479,6 +11480,603 @@ fn plan_class_field_variance_modifier_diagnostics(
     Some(diagnostics)
 }
 
+fn plan_super_inaccessible_arrow_field(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    declaration: NodeRef,
+    field: NodeRef,
+) -> Option<(String, SemanticSymbolId)> {
+    let record = preflight_node(store, host, field).ok()?;
+    let NodeData::PropertyDeclaration(property) = &record.data else {
+        return None;
+    };
+    let name = NodeRef::new(field.arena, field.file, property.name);
+    let name_record = preflight_node(store, host, name).ok()?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return None;
+    };
+    let arrow = NodeRef::new(field.arena, field.file, property.initializer?);
+    let arrow_record = preflight_node(store, host, arrow).ok()?;
+    let NodeData::ArrowFunction(arrow_data) = &arrow_record.data else {
+        return None;
+    };
+    let token = NodeRef::new(
+        arrow.arena,
+        arrow.file,
+        arrow_data.equals_greater_than_token,
+    );
+    let token_record = preflight_node(store, host, token).ok()?;
+    let body = NodeRef::new(arrow.arena, arrow.file, arrow_data.body);
+    let body_record = preflight_node(store, host, body).ok()?;
+    let NodeData::Block(block) = &body_record.data else {
+        return None;
+    };
+    let symbol = bound_symbol(store, host, field)?;
+    let symbol_record = store.symbol(symbol)?;
+    let members = store
+        .symbol(owner)
+        .and_then(Symbol::members)
+        .and_then(|members| store.symbol_table(members))?;
+    let arrow_symbol = bound_symbol(store, host, arrow)?;
+    let arrow_owner = store.symbol(arrow_symbol)?;
+    if record.kind != SyntaxKind::PropertyDeclaration
+        || record.flags.0 != 0
+        || record.parent != Some(declaration.node)
+        || property.postfix_token.is_some()
+        || property.symbol.is_some()
+        || property.type_.is_some()
+        || property.facts != 0
+        || property.modifiers.is_some()
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(field.node)
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+        || arrow_record.kind != SyntaxKind::ArrowFunction
+        || arrow_record.flags.0 != 0
+        || arrow_record.parent != Some(field.node)
+        || arrow_record.range.start < name_record.range.end
+        || arrow_data.asterisk_token.is_some()
+        || arrow_data.end_flow_node.is_some()
+        || arrow_data.flow_node.is_some()
+        || arrow_data.full_signature.is_some()
+        || arrow_data.next_container.is_some()
+        || arrow_data.symbol.is_some()
+        || arrow_data.type_.is_some()
+        || arrow_data.type_parameters.is_some()
+        || arrow_data.facts != 0
+        || arrow_data.modifiers.is_some()
+        || arrow_data.parameters.has_trailing_comma
+        || !arrow_data.parameters.nodes.is_empty()
+        || token_record.kind != SyntaxKind::EqualsGreaterThanToken
+        || token_record.flags.0 != 0
+        || token_record.parent != Some(arrow.node)
+        || !matches!(token_record.data, NodeData::Token(_))
+        || body_record.kind != SyntaxKind::Block
+        || body_record.flags.0 != 0
+        || body_record.parent != Some(arrow.node)
+        || body_record.range.start < token_record.range.end
+        || block.flow_node.is_some()
+        || block.next_container.is_some()
+        || block.facts != 0
+        || block.statements.has_trailing_comma
+        || !block.statements.nodes.is_empty()
+        || symbol_record.flags() != SymbolFlags::PROPERTY
+        || symbol_record.check_flags() != CheckFlags::NONE
+        || symbol_record.name().as_utf8() != Some(identifier.text.as_str())
+        || symbol_record.declarations() != Some(&[field])
+        || symbol_record.value_declaration() != Some(field)
+        || symbol_record.members().is_some()
+        || symbol_record.exports().is_some()
+        || symbol_record.parent() != Some(owner)
+        || symbol_record.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || members.len() != 1
+        || members.get_source(&identifier.text) != Some(symbol)
+        || arrow_symbol == symbol
+        || arrow_owner.flags() != SymbolFlags::FUNCTION
+        || arrow_owner.check_flags() != CheckFlags::NONE
+        || arrow_owner.name() != InternalSymbolName::Function.as_ref()
+        || arrow_owner.declarations() != Some(&[arrow])
+        || arrow_owner.value_declaration() != Some(arrow)
+        || arrow_owner.members().is_some()
+        || arrow_owner.exports().is_some()
+        || arrow_owner.parent().is_some()
+        || arrow_owner.export_symbol().is_some()
+        || store.get_merged_symbol(arrow_symbol) != Some(arrow_symbol)
+        || store
+            .value_symbol_links(symbol)
+            .is_some_and(|links| links != &ValueSymbolLinks::default())
+        || store
+            .value_symbol_links(arrow_symbol)
+            .is_some_and(|links| links != &ValueSymbolLinks::default())
+        || store
+            .type_node_links(arrow)
+            .is_some_and(|links| links != &TypeNodeLinks::default())
+        || store
+            .signature_links(arrow)
+            .is_some_and(|links| links != &SignatureLinks::default())
+        || store.source_callable_type_for_owner(arrow_symbol).is_some()
+        || store.source_callable_type_for_declaration(arrow).is_some()
+    {
+        return None;
+    }
+    Some((identifier.text.clone(), symbol))
+}
+
+fn plan_super_inaccessible_derived_method(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    base: (SemanticSymbolId, &str),
+    declaration: NodeRef,
+    field: (&str, SemanticSymbolId),
+) -> Option<(SemanticSymbolId, SemanticSymbolId, String, NodeRef)> {
+    let (base_symbol, base_name) = base;
+    let (field_name, field_symbol) = field;
+    let record = preflight_node(store, host, declaration).ok()?;
+    let NodeData::ClassDeclaration(class) = &record.data else {
+        return None;
+    };
+    let name = NodeRef::new(declaration.arena, declaration.file, class.name?);
+    let name_record = preflight_node(store, host, name).ok()?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return None;
+    };
+    let symbol = bound_symbol(store, host, declaration)?;
+    let owner = store.symbol(symbol)?;
+    let exports = owner.exports()?;
+    validate_prototype(store, symbol, exports).ok()?;
+    let members = owner
+        .members()
+        .and_then(|members| store.symbol_table(members))?;
+    let heritage = class.heritage_clauses.as_ref()?;
+    let [clause] = heritage.nodes.as_slice() else {
+        return None;
+    };
+    let clause = NodeRef::new(declaration.arena, declaration.file, *clause);
+    let clause_record = preflight_node(store, host, clause).ok()?;
+    let NodeData::HeritageClause(clause_data) = &clause_record.data else {
+        return None;
+    };
+    let [heritage_type] = clause_data.types.nodes.as_slice() else {
+        return None;
+    };
+    let heritage_type = NodeRef::new(clause.arena, clause.file, *heritage_type);
+    let heritage_record = preflight_node(store, host, heritage_type).ok()?;
+    let NodeData::ExpressionWithTypeArguments(heritage_data) = &heritage_record.data else {
+        return None;
+    };
+    let base_reference = NodeRef::new(
+        heritage_type.arena,
+        heritage_type.file,
+        heritage_data.expression,
+    );
+    let base_record = preflight_node(store, host, base_reference).ok()?;
+    let NodeData::Identifier(base_identifier) = &base_record.data else {
+        return None;
+    };
+    let [method] = class.members.nodes.as_slice() else {
+        return None;
+    };
+    let method = NodeRef::new(declaration.arena, declaration.file, *method);
+    let method_record = preflight_node(store, host, method).ok()?;
+    let NodeData::MethodDeclaration(method_data) = &method_record.data else {
+        return None;
+    };
+    let method_name = NodeRef::new(method.arena, method.file, method_data.name);
+    let method_name_record = preflight_node(store, host, method_name).ok()?;
+    let NodeData::Identifier(method_identifier) = &method_name_record.data else {
+        return None;
+    };
+    let method_symbol = bound_symbol(store, host, method)?;
+    let method_owner = store.symbol(method_symbol)?;
+    let body = NodeRef::new(method.arena, method.file, method_data.body?);
+    let body_record = preflight_node(store, host, body).ok()?;
+    let NodeData::Block(block) = &body_record.data else {
+        return None;
+    };
+    let [statement] = block.statements.nodes.as_slice() else {
+        return None;
+    };
+    let statement = NodeRef::new(body.arena, body.file, *statement);
+    let statement_record = preflight_node(store, host, statement).ok()?;
+    let NodeData::ExpressionStatement(expression) = &statement_record.data else {
+        return None;
+    };
+    let call = NodeRef::new(statement.arena, statement.file, expression.expression);
+    let call_record = preflight_node(store, host, call).ok()?;
+    let NodeData::CallExpression(call_data) = &call_record.data else {
+        return None;
+    };
+    let access = NodeRef::new(call.arena, call.file, call_data.expression);
+    let access_record = preflight_node(store, host, access).ok()?;
+    let NodeData::PropertyAccessExpression(access_data) = &access_record.data else {
+        return None;
+    };
+    let receiver = NodeRef::new(access.arena, access.file, access_data.expression);
+    let receiver_record = preflight_node(store, host, receiver).ok()?;
+    let NodeData::KeywordExpression(keyword) = &receiver_record.data else {
+        return None;
+    };
+    let property = NodeRef::new(access.arena, access.file, access_data.name);
+    let property_record = preflight_node(store, host, property).ok()?;
+    let NodeData::Identifier(property_identifier) = &property_record.data else {
+        return None;
+    };
+    let bound = host.bound_file(declaration)?;
+    if record.kind != SyntaxKind::ClassDeclaration
+        || record.flags.0 != 0
+        || record.parent != Some(bound.source_file().node)
+        || class.flow_node.is_some()
+        || class.local_symbol.is_some()
+        || class.symbol.is_some()
+        || class.next_container.is_some()
+        || class.facts != 0
+        || class.modifiers.is_some()
+        || class.type_parameters.is_some()
+        || class.members.has_trailing_comma
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(declaration.node)
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+        || owner.flags() != SymbolFlags::CLASS
+        || owner.check_flags() != CheckFlags::NONE
+        || owner.name().as_utf8() != Some(identifier.text.as_str())
+        || owner.declarations() != Some(&[declaration])
+        || owner.value_declaration() != Some(declaration)
+        || owner.parent().is_some()
+        || owner.export_symbol().is_some()
+        || symbol == base_symbol
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || store.symbol_table(exports)?.len() != 1
+        || members.len() != 1
+        || heritage.has_trailing_comma
+        || clause_record.kind != SyntaxKind::HeritageClause
+        || clause_record.flags.0 != 0
+        || clause_record.parent != Some(declaration.node)
+        || clause_data.token != SyntaxKind::ExtendsKeyword
+        || clause_data.facts != 0
+        || clause_data.types.has_trailing_comma
+        || heritage_record.kind != SyntaxKind::ExpressionWithTypeArguments
+        || heritage_record.flags.0 != 0
+        || heritage_record.parent != Some(clause.node)
+        || heritage_data.type_arguments.is_some()
+        || heritage_data.facts != 0
+        || base_record.kind != SyntaxKind::Identifier
+        || base_record.flags.0 != 0
+        || base_record.parent != Some(heritage_type.node)
+        || base_identifier.flow_node.is_some()
+        || base_identifier.text != base_name
+        || bound
+            .locals(bound.source_file())
+            .and_then(|locals| store.symbol_table(locals))
+            .and_then(|locals| locals.get_source(base_name))
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            != Some(base_symbol)
+        || method_record.kind != SyntaxKind::MethodDeclaration
+        || method_record.flags.0 != 0
+        || method_record.parent != Some(declaration.node)
+        || method_data.asterisk_token.is_some()
+        || method_data.end_flow_node.is_some()
+        || method_data.flow_node.is_some()
+        || method_data.full_signature.is_some()
+        || method_data.next_container.is_some()
+        || method_data.postfix_token.is_some()
+        || method_data.symbol.is_some()
+        || method_data.type_.is_some()
+        || method_data.type_parameters.is_some()
+        || method_data.facts != 0
+        || method_data.modifiers.is_some()
+        || method_data.parameters.has_trailing_comma
+        || !method_data.parameters.nodes.is_empty()
+        || method_name_record.kind != SyntaxKind::Identifier
+        || method_name_record.flags.0 != 0
+        || method_name_record.parent != Some(method.node)
+        || method_identifier.flow_node.is_some()
+        || method_identifier.text.is_empty()
+        || method_owner.flags() != SymbolFlags::METHOD
+        || method_owner.check_flags() != CheckFlags::NONE
+        || method_owner.name().as_utf8() != Some(method_identifier.text.as_str())
+        || method_owner.declarations() != Some(&[method])
+        || method_owner.value_declaration() != Some(method)
+        || method_owner.members().is_some()
+        || method_owner.exports().is_some()
+        || method_owner.parent() != Some(symbol)
+        || method_owner.export_symbol().is_some()
+        || store.get_merged_symbol(method_symbol) != Some(method_symbol)
+        || members.get_source(&method_identifier.text) != Some(method_symbol)
+        || body_record.kind != SyntaxKind::Block
+        || body_record.flags.0 != 0
+        || body_record.parent != Some(method.node)
+        || block.flow_node.is_some()
+        || block.next_container.is_some()
+        || block.facts != 0
+        || block.statements.has_trailing_comma
+        || statement_record.kind != SyntaxKind::ExpressionStatement
+        || statement_record.flags.0 != 0
+        || statement_record.parent != Some(body.node)
+        || expression.flow_node.is_some()
+        || call_record.kind != SyntaxKind::CallExpression
+        || call_record.flags.0 != 0
+        || call_record.parent != Some(statement.node)
+        || call_data.question_dot_token.is_some()
+        || call_data.symbol.is_some()
+        || call_data.type_arguments.is_some()
+        || call_data.facts != 0
+        || call_data.arguments.has_trailing_comma
+        || !call_data.arguments.nodes.is_empty()
+        || access_record.kind != SyntaxKind::PropertyAccessExpression
+        || access_record.flags.0 != 0
+        || access_record.parent != Some(call.node)
+        || access_data.flow_node.is_some()
+        || access_data.question_dot_token.is_some()
+        || access_data.facts != 0
+        || receiver_record.kind != SyntaxKind::SuperKeyword
+        || receiver_record.flags.0 != 0
+        || receiver_record.parent != Some(access.node)
+        || keyword.flow_node.is_some()
+        || property_record.kind != SyntaxKind::Identifier
+        || property_record.flags.0 != 0
+        || property_record.parent != Some(access.node)
+        || property_identifier.flow_node.is_some()
+        || property_identifier.text != field_name
+        || store
+            .symbol(base_symbol)
+            .and_then(Symbol::members)
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get_source(field_name))
+            != Some(field_symbol)
+        || store
+            .declared_type_links(symbol)
+            .is_some_and(|links| links.declared_type.is_some())
+        || store
+            .value_symbol_links(symbol)
+            .is_some_and(|links| links != &ValueSymbolLinks::default())
+        || store
+            .value_symbol_links(method_symbol)
+            .is_some_and(|links| links != &ValueSymbolLinks::default())
+        || [method, call].iter().any(|node| {
+            store
+                .signature_links(*node)
+                .is_some_and(|links| links != &SignatureLinks::default())
+        })
+        || [base_reference, call, access, receiver, property]
+            .iter()
+            .any(|node| {
+                store
+                    .type_node_links(*node)
+                    .is_some_and(|links| links != &TypeNodeLinks::default())
+                    || store
+                        .symbol_node_links(*node)
+                        .is_some_and(|links| links != &SymbolNodeLinks::default())
+            })
+    {
+        return None;
+    }
+    Some((
+        symbol,
+        method_symbol,
+        method_identifier.text.clone(),
+        property,
+    ))
+}
+
+fn plan_super_inaccessible_invocation(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    statement: NodeRef,
+    derived: (SemanticSymbolId, &str),
+    method: (SemanticSymbolId, &str),
+) -> Option<()> {
+    let (derived_symbol, derived_name) = derived;
+    let (method_symbol, method_name) = method;
+    let statement_record = preflight_node(store, host, statement).ok()?;
+    let NodeData::ExpressionStatement(expression) = &statement_record.data else {
+        return None;
+    };
+    let call = NodeRef::new(statement.arena, statement.file, expression.expression);
+    let call_record = preflight_node(store, host, call).ok()?;
+    let NodeData::CallExpression(call_data) = &call_record.data else {
+        return None;
+    };
+    let access = NodeRef::new(call.arena, call.file, call_data.expression);
+    let access_record = preflight_node(store, host, access).ok()?;
+    let NodeData::PropertyAccessExpression(access_data) = &access_record.data else {
+        return None;
+    };
+    let construction = NodeRef::new(access.arena, access.file, access_data.expression);
+    let construction_record = preflight_node(store, host, construction).ok()?;
+    let NodeData::NewExpression(new_data) = &construction_record.data else {
+        return None;
+    };
+    let constructor = NodeRef::new(construction.arena, construction.file, new_data.expression);
+    let constructor_record = preflight_node(store, host, constructor).ok()?;
+    let NodeData::Identifier(constructor_name) = &constructor_record.data else {
+        return None;
+    };
+    let property = NodeRef::new(access.arena, access.file, access_data.name);
+    let property_record = preflight_node(store, host, property).ok()?;
+    let NodeData::Identifier(property_name) = &property_record.data else {
+        return None;
+    };
+    let arguments = new_data.arguments.as_ref()?;
+    let bound = host.bound_file(statement)?;
+    (statement_record.kind == SyntaxKind::ExpressionStatement
+        && statement_record.flags.0 == 0
+        && statement_record.parent == Some(bound.source_file().node)
+        && expression.flow_node.is_none()
+        && call_record.kind == SyntaxKind::CallExpression
+        && call_record.flags.0 == 0
+        && call_record.parent == Some(statement.node)
+        && call_data.question_dot_token.is_none()
+        && call_data.symbol.is_none()
+        && call_data.type_arguments.is_none()
+        && call_data.facts == 0
+        && !call_data.arguments.has_trailing_comma
+        && call_data.arguments.nodes.is_empty()
+        && access_record.kind == SyntaxKind::PropertyAccessExpression
+        && access_record.flags.0 == 0
+        && access_record.parent == Some(call.node)
+        && access_data.flow_node.is_none()
+        && access_data.question_dot_token.is_none()
+        && access_data.facts == 0
+        && construction_record.kind == SyntaxKind::NewExpression
+        && construction_record.flags.0 == 0
+        && construction_record.parent == Some(access.node)
+        && new_data.type_arguments.is_none()
+        && new_data.facts == 0
+        && !arguments.has_trailing_comma
+        && arguments.nodes.is_empty()
+        && constructor_record.kind == SyntaxKind::Identifier
+        && constructor_record.flags.0 == 0
+        && constructor_record.parent == Some(construction.node)
+        && constructor_name.flow_node.is_none()
+        && constructor_name.text == derived_name
+        && property_record.kind == SyntaxKind::Identifier
+        && property_record.flags.0 == 0
+        && property_record.parent == Some(access.node)
+        && property_name.flow_node.is_none()
+        && property_name.text == method_name
+        && bound
+            .locals(bound.source_file())
+            .and_then(|locals| store.symbol_table(locals))
+            .and_then(|locals| locals.get_source(derived_name))
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            == Some(derived_symbol)
+        && store
+            .symbol(derived_symbol)
+            .and_then(Symbol::members)
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get_source(method_name))
+            == Some(method_symbol)
+        && [call, construction].iter().all(|node| {
+            store
+                .signature_links(*node)
+                .is_none_or(|links| links == &SignatureLinks::default())
+        })
+        && [call, access, construction, constructor, property]
+            .iter()
+            .all(|node| {
+                store
+                    .type_node_links(*node)
+                    .is_none_or(|links| links == &TypeNodeLinks::default())
+                    && store
+                        .symbol_node_links(*node)
+                        .is_none_or(|links| links == &SymbolNodeLinks::default())
+            }))
+    .then_some(())
+}
+
+fn plan_super_inaccessible_field_grammar_diagnostics(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+) -> Option<ClassGrammarDiagnosticPlan> {
+    if store.get_merged_symbol(symbol)? != symbol {
+        return None;
+    }
+    let owner = store.symbol(symbol)?;
+    let [declaration] = owner.declarations()? else {
+        return None;
+    };
+    let declaration = *declaration;
+    let record = preflight_node(store, host, declaration).ok()?;
+    let NodeData::ClassDeclaration(class) = &record.data else {
+        return None;
+    };
+    let parent = NodeRef::new(declaration.arena, declaration.file, record.parent?);
+    let parent_record = preflight_node(store, host, parent).ok()?;
+    let NodeData::SourceFile(source) = &parent_record.data else {
+        return None;
+    };
+    let [base, derived, invocation] = source.statements.nodes.as_slice() else {
+        return None;
+    };
+    if *base != declaration.node {
+        return None;
+    }
+    let derived = NodeRef::new(parent.arena, parent.file, *derived);
+    let invocation = NodeRef::new(parent.arena, parent.file, *invocation);
+    let name = NodeRef::new(declaration.arena, declaration.file, class.name?);
+    let name_record = preflight_node(store, host, name).ok()?;
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return None;
+    };
+    let [field] = class.members.nodes.as_slice() else {
+        return None;
+    };
+    let field = NodeRef::new(declaration.arena, declaration.file, *field);
+    let exports = owner.exports()?;
+    validate_prototype(store, symbol, exports).ok()?;
+    if owner.flags() != SymbolFlags::CLASS
+        || owner.check_flags() != CheckFlags::NONE
+        || owner.name().as_utf8() != Some(identifier.text.as_str())
+        || owner.value_declaration() != Some(declaration)
+        || owner.parent().is_some()
+        || owner.export_symbol().is_some()
+        || store.symbol_table(exports)?.len() != 1
+        || record.kind != SyntaxKind::ClassDeclaration
+        || record.flags.0 != 0
+        || record.parent != Some(parent.node)
+        || class.flow_node.is_some()
+        || class.local_symbol.is_some()
+        || class.symbol.is_some()
+        || class.next_container.is_some()
+        || class.facts != 0
+        || class.modifiers.is_some()
+        || class.type_parameters.is_some()
+        || class.heritage_clauses.is_some()
+        || class.members.has_trailing_comma
+        || name_record.kind != SyntaxKind::Identifier
+        || name_record.flags.0 != 0
+        || name_record.parent != Some(declaration.node)
+        || identifier.flow_node.is_some()
+        || identifier.text.is_empty()
+        || parent_record.kind != SyntaxKind::SourceFile
+        || parent_record.parent.is_some()
+        || store
+            .declared_type_links(symbol)
+            .is_some_and(|links| links.declared_type.is_some())
+        || store
+            .value_symbol_links(symbol)
+            .is_some_and(|links| links != &ValueSymbolLinks::default())
+    {
+        return None;
+    }
+
+    let (field_name, field_symbol) =
+        plan_super_inaccessible_arrow_field(store, host, symbol, declaration, field)?;
+    let (derived_symbol, method_symbol, method_name, diagnostic) =
+        plan_super_inaccessible_derived_method(
+            store,
+            host,
+            (symbol, &identifier.text),
+            derived,
+            (&field_name, field_symbol),
+        )?;
+    let derived_name = store.symbol(derived_symbol)?.name().as_utf8()?;
+    plan_super_inaccessible_invocation(
+        store,
+        host,
+        invocation,
+        (derived_symbol, derived_name),
+        (method_symbol, &method_name),
+    )?;
+
+    Some(ClassGrammarDiagnosticPlan {
+        declaration,
+        symbol,
+        diagnostics: vec![ClassGrammarDiagnostic {
+            node: diagnostic,
+            range_override: None,
+            code: 2855,
+            arguments: vec![field_name],
+        }],
+    })
+}
+
 fn plan_clodule_static_member(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -11950,6 +12548,9 @@ pub(super) fn plan_class_grammar_diagnostics(
     symbol: SemanticSymbolId,
 ) -> Option<ClassGrammarDiagnosticPlan> {
     if let Some(plan) = plan_merged_null_base_class_grammar_diagnostics(store, host, symbol) {
+        return Some(plan);
+    }
+    if let Some(plan) = plan_super_inaccessible_field_grammar_diagnostics(store, host, symbol) {
         return Some(plan);
     }
     if let Some(plan) = plan_clodule_static_grammar_diagnostics(store, host, symbol) {
@@ -18419,6 +19020,210 @@ mod tests {
                 warm,
                 "{source}",
             );
+        }
+    }
+
+    #[test]
+    fn inherited_arrow_fields_preserve_exact_super_access_diagnostics() {
+        let source = concat!(
+            "class Base { field = () => {}; } ",
+            "class Derived extends Base { f() { super.field(); } } ",
+            "new Derived().f();",
+        );
+        let fixture = fixture(source);
+        let base = class_symbol(&fixture, "Base");
+        let derived = class_symbol(&fixture, "Derived");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let cold = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        let plan = plan_class_grammar_diagnostics(&fixture.store, &host, base)
+            .expect("the inherited field must retain its exact super-access diagnostic");
+
+        assert_eq!(plan.symbol, base);
+        assert_eq!(plan.declaration, class_node(&fixture, "Base"));
+        let [diagnostic] = plan.diagnostics.as_slice() else {
+            panic!("the inherited field must produce exactly one diagnostic")
+        };
+        assert_eq!(diagnostic.code, 2855);
+        assert_eq!(diagnostic.arguments, ["field"]);
+        let range = fixture
+            .parsed
+            .arena
+            .get(diagnostic.node.node)
+            .unwrap()
+            .range;
+        assert_eq!(
+            &source[range.start.get() as usize..range.end.get() as usize],
+            "field",
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            cold,
+        );
+        for symbol in [base, derived] {
+            assert!(fixture.store.declared_type_links(symbol).is_none());
+            assert!(fixture.store.value_symbol_links(symbol).is_none());
+        }
+    }
+
+    #[test]
+    fn inherited_super_field_diagnostics_reject_private_protected_and_unrelated_shapes() {
+        for source in [
+            concat!(
+                "class Base { private field = () => {}; } ",
+                "class Derived extends Base { f() { super.field(); } } ",
+                "new Derived().f();",
+            ),
+            concat!(
+                "class Base { protected field = () => {}; } ",
+                "class Derived extends Base { f() { super.field(); } } ",
+                "new Derived().f();",
+            ),
+            concat!(
+                "class Base { field() {} } ",
+                "class Derived extends Base { f() { super.field(); } } ",
+                "new Derived().f();",
+            ),
+            concat!(
+                "class Base { field = () => {}; } ",
+                "class Derived extends Base { f() { this.field(); } } ",
+                "new Derived().f();",
+            ),
+            concat!(
+                "class Base { field = () => {}; } ",
+                "class Derived extends Base { f() { super.field(1); } } ",
+                "new Derived().f();",
+            ),
+            concat!(
+                "class Base { field = () => {}; } ",
+                "class Derived extends Base { f() { super.field(); } } ",
+                "new Derived().other();",
+            ),
+            concat!(
+                "class Base { field = () => {}; } ",
+                "class Derived extends Base { f() { super.field(); } } ",
+                "new Derived(1).f();",
+            ),
+            concat!(
+                "class Base { field = () => {}; } ",
+                "class Derived extends Base { f() { super.field(); } }",
+            ),
+        ] {
+            let fixture = fixture(source);
+            let base = class_symbol(&fixture, "Base");
+            let bound = &fixture.files[&fixture.file];
+            let host = host(&fixture.parsed.arena, bound);
+            let cold = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            assert!(
+                plan_super_inaccessible_field_grammar_diagnostics(&fixture.store, &host, base)
+                    .is_none(),
+                "{source}",
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                cold,
+            );
+        }
+    }
+
+    #[test]
+    fn inherited_super_field_diagnostics_reject_forged_owners_and_caches() {
+        for poison in 0..3 {
+            let mut fixture = fixture(concat!(
+                "class Base { field = () => {}; } ",
+                "class Derived extends Base { f() { super.field(); } } ",
+                "new Derived().f();",
+            ));
+            let base = class_symbol(&fixture, "Base");
+            let derived = class_symbol(&fixture, "Derived");
+            let field = fixture
+                .store
+                .symbol(base)
+                .and_then(Symbol::members)
+                .and_then(|members| fixture.store.symbol_table(members))
+                .and_then(|members| members.get_source("field"))
+                .unwrap();
+            let diagnostic = {
+                let bound = &fixture.files[&fixture.file];
+                let host = host(&fixture.parsed.arena, bound);
+                plan_super_inaccessible_field_grammar_diagnostics(&fixture.store, &host, base)
+                    .unwrap()
+                    .diagnostics[0]
+                    .node
+            };
+            match poison {
+                0 => assert!(fixture.store.set_symbol_relationships(
+                    field,
+                    None,
+                    None,
+                    Some(derived),
+                    None,
+                )),
+                1 => {
+                    let wrong = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+                    assert!(fixture.store.set_value_symbol_links(
+                        field,
+                        ValueSymbolLinks {
+                            resolved_type: Some(wrong),
+                            ..ValueSymbolLinks::default()
+                        },
+                    ));
+                }
+                2 => {
+                    let wrong = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+                    assert!(fixture.store.set_type_node_links(
+                        diagnostic,
+                        TypeNodeLinks {
+                            resolved_type: Some(wrong),
+                            ..TypeNodeLinks::default()
+                        },
+                    ));
+                }
+                _ => unreachable!("only the declared owner and cache poison cases are visited"),
+            }
+            let bound = &fixture.files[&fixture.file];
+            let host = host(&fixture.parsed.arena, bound);
+            let before = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            assert!(
+                plan_super_inaccessible_field_grammar_diagnostics(&fixture.store, &host, base)
+                    .is_none(),
+                "poison case {poison}",
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                before,
+            );
+            for symbol in [base, derived] {
+                assert!(fixture.store.declared_type_links(symbol).is_none());
+                assert!(fixture.store.value_symbol_links(symbol).is_none());
+            }
         }
     }
 

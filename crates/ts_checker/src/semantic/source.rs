@@ -2169,9 +2169,12 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         let mut arrows = Vec::new();
         let mut contextual_arrows = Vec::new();
         let mut recovered_export_statements = HashSet::new();
+        let mut recovered_super_field_statements = HashSet::new();
         for (statement_index, &statement) in source_statements.iter().enumerate() {
             let statement = self.reference(statement);
-            if recovered_export_statements.remove(&statement) {
+            if recovered_export_statements.remove(&statement)
+                || recovered_super_field_statements.remove(&statement)
+            {
                 continue;
             }
             match self.node(statement)?.kind {
@@ -2804,6 +2807,24 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                                     || grammar.diagnostics.is_empty()
                                 {
                                     return Err(SourceCheckError::Class(statement));
+                                }
+                                if matches!(
+                                    grammar.diagnostics.as_slice(),
+                                    [diagnostic] if diagnostic.code == 2855
+                                ) {
+                                    let [base, derived, invocation] = source_statements.as_slice()
+                                    else {
+                                        return Err(SourceCheckError::Class(statement));
+                                    };
+                                    if statement_index != 0
+                                        || *base != statement.node
+                                        || !recovered_super_field_statements
+                                            .insert(self.reference(*derived))
+                                        || !recovered_super_field_statements
+                                            .insert(self.reference(*invocation))
+                                    {
+                                        return Err(SourceCheckError::Class(statement));
+                                    }
                                 }
                                 statements.push(PlannedStatement::ClassGrammar(grammar));
                                 continue;
@@ -45269,6 +45290,95 @@ mod tests {
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn inherited_arrow_fields_report_exact_super_access_diagnostics_and_replay_warm() {
+        let source = parsed(concat!(
+            "class T {\n",
+            "    field = () => {}\n",
+            "}\n",
+            "class T2 extends T {\n",
+            "    f() {\n",
+            "        super.field()\n",
+            "    }\n",
+            "}\n\n",
+            "new T2().f()\n",
+        ));
+        let file = FileId::new(9_887);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let base = global_symbol(&context, "T");
+        let derived = global_symbol(&context, "T2");
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("the inherited arrow field must produce one super-access diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2855);
+        assert_eq!(diagnostic.diagnostic.arguments, ["field"]);
+        assert_eq!(node_text(&source, diagnostic.node.unwrap()), "field");
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "Class field 'field' defined by the parent class is not accessible in the child class via super.",
+        );
+        assert!(diagnostic.related_information.is_empty());
+        for symbol in [base, derived] {
+            assert!(context.store().declared_type_links(symbol).is_none());
+            assert!(context.store().value_symbol_links(symbol).is_none());
+        }
+        assert!(is_type_checked(&context, file));
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn inherited_super_field_recovery_rejects_unproven_classes_and_following_statements() {
+        for (index, text) in [
+            concat!(
+                "class T { private field = () => {}; } ",
+                "class T2 extends T { f() { super.field(); } } ",
+                "new T2().f();",
+            ),
+            concat!(
+                "class T { field = () => {}; } ",
+                "class T2 extends T { f() { super.field(); } } ",
+                "new T2().other();",
+            ),
+            concat!(
+                "class T { field = () => {}; } ",
+                "class T2 extends T { f() { super.field(); } } ",
+                "new T2().f(); const extra = 1;",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parsed(text);
+            let file = FileId::new(9_890 + u32::try_from(index).unwrap());
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            let base = global_symbol(&context, "T");
+            let derived = global_symbol(&context, "T2");
+            let cold = observable_state(&context, file);
+
+            assert!(
+                matches!(
+                    context.check_source_file(file),
+                    Err(SourceCheckError::Unsupported(
+                        UnsupportedSourceSyntax::Class(_)
+                    ))
+                ),
+                "{text}",
+            );
+            assert_eq!(observable_state(&context, file), cold);
+            assert!(context.diagnostics().is_empty());
+            for symbol in [base, derived] {
+                assert!(context.store().declared_type_links(symbol).is_none());
+                assert!(context.store().value_symbol_links(symbol).is_none());
+            }
+        }
     }
 
     #[test]
