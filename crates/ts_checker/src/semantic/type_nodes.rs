@@ -17195,18 +17195,21 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             .value_symbol_links(method_symbol)
             .and_then(|links| links.resolved_type)
             .ok_or_else(invalid)?;
+        let linked_callable = match (
+            self.store
+                .authenticated_interface_method_owner(method_symbol),
+            self.store
+                .authenticated_type_literal_method_owner(method_symbol),
+        ) {
+            (Some(_), None) => self.store.interface_method_linked_type(signature),
+            (None, Some(_)) => self.store.type_literal_method_linked_type(signature),
+            _ => None,
+        };
 
         if !self
             .host
             .symbol_matches(self.store, declaration, method_symbol)
-            || self
-                .store
-                .authenticated_interface_method_owner(method_symbol)
-                .is_none()
-                && self
-                    .store
-                    .authenticated_type_literal_method_owner(method_symbol)
-                    .is_none()
+            || linked_callable != Some(callable)
             || self
                 .store
                 .signature_links(declaration)
@@ -39337,6 +39340,10 @@ mod tests {
                 .insert_symbol(exports, EscapedName::source("Contract"), method),
             Some(Some(contract)),
         );
+        assert_eq!(
+            fixture.store.interface_method_linked_type(method_signature),
+            None,
+        );
         let poisoned = function_store_state(&fixture.store);
         assert!(matches!(
             query_signature_return(&mut fixture, method_signature, &mut diagnostics),
@@ -39350,6 +39357,10 @@ mod tests {
                 .store
                 .insert_symbol(exports, EscapedName::source("Contract"), contract),
             Some(Some(method)),
+        );
+        assert_eq!(
+            fixture.store.interface_method_linked_type(method_signature),
+            Some(callable),
         );
         assert_eq!(
             query_signature_return(&mut fixture, method_signature, &mut diagnostics),
