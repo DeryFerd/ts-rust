@@ -9644,7 +9644,9 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     SourceSyntaxRole::Statement,
                 )
             })?;
-        let target_symbol = if !export_equals {
+        let target_symbol = if export_equals {
+            local_symbol
+        } else {
             store
                 .symbol(local_symbol)
                 .filter(|local| local.flags() == SymbolFlags::EXPORT_VALUE)
@@ -9656,8 +9658,6 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                             .is_some_and(|class| class.flags() == SymbolFlags::CLASS)
                 })
                 .unwrap_or(local_symbol)
-        } else {
-            local_symbol
         };
         let target = store
             .symbol(target_symbol)
