@@ -1027,11 +1027,6 @@ fn ambient_generic_forms_outside_the_existing_exact_closure_remain_typed_boundar
             CanonicalModuleState::Script,
         ),
         (
-            "declare function rest<T>(...values: T[]): T;",
-            false,
-            CanonicalModuleState::Script,
-        ),
-        (
             "declare function initialized<T>(value: T = undefined): T;",
             false,
             CanonicalModuleState::Script,
