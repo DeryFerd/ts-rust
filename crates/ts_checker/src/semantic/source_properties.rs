@@ -1883,6 +1883,44 @@ fn resolve_namespace_property(
         return Ok(None);
     }
     let TypeData::Object(object) = receiver.data() else {
+        let merged_interface_namespace = owner.flags()
+            == SymbolFlags::INTERFACE | SymbolFlags::NAMESPACE_MODULE
+            && owner.check_flags() == CheckFlags::NONE
+            && owner.value_declaration().is_none()
+            && owner.parent().is_none()
+            && owner.members().is_some()
+            && owner.exports().is_some()
+            && store.get_merged_symbol(module) == Some(module)
+            && owner.declarations().is_some_and(|declarations| {
+                declarations.len() == 2
+                    && declarations.iter().any(|declaration| {
+                        store.source_node_kind(*declaration)
+                            == Some(SyntaxKind::InterfaceDeclaration)
+                    })
+                    && declarations.iter().any(|declaration| {
+                        store.source_node_kind(*declaration) == Some(SyntaxKind::ModuleDeclaration)
+                    })
+            });
+        if merged_interface_namespace
+            && matches!(receiver.data(), TypeData::Interface(_))
+            && receiver.symbol() == Some(module)
+            && store
+                .declared_type_links(module)
+                .and_then(|links| links.declared_type)
+                == Some(receiver_type)
+        {
+            return Err(SourcePropertyError::Unsupported(
+                SourcePropertyUnsupported::Access(plan.node),
+            ));
+        }
+        if merged_interface_namespace
+            && alias_module == Some(module)
+            && store
+                .intrinsic_bootstrap()
+                .is_some_and(|bootstrap| receiver_type == bootstrap.error_type)
+        {
+            return Ok(None);
+        }
         return Err(SourcePropertyError::InvalidCache(plan.node));
     };
     let exports = store

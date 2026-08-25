@@ -34575,6 +34575,111 @@ mod tests {
     }
 
     #[test]
+    fn merged_namespace_interface_method_reads_are_unsupported_not_invalid_caches() {
+        let declarations = parsed(concat!(
+            "declare module 'foo' { ",
+            "namespace B { export interface A {} } ",
+            "interface B { bar(name: string): B.A; } ",
+            "export = B; ",
+            "}",
+        ));
+        let importer = parsed(concat!(
+            "import foo = require('foo'); ",
+            "declare var z: foo; ",
+            "z.bar('hello'); ",
+            "var x: foo.A = foo.bar('hello');",
+        ));
+        let declaration_file = FileId::new(9_850);
+        let importer_file = FileId::new(9_851);
+        let files = [
+            (
+                declaration_file,
+                &declarations,
+                CanonicalModuleState::Script,
+            ),
+            (importer_file, &importer, CanonicalModuleState::External),
+        ];
+        let mut binder = CanonicalBinder::new();
+        for (file, source, state) in files {
+            binder
+                .bind_source_file_with_facts(
+                    &source.arena,
+                    source.source_file,
+                    file,
+                    source_facts_with_module_state(file, state),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&source.arena, file)
+                .unwrap();
+        }
+        let specifier = importer
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::ImportEqualsDeclaration(import) = &record.data else {
+                    return None;
+                };
+                let NodeData::ExternalModuleReference(reference) =
+                    &importer.arena.get(import.module_reference)?.data
+                else {
+                    return None;
+                };
+                Some(NodeRef::new(
+                    importer.arena.id(),
+                    importer_file,
+                    reference.expression,
+                ))
+            })
+            .unwrap();
+        let access = importer
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::PropertyAccessExpression(access) = &record.data else {
+                    return None;
+                };
+                matches!(
+                    importer.arena.get(access.expression).map(|receiver| &receiver.data),
+                    Some(NodeData::Identifier(identifier)) if identifier.text == "z"
+                )
+                .then_some(NodeRef::new(importer.arena.id(), importer_file, node))
+            })
+            .unwrap();
+        let mut context = CanonicalCheckerContext::new_with_module_resolutions(
+            binder.finish(),
+            vec![
+                (declaration_file, &declarations.arena),
+                (importer_file, &importer.arena),
+            ],
+            CanonicalCheckerOptions {
+                emit_common_js: true,
+                ..CanonicalCheckerOptions::default()
+            },
+            CanonicalModuleResolutionManifestInput::new([
+                CanonicalModuleResolutionEntry::resolved(
+                    specifier,
+                    CanonicalResolvedModuleInput::new(
+                        declaration_file,
+                        CanonicalModuleResolutionMode::CommonJs,
+                        CanonicalModuleResolutionMode::CommonJs,
+                    ),
+                ),
+            ]),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            context.check_source_file(importer_file),
+            Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::Property(node)))
+                if node == access
+        ));
+        assert!(context.store().type_node_links(access).is_none());
+        assert!(context.store().symbol_node_links(access).is_none());
+        assert!(!is_type_checked(&context, importer_file));
+    }
+
+    #[test]
     fn used_namespace_imports_resolve_reexported_values_importer_first() {
         let importer = parsed(concat!(
             "import * as namespace from './bridge'; ",
