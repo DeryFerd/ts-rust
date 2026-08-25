@@ -4,8 +4,8 @@ use ts_binder::{
     CheckFlags, EscapedName, SemanticSymbolId, SymbolFlags,
 };
 use ts_checker::semantic::{
-    CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions, SourceCheckError,
-    TypeData, TypeNodeLinks, UnsupportedSourceSyntax, ValueSymbolLinks,
+    CanonicalCheckerContext, CanonicalCheckerOptions, ClassMembers, IntrinsicBootstrapOptions,
+    SourceCheckError, TypeData, TypeNodeLinks, UnsupportedSourceSyntax, ValueSymbolLinks,
     signatures::SignatureFlags,
     type_records::TypeCacheState,
     types::{ObjectFlags, TypeFlags},
@@ -1253,18 +1253,23 @@ fn unsupported_ambient_class_shapes_leave_class_publication_cold() {
     }
 }
 
-#[test]
-fn exported_class_publishes_owner_local_alias_and_optional_member_once() {
-    let parsed = parse_source_file("export class Exported { value?: string; }");
-    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
-    let file = FileId::new(0);
-    let mut context =
-        checker_context_with_module_state(&parsed, file, CanonicalModuleState::External);
-    let declaration = class_declaration(&parsed, file, "Exported");
+struct ExportedClassIdentities {
+    owner: SemanticSymbolId,
+    local: SemanticSymbolId,
+    field: SemanticSymbolId,
+    annotation: NodeRef,
+}
+
+fn assert_cold_exported_class_identities(
+    parsed: &ParseResult,
+    file: FileId,
+    context: &CanonicalCheckerContext<'_>,
+) -> ExportedClassIdentities {
+    let declaration = class_declaration(parsed, file, "Exported");
     let bound = context.file(file).unwrap().1;
     let module = bound.symbol(bound.source_file()).unwrap();
     let locals = bound.locals(bound.source_file()).unwrap();
-    let exported = context
+    let owner = context
         .store()
         .get_merged_symbol(bound.symbol(declaration).unwrap())
         .unwrap();
@@ -1278,16 +1283,16 @@ fn exported_class_publishes_owner_local_alias_and_optional_member_once() {
     };
     let field_declaration = NodeRef::new(parsed.arena.id(), file, class.members.nodes[0]);
     let field = bound.symbol(field_declaration).unwrap();
-    let annotation = property_type_node(&parsed, file, "value");
+    let annotation = property_type_node(parsed, file, "value");
 
-    assert_ne!(exported, local);
+    assert_ne!(owner, local);
     assert_eq!(
-        context.store().symbol(exported).unwrap().parent(),
-        Some(module),
+        context.store().symbol(owner).unwrap().parent(),
+        Some(module)
     );
     assert_eq!(
         context.store().symbol(local).unwrap().export_symbol(),
-        Some(exported),
+        Some(owner),
     );
     assert_eq!(
         context.store().symbol(local).unwrap().flags(),
@@ -1297,10 +1302,10 @@ fn exported_class_publishes_owner_local_alias_and_optional_member_once() {
         context
             .store()
             .symbol(module)
-            .and_then(|module| module.exports())
+            .and_then(ts_binder::semantic::Symbol::exports)
             .and_then(|exports| context.store().symbol_table(exports))
             .and_then(|exports| exports.get_source("Exported")),
-        Some(exported),
+        Some(owner),
     );
     assert_eq!(
         context
@@ -1309,7 +1314,7 @@ fn exported_class_publishes_owner_local_alias_and_optional_member_once() {
             .and_then(|locals| locals.get_source("Exported")),
         Some(local),
     );
-    for symbol in [exported, local] {
+    for symbol in [owner, local] {
         assert!(
             context
                 .store()
@@ -1321,15 +1326,28 @@ fn exported_class_publishes_owner_local_alias_and_optional_member_once() {
     assert!(
         context
             .store()
-            .declared_type_links(exported)
+            .declared_type_links(owner)
             .and_then(|links| links.declared_type)
             .is_none()
     );
-    assert!(!is_type_checked(&context, file));
+    assert!(!is_type_checked(context, file));
 
-    context.check_source_file(file).unwrap();
+    ExportedClassIdentities {
+        owner,
+        local,
+        field,
+        annotation,
+    }
+}
 
-    let members = context.get_nongeneric_class_members(exported).unwrap();
+fn assert_published_exported_class(
+    context: &mut CanonicalCheckerContext<'_>,
+    file: FileId,
+    identities: &ExportedClassIdentities,
+) -> (ClassMembers, ValueSymbolLinks) {
+    let members = context
+        .get_nongeneric_class_members(identities.owner)
+        .unwrap();
     let instance = members.shells().instance_type();
     let value = members.shells().value_type();
     let string = context.store().intrinsic_bootstrap().unwrap().string_type;
@@ -1337,47 +1355,47 @@ fn exported_class_publishes_owner_local_alias_and_optional_member_once() {
         resolved_type: Some(value),
         ..ValueSymbolLinks::default()
     };
-    assert_eq!(members.declared_instance_properties(), &[field]);
+    assert_eq!(members.declared_instance_properties(), &[identities.field]);
     assert!(members.declared_static_properties().is_empty());
     assert_eq!(
         context
             .store()
-            .declared_type_links(exported)
+            .declared_type_links(identities.owner)
             .and_then(|links| links.declared_type),
         Some(instance),
     );
     assert!(
         context
             .store()
-            .declared_type_links(local)
+            .declared_type_links(identities.local)
             .and_then(|links| links.declared_type)
             .is_none()
     );
     assert_eq!(
-        context.store().value_symbol_links(exported),
+        context.store().value_symbol_links(identities.owner),
         Some(&class_value)
     );
     assert_eq!(
-        context.store().value_symbol_links(local),
+        context.store().value_symbol_links(identities.local),
         Some(&class_value)
     );
     assert_eq!(
-        context.store().symbol(field).unwrap().flags(),
+        context.store().symbol(identities.field).unwrap().flags(),
         SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL,
     );
     assert_eq!(
-        context.store().symbol(field).unwrap().parent(),
-        Some(exported),
+        context.store().symbol(identities.field).unwrap().parent(),
+        Some(identities.owner),
     );
     assert_eq!(
-        context.store().value_symbol_links(field),
+        context.store().value_symbol_links(identities.field),
         Some(&ValueSymbolLinks {
             resolved_type: Some(string),
             ..ValueSymbolLinks::default()
         }),
     );
     assert_eq!(
-        context.store().type_node_links(annotation),
+        context.store().type_node_links(identities.annotation),
         Some(&TypeNodeLinks {
             resolved_type: Some(string),
             ..TypeNodeLinks::default()
@@ -1388,11 +1406,26 @@ fn exported_class_publishes_owner_local_alias_and_optional_member_once() {
             .store()
             .symbol_table(members.instance_members().unwrap())
             .and_then(|members| members.get_source("value")),
-        Some(field),
+        Some(identities.field),
     );
-    assert!(is_type_checked(&context, file));
+    assert!(is_type_checked(context, file));
     assert!(context.diagnostics().is_empty());
 
+    (members, class_value)
+}
+
+#[test]
+fn exported_class_publishes_owner_local_alias_and_optional_member_once() {
+    let parsed = parse_source_file("export class Exported { value?: string; }");
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(0);
+    let mut context =
+        checker_context_with_module_state(&parsed, file, CanonicalModuleState::External);
+    let identities = assert_cold_exported_class_identities(&parsed, file, &context);
+
+    context.check_source_file(file).unwrap();
+
+    let (members, class_value) = assert_published_exported_class(&mut context, file, &identities);
     let warm = (
         context.store().type_len(),
         context.store().signature_len(),
@@ -1404,7 +1437,9 @@ fn exported_class_publishes_owner_local_alias_and_optional_member_once() {
     context.check_source_file(file).unwrap();
     context.recheck_source_file(file).unwrap();
     assert_eq!(
-        context.get_nongeneric_class_members(exported).unwrap(),
+        context
+            .get_nongeneric_class_members(identities.owner)
+            .unwrap(),
         members,
     );
     assert_eq!(
@@ -1419,11 +1454,11 @@ fn exported_class_publishes_owner_local_alias_and_optional_member_once() {
         warm,
     );
     assert_eq!(
-        context.store().value_symbol_links(exported),
+        context.store().value_symbol_links(identities.owner),
         Some(&class_value)
     );
     assert_eq!(
-        context.store().value_symbol_links(local),
+        context.store().value_symbol_links(identities.local),
         Some(&class_value)
     );
     assert!(is_type_checked(&context, file));
