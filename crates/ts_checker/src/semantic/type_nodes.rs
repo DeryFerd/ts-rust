@@ -3655,7 +3655,6 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let merged = parameter.flags() == SymbolFlags::TYPE_PARAMETER | SymbolFlags::TRANSIENT;
         if declaration_record.kind != SyntaxKind::TypeParameter
             || !ordinary && !merged
-            || ordinary && declarations.len() != 1
             || merged && declarations.len() < 2
             || parameter.check_flags() != CheckFlags::NONE
             || parameter.value_declaration().is_some()
@@ -3743,6 +3742,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
 
             if parameter_owner == parent {
                 return Ok(ordinary
+                    && declarations.len() == 1
                     && method
                         .type_parameters
                         .as_ref()

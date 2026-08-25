@@ -2482,14 +2482,16 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         let Some(bootstrap) = self.intrinsic_bootstrap.as_ref() else {
             return false;
         };
+        let ordinary = record.flags() == SymbolFlags::TYPE_PARAMETER;
+        let merged = record.flags() == SymbolFlags::TYPE_PARAMETER | SymbolFlags::TRANSIENT;
         let allowed_owner_flags =
             SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::TRANSIENT;
-        if record.flags() != SymbolFlags::TYPE_PARAMETER | SymbolFlags::TRANSIENT
+        if !ordinary && !merged
+            || declarations.len() < 2
             || record.members().is_some()
             || owner_record.flags().without(allowed_owner_flags) != SymbolFlags::NONE
-            || !owner_record
-                .flags()
-                .contains(SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT)
+            || !owner_record.flags().contains(SymbolFlags::INTERFACE)
+            || owner_record.flags().contains(SymbolFlags::TRANSIENT) != merged
             || owner_record.check_flags() != CheckFlags::NONE
             || owner_record.exports().is_some()
             || owner_record.export_symbol().is_some()
@@ -2940,12 +2942,14 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
                 };
                 let valid_declarations = match symbol_record.flags() {
-                    SymbolFlags::TYPE_PARAMETER => matches!(
-                        symbol_record.declarations(),
-                        Some([declaration])
-                            if self.source_node_kind(*declaration)
-                                == Some(SyntaxKind::TypeParameter)
-                    ),
+                    SymbolFlags::TYPE_PARAMETER => {
+                        matches!(
+                            symbol_record.declarations(),
+                            Some([declaration])
+                                if self.source_node_kind(*declaration)
+                                    == Some(SyntaxKind::TypeParameter)
+                        ) || self.valid_supported_merged_type_parameter(type_, symbol, parameter)
+                    }
                     flags if flags == SymbolFlags::TYPE_PARAMETER | SymbolFlags::TRANSIENT => {
                         self.valid_supported_merged_type_parameter(type_, symbol, parameter)
                     }
