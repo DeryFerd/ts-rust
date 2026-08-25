@@ -42,12 +42,13 @@ use super::{
     },
     keyof_types::{cached_nongeneric_keyof_type, plan_nongeneric_keyof_type},
     reference_types::{DirectGenericReference, validate_direct_generic_reference},
-    signatures::{IndexFlags, SignatureFlags},
+    signatures::{ElementFlags, IndexFlags, SignatureFlags},
     source_callables::{
-        StoredSourceCallableValidation, valid_fixed_generic_source_parameter_type,
-        validate_stored_source_callable,
+        StoredSourceCallableValidation, constrained_string_rest_tuple_parameter,
+        valid_fixed_generic_source_parameter_type, validate_stored_source_callable,
     },
     store::CachedSignatureLookup,
+    tuple_types::CanonicalTupleTypeRequest,
     type_records::TypeData,
     types::{ObjectFlags, TypeFlags, VarianceFlags},
 };
@@ -1436,6 +1437,14 @@ fn validate_generic_parameter_template(
         return Ok(true);
     }
 
+    if let Some(tuple) = store
+        .canonical_tuple_shape(type_)
+        .map_err(|_| GenericCallVectorInvariant::CallableSignatureMismatch(signature))?
+    {
+        return Ok(tuple.combined_flags().intersects(ElementFlags::VARIABLE)
+            && constrained_string_rest_tuple_parameter(store, type_, type_parameters).is_some());
+    }
+
     if let Some(array_targets) = array_targets {
         let reference = store
             .canonical_array_reference_with_targets(array_targets, type_)
@@ -1776,6 +1785,21 @@ fn validate_generic_constraint_dependency(
     {
         return Ok(parameter.base_constraint);
     }
+    if store
+        .canonical_tuple_shape(constraint)
+        .map_err(|_| GenericCallVectorInvariant::InvalidTypeParameter(owner))?
+        .is_some()
+    {
+        return if valid_fixed_string_tuple_constraint(store, constraint) {
+            Ok(constraint)
+        } else {
+            Err(GenericCallVectorUnsupported::TypeParameterDependency {
+                type_parameter: owner,
+                dependency: constraint,
+            }
+            .into())
+        };
+    }
     let record = store.type_payload(constraint).ok_or(
         GenericCallVectorUnsupported::TypeParameterDependency {
             type_parameter: owner,
@@ -1810,6 +1834,30 @@ fn validate_generic_constraint_dependency(
         }
         .into()),
     }
+}
+
+fn valid_fixed_string_tuple_constraint(
+    store: &CanonicalTypeMapperStore,
+    constraint: TypeId,
+) -> bool {
+    let Some(string) = store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| bootstrap.string_type)
+    else {
+        return false;
+    };
+    let Ok(Some(tuple)) = store.canonical_tuple_shape(constraint) else {
+        return false;
+    };
+    let [required] = tuple.element_infos() else {
+        return false;
+    };
+    tuple.element_types() == [string]
+        && required.flags() == ElementFlags::REQUIRED
+        && required.labeled_declaration().is_none()
+        && tuple.min_length() == 1
+        && tuple.fixed_length() == 1
+        && !tuple.is_readonly()
 }
 
 fn validate_generic_type_parameter_dependency(
@@ -2217,7 +2265,21 @@ fn infer_generic_call_type_arguments(
                     )
                 })
                 .transpose()?
-                .unwrap_or(unknown),
+                .unwrap_or_else(|| {
+                    instantiated_constraint
+                        .filter(|constraint| {
+                            buckets[index].is_empty()
+                                && contravariant_buckets[index].is_empty()
+                                && shape.parameter_templates.iter().copied().any(|template| {
+                                    constrained_string_rest_tuple_parameter(
+                                        store,
+                                        template,
+                                        &type_parameters,
+                                    ) == Some(*constraint)
+                                })
+                        })
+                        .unwrap_or(unknown)
+                }),
         };
         if let Some(constraint) = instantiated_constraint
             && !is_assignable(store, argument, constraint)?
@@ -2325,6 +2387,27 @@ fn collect_generic_call_inferences(
             active_targets,
             contravariant,
         );
+    }
+
+    if constrained_string_rest_tuple_parameter(store, target, type_parameters).is_some() {
+        let Some(source_tuple) = store
+            .canonical_tuple_shape(source)
+            .map_err(|_| GenericCallVectorInvariant::CallableSignatureMismatch(signature))?
+        else {
+            return Ok(());
+        };
+        if source_tuple
+            .combined_flags()
+            .intersects(ElementFlags::VARIABLE)
+        {
+            return Err(GenericCallVectorUnsupported::NonNakedParameter {
+                signature,
+                index: 0,
+                type_: target,
+            }
+            .into());
+        }
+        return Ok(());
     }
 
     if let Some(array_targets) = array_targets {
@@ -2574,7 +2657,24 @@ fn check_generic_call_arguments(
         } else {
             parameter_type
         };
-        if !is_assignable(store, argument_type, parameter_type)? {
+        let assignable = if constrained_string_rest_tuple_parameter(
+            store,
+            shape.parameter_templates[parameter_index],
+            sources,
+        )
+        .is_some()
+        {
+            constrained_rest_tuple_argument_is_assignable(
+                store,
+                shape.signature,
+                argument_type,
+                parameter_type,
+                is_assignable,
+            )?
+        } else {
+            is_assignable(store, argument_type, parameter_type)?
+        };
+        if !assignable {
             return Ok(Some(
                 GenericCallVectorApplicability::ArgumentNotAssignable {
                     index,
@@ -2587,6 +2687,63 @@ fn check_generic_call_arguments(
     Ok(None)
 }
 
+fn constrained_rest_tuple_argument_is_assignable(
+    store: &mut CanonicalTypeMapperStore,
+    signature: SignatureId,
+    source: TypeId,
+    target: TypeId,
+    is_assignable: &mut impl FnMut(
+        &mut CanonicalTypeMapperStore,
+        TypeId,
+        TypeId,
+    ) -> Result<bool, RelationUnavailable>,
+) -> Result<bool, GenericCallVectorError> {
+    let Some(source_tuple) = store
+        .canonical_tuple_shape(source)
+        .map_err(|_| GenericCallVectorInvariant::CallableSignatureMismatch(signature))?
+    else {
+        return Ok(false);
+    };
+    if source_tuple
+        .combined_flags()
+        .intersects(ElementFlags::VARIABLE)
+    {
+        return Err(GenericCallVectorUnsupported::NonNakedParameter {
+            signature,
+            index: 0,
+            type_: target,
+        }
+        .into());
+    }
+    let source_types = source_tuple.element_types().to_vec();
+    let Some(target_tuple) = store
+        .canonical_tuple_shape(target)
+        .map_err(|_| GenericCallVectorInvariant::CallableSignatureMismatch(signature))?
+    else {
+        return Err(GenericCallVectorInvariant::CallableSignatureMismatch(signature).into());
+    };
+    let [rest, required] = target_tuple.element_infos() else {
+        return Err(GenericCallVectorInvariant::CallableSignatureMismatch(signature).into());
+    };
+    if rest.flags() != ElementFlags::REST
+        || required.flags() != ElementFlags::REQUIRED
+        || target_tuple.is_readonly()
+    {
+        return Err(GenericCallVectorInvariant::CallableSignatureMismatch(signature).into());
+    }
+    if source_types.len() < target_tuple.min_length() {
+        return Ok(false);
+    }
+    let target_types = target_tuple.element_types().to_vec();
+    let last = source_types.len().saturating_sub(1);
+    for (index, source_type) in source_types.into_iter().enumerate() {
+        if !is_assignable(store, source_type, target_types[usize::from(index == last)])? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn instantiate_generic_call_type(
     store: &mut CanonicalTypeMapperStore,
     type_: TypeId,
@@ -2597,6 +2754,53 @@ fn instantiate_generic_call_type(
 ) -> Result<TypeId, InstantiationError> {
     if authenticated_nongeneric_keyof_union(store, type_) {
         return Ok(type_);
+    }
+    if valid_fixed_string_tuple_constraint(store, type_) {
+        return Ok(type_);
+    }
+    if constrained_string_rest_tuple_parameter(store, type_, sources).is_some() {
+        let tuple = store
+            .canonical_tuple_shape(type_)
+            .map_err(|_| InstantiationError::UnsupportedType(type_))?
+            .ok_or(InstantiationError::UnsupportedType(type_))?;
+        let elements = tuple.element_types().to_vec();
+        let infos = tuple.element_infos().to_vec();
+        let readonly = tuple.is_readonly();
+        let mut mapped_elements = Vec::with_capacity(elements.len());
+        let mut mapped_infos = Vec::with_capacity(infos.len());
+        for (element, info) in elements.into_iter().zip(infos) {
+            if info.flags() == ElementFlags::VARIADIC {
+                let index = sources
+                    .iter()
+                    .position(|source| *source == element)
+                    .ok_or(InstantiationError::UnsupportedType(type_))?;
+                let mapped = *targets
+                    .get(index)
+                    .ok_or(InstantiationError::UnsupportedType(type_))?;
+                let mapped_tuple = store
+                    .canonical_tuple_shape(mapped)
+                    .map_err(|_| InstantiationError::UnsupportedType(mapped))?
+                    .ok_or(InstantiationError::UnsupportedType(mapped))?;
+                if mapped_tuple
+                    .combined_flags()
+                    .intersects(ElementFlags::VARIABLE)
+                {
+                    return Err(InstantiationError::UnsupportedType(mapped));
+                }
+                mapped_elements.extend_from_slice(mapped_tuple.element_types());
+                mapped_infos.extend_from_slice(mapped_tuple.element_infos());
+            } else {
+                mapped_elements.push(element);
+                mapped_infos.push(info);
+            }
+        }
+        let mut request = CanonicalTupleTypeRequest::new(&mapped_elements, &mapped_infos, readonly);
+        if let Some(array_targets) = array_targets {
+            request = request.with_array_targets(array_targets);
+        }
+        return store
+            .create_canonical_tuple_type(request)
+            .map_err(|_| InstantiationError::UnsupportedType(type_));
     }
     instantiate_type_with_vector_and_session(store, type_, sources, targets, array_targets, session)
 }
@@ -3215,6 +3419,40 @@ fn generic_call_type_instantiation_matches(
     if let Some(index) = sources.iter().position(|source| *source == template) {
         return targets.get(index).copied() == Some(actual);
     }
+    if constrained_string_rest_tuple_parameter(store, template, sources).is_some() {
+        let (Ok(Some(template_tuple)), Ok(Some(actual_tuple))) = (
+            store.canonical_tuple_shape(template),
+            store.canonical_tuple_shape(actual),
+        ) else {
+            return false;
+        };
+        let [rest_type, variadic_type] = template_tuple.element_types() else {
+            return false;
+        };
+        let Some(index) = sources.iter().position(|source| source == variadic_type) else {
+            return false;
+        };
+        let Some(mapped) = targets.get(index).copied() else {
+            return false;
+        };
+        let Ok(Some(mapped_tuple)) = store.canonical_tuple_shape(mapped) else {
+            return false;
+        };
+        let [rest, required] = actual_tuple.element_infos() else {
+            return false;
+        };
+        return actual_tuple.element_types().len() == mapped_tuple.element_types().len() + 1
+            && actual_tuple.element_types()[0] == *rest_type
+            && &actual_tuple.element_types()[1..] == mapped_tuple.element_types()
+            && rest.flags() == ElementFlags::REST
+            && required.flags() == ElementFlags::REQUIRED
+            && rest.labeled_declaration().is_none()
+            && required.labeled_declaration().is_none()
+            && actual_tuple.is_readonly() == template_tuple.is_readonly()
+            && !mapped_tuple
+                .combined_flags()
+                .intersects(ElementFlags::VARIABLE);
+    }
     if valid_fixed_generic_source_parameter_type(store, template) {
         return template == actual;
     }
@@ -3763,6 +4001,15 @@ fn demand_generic_call_vector_parameter(
     )?;
     let resolved = if valid_fixed_generic_source_parameter_type(store, template) {
         template
+    } else if constrained_string_rest_tuple_parameter(store, template, sources).is_some() {
+        instantiate_generic_call_type(
+            store,
+            template,
+            sources,
+            type_arguments,
+            shape.array_targets,
+            session,
+        )?
     } else {
         instantiate_type_with_session(store, template, mapper, shape.array_targets, session)?
     };

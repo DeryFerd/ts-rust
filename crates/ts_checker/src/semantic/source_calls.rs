@@ -2441,12 +2441,10 @@ pub(super) fn source_call_argument_contextual_type(
         && let [callable] = projection.call_signatures.as_ref()
         && let Some(signature) = store.signature(callable.signature)
         && let Some(parameter) = callable.parameters.get(argument_index).copied()
-        && constrained_string_rest_tuple_parameter(store, parameter, signature.type_parameters())
-            .is_some()
+        && let Some(constraint) =
+            constrained_string_rest_tuple_parameter(store, parameter, signature.type_parameters())
     {
-        return Err(SourceCheckError::Unsupported(
-            UnsupportedSourceSyntax::Call(plan.node),
-        ));
+        return Ok(Some(constraint));
     }
 
     if matches!(argument.kind, PlannedExpressionKind::Template(_))
@@ -11619,7 +11617,7 @@ mod tests {
     }
 
     #[test]
-    fn constrained_rest_tuple_calls_fail_closed_before_call_publication() {
+    fn constrained_rest_tuple_calls_report_exact_length_details_and_reuse_checked_cache() {
         let library = parsed("interface Array<T> {} interface ReadonlyArray<T> {}");
         let source = parsed(concat!(
             "function f<T extends [string]>(args: [...string[], ...T]) {} ",
@@ -11632,18 +11630,32 @@ mod tests {
             panic!("expected one constrained rest-tuple call")
         };
         let call = *call;
+        let argument = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ArrayLiteralExpression)
+                    .then(|| NodeRef::new(source.arena.id(), source_file, node))
+            })
+            .unwrap();
         let mut context =
             context_with_default_library(&library, library_file, &source, source_file);
 
+        context.check_source_file(source_file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected the constrained rest-tuple length diagnostic")
+        };
+        assert_eq!(diagnostic.node, Some(argument));
+        assert_eq!(diagnostic.diagnostic.code(), 2345);
         assert_eq!(
-            context.check_source_file(source_file),
-            Err(SourceCheckError::Unsupported(
-                UnsupportedSourceSyntax::Call(call)
-            )),
+            diagnostic.diagnostic.render().unwrap(),
+            concat!(
+                "Argument of type '[]' is not assignable to parameter of type ",
+                "'[...string[], string]'.\n",
+                "  Source has 0 element(s) but target requires 1.",
+            )
         );
-        assert!(context.diagnostics().is_empty());
-        assert!(context.store().type_node_links(call).is_none());
-        assert!(context.store().signature_links(call).is_none());
 
         let owner = first_function_symbol(&source, &context, source_file);
         let callable = context
@@ -11655,6 +11667,47 @@ mod tests {
             validate_stored_source_callable(context.store(), callable),
             StoredSourceCallableValidation::Valid(_)
         ));
+        let generic = context
+            .store()
+            .source_callable_provenance(callable)
+            .unwrap()
+            .signature;
+        let type_parameter = context
+            .store()
+            .signature(generic)
+            .unwrap()
+            .type_parameters()[0];
+        let Some(TypeData::TypeParameter(parameter)) = context
+            .store()
+            .type_payload(type_parameter)
+            .map(TypeRecord::data)
+        else {
+            panic!("expected the constrained source type parameter")
+        };
+        let constraint = parameter.constraint.unwrap();
+        let CachedSignatureLookup::Hit(checked) =
+            context
+                .store()
+                .cached_signature(generic, type_list_key(&[constraint]), &[constraint])
+        else {
+            panic!("expected the constraint-backed checked signature in the global cache")
+        };
+        let recovery = context
+            .store()
+            .signature_links(call)
+            .and_then(|links| links.resolved_signature.signature())
+            .unwrap();
+        assert_ne!(checked, recovery);
+        assert_eq!(
+            context.store().cached_signatures_contain(recovery),
+            Some(false)
+        );
+        let warm = call_publication_state(&context, call);
+
+        mark_source_unchecked(&mut context, source_file);
+        context.check_source_file(source_file).unwrap();
+
+        assert_eq!(call_publication_state(&context, call), warm);
     }
 
     #[test]
