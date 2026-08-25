@@ -2809,16 +2809,17 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                                 {
                                     return Err(SourceCheckError::Class(statement));
                                 }
-                                if matches!(
-                                    grammar.diagnostics.as_slice(),
-                                    [diagnostic] if diagnostic.code == 2855
-                                ) {
+                                if statement_index == 0
+                                    && matches!(
+                                        grammar.diagnostics.as_slice(),
+                                        [diagnostic] if diagnostic.code == 2855
+                                    )
+                                {
                                     let [base, derived, invocation] = source_statements.as_slice()
                                     else {
                                         return Err(SourceCheckError::Class(statement));
                                     };
-                                    if statement_index != 0
-                                        || *base != statement.node
+                                    if *base != statement.node
                                         || !recovered_super_field_statements
                                             .insert(self.reference(*derived))
                                         || !recovered_super_field_statements
