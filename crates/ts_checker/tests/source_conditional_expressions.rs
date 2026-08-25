@@ -307,6 +307,56 @@ fn annotated_literal_conditionals_keep_widened_types_and_assignment_diagnostics(
 }
 
 #[test]
+fn inferred_condition_variables_preserve_joined_branch_types() {
+    let source = concat!(
+        "let flag = true;\n",
+        "let text: string = \"x\";\n",
+        "let count: number = 1;\n",
+        "const unannotated = flag ? text : count;\n",
+    );
+    let parsed = parse_source_file(source);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(9);
+    let mut context = context(&parsed, file);
+
+    context.check_source_file(file).unwrap();
+
+    let expression = parsed
+        .arena
+        .iter()
+        .find_map(|(node, record)| {
+            (record.kind == SyntaxKind::ConditionalExpression).then_some(NodeRef::new(
+                parsed.arena.id(),
+                file,
+                node,
+            ))
+        })
+        .unwrap();
+    let expected = context
+        .store()
+        .intrinsic_bootstrap()
+        .unwrap()
+        .string_or_number_type;
+    assert_eq!(resolved_type(&context, expression), expected);
+    assert!(context.diagnostics().is_empty());
+
+    let warm = (
+        context.store().type_len(),
+        context.store().signature_len(),
+        context.diagnostics().as_slice().to_vec(),
+    );
+    context.recheck_source_file(file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.diagnostics().as_slice().to_vec(),
+        ),
+        warm,
+    );
+}
+
+#[test]
 #[allow(clippy::too_many_lines)] // The complete unsupported-form matrix shares one atomic setup.
 fn unsupported_contextual_narrowed_inferred_and_assigned_forms_fail_before_publication() {
     for (index, source) in [
@@ -317,12 +367,6 @@ fn unsupported_contextual_narrowed_inferred_and_assigned_forms_fail_before_publi
         concat!(
             "let flag: boolean = true;\n",
             "const narrowed = flag ? flag : false;\n",
-        ),
-        concat!(
-            "let flag = true;\n",
-            "let text: string = \"x\";\n",
-            "let count: number = 1;\n",
-            "const unannotated = flag ? text : count;\n",
         ),
         concat!(
             "let flag: boolean = true as never;\n",
