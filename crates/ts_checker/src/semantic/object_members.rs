@@ -1643,6 +1643,13 @@ pub(super) fn plan_interface(
                 &value_declarations,
                 &plan,
             )
+            && !authenticated_global_builtin_interface(
+                store,
+                host,
+                symbol,
+                &value_declarations,
+                &plan,
+            )
             || symbol_record.name().as_utf8() == Some("IntrinsicElements")
                 && store
                     .get_parent_of_symbol(symbol)
@@ -2107,7 +2114,8 @@ fn authenticated_global_math_random_interface(
         .and_then(ts_binder::BoundFile::source_facts)
         .is_some_and(|facts| facts.is_declaration_file() && facts.is_default_library());
 
-    method.parameters.is_empty()
+    method.type_parameters.is_empty()
+        && method.parameters.is_empty()
         && method.flags == SignatureFlags::NONE
         && method.minimum_argument_count == 0
         && return_type.kind == SyntaxKind::NumberKeyword
@@ -2127,6 +2135,17 @@ fn authenticated_global_math_value_declaration(
     symbol: SemanticSymbolId,
     declaration: NodeRef,
 ) -> bool {
+    authenticated_global_builtin_value_declaration(store, host, symbol, declaration, "Math", "Math")
+}
+
+fn authenticated_global_builtin_value_declaration(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+    declaration: NodeRef,
+    owner_name: &str,
+    annotation_name: &str,
+) -> bool {
     let Some(owner) = store.symbol(symbol) else {
         return false;
     };
@@ -2135,7 +2154,7 @@ fn authenticated_global_math_value_declaration(
     let global = store
         .intrinsic_bootstrap()
         .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
-        .and_then(|globals| globals.get_source("Math"))
+        .and_then(|globals| globals.get_source(owner_name))
         .and_then(|global| store.get_merged_symbol(global));
     let Some(bound) = host.bound_file(declaration) else {
         return false;
@@ -2169,7 +2188,7 @@ fn authenticated_global_math_value_declaration(
         return false;
     };
 
-    owner.name().as_utf8() == Some("Math")
+    owner.name().as_utf8() == Some(owner_name)
         && owner
             .flags()
             .contains(SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE)
@@ -2198,10 +2217,93 @@ fn authenticated_global_math_value_declaration(
         && name_record.flags.0 == 0
         && name_record.parent == Some(annotation.node)
         && identifier.flow_node.is_none()
-        && identifier.text == "Math"
+        && identifier.text == annotation_name
 }
 
-fn authenticated_default_library_math_symbol_tag(
+fn authenticated_global_builtin_interface(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+    value_declarations: &[NodeRef],
+    plan: &PropertyObjectPlan,
+) -> bool {
+    let [declaration] = value_declarations else {
+        return false;
+    };
+    let Some(owner_name) = store
+        .symbol(symbol)
+        .and_then(|owner| owner.name().as_utf8())
+    else {
+        return false;
+    };
+    let (annotation_name, marker, parameter_count) = match owner_name {
+        "Number" => ("NumberConstructor", "toFixed", 1),
+        "String" => ("StringConstructor", "toLowerCase", 0),
+        "Object" => ("ObjectConstructor", "toString", 0),
+        "Symbol" => ("SymbolConstructor", "toString", 0),
+        _ => return false,
+    };
+    if !authenticated_global_builtin_value_declaration(
+        store,
+        host,
+        symbol,
+        *declaration,
+        owner_name,
+        annotation_name,
+    ) {
+        return false;
+    }
+    let mut markers = plan.methods.iter().filter(|method| {
+        store
+            .symbol(method.symbol)
+            .is_some_and(|method| method.name().as_utf8() == Some(marker))
+    });
+    let Some(method) = markers.next() else {
+        return false;
+    };
+    if markers.next().is_some() {
+        return false;
+    }
+    let Some(return_type) = host.node(method.return_type) else {
+        return false;
+    };
+
+    method.type_parameters.is_empty()
+        && method.parameters.len() == parameter_count
+        && (owner_name != "Number"
+            || method.parameters.first().is_some_and(|parameter| {
+                store.source_node_kind(parameter.type_node) == Some(SyntaxKind::NumberKeyword)
+            }))
+        && method.flags == SignatureFlags::NONE
+        && method.minimum_argument_count == 0
+        && return_type.kind == SyntaxKind::StringKeyword
+        && return_type.flags.0 == 0
+        && return_type.parent == Some(method.declaration.node)
+        && plan.methods.iter().all(|method| {
+            method.type_parameters.is_empty()
+                && host
+                    .bound_file(method.declaration)
+                    .and_then(ts_binder::BoundFile::source_facts)
+                    .is_some_and(|facts| {
+                        facts.is_declaration_file()
+                            && facts.is_default_library()
+                            && !facts.is_javascript_file()
+                            && !facts.is_external_or_common_js_module()
+                    })
+        })
+        && plan.indexes.iter().all(|index| {
+            owner_name == "String"
+                && index.readonly
+                && store.source_node_kind(index.key_type_node) == Some(SyntaxKind::NumberKeyword)
+                && store.source_node_kind(index.value_type_node) == Some(SyntaxKind::StringKeyword)
+        })
+        && plan.accessors.is_empty()
+        && plan.spreads.is_empty()
+        && plan.call_signatures.is_empty()
+        && plan.heritage.is_none()
+}
+
+fn authenticated_default_library_builtin_symbol_tag(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
     owner: SemanticSymbolId,
@@ -2290,14 +2392,28 @@ fn authenticated_default_library_math_symbol_tag(
     else {
         return false;
     };
+    let Some(owner_name) = store.symbol(owner).and_then(|owner| owner.name().as_utf8()) else {
+        return false;
+    };
+    let annotation_name = match owner_name {
+        "Math" => "Math",
+        "Symbol" => "SymbolConstructor",
+        _ => return false,
+    };
 
     bound.source_facts().is_some_and(|facts| {
         facts.is_declaration_file()
             && facts.is_default_library()
             && !facts.is_javascript_file()
             && !facts.is_external_or_common_js_module()
-    }) && authenticated_global_math_value_declaration(store, host, owner, value_declaration)
-        && record.flags.0 == 0
+    }) && authenticated_global_builtin_value_declaration(
+        store,
+        host,
+        owner,
+        value_declaration,
+        owner_name,
+        annotation_name,
+    ) && record.flags.0 == 0
         && postfix_token.is_none()
         && ast_symbol.is_none()
         && valid_initializer
@@ -2340,6 +2456,212 @@ fn authenticated_default_library_math_symbol_tag(
         && store
             .symbol(owner)
             .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| store.symbol_table(members))
+            .is_some_and(|members| members.iter().all(|(_, member)| member != symbol))
+}
+
+fn authenticated_default_library_builtin_symbol_method(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    declaration: NodeRef,
+) -> bool {
+    let Some(owner_record) = store.symbol(owner) else {
+        return false;
+    };
+    let Some(owner_name) = owner_record.name().as_utf8() else {
+        return false;
+    };
+    let (annotation_name, member_name, parameter_count) = match owner_name {
+        "Symbol" => ("SymbolConstructor", "toPrimitive", 1),
+        "String" => ("StringConstructor", "iterator", 0),
+        _ => return false,
+    };
+    let Some(value_declaration) = owner_record.value_declaration() else {
+        return false;
+    };
+    if !authenticated_global_builtin_value_declaration(
+        store,
+        host,
+        owner,
+        value_declaration,
+        owner_name,
+        annotation_name,
+    ) {
+        return false;
+    }
+    let Ok(record) = preflight_node(store, host, declaration) else {
+        return false;
+    };
+    let NodeData::MethodSignatureDeclaration(method) = &record.data else {
+        return false;
+    };
+    let name = NodeRef::new(declaration.arena, declaration.file, method.name);
+    let Ok(name_record) = preflight_node(store, host, name) else {
+        return false;
+    };
+    let NodeData::ComputedPropertyName(computed) = &name_record.data else {
+        return false;
+    };
+    let expression = NodeRef::new(name.arena, name.file, computed.expression);
+    let Ok(expression_record) = preflight_node(store, host, expression) else {
+        return false;
+    };
+    let NodeData::PropertyAccessExpression(access) = &expression_record.data else {
+        return false;
+    };
+    let object = NodeRef::new(expression.arena, expression.file, access.expression);
+    let member = NodeRef::new(expression.arena, expression.file, access.name);
+    let (Ok(object_record), Ok(member_record)) = (
+        preflight_node(store, host, object),
+        preflight_node(store, host, member),
+    ) else {
+        return false;
+    };
+    let (NodeData::Identifier(object_identifier), NodeData::Identifier(member_identifier)) =
+        (&object_record.data, &member_record.data)
+    else {
+        return false;
+    };
+    let Some(return_type) = method
+        .type_
+        .map(|node| NodeRef::new(declaration.arena, declaration.file, node))
+    else {
+        return false;
+    };
+    let Ok(return_record) = preflight_node(store, host, return_type) else {
+        return false;
+    };
+    let Some(bound) = host.bound_file(declaration) else {
+        return false;
+    };
+    let Some(symbol) = bound
+        .symbol(declaration)
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+    else {
+        return false;
+    };
+    let Some(symbol_record) = store.symbol(symbol) else {
+        return false;
+    };
+    let locals = bound
+        .locals(declaration)
+        .and_then(|locals| store.symbol_table(locals));
+    let valid_parameter = match (owner_name, method.parameters.nodes.as_slice()) {
+        ("Symbol", [parameter]) => {
+            let parameter = NodeRef::new(declaration.arena, declaration.file, *parameter);
+            let Ok((planned, rest, optional)) = plan_interface_method_parameter(
+                store,
+                host,
+                declaration,
+                parameter,
+                &method.parameters,
+                false,
+            ) else {
+                return false;
+            };
+            !rest
+                && !optional
+                && store.source_node_kind(planned.type_node) == Some(SyntaxKind::StringKeyword)
+                && store
+                    .symbol(planned.symbol)
+                    .is_some_and(|parameter| parameter.name().as_utf8() == Some("hint"))
+                && locals.is_some_and(|locals| {
+                    locals.len() == 1 && locals.get_source("hint") == Some(planned.symbol)
+                })
+        }
+        ("String", []) => locals.is_none_or(|locals| locals.is_empty()),
+        _ => false,
+    };
+    let valid_return = match (owner_name, &return_record.data) {
+        ("Symbol", NodeData::KeywordTypeNode(_)) => return_record.kind == SyntaxKind::SymbolKeyword,
+        ("String", NodeData::TypeReferenceNode(reference))
+            if return_record.kind == SyntaxKind::TypeReference =>
+        {
+            let reference_name =
+                NodeRef::new(return_type.arena, return_type.file, reference.type_name);
+            let Ok(reference_name_record) = preflight_node(store, host, reference_name) else {
+                return false;
+            };
+            let NodeData::Identifier(identifier) = &reference_name_record.data else {
+                return false;
+            };
+            let Some(arguments) = reference.type_arguments.as_ref() else {
+                return false;
+            };
+            let [argument] = arguments.nodes.as_slice() else {
+                return false;
+            };
+            let argument = NodeRef::new(return_type.arena, return_type.file, *argument);
+            let Ok(argument_record) = preflight_node(store, host, argument) else {
+                return false;
+            };
+            reference_name_record.kind == SyntaxKind::Identifier
+                && reference_name_record.flags.0 == 0
+                && reference_name_record.parent == Some(return_type.node)
+                && identifier.flow_node.is_none()
+                && identifier.text == "StringIterator"
+                && !arguments.has_trailing_comma
+                && argument_record.kind == SyntaxKind::StringKeyword
+                && argument_record.flags.0 == 0
+                && argument_record.parent == Some(return_type.node)
+        }
+        _ => false,
+    };
+
+    bound.source_facts().is_some_and(|facts| {
+        facts.is_declaration_file()
+            && facts.is_default_library()
+            && !facts.is_javascript_file()
+            && !facts.is_external_or_common_js_module()
+    }) && record.kind == SyntaxKind::MethodSignature
+        && record.flags.0 == 0
+        && method.full_signature.is_none()
+        && method.next_container.is_none()
+        && method.postfix_token.is_none()
+        && method.symbol.is_none()
+        && method.type_parameters.is_none()
+        && method.modifiers.is_none()
+        && !method.parameters.has_trailing_comma
+        && method.parameters.nodes.len() == parameter_count
+        && valid_parameter
+        && valid_return
+        && return_record.flags.0 == 0
+        && return_record.parent == Some(declaration.node)
+        && name_record.kind == SyntaxKind::ComputedPropertyName
+        && name_record.flags.0 == 0
+        && name_record.parent == Some(declaration.node)
+        && computed.facts == 0
+        && expression_record.kind == SyntaxKind::PropertyAccessExpression
+        && expression_record.flags.0 == 0
+        && expression_record.parent == Some(name.node)
+        && access.flow_node.is_none()
+        && access.question_dot_token.is_none()
+        && access.facts == 0
+        && object_record.kind == SyntaxKind::Identifier
+        && object_record.flags.0 == 0
+        && object_record.parent == Some(expression.node)
+        && object_identifier.flow_node.is_none()
+        && object_identifier.text == "Symbol"
+        && member_record.kind == SyntaxKind::Identifier
+        && member_record.flags.0 == 0
+        && member_record.parent == Some(expression.node)
+        && member_identifier.flow_node.is_none()
+        && member_identifier.text == member_name
+        && symbol_record.flags() == SymbolFlags::METHOD
+        && symbol_record.check_flags() == CheckFlags::NONE
+        && symbol_record.name() == InternalSymbolName::Computed.as_ref()
+        && symbol_record.declarations() == Some(&[declaration])
+        && symbol_record.value_declaration() == Some(declaration)
+        && symbol_record.members().is_none()
+        && symbol_record.exports().is_none()
+        && symbol_record.export_symbol().is_none()
+        && symbol_record
+            .parent()
+            .and_then(|parent| store.get_merged_symbol(parent))
+            == Some(owner)
+        && owner_record
+            .members()
             .and_then(|members| store.symbol_table(members))
             .is_some_and(|members| members.iter().all(|(_, member)| member != symbol))
 }
@@ -4976,7 +5298,22 @@ fn plan_members(
                 member_record.kind,
                 SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature
             )
-            && authenticated_default_library_math_symbol_tag(store, host, symbol, member)
+            && authenticated_default_library_builtin_symbol_tag(store, host, symbol, member)
+        {
+            continue;
+        }
+        if kind == PropertyObjectKind::Interface
+            && member_record.kind == SyntaxKind::MethodSignature
+            && matches!(
+                &member_record.data,
+                NodeData::MethodSignatureDeclaration(method)
+                    if store.source_node_kind(NodeRef::new(
+                        member.arena,
+                        member.file,
+                        method.name,
+                    )) == Some(SyntaxKind::ComputedPropertyName)
+            )
+            && authenticated_default_library_builtin_symbol_method(store, host, symbol, member)
         {
             continue;
         }
@@ -16858,6 +17195,23 @@ mod generic_publication_tests {
             "interface Shared { max(...values: number[]): number } declare var Shared: Shared;",
             "interface Math { random(): number } declare var Math: Math;",
             "interface Math { random(value: number): number } declare var Math: Math;",
+            concat!(
+                "interface Number { toFixed(fractionDigits?: number): string } ",
+                "interface NumberConstructor {} declare var Number: NumberConstructor;",
+            ),
+            concat!(
+                "interface String { toLowerCase(): string } ",
+                "interface StringConstructor {} declare var String: StringConstructor;",
+            ),
+            concat!(
+                "interface Object { toString(): string } ",
+                "interface ObjectConstructor {} declare var Object: ObjectConstructor;",
+            ),
+            concat!(
+                "interface Symbol { toString(): string; ",
+                "[Symbol.toPrimitive](hint: string): symbol } ",
+                "interface SymbolConstructor {} declare var Symbol: SymbolConstructor;",
+            ),
             concat!(
                 "interface Math { max(...values: number[]): number; random(): number } ",
                 "declare var Math: Math;",

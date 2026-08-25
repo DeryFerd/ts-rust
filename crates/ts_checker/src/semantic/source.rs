@@ -47593,6 +47593,85 @@ mod tests {
     }
 
     #[test]
+    fn default_library_builtin_interfaces_preserve_methods_and_detached_symbol_members() {
+        let library = parsed(concat!(
+            "interface Array<T> {} interface ReadonlyArray<T> {} ",
+            "interface SymbolConstructor {} ",
+            "interface Symbol { toString(): string; valueOf(): symbol; } ",
+            "declare var Symbol: SymbolConstructor; ",
+            "interface Symbol { ",
+            "[Symbol.toPrimitive](hint: string): symbol; ",
+            "readonly [Symbol.toStringTag]: string; ",
+            "} ",
+            "interface NumberConstructor {} ",
+            "interface Number { ",
+            "toString(radix?: number): string; ",
+            "toFixed(fractionDigits?: number): string; ",
+            "valueOf(): number; ",
+            "} declare var Number: NumberConstructor; ",
+            "interface StringConstructor {} ",
+            "interface String { ",
+            "toString(): string; toLowerCase(): string; valueOf(): string; ",
+            "concat(...strings: string[]): string; ",
+            "readonly [index: number]: string; ",
+            "[Symbol.iterator](): StringIterator<string>; ",
+            "} declare var String: StringConstructor; ",
+            "interface ObjectConstructor {} ",
+            "interface Object { toString(): string; valueOf(): Object; } ",
+            "declare var Object: ObjectConstructor;",
+        ));
+        let source = parsed(concat!(
+            "type SymbolValue = Symbol; ",
+            "type NumberValue = Number; ",
+            "type StringValue = String; ",
+            "type ObjectValue = Object;",
+        ));
+        let library_file = FileId::new(9_483);
+        let file = FileId::new(9_484);
+        let mut context = context_with_default_library_files(
+            &[(library_file, &library), (file, &source)],
+            &[library_file],
+            CanonicalCheckerOptions::default(),
+        );
+
+        context.check_source_file(file).unwrap();
+
+        for (owner_name, marker) in [
+            ("Symbol", "toString"),
+            ("Number", "toFixed"),
+            ("String", "toLowerCase"),
+            ("Object", "toString"),
+        ] {
+            let owner = global_symbol(&context, owner_name);
+            let type_ = context.get_declared_type_of_symbol(owner).unwrap();
+            let members = context
+                .store()
+                .symbol(owner)
+                .and_then(ts_binder::semantic::Symbol::members)
+                .and_then(|members| context.store().symbol_table(members))
+                .unwrap();
+            assert!(members.get(InternalSymbolName::Computed.as_ref()).is_none());
+            let method = members.get_source(marker).unwrap();
+            assert_eq!(
+                context.store().authenticated_interface_method_owner(method),
+                Some((owner, type_)),
+            );
+            assert!(
+                context
+                    .store()
+                    .value_symbol_links(method)
+                    .and_then(|links| links.resolved_type)
+                    .is_some()
+            );
+        }
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
     fn cross_file_ambient_globals_reject_poisoned_value_links_before_publication() {
         let declaration = parsed("declare const shared: number;");
         let source = parsed("const observed = shared;");
