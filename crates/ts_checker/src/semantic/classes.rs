@@ -22,8 +22,10 @@
 //! Direct classes can also retain one string-to-number index signature.
 //! Annotated fields admit one authenticated ambient-function decorator.
 //! One direct getter/setter pair can expose an annotated numeric property.
-//! A constructor may retain one string or number parameter. Decorated
-//! parameters remain restricted to one authenticated string parameter.
+//! A constructor may retain one string or number parameter. Exported ambient
+//! declaration-file classes may also retain generic parameters and bodyless
+//! constructors. Decorated parameters remain restricted to one authenticated
+//! string parameter.
 //! A derived constructor may retain one public, interface-typed parameter
 //! property and forward one primitive interface property to its base.
 //! Numeric instance and static fields can retain a direct numeric initializer.
@@ -55,7 +57,10 @@ use super::{
     CanonicalCheckerDiagnosticRange, CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost,
     IndexInfoId, ResolvedSignatureState, SignatureId, SignatureLinks, TypeId,
     bootstrap::LiteralTypeCacheError,
-    declared::{preflight_class_or_interface_reference, preflight_node, type_list_key},
+    declared::{
+        cached_ordinary_type_parameter_owner, preflight_class_or_interface_reference,
+        preflight_node, type_list_key,
+    },
     interface_heritage::{DirectInterfaceBaseKind, plan_direct_interface_heritage},
     links::{SymbolNodeLinks, TypeNodeLinks, ValueSymbolLinks},
     object_members::{
@@ -68,7 +73,7 @@ use super::{
     store::{DirectClassHeritageProvenance, SourceNodeParent},
     type_records::{
         ConstrainedTypeData, ObjectTypeData, StructuredTypeData, TypeCacheState, TypeData,
-        TypeParameterData,
+        TypeParameterData, TypeRecord,
     },
     types::{ObjectFlags, TypeFlags},
 };
@@ -1497,6 +1502,7 @@ fn plan_constructor(
     owner: SemanticSymbolId,
     declaration: NodeRef,
     instance_members: Option<SymbolTableId>,
+    ambient: bool,
 ) -> Result<ClassConstructorPlan, ClassError> {
     let record = preflight_node(store, host, declaration)?;
     let NodeData::ConstructorDeclaration(constructor) = &record.data else {
@@ -1536,34 +1542,37 @@ fn plan_constructor(
             )
         })
         .transpose()?;
-    let body = constructor
-        .body
-        .map(|body| NodeRef::new(declaration.arena, declaration.file, body))
-        .ok_or_else(|| {
-            unsupported(ClassUnsupported::Member {
+    match constructor.body {
+        None if ambient => {}
+        Some(body) if !ambient => {
+            let body = NodeRef::new(declaration.arena, declaration.file, body);
+            let body_record = preflight_node(store, host, body)?;
+            let NodeData::Block(block) = &body_record.data else {
+                return Err(invariant(ClassInvariant::InvalidProperty(declaration)));
+            };
+            if body_record.kind != SyntaxKind::Block
+                || body_record.parent != Some(declaration.node)
+                || body_record.flags.0 != 0
+                || body_record.range.start < constructor.parameters.range.end
+                || body_record.range.end != record.range.end
+                || block.facts != 0
+                || block.statements.has_trailing_comma
+            {
+                return Err(invariant(ClassInvariant::InvalidProperty(declaration)));
+            }
+            if !block.statements.nodes.is_empty() {
+                return Err(unsupported(ClassUnsupported::Member {
+                    node: declaration,
+                    kind: SyntaxKind::Constructor,
+                }));
+            }
+        }
+        _ => {
+            return Err(unsupported(ClassUnsupported::Member {
                 node: declaration,
                 kind: SyntaxKind::Constructor,
-            })
-        })?;
-    let body_record = preflight_node(store, host, body)?;
-    let NodeData::Block(block) = &body_record.data else {
-        return Err(invariant(ClassInvariant::InvalidProperty(declaration)));
-    };
-    if body_record.kind != SyntaxKind::Block
-        || body_record.parent != Some(declaration.node)
-        || body_record.flags.0 != 0
-        || body_record.range.start < constructor.parameters.range.end
-        || body_record.range.end != record.range.end
-        || block.facts != 0
-        || block.statements.has_trailing_comma
-    {
-        return Err(invariant(ClassInvariant::InvalidProperty(declaration)));
-    }
-    if !block.statements.nodes.is_empty() {
-        return Err(unsupported(ClassUnsupported::Member {
-            node: declaration,
-            kind: SyntaxKind::Constructor,
-        }));
+            }));
+        }
     }
 
     let visibility = class_constructor_visibility(
@@ -4798,6 +4807,13 @@ fn plan_class_declaration_modifiers(
 
     let expected = match modifiers.list.nodes.as_slice() {
         [_] => &[SyntaxKind::DeclareKeyword][..],
+        [_, modifier]
+            if host
+                .node(NodeRef::new(declaration.arena, declaration.file, *modifier))
+                .is_some_and(|modifier| modifier.kind == SyntaxKind::DefaultKeyword) =>
+        {
+            &[SyntaxKind::ExportKeyword, SyntaxKind::DefaultKeyword][..]
+        }
         [_, _] => &[SyntaxKind::ExportKeyword, SyntaxKind::DeclareKeyword][..],
         _ => {
             return Err(unsupported(ClassUnsupported::DeclarationModifiers(
@@ -4816,6 +4832,7 @@ fn plan_class_declaration_modifiers(
         let spelling = match kind {
             SyntaxKind::ExportKeyword => "export",
             SyntaxKind::DeclareKeyword => "declare",
+            SyntaxKind::DefaultKeyword => "default",
             _ => unreachable!("only exported ambient class modifiers are planned"),
         };
         if record.kind != *kind {
@@ -4858,20 +4875,26 @@ fn plan_class_declaration_modifiers(
     let Some(NodeData::Identifier(identifier)) = host.node(name).map(|record| &record.data) else {
         return Err(invariant(ClassInvariant::InvalidName(name)));
     };
+    let default_export = expected.last() == Some(&SyntaxKind::DefaultKeyword);
     let source_locals = bound
         .locals(bound.source_file())
         .and_then(|locals| store.symbol_table(locals));
-    if !bound
-        .source_facts()
-        .is_some_and(ts_binder::CanonicalSourceFileFacts::is_external_module)
-        || bound.symbol(bound.source_file()) != Some(parent)
+    if !bound.source_facts().is_some_and(|facts| {
+        facts.is_external_module() && (!default_export || facts.is_declaration_file())
+    }) || bound.symbol(bound.source_file()) != Some(parent)
         || store.get_merged_symbol(parent) != Some(parent)
         || parent_record.flags() != SymbolFlags::VALUE_MODULE
         || parent_record
             .exports()
             .and_then(|exports| store.symbol_table(exports))
-            .and_then(|exports| exports.get_source(&identifier.text))
+            .and_then(|exports| exports.get(owner.name()))
             != Some(symbol)
+        || owner.name().as_utf8()
+            != Some(if default_export {
+                "default"
+            } else {
+                identifier.text.as_str()
+            })
         || local == symbol
         || local_record.flags() != SymbolFlags::EXPORT_VALUE
         || local_record.check_flags() != CheckFlags::NONE
@@ -4965,7 +4988,17 @@ fn plan_class_declaration(
         name,
         class.modifiers.as_ref(),
     )?;
-    if class.type_parameters.is_some() {
+    let exported_ambient_declaration = ambient
+        && export_local.is_some()
+        && host.bound_file(declaration).is_some_and(|bound| {
+            bound.source_facts().is_some_and(|facts| {
+                facts.is_declaration_file()
+                    && facts.is_external_module()
+                    && !facts.is_common_js_module()
+                    && !facts.is_javascript_file()
+            })
+        });
+    if class.type_parameters.is_some() && !exported_ambient_declaration {
         return Err(unsupported(ClassUnsupported::Generic(declaration)));
     }
     if symbol_record.flags() != SymbolFlags::CLASS && class.heritage_clauses.is_some() {
@@ -5018,7 +5051,14 @@ fn plan_class_declaration(
         || name_record.flags.0 != 0
         || name_record.range.start < declaration_record.range.start
         || name_record.range.end > declaration_record.range.end
-        || symbol_record.name().as_utf8() != Some(identifier.text.as_str())
+        || symbol_record.name().as_utf8()
+            != Some(
+                if symbol_record.name() == InternalSymbolName::Default.as_ref() {
+                    "default"
+                } else {
+                    identifier.text.as_str()
+                },
+            )
     {
         return Err(invariant(ClassInvariant::InvalidName(name)));
     }
@@ -5107,7 +5147,7 @@ fn plan_class_declaration(
                     base,
                 )?
             } else {
-                plan_constructor(store, host, symbol, member, instance_members)?
+                plan_constructor(store, host, symbol, member, instance_members, ambient)?
             };
             if let Some(parameter) = planned.parameter_property {
                 let name = store
@@ -5301,10 +5341,16 @@ fn plan_class_declaration(
         }
     }
 
+    let local_arity =
+        preflight_class_or_interface_reference(store, host, symbol, SymbolFlags::CLASS)?;
+    if local_arity != 0 && !exported_ambient_declaration {
+        return Err(unsupported(ClassUnsupported::Generic(declaration)));
+    }
     let instance_table = instance_members.and_then(|table| store.symbol_table(table));
     let expected_instance_members = instance_properties
         .len()
-        .checked_add(instance_methods.len())
+        .checked_add(local_arity)
+        .and_then(|count| count.checked_add(instance_methods.len()))
         .and_then(|count| count.checked_add(usize::from(constructor.is_some())))
         .and_then(|count| {
             count.checked_add(usize::from(
@@ -5361,11 +5407,6 @@ fn plan_class_declaration(
         return Err(invariant(ClassInvariant::InvalidOwnerSymbol(symbol)));
     }
 
-    let local_arity =
-        preflight_class_or_interface_reference(store, host, symbol, SymbolFlags::CLASS)?;
-    if local_arity != 0 {
-        return Err(unsupported(ClassUnsupported::Generic(declaration)));
-    }
     Ok(ClassDeclarationPlan {
         declaration,
         symbol,
@@ -10304,9 +10345,7 @@ fn exact_class_instance_identity(
     let TypeData::Interface(instance) = record.data() else {
         return None;
     };
-    let [this_type] = instance.all_type_parameters.as_deref()? else {
-        return None;
-    };
+    let (this_type, type_parameters) = instance.all_type_parameters.as_deref()?.split_last()?;
     let this_record = store.type_payload(*this_type)?;
     let TypeData::TypeParameter(this) = this_record.data() else {
         return None;
@@ -10322,10 +10361,16 @@ fn exact_class_instance_identity(
         && instance.this_type == Some(*this_type)
         && instance.reference.object.target == Some(instance_type)
         && instance.reference.object.mapper.is_none()
-        && instantiations.len() == 1
-        && instantiations.get(&type_list_key(&[])) == Some(&instance_type)
+        && (type_parameters.is_empty() && instantiations.len() == 1
+            || !type_parameters.is_empty() && !instantiations.is_empty())
+        && instantiations.get(&type_list_key(type_parameters)) == Some(&instance_type)
         && instance.reference.node.is_none()
-        && instance.reference.resolved_type_arguments.as_deref() == Some(&[][..])
+        && instance.reference.resolved_type_arguments.as_deref() == Some(type_parameters)
+        && type_parameters.iter().all(|type_| {
+            cached_ordinary_type_parameter_owner(store, *type_)
+                .and_then(|parameter| store.get_parent_of_symbol(parameter))
+                == Some(symbol)
+        })
         && this_record.flags() == TypeFlags::TYPE_PARAMETER
         && this_record.object_flags() == ObjectFlags::NONE
         && this_record.symbol() == Some(symbol)
@@ -10354,12 +10399,20 @@ fn exact_construct_signature(
     declaration: Option<NodeRef>,
     parameter: Option<SemanticSymbolId>,
 ) -> bool {
+    let Some(TypeData::Interface(instance)) =
+        store.type_payload(instance_type).map(TypeRecord::data)
+    else {
+        return false;
+    };
+    let Some(type_parameters) = instance.reference.resolved_type_arguments.as_deref() else {
+        return false;
+    };
     store.signature(signature).is_some_and(|signature| {
         signature.flags() == SignatureFlags::CONSTRUCT
             && signature.min_argument_count() == i32::from(parameter.is_some())
             && signature.resolved_min_argument_count() == -1
             && signature.declaration() == declaration
-            && signature.type_parameters().is_empty()
+            && signature.type_parameters() == type_parameters
             && signature.parameters() == parameter.as_slice()
             && signature.this_parameter().is_none()
             && signature.resolved_return_type() == Some(instance_type)
@@ -11249,8 +11302,13 @@ pub(super) fn execute_nongeneric_class_shells(
     }
 
     let cold_instance = state.instance.is_none();
+    let local_arity =
+        preflight_class_or_interface_reference(store, host, plan.symbol, SymbolFlags::CLASS)?;
+    let instance_types = local_arity
+        .checked_add(2)
+        .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.declaration)))?;
     let additional = 1usize
-        .checked_add(usize::from(cold_instance) * 2)
+        .checked_add(usize::from(cold_instance) * instance_types)
         .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.declaration)))?;
     let missing_base_type_node = usize::from(
         plan.null_base
@@ -11799,8 +11857,13 @@ pub(super) fn execute_nongeneric_class_members(
     let shell = shell_state(store, host, &plan.class)?;
     let cold_instance = shell.instance.is_none();
     let cold_value = matches!(shell.value, StaticShellState::Cold);
+    let local_arity =
+        preflight_class_or_interface_reference(store, host, plan.class.symbol, SymbolFlags::CLASS)?;
+    let instance_types = local_arity
+        .checked_add(2)
+        .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
     let additional_types = usize::from(cold_value)
-        .checked_add(usize::from(cold_instance) * 2)
+        .checked_add(usize::from(cold_instance) * instance_types)
         .and_then(|count| count.checked_add(plan.class.methods.len()))
         .and_then(|count| {
             plan.class
@@ -12057,6 +12120,23 @@ pub(super) fn execute_nongeneric_class_members(
     }
 
     let shells = execute_nongeneric_class_shells(store, host, &plan.class)?;
+    let type_parameters = match store
+        .type_payload(shells.instance_type)
+        .map(TypeRecord::data)
+    {
+        Some(TypeData::Interface(instance)) => {
+            instance
+                .reference
+                .resolved_type_arguments
+                .clone()
+                .ok_or_else(|| invariant(ClassInvariant::InvalidInstanceCache(plan.class.symbol)))?
+        }
+        _ => {
+            return Err(invariant(ClassInvariant::InvalidInstanceCache(
+                plan.class.symbol,
+            )));
+        }
+    };
     let instance_members = prepared_instance_members.map(|prepared| {
         let table = store.alloc_prepared_symbol_table(prepared);
         for (name, symbol) in instance_member_entries {
@@ -12074,7 +12154,7 @@ pub(super) fn execute_nongeneric_class_members(
                 .alloc_signature(
                     SignatureFlags::CONSTRUCT,
                     plan.constructor_declaration(),
-                    Vec::new(),
+                    type_parameters,
                     None,
                     constructor_parameters,
                     Some(shells.instance_type),
@@ -14424,10 +14504,19 @@ fn stored_declared_properties(
         return None;
     }
     let mut properties = Vec::new();
+    let mut type_parameter_count = 0usize;
     properties.try_reserve_exact(table.len()).ok()?;
     for (name, property) in table.iter() {
-        if store.symbol(property)?.name() != name {
+        let record = store.symbol(property)?;
+        if record.name() != name {
             return None;
+        }
+        if prototype.is_none()
+            && record.flags() == SymbolFlags::TYPE_PARAMETER
+            && store.get_parent_of_symbol(property) == Some(owner)
+        {
+            type_parameter_count = type_parameter_count.checked_add(1)?;
+            continue;
         }
         if Some(property) == prototype || Some(property) == constructor || Some(property) == index {
             continue;
@@ -14465,6 +14554,7 @@ fn stored_declared_properties(
     }
     let expected_len = properties
         .len()
+        .checked_add(type_parameter_count)?
         .checked_add(usize::from(prototype.is_some()))?
         .checked_add(usize::from(constructor.is_some()))?
         .checked_add(usize::from(index.is_some()))?;

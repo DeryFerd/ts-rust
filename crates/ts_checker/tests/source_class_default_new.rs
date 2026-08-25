@@ -143,6 +143,102 @@ fn first_new_expression(parsed: &ParseResult, file: FileId) -> NodeRef {
         .expect("fixture contains a new expression")
 }
 
+fn package_class_context<'arena>(
+    importer: &'arena ParseResult,
+    declaration: &'arena ParseResult,
+    importer_file: FileId,
+    declaration_file: FileId,
+) -> (CanonicalCheckerContext<'arena>, NodeRef) {
+    assert!(
+        importer.diagnostics.is_empty(),
+        "{:?}",
+        importer.diagnostics
+    );
+    assert!(
+        declaration.diagnostics.is_empty(),
+        "{:?}",
+        declaration.diagnostics
+    );
+    let (specifier, binding) = importer
+        .arena
+        .iter()
+        .find_map(|(_, record)| {
+            let NodeData::ImportDeclaration(import) = &record.data else {
+                return None;
+            };
+            let clause_node = import.import_clause?;
+            let NodeData::ImportClause(clause) = &importer.arena.get(clause_node)?.data else {
+                return None;
+            };
+            let binding = if clause.name.is_some() {
+                clause_node
+            } else {
+                let NodeData::NamedImports(named) =
+                    &importer.arena.get(clause.named_bindings?)?.data
+                else {
+                    return None;
+                };
+                *named.elements.nodes.first()?
+            };
+            Some((
+                NodeRef::new(importer.arena.id(), importer_file, import.module_specifier),
+                NodeRef::new(importer.arena.id(), importer_file, binding),
+            ))
+        })
+        .expect("fixture has one package class import");
+
+    let mut binder = CanonicalBinder::new();
+    for (file, parsed, path, ambient) in [
+        (importer_file, importer, "\"/makeC.ts\"", false),
+        (
+            declaration_file,
+            declaration,
+            "\"/node_modules/pkg/index.d.ts\"",
+            true,
+        ),
+    ] {
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source(path),
+                    CanonicalSourceLanguage::TypeScript,
+                    ambient,
+                    CanonicalModuleState::External,
+                ),
+            )
+            .unwrap();
+    }
+    for (file, parsed) in [(importer_file, importer), (declaration_file, declaration)] {
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+    }
+
+    let context = CanonicalCheckerContext::new_with_module_resolutions(
+        binder.finish(),
+        [
+            (importer_file, &importer.arena),
+            (declaration_file, &declaration.arena),
+        ]
+        .into_iter()
+        .collect(),
+        CanonicalCheckerOptions::default(),
+        CanonicalModuleResolutionManifestInput::new([CanonicalModuleResolutionEntry::resolved(
+            specifier,
+            CanonicalResolvedModuleInput::new(
+                declaration_file,
+                CanonicalModuleResolutionMode::Esm,
+                CanonicalModuleResolutionMode::Esm,
+            ),
+        )]),
+    )
+    .unwrap();
+    (context, binding)
+}
+
 #[test]
 #[allow(clippy::too_many_lines)] // The exact multi-file fixture proves alias and class identity.
 fn imported_ambient_default_new_preserves_private_fields_and_inferred_returns() {
@@ -390,6 +486,547 @@ fn imported_ambient_default_new_preserves_private_fields_and_inferred_returns() 
             context.store().type_node_links(construction).cloned(),
             context.store().value_symbol_links(alias).cloned(),
             context.store().value_symbol_links(private_field).cloned(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // The upstream fixture retains two package targets and two users.
+fn package_exports_false_fixture_preserves_the_resolved_package_class_through_reexported_calls() {
+    let package = parse_source_file("export declare class C {\n  private p;\n}\n");
+    let exported_package = parse_source_file("export declare class C {\n  private p;\n}\n");
+    let factory = parse_source_file(concat!(
+        "import { C } from \"pkg\";\n",
+        "export function makeC() {\n",
+        "  return new C();\n",
+        "}\n",
+    ));
+    let consumer = parse_source_file(concat!(
+        "import { makeC } from \"./makeC\";\n",
+        "export const c = makeC();\n",
+    ));
+    let package_file = FileId::new(1_850);
+    let exported_package_file = FileId::new(1_851);
+    let factory_file = FileId::new(1_852);
+    let consumer_file = FileId::new(1_853);
+
+    let mut binder = CanonicalBinder::new();
+    for (parsed, file, path, ambient) in [
+        (
+            &package,
+            package_file,
+            "\"/node_modules/pkg/index.d.ts\"",
+            true,
+        ),
+        (
+            &exported_package,
+            exported_package_file,
+            "\"/node_modules/pkg/dist/index.d.ts\"",
+            true,
+        ),
+        (&factory, factory_file, "\"/makeC.ts\"", false),
+        (&consumer, consumer_file, "\"/index.ts\"", false),
+    ] {
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source(path),
+                    CanonicalSourceLanguage::TypeScript,
+                    ambient,
+                    CanonicalModuleState::External,
+                ),
+            )
+            .unwrap();
+    }
+    for (parsed, file) in [
+        (&package, package_file),
+        (&exported_package, exported_package_file),
+        (&factory, factory_file),
+        (&consumer, consumer_file),
+    ] {
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+    }
+    let import_specifier = |parsed: &ParseResult, file| {
+        parsed
+            .arena
+            .iter()
+            .find_map(|(_, record)| {
+                let NodeData::ImportDeclaration(import) = &record.data else {
+                    return None;
+                };
+                Some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    import.module_specifier,
+                ))
+            })
+            .expect("the user source retains its module import")
+    };
+    let resolutions = [
+        (import_specifier(&factory, factory_file), package_file),
+        (import_specifier(&consumer, consumer_file), factory_file),
+    ]
+    .map(|(specifier, target)| {
+        CanonicalModuleResolutionEntry::resolved(
+            specifier,
+            CanonicalResolvedModuleInput::new(
+                target,
+                CanonicalModuleResolutionMode::Esm,
+                CanonicalModuleResolutionMode::Esm,
+            ),
+        )
+    });
+    let mut context = CanonicalCheckerContext::new_with_module_resolutions(
+        binder.finish(),
+        [
+            (package_file, &package.arena),
+            (exported_package_file, &exported_package.arena),
+            (factory_file, &factory.arena),
+            (consumer_file, &consumer.arena),
+        ]
+        .into_iter()
+        .collect(),
+        CanonicalCheckerOptions::default(),
+        CanonicalModuleResolutionManifestInput::new(resolutions),
+    )
+    .unwrap();
+    let resolved_class = class_symbol(&package, package_file, &context, "C");
+    let exported_class = class_symbol(&exported_package, exported_package_file, &context, "C");
+    assert_ne!(resolved_class, exported_class);
+
+    for file in [
+        package_file,
+        exported_package_file,
+        factory_file,
+        consumer_file,
+    ] {
+        context.check_source_file(file).unwrap();
+    }
+
+    let resolved_members = context
+        .get_nongeneric_class_members(resolved_class)
+        .unwrap();
+    let exported_members = context
+        .get_nongeneric_class_members(exported_class)
+        .unwrap();
+    assert_ne!(
+        resolved_members.declared_instance_properties(),
+        exported_members.declared_instance_properties(),
+    );
+    let value = variable_symbol(&consumer, consumer_file, &context, "c");
+    assert_eq!(
+        context
+            .store()
+            .value_symbol_links(value)
+            .and_then(|links| links.resolved_type),
+        Some(resolved_members.shells().instance_type()),
+    );
+    assert!(context.diagnostics().is_empty());
+
+    let warm = (
+        context.store().type_len(),
+        context.store().signature_len(),
+        context.store().symbol_len(),
+        context.store().relation_state_snapshot(),
+    );
+    context.recheck_source_file(factory_file).unwrap();
+    context.recheck_source_file(consumer_file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().symbol_len(),
+            context.store().relation_state_snapshot(),
+        ),
+        warm,
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Alias, argument, and warm identities share one source graph.
+fn imported_ambient_constructor_arguments_preserve_named_and_default_aliases() {
+    for (index, (declaration_text, importer_text, expected)) in [
+        (
+            concat!(
+                "export declare class C {\n",
+                "  constructor(value: string);\n",
+                "  private p;\n",
+                "}\n",
+            ),
+            concat!(
+                "import { C as Renamed } from \"pkg\";\n",
+                "export function makeC() { return new Renamed(\"ready\"); }\n",
+            ),
+            "string",
+        ),
+        (
+            concat!(
+                "export default class C {\n",
+                "  constructor(value: number);\n",
+                "  private p;\n",
+                "}\n",
+            ),
+            concat!(
+                "import Selected from \"pkg\";\n",
+                "export function makeC() { return new Selected(1); }\n",
+            ),
+            "number",
+        ),
+        (
+            concat!(
+                "export declare class C {\n",
+                "  constructor(value: number);\n",
+                "  private p;\n",
+                "}\n",
+                "export { C as default };\n",
+            ),
+            concat!(
+                "import Selected from \"pkg\";\n",
+                "export function makeC() { return new Selected(1); }\n",
+            ),
+            "number",
+        ),
+        (
+            concat!(
+                "export declare class C {\n",
+                "  constructor(value: string);\n",
+                "  private p;\n",
+                "}\n",
+                "export default C;\n",
+            ),
+            concat!(
+                "import Selected from \"pkg\";\n",
+                "export function makeC() { return new Selected(\"ready\"); }\n",
+            ),
+            "string",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let declaration = parse_source_file(declaration_text);
+        let importer = parse_source_file(importer_text);
+        let importer_file = FileId::new(1_830 + u32::try_from(index).unwrap() * 2);
+        let declaration_file = FileId::new(1_831 + u32::try_from(index).unwrap() * 2);
+        let (mut context, binding) =
+            package_class_context(&importer, &declaration, importer_file, declaration_file);
+        let target = class_symbol(&declaration, declaration_file, &context, "C");
+        let alias = context
+            .file(importer_file)
+            .unwrap()
+            .1
+            .symbol(binding)
+            .unwrap();
+        let construction = first_new_expression(&importer, importer_file);
+        let NodeData::NewExpression(expression) =
+            &importer.arena.get(construction.node).unwrap().data
+        else {
+            panic!("the constructor fixture must retain its argument")
+        };
+        let argument = NodeRef::new(
+            construction.arena,
+            construction.file,
+            expression.arguments.as_ref().unwrap().nodes[0],
+        );
+
+        if index != 0 {
+            context.check_source_file(declaration_file).unwrap();
+        }
+        context.check_source_file(importer_file).unwrap();
+
+        let members = context.get_nongeneric_class_members(target).unwrap();
+        let signature = context
+            .store()
+            .signature_links(construction)
+            .and_then(|links| links.resolved_signature.signature())
+            .unwrap();
+        assert_eq!(signature, members.default_construct_signature());
+        let [parameter] = context.store().signature(signature).unwrap().parameters() else {
+            panic!("the imported constructor retains exactly one parameter")
+        };
+        let parameter_type = context
+            .store()
+            .value_symbol_links(*parameter)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        assert_eq!(context.type_to_string(parameter_type).unwrap(), expected);
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(constructor(&importer, construction))
+                .and_then(|links| links.resolved_symbol),
+            Some(alias),
+        );
+        assert!(
+            context
+                .store()
+                .type_node_links(argument)
+                .and_then(|links| links.resolved_type)
+                .is_some(),
+        );
+        assert_eq!(
+            context
+                .store()
+                .alias_symbol_links(alias)
+                .unwrap()
+                .alias_target,
+            AliasTargetState::Resolved(target),
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().mapper_len(),
+            context.store().symbol_len(),
+        );
+        context.recheck_source_file(importer_file).unwrap();
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().mapper_len(),
+                context.store().symbol_len(),
+            ),
+            warm,
+        );
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Explicit and inferred references require one retained graph.
+fn imported_ambient_generic_constructors_preserve_instantiated_class_identity() {
+    const GENERIC_PACKAGE: &str = concat!(
+        "export declare class Box<T> { private p; }\n",
+        "export { Box as default };\n",
+    );
+    for (index, (declaration_text, importer_text, expected)) in [
+        (
+            GENERIC_PACKAGE,
+            concat!(
+                "import { Box } from \"pkg\";\n",
+                "export function makeBox() { return new Box<string>(); }\n",
+            ),
+            "Box<string>",
+        ),
+        (
+            GENERIC_PACKAGE,
+            concat!(
+                "import { Box } from \"pkg\";\n",
+                "export function makeBox() { return new Box(); }\n",
+            ),
+            "Box<unknown>",
+        ),
+        (
+            GENERIC_PACKAGE,
+            concat!(
+                "import Selected from \"pkg\";\n",
+                "export function makeBox() { return new Selected<number>(); }\n",
+            ),
+            "Box<number>",
+        ),
+        (
+            concat!(
+                "export declare class Box<T> {\n",
+                "  constructor(value: number);\n",
+                "  private p;\n",
+                "}\n",
+                "export { Box as default };\n",
+            ),
+            concat!(
+                "import Selected from \"pkg\";\n",
+                "export function makeBox() { return new Selected<string>(1); }\n",
+            ),
+            "Box<string>",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let declaration = parse_source_file(declaration_text);
+        let importer = parse_source_file(importer_text);
+        let importer_file = FileId::new(1_840 + u32::try_from(index).unwrap() * 2);
+        let declaration_file = FileId::new(1_841 + u32::try_from(index).unwrap() * 2);
+        let (mut context, binding) =
+            package_class_context(&importer, &declaration, importer_file, declaration_file);
+        let target = class_symbol(&declaration, declaration_file, &context, "Box");
+        let alias = context
+            .file(importer_file)
+            .unwrap()
+            .1
+            .symbol(binding)
+            .unwrap();
+        let construction = first_new_expression(&importer, importer_file);
+
+        if index != 0 {
+            context.check_source_file(declaration_file).unwrap();
+        }
+        context.check_source_file(importer_file).unwrap();
+
+        let members = context.get_nongeneric_class_members(target).unwrap();
+        let &[private_field] = members.declared_instance_properties() else {
+            panic!("the generic package class must preserve its private field")
+        };
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(private_field)
+                .and_then(|links| links.resolved_type),
+            Some(context.store().intrinsic_bootstrap().unwrap().any_type),
+        );
+        let instance = context
+            .store()
+            .type_node_links(construction)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        assert_eq!(context.type_to_string(instance).unwrap(), expected);
+        let TypeData::TypeReference(reference) =
+            context.store().type_payload(instance).unwrap().data()
+        else {
+            panic!("generic construction must preserve its canonical class reference")
+        };
+        assert_eq!(
+            reference.object.target,
+            context
+                .store()
+                .declared_type_links(target)
+                .and_then(|links| links.declared_type),
+        );
+        assert_eq!(reference.resolved_type_arguments.as_ref().unwrap().len(), 1);
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(constructor(&importer, construction))
+                .and_then(|links| links.resolved_symbol),
+            Some(alias),
+        );
+        let signature = context
+            .store()
+            .signature_links(construction)
+            .and_then(|links| links.resolved_signature.signature())
+            .unwrap();
+        let base_signature = members.default_construct_signature();
+        assert_ne!(signature, base_signature);
+        assert_eq!(
+            context
+                .store()
+                .signature(base_signature)
+                .unwrap()
+                .type_parameters()
+                .len(),
+            1,
+        );
+        assert_eq!(
+            context.store().signature(signature).unwrap().target(),
+            Some(base_signature),
+        );
+        assert_eq!(
+            context
+                .store()
+                .signature(signature)
+                .unwrap()
+                .resolved_return_type(),
+            Some(instance),
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().mapper_len(),
+            context.store().symbol_len(),
+        );
+        context.recheck_source_file(importer_file).unwrap();
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().mapper_len(),
+                context.store().symbol_len(),
+            ),
+            warm,
+        );
+    }
+}
+
+#[test]
+fn invalid_imported_ambient_constructor_arguments_leave_class_state_cold() {
+    let declaration = parse_source_file(concat!(
+        "export declare class C {\n",
+        "  constructor(value: number);\n",
+        "  private p;\n",
+        "}\n",
+    ));
+    for (index, expression) in ["new C()", "new C(\"wrong\")", "new C<string>(1)"]
+        .into_iter()
+        .enumerate()
+    {
+        let importer = parse_source_file(&format!(
+            "import {{ C }} from \"pkg\"; export function makeC() {{ return {expression}; }}",
+        ));
+        let importer_file = FileId::new(1_860 + u32::try_from(index).unwrap() * 2);
+        let declaration_file = FileId::new(1_861 + u32::try_from(index).unwrap() * 2);
+        let (mut context, _) =
+            package_class_context(&importer, &declaration, importer_file, declaration_file);
+        let target = class_symbol(&declaration, declaration_file, &context, "C");
+        let construction = first_new_expression(&importer, importer_file);
+
+        assert_eq!(
+            context.check_source_file(importer_file),
+            Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::New(
+                construction,
+            ))),
+            "{expression}",
+        );
+        assert!(context.store().declared_type_links(target).is_none());
+        assert!(context.store().value_symbol_links(target).is_none());
+        assert!(context.store().type_node_links(construction).is_none());
+        assert!(context.diagnostics().is_empty());
+    }
+}
+
+#[test]
+fn default_exported_private_constructor_diagnostics_use_the_declared_class_name() {
+    let declaration = parse_source_file(concat!(
+        "export default class Hidden {\n",
+        "  private constructor();\n",
+        "  private p;\n",
+        "}\n",
+    ));
+    let importer = parse_source_file(concat!(
+        "import Selected from \"pkg\";\n",
+        "export function makeHidden() { return new Selected(); }\n",
+    ));
+    let importer_file = FileId::new(1_870);
+    let declaration_file = FileId::new(1_871);
+    let (mut context, _) =
+        package_class_context(&importer, &declaration, importer_file, declaration_file);
+
+    context.check_source_file(importer_file).unwrap();
+
+    let [diagnostic] = context.diagnostics().as_slice() else {
+        panic!("a private imported constructor must report one accessibility diagnostic")
+    };
+    assert_eq!(diagnostic.diagnostic.code(), 2673);
+    assert_eq!(diagnostic.diagnostic.arguments, ["Hidden".to_owned()]);
+    let warm = (
+        context.store().type_len(),
+        context.store().signature_len(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(importer_file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().signature_len(),
             context.diagnostics().clone(),
         ),
         warm,

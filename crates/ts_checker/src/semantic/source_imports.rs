@@ -11,8 +11,8 @@
 //! flag. Comment-only typedef imports authenticate promoted `CommonJS` type
 //! exports through their exact module-specifier nodes. Value preparation
 //! supports initialized annotated `const` declarations, exported ambient
-//! classes from declaration files, authenticated `CommonJS` variables and named
-//! assignments, explicit and implicit ambient
+//! classes and generic constructors from declaration files, authenticated
+//! `CommonJS` variables and named assignments, explicit and implicit ambient
 //! `export const` declarations in retained declaration files, annotated
 //! `FunctionDeclaration`s, already-published inferred object constants, and
 //! narrowly authenticated cold async-arrow object constants with canonical
@@ -3807,13 +3807,23 @@ fn plan_direct_ambient_class_target(
             .and_then(|exports| store.symbol_table(exports))
             .and_then(|exports| exports.get(record.name()))
             != Some(target)
-        || !has_exact_export_declare_modifiers(
+        || !(has_exact_export_declare_modifiers(
             arena,
             bound,
             store,
             declaration,
             class.modifiers.as_ref(),
-        )?
+        )? || has_exact_modifier_sequence(
+            arena,
+            bound,
+            store,
+            declaration,
+            class.modifiers.as_ref(),
+            &[
+                (SyntaxKind::ExportKeyword, "export"),
+                (SyntaxKind::DefaultKeyword, "default"),
+            ],
+        )?)
     {
         return Err(unsupported(SourceImportUnsupported::TargetDeclaration(
             declaration,
@@ -6924,6 +6934,12 @@ fn validate_prepared_import_value(
             instance_type,
             signature,
         } => {
+            let type_parameters = store.type_payload(*instance_type).and_then(|record| {
+                let TypeData::Interface(instance) = record.data() else {
+                    return None;
+                };
+                instance.reference.resolved_type_arguments.as_deref()
+            });
             store.symbol(prepared.target_symbol).is_some_and(|target| {
                 target.flags() == SymbolFlags::CLASS
                     && target.value_declaration() == Some(prepared.target_declaration)
@@ -6938,7 +6954,10 @@ fn validate_prepared_import_value(
                     .and_then(|links| links.resolved_type)
                     == Some(prepared.type_)
                 && store.signature(*signature).is_some_and(|signature| {
-                    signature.resolved_return_type() == Some(*instance_type)
+                    signature.flags() == super::signatures::SignatureFlags::CONSTRUCT
+                        && signature.resolved_return_type() == Some(*instance_type)
+                        && type_parameters
+                            .is_some_and(|expected| signature.type_parameters() == expected)
                 })
                 && store
                     .type_payload(prepared.type_)

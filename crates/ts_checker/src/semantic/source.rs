@@ -2,8 +2,8 @@
 //!
 //! This module deliberately supports only unmodified type aliases and simple
 //! interfaces, top-level nongeneric classes with primitive annotated fields
-//! and at most one exact direct preceding local nongeneric base, empty exported
-//! classes,
+//! and at most one exact direct preceding local nongeneric base, exported
+//! generic ambient declaration-file classes, empty exported classes,
 //! exact construction of preceding admitted classes, imported ambient classes,
 //! and declared constructors inside top-level values, assignments, property
 //! receivers, statements, and direct top-level function returns,
@@ -6679,6 +6679,41 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             return Ok(None);
         };
         let name_start = self.node(self.reference(name))?.range.start.get();
+        if let [export, default] = modifiers.list.nodes.as_slice()
+            && self
+                .bound
+                .source_facts()
+                .is_some_and(ts_binder::CanonicalSourceFileFacts::is_declaration_file)
+            && self.node(self.reference(*default))?.kind == SyntaxKind::DefaultKeyword
+        {
+            let export = self.reference(*export);
+            let default = self.reference(*default);
+            let export_node = self.node(export)?;
+            let default_node = self.node(default)?;
+            if !is_external_module
+                || modifiers.flags.0 != 0
+                || modifiers.list.has_trailing_comma
+                || modifiers.list.range.start != declaration_range.start
+                || modifiers.list.range.end.get() > name_start
+                || export_node.kind != SyntaxKind::ExportKeyword
+                || export_node.flags.0 != 0
+                || export_node.parent != Some(declaration.node)
+                || export_node.range.start != declaration_range.start
+                || export_node.range.end > default_node.range.start
+                || !matches!(export_node.data, NodeData::Token(_))
+                || !self.source_spelling_matches(export, "export")
+                || default_node.flags.0 != 0
+                || default_node.parent != Some(declaration.node)
+                || default_node.range.end.get() > modifiers.list.range.end.get()
+                || !matches!(default_node.data, NodeData::Token(_))
+                || !self.source_spelling_matches(default, "default")
+            {
+                return Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Class(declaration),
+                ));
+            }
+            return Ok(Some(export));
+        }
         match self.validate_function_modifiers(
             declaration,
             declaration_range,
@@ -9408,6 +9443,24 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                                 })
                         })
                 });
+            let prior_class_symbol = (local_record.flags() == SymbolFlags::EXPORT_VALUE)
+                .then_some(local_record.export_symbol())
+                .flatten()
+                .filter(|symbol| {
+                    self.planned_classes.contains(symbol)
+                        && store.symbol(*symbol).is_some_and(|class| {
+                            class.flags() == SymbolFlags::CLASS
+                                && class.value_declaration().is_some_and(|declaration| {
+                                    declaration.is_for(self.arena.id(), self.bound.file_id())
+                                        && self.node(declaration).is_ok_and(|record| {
+                                            record.kind == SyntaxKind::ClassDeclaration
+                                                && record.parent
+                                                    == Some(self.source.node_ref().node)
+                                                && record.range.end <= statement_node.range.start
+                                        })
+                                })
+                        })
+                });
             let is_prior_namespace = local_record.flags().intersects(SymbolFlags::MODULE)
                 && local_record
                     .flags()
@@ -9469,6 +9522,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 || (!export.is_type_only
                     && !is_prior_enum
                     && !is_prior_function
+                    && prior_class_symbol.is_none()
                     && !is_prior_namespace
                     && !is_prior_named_value_import
                     && !is_prior_variable)
@@ -9487,6 +9541,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             let alias_record = store
                 .symbol(alias)
                 .ok_or(SourceCheckError::Import(binding))?;
+            let resolved_local = prior_class_symbol.unwrap_or(local_symbol);
             if !aliases.insert(alias)
                 || module_record
                     .exports()
@@ -9506,7 +9561,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 || store.alias_symbol_links(alias).is_some_and(|links| {
                     links
                         .immediate_target
-                        .is_some_and(|target| target != local_symbol)
+                        .is_some_and(|target| target != resolved_local)
                         || links
                             .type_only_declaration
                             .is_some_and(|marker| !export.is_type_only || marker != binding)
@@ -9521,7 +9576,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
 
             planned.push(PlannedLocalNamedExport {
                 clause,
-                local_symbol,
+                local_symbol: resolved_local,
                 binding: SourceNamedReexportBindingPlan {
                     declaration: binding,
                     imported_name: local_name,
@@ -9570,7 +9625,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 SourceSyntaxRole::Statement,
             ));
         }
-        let target_symbol = self
+        let local_symbol = self
             .bound
             .locals(self.source.node_ref())
             .and_then(|locals| store.symbol_table(locals))
@@ -9583,6 +9638,21 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     SourceSyntaxRole::Statement,
                 )
             })?;
+        let target_symbol = if !export_equals {
+            store
+                .symbol(local_symbol)
+                .filter(|local| local.flags() == SymbolFlags::EXPORT_VALUE)
+                .and_then(ts_binder::semantic::Symbol::export_symbol)
+                .filter(|target| {
+                    self.planned_classes.contains(target)
+                        && store
+                            .symbol(*target)
+                            .is_some_and(|class| class.flags() == SymbolFlags::CLASS)
+                })
+                .unwrap_or(local_symbol)
+        } else {
+            local_symbol
+        };
         let target = store
             .symbol(target_symbol)
             .ok_or(SourceCheckError::Import(declaration))?;
@@ -9805,6 +9875,10 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         let supported_target = !export_equals
             && target.flags() == SymbolFlags::INTERFACE
             && target_record.kind == SyntaxKind::InterfaceDeclaration
+            || !export_equals
+                && target.flags() == SymbolFlags::CLASS
+                && self.planned_classes.contains(&target_symbol)
+                && target_record.kind == SyntaxKind::ClassDeclaration
             || self.prior_enums.contains(&target_symbol)
                 && matches!(
                     target.flags(),
@@ -25523,7 +25597,10 @@ pub(super) fn check_source_file(
                 } else {
                     matches!(
                         target.flags(),
-                        SymbolFlags::CONST_ENUM | SymbolFlags::REGULAR_ENUM | SymbolFlags::FUNCTION
+                        SymbolFlags::CONST_ENUM
+                            | SymbolFlags::REGULAR_ENUM
+                            | SymbolFlags::FUNCTION
+                            | SymbolFlags::CLASS
                     ) || target.flags().intersects(SymbolFlags::MODULE)
                         && target
                             .flags()
