@@ -4083,7 +4083,12 @@ fn materialize_cold_async_arrow_object_target(
     else {
         return Ok(false);
     };
-    if variable.type_.is_some() || store.type_node_links(expression).is_some() {
+    let expression_record = checked_node(arena, bound, store, expression)?;
+    if variable.type_.is_some()
+        || expression_record.kind != SyntaxKind::ObjectLiteralExpression
+        || !matches!(expression_record.data, NodeData::ObjectLiteralExpression(_))
+        || store.type_node_links(expression).is_some()
+    {
         return Ok(false);
     }
 
@@ -14153,12 +14158,26 @@ mod tests {
         )
         .unwrap();
         let resolved = resolve_all(&mut unannotated, &plan.bindings).unwrap();
+        let before = store_state(&unannotated.store);
         assert!(matches!(
             prepare_one(&mut unannotated, &resolved[0], &read),
             Err(SourceImportError::Unsupported(
                 SourceImportUnsupported::MissingTargetAnnotation(_)
             ))
         ));
+        assert_eq!(store_state(&unannotated.store), before);
+        assert!(
+            unannotated
+                .store
+                .value_symbol_links(resolved[0].target_symbol)
+                .is_none()
+        );
+        assert!(
+            unannotated
+                .store
+                .value_symbol_links(plan.bindings[0].alias_symbol)
+                .is_none()
+        );
 
         let mut unannotated_function = fixture(
             &[
