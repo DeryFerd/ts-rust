@@ -8173,8 +8173,12 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             Some(links) => links.resolved_type,
             None => None,
         };
+        let annotation_identity = match annotation_type {
+            Some(type_) => Some(type_),
+            None => self.cached_array_element_identity(annotation)?,
+        };
         if annotation_type.is_some_and(|type_| self.store.type_payload(type_).is_none())
-            || value_type.is_some_and(|value| annotation_type != Some(value))
+            || value_type.is_some_and(|value| annotation_identity != Some(value))
         {
             return Err(invalid());
         }
@@ -8196,7 +8200,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 .store
                 .symbol_node_links(node)
                 .is_some_and(|links| links.resolved_symbol.is_some())
-            || cached_type.is_some_and(|cached| Some(cached) != annotation_type)
+            || cached_type.is_some_and(|cached| Some(cached) != annotation_identity)
             || cached_symbol.is_some_and(|cached| cached != symbol)
             || cached_type.is_some() != cached_symbol.is_some()
         {
