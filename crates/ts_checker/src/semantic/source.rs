@@ -1151,7 +1151,7 @@ enum PlannedAsyncCapturedLoopEnding {
     Continue(NodeRef),
     Return {
         statement: NodeRef,
-        expression: PlannedExpression,
+        expression: Box<PlannedExpression>,
     },
 }
 
@@ -1795,6 +1795,7 @@ enum PlannedVariableStatement {
     Object(Box<PlannedObjectVariable>),
 }
 
+#[allow(clippy::struct_excessive_bools)] // Checker options and source-state flags are independent.
 struct SourcePlanner<'arena, 'semantic, 'sources> {
     arena: &'arena NodeArena,
     bound: &'arena BoundFile,
@@ -3650,7 +3651,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                                     comment
                                         .type_tag()
                                         .and_then(super::jsdoc::JsDocTag::type_expression)
-                                        .map(|annotation| annotation.planned())
+                                        .map(super::jsdoc::JsDocTypeExpression::planned)
                                 })
                         } else {
                             None
@@ -8881,7 +8882,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     }
                     PlannedAsyncCapturedLoopEnding::Return {
                         statement,
-                        expression: self.plan_expression(expression)?,
+                        expression: Box::new(self.plan_expression(expression)?),
                     }
                 }
                 _ => return Err(Self::unsupported_function_body(callable)),
@@ -23454,7 +23455,7 @@ fn check_expression_type(
             let resolved = if preserve_template {
                 store
                     .get_template_literal_type(&template.texts, &substitutions)
-                    .map_err(|error| source_template_expression_error(expression.node, error))?
+                    .map_err(|error| source_template_expression_error(expression.node, &error))?
             } else {
                 store
                     .intrinsic_bootstrap()
@@ -25784,7 +25785,7 @@ fn template_expression_is_const_asserted(host: &DeclaredTypeHost<'_>, node: Node
     false
 }
 
-fn source_template_expression_error(node: NodeRef, error: TemplateTypeError) -> SourceCheckError {
+fn source_template_expression_error(node: NodeRef, error: &TemplateTypeError) -> SourceCheckError {
     match error {
         TemplateTypeError::BootstrapUninitialized => {
             SourceCheckError::LiteralCache(SourceLiteralCacheError::BootstrapUninitialized)
@@ -25792,13 +25793,13 @@ fn source_template_expression_error(node: NodeRef, error: TemplateTypeError) -> 
         TemplateTypeError::InvalidType(type_)
         | TemplateTypeError::InvalidLiteral(type_)
         | TemplateTypeError::InvalidTemplate(type_) => {
-            SourceCheckError::LiteralCache(SourceLiteralCacheError::InvalidCachedLiteral(type_))
+            SourceCheckError::LiteralCache(SourceLiteralCacheError::InvalidCachedLiteral(*type_))
         }
         TemplateTypeError::InvalidUnion(type_) => {
-            SourceCheckError::LiteralCache(SourceLiteralCacheError::InvalidCachedUnion(type_))
+            SourceCheckError::LiteralCache(SourceLiteralCacheError::InvalidCachedUnion(*type_))
         }
         TemplateTypeError::UnsupportedUnionConstituent(type_) => SourceCheckError::LiteralCache(
-            SourceLiteralCacheError::UnsupportedUnionConstituent(type_),
+            SourceLiteralCacheError::UnsupportedUnionConstituent(*type_),
         ),
         TemplateTypeError::Capacity => {
             SourceCheckError::LiteralCache(SourceLiteralCacheError::Capacity)
@@ -27895,7 +27896,7 @@ fn check_planned_switch_function_statements(
                     ));
                 }
             }
-            let mut types = Vec::with_capacity(constituents.len());
+            let mut constituent_types = Vec::with_capacity(constituents.len());
             for constituent in &constituents {
                 let property = store
                     .resolved_own_property(*constituent, &element.property_name)?
@@ -27903,24 +27904,27 @@ fn check_planned_switch_function_statements(
                     .ok_or(SourceCheckError::Function(
                         SourceFunctionInvariant::Callable(binding.initializer.node),
                     ))?;
-                types.push(property.type_);
+                constituent_types.push(property.type_);
             }
-            let type_ = switch_union_type(store, global_types, &types)?;
+            let property_type = switch_union_type(store, global_types, &constituent_types)?;
             stage_value_type(
                 store,
                 staged_value_types,
                 value_order,
                 element.symbol,
-                type_,
+                property_type,
             )?;
-            if switch_flow_types.insert(element.symbol, type_).is_some() {
+            if switch_flow_types
+                .insert(element.symbol, property_type)
+                .is_some()
+            {
                 return Err(SourceCheckError::Variable(
                     VariableInvariant::DuplicateCurrentFlowType(element.symbol),
                 ));
             }
             properties.push(CheckedSwitchObjectBindingProperty {
                 symbol: element.symbol,
-                constituent_types: types,
+                constituent_types,
             });
         }
         Some(CheckedSwitchObjectBinding { properties })
@@ -29714,8 +29718,11 @@ fn check_planned_async_captured_loop(
 
     match (&statements.ending, return_type) {
         (PlannedAsyncCapturedLoopEnding::None, None) => {}
-        (PlannedAsyncCapturedLoopEnding::Break(statement), None)
-        | (PlannedAsyncCapturedLoopEnding::Continue(statement), None) => {
+        (
+            PlannedAsyncCapturedLoopEnding::Break(statement)
+            | PlannedAsyncCapturedLoopEnding::Continue(statement),
+            None,
+        ) => {
             if host.node(*statement).is_none() {
                 return Err(SourcePlanner::unsupported_function_body(callable));
             }
@@ -42100,7 +42107,7 @@ pub(super) fn check_source_file(
                 )?;
                 if bound
                     .source_facts()
-                    .is_some_and(|facts| facts.is_javascript_file())
+                    .is_some_and(ts_binder::CanonicalSourceFileFacts::is_javascript_file)
                     || store
                         .symbol(assignment.owner_symbol)
                         .and_then(ts_binder::semantic::Symbol::value_declaration)
