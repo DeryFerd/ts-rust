@@ -172,6 +172,24 @@ pub struct CompilationDiagnostic {
     pub message: String,
     /// `None` means the checker did not expose whether related information exists.
     pub related_information: Option<Vec<CompilationRelatedInformation>>,
+    /// Upstream diagnostic provenance and unrendered message data used for exact ordering.
+    pub ordering: CompilationDiagnosticOrdering,
+}
+
+/// Provenance and structured message data retained for the pinned Go comparator.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CompilationDiagnosticOrdering {
+    pub origin: CompilationDiagnosticOrigin,
+    /// `None` preserves the fail-closed boundary when rendered text cannot be authenticated.
+    pub diagnostic: Option<ts_diagnostics::Diagnostic>,
+}
+
+/// Distinguishes undefined compiler-option locations from zero-based checker globals.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CompilationDiagnosticOrigin {
+    #[default]
+    Checker,
+    CompilerOption,
 }
 
 /// Related diagnostic detail retained when the checker exposes it.
@@ -2645,6 +2663,7 @@ fn render_error_baseline(
     let mut artifact = RenderedDiagnosticArtifact::default();
     for (index, pair) in ordered.windows(2).enumerate() {
         if diagnostic_primary_order_key(pair[0]) == diagnostic_primary_order_key(pair[1])
+            && (pair[0].ordering.diagnostic.is_none() || pair[1].ordering.diagnostic.is_none())
             && (pair[0].message != pair[1].message
                 || compare_compilation_related_information(
                     pair[0].related_information.as_deref(),
@@ -3061,24 +3080,205 @@ fn compare_compilation_diagnostics(
         .as_deref()
         .unwrap_or_default()
         .cmp(right.file_name.as_deref().unwrap_or_default())
-        .then_with(|| {
-            left.range
-                .map(|range| range.start)
-                .cmp(&right.range.map(|range| range.start))
-        })
-        .then_with(|| {
-            left.range
-                .map(|range| range.end)
-                .cmp(&right.range.map(|range| range.end))
-        })
+        .then_with(|| diagnostic_order_location(left).cmp(&diagnostic_order_location(right)))
         .then_with(|| left.code.cmp(&right.code))
-        .then_with(|| left.message.cmp(&right.message))
+        .then_with(|| {
+            compare_diagnostic_messages(
+                left.ordering.diagnostic.as_ref(),
+                &left.message,
+                right.ordering.diagnostic.as_ref(),
+                &right.message,
+            )
+        })
         .then_with(|| {
             compare_compilation_related_information(
                 left.related_information.as_deref(),
                 right.related_information.as_deref(),
             )
         })
+}
+
+fn diagnostic_order_location(diagnostic: &CompilationDiagnostic) -> (i64, i64) {
+    diagnostic.range.map_or_else(
+        || match diagnostic.ordering.origin {
+            CompilationDiagnosticOrigin::CompilerOption => (-1, -1),
+            CompilationDiagnosticOrigin::Checker => (0, 0),
+        },
+        |range| (i64::from(range.start.get()), i64::from(range.end.get())),
+    )
+}
+
+fn compare_diagnostic_messages(
+    left: Option<&ts_diagnostics::Diagnostic>,
+    left_rendered: &str,
+    right: Option<&ts_diagnostics::Diagnostic>,
+    right_rendered: &str,
+) -> Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            let left_chains = diagnostic_message_chains(&left.details);
+            let right_chains = diagnostic_message_chains(&right.details);
+            left.arguments
+                .cmp(&right.arguments)
+                .then_with(|| compare_diagnostic_message_chain_sizes(&left_chains, &right_chains))
+                .then_with(|| {
+                    compare_diagnostic_message_chain_contents(&left_chains, &right_chains)
+                })
+        }
+        _ => left_rendered.cmp(right_rendered),
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DiagnosticMessageChain<'a> {
+    text: &'a str,
+    children: Vec<Self>,
+}
+
+fn diagnostic_message_chains(details: &[String]) -> Vec<DiagnosticMessageChain<'_>> {
+    let lines = details
+        .iter()
+        .flat_map(|detail| detail.lines())
+        .filter_map(|line| {
+            let text = line.trim_start();
+            (!text.is_empty()).then_some((line.len() - text.len(), text))
+        })
+        .collect::<Vec<_>>();
+    let Some((indentation, _)) = lines.first().copied() else {
+        return Vec::new();
+    };
+    let mut index = 0;
+    parse_diagnostic_message_chains(&lines, &mut index, indentation)
+}
+
+fn parse_diagnostic_message_chains<'a>(
+    lines: &[(usize, &'a str)],
+    index: &mut usize,
+    indentation: usize,
+) -> Vec<DiagnosticMessageChain<'a>> {
+    let mut chains = Vec::new();
+    while let Some((current_indentation, text)) = lines.get(*index).copied() {
+        if current_indentation != indentation {
+            break;
+        }
+        *index += 1;
+        let children = match lines.get(*index).copied() {
+            Some((next_indentation, _)) if next_indentation > indentation => {
+                parse_diagnostic_message_chains(lines, index, next_indentation)
+            }
+            _ => Vec::new(),
+        };
+        chains.push(DiagnosticMessageChain { text, children });
+    }
+    chains
+}
+
+fn compare_diagnostic_message_chain_sizes(
+    left: &[DiagnosticMessageChain<'_>],
+    right: &[DiagnosticMessageChain<'_>],
+) -> Ordering {
+    right.len().cmp(&left.len()).then_with(|| {
+        left.iter()
+            .zip(right)
+            .map(|(left, right)| {
+                compare_diagnostic_message_chain_sizes(&left.children, &right.children)
+            })
+            .find(|ordering| !ordering.is_eq())
+            .unwrap_or(Ordering::Equal)
+    })
+}
+
+fn compare_diagnostic_message_chain_contents(
+    left: &[DiagnosticMessageChain<'_>],
+    right: &[DiagnosticMessageChain<'_>],
+) -> Ordering {
+    left.iter()
+        .zip(right)
+        .map(|(left, right)| {
+            left.text.cmp(right.text).then_with(|| {
+                compare_diagnostic_message_chain_contents(&left.children, &right.children)
+            })
+        })
+        .find(|ordering| !ordering.is_eq())
+        .unwrap_or(Ordering::Equal)
+}
+
+fn recover_structured_compilation_diagnostic(
+    code: Option<u32>,
+    rendered: &str,
+) -> Option<ts_diagnostics::Diagnostic> {
+    let message = ts_diagnostics::message_by_code(code?)?;
+    let mut lines = rendered.split('\n');
+    let head = lines.next()?;
+    let arguments = recover_diagnostic_message_arguments(message, head)?;
+    let diagnostic = ts_diagnostics::Diagnostic::with_arguments(message, arguments)
+        .with_details(lines.map(str::to_owned));
+    (diagnostic.render().ok().as_deref() == Some(rendered)).then_some(diagnostic)
+}
+
+fn recover_diagnostic_message_arguments(
+    message: &'static ts_diagnostics::Message,
+    rendered: &str,
+) -> Option<Vec<String>> {
+    let template = message.text();
+    let mut placeholders = Vec::new();
+    let mut literal_start = 0;
+    let mut scan = 0;
+    while let Some(relative) = template.get(scan..)?.find('{') {
+        let opening = scan + relative;
+        let following = template.get(opening + 1..)?;
+        let digits = following.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 || following.as_bytes().get(digits) != Some(&b'}') {
+            scan = opening + 1;
+            continue;
+        }
+        let index = following.get(..digits)?.parse::<usize>().ok()?;
+        placeholders.push((template.get(literal_start..opening)?, index));
+        scan = opening + digits + 2;
+        literal_start = scan;
+    }
+    let trailing = template.get(literal_start..)?;
+    if placeholders.is_empty() {
+        return (rendered == template).then(Vec::new);
+    }
+
+    let argument_count = placeholders
+        .iter()
+        .map(|(_, index)| *index)
+        .max()?
+        .checked_add(1)?;
+    let mut arguments = vec![None; argument_count];
+    let mut remaining = rendered;
+    for (position, (prefix, index)) in placeholders.iter().enumerate() {
+        remaining = remaining.strip_prefix(prefix)?;
+        let next_literal = placeholders
+            .get(position + 1)
+            .map_or(trailing, |(literal, _)| *literal);
+        let end = if next_literal.is_empty() {
+            if position + 1 != placeholders.len() {
+                return None;
+            }
+            remaining.len()
+        } else if position + 1 == placeholders.len() {
+            remaining.rfind(next_literal)?
+        } else {
+            remaining.find(next_literal)?
+        };
+        let value = remaining.get(..end)?.to_owned();
+        if arguments[*index]
+            .as_ref()
+            .is_some_and(|existing: &String| existing != &value)
+        {
+            return None;
+        }
+        arguments[*index] = Some(value);
+        remaining = remaining.get(end..)?;
+    }
+    if remaining.strip_prefix(trailing) != Some("") {
+        return None;
+    }
+    let arguments = arguments.into_iter().collect::<Option<Vec<_>>>()?;
+    (message.format(&arguments).ok().as_deref() == Some(rendered)).then_some(arguments)
 }
 
 fn compare_compilation_related_information(
@@ -3106,7 +3306,18 @@ fn compare_compilation_related_information(
                             .cmp(&right.range.map(|range| range.end))
                     })
                     .then_with(|| left.code.cmp(&right.code))
-                    .then_with(|| left.message.cmp(&right.message))
+                    .then_with(|| {
+                        let left_structured =
+                            recover_structured_compilation_diagnostic(left.code, &left.message);
+                        let right_structured =
+                            recover_structured_compilation_diagnostic(right.code, &right.message);
+                        compare_diagnostic_messages(
+                            left_structured.as_ref(),
+                            &left.message,
+                            right_structured.as_ref(),
+                            &right.message,
+                        )
+                    })
             })
             .find(|ordering| *ordering != Ordering::Equal)
             .unwrap_or(Ordering::Equal)
@@ -4394,6 +4605,14 @@ fn compile_case_variant(
     let parsed_options = fixture_compiler_options_result(case, variant);
     let option_diagnostics = parsed_options.diagnostics;
     let mut compiler_options = parsed_options.options;
+    let conflicting_no_library_options = compiler_options.no_lib
+        && option_diagnostics.iter().any(|diagnostic| {
+            diagnostic.code() == 5053
+                && matches!(
+                    diagnostic.arguments.as_slice(),
+                    [library, no_library] if library == "lib" && no_library == "noLib"
+                )
+        });
     if let Some(config) = pinned_project_config(case) {
         roots = project_root_unit_indices(case, &config, &compiler_options)
             .into_iter()
@@ -4489,60 +4708,87 @@ fn compile_case_variant(
     // The Go harness baselines pre-emit program/syntactic/semantic/global and
     // declaration diagnostics. Emit-result diagnostics are not part of that
     // stream, so use Program's aggregate as the closest available Rust API.
+    // Pinned Go suppresses iteration diagnostics when incompatible library
+    // options leave the global Array target unavailable.
+    let missing_global_array = conflicting_no_library_options
+        && program.diagnostics().iter().any(|diagnostic| {
+            diagnostic.file_name.is_none()
+                && diagnostic.code == Some(2318)
+                && recover_structured_compilation_diagnostic(
+                    diagnostic.code,
+                    &diagnostic.message,
+                )
+                .is_some_and(|diagnostic| {
+                    matches!(diagnostic.arguments.as_slice(), [name] if name == "Array")
+                })
+        });
     let mut diagnostics = program
         .diagnostics()
         .iter()
-        .map(|diagnostic| CompilationDiagnostic {
-            file_name: diagnostic.file_name.clone(),
-            source_text: diagnostic
-                .file_name
-                .as_deref()
-                .and_then(&diagnostic_source_text),
-            range: diagnostic.range,
-            code: diagnostic.code,
-            category: Some(match diagnostic.category {
-                ts_diagnostics::Category::Error => CompilationDiagnosticCategory::Error,
-                ts_diagnostics::Category::Warning => CompilationDiagnosticCategory::Warning,
-                ts_diagnostics::Category::Suggestion => CompilationDiagnosticCategory::Suggestion,
-                ts_diagnostics::Category::Message => CompilationDiagnosticCategory::Message,
-            }),
-            message: pinned_program_diagnostic_message(&program, diagnostic),
-            related_information: match checker {
-                // Legacy Program diagnostics still do not expose whether
-                // related records exist. Do not manufacture canonical detail
-                // or use the legacy checker as a fallback for canonical mode.
-                FixtureChecker::Legacy => None,
-                FixtureChecker::Canonical => Some(
-                    diagnostic
-                        .related_information
-                        .iter()
-                        .map(|related| CompilationRelatedInformation {
-                            file_name: related.file_name.clone(),
-                            source_text: related
-                                .file_name
-                                .as_deref()
-                                .and_then(&diagnostic_source_text),
-                            range: related.range,
-                            code: related.code,
-                            category: Some(match related.category {
-                                ts_diagnostics::Category::Error => {
-                                    CompilationDiagnosticCategory::Error
-                                }
-                                ts_diagnostics::Category::Warning => {
-                                    CompilationDiagnosticCategory::Warning
-                                }
-                                ts_diagnostics::Category::Suggestion => {
-                                    CompilationDiagnosticCategory::Suggestion
-                                }
-                                ts_diagnostics::Category::Message => {
-                                    CompilationDiagnosticCategory::Message
-                                }
-                            }),
-                            message: related.message.clone(),
-                        })
-                        .collect(),
-                ),
-            },
+        .filter(|diagnostic| {
+            !missing_global_array || diagnostic.file_name.is_none() || diagnostic.code != Some(2495)
+        })
+        .map(|diagnostic| {
+            let message = pinned_program_diagnostic_message(&program, diagnostic);
+            let ordering = CompilationDiagnosticOrdering {
+                origin: CompilationDiagnosticOrigin::Checker,
+                diagnostic: recover_structured_compilation_diagnostic(diagnostic.code, &message),
+            };
+            CompilationDiagnostic {
+                file_name: diagnostic.file_name.clone(),
+                source_text: diagnostic
+                    .file_name
+                    .as_deref()
+                    .and_then(&diagnostic_source_text),
+                range: diagnostic.range,
+                code: diagnostic.code,
+                category: Some(match diagnostic.category {
+                    ts_diagnostics::Category::Error => CompilationDiagnosticCategory::Error,
+                    ts_diagnostics::Category::Warning => CompilationDiagnosticCategory::Warning,
+                    ts_diagnostics::Category::Suggestion => {
+                        CompilationDiagnosticCategory::Suggestion
+                    }
+                    ts_diagnostics::Category::Message => CompilationDiagnosticCategory::Message,
+                }),
+                message,
+                related_information: match checker {
+                    // Legacy Program diagnostics still do not expose whether
+                    // related records exist. Do not manufacture canonical detail
+                    // or use the legacy checker as a fallback for canonical mode.
+                    FixtureChecker::Legacy => None,
+                    FixtureChecker::Canonical => Some(
+                        diagnostic
+                            .related_information
+                            .iter()
+                            .map(|related| CompilationRelatedInformation {
+                                file_name: related.file_name.clone(),
+                                source_text: related
+                                    .file_name
+                                    .as_deref()
+                                    .and_then(&diagnostic_source_text),
+                                range: related.range,
+                                code: related.code,
+                                category: Some(match related.category {
+                                    ts_diagnostics::Category::Error => {
+                                        CompilationDiagnosticCategory::Error
+                                    }
+                                    ts_diagnostics::Category::Warning => {
+                                        CompilationDiagnosticCategory::Warning
+                                    }
+                                    ts_diagnostics::Category::Suggestion => {
+                                        CompilationDiagnosticCategory::Suggestion
+                                    }
+                                    ts_diagnostics::Category::Message => {
+                                        CompilationDiagnosticCategory::Message
+                                    }
+                                }),
+                                message: related.message.clone(),
+                            })
+                            .collect(),
+                    ),
+                },
+                ordering,
+            }
         })
         .collect::<Vec<_>>();
     for diagnostic in option_diagnostics {
@@ -4565,14 +4811,20 @@ fn compile_case_variant(
                 FixtureChecker::Legacy => None,
                 FixtureChecker::Canonical => Some(Vec::new()),
             },
+            ordering: CompilationDiagnosticOrdering {
+                origin: CompilationDiagnosticOrigin::CompilerOption,
+                diagnostic: Some(diagnostic),
+            },
         };
-        if !diagnostics.iter().any(|existing| {
+        if let Some(existing) = diagnostics.iter_mut().find(|existing| {
             existing.file_name == option_diagnostic.file_name
                 && existing.range == option_diagnostic.range
                 && existing.code == option_diagnostic.code
                 && existing.category == option_diagnostic.category
                 && existing.message == option_diagnostic.message
         }) {
+            existing.ordering = option_diagnostic.ordering;
+        } else {
             diagnostics.push(option_diagnostic);
         }
     }
@@ -5874,12 +6126,13 @@ mod tests {
     use ts_core::{TextPos, TextRange};
 
     use super::{
-        Case, CompilationDiagnostic, CompilationDiagnosticCategory, CompilationRelatedInformation,
-        DiagnosticArtifactComparison, DiagnosticArtifactMismatchKind, DiagnosticCheckerMode,
-        DiagnosticComparisonScope, DiagnosticScorecard, DiagnosticScorecardDiagnostic,
-        DiagnosticScorecardProvenance, DiagnosticScorecardSummary, DiagnosticVariantOutcomeClass,
-        DiagnosticVariantStatus, FatalVariantRecord, FixedVariantManifest, FixtureChecker,
-        OptionVariant, OutputDifferenceKind, ParseError, RunnerOptions, RunnerSummary,
+        Case, CompilationDiagnostic, CompilationDiagnosticCategory, CompilationDiagnosticOrdering,
+        CompilationRelatedInformation, DiagnosticArtifactComparison,
+        DiagnosticArtifactMismatchKind, DiagnosticCheckerMode, DiagnosticComparisonScope,
+        DiagnosticScorecard, DiagnosticScorecardDiagnostic, DiagnosticScorecardProvenance,
+        DiagnosticScorecardSummary, DiagnosticVariantOutcomeClass, DiagnosticVariantStatus,
+        FatalVariantRecord, FixedVariantManifest, FixtureChecker, OptionVariant,
+        OutputDifferenceKind, ParseError, RunnerOptions, RunnerSummary,
         ScorecardCapabilityRegistry, ScorecardRepositoryRevision, TYPED_CHECKER_CAPABILITY_CODES,
         capability_registry_contains, capability_registry_metadata,
         compare_case_emitted_output_sections, compare_diagnostic_artifacts,
@@ -7612,6 +7865,7 @@ mod tests {
                 category: Some(CompilationDiagnosticCategory::Message),
                 message: "The declaration is here.".to_owned(),
             }]),
+            ordering: CompilationDiagnosticOrdering::default(),
         };
 
         let artifact = render_error_baseline(&case, &[diagnostic]);
@@ -7685,6 +7939,7 @@ mod tests {
                     message: "and here.".to_owned(),
                 },
             ]),
+            ordering: CompilationDiagnosticOrdering::default(),
         };
 
         let artifact = render_error_baseline(&case, std::slice::from_ref(&diagnostic));
@@ -7739,6 +7994,7 @@ mod tests {
             category: Some(CompilationDiagnosticCategory::Error),
             message: "First line.\nSecond line.".to_owned(),
             related_information: None,
+            ordering: CompilationDiagnosticOrdering::default(),
         };
 
         let artifact = render_error_baseline(&case, &[diagnostic]);
@@ -7776,6 +8032,7 @@ mod tests {
             category: Some(CompilationDiagnosticCategory::Error),
             message: "Original message.".to_owned(),
             related_information: None,
+            ordering: CompilationDiagnosticOrdering::default(),
         };
         let actual = render_error_baseline(&case, std::slice::from_ref(&diagnostic));
         assert!(
@@ -7819,6 +8076,7 @@ mod tests {
                 category: Some(CompilationDiagnosticCategory::Error),
                 message: "First.".to_owned(),
                 related_information: None,
+                ordering: CompilationDiagnosticOrdering::default(),
             },
             CompilationDiagnostic {
                 file_name: None,
@@ -7828,6 +8086,7 @@ mod tests {
                 category: Some(CompilationDiagnosticCategory::Error),
                 message: "Second.".to_owned(),
                 related_information: None,
+                ordering: CompilationDiagnosticOrdering::default(),
             },
         ];
         let actual = render_error_baseline(&case, &globals);
@@ -7852,6 +8111,7 @@ mod tests {
             category: Some(CompilationDiagnosticCategory::Error),
             message: "Global error.".to_owned(),
             related_information: None,
+            ordering: CompilationDiagnosticOrdering::default(),
         };
         let actual = render_error_baseline(&case, std::slice::from_ref(&diagnostic));
         let expected = actual.text.replacen(
@@ -7885,6 +8145,7 @@ mod tests {
                 category: Some(CompilationDiagnosticCategory::Error),
                 message: "See /.src/first.ts.".to_owned(),
                 related_information: None,
+                ordering: CompilationDiagnosticOrdering::default(),
             },
             CompilationDiagnostic {
                 file_name: None,
@@ -7894,6 +8155,7 @@ mod tests {
                 category: Some(CompilationDiagnosticCategory::Error),
                 message: "See bundled:///libs/second.d.ts.".to_owned(),
                 related_information: None,
+                ordering: CompilationDiagnosticOrdering::default(),
             },
         ];
         let artifact = render_error_baseline(&case, &diagnostics);
@@ -7908,6 +8170,208 @@ mod tests {
         assert_eq!(
             comparison.status(),
             super::DiagnosticVariantStatus::UnsupportedDetail
+        );
+    }
+
+    #[test]
+    fn upstream_diagnostic_order_uses_origin_arguments_and_message_chain_shape() {
+        fn diagnostic(
+            code: u32,
+            arguments: &[&str],
+            origin: super::CompilationDiagnosticOrigin,
+            details: &[&str],
+        ) -> CompilationDiagnostic {
+            let structured = ts_diagnostics::Diagnostic::with_arguments(
+                ts_diagnostics::message_by_code(code).unwrap(),
+                arguments.iter().copied(),
+            )
+            .with_details(details.iter().copied());
+            CompilationDiagnostic {
+                file_name: None,
+                source_text: None,
+                range: None,
+                code: Some(code),
+                category: Some(CompilationDiagnosticCategory::Error),
+                message: structured.render().unwrap(),
+                related_information: Some(Vec::new()),
+                ordering: super::CompilationDiagnosticOrdering {
+                    origin,
+                    diagnostic: Some(structured),
+                },
+            }
+        }
+
+        let case = Case::parse("global.ts", "").unwrap();
+        let globals = [
+            diagnostic(
+                2318,
+                &["Object"],
+                super::CompilationDiagnosticOrigin::Checker,
+                &[],
+            ),
+            diagnostic(
+                2318,
+                &["Boolean"],
+                super::CompilationDiagnosticOrigin::Checker,
+                &[],
+            ),
+            diagnostic(
+                5053,
+                &["lib", "noLib"],
+                super::CompilationDiagnosticOrigin::CompilerOption,
+                &[],
+            ),
+            diagnostic(
+                2318,
+                &["Array"],
+                super::CompilationDiagnosticOrigin::Checker,
+                &[],
+            ),
+        ];
+        let artifact = render_error_baseline(&case, &globals);
+        assert!(artifact.unsupported_details.is_empty(), "{artifact:?}");
+        assert_eq!(
+            parse_error_baseline_header(&artifact.text),
+            concat!(
+                "error TS5053: Option 'lib' cannot be specified with option 'noLib'.\n",
+                "error TS2318: Cannot find global type 'Array'.\n",
+                "error TS2318: Cannot find global type 'Boolean'.\n",
+                "error TS2318: Cannot find global type 'Object'.",
+            ),
+        );
+
+        let argument_first = diagnostic(
+            1007,
+            &["alpha", "zeta"],
+            super::CompilationDiagnosticOrigin::Checker,
+            &[],
+        );
+        let rendered_first = diagnostic(
+            1007,
+            &["beta", "alpha"],
+            super::CompilationDiagnosticOrigin::Checker,
+            &[],
+        );
+        assert!(argument_first.message > rendered_first.message);
+        assert_eq!(
+            super::compare_compilation_diagnostics(&argument_first, &rendered_first),
+            std::cmp::Ordering::Less,
+        );
+
+        let elaborated = diagnostic(
+            2318,
+            &["Array"],
+            super::CompilationDiagnosticOrigin::Checker,
+            &["first detail", "second detail"],
+        );
+        let brief = diagnostic(
+            2318,
+            &["Array"],
+            super::CompilationDiagnosticOrigin::Checker,
+            &["first detail"],
+        );
+        assert_eq!(
+            super::compare_compilation_diagnostics(&elaborated, &brief),
+            std::cmp::Ordering::Less,
+        );
+
+        let nested = diagnostic(
+            2318,
+            &["Array"],
+            super::CompilationDiagnosticOrigin::Checker,
+            &["first detail", "  nested detail"],
+        );
+        let siblings = diagnostic(
+            2318,
+            &["Array"],
+            super::CompilationDiagnosticOrigin::Checker,
+            &["first detail", "second detail"],
+        );
+        assert_eq!(
+            super::compare_compilation_diagnostics(&nested, &siblings),
+            std::cmp::Ordering::Greater,
+        );
+    }
+
+    #[test]
+    fn reconstructs_catalog_diagnostic_arguments_in_numbered_placeholder_order() {
+        let message = ts_diagnostics::message_by_code(1007).unwrap();
+        let original = ts_diagnostics::Diagnostic::with_arguments(message, ["opening", "closing"])
+            .with_details(["additional context"]);
+        let rendered = original.render().unwrap();
+
+        let recovered = super::recover_structured_compilation_diagnostic(Some(1007), &rendered)
+            .expect("catalog placeholders should recover the original argument order");
+
+        assert_eq!(recovered.arguments, ["opening", "closing"]);
+        assert_eq!(recovered.details, ["additional context"]);
+        assert_eq!(recovered.render().unwrap(), rendered);
+        assert!(
+            super::recover_structured_compilation_diagnostic(Some(1007), "unrelated text")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn conflicting_library_options_match_upstream_global_diagnostic_order() {
+        let case = Case::parse(
+            "arrayIterationLibES5TargetDifferent.ts",
+            concat!(
+                "// @strict: true\n",
+                "// @lib: es5\n",
+                "// @noLib: true\n",
+                "// @target: es2015\n",
+                "declare function log(message?: any): void;\n",
+                "for (const value of [1, 2, 3]) { log(value); }\n",
+                "declare const invalid: number;\n",
+                "for (const value of invalid) { log(value); }\n",
+            ),
+        )
+        .unwrap();
+        let variants = compile_case_matrix_with_checker(&case, FixtureChecker::Canonical).unwrap();
+        let [(variant, compilation)] = variants.as_slice() else {
+            panic!("expected one variant, got {variants:?}")
+        };
+        assert!(variant.unsupported_details.is_empty());
+        assert_eq!(compilation.diagnostics[0].code, Some(5053));
+        assert!(
+            compilation.diagnostics[1..]
+                .iter()
+                .all(|diagnostic| diagnostic.code == Some(2318))
+        );
+        assert!(
+            compilation
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.file_name.is_none())
+        );
+        assert_eq!(
+            compilation.diagnostics[1..]
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Cannot find global type 'Array'.",
+                "Cannot find global type 'Boolean'.",
+                "Cannot find global type 'CallableFunction'.",
+                "Cannot find global type 'Function'.",
+                "Cannot find global type 'IArguments'.",
+                "Cannot find global type 'NewableFunction'.",
+                "Cannot find global type 'Number'.",
+                "Cannot find global type 'Object'.",
+                "Cannot find global type 'RegExp'.",
+                "Cannot find global type 'String'.",
+            ]
+        );
+        let artifact = render_error_baseline(&case, &compilation.diagnostics);
+        assert!(artifact.unsupported_details.is_empty(), "{artifact:?}");
+        assert!(
+            artifact.text.starts_with(concat!(
+                "error TS5053: Option 'lib' cannot be specified with option 'noLib'.\r\n",
+                "error TS2318: Cannot find global type 'Array'.\r\n",
+            )),
+            "{}",
+            artifact.text,
         );
     }
 
@@ -8705,6 +9169,7 @@ mod tests {
             )
             .to_owned(),
             related_information: Some(Vec::new()),
+            ordering: CompilationDiagnosticOrdering::default(),
         };
         let artifact = render_error_baseline(&case, &[diagnostic]);
         let root = artifact.text.find("==== /src/a.ts").unwrap();
