@@ -1,7 +1,7 @@
 use ts_ast::{FileId, NodeData, NodeRef};
 use ts_binder::{
     CanonicalBinder, CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
-    EscapedName, SemanticSymbolId,
+    EscapedName, InternalSymbolName, SemanticSymbolId, SymbolFlags,
 };
 use ts_checker::semantic::{
     AliasTargetState, CanonicalCheckerContext, CanonicalCheckerOptions,
@@ -995,9 +995,136 @@ fn assert_module_reexport_shape_is_closed(source_text: &str) {
 }
 
 #[test]
-fn missing_default_and_star_reexports_remain_typed_boundaries() {
+fn missing_default_reexports_remain_typed_boundaries() {
     assert_module_reexport_shape_is_closed("export { default as publicValue } from './base';");
-    assert_module_reexport_shape_is_closed("export * from './base';");
+}
+
+#[test]
+fn star_reexports_preserve_binder_identity_and_imported_value_types() {
+    let consumer = parse_source_file(concat!(
+        "import { value as selected } from './barrel'; ",
+        "const copied: number = selected;",
+    ));
+    let barrel = parse_source_file("export * from './base';");
+    let base = parse_source_file("export const value: number = 1;");
+    let consumer_file = FileId::new(24);
+    let barrel_file = FileId::new(25);
+    let base_file = FileId::new(26);
+    let sources = [
+        Source {
+            parsed: &consumer,
+            file: consumer_file,
+            path: "\"/project/star-consumer.ts\"",
+        },
+        Source {
+            parsed: &barrel,
+            file: barrel_file,
+            path: "\"/project/star-barrel.ts\"",
+        },
+        Source {
+            parsed: &base,
+            file: base_file,
+            path: "\"/project/star-base.ts\"",
+        },
+    ];
+    let mut context = make_context(
+        &sources,
+        &[
+            Route {
+                source: 0,
+                specifier: 0,
+                target: 1,
+            },
+            Route {
+                source: 1,
+                specifier: 0,
+                target: 2,
+            },
+        ],
+    );
+    let imported = bound_symbol(
+        &context,
+        named_import_binding(&consumer, consumer_file, "selected"),
+    );
+    let target = direct_export_symbol(&context, base_file, "value");
+    let barrel_bound = context.file(barrel_file).unwrap().1;
+    let barrel_module = barrel_bound.symbol(barrel_bound.source_file()).unwrap();
+    let star = context
+        .store()
+        .symbol(barrel_module)
+        .and_then(ts_binder::semantic::Symbol::exports)
+        .and_then(|exports| context.store().symbol_table(exports))
+        .and_then(|exports| exports.get(InternalSymbolName::ExportStar.as_ref()))
+        .unwrap();
+    assert_eq!(
+        context.store().symbol(star).unwrap().flags(),
+        SymbolFlags::EXPORT_STAR
+    );
+    assert_eq!(
+        context.store().symbol(star).unwrap().parent(),
+        Some(barrel_module)
+    );
+    assert!(context.store().alias_symbol_links(star).is_none());
+    assert!(context.store().value_symbol_links(star).is_none());
+
+    context.check_source_file(consumer_file).unwrap();
+
+    assert!(context.diagnostics().is_empty());
+    assert!(source_is_checked(&context, consumer_file));
+    assert!(!source_is_checked(&context, barrel_file));
+    assert!(!source_is_checked(&context, base_file));
+    assert_alias_chain(&context, imported, target, target, None);
+    let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+    assert_eq!(
+        context
+            .store()
+            .value_symbol_links(imported)
+            .and_then(|links| links.resolved_type),
+        Some(number),
+    );
+    assert_eq!(
+        context
+            .store()
+            .value_symbol_links(target)
+            .and_then(|links| links.resolved_type),
+        Some(number),
+    );
+    assert!(context.store().alias_symbol_links(star).is_none());
+    assert!(context.store().value_symbol_links(star).is_none());
+
+    context.check_source_file(barrel_file).unwrap();
+    assert!(source_is_checked(&context, barrel_file));
+    assert!(!source_is_checked(&context, base_file));
+    assert!(context.store().alias_symbol_links(star).is_none());
+    assert!(context.store().value_symbol_links(star).is_none());
+
+    let warm = (
+        context.store().type_len(),
+        context.store().symbol_len(),
+        context.store().mapper_len(),
+        context.store().signature_len(),
+        context.store().alias_symbol_links(imported).cloned(),
+        context.store().value_symbol_links(imported).cloned(),
+        context.store().value_symbol_links(target).cloned(),
+        context.diagnostics().clone(),
+    );
+    context.recheck_source_file(barrel_file).unwrap();
+    context.recheck_source_file(consumer_file).unwrap();
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().mapper_len(),
+            context.store().signature_len(),
+            context.store().alias_symbol_links(imported).cloned(),
+            context.store().value_symbol_links(imported).cloned(),
+            context.store().value_symbol_links(target).cloned(),
+            context.diagnostics().clone(),
+        ),
+        warm,
+    );
+    assert!(context.store().alias_symbol_links(star).is_none());
+    assert!(context.store().value_symbol_links(star).is_none());
 }
 
 #[test]
