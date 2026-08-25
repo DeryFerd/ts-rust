@@ -700,6 +700,7 @@ struct TypeQueryPlan {
     mapped_indexed_accesses: BTreeMap<NodeRef, PlannedMappedIndexedAccess>,
     type_literals: BTreeMap<NodeRef, PropertyObjectPlan>,
     interfaces: BTreeMap<SemanticSymbolId, PropertyObjectPlan>,
+    generic_interfaces: BTreeMap<SemanticSymbolId, PropertyObjectPlan>,
     functions: BTreeMap<NodeRef, FunctionTypePlan>,
     templates: BTreeMap<NodeRef, PlannedTemplateType>,
     tuples: BTreeMap<NodeRef, TupleTypeNodePlan>,
@@ -4184,6 +4185,138 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         result
     }
 
+    fn has_generic_interface_heritage(
+        &self,
+        symbol: SemanticSymbolId,
+    ) -> Result<bool, DeclaredTypeError> {
+        if self.store.get_parent_of_symbol(symbol).is_some() {
+            return Ok(false);
+        }
+        let declarations = self
+            .store
+            .symbol(symbol)
+            .and_then(ts_binder::semantic::Symbol::declarations)
+            .ok_or(DeclaredTypeError::Unavailable(
+                DeclaredTypeUnavailable::MissingDeclarations(symbol),
+            ))?;
+        for declaration in declarations {
+            if self.host.source(*declaration).is_none() {
+                return Ok(false);
+            }
+            if self
+                .host
+                .bound_file(*declaration)
+                .and_then(ts_binder::BoundFile::source_facts)
+                .is_some_and(ts_binder::CanonicalSourceFileFacts::is_default_library)
+            {
+                return Ok(false);
+            }
+            let record = preflight_node(self.store, self.host, *declaration)?;
+            let NodeData::InterfaceDeclaration(interface) = &record.data else {
+                return Ok(false);
+            };
+            if interface.type_parameters.is_none() {
+                return Ok(false);
+            }
+            if let Some(clauses) = interface.heritage_clauses.as_ref() {
+                for clause in &clauses.nodes {
+                    let clause = NodeRef::new(declaration.arena, declaration.file, *clause);
+                    let record = preflight_node(self.store, self.host, clause)?;
+                    let NodeData::HeritageClause(heritage) = &record.data else {
+                        return Ok(false);
+                    };
+                    for base in &heritage.types.nodes {
+                        let base = NodeRef::new(clause.arena, clause.file, *base);
+                        let record = preflight_node(self.store, self.host, base)?;
+                        let NodeData::ExpressionWithTypeArguments(base) = &record.data else {
+                            return Ok(false);
+                        };
+                        if base.type_arguments.is_none() {
+                            return Ok(false);
+                        }
+                    }
+                }
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Plans generic bases without demanding either interface's own members.
+    fn plan_generic_interface_heritage(
+        &mut self,
+        symbol: SemanticSymbolId,
+    ) -> Result<(), DeclaredTypeError> {
+        let symbol = self
+            .store
+            .get_merged_symbol(symbol)
+            .ok_or(DeclaredTypeError::Unavailable(
+                DeclaredTypeUnavailable::SymbolNotOwned(symbol),
+            ))?;
+        if self.plan.generic_interfaces.contains_key(&symbol) {
+            return Ok(());
+        }
+        let planned = object_members::plan_generic_interface(self.store, self.host, symbol)
+            .map_err(property_object_error)?;
+        let Some(heritage) = planned.heritage.as_ref() else {
+            return Ok(());
+        };
+        let bases = heritage.bases.clone();
+        self.plan.generic_interfaces.insert(symbol, planned);
+        if !self.planning_interfaces.insert(symbol) {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::GenericReferenceUnsupported {
+                    node: bases[0].node,
+                    symbol,
+                },
+            ));
+        }
+
+        let result = (|| {
+            for base in bases {
+                if base.kind != DirectInterfaceBaseKind::Interface || base.type_arguments.is_empty()
+                {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::GenericReferenceUnsupported {
+                            node: base.node,
+                            symbol: base.symbol,
+                        },
+                    ));
+                }
+                let flags = self
+                    .store
+                    .symbol(base.symbol)
+                    .map(ts_binder::semantic::Symbol::flags)
+                    .ok_or(DeclaredTypeError::Unavailable(
+                        DeclaredTypeUnavailable::SymbolNotOwned(base.symbol),
+                    ))?;
+                if preflight_class_or_interface_reference(
+                    self.store,
+                    self.host,
+                    base.symbol,
+                    flags,
+                )? != base.type_arguments.len()
+                {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::GenericReferenceUnsupported {
+                            node: base.node,
+                            symbol: base.symbol,
+                        },
+                    ));
+                }
+                if self.has_generic_interface_heritage(base.symbol)? {
+                    self.plan_generic_interface_heritage(base.symbol)?;
+                }
+                for argument in base.type_arguments {
+                    self.plan_type_node_in_context(argument, None, false)?;
+                }
+            }
+            Ok(())
+        })();
+        assert!(self.planning_interfaces.remove(&symbol));
+        result
+    }
+
     fn plan_union_type(
         &mut self,
         node: NodeRef,
@@ -7156,6 +7289,13 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 }
                 direct_generic_constraints =
                     self.preflight_direct_generic_reference_target(node, symbol, local_count)?;
+                if flags.contains(SymbolFlags::INTERFACE)
+                    && !flags.contains(SymbolFlags::CLASS)
+                    && type_arguments.len() == local_count
+                    && self.has_generic_interface_heritage(symbol)?
+                {
+                    self.plan_generic_interface_heritage(symbol)?;
+                }
                 if union_constituent {
                     for argument in &type_arguments {
                         self.plan_type_node_in_context(*argument, None, true)?;
@@ -10204,7 +10344,17 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             return Ok(Vec::new());
         }
         if declarations.len() != 1 {
-            return Err(unsupported());
+            let owner = self.store.symbol(symbol).ok_or_else(&unsupported)?;
+            if !owner.flags().contains(SymbolFlags::INTERFACE)
+                || owner.flags().contains(SymbolFlags::CLASS)
+                || object_members::plan_generic_interface(self.store, self.host, symbol)
+                    .map_err(property_object_error)?
+                    .declarations
+                    .as_slice()
+                    != declarations
+            {
+                return Err(unsupported());
+            }
         }
         let declaration = declarations[0];
         if (declaration.arena != node.arena || declaration.file != node.file)
@@ -13769,14 +13919,17 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             && flags.contains(SymbolFlags::TYPE_ALIAS)
         {
             planner.plan_type_alias(symbol, false)?;
-        } else if flags.contains(SymbolFlags::INTERFACE)
-            && !flags.contains(SymbolFlags::CLASS)
-            && preflight_class_or_interface_reference(planner.store, planner.host, symbol, flags)?
-                == 0
-            && !planner.is_default_library_template_strings_array(symbol)
-            && !planner.is_canonical_global_jsx_element(symbol)
-        {
-            planner.plan_property_interface(symbol)?;
+        } else if flags.contains(SymbolFlags::INTERFACE) && !flags.contains(SymbolFlags::CLASS) {
+            let parameter_count =
+                preflight_class_or_interface_reference(planner.store, planner.host, symbol, flags)?;
+            if parameter_count == 0
+                && !planner.is_default_library_template_strings_array(symbol)
+                && !planner.is_canonical_global_jsx_element(symbol)
+            {
+                planner.plan_property_interface(symbol)?;
+            } else if parameter_count != 0 && planner.has_generic_interface_heritage(symbol)? {
+                planner.plan_generic_interface_heritage(symbol)?;
+            }
         }
         let plan = planner.finish();
         let mut prepared = self.prepare_literal_types(&plan)?;
@@ -14327,11 +14480,19 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         if let Some(declared_type) =
             get_declared_class_interface_or_type_parameter(self.store, self.host, symbol, flags)?
         {
-            if flags.contains(SymbolFlags::INTERFACE)
-                && !flags.contains(SymbolFlags::CLASS)
-                && plan.interfaces.contains_key(&symbol)
-            {
-                return self.execute_property_interface(symbol, declared_type, plan, prepared);
+            if flags.contains(SymbolFlags::INTERFACE) && !flags.contains(SymbolFlags::CLASS) {
+                if let Some(interface) = plan.generic_interfaces.get(&symbol).cloned() {
+                    return self.execute_generic_interface_heritage(
+                        symbol,
+                        declared_type,
+                        &interface,
+                        plan,
+                        prepared,
+                    );
+                }
+                if plan.interfaces.contains_key(&symbol) {
+                    return self.execute_property_interface(symbol, declared_type, plan, prepared);
+                }
             }
             return Ok(declared_type);
         }
@@ -14351,6 +14512,72 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             ));
         }
         Ok(error_type)
+    }
+
+    fn execute_generic_interface_heritage(
+        &mut self,
+        symbol: SemanticSymbolId,
+        target: TypeId,
+        interface: &PropertyObjectPlan,
+        plan: &TypeQueryPlan,
+        prepared: &mut PreparedTypeQueryTypes,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let invalid = || {
+            DeclaredTypeError::Unavailable(DeclaredTypeUnavailable::InvalidCachedDeclaredType {
+                symbol,
+                declared_type: target,
+            })
+        };
+        let heritage = interface.heritage.as_ref().ok_or_else(invalid)?;
+        if interface.symbol != symbol || heritage.bases.is_empty() {
+            return Err(invalid());
+        }
+
+        let mut bases = Vec::with_capacity(heritage.bases.len());
+        for base in &heritage.bases {
+            if base.kind != DirectInterfaceBaseKind::Interface || base.symbol == symbol {
+                return Err(invalid());
+            }
+            let base_target = self.execute_declared_type(base.symbol, plan, prepared)?;
+            let mut arguments = Vec::with_capacity(base.type_arguments.len());
+            for argument in &base.type_arguments {
+                arguments.push(self.execute_type_node(*argument, plan, prepared)?);
+            }
+            let reference = create_direct_generic_reference(
+                self.store,
+                base_target,
+                &arguments,
+                ObjectFlags::NONE,
+            )
+            .map_err(|_| invalid())?;
+            if reference == target || bases.contains(&reference) {
+                return Err(invalid());
+            }
+            bases.push(reference);
+        }
+
+        let record = self.store.type_payload(target).ok_or_else(invalid)?;
+        let TypeData::Interface(data) = record.data() else {
+            return Err(invalid());
+        };
+        if record.symbol() != Some(symbol) || data.resolved_base_constructor_type.is_some() {
+            return Err(invalid());
+        }
+        if data.base_types_resolved {
+            return if data.resolved_base_types.as_deref() == Some(bases.as_slice()) {
+                Ok(target)
+            } else {
+                Err(invalid())
+            };
+        }
+        if data.resolved_base_types.is_some()
+            || !self
+                .store
+                .set_interface_base_resolution(target, true, None, Some(bases))
+        {
+            return Err(invalid());
+        }
+        Ok(target)
     }
 
     fn execute_property_interface(
@@ -27634,6 +27861,242 @@ mod tests {
             query_global_node(&mut fixture, &global_types, accepted, &mut diagnostics),
             Ok(expected),
         );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn generic_interface_heritage_publishes_forwarded_bases_before_member_demand() {
+        let mut fixture = fixture(concat!(
+            "interface Base<Value> { inherited: Value; } ",
+            "interface Derived<Value> extends Base<Value> { own: Value; }",
+        ));
+        let base = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Base");
+        let derived = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Derived");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let target = query_declared(
+            &mut fixture,
+            derived,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let base_target = fixture
+            .store
+            .declared_type_links(base)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let TypeData::Interface(interface) = fixture.store.type_payload(target).unwrap().data()
+        else {
+            panic!("Derived must retain its generic interface identity")
+        };
+        let [inherited] = interface.resolved_base_types.as_deref().unwrap() else {
+            panic!("the generic owner must retain one forwarded base")
+        };
+        let reference = validate_direct_generic_reference(&fixture.store, *inherited).unwrap();
+        assert_eq!(reference.target, base_target);
+        assert_eq!(
+            reference.type_arguments.as_slice(),
+            interface
+                .reference
+                .resolved_type_arguments
+                .as_deref()
+                .unwrap(),
+        );
+        assert!(interface.base_types_resolved);
+        assert!(!interface.declared_members_resolved);
+        assert!(
+            fixture
+                .store
+                .type_payload(base_target)
+                .and_then(|record| match record.data() {
+                    TypeData::Interface(base) => Some(!base.declared_members_resolved),
+                    _ => None,
+                })
+                .unwrap(),
+        );
+
+        let warm = store_state(&fixture.store);
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                derived,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(target),
+        );
+        assert_eq!(store_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn reopened_generic_interface_references_keep_one_canonical_target() {
+        let mut fixture = fixture(concat!(
+            "interface Box<Value> { first: Value; } ",
+            "interface Box<Value> { second: Value; } ",
+            "let value: Box<string>;",
+        ));
+        let owner = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Box");
+        let annotation = variable_type_node(&fixture, "value");
+        let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let type_ = query_node(&mut fixture, annotation, &mut diagnostics).unwrap();
+        let reference = validate_direct_generic_reference(&fixture.store, type_).unwrap();
+        assert_eq!(reference.type_arguments, [string]);
+        assert_eq!(
+            fixture
+                .store
+                .type_payload(reference.target)
+                .and_then(TypeRecord::symbol),
+            Some(owner),
+        );
+
+        let warm = store_state(&fixture.store);
+        assert_eq!(
+            query_node(&mut fixture, annotation, &mut diagnostics),
+            Ok(type_),
+        );
+        assert_eq!(store_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn poisoned_generic_heritage_and_cycles_fail_before_additional_writes() {
+        let mut inherited = fixture(concat!(
+            "interface Base<Value> { inherited: Value; } ",
+            "interface Derived<Value> extends Base<Value> { own: Value; }",
+        ));
+        let derived = named_symbol(&inherited, SyntaxKind::InterfaceDeclaration, "Derived");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let target = query_declared(
+            &mut inherited,
+            derived,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let original = inherited
+            .store
+            .type_payload(target)
+            .and_then(|record| match record.data() {
+                TypeData::Interface(interface) => interface.resolved_base_types.clone(),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            inherited
+                .store
+                .set_interface_base_resolution(target, true, None, None)
+        );
+        let poisoned = store_state(&inherited.store);
+
+        assert_eq!(
+            query_declared(
+                &mut inherited,
+                derived,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Err(DeclaredTypeError::Unavailable(
+                DeclaredTypeUnavailable::InvalidCachedDeclaredType {
+                    symbol: derived,
+                    declared_type: target,
+                },
+            )),
+        );
+        assert_eq!(store_state(&inherited.store), poisoned);
+        assert!(
+            inherited
+                .store
+                .set_interface_base_resolution(target, true, None, Some(original),)
+        );
+
+        let mut cycle = fixture(concat!(
+            "interface Left<Value> extends Right<Value> {} ",
+            "interface Right<Value> extends Left<Value> {}",
+        ));
+        let left = named_symbol(&cycle, SyntaxKind::InterfaceDeclaration, "Left");
+        let before = store_state(&cycle.store);
+        assert!(
+            query_declared(
+                &mut cycle,
+                left,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .is_err(),
+        );
+        assert_eq!(store_state(&cycle.store), before);
+    }
+
+    #[test]
+    fn keyof_reopened_interfaces_includes_inherited_property_symbols() {
+        let mut fixture = fixture(concat!(
+            "interface Base { inherited: string; } ",
+            "interface Derived { first: number; } ",
+            "interface Derived extends Base { second: boolean; } ",
+            "type Keys = keyof Derived;",
+        ));
+        let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Keys");
+        let base = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Base");
+        let derived = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Derived");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let keys = query_declared(
+            &mut fixture,
+            alias,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let TypeData::Union(union) = fixture.store.type_payload(keys).unwrap().data() else {
+            panic!("three declared property keys must retain a literal union")
+        };
+        let mut names = union
+            .union
+            .types
+            .iter()
+            .map(
+                |key| match fixture.store.type_payload(*key).unwrap().data() {
+                    TypeData::Literal(literal) => match &literal.value {
+                        LiteralValue::String(value) => value.as_str(),
+                        _ => panic!("interface keys must remain string literals"),
+                    },
+                    _ => panic!("interface keys must remain string literals"),
+                },
+            )
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        assert_eq!(names, ["first", "inherited", "second"]);
+
+        let derived_type = fixture
+            .store
+            .declared_type_links(derived)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let inherited = fixture
+            .store
+            .type_payload(derived_type)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.properties.as_deref())
+            .and_then(|properties| properties.last())
+            .copied()
+            .unwrap();
+        assert_eq!(fixture.store.get_parent_of_symbol(inherited), Some(base));
+
+        let warm = store_state(&fixture.store);
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(keys),
+        );
+        assert_eq!(store_state(&fixture.store), warm);
         assert!(diagnostics.is_empty());
     }
 

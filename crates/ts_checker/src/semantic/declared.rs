@@ -2782,6 +2782,63 @@ mod tests {
     }
 
     #[test]
+    fn reopened_interface_heritage_preserves_each_base_in_declaration_order() {
+        let mut fixture = fixture(concat!(
+            "interface First {} ",
+            "interface Second { current: this } ",
+            "interface Derived extends First {} ",
+            "interface Derived extends Second {}",
+        ));
+        merge_fixture_globals(&mut fixture);
+        let first = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "First");
+        let second = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Second");
+        let derived = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Derived");
+        let bound = fixture.files.get(&fixture.file).unwrap();
+        let host = post_global_host(&fixture.parsed.arena, bound);
+
+        let derived_type = fixture
+            .store
+            .get_declared_type_of_symbol(&host, derived)
+            .unwrap();
+        let first_type = fixture
+            .store
+            .declared_type_links(first)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let second_type = fixture
+            .store
+            .declared_type_links(second)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+
+        assert!(derived_type.get() < first_type.get());
+        assert!(first_type.get() < second_type.get());
+        assert!(
+            interface_data(&fixture.store, derived_type)
+                .this_type
+                .is_some()
+        );
+
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.mapper_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            fixture.store.get_declared_type_of_symbol(&host, derived),
+            Ok(derived_type),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.mapper_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
     fn a_pure_class_base_forces_this_without_allocating_the_class_identity() {
         let mut fixture = fixture("class Base {} interface Derived extends Base {}");
         merge_fixture_globals(&mut fixture);

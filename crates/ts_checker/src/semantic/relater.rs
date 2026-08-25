@@ -291,6 +291,48 @@ fn validate_direct_interface_heritage_relation_endpoint(
     Ok(())
 }
 
+fn generic_reference_inherits_symbol_owner(
+    store: &SemanticStore<TypeRecord, TypeMapper>,
+    reference: TypeId,
+    owner: SemanticSymbolId,
+) -> bool {
+    if store.get_merged_symbol(owner) != Some(owner) {
+        return false;
+    }
+    let Ok(reference) = validate_direct_generic_reference(store, reference) else {
+        return false;
+    };
+    let mut pending = vec![reference.target];
+    let mut visited = HashSet::new();
+    while let Some(target) = pending.pop() {
+        if !visited.insert(target) {
+            continue;
+        }
+        let Some(TypeData::Interface(interface)) = store.type_payload(target).map(TypeRecord::data)
+        else {
+            return false;
+        };
+        for base in interface.resolved_base_types.as_deref().unwrap_or_default() {
+            let target = validate_direct_generic_reference(store, *base)
+                .map(|reference| reference.target)
+                .unwrap_or(*base);
+            let Some(record) = store.type_payload(target) else {
+                return false;
+            };
+            let Some(symbol) = record.symbol() else {
+                return false;
+            };
+            if symbol == owner {
+                return true;
+            }
+            if matches!(record.data(), TypeData::Interface(_)) {
+                pending.push(target);
+            }
+        }
+    }
+    false
+}
+
 fn validate_class_members_relation_endpoint(
     store: &SemanticStore<TypeRecord, TypeMapper>,
     type_: TypeId,
@@ -3997,10 +4039,6 @@ impl<'store> RelaterSession<'store> {
                 let Some(target_record) = self.store.symbol(target) else {
                     return Err(RelationUnavailable::UnsupportedProperty(symbol));
                 };
-                let mapper_valid = links.mapper == validated.mapper()
-                    && links
-                        .mapper
-                        .is_some_and(|mapper| self.store.mapper_payload(mapper).is_some());
                 let expected_checks = CheckFlags::INSTANTIATED
                     | (target_record.check_flags()
                         & (CheckFlags::READONLY
@@ -4011,13 +4049,26 @@ impl<'store> RelaterSession<'store> {
                     .store
                     .type_payload(reference)
                     .and_then(TypeRecord::symbol);
+                let inherited = record.parent().is_some_and(|owner| {
+                    Some(owner) != reference_owner
+                        && generic_reference_inherits_symbol_owner(self.store, reference, owner)
+                });
+                let expected_mapper = if inherited {
+                    links.mapper
+                } else {
+                    validated.mapper()
+                };
+                let mapper_valid = links.mapper == expected_mapper
+                    && links
+                        .mapper
+                        .is_some_and(|mapper| self.store.mapper_payload(mapper).is_some());
                 return if record.flags() == target_record.flags() | SymbolFlags::TRANSIENT
                     && record.check_flags() == expected_checks
                     && record.name() == target_record.name()
                     && record.declarations() == target_record.declarations()
                     && record.value_declaration() == target_record.value_declaration()
                     && record.parent() == target_record.parent()
-                    && record.parent() == reference_owner
+                    && (record.parent() == reference_owner || inherited)
                     && record.members().is_none()
                     && record.exports().is_none()
                     && record.export_symbol().is_none()
@@ -4026,7 +4077,7 @@ impl<'store> RelaterSession<'store> {
                         == &(ValueSymbolLinks {
                             resolved_type: links.resolved_type,
                             target: Some(target),
-                            mapper: validated.mapper(),
+                            mapper: expected_mapper,
                             name_type: self
                                 .store
                                 .value_symbol_links(target)
@@ -4440,13 +4491,13 @@ impl<'store> RelaterSession<'store> {
                     .and_then(|target| self.store.type_payload(target))
                     .and_then(TypeRecord::symbol)
                     .and_then(|owner| self.store.symbol(owner))
-                    .and_then(|owner| match owner.declarations() {
-                        Some([declaration]) => Some(*declaration),
-                        _ => None,
-                    })
-                    .is_some_and(|declaration| {
-                        self.store.source_node_kind(declaration)
-                            == Some(SyntaxKind::InterfaceDeclaration)
+                    .and_then(ts_binder::semantic::Symbol::declarations)
+                    .is_some_and(|declarations| {
+                        !declarations.is_empty()
+                            && declarations.iter().all(|declaration| {
+                                self.store.source_node_kind(*declaration)
+                                    == Some(SyntaxKind::InterfaceDeclaration)
+                            })
                     });
                 if !source_declared_target {
                     return Err(RelationUnavailable::UnsupportedStructuredType(type_id));
@@ -5565,12 +5616,15 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 let mut by_name = HashMap::with_capacity(resolved.properties.len());
                 for property in resolved.properties {
                     let record = session.property_symbol(property, resolved.property_origin)?;
-                    let Some([declaration]) = record.declarations() else {
+                    let Some(declaration) = record
+                        .declarations()
+                        .and_then(|declarations| declarations.first())
+                        .copied()
+                    else {
                         return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
                     };
                     let name = record.name().to_owned();
                     let optional = record.flags().contains(SymbolFlags::OPTIONAL);
-                    let declaration = *declaration;
                     let type_ = session.property_type(property)?;
                     let index = properties.len();
                     if by_name.insert(name.clone(), index).is_some() {
@@ -9235,6 +9289,123 @@ mod tests {
             Err(RelationUnavailable::InvalidStructuredMembers(reference))
         );
         assert_eq!(fixture.store.relation_state_snapshot(), before);
+    }
+
+    #[test]
+    fn reopened_generic_relations_accept_authenticated_inherited_proxy_owners() {
+        let mut fixture = function_relation_fixture(concat!(
+            "interface Base<Value> { inherited: Value; fixed: string; } ",
+            "interface Derived<Value> extends Base<Value> { own: Value; } ",
+            "interface Derived<Value> extends Base<Value> { explicit: string; }",
+        ));
+        let globals = fixture.store.intrinsic_bootstrap().unwrap().globals;
+        let base = fixture
+            .store
+            .symbol_table(globals)
+            .and_then(|globals| globals.get_source("Base"))
+            .unwrap();
+        let derived = fixture
+            .store
+            .symbol_table(globals)
+            .and_then(|globals| globals.get_source("Derived"))
+            .unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let target = {
+            let host = relation_host(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            );
+            CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_declared_type_of_symbol(derived)
+            .unwrap()
+        };
+        let base_target = fixture
+            .store
+            .declared_type_links(base)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let base_parameter = validate_direct_generic_reference(&fixture.store, base_target)
+            .unwrap()
+            .type_arguments[0];
+        let derived_parameter = validate_direct_generic_reference(&fixture.store, target)
+            .unwrap()
+            .type_arguments[0];
+        let (number, string) = {
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            (bootstrap.number_type, bootstrap.string_type)
+        };
+        let (base_plan, derived_plan) = {
+            let host = relation_host(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            );
+            (
+                super::super::object_members::plan_generic_interface(&fixture.store, &host, base)
+                    .unwrap(),
+                super::super::object_members::plan_generic_interface(
+                    &fixture.store,
+                    &host,
+                    derived,
+                )
+                .unwrap(),
+            )
+        };
+        assert!(
+            fixture
+                .store
+                .publish_interface_no_base_resolution(base_target)
+        );
+        super::super::object_members::publish_generic_interface_declared_members(
+            &mut fixture.store,
+            &base_plan,
+            base_target,
+            &[base_parameter, string],
+        )
+        .unwrap();
+        super::super::object_members::publish_generic_interface_declared_members(
+            &mut fixture.store,
+            &derived_plan,
+            target,
+            &[derived_parameter, string],
+        )
+        .unwrap();
+
+        let reference = fixture
+            .store
+            .create_direct_generic_reference_type(target, &[number])
+            .unwrap();
+        for name in ["own", "explicit", "inherited", "fixed"] {
+            fixture
+                .store
+                .resolve_generic_interface_property(reference, name, None)
+                .unwrap()
+                .unwrap();
+        }
+        let expected_properties = [
+            alloc_typed_property(&mut fixture.store, "own", number, false),
+            alloc_typed_property(&mut fixture.store, "explicit", string, false),
+            alloc_typed_property(&mut fixture.store, "inherited", number, false),
+            alloc_typed_property(&mut fixture.store, "fixed", string, false),
+        ];
+        let expected = alloc_property_object(&mut fixture.store, expected_properties.to_vec());
+
+        assert_eq!(
+            fixture.store.is_type_assignable_to(reference, expected),
+            Ok(true),
+        );
+        let warm = fixture.store.relation_state_snapshot();
+        assert_eq!(
+            fixture.store.is_type_assignable_to(reference, expected),
+            Ok(true),
+        );
+        assert_eq!(fixture.store.relation_state_snapshot(), warm);
+        assert!(diagnostics.is_empty());
     }
 
     #[test]
@@ -14918,6 +15089,63 @@ mod tests {
         set_object_properties(&mut store, source, vec![source_property]);
         set_object_properties(&mut store, target, vec![target_property]);
         assert_eq!(store.is_type_assignable_to(source, target), Ok(true));
+    }
+
+    #[test]
+    fn reopened_interface_relations_keep_inherited_source_symbols_after_explicit_members() {
+        let mut fixture = function_relation_fixture(concat!(
+            "interface Base { inherited: string; } ",
+            "interface Base { inherited: string; } ",
+            "interface Derived { own: number; } ",
+            "interface Derived extends Base { own: number; extra: boolean; } ",
+            "type Actual = Derived; ",
+            "type Expected = { own: number; extra: boolean; inherited: string; };",
+        ));
+        let actual = query_declared_relation_alias(&mut fixture, "Actual");
+        let expected = query_declared_relation_alias(&mut fixture, "Expected");
+
+        assert_eq!(
+            fixture.store.is_type_assignable_to(actual, expected),
+            Ok(true)
+        );
+        let warm = fixture.store.relation_state_snapshot();
+        assert_eq!(
+            fixture.store.is_type_assignable_to(actual, expected),
+            Ok(true)
+        );
+        assert_eq!(fixture.store.relation_state_snapshot(), warm);
+
+        let resolved = {
+            let host = relation_host(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            );
+            fixture
+                .store
+                .resolved_declared_property_object(&host, actual)
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(
+            resolved
+                .properties
+                .iter()
+                .map(|property| property.name.as_utf8())
+                .collect::<Vec<_>>(),
+            [Some("own"), Some("extra"), Some("inherited")],
+        );
+        let globals = fixture.store.intrinsic_bootstrap().unwrap().globals;
+        let base = fixture
+            .store
+            .symbol_table(globals)
+            .and_then(|globals| globals.get_source("Base"))
+            .unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .get_parent_of_symbol(resolved.properties[2].symbol),
+            Some(base),
+        );
     }
 
     #[test]

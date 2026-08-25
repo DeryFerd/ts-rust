@@ -75,21 +75,22 @@ fn matching_inherited_property_contract(
     let Some(second_record) = store.symbol(second) else {
         return false;
     };
-    let Some(first_type) = store
-        .value_symbol_links(first)
-        .and_then(|links| links.resolved_type)
-    else {
+    let Some(first_links) = store.value_symbol_links(first) else {
         return false;
     };
-    let Some(second_type) = store
-        .value_symbol_links(second)
-        .and_then(|links| links.resolved_type)
-    else {
+    let Some(first_type) = first_links.resolved_type else {
+        return false;
+    };
+    let Some(second_links) = store.value_symbol_links(second) else {
+        return false;
+    };
+    let Some(second_type) = second_links.resolved_type else {
         return false;
     };
     first_record.name() == second_record.name()
         && first_record.flags() == second_record.flags()
         && first_record.check_flags() == second_record.check_flags()
+        && first_links.write_type == second_links.write_type
         && (first_type == second_type
             || first_record.flags().contains(SymbolFlags::METHOD)
                 && matching_interface_method_contract(store, first, second))
@@ -351,6 +352,15 @@ pub(super) fn resolve_direct_interface_members(
         .iter()
         .filter(|property| store.value_symbol_links(property.symbol).is_none())
         .count();
+    let missing_accessor_links = plan
+        .accessors
+        .iter()
+        .filter_map(|accessor| accessor.parameter)
+        .filter(|parameter| store.value_symbol_links(parameter.symbol).is_none())
+        .count();
+    let missing_value_links = missing_value_links
+        .checked_add(missing_accessor_links)
+        .ok_or_else(|| capacity(plan))?;
     if !store.try_reserve_checker_symbol_allocations(0, usize::from(prepared_members.is_some()))
         || !store.try_reserve_value_symbol_links(missing_value_links)
         || !store.try_reserve_direct_interface_heritage_provenance(1)
@@ -663,7 +673,7 @@ pub(super) fn validate_planned_interface_heritage_members(
         && plan.properties.iter().all(|property| {
             store.symbol(property.symbol).is_some_and(|record| {
                 record.check_flags()
-                    == if property.readonly {
+                    == if property.readonly && !record.flags().intersects(SymbolFlags::ACCESSOR) {
                         CheckFlags::READONLY
                     } else {
                         CheckFlags::NONE
@@ -1275,6 +1285,31 @@ fn valid_call_return_annotation(
     expected == Some(return_type)
 }
 
+fn valid_accessor_declarations(
+    store: &CanonicalTypeMapperStore,
+    flags: SymbolFlags,
+    declarations: &[NodeRef],
+) -> bool {
+    let mut read_count = 0usize;
+    let mut write_count = 0usize;
+    let mut property_count = 0usize;
+    for declaration in declarations {
+        match store.source_node_kind(*declaration) {
+            Some(SyntaxKind::GetAccessor) => read_count += 1,
+            Some(SyntaxKind::SetAccessor) => write_count += 1,
+            Some(SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature) => {
+                property_count += 1;
+            }
+            _ => return false,
+        }
+    }
+    read_count <= 1
+        && write_count <= 1
+        && flags.contains(SymbolFlags::GET_ACCESSOR) == (read_count == 1)
+        && flags.contains(SymbolFlags::SET_ACCESSOR) == (write_count == 1)
+        && flags.contains(SymbolFlags::PROPERTY) == (property_count != 0)
+}
+
 fn valid_property_symbol(store: &CanonicalTypeMapperStore, property: SemanticSymbolId) -> bool {
     let Some(record) = store.symbol(property) else {
         return false;
@@ -1286,8 +1321,16 @@ fn valid_property_symbol(store: &CanonicalTypeMapperStore, property: SemanticSym
         return false;
     };
     let method = record.flags().contains(SymbolFlags::METHOD);
+    let accessor = record.flags().intersects(SymbolFlags::ACCESSOR);
     let expected_flags = if method {
         SymbolFlags::METHOD
+    } else if accessor {
+        (record.flags() & SymbolFlags::ACCESSOR)
+            | if record.flags().contains(SymbolFlags::PROPERTY) {
+                SymbolFlags::PROPERTY
+            } else {
+                SymbolFlags::NONE
+            }
     } else {
         SymbolFlags::PROPERTY
     } | if record.flags().contains(SymbolFlags::OPTIONAL) {
@@ -1295,42 +1338,64 @@ fn valid_property_symbol(store: &CanonicalTypeMapperStore, property: SemanticSym
     } else {
         SymbolFlags::NONE
     };
-    record.flags() == expected_flags
-        && if method {
-            record.check_flags() == CheckFlags::NONE
+    if record.flags() != expected_flags
+        || method && accessor
+        || accessor
+            && record.flags().contains(SymbolFlags::OPTIONAL)
+            && !record.flags().contains(SymbolFlags::PROPERTY)
+        || if method || accessor {
+            record.check_flags() != CheckFlags::NONE
         } else {
-            record.check_flags().bits() & !CheckFlags::READONLY.bits() == 0
+            record.check_flags().bits() & !CheckFlags::READONLY.bits() != 0
         }
-        && record
+        || record
             .value_declaration()
-            .is_some_and(|declaration| declarations.contains(&declaration))
-        && record.members().is_none()
-        && record.exports().is_none()
-        && record.parent().is_some()
-        && record.export_symbol().is_none()
-        && store.get_merged_symbol(property) == Some(property)
-        && declarations.iter().all(|declaration| {
-            if method {
-                store.source_node_kind(*declaration) == Some(SyntaxKind::MethodSignature)
-            } else {
-                matches!(
-                    store.source_node_kind(*declaration),
-                    Some(SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature)
-                )
+            .is_none_or(|declaration| !declarations.contains(&declaration))
+        || record.members().is_some()
+        || record.exports().is_some()
+        || record.parent().is_none()
+        || record.export_symbol().is_some()
+        || store.get_merged_symbol(property) != Some(property)
+    {
+        return false;
+    }
+
+    if accessor {
+        if !valid_accessor_declarations(store, record.flags(), declarations) {
+            return false;
+        }
+    } else if !declarations.iter().all(|declaration| {
+        if method {
+            store.source_node_kind(*declaration) == Some(SyntaxKind::MethodSignature)
+        } else {
+            matches!(
+                store.source_node_kind(*declaration),
+                Some(SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature)
+            )
+        }
+    }) {
+        return false;
+    }
+
+    store.value_symbol_links(property).is_some_and(|links| {
+        let Some(read_type) = links.resolved_type else {
+            return false;
+        };
+        let write_type = if accessor { links.write_type } else { None };
+        links
+            == &ValueSymbolLinks {
+                resolved_type: Some(read_type),
+                write_type,
+                ..ValueSymbolLinks::default()
             }
-        })
-        && store.value_symbol_links(property).is_some_and(|links| {
-            let Some(type_) = links.resolved_type else {
-                return false;
-            };
-            links
-                == &ValueSymbolLinks {
-                    resolved_type: Some(type_),
-                    ..ValueSymbolLinks::default()
-                }
-                && store.type_payload(type_).is_some()
-                && (!method || valid_interface_method_value(store, property, type_).is_some())
-        })
+            && store.type_payload(read_type).is_some()
+            && write_type.is_none_or(|write_type| {
+                record.flags().contains(SymbolFlags::SET_ACCESSOR)
+                    && write_type != read_type
+                    && store.type_payload(write_type).is_some()
+            })
+            && (!method || valid_interface_method_value(store, property, read_type).is_some())
+    })
 }
 
 pub(super) fn valid_interface_method_value(

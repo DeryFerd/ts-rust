@@ -29060,7 +29060,7 @@ mod tests {
             validate_resolved_declared_property_object,
         },
         production::GlobalMergeCompletion,
-        type_records::TypeData,
+        type_records::{LiteralValue, TypeData},
         types::ObjectFlags,
     };
 
@@ -40280,6 +40280,177 @@ mod tests {
         }
         assert!(context.diagnostics().is_empty());
         assert!(is_type_checked(&context, file));
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn reopened_interface_heritage_keeps_accessors_and_inherited_keys_in_source_order() {
+        let source = parsed(concat!(
+            "interface Base { get inherited(): string; set inherited(next: string); } ",
+            "interface Base { inherited: string; } ",
+            "interface Entry { get value(): string; set value(next: string); } ",
+            "interface Entry extends Base { value: string; own: number; } ",
+            "type Keys = keyof Entry;",
+        ));
+        let file = FileId::new(8_685);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let base = global_symbol(&context, "Base");
+        let entry = global_symbol(&context, "Entry");
+        let entry_type = context
+            .store()
+            .declared_type_links(entry)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let properties = context
+            .store()
+            .type_payload(entry_type)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.properties.as_deref())
+            .unwrap();
+        assert_eq!(
+            properties
+                .iter()
+                .map(|property| context.store().symbol(*property).unwrap().name().as_utf8())
+                .collect::<Vec<_>>(),
+            [Some("value"), Some("own"), Some("inherited")],
+        );
+        assert_eq!(
+            context.store().symbol(properties[0]).unwrap().flags(),
+            SymbolFlags::PROPERTY | SymbolFlags::GET_ACCESSOR | SymbolFlags::SET_ACCESSOR,
+        );
+        assert_eq!(
+            context.store().get_parent_of_symbol(properties[2]),
+            Some(base)
+        );
+        assert_eq!(
+            context.store().symbol(properties[2]).unwrap().flags(),
+            SymbolFlags::PROPERTY | SymbolFlags::GET_ACCESSOR | SymbolFlags::SET_ACCESSOR,
+        );
+
+        let keys = global_symbol(&context, "Keys");
+        let keys = context
+            .store()
+            .type_alias_links(keys)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let TypeData::Union(union) = context.store().type_payload(keys).unwrap().data() else {
+            panic!("the accessor and inherited properties must produce three literal keys")
+        };
+        let mut names = union
+            .union
+            .types
+            .iter()
+            .map(
+                |key| match context.store().type_payload(*key).unwrap().data() {
+                    TypeData::Literal(literal) => match &literal.value {
+                        LiteralValue::String(value) => value.as_str(),
+                        _ => panic!("interface property keys must remain string literals"),
+                    },
+                    _ => panic!("interface property keys must remain string literals"),
+                },
+            )
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        assert_eq!(names, ["inherited", "own", "value"]);
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn generic_source_heritage_preserves_inherited_indexes_and_explicit_members() {
+        let source = parsed(concat!(
+            "interface Dictionary<Value> { [key: string]: Value; } ",
+            "interface Entry<Value> extends Dictionary<Value> { own: Value; }",
+        ));
+        let file = FileId::new(8_686);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let dictionary = global_symbol(&context, "Dictionary");
+        let entry = global_symbol(&context, "Entry");
+        let target = context
+            .store()
+            .declared_type_links(entry)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let TypeData::Interface(interface) = context.store().type_payload(target).unwrap().data()
+        else {
+            panic!("the generic declaration must retain its interface target")
+        };
+        let [base] = interface.resolved_base_types.as_deref().unwrap() else {
+            panic!("the derived generic declaration must retain its instantiated base")
+        };
+        assert_eq!(
+            context.store().type_payload(*base).unwrap().symbol(),
+            Some(dictionary)
+        );
+
+        let parameter = interface
+            .reference
+            .resolved_type_arguments
+            .as_deref()
+            .unwrap()[0];
+        let members = context
+            .store_mut_for_test()
+            .resolve_generic_interface_members(target, None)
+            .unwrap();
+        assert_eq!(members.properties().len(), 1);
+        assert_eq!(
+            context
+                .store()
+                .symbol(members.properties()[0])
+                .unwrap()
+                .name()
+                .as_utf8(),
+            Some("own"),
+        );
+        let indexes = context
+            .store()
+            .type_payload(target)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.index_infos.as_deref())
+            .unwrap();
+        let [index] = indexes else {
+            panic!("the derived target must retain one inherited string index")
+        };
+        assert_eq!(
+            context.store().index_info(*index).unwrap().value_type(),
+            parameter
+        );
+
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let reference = context
+            .store_mut_for_test()
+            .create_direct_generic_reference_type(target, &[number])
+            .unwrap();
+        context
+            .store_mut_for_test()
+            .resolve_generic_interface_members(reference, None)
+            .unwrap();
+        let [index] = context
+            .store()
+            .type_payload(reference)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.index_infos.as_deref())
+            .unwrap()
+        else {
+            panic!("the concrete reference must retain one inherited string index")
+        };
+        assert_eq!(
+            context.store().index_info(*index).unwrap().value_type(),
+            number
+        );
+        assert!(context.diagnostics().is_empty());
 
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();

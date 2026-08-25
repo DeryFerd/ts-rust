@@ -1466,22 +1466,14 @@ pub(super) fn plan_interface(
             return Err(invalid());
         }
         if let Some(clauses) = interface.heritage_clauses.as_ref() {
-            if interface_declarations.len() != 1 || heritage.is_some() {
-                return Err(PropertyObjectError::UnsupportedMember {
-                    node: candidate,
-                    kind: SyntaxKind::InterfaceDeclaration,
-                });
-            }
-            heritage = Some(
-                plan_direct_interface_heritage(store, host, candidate, symbol, clauses).map_err(
-                    |error| match error {
-                        DirectInterfaceHeritageError::Invalid => invalid(),
-                        DirectInterfaceHeritageError::Unsupported { node, kind } => {
-                            PropertyObjectError::UnsupportedMember { node, kind }
-                        }
-                    },
-                )?,
-            );
+            let planned = plan_direct_interface_heritage(store, host, candidate, symbol, clauses)
+                .map_err(|error| match error {
+                DirectInterfaceHeritageError::Invalid => invalid(),
+                DirectInterfaceHeritageError::Unsupported { node, kind } => {
+                    PropertyObjectError::UnsupportedMember { node, kind }
+                }
+            })?;
+            merge_interface_heritage(store, host, &mut heritage, planned, 2)?;
         }
         if index != 0 {
             additional_members.push((candidate, &interface.members));
@@ -1573,9 +1565,7 @@ pub(super) fn plan_interface(
                 });
             }
             if base_plan.heritage.is_some()
-                && (heritage.bases.len() != 1
-                    || !base_plan.call_signatures.is_empty()
-                    || !plan.call_signatures.is_empty())
+                && (!base_plan.call_signatures.is_empty() || !plan.call_signatures.is_empty())
             {
                 return Err(PropertyObjectError::UnsupportedMember {
                     node: base.node,
@@ -1738,6 +1728,53 @@ pub(super) fn plan_interface(
     Ok(plan)
 }
 
+/// Combines reopened interface clauses without duplicating authenticated bases.
+fn merge_interface_heritage(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    heritage: &mut Option<DirectInterfaceHeritagePlan>,
+    planned: DirectInterfaceHeritagePlan,
+    maximum_bases: usize,
+) -> Result<(), PropertyObjectError> {
+    let Some(existing) = heritage.as_mut() else {
+        *heritage = Some(planned);
+        return Ok(());
+    };
+
+    for base in planned.bases {
+        if let Some(previous) = existing
+            .bases
+            .iter()
+            .find(|previous| previous.symbol == base.symbol)
+        {
+            if previous.kind != base.kind
+                || previous.type_arguments.len() != base.type_arguments.len()
+                || previous
+                    .type_arguments
+                    .iter()
+                    .zip(&base.type_arguments)
+                    .any(|(previous, current)| {
+                        !equivalent_merged_property_annotations(store, host, *previous, *current)
+                    })
+            {
+                return Err(PropertyObjectError::UnsupportedMember {
+                    node: base.node,
+                    kind: SyntaxKind::ExpressionWithTypeArguments,
+                });
+            }
+            continue;
+        }
+        if existing.bases.len() >= maximum_bases {
+            return Err(PropertyObjectError::UnsupportedMember {
+                node: planned.clause,
+                kind: SyntaxKind::HeritageClause,
+            });
+        }
+        existing.bases.push(base);
+    }
+    Ok(())
+}
+
 fn matching_planned_interface_method_contract(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -1842,27 +1879,29 @@ fn collect_interface_property_heritage(
     }
 
     if let Some(heritage) = plan.heritage.as_ref() {
-        let [base] = heritage.bases.as_slice() else {
+        if !matches!(heritage.bases.as_slice(), [_] | [_, _]) {
             return Err(PropertyObjectError::UnsupportedMember {
                 node: heritage.clause,
                 kind: SyntaxKind::HeritageClause,
             });
-        };
-        let base_plan = plan_interface(store, host, base.symbol)?;
-        if !base_plan.indexes.is_empty() || !base_plan.call_signatures.is_empty() {
-            return Err(PropertyObjectError::UnsupportedMember {
-                node: base.node,
-                kind: SyntaxKind::ExpressionWithTypeArguments,
-            });
         }
-        collect_interface_property_heritage(
-            store,
-            host,
-            &base_plan,
-            properties,
-            active,
-            depth + 1,
-        )?;
+        for base in &heritage.bases {
+            let base_plan = plan_interface(store, host, base.symbol)?;
+            if !base_plan.indexes.is_empty() || !base_plan.call_signatures.is_empty() {
+                return Err(PropertyObjectError::UnsupportedMember {
+                    node: base.node,
+                    kind: SyntaxKind::ExpressionWithTypeArguments,
+                });
+            }
+            collect_interface_property_heritage(
+                store,
+                host,
+                &base_plan,
+                properties,
+                active,
+                depth + 1,
+            )?;
+        }
     }
 
     assert!(active.remove(&plan.symbol));
@@ -3463,12 +3502,6 @@ pub(super) fn plan_generic_interface(
             return Err(invalid_declaration());
         }
         if let Some(clauses) = interface.heritage_clauses.as_ref() {
-            if declarations.len() != 1 || heritage.is_some() {
-                return Err(PropertyObjectError::UnsupportedMember {
-                    node: candidate,
-                    kind: SyntaxKind::InterfaceDeclaration,
-                });
-            }
             let planned = plan_direct_interface_heritage(store, host, candidate, symbol, clauses)
                 .map_err(|error| match error {
                 DirectInterfaceHeritageError::Invalid => invalid_declaration(),
@@ -3487,7 +3520,7 @@ pub(super) fn plan_generic_interface(
                     kind: SyntaxKind::HeritageClause,
                 });
             }
-            heritage = Some(planned);
+            merge_interface_heritage(store, host, &mut heritage, planned, 1)?;
         }
 
         let mut current_parameters = Vec::with_capacity(parameters.nodes.len());
@@ -6639,7 +6672,6 @@ fn validate_resolved_declared_property_object_detailed(
                 DeclaredOwnerMemberDomain::Malformed => return Malformed,
             }
             if interface.resolved_base_constructor_type.is_some()
-                || interface.resolved_base_types.is_some()
                 || interface.declared_call_signatures.is_some()
                 || interface.declared_construct_signatures.is_some()
                 || interface.declared_index_infos.is_some()
@@ -6648,6 +6680,32 @@ fn validate_resolved_declared_property_object_detailed(
                 || interface.reference.object.structured.index_infos.is_some()
             {
                 return NotDeclared;
+            }
+            if interface.resolved_base_types.is_some() {
+                return match super::structured_members::validate_interface_heritage_members(
+                    store, type_,
+                ) {
+                    super::structured_members::InterfaceHeritageMembersValidation::Valid => {
+                        if owner_record.declarations().unwrap_or_default().iter().any(
+                            |declaration| declaration_has_external_owner_shape(store, *declaration),
+                        ) {
+                            TraversableBoundary(DeclaredPropertyObjectProof::Interface)
+                        } else if owner_record.parent().is_some()
+                            || owner_record.exports().is_some()
+                            || owner_record.export_symbol().is_some()
+                        {
+                            Malformed
+                        } else {
+                            Valid(DeclaredPropertyObjectProof::Interface)
+                        }
+                    }
+                    super::structured_members::InterfaceHeritageMembersValidation::Malformed => {
+                        Malformed
+                    }
+                    super::structured_members::InterfaceHeritageMembersValidation::NotHeritage => {
+                        NotDeclared
+                    }
+                };
             }
             validate_resolved_property_interface(store, type_, record, interface)
         }
@@ -9661,7 +9719,6 @@ fn valid_generic_structured_members(
     if structured.constrained != ConstrainedTypeData::default()
         || structured.signatures.is_some()
         || structured.call_signature_count != 0
-        || structured.index_infos.as_deref() != interface.declared_index_infos.as_deref()
         || structured
             .object_type_without_abstract_construct_signatures
             .is_some()
@@ -9669,12 +9726,81 @@ fn valid_generic_structured_members(
         return false;
     }
     let properties = structured.properties.as_deref().unwrap_or_default();
-    if properties.len() != plan.properties.len()
+    let mut expected = plan
+        .properties
+        .iter()
+        .map(|property| property.symbol)
+        .collect::<Vec<_>>();
+    let mut names = plan
+        .properties
+        .iter()
+        .map(|property| EscapedName::source(&property.name))
+        .collect::<HashSet<_>>();
+    let mut expected_indexes = interface
+        .declared_index_infos
+        .as_deref()
+        .unwrap_or_default()
+        .to_vec();
+    let Some(mut index_keys) = expected_indexes
+        .iter()
+        .map(|index| {
+            store
+                .index_info(*index)
+                .map(super::signatures::IndexInfo::key_type)
+        })
+        .collect::<Option<HashSet<_>>>()
+    else {
+        return false;
+    };
+    if let Some(heritage) = plan.heritage.as_ref() {
+        let Some(bases) = interface.resolved_base_types.as_deref() else {
+            return false;
+        };
+        if bases.len() != heritage.bases.len() {
+            return false;
+        }
+        for (planned, base) in heritage.bases.iter().zip(bases) {
+            let Some(record) = store.type_payload(*base) else {
+                return false;
+            };
+            let Ok(reference) = validate_direct_generic_reference(store, *base) else {
+                return false;
+            };
+            if store
+                .type_payload(reference.target)
+                .and_then(TypeRecord::symbol)
+                != Some(planned.symbol)
+                || !record
+                    .object_flags()
+                    .contains(ObjectFlags::MEMBERS_RESOLVED)
+            {
+                return false;
+            }
+            let Some(base_members) = record.data().structured() else {
+                return false;
+            };
+            for property in base_members.properties.as_deref().unwrap_or_default() {
+                let Some(property_record) = store.symbol(*property) else {
+                    return false;
+                };
+                if names.insert(property_record.name().to_owned()) {
+                    expected.push(*property);
+                }
+            }
+            for index in base_members.index_infos.as_deref().unwrap_or_default() {
+                let Some(info) = store.index_info(*index) else {
+                    return false;
+                };
+                if index_keys.insert(info.key_type()) {
+                    expected_indexes.push(*index);
+                }
+            }
+        }
+    }
+    if properties != expected.as_slice()
         || properties.is_empty() != structured.properties.is_none()
-        || properties
-            .iter()
-            .zip(&plan.properties)
-            .any(|(actual, planned)| *actual != planned.symbol)
+        || structured.index_infos.as_deref()
+            != (!expected_indexes.is_empty()).then_some(expected_indexes.as_slice())
     {
         return false;
     }
@@ -9686,10 +9812,11 @@ fn valid_generic_structured_members(
         .and_then(|members| store.symbol_table(members))
         .is_some_and(|table| {
             table.len() == properties.len()
-                && plan
-                    .properties
-                    .iter()
-                    .all(|property| table.get_source(&property.name) == Some(property.symbol))
+                && properties.iter().all(|property| {
+                    store
+                        .symbol(*property)
+                        .is_some_and(|record| table.get(record.name()) == Some(*property))
+                })
         })
 }
 
@@ -13911,6 +14038,155 @@ mod generic_publication_tests {
     }
 
     #[test]
+    fn reopened_interfaces_merge_repeated_bases_after_their_own_properties() {
+        let mut fixture = interface_fixture(
+            concat!(
+                "interface Derived extends Base { first: string } ",
+                "interface Derived extends Base { second: number } ",
+                "interface Base { inherited: boolean }",
+            ),
+            3_792,
+        );
+        let locals = fixture.bound.locals(fixture.bound.source_file()).unwrap();
+        let base = fixture
+            .store
+            .symbol_table(locals)
+            .and_then(|locals| locals.get_source("Base"))
+            .unwrap();
+        let globals = fixture.store.intrinsic_bootstrap().unwrap().globals;
+        fixture.store.merge_global_symbol(globals, base).unwrap();
+        let host = host(&fixture.parsed, &fixture.bound);
+        let plan = plan_interface(&fixture.store, &host, fixture.symbol).unwrap();
+        let heritage = plan.heritage.as_ref().unwrap();
+
+        assert_eq!(plan.declarations.len(), 2);
+        assert_eq!(heritage.bases.len(), 1);
+        assert_eq!(heritage.bases[0].symbol, base);
+        assert_eq!(
+            plan.properties
+                .iter()
+                .map(|property| property.name.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second"],
+        );
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let type_ = CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalCheckerOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_declared_type_of_symbol(fixture.symbol)
+        .unwrap();
+        let TypeData::Interface(interface) = fixture.store.type_payload(type_).unwrap().data()
+        else {
+            panic!("the reopened declaration must retain its interface identity")
+        };
+        let properties = interface
+            .reference
+            .object
+            .structured
+            .properties
+            .as_deref()
+            .unwrap();
+        assert_eq!(
+            properties
+                .iter()
+                .map(|property| fixture.store.symbol(*property).unwrap().name().as_utf8())
+                .collect::<Vec<_>>(),
+            [Some("first"), Some("second"), Some("inherited")],
+        );
+        assert_eq!(
+            fixture.store.get_parent_of_symbol(properties[2]),
+            Some(base),
+        );
+
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalCheckerOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_declared_type_of_symbol(fixture.symbol),
+            Ok(type_),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn reopened_interface_diamonds_keep_unique_inherited_symbols_in_source_order() {
+        let mut fixture = interface_fixture(
+            concat!(
+                "interface Derived extends Left { own: string } ",
+                "interface Derived extends Right { extra: number } ",
+                "interface Left extends Root { left: string } ",
+                "interface Right extends Root { right: boolean } ",
+                "interface Root { shared: string }",
+            ),
+            3_794,
+        );
+        let locals = fixture.bound.locals(fixture.bound.source_file()).unwrap();
+        let globals = fixture.store.intrinsic_bootstrap().unwrap().globals;
+        for name in ["Left", "Right", "Root"] {
+            let base = fixture
+                .store
+                .symbol_table(locals)
+                .and_then(|locals| locals.get_source(name))
+                .unwrap();
+            fixture.store.merge_global_symbol(globals, base).unwrap();
+        }
+        let host = host(&fixture.parsed, &fixture.bound);
+        let plan = plan_interface(&fixture.store, &host, fixture.symbol).unwrap();
+        assert_eq!(plan.heritage.as_ref().unwrap().bases.len(), 2);
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let type_ = CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalCheckerOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_declared_type_of_symbol(fixture.symbol)
+        .unwrap();
+        let properties = fixture
+            .store
+            .type_payload(type_)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.properties.as_deref())
+            .unwrap();
+        assert_eq!(
+            properties
+                .iter()
+                .map(|property| fixture.store.symbol(*property).unwrap().name().as_utf8())
+                .collect::<Vec<_>>(),
+            [
+                Some("own"),
+                Some("extra"),
+                Some("left"),
+                Some("shared"),
+                Some("right"),
+            ],
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
     fn merged_generic_interfaces_publish_once_and_preserve_declaration_order() {
         let mut fixture = interface_fixture(
             concat!(
@@ -14347,6 +14623,117 @@ mod generic_publication_tests {
             ),
             before,
         );
+    }
+
+    #[test]
+    fn reopened_generic_interfaces_keep_one_forwarded_base_and_warm_inherited_members() {
+        let mut fixture = interface_fixture(
+            concat!(
+                "interface Derived<T> extends Base<T> { own: T } ",
+                "interface Derived<T> extends Base<T> { extra: string } ",
+                "interface Base<T> { inherited: T }",
+            ),
+            3_793,
+        );
+        let locals = fixture.bound.locals(fixture.bound.source_file()).unwrap();
+        let base = fixture
+            .store
+            .symbol_table(locals)
+            .and_then(|locals| locals.get_source("Base"))
+            .unwrap();
+        let globals = fixture.store.intrinsic_bootstrap().unwrap().globals;
+        fixture.store.merge_global_symbol(globals, base).unwrap();
+        let host = host(&fixture.parsed, &fixture.bound);
+        let derived_plan = plan_generic_interface(&fixture.store, &host, fixture.symbol).unwrap();
+        assert_eq!(derived_plan.declarations.len(), 2);
+        assert_eq!(derived_plan.heritage.as_ref().unwrap().bases.len(), 1);
+
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let derived = CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalCheckerOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_declared_type_of_symbol(fixture.symbol)
+        .unwrap();
+        let base_target = fixture
+            .store
+            .declared_type_links(base)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let base_parameter = validate_direct_generic_reference(&fixture.store, base_target)
+            .unwrap()
+            .type_arguments[0];
+        let derived_parameter = validate_direct_generic_reference(&fixture.store, derived)
+            .unwrap()
+            .type_arguments[0];
+        let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        let base_plan = plan_generic_interface(&fixture.store, &host, base).unwrap();
+
+        assert!(
+            fixture
+                .store
+                .publish_interface_no_base_resolution(base_target)
+        );
+        assert_eq!(
+            publish_generic_interface_declared_members(
+                &mut fixture.store,
+                &base_plan,
+                base_target,
+                &[base_parameter],
+            ),
+            Ok(base_target),
+        );
+        assert_eq!(
+            publish_generic_interface_declared_members(
+                &mut fixture.store,
+                &derived_plan,
+                derived,
+                &[derived_parameter, string],
+            ),
+            Ok(derived),
+        );
+        let members = fixture
+            .store
+            .resolve_generic_interface_members(derived, None)
+            .unwrap();
+        assert_eq!(
+            members
+                .properties()
+                .iter()
+                .map(|property| fixture.store.symbol(*property).unwrap().name().as_utf8())
+                .collect::<Vec<_>>(),
+            [Some("own"), Some("extra"), Some("inherited")],
+        );
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        let concrete = fixture
+            .store
+            .create_direct_generic_reference_type(derived, &[number])
+            .unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .resolve_generic_interface_property(concrete, "inherited", None)
+                .unwrap()
+                .unwrap()
+                .type_id(),
+            number,
+        );
+
+        let warm = state(&fixture.store, &derived_plan, derived);
+        assert_eq!(
+            publish_generic_interface_declared_members(
+                &mut fixture.store,
+                &derived_plan,
+                derived,
+                &[derived_parameter, string],
+            ),
+            Ok(derived),
+        );
+        assert_eq!(state(&fixture.store, &derived_plan, derived), warm);
+        assert!(diagnostics.is_empty());
     }
 
     #[test]
