@@ -252,6 +252,12 @@ struct SourceNamespaceRecursiveClassState {
     class_type: TypeId,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecursiveNamespaceClassCacheState {
+    Cold,
+    Warm(SourceNamespaceRecursiveClassState),
+}
+
 struct NamespaceVariablePlans<'a> {
     members: &'a mut Vec<SourceNamespaceMemberPlan>,
     implicit_variables: &'a mut Vec<SourceNamespaceImplicitVariablePlan>,
@@ -7101,7 +7107,7 @@ fn recursive_namespace_class_state(
     store: &CanonicalTypeMapperStore,
     namespace: SemanticSymbolId,
     class: &SourceNamespaceRecursiveClassPlan,
-) -> Option<Option<SourceNamespaceRecursiveClassState>> {
+) -> Option<RecursiveNamespaceClassCacheState> {
     let exact_value = |symbol| {
         let Some(links) = store.value_symbol_links(symbol) else {
             return Some(None);
@@ -7151,7 +7157,7 @@ fn recursive_namespace_class_state(
             }) {
                 return None;
             }
-            return Some(None);
+            return Some(RecursiveNamespaceClassCacheState::Cold);
         }
         (Some(namespace_type), Some(class_type), Some(local), Some(variable), Some(instance))
             if local == class_type && variable == class_type =>
@@ -7271,11 +7277,13 @@ fn recursive_namespace_class_state(
         return None;
     }
 
-    Some(Some(SourceNamespaceRecursiveClassState {
-        instance,
-        namespace_type,
-        class_type,
-    }))
+    Some(RecursiveNamespaceClassCacheState::Warm(
+        SourceNamespaceRecursiveClassState {
+            instance,
+            namespace_type,
+            class_type,
+        },
+    ))
 }
 
 fn plan_namespace_variables(
@@ -9221,7 +9229,7 @@ fn execute_recursive_namespace_class(
     }
     let state =
         recursive_namespace_class_state(store, namespace.symbol, class).ok_or_else(invalid)?;
-    if state.is_some() {
+    if matches!(state, RecursiveNamespaceClassCacheState::Warm(_)) {
         return Ok(());
     }
     if preflight_class_or_interface_reference(store, host, class.class_symbol, SymbolFlags::CLASS)?
@@ -9354,11 +9362,13 @@ fn execute_recursive_namespace_class(
     }
 
     (recursive_namespace_class_state(store, namespace.symbol, class)
-        == Some(Some(SourceNamespaceRecursiveClassState {
-            instance,
-            namespace_type,
-            class_type,
-        })))
+        == Some(RecursiveNamespaceClassCacheState::Warm(
+            SourceNamespaceRecursiveClassState {
+                instance,
+                namespace_type,
+                class_type,
+            },
+        )))
     .then_some(())
     .ok_or_else(invalid)
 }
@@ -10545,10 +10555,11 @@ mod tests {
         );
         assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
 
-        let state =
+        let Some(RecursiveNamespaceClassCacheState::Warm(state)) =
             recursive_namespace_class_state(fixture.context.store(), namespace.symbol, &class)
-                .flatten()
-                .expect("the completed recursive class must retain its exact warm graph");
+        else {
+            panic!("the completed recursive class must retain its exact warm graph");
+        };
         assert_ne!(state.instance, state.class_type);
         assert_ne!(state.namespace_type, state.class_type);
         for symbol in [class.class_symbol, class.class_local, class.variable_symbol] {
@@ -10774,11 +10785,10 @@ mod tests {
         assert!(fixture.context.diagnostics().is_empty());
         let namespace = plan(&fixture, 0);
         let class = namespace.recursive_class.as_ref().unwrap();
-        assert!(
-            recursive_namespace_class_state(fixture.context.store(), namespace.symbol, class,)
-                .flatten()
-                .is_some(),
-        );
+        assert!(matches!(
+            recursive_namespace_class_state(fixture.context.store(), namespace.symbol, class,),
+            Some(RecursiveNamespaceClassCacheState::Warm(_)),
+        ));
         let warm = (
             fixture.context.store().type_len(),
             fixture.context.store().symbol_len(),
