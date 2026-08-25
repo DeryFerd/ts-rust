@@ -4030,7 +4030,7 @@ fn plan_direct_exported_type_target(
                 && interface.flow_node.is_none()
                 && interface.local_symbol.is_none()
                 && interface.symbol.is_none()
-                && interface.heritage_clauses.is_none() =>
+                && (interface.heritage_clauses.is_none() || facts.is_declaration_file()) =>
         {
             (interface.name, interface.modifiers.as_ref())
         }
@@ -12844,6 +12844,236 @@ mod tests {
             resolved
         );
         assert_eq!(store_state(&fixture.store), warm);
+    }
+
+    #[test]
+    fn declaration_interface_imports_preserve_authenticated_base_identity() {
+        for (provider, qualified) in [
+            (
+                concat!(
+                    "export interface Base { inherited: number; } ",
+                    "export interface Model extends Base { own: string; }",
+                ),
+                false,
+            ),
+            (
+                concat!(
+                    "export namespace React { ",
+                    "export interface Base { inherited: number; } } ",
+                    "export interface Model extends React.Base { own: string; }",
+                ),
+                true,
+            ),
+        ] {
+            let mut fixture = fixture_with_declaration_files(
+                &[
+                    concat!(
+                        "import type { Model as Imported } from 'react'; ",
+                        "declare const value: Imported;",
+                    ),
+                    provider,
+                ],
+                &[Route {
+                    source: 0,
+                    specifier: 0,
+                    target: Some(1),
+                }],
+                &[1],
+            );
+            let plan = fixture.plan_type_import(0, 0);
+            let model = direct_export(&fixture, 1, "Model");
+            let base = if qualified {
+                let namespace = direct_export(&fixture, 1, "React");
+                fixture
+                    .store
+                    .symbol(namespace)
+                    .and_then(ts_binder::semantic::Symbol::exports)
+                    .and_then(|exports| fixture.store.symbol_table(exports))
+                    .and_then(|exports| exports.get_source("Base"))
+                    .unwrap()
+            } else {
+                direct_export(&fixture, 1, "Base")
+            };
+
+            let resolved = resolve_all_types(&mut fixture, &plan.bindings).unwrap();
+            assert_eq!(resolved[0].target_symbol, model);
+            for symbol in [model, base] {
+                assert!(fixture.store.declared_type_links(symbol).is_none());
+                assert!(fixture.store.value_symbol_links(symbol).is_none());
+            }
+            assert!(
+                fixture
+                    .store
+                    .value_symbol_links(plan.bindings[0].alias_symbol)
+                    .is_none(),
+            );
+
+            let reference = type_reference(&fixture, 0, "Imported");
+            let capability = plan_type_reference_capability(&fixture, &resolved[0], reference);
+            let imported =
+                query_type_with_import_capability(&mut fixture, reference, capability).unwrap();
+            let TypeData::Interface(interface) =
+                fixture.store.type_payload(imported).unwrap().data()
+            else {
+                panic!("the imported declaration must retain its interface identity")
+            };
+            let [inherited] = interface.resolved_base_types.as_deref().unwrap() else {
+                panic!("the imported interface must retain one authenticated base")
+            };
+            assert_eq!(
+                fixture
+                    .store
+                    .type_payload(*inherited)
+                    .and_then(TypeRecord::symbol),
+                Some(base),
+            );
+
+            let warm = store_state(&fixture.store);
+            assert_eq!(
+                resolve_all_types(&mut fixture, &plan.bindings).unwrap(),
+                resolved,
+            );
+            let capability = plan_type_reference_capability(&fixture, &resolved[0], reference);
+            assert_eq!(
+                query_type_with_import_capability(&mut fixture, reference, capability).unwrap(),
+                imported,
+            );
+            assert_eq!(store_state(&fixture.store), warm);
+        }
+    }
+
+    #[test]
+    fn unused_declaration_interface_imports_leave_unsupported_bases_unchecked() {
+        let provider = parsed("export interface Model extends MissingBase {}");
+        let consumer = parsed(concat!(
+            "import type { Model } from 'react'; ",
+            "export const ready = 1;",
+        ));
+        let provider_file = FileId::new(9_852);
+        let consumer_file = FileId::new(9_853);
+        let mut context = context_with_declaration_routes(
+            &[(provider_file, &provider), (consumer_file, &consumer)],
+            &[Route {
+                source: 1,
+                specifier: 0,
+                target: Some(0),
+            }],
+            &[0],
+        );
+
+        context.check_source_file(consumer_file).unwrap();
+
+        let (_, bound) = context.file(provider_file).unwrap();
+        let module = bound.symbol(bound.source_file()).unwrap();
+        let model = context
+            .store()
+            .symbol(module)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| context.store().symbol_table(exports))
+            .and_then(|exports| exports.get_source("Model"))
+            .unwrap();
+        assert!(context.store().declared_type_links(model).is_none());
+        assert!(context.diagnostics().is_empty());
+
+        let warm = store_state(context.store());
+        context.recheck_source_file(consumer_file).unwrap();
+        assert_eq!(store_state(context.store()), warm);
+    }
+
+    #[test]
+    fn inherited_declaration_imports_reject_poisoned_alias_and_base_caches() {
+        for poison_alias in [true, false] {
+            let mut fixture = fixture_with_declaration_files(
+                &[
+                    concat!(
+                        "import type { Model as Imported } from 'react'; ",
+                        "declare const value: Imported;",
+                    ),
+                    concat!(
+                        "export interface Base { inherited: number; } ",
+                        "export interface Model extends Base { own: string; }",
+                    ),
+                ],
+                &[Route {
+                    source: 0,
+                    specifier: 0,
+                    target: Some(1),
+                }],
+                &[1],
+            );
+            let plan = fixture.plan_type_import(0, 0);
+            let resolved = resolve_all_types(&mut fixture, &plan.bindings).unwrap();
+            let reference = type_reference(&fixture, 0, "Imported");
+            let capability = plan_type_reference_capability(&fixture, &resolved[0], reference);
+            let imported =
+                query_type_with_import_capability(&mut fixture, reference, capability).unwrap();
+
+            if poison_alias {
+                let alias = plan.bindings[0].alias_symbol;
+                let mut links = fixture.store.alias_symbol_links(alias).unwrap().clone();
+                links.immediate_target = Some(direct_export(&fixture, 1, "Base"));
+                assert!(fixture.store.set_alias_symbol_links(alias, links));
+                let poisoned = store_state(&fixture.store);
+                assert_eq!(
+                    resolve_all_types(&mut fixture, &plan.bindings),
+                    Err(SourceImportError::Invariant(
+                        SourceImportInvariant::InvalidAliasLinks(alias),
+                    )),
+                );
+                assert_eq!(store_state(&fixture.store), poisoned);
+            } else {
+                assert!(
+                    fixture
+                        .store
+                        .set_interface_base_resolution(imported, true, None, None,)
+                );
+                let poisoned = store_state(&fixture.store);
+                assert!(
+                    query_type_with_import_capability(&mut fixture, reference, capability).is_err(),
+                );
+                assert_eq!(store_state(&fixture.store), poisoned);
+            }
+            assert!(
+                fixture
+                    .store
+                    .value_symbol_links(plan.bindings[0].alias_symbol)
+                    .is_none(),
+            );
+        }
+    }
+
+    #[test]
+    fn inherited_ordinary_source_interface_imports_remain_unsupported() {
+        let mut fixture = fixture(
+            &[
+                "import type { Model } from './target';",
+                concat!(
+                    "export interface Base { inherited: number; } ",
+                    "export interface Model extends Base { own: string; }",
+                ),
+            ],
+            &[Route {
+                source: 0,
+                specifier: 0,
+                target: Some(1),
+            }],
+        );
+        let plan = fixture.plan_type_import(0, 0);
+        let target = direct_export(&fixture, 1, "Model");
+        let declaration = fixture
+            .store
+            .symbol(target)
+            .unwrap()
+            .declarations()
+            .unwrap()[0];
+
+        assert_eq!(
+            resolve_all_types(&mut fixture, &plan.bindings),
+            Err(SourceImportError::Unsupported(
+                SourceImportUnsupported::TargetTypeShape(declaration),
+            )),
+        );
+        assert!(fixture.store.declared_type_links(target).is_none());
     }
 
     #[test]
