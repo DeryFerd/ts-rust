@@ -2179,11 +2179,99 @@ fn display_direct_generic_reference(
     let symbol_record = store
         .symbol(symbol)
         .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
-    let [declaration] = symbol_record.declarations().unwrap_or_default() else {
-        return Err(TypeDisplayUnavailable::MalformedType(type_id));
+    let declarations = symbol_record
+        .declarations()
+        .filter(|declarations| !declarations.is_empty())
+        .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+    let declaration = match declarations {
+        [declaration] => *declaration,
+        declarations => {
+            let name = symbol_record
+                .name()
+                .as_utf8()
+                .filter(|name| matches!(*name, "Promise" | "PromiseLike"))
+                .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+            let global = store
+                .intrinsic_bootstrap()
+                .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+                .and_then(|globals| globals.get_source(name))
+                .and_then(|global| store.get_merged_symbol(global));
+            let allowed = SymbolFlags::INTERFACE
+                | SymbolFlags::FUNCTION_SCOPED_VARIABLE
+                | SymbolFlags::TRANSIENT;
+            if global != Some(symbol)
+                || !symbol_record.flags().contains(SymbolFlags::INTERFACE)
+                || symbol_record.flags().without(allowed) != SymbolFlags::NONE
+                || symbol_record.check_flags() != CheckFlags::NONE
+                || symbol_record.parent().is_some()
+                || symbol_record.exports().is_some()
+                || symbol_record.export_symbol().is_some()
+                || reference.type_arguments.len() != 1
+            {
+                return Err(TypeDisplayUnavailable::MalformedType(type_id));
+            }
+
+            let mut interface = None;
+            let mut value = None;
+            let mut seen = HashSet::with_capacity(declarations.len());
+            for &declaration in declarations {
+                let bound = host
+                    .bound_file(declaration)
+                    .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+                let facts = bound
+                    .source_facts()
+                    .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+                let record = host
+                    .node(declaration)
+                    .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
+                if !seen.insert(declaration)
+                    || !facts.is_default_library()
+                    || !facts.is_declaration_file()
+                    || facts.is_javascript_file()
+                    || facts.is_external_or_common_js_module()
+                    || !host.symbol_matches(store, declaration, symbol)
+                {
+                    return Err(TypeDisplayUnavailable::MalformedType(type_id));
+                }
+                match &record.data {
+                    NodeData::InterfaceDeclaration(data)
+                        if record.kind == SyntaxKind::InterfaceDeclaration
+                            && record.parent == Some(bound.source_file().node)
+                            && data.type_parameters.as_ref().is_some_and(|parameters| {
+                                parameters.nodes.len() == 1 && !parameters.has_trailing_comma
+                            }) =>
+                    {
+                        interface.get_or_insert(declaration);
+                    }
+                    NodeData::VariableDeclaration(data)
+                        if name == "Promise"
+                            && record.kind == SyntaxKind::VariableDeclaration
+                            && symbol_record
+                                .flags()
+                                .contains(SymbolFlags::FUNCTION_SCOPED_VARIABLE)
+                            && host
+                                .node(NodeRef::new(declaration.arena, declaration.file, data.name))
+                                .is_some_and(|record| {
+                                    matches!(
+                                        &record.data,
+                                        NodeData::Identifier(identifier)
+                                            if record.kind == SyntaxKind::Identifier
+                                                && record.parent == Some(declaration.node)
+                                                && identifier.text == name
+                                    )
+                                })
+                            && value.replace(declaration).is_none() => {}
+                    _ => return Err(TypeDisplayUnavailable::MalformedType(type_id)),
+                }
+            }
+            if value != symbol_record.value_declaration() {
+                return Err(TypeDisplayUnavailable::MalformedType(type_id));
+            }
+            interface.ok_or(TypeDisplayUnavailable::MalformedType(type_id))?
+        }
     };
     let declaration_record = host
-        .node(*declaration)
+        .node(declaration)
         .ok_or(TypeDisplayUnavailable::MalformedType(type_id))?;
     let name_node = match &declaration_record.data {
         NodeData::ClassDeclaration(class) => class
@@ -2193,7 +2281,7 @@ fn display_direct_generic_reference(
         _ => return Err(TypeDisplayUnavailable::MalformedType(type_id)),
     };
     let name_node = NodeRef::new(declaration.arena, declaration.file, name_node);
-    if !host.symbol_matches(store, *declaration, symbol)
+    if !host.symbol_matches(store, declaration, symbol)
         || !host.node(name_node).is_some_and(|node| {
             matches!(&node.data, NodeData::Identifier(name)
                 if symbol_record.name().as_utf8() == Some(name.text.as_str()))
