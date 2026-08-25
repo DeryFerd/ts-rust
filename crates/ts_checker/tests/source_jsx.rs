@@ -1215,9 +1215,8 @@ fn inline_object_spread_attributes_share_the_published_object_type() {
 }
 
 #[test]
-fn spread_attributes_fail_before_jsx_semantic_publication() {
-    let source =
-        format!("{NAMESPACE}declare const props: any;\nconst view = <div {{...props}} />;\n");
+fn unresolved_spread_attributes_fail_before_jsx_semantic_publication() {
+    let source = format!("{NAMESPACE}const view = <div {{...missing}} />;\n");
     let mut fixture = Fixture::new(&source, FileId::new(3_708));
     let opening = fixture.expression("view");
     let counts = (
