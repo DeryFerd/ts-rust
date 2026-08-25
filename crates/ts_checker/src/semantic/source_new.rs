@@ -6091,11 +6091,11 @@ mod tests {
                     .and_then(|links| links.resolved_signature.signature())
                     .unwrap();
                 let unknown = store.intrinsic_bootstrap().unwrap().unknown_type;
-                let selected =
-                    match store.cached_signature(base, type_list_key(&[unknown]), &[unknown]) {
-                        CachedSignatureLookup::Hit(signature) => signature,
-                        _ => panic!("expected the selected Promise signature"),
-                    };
+                let CachedSignatureLookup::Hit(selected) =
+                    store.cached_signature(base, type_list_key(&[unknown]), &[unknown])
+                else {
+                    panic!("expected the selected Promise signature")
+                };
                 (promise, owner, globals, base, selected)
             };
             match poison {
