@@ -423,6 +423,7 @@ fn canonical_program_consumes_declaration_exports_in_both_program_orders() {
         "/project/target.d.ts",
         concat!(
             "export declare const value: number; ",
+            "export const implicit: number; ",
             "export type Scalar = number; ",
             "export interface Model { count: number; } ",
             // A declaration-file source check would try to resolve this name.
@@ -438,9 +439,10 @@ fn canonical_program_consumes_declaration_exports_in_both_program_orders() {
     fs.write_file(
         "/project/cold.ts",
         concat!(
-            "import { value } from './target'; ",
+            "import { value, implicit } from './target'; ",
             "import type { Scalar } from './target'; ",
             "const good: number = value; ",
+            "const ambient: number = implicit; ",
             "const typed: Scalar = value; ",
             "const bad: string = value;",
         ),
@@ -535,12 +537,6 @@ fn canonical_program_fails_closed_on_declaration_import_near_misses() {
             "ambient global",
             "target.d.ts",
             "declare const value: number;",
-            "import { value } from './target'; const copy = value;",
-        ),
-        (
-            "missing declare modifier",
-            "target.d.ts",
-            "export const value: number;",
             "import { value } from './target'; const copy = value;",
         ),
         (
