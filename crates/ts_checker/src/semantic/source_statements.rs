@@ -30,6 +30,7 @@ use super::{
 
 const NODE_FLAG_LET: u32 = 1 << 0;
 const NODE_FLAG_CONST: u32 = 1 << 1;
+const MAX_NESTED_CAPTURED_LOOPS: usize = 8;
 
 /// The exact syntactic owner at which the closed statement proof stopped.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -430,9 +431,10 @@ pub(super) struct SourceLinearFunctionStatementsSyntax {
 }
 
 /// One initialized lexical declaration or expression inside a loop body.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum SourceLoopFunctionStatementSyntax {
     Local(SourceLocalDeclarationSyntax),
+    Loop(Box<SourceLoopFunctionStatementsSyntax>),
     Expression {
         statement: NodeRef,
         expression: NodeRef,
@@ -441,6 +443,12 @@ pub(super) enum SourceLoopFunctionStatementSyntax {
         statement: NodeRef,
         condition: NodeRef,
         jump: NodeRef,
+    },
+    ConditionalReturn {
+        statement: NodeRef,
+        condition: NodeRef,
+        returned: NodeRef,
+        expression: Option<NodeRef>,
     },
 }
 
@@ -6285,18 +6293,26 @@ impl SyntaxPlanner<'_> {
                         expression,
                     });
                 }
-                SyntaxKind::IfStatement => {
-                    let (condition, jump) = self.plan_loop_conditional_jump(
+                SyntaxKind::LabeledStatement
+                | SyntaxKind::ForStatement
+                | SyntaxKind::WhileStatement
+                | SyntaxKind::DoStatement => {
+                    let nested = self.plan_nested_loop_statement(
                         statement,
                         control.body,
                         declaration,
                         &labels,
+                        1,
                     )?;
-                    statements.push(SourceLoopFunctionStatementSyntax::ConditionalJump {
+                    statements.push(SourceLoopFunctionStatementSyntax::Loop(Box::new(nested)));
+                }
+                SyntaxKind::IfStatement => {
+                    statements.push(self.plan_loop_conditional_statement(
                         statement,
-                        condition,
-                        jump,
-                    });
+                        control.body,
+                        declaration,
+                        &labels,
+                    )?);
                 }
                 kind => {
                     return Err(self.unsupported(
@@ -6330,8 +6346,10 @@ impl SyntaxPlanner<'_> {
         if let Some(first) = statements.first() {
             let first = match first {
                 SourceLoopFunctionStatementSyntax::Local(local) => local.name,
+                SourceLoopFunctionStatementSyntax::Loop(nested) => nested.control.statement,
                 SourceLoopFunctionStatementSyntax::Expression { statement, .. }
-                | SourceLoopFunctionStatementSyntax::ConditionalJump { statement, .. } => {
+                | SourceLoopFunctionStatementSyntax::ConditionalJump { statement, .. }
+                | SourceLoopFunctionStatementSyntax::ConditionalReturn { statement, .. } => {
                     *statement
                 }
             };
@@ -6452,6 +6470,323 @@ impl SyntaxPlanner<'_> {
             initializers,
             locals,
             statements,
+        })
+    }
+
+    fn plan_nested_loop_statement(
+        &self,
+        statement: NodeRef,
+        parent: NodeRef,
+        callable: NodeRef,
+        outer_labels: &[NodeRef],
+        depth: usize,
+    ) -> Result<SourceLoopFunctionStatementsSyntax, SourceFunctionStatementsError> {
+        if depth >= MAX_NESTED_CAPTURED_LOOPS {
+            return Err(self.unsupported(
+                statement,
+                self.node(statement)?.kind,
+                SourceFunctionStatementsRole::BranchStatement,
+            ));
+        }
+
+        let mut statement = statement;
+        let mut expected_parent = parent;
+        let mut labels = outer_labels.to_vec();
+        while self.node(statement)?.kind == SyntaxKind::LabeledStatement {
+            let record = self.node(statement)?;
+            let NodeData::LabeledStatement(labeled) = &record.data else {
+                return Err(self.unsupported(
+                    statement,
+                    record.kind,
+                    SourceFunctionStatementsRole::BranchStatement,
+                ));
+            };
+            let label = self.reference(labeled.label);
+            let child =
+                validate_labeled_statement(self.arena, self.bound, statement, expected_parent)?;
+            labels.push(label);
+            expected_parent = statement;
+            statement = child;
+        }
+
+        let kind = self.node(statement)?.kind;
+        if !matches!(
+            kind,
+            SyntaxKind::ForStatement | SyntaxKind::WhileStatement | SyntaxKind::DoStatement
+        ) {
+            return Err(self.unsupported(
+                statement,
+                kind,
+                SourceFunctionStatementsRole::BranchStatement,
+            ));
+        }
+        let control =
+            plan_source_control_loop_syntax(self.arena, self.bound, statement, expected_parent)?;
+        self.validate_block_scope_container(statement, parent)?;
+        let initializers = if control.kind == SourceControlLoopKind::For {
+            self.plan_classic_loop_initializers(&control, callable)?
+        } else {
+            Vec::new()
+        };
+        let loop_scope = if control.kind == SourceControlLoopKind::For {
+            statement
+        } else {
+            parent
+        };
+        let condition = control.condition.ok_or_else(|| {
+            self.unsupported(statement, kind, SourceFunctionStatementsRole::Condition)
+        })?;
+        self.validate_block_scope_container(condition, loop_scope)?;
+        if let Some(incrementor) = control.incrementor {
+            self.validate_classic_loop_incrementor(
+                incrementor,
+                statement,
+                callable,
+                &initializers,
+            )?;
+        }
+
+        let record = self.node(control.body)?;
+        let NodeData::Block(block) = &record.data else {
+            return Err(self.unsupported(
+                control.body,
+                record.kind,
+                SourceFunctionStatementsRole::BranchBlock,
+            ));
+        };
+        if record.kind != SyntaxKind::Block
+            || record.flags.0 != 0
+            || record.parent != Some(statement.node)
+            || block.flow_node.is_some()
+            || block.next_container.is_some()
+            || block.statements.has_trailing_comma
+            || block.facts != 0
+        {
+            return Err(self.unsupported(
+                control.body,
+                record.kind,
+                SourceFunctionStatementsRole::BranchBlock,
+            ));
+        }
+        self.validate_range(control.body, statement)?;
+        self.validate_container(control.body, callable)?;
+        self.validate_block_scope_container(control.body, loop_scope)?;
+        self.validate_node_list(
+            control.body,
+            block.statements.range,
+            &block.statements.nodes,
+        )?;
+
+        let mut locals = Vec::new();
+        let mut statements = Vec::new();
+        for node in &block.statements.nodes {
+            let statement = self.reference(*node);
+            match self.node(statement)?.kind {
+                SyntaxKind::VariableStatement => {
+                    let declarations =
+                        self.plan_local_statement(statement, control.body, callable)?;
+                    statements.extend(
+                        declarations
+                            .iter()
+                            .copied()
+                            .map(SourceLoopFunctionStatementSyntax::Local),
+                    );
+                    locals.extend(declarations);
+                }
+                SyntaxKind::ExpressionStatement => {
+                    let expression =
+                        self.plan_loop_expression_statement(statement, control.body, callable)?;
+                    statements.push(SourceLoopFunctionStatementSyntax::Expression {
+                        statement,
+                        expression,
+                    });
+                }
+                SyntaxKind::LabeledStatement
+                | SyntaxKind::ForStatement
+                | SyntaxKind::WhileStatement
+                | SyntaxKind::DoStatement => {
+                    let nested = self.plan_nested_loop_statement(
+                        statement,
+                        control.body,
+                        callable,
+                        &labels,
+                        depth + 1,
+                    )?;
+                    statements.push(SourceLoopFunctionStatementSyntax::Loop(Box::new(nested)));
+                }
+                SyntaxKind::IfStatement => {
+                    statements.push(self.plan_loop_conditional_statement(
+                        statement,
+                        control.body,
+                        callable,
+                        &labels,
+                    )?);
+                }
+                kind => {
+                    return Err(self.unsupported(
+                        statement,
+                        kind,
+                        SourceFunctionStatementsRole::BranchStatement,
+                    ));
+                }
+            }
+        }
+
+        if self.bound.flow_container(control.statement) != Some(callable)
+            || self.bound.flow_at(control.statement).is_none()
+        {
+            return Err(SourceFunctionStatementsInvariant::InvalidFlowContainer {
+                node: control.statement,
+                expected: callable,
+                actual: self.bound.flow_container(control.statement),
+            }
+            .into());
+        }
+        for local in initializers.iter().chain(&locals) {
+            if self.bound.flow_container(local.name) != Some(callable)
+                || self.bound.flow_at(local.name).is_none()
+            {
+                return Err(SourceFunctionStatementsInvariant::InvalidFlowContainer {
+                    node: local.name,
+                    expected: callable,
+                    actual: self.bound.flow_container(local.name),
+                }
+                .into());
+            }
+        }
+
+        Ok(SourceLoopFunctionStatementsSyntax {
+            body: self.callable.body,
+            control,
+            labels,
+            initializers,
+            locals,
+            statements,
+        })
+    }
+
+    fn plan_loop_conditional_statement(
+        &self,
+        statement: NodeRef,
+        parent: NodeRef,
+        callable: NodeRef,
+        labels: &[NodeRef],
+    ) -> Result<SourceLoopFunctionStatementSyntax, SourceFunctionStatementsError> {
+        let control = plan_source_control_if_syntax(self.arena, self.bound, statement, parent)?;
+        if control.else_statement.is_some() || !control.nested_export_diagnostics.is_empty() {
+            return Err(self.unsupported(
+                statement,
+                SyntaxKind::IfStatement,
+                SourceFunctionStatementsRole::BranchStatement,
+            ));
+        }
+
+        let branch = self.node(control.then_statement)?;
+        let (returned, scope) = if let NodeData::Block(block) = &branch.data {
+            let [returned] = block.statements.nodes.as_slice() else {
+                return Err(self.unsupported(
+                    control.then_statement,
+                    branch.kind,
+                    SourceFunctionStatementsRole::BranchBlock,
+                ));
+            };
+            (self.reference(*returned), control.then_statement)
+        } else {
+            (control.then_statement, parent)
+        };
+
+        if self.node(returned)?.kind != SyntaxKind::ReturnStatement {
+            let (condition, jump) =
+                self.plan_loop_conditional_jump(statement, parent, callable, labels)?;
+            return Ok(SourceLoopFunctionStatementSyntax::ConditionalJump {
+                statement,
+                condition,
+                jump,
+            });
+        }
+
+        self.validate_block_scope_container(statement, parent)?;
+        self.validate_block_scope_container(control.condition, parent)?;
+        if scope != parent {
+            let record = self.node(scope)?;
+            let NodeData::Block(block) = &record.data else {
+                return Err(self.unsupported(
+                    scope,
+                    record.kind,
+                    SourceFunctionStatementsRole::BranchBlock,
+                ));
+            };
+            if record.kind != SyntaxKind::Block
+                || record.flags.0 != 0
+                || record.parent != Some(statement.node)
+                || block.flow_node.is_some()
+                || block.next_container.is_some()
+                || block.statements.has_trailing_comma
+                || block.facts != 0
+            {
+                return Err(self.unsupported(
+                    scope,
+                    record.kind,
+                    SourceFunctionStatementsRole::BranchBlock,
+                ));
+            }
+            self.validate_range(scope, statement)?;
+            self.validate_container(scope, callable)?;
+            self.validate_block_scope_container(scope, parent)?;
+            self.validate_node_list(scope, block.statements.range, &block.statements.nodes)?;
+        }
+
+        let record = self.node(returned)?;
+        let NodeData::ReturnStatement(value) = &record.data else {
+            return Err(self.unsupported(
+                returned,
+                record.kind,
+                SourceFunctionStatementsRole::ReturnStatement,
+            ));
+        };
+        let expected_parent = if scope == parent { statement } else { scope };
+        if record.flags.0 != 0
+            || record.parent != Some(expected_parent.node)
+            || value.flow_node.is_some()
+            || value.facts != 0
+        {
+            return Err(self.unsupported(
+                returned,
+                record.kind,
+                SourceFunctionStatementsRole::ReturnStatement,
+            ));
+        }
+        self.validate_range(returned, expected_parent)?;
+        self.validate_container(returned, callable)?;
+        self.validate_block_scope_container(returned, scope)?;
+        if self.bound.flow_container(returned) != Some(callable)
+            || self.bound.flow_at(returned).is_none()
+        {
+            return Err(SourceFunctionStatementsInvariant::InvalidFlowContainer {
+                node: returned,
+                expected: callable,
+                actual: self.bound.flow_container(returned),
+            }
+            .into());
+        }
+
+        let expression = value.expression.map(|node| self.reference(node));
+        if let Some(expression) = expression {
+            self.validate_parent(
+                expression,
+                Some(returned.node),
+                SourceFunctionStatementsRole::ReturnExpression,
+            )?;
+            self.validate_range(expression, returned)?;
+            self.validate_container(expression, callable)?;
+            self.validate_block_scope_container(expression, scope)?;
+        }
+
+        Ok(SourceLoopFunctionStatementSyntax::ConditionalReturn {
+            statement,
+            condition: control.condition,
+            returned,
+            expression,
         })
     }
 
@@ -9832,6 +10167,48 @@ mod joined_tests {
                 Some(fixture.declaration()),
             );
         }
+    }
+
+    #[test]
+    fn nested_labeled_loops_authenticate_outer_jumps_and_conditional_returns() {
+        let fixture = JoinedFixture::new(
+            concat!(
+                "function nested() { ",
+                "outer: for (let outerValue = 0; outerValue < 1; ++outerValue) { ",
+                "middle: for (const value = 0; value < 1;) { ",
+                "inner: for (let item = 0; item < 1; ++item) { ",
+                "(function () { return value + item; }); (() => value + item); ",
+                "if (item == 1) { break middle; } ",
+                "if (value == 2) { continue outer; } ",
+                "if (value == 2) { return 'nested'; } ",
+                "if (value == 3) { return; } ",
+                "} ",
+                "if (value == 1) { continue outer; } ",
+                "} } }",
+            ),
+            FileId::new(1_498),
+        );
+
+        let syntax = fixture.loop_plan().unwrap();
+        let [SourceLoopFunctionStatementSyntax::Loop(middle)] = syntax.statements.as_slice() else {
+            panic!("expected one nested middle loop")
+        };
+        let SourceLoopFunctionStatementSyntax::Loop(inner) = &middle.statements[0] else {
+            panic!("expected one nested inner loop")
+        };
+        assert_eq!(middle.labels.len(), 2);
+        assert_eq!(inner.labels.len(), 3);
+        assert_eq!(
+            inner
+                .statements
+                .iter()
+                .filter(|statement| matches!(
+                    statement,
+                    SourceLoopFunctionStatementSyntax::ConditionalReturn { .. }
+                ))
+                .count(),
+            2,
+        );
     }
 
     #[test]

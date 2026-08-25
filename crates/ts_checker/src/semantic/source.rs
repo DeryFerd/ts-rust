@@ -1196,10 +1196,16 @@ struct PlannedLoopIncrementor {
 #[derive(Clone, Debug)]
 enum PlannedLoopFunctionStatement {
     Local(usize),
+    Loop(Box<PlannedLoopFunctionStatements>),
     Expression(PlannedExpression),
     ConditionalJump {
         condition: PlannedExpression,
         jump: NodeRef,
+    },
+    ConditionalReturn {
+        condition: PlannedExpression,
+        returned: NodeRef,
+        expression: Option<PlannedExpression>,
     },
 }
 
@@ -10108,6 +10114,10 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         locals.push(variable);
                         statements.push(PlannedLoopFunctionStatement::Local(index));
                     }
+                    SourceLoopFunctionStatementSyntax::Loop(nested) => {
+                        let nested = self.finish_loop_function_statements(callable, *nested)?;
+                        statements.push(PlannedLoopFunctionStatement::Loop(Box::new(nested)));
+                    }
                     SourceLoopFunctionStatementSyntax::Expression { expression, .. } => {
                         self.primitive_binary_position_roots.insert(expression);
                         statements.push(PlannedLoopFunctionStatement::Expression(
@@ -10121,6 +10131,21 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         statements.push(PlannedLoopFunctionStatement::ConditionalJump {
                             condition: self.plan_expression(condition)?,
                             jump,
+                        });
+                    }
+                    SourceLoopFunctionStatementSyntax::ConditionalReturn {
+                        condition,
+                        returned,
+                        expression,
+                        ..
+                    } => {
+                        self.primitive_binary_position_roots.insert(condition);
+                        statements.push(PlannedLoopFunctionStatement::ConditionalReturn {
+                            condition: self.plan_expression(condition)?,
+                            returned,
+                            expression: expression
+                                .map(|expression| self.plan_expression(expression))
+                                .transpose()?,
                         });
                     }
                 }
@@ -15830,16 +15855,34 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 _ => return Ok(false),
             };
             let mut owner = iteration_record.parent.map(|node| self.reference(node));
-            while let Some(label) = owner {
-                let record = self.node(label)?;
-                let NodeData::LabeledStatement(labeled) = &record.data else {
+            while let Some(ancestor) = owner {
+                if body == Some(ancestor.node) {
                     break;
-                };
-                if record.kind != SyntaxKind::LabeledStatement
-                    || labeled.flow_node.is_some()
-                    || self.bound.container(label) != Some(container)
-                {
+                }
+                let record = self.node(ancestor)?;
+                if self.bound.container(ancestor) != Some(container) {
                     return Ok(false);
+                }
+                match &record.data {
+                    NodeData::LabeledStatement(labeled)
+                        if record.kind == SyntaxKind::LabeledStatement
+                            && labeled.flow_node.is_none() => {}
+                    NodeData::Block(block)
+                        if record.kind == SyntaxKind::Block
+                            && record.flags.0 == 0
+                            && block.flow_node.is_none()
+                            && block.next_container.is_none()
+                            && !block.statements.has_trailing_comma
+                            && block.facts == 0 => {}
+                    NodeData::ForStatement(_) if record.kind == SyntaxKind::ForStatement => {}
+                    NodeData::WhileStatement(_) if record.kind == SyntaxKind::WhileStatement => {}
+                    NodeData::DoStatement(_) if record.kind == SyntaxKind::DoStatement => {}
+                    NodeData::ForInOrOfStatement(_)
+                        if matches!(
+                            record.kind,
+                            SyntaxKind::ForInStatement | SyntaxKind::ForOfStatement
+                        ) => {}
+                    _ => return Ok(false),
                 }
                 owner = record.parent.map(|node| self.reference(node));
             }
@@ -29571,8 +29614,9 @@ fn check_planned_loop_function_statements(
     statements: &PlannedLoopFunctionStatements,
     staged_value_types: &mut HashMap<SemanticSymbolId, TypeId>,
     value_order: &mut Vec<SemanticSymbolId>,
-) -> Result<(), SourceCheckError> {
+) -> Result<Vec<TypeId>, SourceCheckError> {
     let mut loop_flow_types = base_flow_types.clone();
+    let mut return_types = Vec::new();
     for initializer in &statements.initializers {
         check_planned_loop_local(
             store,
@@ -29668,6 +29712,25 @@ fn check_planned_loop_function_statements(
                     value_order,
                 )?;
             }
+            PlannedLoopFunctionStatement::Loop(nested) => {
+                return_types.extend(check_planned_loop_function_statements(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    &loop_flow_types,
+                    preflighted_type_import_value_uses,
+                    type_import_capabilities,
+                    deferred,
+                    callable,
+                    nested,
+                    staged_value_types,
+                    value_order,
+                )?);
+            }
             PlannedLoopFunctionStatement::Expression(expression) => {
                 check_expression_type(
                     store,
@@ -29728,6 +29791,94 @@ fn check_planned_loop_function_statements(
                     *jump,
                 )?;
             }
+            PlannedLoopFunctionStatement::ConditionalReturn {
+                condition,
+                returned,
+                expression,
+            } => {
+                let checked = check_expression_type(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    &loop_flow_types,
+                    preflighted_type_import_value_uses,
+                    condition,
+                    None,
+                    deferred,
+                )?;
+                if !source_truthiness_condition_type_is_supported(
+                    store,
+                    checked.result,
+                    condition.node,
+                    &mut HashSet::new(),
+                )? {
+                    return Err(SourcePlanner::unsupported_function_body(callable));
+                }
+                emit_truthiness_operand_diagnostics(
+                    store,
+                    host,
+                    diagnostics,
+                    condition,
+                    checked.result,
+                    *returned,
+                )?;
+
+                let type_ = match expression {
+                    Some(expression) => {
+                        if let Some(annotation) = callable.return_type.type_node() {
+                            check_planned_assignment(
+                                store,
+                                host,
+                                global_types,
+                                source,
+                                options,
+                                session,
+                                diagnostics,
+                                &loop_flow_types,
+                                preflighted_type_import_value_uses,
+                                deferred,
+                                annotation,
+                                type_import_capabilities
+                                    .get(&annotation)
+                                    .map_or(&[], Vec::as_slice),
+                                expression,
+                                *returned,
+                                None,
+                            )?
+                            .assigned_type
+                        } else {
+                            check_expression_type(
+                                store,
+                                host,
+                                global_types,
+                                source,
+                                options,
+                                session,
+                                diagnostics,
+                                &loop_flow_types,
+                                preflighted_type_import_value_uses,
+                                expression,
+                                None,
+                                deferred,
+                            )?
+                            .result
+                        }
+                    }
+                    None => {
+                        store
+                            .intrinsic_bootstrap()
+                            .ok_or(SourceCheckError::LiteralCache(
+                                SourceLiteralCacheError::BootstrapUninitialized,
+                            ))?
+                            .undefined_type
+                    }
+                };
+                return_types.push(type_);
+            }
         }
     }
 
@@ -29774,7 +29925,7 @@ fn check_planned_loop_function_statements(
             statements,
         )?;
     }
-    Ok(())
+    Ok(return_types)
 }
 
 #[allow(clippy::too_many_arguments)] // Loop bindings share source annotation and publication state.
@@ -40043,7 +40194,7 @@ pub(super) fn check_source_file(
                 (None, body_flow_types)
             }
             PlannedFunctionBody::Loop(statements) => {
-                check_planned_loop_function_statements(
+                let mut return_types = check_planned_loop_function_statements(
                     store,
                     host,
                     global_types,
@@ -40060,6 +40211,42 @@ pub(super) fn check_source_file(
                     &mut staged_value_types,
                     &mut value_order,
                 )?;
+                if !return_types.is_empty() {
+                    let undefined = store
+                        .intrinsic_bootstrap()
+                        .ok_or(SourceCheckError::LiteralCache(
+                            SourceLiteralCacheError::BootstrapUninitialized,
+                        ))?
+                        .undefined_type;
+                    return_types.push(undefined);
+                    let combined = store.expression_union_type_with_global_types(
+                        global_types,
+                        &return_types,
+                        UnionReduction::Subtype,
+                    )?;
+                    let widened = widened_fresh_literal_union_type(store, global_types, combined)?;
+                    let inferred =
+                        store.get_widened_type_with_global_types(widened, global_types)?;
+                    let inferred = source_callable_inferred_return_type(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        session,
+                        &mut function_diagnostics,
+                        &function.callable,
+                        inferred,
+                    )?;
+                    publish_inferred_source_callable_return(
+                        store,
+                        &function.callable,
+                        materialized.signature,
+                        inferred,
+                    )
+                    .map_err(SourcePlanner::callable_plan_error)?;
+                    inferred_function_diagnostics[index] = Some(function_diagnostics);
+                    continue;
+                }
                 (None, body_flow_types)
             }
             PlannedFunctionBody::Switch(statements) => {
@@ -46466,6 +46653,75 @@ mod tests {
         );
         for read in identifier_expressions(&source, file, "index") {
             assert_eq!(resolved_node_type(&context, read), number);
+        }
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn nested_labeled_function_loops_preserve_outer_jumps_and_literal_comparisons() {
+        let source = parsed(concat!(
+            "function mutable() { ",
+            "outer: for (let z = 0; z < 1; ++z) { ",
+            "middle: for (let x = 0; x < 1; ++x) { ",
+            "inner: for (let y = 0; y < 1; ++y) { ",
+            "(function () { return x + y; }); (() => x + y); ",
+            "if (y == 1) { break; } ",
+            "if (y == 1) { break middle; } ",
+            "if (y == 1) { break inner; } ",
+            "if (y == 1) { continue outer; } ",
+            "if (x == 2) { continue; } ",
+            "if (x == 2) { continue middle; } ",
+            "if (x == 2) { continue inner; } ",
+            "if (x == 2) { return '123'; } ",
+            "if (x == 3) { return; } ",
+            "} ",
+            "if (x == 1) { break; } ",
+            "if (x == 1) { break middle; } ",
+            "if (x == 2) { continue; } ",
+            "if (x == 2) { continue middle; } ",
+            "if (x == 2) { continue outer; } ",
+            "if (x == 2) { return '456'; } ",
+            "if (x == 3) { return; } ",
+            "} } } ",
+            "function constant() { ",
+            "outer: for (const z = 0; z < 1;) { ",
+            "middle: for (const x = 0; x < 1;) { ",
+            "inner: for (const y = 0; y < 1;) { ",
+            "(function () { return x + y; }); (() => x + y); ",
+            "if (y == 1) { break; } ",
+            "if (y == 1) { break middle; } ",
+            "if (y == 1) { break inner; } ",
+            "if (y == 1) { continue outer; } ",
+            "if (x == 2) { continue; } ",
+            "if (x == 2) { continue middle; } ",
+            "if (x == 2) { continue inner; } ",
+            "if (x == 2) { return '123'; } ",
+            "if (x == 3) { return; } ",
+            "} ",
+            "if (x == 1) { break; } ",
+            "if (x == 1) { break middle; } ",
+            "if (x == 2) { continue; } ",
+            "if (x == 2) { continue middle; } ",
+            "if (x == 2) { continue outer; } ",
+            "if (x == 2) { return '456'; } ",
+            "if (x == 3) { return; } ",
+            "} } }",
+        ));
+        let file = FileId::new(8_809);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 16);
+        for (diagnostic, value) in diagnostics.iter().zip([
+            "1", "1", "1", "1", "2", "2", "2", "2", "3", "1", "1", "2", "2", "2", "2", "3",
+        ]) {
+            assert_eq!(diagnostic.diagnostic.code(), 2367);
+            assert_eq!(diagnostic.diagnostic.arguments, ["0", value]);
         }
 
         let warm = observable_state(&context, file);
