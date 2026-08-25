@@ -6407,7 +6407,9 @@ mod tests {
                     .and_then(|links| links.resolved_type)
                     .expect("Boolean's object argument must preserve its resolved object type");
                 assert!(matches!(
-                    store.type_payload(object_type).map(|record| record.data()),
+                    store
+                        .type_payload(object_type)
+                        .map(super::super::type_records::TypeRecord::data),
                     Some(TypeData::Object(_)),
                 ));
             }
@@ -6760,7 +6762,7 @@ mod tests {
             let value_annotation = context
                 .store()
                 .symbol(instance)
-                .and_then(|symbol| symbol.value_declaration())
+                .and_then(ts_binder::semantic::Symbol::value_declaration)
                 .and_then(|declaration| context.store().source_direct_type_annotation(declaration))
                 .unwrap();
             let return_annotation = context

@@ -16661,7 +16661,6 @@ mod tests {
             forwarded,
             SymbolNodeLinks {
                 resolved_symbol: Some(event_target),
-                ..SymbolNodeLinks::default()
             },
         ));
         let poisoned = (
@@ -16835,7 +16834,6 @@ mod tests {
             dom_reference,
             SymbolNodeLinks {
                 resolved_symbol: Some(element),
-                ..SymbolNodeLinks::default()
             },
         ));
         let poisoned = (
@@ -17027,7 +17025,6 @@ mod tests {
             annotation,
             SymbolNodeLinks {
                 resolved_symbol: Some(element),
-                ..SymbolNodeLinks::default()
             },
         ));
         let poisoned = (
@@ -17225,7 +17222,6 @@ mod tests {
             annotations[0],
             SymbolNodeLinks {
                 resolved_symbol: Some(other),
-                ..SymbolNodeLinks::default()
             },
         ));
         let poisoned = (
