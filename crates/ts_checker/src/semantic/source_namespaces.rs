@@ -924,10 +924,13 @@ fn plan_interface_method_signature(
         || symbol_record.value_declaration().is_none()
         || symbol_record.members().is_some()
         || symbol_record.exports().is_some()
-        || symbol_record.parent() != Some(owner)
+        || store.get_parent_of_symbol(symbol) != Some(owner)
         || symbol_record.export_symbol().is_some()
         || store.get_merged_symbol(symbol) != Some(symbol)
-        || members.and_then(|members| members.get_source(&identifier.text)) != Some(symbol)
+        || members
+            .and_then(|members| members.get_source(&identifier.text))
+            .and_then(|member| store.get_merged_symbol(member))
+            != Some(symbol)
     {
         return Err(SourceCheckError::Provenance(
             SourceCheckProvenanceError::MissingDeclarationSymbol(declaration),
@@ -1649,6 +1652,179 @@ fn reopened_namespace_generic_interface_members_are_exact(
     })
 }
 
+/// Authenticates the source contribution without forcing unrelated global Array members.
+#[allow(clippy::too_many_lines)] // Global ownership, augmentation syntax, and method edges are one proof.
+fn global_augmentation_array_interface_members_are_exact(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    declaration: NodeRef,
+    namespace: SemanticSymbolId,
+    symbol: SemanticSymbolId,
+    generic: &SourceNamespaceGenericInterfacePlan,
+) -> bool {
+    let Some(facts) = bound.source_facts() else {
+        return false;
+    };
+    let Some(interface) = arena.get(declaration.node) else {
+        return false;
+    };
+    let NodeData::InterfaceDeclaration(interface_data) = &interface.data else {
+        return false;
+    };
+    let Some(block_id) = interface.parent else {
+        return false;
+    };
+    let Some(block) = arena.get(block_id) else {
+        return false;
+    };
+    let NodeData::ModuleBlock(block_data) = &block.data else {
+        return false;
+    };
+    let Some(global_id) = block.parent else {
+        return false;
+    };
+    let Some(global) = arena.get(global_id) else {
+        return false;
+    };
+    let NodeData::ModuleDeclaration(global_data) = &global.data else {
+        return false;
+    };
+    let global_declaration = child(declaration, global_id);
+    let global_name = child(global_declaration, global_data.name);
+    let Some(global_name_record) = arena.get(global_name.node) else {
+        return false;
+    };
+    let NodeData::Identifier(global_identifier) = &global_name_record.data else {
+        return false;
+    };
+    let Some(owner) = store.symbol(symbol) else {
+        return false;
+    };
+    let Some(declarations) = owner.declarations() else {
+        return false;
+    };
+    let Some(target) = store
+        .declared_type_links(symbol)
+        .and_then(|links| links.declared_type)
+    else {
+        return false;
+    };
+    let Ok(reference) = validate_direct_generic_reference(store, target) else {
+        return false;
+    };
+    let [parameter] = reference.type_arguments.as_slice() else {
+        return false;
+    };
+    let Some(parameter_symbol) = cached_ordinary_type_parameter_owner(store, *parameter) else {
+        return false;
+    };
+    let Some(members) = store.symbol_table(generic.members) else {
+        return false;
+    };
+    let allowed_flags =
+        SymbolFlags::INTERFACE | SymbolFlags::FUNCTION_SCOPED_VARIABLE | SymbolFlags::TRANSIENT;
+    if facts.is_default_library()
+        || facts.is_javascript_file()
+        || !facts.is_external_module()
+        || interface.kind != SyntaxKind::InterfaceDeclaration
+        || interface.flags.0 != 0
+        || interface_data.flow_node.is_some()
+        || interface_data.local_symbol.is_some()
+        || interface_data.symbol.is_some()
+        || interface_data.modifiers.is_some()
+        || interface_data.heritage_clauses.is_some()
+        || interface_data.members.has_trailing_comma
+        || block.kind != SyntaxKind::ModuleBlock
+        || block.flags.0 != 0
+        || block_data.flow_node.is_some()
+        || block_data.facts != 0
+        || !block_data.statements.nodes.contains(&declaration.node)
+        || global.kind != SyntaxKind::ModuleDeclaration
+        || global.flags.0 != 0
+        || global.parent != Some(bound.source_file().node)
+        || global_data.keyword != SyntaxKind::GlobalKeyword
+        || global_data.body != Some(block_id)
+        || global_name_record.kind != SyntaxKind::Identifier
+        || global_name_record.parent != Some(global_id)
+        || global_identifier.flow_node.is_some()
+        || global_identifier.text != "global"
+        || !bound
+            .module_augmentations()
+            .iter()
+            .any(|augmentation| augmentation.name() == global_name)
+        || bound
+            .symbol(global_declaration)
+            .and_then(|owner| store.get_merged_symbol(owner))
+            != Some(namespace)
+        || !owner.flags().contains(SymbolFlags::INTERFACE)
+        || owner.flags().without(allowed_flags) != SymbolFlags::NONE
+        || owner.check_flags() != CheckFlags::NONE
+        || owner.name().as_utf8() != Some("Array")
+        || owner.parent().is_some()
+        || owner.exports().is_some()
+        || owner.export_symbol().is_some()
+        || owner.members() != Some(generic.members)
+        || !declarations.contains(&declaration)
+        || !declarations
+            .iter()
+            .any(|candidate| candidate.file != declaration.file)
+        || store
+            .intrinsic_bootstrap()
+            .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+            .and_then(|globals| globals.get_source("Array"))
+            .and_then(|owner| store.get_merged_symbol(owner))
+            != Some(symbol)
+        || reference.target != target
+        || generic.type_parameters.as_slice() != [parameter_symbol]
+        || generic.methods.is_empty()
+        || !generic.properties.is_empty()
+        || !generic.call_signatures.is_empty()
+        || !generic.construct_signatures.is_empty()
+        || !generic.index_signatures.is_empty()
+        || !generic.computed_properties.is_empty()
+        || !generic.base_interfaces.is_empty()
+        || interface_data.members.nodes.len() != generic.methods.len()
+    {
+        return false;
+    }
+
+    generic.methods.iter().copied().all(|method| {
+        let Some(record) = store.symbol(method) else {
+            return false;
+        };
+        let Some(method_declarations) = record.declarations() else {
+            return false;
+        };
+        record
+            .flags()
+            .without(SymbolFlags::METHOD | SymbolFlags::OPTIONAL)
+            == SymbolFlags::NONE
+            && record.flags().contains(SymbolFlags::METHOD)
+            && record.check_flags() == CheckFlags::NONE
+            && record.members().is_none()
+            && record.exports().is_none()
+            && record.export_symbol().is_none()
+            && store.get_merged_symbol(method) == Some(method)
+            && store.get_parent_of_symbol(method) == Some(symbol)
+            && members
+                .get(record.name())
+                .and_then(|member| store.get_merged_symbol(member))
+                == Some(method)
+            && method_declarations.iter().any(|method_declaration| {
+                method_declaration.is_for(arena.id(), bound.file_id())
+                    && arena.get(method_declaration.node).is_some_and(|node| {
+                        node.kind == SyntaxKind::MethodSignature
+                            && node.parent == Some(declaration.node)
+                    })
+                    && bound
+                        .symbol(*method_declaration)
+                        .and_then(|bound_symbol| store.get_merged_symbol(bound_symbol))
+                        == Some(method)
+            })
+    })
+}
+
 fn namespace_generic_annotation_requires_deferral(
     arena: &NodeArena,
     bound: &BoundFile,
@@ -2177,6 +2353,15 @@ fn plan_interface_member(
             generic.members,
         )
         && !reopened_namespace_generic_interface_members_are_exact(
+            arena,
+            bound,
+            store,
+            declaration,
+            owner,
+            symbol,
+            generic,
+        )
+        && !global_augmentation_array_interface_members_are_exact(
             arena,
             bound,
             store,
@@ -14097,6 +14282,178 @@ mod tests {
         );
         let plan = plan(&fixture, 1);
         assert!(execute(&mut fixture, &plan).unwrap().is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep merged ownership, warm identity, and forgery checks together.
+    fn external_global_array_method_augmentation_authenticates_merged_parent() {
+        let library = parse_source_file(concat!(
+            "interface Array<T> { length: number; } ",
+            "declare var Array: any; ",
+            "interface ReadonlyArray<T> {}",
+        ));
+        let augmentation = parse_source_file(concat!(
+            "declare global { interface Array<T> { customMethod(): T; } } ",
+            "export {};",
+        ));
+        assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+        assert!(
+            augmentation.diagnostics.is_empty(),
+            "{:?}",
+            augmentation.diagnostics,
+        );
+
+        let library_file = FileId::new(7_496);
+        let augmentation_file = FileId::new(7_497);
+        let mut binder = CanonicalBinder::new();
+        for (parsed, file, default_library, module_state) in [
+            (&library, library_file, true, CanonicalModuleState::Script),
+            (
+                &augmentation,
+                augmentation_file,
+                false,
+                CanonicalModuleState::External,
+            ),
+        ] {
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new_with_default_library(
+                        EscapedName::source(if default_library {
+                            "\"/lib.array.d.ts\""
+                        } else {
+                            "\"/augment.ts\""
+                        }),
+                        CanonicalSourceLanguage::TypeScript,
+                        default_library,
+                        default_library,
+                        module_state,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![
+                (library_file, &library.arena),
+                (augmentation_file, &augmentation.arena),
+            ],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        let (_, bound) = context.file(augmentation_file).unwrap();
+        let namespace_declaration = augmentation
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ModuleDeclaration).then_some(NodeRef::new(
+                    augmentation.arena.id(),
+                    augmentation_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let method_declaration = augmentation
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::MethodSignature).then_some(NodeRef::new(
+                    augmentation.arena.id(),
+                    augmentation_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let method = bound
+            .symbol(method_declaration)
+            .and_then(|symbol| context.store().get_merged_symbol(symbol))
+            .unwrap();
+        let array = context
+            .store()
+            .intrinsic_bootstrap()
+            .and_then(|bootstrap| context.store().symbol_table(bootstrap.globals))
+            .and_then(|globals| globals.get_source("Array"))
+            .and_then(|symbol| context.store().get_merged_symbol(symbol))
+            .unwrap();
+        assert_ne!(
+            context.store().symbol(method).unwrap().parent(),
+            Some(array)
+        );
+        assert_eq!(context.store().get_parent_of_symbol(method), Some(array));
+
+        let members = context
+            .store()
+            .symbol(array)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| context.store().symbol_table(members))
+            .unwrap();
+        assert!(members.get_source("length").is_some());
+        assert_eq!(
+            members
+                .get_source("customMethod")
+                .and_then(|symbol| context.store().get_merged_symbol(symbol)),
+            Some(method),
+        );
+
+        let namespace = plan_source_namespace(
+            &augmentation.arena,
+            bound,
+            context.store(),
+            namespace_declaration,
+        )
+        .unwrap();
+        let [
+            SourceNamespaceMemberPlan::Interface {
+                symbol,
+                generic: Some(generic),
+                ..
+            },
+        ] = namespace.members.as_slice()
+        else {
+            panic!("the global augmentation must retain its generic Array contribution")
+        };
+        assert_eq!(*symbol, array);
+        assert_eq!(generic.methods.as_slice(), [method]);
+
+        context.check_source_file(augmentation_file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        let warm = (
+            context.store().type_len(),
+            context.store().symbol_len(),
+            context.store().checker_link_allocated_lengths(),
+            context.diagnostics().as_slice().to_vec(),
+        );
+        context.recheck_source_file(augmentation_file).unwrap();
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.diagnostics().as_slice().to_vec(),
+            ),
+            warm,
+        );
+
+        assert_ne!(namespace.symbol, array);
+        assert!(context.store_mut_for_test().set_symbol_relationships(
+            method,
+            None,
+            None,
+            Some(namespace.symbol),
+            None,
+        ));
+        let (arena, bound) = context.file(augmentation_file).unwrap();
+        assert!(matches!(
+            plan_source_namespace(arena, bound, context.store(), namespace_declaration),
+            Err(SourceCheckError::Provenance(
+                SourceCheckProvenanceError::MissingDeclarationSymbol(node),
+            )) if node == method_declaration
+        ));
     }
 
     #[test]
