@@ -36093,7 +36093,21 @@ mod tests {
                 .symbol_table(globals)
                 .and_then(|globals| globals.get_source(intermediate))
                 .unwrap();
-            assert!(context.store().declared_type_links(symbol).is_none());
+            let declared = context
+                .store()
+                .declared_type_links(symbol)
+                .and_then(|links| links.declared_type)
+                .unwrap();
+            let record = context.store().type_payload(declared).unwrap();
+            let TypeData::Interface(interface) = record.data() else {
+                panic!("intermediate DOM bases must retain their interface identities")
+            };
+            assert_eq!(record.symbol(), Some(symbol));
+            assert!(!interface.base_types_resolved);
+            assert!(!interface.declared_members_resolved);
+            assert!(interface.resolved_base_types.is_none());
+            assert!(interface.reference.object.structured.properties.is_none());
+            assert!(interface.reference.object.structured.signatures.is_none());
         }
         let warm = store_state(context.store());
         for (annotation, expected) in &resolved {
