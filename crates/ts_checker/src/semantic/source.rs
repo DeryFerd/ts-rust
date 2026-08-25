@@ -61,6 +61,8 @@
 //! source staging until a retry completes and publishes them atomically.
 //! Strict `arguments` collisions retain a bounded binder-authenticated recovery
 //! that preserves the real `IArguments` assignment diagnostic.
+//! Declaration-only mixed signatures with implicit rest parameters retain a
+//! separate bounded recovery that preserves binder-owned overload identity.
 
 use std::collections::{HashMap, HashSet};
 
@@ -35437,6 +35439,496 @@ fn strict_arguments_signature_collisions(
     includes_failure && observed == *diagnostics
 }
 
+fn declaration_only_rest_symbol(
+    store: &CanonicalTypeMapperStore,
+    symbol: SemanticSymbolId,
+    flags: SymbolFlags,
+    parent: Option<SemanticSymbolId>,
+    value_declaration: Option<NodeRef>,
+) -> Option<&ts_binder::semantic::Symbol> {
+    let owner = store.symbol(symbol)?;
+    (owner.flags() == flags
+        && owner.check_flags() == CheckFlags::NONE
+        && owner.value_declaration() == value_declaration
+        && owner.exports().is_none()
+        && owner.parent() == parent
+        && owner.export_symbol().is_none()
+        && store.get_merged_symbol(symbol) == Some(symbol))
+    .then_some(owner)
+}
+
+fn declaration_only_rest_signature_parameters(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    signature: NodeRef,
+    parameters: &ts_ast::NodeList,
+) -> bool {
+    let [ordinary, rest] = parameters.nodes.as_slice() else {
+        return false;
+    };
+    if parameters.has_trailing_comma {
+        return false;
+    }
+    let Some(locals) = bound
+        .locals(signature)
+        .and_then(|locals| store.symbol_table(locals))
+    else {
+        return false;
+    };
+    if locals.len() != 2 {
+        return false;
+    }
+
+    for (index, node) in [*ordinary, *rest].into_iter().enumerate() {
+        let Some(parameter) = strict_arguments_child(arena, bound, signature, node) else {
+            return false;
+        };
+        let Some(record) = arena.get(parameter.node) else {
+            return false;
+        };
+        let NodeData::ParameterDeclaration(data) = &record.data else {
+            return false;
+        };
+        let Some(name) = strict_arguments_child(arena, bound, parameter, data.name) else {
+            return false;
+        };
+        let Some(name_record) = arena.get(name.node) else {
+            return false;
+        };
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return false;
+        };
+        let Some(symbol) = bound.symbol(parameter) else {
+            return false;
+        };
+        let Some(owner) = declaration_only_rest_symbol(
+            store,
+            symbol,
+            SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+            None,
+            Some(parameter),
+        ) else {
+            return false;
+        };
+        if record.kind != SyntaxKind::Parameter
+            || record.flags.0 != 0
+            || data.initializer.is_some()
+            || data.question_token.is_some()
+            || data.symbol.is_some()
+            || data.facts != 0
+            || data.modifiers.is_some()
+            || name_record.kind != SyntaxKind::Identifier
+            || name_record.flags.0 != 0
+            || identifier.flow_node.is_some()
+            || identifier.text.is_empty()
+            || owner.name().as_utf8() != Some(identifier.text.as_str())
+            || owner.declarations() != Some(&[parameter])
+            || owner.members().is_some()
+            || locals.get_source(&identifier.text) != Some(symbol)
+        {
+            return false;
+        }
+
+        if index == 0 {
+            let Some(annotation) = data
+                .type_
+                .and_then(|annotation| strict_arguments_child(arena, bound, parameter, annotation))
+            else {
+                return false;
+            };
+            if data.dot_dot_dot_token.is_some()
+                || arena
+                    .get(annotation.node)
+                    .is_none_or(|annotation| annotation.kind != SyntaxKind::NumberKeyword)
+            {
+                return false;
+            }
+        } else {
+            let Some(token) = data
+                .dot_dot_dot_token
+                .and_then(|token| strict_arguments_child(arena, bound, parameter, token))
+            else {
+                return false;
+            };
+            let Some(token_record) = arena.get(token.node) else {
+                return false;
+            };
+            if data.type_.is_some()
+                || token_record.kind != SyntaxKind::DotDotDotToken
+                || token_record.flags.0 != 0
+                || !matches!(token_record.data, NodeData::Token(_))
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn declaration_only_rest_function_type(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+) -> bool {
+    let Some(record) = arena.get(node.node) else {
+        return false;
+    };
+    let NodeData::FunctionTypeNode(function) = &record.data else {
+        return false;
+    };
+    let Some(return_type) = function
+        .type_
+        .and_then(|return_type| strict_arguments_child(arena, bound, node, return_type))
+    else {
+        return false;
+    };
+    let Some(symbol) = bound.symbol(node) else {
+        return false;
+    };
+    let Some(owner) =
+        declaration_only_rest_symbol(store, symbol, SymbolFlags::TYPE_LITERAL, None, None)
+    else {
+        return false;
+    };
+    let Some(members) = owner
+        .members()
+        .and_then(|members| store.symbol_table(members))
+    else {
+        return false;
+    };
+    let Some(call) = members.get(ts_binder::InternalSymbolName::Call.as_ref()) else {
+        return false;
+    };
+    let Some(signature) =
+        declaration_only_rest_symbol(store, call, SymbolFlags::SIGNATURE, None, None)
+    else {
+        return false;
+    };
+    record.kind == SyntaxKind::FunctionType
+        && record.flags.0 == 0
+        && function.full_signature.is_none()
+        && function.next_container.is_none()
+        && function.symbol.is_none()
+        && function.type_parameters.is_none()
+        && function.modifiers.is_none()
+        && owner.name() == ts_binder::InternalSymbolName::Type.as_ref()
+        && owner.declarations() == Some(&[node])
+        && members.len() == 1
+        && signature.name() == ts_binder::InternalSymbolName::Call.as_ref()
+        && signature.declarations() == Some(&[node])
+        && signature.members().is_none()
+        && arena
+            .get(return_type.node)
+            .is_some_and(|return_type| return_type.kind == SyntaxKind::VoidKeyword)
+        && declaration_only_rest_signature_parameters(
+            arena,
+            bound,
+            store,
+            node,
+            &function.parameters,
+        )
+}
+
+fn declaration_only_rest_signature_member(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    literal: NodeRef,
+    literal_symbol: SemanticSymbolId,
+    node: NodeId,
+    kind: SyntaxKind,
+) -> bool {
+    let Some(signature) = strict_arguments_child(arena, bound, literal, node) else {
+        return false;
+    };
+    let Some(record) = arena.get(signature.node) else {
+        return false;
+    };
+    let Some(symbol) = bound.symbol(signature) else {
+        return false;
+    };
+    let expected_flags = if kind == SyntaxKind::MethodSignature {
+        SymbolFlags::METHOD
+    } else {
+        SymbolFlags::SIGNATURE
+    };
+    let Some(owner) = declaration_only_rest_symbol(
+        store,
+        symbol,
+        expected_flags,
+        Some(literal_symbol),
+        (kind == SyntaxKind::MethodSignature).then_some(signature),
+    ) else {
+        return false;
+    };
+    let (parameters, valid_syntax, expected_name) = match &record.data {
+        NodeData::CallSignatureDeclaration(data) if kind == SyntaxKind::CallSignature => (
+            &data.parameters,
+            data.full_signature.is_none()
+                && data.next_container.is_none()
+                && data.symbol.is_none()
+                && data.type_.is_none()
+                && data.type_parameters.is_none(),
+            owner.name() == ts_binder::InternalSymbolName::Call.as_ref(),
+        ),
+        NodeData::ConstructSignatureDeclaration(data) if kind == SyntaxKind::ConstructSignature => {
+            (
+                &data.parameters,
+                data.full_signature.is_none()
+                    && data.next_container.is_none()
+                    && data.symbol.is_none()
+                    && data.type_.is_none()
+                    && data.type_parameters.is_none(),
+                owner.name() == ts_binder::InternalSymbolName::New.as_ref(),
+            )
+        }
+        NodeData::MethodSignatureDeclaration(data) if kind == SyntaxKind::MethodSignature => {
+            let Some(name) = strict_arguments_child(arena, bound, signature, data.name) else {
+                return false;
+            };
+            let Some(name_record) = arena.get(name.node) else {
+                return false;
+            };
+            let NodeData::Identifier(identifier) = &name_record.data else {
+                return false;
+            };
+            (
+                &data.parameters,
+                name_record.kind == SyntaxKind::Identifier
+                    && name_record.flags.0 == 0
+                    && !identifier.text.is_empty()
+                    && identifier.flow_node.is_none()
+                    && data.full_signature.is_none()
+                    && data.next_container.is_none()
+                    && data.postfix_token.is_none()
+                    && data.symbol.is_none()
+                    && data.type_.is_none()
+                    && data.type_parameters.is_none()
+                    && data.modifiers.is_none(),
+                owner.name().as_utf8() == Some(identifier.text.as_str()),
+            )
+        }
+        _ => return false,
+    };
+    let Some(members) = store
+        .symbol(literal_symbol)
+        .and_then(ts_binder::semantic::Symbol::members)
+        .and_then(|members| store.symbol_table(members))
+    else {
+        return false;
+    };
+    let Some(literal_record) = arena.get(literal.node) else {
+        return false;
+    };
+    let NodeData::TypeLiteralNode(literal_data) = &literal_record.data else {
+        return false;
+    };
+    let Some(declarations) = owner.declarations() else {
+        return false;
+    };
+    let expected_declarations = literal_data.members.nodes.iter().copied().filter(|node| {
+        arena
+            .get(*node)
+            .is_some_and(|candidate| candidate.kind == kind)
+    });
+    record.kind == kind
+        && record.flags.0 == 0
+        && valid_syntax
+        && expected_name
+        && declarations
+            .iter()
+            .map(|declaration| declaration.node)
+            .eq(expected_declarations)
+        && owner.members().is_none()
+        && members.get(owner.name()) == Some(symbol)
+        && declaration_only_rest_signature_parameters(arena, bound, store, signature, parameters)
+}
+
+fn declaration_only_rest_signature_property(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    literal: NodeRef,
+    literal_symbol: SemanticSymbolId,
+    node: NodeId,
+) -> bool {
+    let Some(property) = strict_arguments_child(arena, bound, literal, node) else {
+        return false;
+    };
+    let Some(record) = arena.get(property.node) else {
+        return false;
+    };
+    let NodeData::PropertyDeclaration(data) = &record.data else {
+        return false;
+    };
+    let Some(name) = strict_arguments_child(arena, bound, property, data.name) else {
+        return false;
+    };
+    let Some(name_record) = arena.get(name.node) else {
+        return false;
+    };
+    let NodeData::Identifier(identifier) = &name_record.data else {
+        return false;
+    };
+    let Some(annotation) = data
+        .type_
+        .and_then(|annotation| strict_arguments_child(arena, bound, property, annotation))
+    else {
+        return false;
+    };
+    let Some(symbol) = bound.symbol(property) else {
+        return false;
+    };
+    let Some(owner) = declaration_only_rest_symbol(
+        store,
+        symbol,
+        SymbolFlags::PROPERTY,
+        Some(literal_symbol),
+        Some(property),
+    ) else {
+        return false;
+    };
+    record.kind == SyntaxKind::PropertyDeclaration
+        && record.flags.0 == 0
+        && data.initializer.is_none()
+        && data.postfix_token.is_none()
+        && data.symbol.is_none()
+        && data.facts == 0
+        && data.modifiers.is_none()
+        && name_record.kind == SyntaxKind::Identifier
+        && name_record.flags.0 == 0
+        && !identifier.text.is_empty()
+        && identifier.flow_node.is_none()
+        && owner.name().as_utf8() == Some(identifier.text.as_str())
+        && owner.declarations() == Some(&[property])
+        && owner.members().is_none()
+        && store
+            .symbol(literal_symbol)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get_source(&identifier.text))
+            == Some(symbol)
+        && declaration_only_rest_function_type(arena, bound, store, annotation)
+}
+
+fn declaration_only_rest_signature_source(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    options: CanonicalCheckerOptions,
+    failure: NodeRef,
+) -> bool {
+    let Some(facts) = bound.source_facts() else {
+        return false;
+    };
+    let Some(NodeData::SourceFile(source)) =
+        arena.get(bound.source_file().node).map(|node| &node.data)
+    else {
+        return false;
+    };
+    let [first, second] = source.statements.nodes.as_slice() else {
+        return false;
+    };
+    if facts.is_declaration_file()
+        || facts.is_javascript_file()
+        || facts.is_external_or_common_js_module()
+        || options.no_implicit_any
+        || !bound.diagnostics().is_empty()
+    {
+        return false;
+    }
+    let Some(first) =
+        strict_arguments_variable_statement(arena, bound, store, bound.source_file(), *first)
+    else {
+        return false;
+    };
+    let Some(first_type) = first.type_node else {
+        return false;
+    };
+    if first.initializer.is_some()
+        || !declaration_only_rest_function_type(arena, bound, store, first_type)
+    {
+        return false;
+    }
+    let Some(second) =
+        strict_arguments_variable_statement(arena, bound, store, bound.source_file(), *second)
+    else {
+        return false;
+    };
+    let Some(literal) = second.type_node else {
+        return false;
+    };
+    let Some(record) = arena.get(literal.node) else {
+        return false;
+    };
+    let NodeData::TypeLiteralNode(data) = &record.data else {
+        return false;
+    };
+    let Some((property, signatures)) = data.members.nodes.split_last() else {
+        return false;
+    };
+    let Some((method, signatures)) = signatures.split_last() else {
+        return false;
+    };
+    let Some((construct, calls)) = signatures.split_last() else {
+        return false;
+    };
+    if calls.is_empty() {
+        return false;
+    }
+    let Some(symbol) = bound.symbol(literal) else {
+        return false;
+    };
+    let Some(owner) =
+        declaration_only_rest_symbol(store, symbol, SymbolFlags::TYPE_LITERAL, None, None)
+    else {
+        return false;
+    };
+    record.kind == SyntaxKind::TypeLiteral
+        && record.flags.0 == 0
+        && second.initializer.is_none()
+        && !data.members.has_trailing_comma
+        && owner.name() == ts_binder::InternalSymbolName::Type.as_ref()
+        && owner.declarations() == Some(&[literal])
+        && owner
+            .members()
+            .and_then(|members| store.symbol_table(members))
+            .is_some_and(|members| members.len() == 4)
+        && calls.iter().all(|call| {
+            declaration_only_rest_signature_member(
+                arena,
+                bound,
+                store,
+                literal,
+                symbol,
+                *call,
+                SyntaxKind::CallSignature,
+            )
+        })
+        && declaration_only_rest_signature_member(
+            arena,
+            bound,
+            store,
+            literal,
+            symbol,
+            *construct,
+            SyntaxKind::ConstructSignature,
+        )
+        && declaration_only_rest_signature_member(
+            arena,
+            bound,
+            store,
+            literal,
+            symbol,
+            *method,
+            SyntaxKind::MethodSignature,
+        )
+        && declaration_only_rest_signature_property(arena, bound, store, literal, symbol, *property)
+        && (calls.contains(&failure.node) || *construct == failure.node || *method == failure.node)
+}
+
 fn strict_arguments_default_library_has_iterator(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -35809,7 +36301,12 @@ pub(super) fn recover_strict_arguments_source(
         return Ok(false);
     };
     let Some(strict_diagnostics) = strict_arguments_diagnostic_nodes(arena, bound, options) else {
-        return Ok(false);
+        return Ok(matches!(
+            failure,
+            StrictArgumentsFailure::Signature(node)
+                if diagnostics.is_empty()
+                    && declaration_only_rest_signature_source(arena, bound, store, options, node)
+        ));
     };
     let failure_node = match failure {
         StrictArgumentsFailure::FunctionAssignment { target, .. } => target,
@@ -70777,6 +71274,215 @@ class Foo2 {
             context.recheck_source_file(file).unwrap();
             assert_eq!(observable_state(&context, file), warm);
         }
+    }
+
+    #[test]
+    fn declaration_only_rest_signatures_preserve_call_overloads_without_publication() {
+        for (index, calls) in [
+            "(_i: number, ...restParameters);",
+            concat!(
+                "(_i: number, ...firstRest);",
+                "(_j: number, ...secondRest);",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let text = format!(
+                concat!(
+                    "var v1: (_i: number, ...restParameters) => void; ",
+                    "var v2: {{ {calls} ",
+                    "new (_i: number, ...restParameters); ",
+                    "foo(_i: number, ...restParameters); ",
+                    "prop: (_i: number, ...restParameters) => void; }};",
+                ),
+                calls = calls,
+            );
+            let source = parsed(&text);
+            let file = FileId::new(9_920 + u32::try_from(index).unwrap());
+            let mut context = context(
+                &[(file, &source)],
+                CanonicalCheckerOptions {
+                    no_implicit_any: false,
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+            let literal = source
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::TypeLiteral).then_some(NodeRef::new(
+                        source.arena.id(),
+                        file,
+                        node,
+                    ))
+                })
+                .unwrap();
+            let (_, bound) = context.file(file).unwrap();
+            let owner = bound.symbol(literal).unwrap();
+            let members = context
+                .store()
+                .symbol(owner)
+                .and_then(ts_binder::semantic::Symbol::members)
+                .and_then(|members| context.store().symbol_table(members))
+                .unwrap();
+            let call = members.get(InternalSymbolName::Call.as_ref()).unwrap();
+            let construct = members.get(InternalSymbolName::New.as_ref()).unwrap();
+            let declarations = context
+                .store()
+                .symbol(call)
+                .and_then(ts_binder::semantic::Symbol::declarations)
+                .unwrap()
+                .to_vec();
+            assert_eq!(declarations.len(), index + 1);
+            assert_ne!(call, construct);
+            let before = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().symbol_len(),
+            );
+
+            context.check_source_file(file).unwrap();
+
+            assert!(context.diagnostics().is_empty());
+            assert_eq!(
+                context
+                    .store()
+                    .symbol(call)
+                    .and_then(ts_binder::semantic::Symbol::declarations),
+                Some(declarations.as_slice()),
+            );
+            for declaration in declarations {
+                assert!(context.store().signature_links(declaration).is_none());
+            }
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().symbol_len(),
+                ),
+                before,
+            );
+
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
+    fn incomplete_declaration_only_rest_signature_surfaces_remain_unsupported() {
+        for (index, body) in [
+            concat!(
+                "(_i: number, ...rest); ",
+                "foo(_i: number, ...rest); ",
+                "prop: (_i: number, ...rest) => void;",
+            ),
+            concat!(
+                "(_i: number, ...rest); ",
+                "new (_i: number, ...rest); ",
+                "foo(_i: number, ...rest: any[]); ",
+                "prop: (_i: number, ...rest) => void;",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parsed(&format!(
+                "var first: (_i: number, ...rest) => void; var second: {{ {body} }};"
+            ));
+            let file = FileId::new(9_930 + u32::try_from(index).unwrap());
+            let mut context = context(
+                &[(file, &source)],
+                CanonicalCheckerOptions {
+                    no_implicit_any: false,
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+            let before = observable_state(&context, file);
+
+            assert!(context.check_source_file(file).is_err());
+            assert_eq!(observable_state(&context, file), before);
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    fn strict_type_signature_arguments_retain_exact_binder_diagnostics() {
+        let text = concat!(
+            "var v1: (i: number, ...arguments) => void;\n",
+            "var v12: (arguments: number, ...restParameters) => void;\n",
+            "var v2: {\n",
+            "    (arguments: number, ...restParameters);\n",
+            "    new (arguments: number, ...restParameters);\n",
+            "    foo(arguments: number, ...restParameters);\n",
+            "    prop: (arguments: number, ...restParameters) => void;\n",
+            "}\n",
+            "var v21: {\n",
+            "    (i: number, ...arguments);\n",
+            "    new (i: number, ...arguments);\n",
+            "    foo(i: number, ...arguments);\n",
+            "    prop: (i: number, ...arguments) => void;\n",
+            "}",
+        );
+        let source = parsed(text);
+        let file = FileId::new(9_940);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &source.arena,
+                source.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/arguments.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                )
+                .with_always_strict(true),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&source.arena, file)
+            .unwrap();
+        let expected = binder
+            .file(file)
+            .unwrap()
+            .diagnostics()
+            .iter()
+            .map(|diagnostic| {
+                assert_eq!(diagnostic.diagnostic.code(), 1100);
+                assert_eq!(diagnostic.diagnostic.arguments, ["arguments"]);
+                source.arena.get(diagnostic.node.node).unwrap().range
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(expected.len(), 10);
+        let mut context = CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![(file, &source.arena)],
+            CanonicalCheckerOptions {
+                no_implicit_any: false,
+                ..CanonicalCheckerOptions::default()
+            },
+        )
+        .unwrap();
+
+        context.check_source_file(file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
+        let (_, bound) = context.file(file).unwrap();
+        assert_eq!(
+            bound
+                .diagnostics()
+                .iter()
+                .map(|diagnostic| source.arena.get(diagnostic.node.node).unwrap().range)
+                .collect::<Vec<_>>(),
+            expected,
+        );
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
     }
 
     #[test]
