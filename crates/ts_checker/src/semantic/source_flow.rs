@@ -1407,7 +1407,11 @@ fn append_narrowed_source_typeof_top(
             return Ok(());
         }
         SourceTypeofTag::Undefined => bootstrap.undefined_type,
-        SourceTypeofTag::Object if kind == SourceTypeofLeafMatch::Any => original,
+        SourceTypeofTag::Object | SourceTypeofTag::Function
+            if kind == SourceTypeofLeafMatch::Any =>
+        {
+            original
+        }
         SourceTypeofTag::Object => {
             retained.push(bootstrap.non_primitive_type);
             if kind == SourceTypeofLeafMatch::Unknown && bootstrap.options.strict_null_checks {
@@ -1415,7 +1419,6 @@ fn append_narrowed_source_typeof_top(
             }
             return Ok(());
         }
-        SourceTypeofTag::Function if kind == SourceTypeofLeafMatch::Any => original,
         SourceTypeofTag::Function => globals.function_type,
     };
     retained.push(narrowed);
