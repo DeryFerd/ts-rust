@@ -56,6 +56,7 @@ pub(super) enum LiteralTreatment {
 pub(super) enum PreparedExpression {
     Literal(LiteralTreatment),
     Identifier(LiteralTreatment),
+    Template(Option<TypeId>),
     Parenthesized(Box<PreparedExpression>),
     Array(Vec<PreparedExpression>),
     Object(Vec<PreparedExpression>),
@@ -339,6 +340,19 @@ fn preflight_contextual_type_graph(
             }
             return Ok(());
         }
+        if flags.intersects(TypeFlags::TEMPLATE_LITERAL) {
+            for placeholder in validate_contextual_template(store, contextual_type)? {
+                preflight_contextual_type_graph(
+                    store,
+                    host,
+                    global_types,
+                    placeholder,
+                    validated,
+                    visiting,
+                )?;
+            }
+            return Ok(());
+        }
         if flags.intersects(TypeFlags::OBJECT) {
             match validate_stored_single_callable(store, contextual_type) {
                 StoredSingleCallableValidation::Valid { .. } => return Ok(()),
@@ -448,6 +462,7 @@ fn prepare_expression(
             contextual_type,
             location,
         )?),
+        PlannedExpressionKind::Template(_) => PreparedExpression::Template(contextual_type),
         PlannedExpressionKind::Number { .. } => PreparedExpression::Literal(literal_treatment(
             store,
             global_types,
@@ -1372,6 +1387,10 @@ fn is_literal_of_contextual_type(
         if flags.intersects(TypeFlags::OBJECT) {
             return Ok(false);
         }
+        if flags.intersects(TypeFlags::TEMPLATE_LITERAL) {
+            validate_contextual_template(store, contextual_type)?;
+            return Ok(kind == LiteralKind::String);
+        }
         if flags.intersects(TypeFlags::STRUCTURED_OR_INSTANTIABLE) {
             return Err(RelationUnavailable::UnsupportedStructuredType(contextual_type).into());
         }
@@ -1387,6 +1406,29 @@ fn is_literal_of_contextual_type(
     })();
     assert!(visited.remove(&contextual_type));
     result
+}
+
+fn validate_contextual_template(
+    store: &CanonicalTypeMapperStore,
+    contextual_type: TypeId,
+) -> Result<Vec<TypeId>, SourceCheckError> {
+    let record = store
+        .type_payload(contextual_type)
+        .ok_or(RelationUnavailable::Type(contextual_type))?;
+    let TypeData::TemplateLiteral(template) = record.data() else {
+        return Err(RelationUnavailable::MalformedStructuredType(contextual_type).into());
+    };
+    if record.flags() != TypeFlags::TEMPLATE_LITERAL
+        || template.types.is_empty()
+        || template.texts.len() != template.types.len() + 1
+        || store
+            .cached_resolved_template_literal_type(&template.texts, &template.types)
+            .map_err(|_| RelationUnavailable::MalformedStructuredType(contextual_type))?
+            != Some(contextual_type)
+    {
+        return Err(RelationUnavailable::MalformedStructuredType(contextual_type).into());
+    }
+    Ok(template.types.clone())
 }
 
 fn validate_contextual_union(

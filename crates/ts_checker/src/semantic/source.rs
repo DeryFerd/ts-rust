@@ -27,6 +27,7 @@
 //! top-level `for...of` loops with one const binding and one direct call,
 //! function-owned `for`, `for...in`, `for...of`, and condition loops with lexical captures,
 //! ordinary direct identifier calls, bounded annotated arrow call arguments,
+//! authenticated interpolated template expressions and contextual template types,
 //! anonymous zero-parameter function expressions with bounded block bodies,
 //! parenthesized standalone closures, lexical captures, and immediate invocation,
 //! authenticated shorthand object-assignment defaults inside bounded function bodies
@@ -239,6 +240,7 @@ use super::{
         plan_source_typeof_switch_function_statements_syntax,
         plan_source_void_switch_function_statements_syntax, source_control_branch_is_empty,
     },
+    template_types::TemplateTypeError,
     tuple_types::{CanonicalTupleTypeRequest, TupleTypeError},
     type_nodes::{
         CanonicalTypeQuery, CanonicalTypeReferenceAliasTarget, TypeNodeUnavailable,
@@ -749,6 +751,7 @@ impl LogicalBinaryPlan {
 pub(super) enum PlannedExpressionKind {
     Null,
     String(String),
+    Template(Box<PlannedTemplateExpression>),
     RegularExpression(TypeId),
     Number {
         value: Number,
@@ -781,6 +784,13 @@ pub(super) enum PlannedExpressionKind {
     Binary(Box<PrimitiveBinaryPlan>),
     Logical(Box<LogicalBinaryPlan>),
     Conditional(Box<ConditionalExpressionPlan>),
+}
+
+/// Authenticated cooked text segments and source-owned template substitutions.
+#[derive(Clone, Debug)]
+pub(super) struct PlannedTemplateExpression {
+    pub(super) texts: Vec<String>,
+    pub(super) substitutions: Vec<PlannedExpression>,
 }
 
 /// A direct expression read of one clause-level type-only import. It remains
@@ -14328,6 +14338,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     PlannedExpressionKind::String(value),
                 ))
             }
+            SyntaxKind::TemplateExpression => self.plan_template_expression(expression),
             SyntaxKind::NumericLiteral => {
                 let value = self.plan_numeric_literal(expression)?;
                 self.numbers.push(value);
@@ -14580,6 +14591,146 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             }
             _ => Err(self.unsupported(expression, kind, SourceSyntaxRole::VariableInitializer)),
         }
+    }
+
+    #[allow(clippy::too_many_lines)] // Template head, spans, and cooked text form one syntax proof.
+    fn plan_template_expression(
+        &mut self,
+        expression: NodeRef,
+    ) -> Result<PlannedExpression, SourceCheckError> {
+        let unsupported = || {
+            SourceCheckError::Unsupported(UnsupportedSourceSyntax::Syntax {
+                node: expression,
+                kind: SyntaxKind::TemplateExpression,
+                role: SourceSyntaxRole::VariableInitializer,
+            })
+        };
+        let record = self.node(expression)?;
+        let NodeData::TemplateExpression(template) = &record.data else {
+            return Err(unsupported());
+        };
+        if record.flags.0 != 0
+            || template.facts != 0
+            || template.template_spans.has_trailing_comma
+            || template.template_spans.nodes.is_empty()
+            || template.template_spans.range.start < record.range.start
+            || template.template_spans.range.end > record.range.end
+        {
+            return Err(unsupported());
+        }
+
+        let head = self.reference(template.head);
+        let head_record = self.node(head)?;
+        let NodeData::TemplateHead(head_data) = &head_record.data else {
+            return Err(unsupported());
+        };
+        if head_record.kind != SyntaxKind::TemplateHead
+            || head_record.flags.0 != 0
+            || head_record.parent != Some(expression.node)
+            || head_record.range.start != record.range.start
+            || head_record.range.end != template.template_spans.range.start
+            || head_data.token_flags.0 != 0
+            || head_data.template_flags.0 != 0
+        {
+            return Err(unsupported());
+        }
+
+        let mut texts = Vec::with_capacity(template.template_spans.nodes.len() + 1);
+        let mut substitution_nodes = Vec::with_capacity(template.template_spans.nodes.len());
+        texts.push(head_data.text.clone());
+        let mut previous_end = head_record.range.end;
+        for (index, span_id) in template.template_spans.nodes.iter().copied().enumerate() {
+            let span = self.reference(span_id);
+            let span_record = self.node(span)?;
+            let NodeData::TemplateSpan(span_data) = &span_record.data else {
+                return Err(unsupported());
+            };
+            let substitution = self.reference(span_data.expression);
+            let substitution_record = self.node(substitution)?;
+            let literal = self.reference(span_data.literal);
+            let literal_record = self.node(literal)?;
+            let text = match (&literal_record.data, literal_record.kind) {
+                (NodeData::TemplateMiddle(data), SyntaxKind::TemplateMiddle)
+                    if index + 1 < template.template_spans.nodes.len()
+                        && data.token_flags.0 == 0
+                        && data.template_flags.0 == 0 =>
+                {
+                    data.text.clone()
+                }
+                (NodeData::TemplateTail(data), SyntaxKind::TemplateTail)
+                    if index + 1 == template.template_spans.nodes.len()
+                        && data.token_flags.0 == 0
+                        && data.template_flags.0 == 0 =>
+                {
+                    data.text.clone()
+                }
+                _ => return Err(unsupported()),
+            };
+            if span_record.kind != SyntaxKind::TemplateSpan
+                || span_record.flags.0 != 0
+                || span_record.parent != Some(expression.node)
+                || span_record.range.start < previous_end
+                || span_record.range.end > record.range.end
+                || substitution_record.parent != Some(span.node)
+                || substitution_record.range.start != span_record.range.start
+                || literal_record.flags.0 != 0
+                || literal_record.parent != Some(span.node)
+                || literal_record.range.start < substitution_record.range.end
+                || literal_record.range.end != span_record.range.end
+            {
+                return Err(unsupported());
+            }
+            previous_end = span_record.range.end;
+            texts.push(text);
+            substitution_nodes.push(substitution);
+        }
+        if previous_end != record.range.end {
+            return Err(unsupported());
+        }
+
+        if let Some((store, _)) = self.semantic
+            && let Some(links) = store.type_node_links(expression)
+        {
+            let string = store
+                .intrinsic_bootstrap()
+                .map(|bootstrap| bootstrap.string_type)
+                .ok_or(SourceCheckError::LiteralCache(
+                    SourceLiteralCacheError::BootstrapUninitialized,
+                ))?;
+            let canonical = TypeNodeLinks {
+                resolved_type: links.resolved_type,
+                ..TypeNodeLinks::default()
+            };
+            if links != &canonical
+                || links.resolved_type.is_some_and(|cached| {
+                    store.type_payload(cached).is_none_or(|record| {
+                        !record
+                            .flags()
+                            .intersects(TypeFlags::STRING_LIKE | TypeFlags::UNION)
+                    })
+                })
+            {
+                return Err(SourceCheckError::Assertion(
+                    SourceAssertionError::InvalidExpressionCache {
+                        node: expression,
+                        cached: links.resolved_type,
+                        expected: string,
+                    },
+                ));
+            }
+        }
+
+        let substitutions = substitution_nodes
+            .into_iter()
+            .map(|substitution| self.plan_expression(substitution))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(PlannedExpression::new(
+            expression,
+            PlannedExpressionKind::Template(Box::new(PlannedTemplateExpression {
+                texts,
+                substitutions,
+            })),
+        ))
     }
 
     fn plan_conditional(
@@ -15752,6 +15903,14 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 {
                     current = parent;
                 }
+                NodeData::TemplateSpan(span) if span.expression == current.node => {
+                    current = parent;
+                }
+                NodeData::TemplateExpression(template)
+                    if template.template_spans.nodes.contains(&current.node) =>
+                {
+                    current = parent;
+                }
                 NodeData::AsExpression(assertion) if assertion.expression == current.node => {
                     current = parent;
                 }
@@ -15831,6 +15990,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         let supported_const_operand = matches!(
             &operand.unparenthesized().kind,
             PlannedExpressionKind::String(_)
+                | PlannedExpressionKind::Template(_)
                 | PlannedExpressionKind::Number { .. }
                 | PlannedExpressionKind::BigInt { .. }
                 | PlannedExpressionKind::Boolean(_)
@@ -17051,6 +17211,7 @@ fn primitive_binary_operand_plan_is_supported(expression: &PlannedExpression) ->
         PlannedExpressionKind::Null
         | PlannedExpressionKind::GlobalUndefined
         | PlannedExpressionKind::String(_)
+        | PlannedExpressionKind::Template(_)
         | PlannedExpressionKind::Number { .. }
         | PlannedExpressionKind::BigInt { .. }
         | PlannedExpressionKind::Boolean(_)
@@ -17103,6 +17264,7 @@ fn conditional_scalar_operand_plan_is_supported(expression: &PlannedExpression) 
             conditional_scalar_operand_plan_is_supported(&binary.right)
         }
         PlannedExpressionKind::TypeImportValueUse(_)
+        | PlannedExpressionKind::Template(_)
         | PlannedExpressionKind::RegularExpression(_)
         | PlannedExpressionKind::Assertion { .. }
         | PlannedExpressionKind::Array(_)
@@ -17163,6 +17325,10 @@ fn comma_left_is_side_effect_free(expression: &PlannedExpression) -> bool {
             comma_left_is_side_effect_free(&conditional.when_true)
                 && comma_left_is_side_effect_free(&conditional.when_false)
         }
+        PlannedExpressionKind::Template(template) => template
+            .substitutions
+            .iter()
+            .all(comma_left_is_side_effect_free),
         PlannedExpressionKind::TypeImportValueUse(_)
         | PlannedExpressionKind::Parenthesized(_)
         | PlannedExpressionKind::Assertion { .. }
@@ -17410,6 +17576,10 @@ fn preflight_inferred_function_return_dependencies(
                 expression_is_closed(inner, parameters, locals, functions)
             }
             PlannedExpressionKind::Array(elements) => elements
+                .iter()
+                .all(|element| expression_is_closed(element, parameters, locals, functions)),
+            PlannedExpressionKind::Template(template) => template
+                .substitutions
                 .iter()
                 .all(|element| expression_is_closed(element, parameters, locals, functions)),
             PlannedExpressionKind::Object { properties, .. } => properties
@@ -17953,6 +18123,7 @@ fn prepare_const_object_property(
         }
         (PlannedExpressionKind::Object { .. }, PreparedExpression::Object(_))
         | (PlannedExpressionKind::Property(_), PreparedExpression::Property(_))
+        | (PlannedExpressionKind::Template(_), PreparedExpression::Template(_))
         | (
             PlannedExpressionKind::Null
             | PlannedExpressionKind::GlobalUndefined
@@ -18153,6 +18324,9 @@ where
             } else {
                 Ok(checked)
             }
+        }
+        (PlannedExpressionKind::Template(_), PreparedExpression::Template(contextual_type)) => {
+            check_nested_expression(store, expression, *contextual_type)
         }
         (PlannedExpressionKind::Array(elements), PreparedExpression::Array(prepared_elements)) => {
             debug_assert_eq!(elements.len(), prepared_elements.len());
@@ -19171,6 +19345,17 @@ fn emit_uninitialized_variable_read_diagnostics(
                 )?;
             }
         }
+        PlannedExpressionKind::Template(template) => {
+            for substitution in &template.substitutions {
+                emit_uninitialized_variable_read_diagnostics(
+                    store,
+                    host,
+                    current_flow_types,
+                    diagnostics,
+                    substitution,
+                )?;
+            }
+        }
         PlannedExpressionKind::Property(property) => {
             emit_uninitialized_variable_read_diagnostics(
                 store,
@@ -19330,6 +19515,17 @@ fn emit_enum_use_before_declaration_diagnostics(
                 )?;
             }
         }
+        PlannedExpressionKind::Template(template) => {
+            for substitution in &template.substitutions {
+                emit_enum_use_before_declaration_diagnostics(
+                    store,
+                    host,
+                    options,
+                    diagnostics,
+                    substitution,
+                )?;
+            }
+        }
         PlannedExpressionKind::Parenthesized(inner)
         | PlannedExpressionKind::Assertion { operand: inner, .. } => {
             emit_enum_use_before_declaration_diagnostics(store, host, options, diagnostics, inner)?;
@@ -19472,6 +19668,84 @@ fn check_expression_type(
             preflighted_type_import_value_uses,
             read,
         ),
+        PlannedExpressionKind::Template(template) => {
+            let mut substitutions = Vec::with_capacity(template.substitutions.len());
+            for substitution in &template.substitutions {
+                let checked = check_expression_type(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    diagnostics,
+                    current_flow_types,
+                    preflighted_type_import_value_uses,
+                    substitution,
+                    None,
+                    deferred,
+                )?;
+                let flags = store
+                    .type_payload(checked.result)
+                    .map(TypeRecord::flags)
+                    .ok_or(RelationUnavailable::Type(checked.result))?;
+                if flags.intersects(TypeFlags::ES_SYMBOL | TypeFlags::UNIQUE_ES_SYMBOL) {
+                    issue_node_diagnostic(diagnostics, substitution.node, 2731)?;
+                }
+                substitutions.push(checked.result);
+            }
+
+            let preserve_template =
+                contextual_type.is_some_and(|contextual| {
+                    store.type_payload(contextual).is_some_and(|record| {
+                        record.flags().intersects(
+                            TypeFlags::STRING_LITERAL
+                                | TypeFlags::TEMPLATE_LITERAL
+                                | TypeFlags::STRING_MAPPING
+                                | TypeFlags::TYPE_PARAMETER
+                                | TypeFlags::UNION
+                                | TypeFlags::INTERSECTION,
+                        )
+                    })
+                }) || template_expression_is_const_asserted(host, expression.node)
+                    || substitutions.iter().all(|substitution| {
+                        store.type_payload(*substitution).is_some_and(|record| {
+                            record
+                                .flags()
+                                .intersects(TypeFlags::LITERAL | TypeFlags::NULLABLE)
+                        })
+                    });
+            let resolved = if preserve_template {
+                store
+                    .get_template_literal_type(&template.texts, &substitutions)
+                    .map_err(|error| source_template_expression_error(expression.node, error))?
+            } else {
+                store
+                    .intrinsic_bootstrap()
+                    .map(|bootstrap| bootstrap.string_type)
+                    .ok_or(SourceCheckError::LiteralCache(
+                        SourceLiteralCacheError::BootstrapUninitialized,
+                    ))?
+            };
+            let raw = if store
+                .type_payload(resolved)
+                .is_some_and(|record| record.flags().intersects(TypeFlags::STRING_LITERAL))
+            {
+                store.fresh_type_of_literal_type(resolved)?
+            } else {
+                resolved
+            };
+            preflight_source_expression_cache(store, expression.node, raw)?;
+            publish_expression_type(store, expression.node, raw)?;
+            Ok(CheckedExpressionTypes::leaf(
+                raw,
+                if contextual_type.is_some() {
+                    resolved
+                } else {
+                    raw
+                },
+            ))
+        }
         PlannedExpressionKind::Conditional(conditional) => {
             if contextual_type.is_some()
                 && !matches!(
@@ -20467,6 +20741,14 @@ fn check_expression_type(
                     {
                         operand_types.result
                     }
+                    TypeData::TemplateLiteral(_)
+                        if matches!(
+                            &operand.unparenthesized().kind,
+                            PlannedExpressionKind::Template(_)
+                        ) =>
+                    {
+                        operand_types.result
+                    }
                     _ => {
                         return Err(SourceCheckError::LiteralCache(
                             SourceLiteralCacheError::InvalidCachedLiteral(operand_types.result),
@@ -21383,6 +21665,96 @@ fn check_uncached_conditional_scalar(
     }
 }
 
+fn template_expression_is_const_asserted(host: &DeclaredTypeHost<'_>, node: NodeRef) -> bool {
+    let mut current = node;
+    let mut visited = HashSet::new();
+    while visited.insert(current) {
+        let Some(parent) = host
+            .node(current)
+            .and_then(|record| record.parent)
+            .map(|parent| NodeRef::new(current.arena, current.file, parent))
+        else {
+            return false;
+        };
+        let Some(parent_record) = host.node(parent) else {
+            return false;
+        };
+        let annotation = match &parent_record.data {
+            NodeData::AsExpression(assertion) if assertion.expression == current.node => {
+                assertion.type_
+            }
+            NodeData::TypeAssertion(assertion) if assertion.expression == current.node => {
+                assertion.type_
+            }
+            NodeData::ParenthesizedExpression(parenthesized)
+                if parenthesized.expression == current.node =>
+            {
+                current = parent;
+                continue;
+            }
+            NodeData::PropertyAssignment(property) if property.initializer == current.node => {
+                current = parent;
+                continue;
+            }
+            NodeData::ObjectLiteralExpression(object)
+                if object.properties.nodes.contains(&current.node) =>
+            {
+                current = parent;
+                continue;
+            }
+            _ => return false,
+        };
+        let annotation = NodeRef::new(parent.arena, parent.file, annotation);
+        let Some(NodeData::TypeReferenceNode(reference)) =
+            host.node(annotation).map(|record| &record.data)
+        else {
+            return false;
+        };
+        if reference.type_arguments.is_some() {
+            return false;
+        }
+        let name = NodeRef::new(annotation.arena, annotation.file, reference.type_name);
+        return matches!(
+            host.node(name).map(|record| &record.data),
+            Some(NodeData::Identifier(identifier)) if identifier.text == "const"
+        );
+    }
+    false
+}
+
+fn source_template_expression_error(node: NodeRef, error: TemplateTypeError) -> SourceCheckError {
+    match error {
+        TemplateTypeError::BootstrapUninitialized => {
+            SourceCheckError::LiteralCache(SourceLiteralCacheError::BootstrapUninitialized)
+        }
+        TemplateTypeError::InvalidType(type_)
+        | TemplateTypeError::InvalidLiteral(type_)
+        | TemplateTypeError::InvalidTemplate(type_) => {
+            SourceCheckError::LiteralCache(SourceLiteralCacheError::InvalidCachedLiteral(type_))
+        }
+        TemplateTypeError::InvalidUnion(type_) => {
+            SourceCheckError::LiteralCache(SourceLiteralCacheError::InvalidCachedUnion(type_))
+        }
+        TemplateTypeError::UnsupportedUnionConstituent(type_) => SourceCheckError::LiteralCache(
+            SourceLiteralCacheError::UnsupportedUnionConstituent(type_),
+        ),
+        TemplateTypeError::Capacity => {
+            SourceCheckError::LiteralCache(SourceLiteralCacheError::Capacity)
+        }
+        TemplateTypeError::InvalidShape { .. }
+        | TemplateTypeError::InvalidMappingSymbol(_)
+        | TemplateTypeError::UnsupportedMappingSymbol(_)
+        | TemplateTypeError::CrossProductTooLarge { .. }
+        | TemplateTypeError::RecursiveType(_) => {
+            SourceCheckError::Unsupported(UnsupportedSourceSyntax::Syntax {
+                node,
+                kind: SyntaxKind::TemplateExpression,
+                role: SourceSyntaxRole::VariableInitializer,
+            })
+        }
+    }
+}
+
 fn validate_conditional_scalar_expectation(
     store: &CanonicalTypeMapperStore,
     global_types: &CanonicalGlobalTypes,
@@ -21775,6 +22147,7 @@ fn syntactic_truthiness(
             syntactic_truthiness(host, &conditional.when_false),
         ),
         PlannedExpressionKind::Boolean(_)
+        | PlannedExpressionKind::Template(_)
         | PlannedExpressionKind::Identifier(_)
         | PlannedExpressionKind::TypeImportValueUse(_)
         | PlannedExpressionKind::Property(_)
@@ -21830,6 +22203,7 @@ fn syntactic_nullishness(expression: &PlannedExpression) -> PredicateSemantics {
             syntactic_nullishness(&conditional.when_false),
         ),
         PlannedExpressionKind::String(_)
+        | PlannedExpressionKind::Template(_)
         | PlannedExpressionKind::RegularExpression(_)
         | PlannedExpressionKind::Number { .. }
         | PlannedExpressionKind::BigInt { .. }
@@ -47396,6 +47770,174 @@ mod tests {
 
         assert!(context.diagnostics().is_empty());
         assert!(is_type_checked(&context, file));
+    }
+
+    #[test]
+    fn interpolated_templates_preserve_contextual_patterns_and_replay_warm() {
+        let source = parsed(concat!(
+            "declare const dynamic: string; ",
+            "const label = 'Ada'; ",
+            "const exact: 'hello-Ada-42' = `hello-${label}-${42}`; ",
+            "const pattern: `hello-${string}` = `hello-${dynamic}`; ",
+            "const ordinary = `hello-${dynamic}`; ",
+            "const object: { value: `hello-${string}` } = { ",
+            "value: `hello-${dynamic}` ",
+            "}; ",
+            "const supplementary: '\\u{1F600}x' = `\\u{1F600}${'x'}`; ",
+            "const nested: `outer-${string}` = `outer-${`inner-${dynamic}`}`;",
+        ));
+        let file = FileId::new(98_100);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let exact = resolved_node_type(&context, variable_initializer(&source, file, "exact"));
+        let TypeData::Literal(literal) = context.store().type_payload(exact).unwrap().data() else {
+            panic!("literal substitutions must retain their exact template result")
+        };
+        assert_eq!(
+            literal.value,
+            LiteralValue::String("hello-Ada-42".to_owned()),
+        );
+        let patterned =
+            resolved_node_type(&context, variable_initializer(&source, file, "pattern"));
+        let TypeData::TemplateLiteral(template) =
+            context.store().type_payload(patterned).unwrap().data()
+        else {
+            panic!("a contextual template must retain its canonical pattern")
+        };
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        assert_eq!(template.texts, ["hello-", ""]);
+        assert_eq!(template.types, [string]);
+        assert_eq!(
+            resolved_node_type(&context, variable_initializer(&source, file, "ordinary")),
+            string,
+        );
+        assert_eq!(
+            object_property_type(
+                &context,
+                variable_initializer(&source, file, "object"),
+                "value",
+            ),
+            patterned,
+        );
+        let supplementary = resolved_node_type(
+            &context,
+            variable_initializer(&source, file, "supplementary"),
+        );
+        let TypeData::Literal(supplementary) =
+            context.store().type_payload(supplementary).unwrap().data()
+        else {
+            panic!("template interpolation must preserve a supplementary Unicode code point")
+        };
+        assert_eq!(
+            supplementary.value,
+            LiteralValue::String("\u{1F600}x".to_owned()),
+        );
+        let nested = resolved_node_type(&context, variable_initializer(&source, file, "nested"));
+        let TypeData::TemplateLiteral(nested) =
+            context.store().type_payload(nested).unwrap().data()
+        else {
+            panic!("a contextual outer template must retain its dynamic nested substitution")
+        };
+        assert_eq!(nested.texts, ["outer-", ""]);
+        assert_eq!(nested.types, [string]);
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn interpolated_templates_support_const_assertions_and_constrained_generic_calls() {
+        let source = parsed(concat!(
+            "declare const dynamic: string; ",
+            "declare function accept(value: `item-${string}`): void; ",
+            "declare function capture<Value extends string>(value: Value): Value; ",
+            "const captured = capture(`item-${dynamic}`); ",
+            "const asserted = `item-${dynamic}` as const; ",
+            "const frozen = { value: (`item-${dynamic}`) } as const; ",
+            "accept(`item-${dynamic}`);",
+        ));
+        let file = FileId::new(98_101);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        for name in ["captured", "asserted"] {
+            let type_ = variable_value_type(&context, &source, file, name);
+            let TypeData::TemplateLiteral(template) =
+                context.store().type_payload(type_).unwrap().data()
+            else {
+                panic!("{name} must preserve its canonical interpolated template pattern")
+            };
+            assert_eq!(template.texts, ["item-", ""]);
+            assert_eq!(template.types, [string]);
+        }
+        let frozen = variable_initializer(&source, file, "frozen");
+        let NodeData::AsExpression(assertion) = &source.arena.get(frozen.node).unwrap().data else {
+            panic!("the frozen object must retain its const assertion")
+        };
+        let object = NodeRef::new(frozen.arena, frozen.file, assertion.expression);
+        let frozen_type = object_property_type(&context, object, "value");
+        let TypeData::TemplateLiteral(frozen_template) =
+            context.store().type_payload(frozen_type).unwrap().data()
+        else {
+            panic!("const object properties must retain their interpolated template pattern")
+        };
+        assert_eq!(frozen_template.texts, ["item-", ""]);
+        assert_eq!(frozen_template.types, [string]);
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn interpolated_template_cache_poison_is_rejected_before_source_publication() {
+        let source = parsed(concat!(
+            "declare const dynamic: string; ",
+            "const value: `item-${string}` = `item-${dynamic}`;",
+        ));
+        let file = FileId::new(98_102);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        context.check_source_file(file).unwrap();
+        let template = variable_initializer(&source, file, "value");
+        let original = context.store().type_node_links(template).unwrap().clone();
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        assert!(context.store_mut_for_test().set_type_node_links(
+            template,
+            TypeNodeLinks {
+                resolved_type: Some(number),
+                ..original.clone()
+            },
+        ));
+        mark_source_unchecked(&mut context, file);
+        let poisoned = observable_state(&context, file);
+
+        assert_eq!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Assertion(
+                SourceAssertionError::InvalidExpressionCache {
+                    node: template,
+                    cached: Some(number),
+                    expected: string,
+                },
+            )),
+        );
+        assert_eq!(observable_state(&context, file), poisoned);
+
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_node_links(template, original)
+        );
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]

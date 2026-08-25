@@ -4,9 +4,9 @@
 //! property calls and tagged templates, proven nested call callees, and
 //! immediately invoked anonymous or async callables.
 //! Arguments may contain scalar
-//! values, identifier and property reads, object and array literals, arrow or
-//! anonymous functions, type assertions, nested direct calls, or recursively
-//! proven primitive expressions, optionally parenthesized.
+//! values, interpolated templates, identifier and property reads, object and
+//! array literals, arrow or anonymous functions, type assertions, nested direct
+//! calls, or recursively proven primitive expressions, optionally parenthesized.
 //! The semantic kernel remains in `calls`; this module owns the AST proof,
 //! lazy-return/relation retries, call caches, and source diagnostics.
 
@@ -133,11 +133,11 @@ pub(super) struct CheckedSourceCall {
     pub(super) return_type: TypeId,
 }
 
-/// Returns an authenticated parameter context for an object, array, or arrow.
+/// Returns an authenticated parameter context for an object, array, arrow, or template.
 ///
 /// Array and object arguments can retain a shared indexed context when
-/// overload parameter identities differ. Generic signatures still require
-/// inference before they can provide an exact context.
+/// overload parameter identities differ. A constrained generic string
+/// parameter also provides the context required by interpolated templates.
 pub(super) fn source_call_argument_contextual_type(
     store: &mut CanonicalTypeMapperStore,
     global_types: &CanonicalGlobalTypes,
@@ -154,6 +154,7 @@ pub(super) fn source_call_argument_contextual_type(
         PlannedExpressionKind::Object { .. }
             | PlannedExpressionKind::Array(_)
             | PlannedExpressionKind::Arrow(_)
+            | PlannedExpressionKind::Template(_)
     ) {
         return Ok(None);
     }
@@ -177,6 +178,22 @@ pub(super) fn source_call_argument_contextual_type(
             return Err(SourceCheckError::Call(plan.node));
         };
         if !signature.type_parameters().is_empty() {
+            if projection.call_signatures.len() == 1
+                && matches!(argument.kind, PlannedExpressionKind::Template(_))
+                && let Some(parameter) = callable.parameters.get(parameter_index).copied()
+                && signature.type_parameters().contains(&parameter)
+                && let Some(TypeData::TypeParameter(data)) =
+                    store.type_payload(parameter).map(TypeRecord::data)
+                && data.constraint.is_some_and(|constraint| {
+                    store.type_payload(constraint).is_some_and(|record| {
+                        record.flags().intersects(
+                            TypeFlags::STRING_LIKE | TypeFlags::UNION | TypeFlags::INTERSECTION,
+                        )
+                    })
+                })
+            {
+                return Ok(Some(parameter));
+            }
             return Ok(None);
         }
         let parameter_type = match callable.parameters.get(parameter_index).copied() {
@@ -198,6 +215,9 @@ pub(super) fn source_call_argument_contextual_type(
     };
     if parameter_types.iter().all(|parameter| *parameter == first) {
         return Ok(Some(first));
+    }
+    if matches!(argument.kind, PlannedExpressionKind::Template(_)) {
+        return Ok(None);
     }
 
     let bootstrap = store
@@ -1361,6 +1381,30 @@ fn is_supported_call_argument_syntax(arena: &NodeArena, node: NodeRef) -> bool {
                 ))
         }
         SyntaxKind::ElementAccessExpression => is_context_insensitive_element_syntax(arena, node),
+        SyntaxKind::TemplateExpression => {
+            let NodeData::TemplateExpression(template) = &record.data else {
+                return false;
+            };
+            record.flags.0 == 0
+                && template.facts == 0
+                && !template.template_spans.nodes.is_empty()
+                && template.template_spans.nodes.iter().all(|span| {
+                    let Some(span_record) = arena.get(*span) else {
+                        return false;
+                    };
+                    let NodeData::TemplateSpan(data) = &span_record.data else {
+                        return false;
+                    };
+                    span_record.parent == Some(node.node)
+                        && arena.get(data.expression).is_some_and(|expression| {
+                            expression.parent == Some(*span)
+                                && is_supported_call_argument_syntax(
+                                    arena,
+                                    NodeRef::new(node.arena, node.file, data.expression),
+                                )
+                        })
+                })
+        }
         SyntaxKind::CallExpression => matches!(&record.data, NodeData::CallExpression(_)),
         SyntaxKind::TaggedTemplateExpression => {
             matches!(&record.data, NodeData::TaggedTemplateExpression(_))
@@ -1870,6 +1914,10 @@ fn is_supported_call_argument_plan(expression: &PlannedExpression) -> bool {
         PlannedExpressionKind::Array(elements) => {
             elements.iter().all(is_supported_call_argument_plan)
         }
+        PlannedExpressionKind::Template(template) => template
+            .substitutions
+            .iter()
+            .all(is_supported_call_argument_plan),
         PlannedExpressionKind::Assertion { operand, .. } => {
             is_supported_call_argument_plan(operand)
         }
@@ -1931,6 +1979,7 @@ fn is_context_insensitive_primitive_binary_operand_plan(expression: &PlannedExpr
         }
         PlannedExpressionKind::Null
         | PlannedExpressionKind::GlobalUndefined
+        | PlannedExpressionKind::Template(_)
         | PlannedExpressionKind::RegularExpression(_)
         | PlannedExpressionKind::TypeImportValueUse(_)
         | PlannedExpressionKind::Assertion { .. }

@@ -2184,35 +2184,37 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 TypeNodeUnavailable::InvalidTypeReference(node),
             ));
         }
-        let NodeData::TupleTypeNode(tuple) = &constraint_record.data else {
-            return Err(type_node_unavailable(
-                TypeNodeUnavailable::UnsupportedSyntax {
-                    node: constraint,
-                    kind: constraint_record.kind,
-                },
-            ));
-        };
-        if constraint_record.kind != SyntaxKind::TupleType || tuple.elements.nodes.is_empty() {
-            return Err(type_node_unavailable(
-                TypeNodeUnavailable::UnsupportedSyntax {
-                    node: constraint,
-                    kind: constraint_record.kind,
-                },
-            ));
-        }
-        for element in &tuple.elements.nodes {
-            let element = NodeRef::new(constraint.arena, constraint.file, *element);
-            let record = preflight_node(self.store, self.host, element)?;
-            if matches!(
-                record.kind,
-                SyntaxKind::OptionalType | SyntaxKind::RestType | SyntaxKind::NamedTupleMember
-            ) {
+        if !self.authenticated_template_infer_constraint(node, constraint)? {
+            let NodeData::TupleTypeNode(tuple) = &constraint_record.data else {
                 return Err(type_node_unavailable(
                     TypeNodeUnavailable::UnsupportedSyntax {
-                        node: element,
-                        kind: record.kind,
+                        node: constraint,
+                        kind: constraint_record.kind,
                     },
                 ));
+            };
+            if constraint_record.kind != SyntaxKind::TupleType || tuple.elements.nodes.is_empty() {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::UnsupportedSyntax {
+                        node: constraint,
+                        kind: constraint_record.kind,
+                    },
+                ));
+            }
+            for element in &tuple.elements.nodes {
+                let element = NodeRef::new(constraint.arena, constraint.file, *element);
+                let record = preflight_node(self.store, self.host, element)?;
+                if matches!(
+                    record.kind,
+                    SyntaxKind::OptionalType | SyntaxKind::RestType | SyntaxKind::NamedTupleMember
+                ) {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::UnsupportedSyntax {
+                            node: element,
+                            kind: record.kind,
+                        },
+                    ));
+                }
             }
         }
         if let Some(parameter) = self
@@ -2227,12 +2229,22 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     TypeNodeUnavailable::InvalidTypeReference(node),
                 ));
             };
+            let cached_constraint = self
+                .store
+                .type_node_links(constraint)
+                .and_then(|links| links.resolved_type)
+                .or_else(|| {
+                    let bootstrap = self.store.intrinsic_bootstrap()?;
+                    match constraint_record.kind {
+                        SyntaxKind::StringKeyword => Some(bootstrap.string_type),
+                        SyntaxKind::NumberKeyword => Some(bootstrap.number_type),
+                        SyntaxKind::BigIntKeyword => Some(bootstrap.bigint_type),
+                        SyntaxKind::BooleanKeyword => Some(bootstrap.boolean_type),
+                        _ => None,
+                    }
+                });
             if let Some(existing) = data.constraint
-                && self
-                    .store
-                    .type_node_links(constraint)
-                    .and_then(|links| links.resolved_type)
-                    != Some(existing)
+                && cached_constraint != Some(existing)
             {
                 return Err(type_node_unavailable(
                     TypeNodeUnavailable::InvalidTypeReference(node),
@@ -2248,6 +2260,78 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             ));
         }
         Ok(())
+    }
+
+    /// Admits primitive `infer` bounds only inside an authenticated template type span.
+    fn authenticated_template_infer_constraint(
+        &self,
+        infer: NodeRef,
+        constraint: NodeRef,
+    ) -> Result<bool, DeclaredTypeError> {
+        let infer_record = preflight_node(self.store, self.host, infer)?;
+        let Some(span) = infer_record
+            .parent
+            .map(|parent| NodeRef::new(infer.arena, infer.file, parent))
+        else {
+            return Ok(false);
+        };
+        let span_record = preflight_node(self.store, self.host, span)?;
+        let NodeData::TemplateLiteralTypeSpan(span_data) = &span_record.data else {
+            return Ok(false);
+        };
+        let Some(template) = span_record
+            .parent
+            .map(|parent| NodeRef::new(span.arena, span.file, parent))
+        else {
+            return Ok(false);
+        };
+        let template_record = preflight_node(self.store, self.host, template)?;
+        let NodeData::TemplateLiteralTypeNode(template_data) = &template_record.data else {
+            return Ok(false);
+        };
+        if infer_record.kind != SyntaxKind::InferType
+            || span_record.kind != SyntaxKind::TemplateLiteralTypeSpan
+            || span_data.type_ != infer.node
+            || template_record.kind != SyntaxKind::TemplateLiteralType
+            || !template_data.template_spans.nodes.contains(&span.node)
+        {
+            return Ok(false);
+        }
+
+        let record = preflight_node(self.store, self.host, constraint)?;
+        let valid_keyword = |kind| {
+            matches!(
+                kind,
+                SyntaxKind::StringKeyword
+                    | SyntaxKind::NumberKeyword
+                    | SyntaxKind::BigIntKeyword
+                    | SyntaxKind::BooleanKeyword
+            )
+        };
+        if valid_keyword(record.kind) {
+            return Ok(matches!(record.data, NodeData::KeywordTypeNode(_)));
+        }
+        let NodeData::UnionTypeNode(union) = &record.data else {
+            return Ok(false);
+        };
+        if record.kind != SyntaxKind::UnionType
+            || union.types.nodes.len() < 2
+            || union.types.has_trailing_comma
+            || union.types.range != record.range
+        {
+            return Ok(false);
+        }
+        for constituent in &union.types.nodes {
+            let constituent = NodeRef::new(constraint.arena, constraint.file, *constituent);
+            let record = preflight_node(self.store, self.host, constituent)?;
+            if record.parent != Some(constraint.node)
+                || !valid_keyword(record.kind)
+                || !matches!(record.data, NodeData::KeywordTypeNode(_))
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     fn plan_template_literal_type(&mut self, node: NodeRef) -> Result<(), DeclaredTypeError> {
@@ -26349,6 +26433,106 @@ mod tests {
             ),
             warm,
         );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn template_inferred_parameters_publish_primitive_constraints_and_replay_warm() {
+        for bound in ["string", "number", "bigint", "boolean", "string | number"] {
+            let source = format!(
+                "type Capture<Input> = Input extends `${{infer Value extends {bound}}}` \
+                 ? Value : never;"
+            );
+            let mut fixture = fixture(&source);
+            let (infer, _, symbol) = constrained_inferred_parameter_nodes(&fixture, "Value");
+            let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+            let inferred = query_node(&mut fixture, infer, &mut diagnostics).unwrap();
+            assert_eq!(
+                cached_ordinary_type_parameter_owner(&fixture.store, inferred),
+                Some(symbol),
+            );
+            let TypeData::TypeParameter(parameter) =
+                fixture.store.type_payload(inferred).unwrap().data()
+            else {
+                panic!("{bound} must retain its inferred template type parameter")
+            };
+            let constraint = parameter
+                .constraint
+                .unwrap_or_else(|| panic!("{bound} must retain its exact inferred constraint"));
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            match bound {
+                "string" => assert_eq!(constraint, bootstrap.string_type),
+                "number" => assert_eq!(constraint, bootstrap.number_type),
+                "bigint" => assert_eq!(constraint, bootstrap.bigint_type),
+                "boolean" => assert_eq!(constraint, bootstrap.boolean_type),
+                "string | number" => assert_eq!(
+                    union_types(&fixture.store, constraint),
+                    [bootstrap.string_type, bootstrap.number_type],
+                ),
+                _ => unreachable!("the template constraint matrix is closed"),
+            }
+
+            let warm = store_state(&fixture.store);
+            assert_eq!(
+                query_node(&mut fixture, infer, &mut diagnostics),
+                Ok(inferred),
+            );
+            assert_eq!(store_state(&fixture.store), warm);
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn constrained_template_aliases_infer_numeric_values_and_complete_unicode_code_points() {
+        let mut fixture = fixture(concat!(
+            "type ParseNumber<Input> = ",
+            "Input extends `${infer Value extends number}` ? Value : never; ",
+            "type NumberResult = ParseNumber<'42'>; ",
+            "type ParseBoolean<Input> = ",
+            "Input extends `${infer Value extends boolean}` ? Value : never; ",
+            "type BooleanResult = ParseBoolean<'true'>; ",
+            "type ParseHead<Input> = ",
+            "Input extends `${infer Head}${infer Rest}` ? Head : never; ",
+            "type UnicodeResult = ParseHead<'\\u{1F600}tail'>;",
+        ));
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        for (name, expected) in [
+            ("NumberResult", LiteralValue::Number(Number::new(42.0))),
+            ("BooleanResult", LiteralValue::Boolean(true)),
+            (
+                "UnicodeResult",
+                LiteralValue::String("\u{1F600}".to_owned()),
+            ),
+        ] {
+            let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, name);
+            let resolved = query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap();
+            let TypeData::Literal(literal) = fixture.store.type_payload(resolved).unwrap().data()
+            else {
+                panic!("{name} must retain its inferred literal identity")
+            };
+            assert_eq!(literal.value, expected, "alias: {name}");
+        }
+
+        let warm = store_state(&fixture.store);
+        for name in ["NumberResult", "BooleanResult", "UnicodeResult"] {
+            let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, name);
+            query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap();
+        }
+        assert_eq!(store_state(&fixture.store), warm);
         assert!(diagnostics.is_empty());
     }
 

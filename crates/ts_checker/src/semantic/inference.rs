@@ -5,8 +5,9 @@
 //! upstream records the source type itself as a covariant candidate. The
 //! bounded Rust branch accepts primitive, literal, unique-symbol, anonymous
 //! primitive-union, and exact resolved nongeneric declared-property-object
-//! candidates, authenticated fixed tuples, and canonical Array/ReadonlyArray
-//! references when the caller retains the authoritative global targets.
+//! candidates, authenticated template-literal patterns, fixed tuples, and
+//! canonical Array/ReadonlyArray references when the caller retains the
+//! authoritative global targets.
 //! Declared objects and tuples are admitted only as root candidates or nested
 //! array/tuple elements, not as union constituents. The branch preserves
 //! candidates that do not require widening, including fresh literals.
@@ -507,6 +508,23 @@ fn validate_inference_candidate(
     {
         return Err(NakedTypeInferenceError::RequiresWidening(candidate));
     }
+    if let TypeData::TemplateLiteral(template) = record.data() {
+        if record.flags() != TypeFlags::TEMPLATE_LITERAL
+            || record.object_flags() != ObjectFlags::NONE
+            || record.symbol().is_some()
+            || record.alias().is_some()
+            || template.types.is_empty()
+            || template.texts.len() != template.types.len() + 1
+            || store
+                .cached_resolved_template_literal_type(&template.texts, &template.types)
+                .ok()
+                .flatten()
+                != Some(candidate)
+        {
+            return Err(NakedTypeInferenceError::InvalidCandidate(candidate));
+        }
+        return Ok(());
+    }
     if let Some(array_targets) = array_targets {
         match store.canonical_array_reference_with_targets(array_targets, candidate) {
             Ok(Some(reference)) => {
@@ -747,6 +765,30 @@ mod tests {
 
         assert_eq!(infer_naked_type_parameter(&store, fresh), Ok(fresh));
         assert_ne!(fresh, regular);
+    }
+
+    #[test]
+    fn naked_inference_accepts_canonical_templates_and_rejects_duplicate_patterns() {
+        let mut store = initialized_store();
+        let string = store.intrinsic_bootstrap().unwrap().string_type;
+        let texts = ["prefix-".to_owned(), String::new()];
+        let template = store.get_template_literal_type(&texts, &[string]).unwrap();
+        let warm = (store.type_len(), store.mapper_len(), store.signature_len());
+
+        assert_eq!(infer_naked_type_parameter(&store, template), Ok(template));
+        assert_eq!(infer_preserved(&mut store, &[template]), Ok(Some(template)));
+        assert_eq!(
+            (store.type_len(), store.mapper_len(), store.signature_len(),),
+            warm,
+        );
+
+        let duplicate = store
+            .alloc_template_literal_type(texts.to_vec(), vec![string])
+            .unwrap();
+        assert_eq!(
+            infer_naked_type_parameter(&store, duplicate),
+            Err(NakedTypeInferenceError::InvalidCandidate(duplicate)),
+        );
     }
 
     #[test]
