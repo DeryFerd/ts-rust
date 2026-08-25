@@ -16724,8 +16724,8 @@ mod tests {
         let valid = fixture("class C { foo(): void; foo(): void {} }");
         let owner = class_symbol(&valid, "C");
         let bound = &valid.files[&valid.file];
-        let host = host(&valid.parsed.arena, bound);
-        assert!(plan_class_grammar_diagnostics(&valid.store, &host, owner).is_none());
+        let valid_host = host(&valid.parsed.arena, bound);
+        assert!(plan_class_grammar_diagnostics(&valid.store, &valid_host, owner).is_none());
 
         let mut invalid = fixture("class C { foo(): string; foo(x): number; bar(x): any {} }");
         let owner = class_symbol(&invalid, "C");
