@@ -12124,7 +12124,11 @@ fn validate_spread_donor(
             SpreadDonorValidation::Valid,
         );
     }
-    match store.validate_derived_object_literal_for_relation(type_) {
+    let derived = global_types.map_or_else(
+        || store.validate_derived_object_literal_for_relation(type_),
+        |global_types| store.validate_derived_object_literal_with_global_types(type_, global_types),
+    );
+    match derived {
         super::derived_types::DerivedObjectLiteralValidation::Valid { .. } => {
             return projected_spread_donor_properties(store, type_).map_or(
                 SpreadDonorValidation::Malformed,
