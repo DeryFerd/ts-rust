@@ -3674,7 +3674,10 @@ fn validate_object_literal_contract(
             return Err(TypeDisplayUnavailable::MalformedType(type_id));
         };
         if clone_record.value_declaration() != Some(*declaration)
-            || store.source_node_kind(*declaration) != Some(SyntaxKind::PropertyAssignment)
+            || !matches!(
+                store.source_node_kind(*declaration),
+                Some(SyntaxKind::PropertyAssignment | SyntaxKind::ShorthandPropertyAssignment)
+            )
             || result_table.get(clone_record.name()) != Some(*clone)
             || raw_table.and_then(|table| table.get(raw_record.name())) != Some(raw)
             || readonly
