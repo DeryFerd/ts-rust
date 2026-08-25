@@ -7823,8 +7823,8 @@ fn canonical_ambient_module_statements(
             source_ref,
         ));
     }
-    if !inside_ambient_module
-        && !(name.kind == SyntaxKind::StringLiteral
+    if !(inside_ambient_module
+        || name.kind == SyntaxKind::StringLiteral
             && matches!(name.data, NodeData::StringLiteral(_)))
     {
         return Ok(true);
