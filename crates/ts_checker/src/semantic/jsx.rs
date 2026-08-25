@@ -4480,18 +4480,29 @@ fn resolve_intrinsic_tag(
         ))?
         .string_type;
     let mut patterned_index = None;
+    let mut overlapping_patterns = false;
     let mut string_index = None;
-    for index in indexes {
+    for &index in &indexes {
         let info = store
             .index_info(index)
             .ok_or(SourceCheckError::Property(opening))?;
         if info.key_type() == string_type {
             string_index.get_or_insert(index);
-        } else if template_pattern_index_matches_name(store, info.key_type(), &tag.name)
-            && patterned_index.replace(index).is_some()
-        {
-            return Err(unsupported(opening, SyntaxKind::IndexSignature));
+        } else if template_pattern_index_matches_name(store, info.key_type(), &tag.name) {
+            overlapping_patterns |= patterned_index.replace(index).is_some();
         }
+    }
+
+    if overlapping_patterns {
+        return resolve_overlapping_intrinsic_indexes(
+            store,
+            bound,
+            opening,
+            tag,
+            owner,
+            &indexes,
+            string_type,
+        );
     }
 
     if let Some(index) = patterned_index.or(string_index) {
@@ -4579,6 +4590,133 @@ fn resolve_intrinsic_tag(
         symbol: namespace.unknown_symbol,
         attributes_type: namespace.error_type,
         flags: JsxFlags::NONE,
+    })
+}
+
+/// Combines matching template indexes without changing their individual cache entries.
+#[allow(clippy::too_many_lines)] // Matching values and every contributing declaration share one proof.
+fn resolve_overlapping_intrinsic_indexes(
+    store: &mut CanonicalTypeMapperStore,
+    bound: &BoundFile,
+    opening: NodeRef,
+    tag: &JsxTagPlan,
+    owner: Option<SemanticSymbolId>,
+    indexes: &[super::IndexInfoId],
+    string_type: TypeId,
+) -> Result<JsxIntrinsicResolution, SourceCheckError> {
+    if indexes.len() < 2 {
+        return Err(SourceCheckError::Property(opening));
+    }
+    if let Some(symbol) = store
+        .symbol_node_links(tag.node)
+        .and_then(|links| links.resolved_symbol)
+        && store
+            .symbol(symbol)
+            .is_none_or(|record| record.check_flags() != CheckFlags::INDEX_SYMBOL)
+    {
+        return Err(unsupported(opening, SyntaxKind::IndexSignature));
+    }
+
+    let mut declarations = Vec::with_capacity(indexes.len());
+    let mut value_types = Vec::with_capacity(indexes.len());
+    for index in indexes {
+        let info = store
+            .index_info(*index)
+            .ok_or(SourceCheckError::Property(opening))?;
+        let patterned = info.key_type() != string_type
+            && template_pattern_index_matches_name(store, info.key_type(), &tag.name);
+        if info.key_type() != string_type && !patterned {
+            continue;
+        }
+        let declaration = info
+            .declaration()
+            .ok_or_else(|| unsupported(opening, SyntaxKind::IndexSignature))?;
+        if !bound.contains(declaration)
+            && !authenticated_foreign_intrinsic_index_declaration(store, owner, declaration)
+            || declarations.contains(&declaration)
+        {
+            return Err(SourceCheckError::Property(opening));
+        }
+        if let Some(symbol) = info.index_symbol() {
+            validate_index_symbol(
+                store,
+                symbol,
+                owner,
+                Some(declaration),
+                info.value_type(),
+                opening,
+            )?;
+        }
+        declarations.push(declaration);
+        if patterned {
+            value_types.push(info.value_type());
+        }
+    }
+    if value_types.len() < 2 {
+        return Err(SourceCheckError::Property(opening));
+    }
+
+    let attributes_type = store
+        .canonical_intersection_type(&value_types, None)
+        .map_err(|_| unsupported(opening, SyntaxKind::IndexSignature))?;
+    let declaration = declarations[0];
+    if let Some(symbol) = store
+        .symbol_node_links(opening)
+        .and_then(|links| links.resolved_symbol)
+    {
+        validate_index_symbol(
+            store,
+            symbol,
+            owner,
+            Some(declaration),
+            attributes_type,
+            opening,
+        )?;
+        if store
+            .symbol(symbol)
+            .and_then(ts_binder::semantic::Symbol::declarations)
+            != Some(declarations.as_slice())
+        {
+            return Err(SourceCheckError::Property(opening));
+        }
+        return Ok(JsxIntrinsicResolution {
+            symbol,
+            attributes_type,
+            flags: JsxFlags::INTRINSIC_INDEXED_ELEMENT,
+        });
+    }
+
+    if !store.try_reserve_checker_symbol_allocations(1, 0)
+        || !store.try_reserve_value_symbol_links(1)
+    {
+        return Err(SourceCheckError::Property(opening));
+    }
+    let symbol = store
+        .alloc_symbol(SymbolData {
+            flags: SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT,
+            check_flags: CheckFlags::INDEX_SYMBOL,
+            name: EscapedName::internal(InternalSymbolName::Index),
+            declarations: Some(declarations),
+            value_declaration: Some(declaration),
+            members: None,
+            exports: None,
+            parent: owner,
+            export_symbol: None,
+        })
+        .ok_or(SourceCheckError::Property(opening))?;
+    if !store.set_value_symbol_links(
+        symbol,
+        ValueSymbolLinks {
+            resolved_type: Some(attributes_type),
+            ..ValueSymbolLinks::default()
+        },
+    ) {
+        return Err(SourceCheckError::Property(opening));
+    }
+    Ok(JsxIntrinsicResolution {
+        symbol,
+        attributes_type,
+        flags: JsxFlags::INTRINSIC_INDEXED_ELEMENT,
     })
 }
 
@@ -10953,6 +11091,202 @@ mod runtime_tests {
                 diagnostics.as_slice().to_vec(),
             ),
             warm,
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep intersected props, index provenance, and warm caches together.
+    fn overlapping_intrinsic_indexes_intersect_attributes_and_replay_warm() {
+        let mut fixture = RuntimeFixture::new(
+            concat!(
+                "declare namespace JSX {\n",
+                "  interface Element {}\n",
+                "  interface IntrinsicElements {\n",
+                "    [tag: string]: any;\n",
+                "    [tag: `custom-${string}`]: { label: string };\n",
+                "    [tag: `${string}-panel`]: { count: number };\n",
+                "  }\n",
+                "}\n",
+                "const valid = <custom-panel label='ready' count={1} />;\n",
+                "const invalid = <custom-panel label='ready' count='wrong' />;\n",
+                "const missing = <custom-panel label='ready' />;\n",
+                "const prefix = <custom-widget label='ready' />;\n",
+                "const suffix = <plain-panel count={1} />;\n",
+                "const fallback = <plain optional={1} />;\n",
+            ),
+            FileId::new(8_205),
+        );
+        let namespace = fixture
+            .bound
+            .locals(fixture.bound.source_file())
+            .and_then(|locals| fixture.store.symbol_table(locals))
+            .and_then(|locals| locals.get_source("JSX"))
+            .unwrap();
+        let globals = fixture.store.intrinsic_bootstrap().unwrap().globals;
+        assert_eq!(
+            fixture
+                .store
+                .insert_symbol(globals, EscapedName::source("JSX"), namespace),
+            Some(None),
+        );
+        let valid = fixture.expression("valid");
+        let invalid = fixture.expression("invalid");
+        let missing = fixture.expression("missing");
+        let prefix = fixture.expression("prefix");
+        let suffix = fixture.expression("suffix");
+        let fallback = fixture.expression("fallback");
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        for expression in [valid, invalid, missing, prefix, suffix, fallback] {
+            fixture.check(expression, CanonicalJsxRuntime::Preserve, &mut diagnostics);
+        }
+
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(diagnostics.as_slice()[0].diagnostic.code(), 2322);
+        assert_eq!(
+            diagnostics.as_slice()[0].diagnostic.render().unwrap(),
+            "Type 'string' is not assignable to type 'number'.",
+        );
+        assert_eq!(diagnostics.as_slice()[1].diagnostic.code(), 2741);
+
+        let exports = fixture.store.symbol(namespace).unwrap().exports().unwrap();
+        let intrinsics = fixture
+            .store
+            .symbol_table(exports)
+            .and_then(|exports| exports.get_source("IntrinsicElements"))
+            .unwrap();
+        let intrinsic_type = fixture
+            .store
+            .declared_type_links(intrinsics)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let indexes = fixture
+            .store
+            .type_payload(intrinsic_type)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.index_infos.as_deref())
+            .unwrap();
+        let [fallback_index, prefix_index, suffix_index] = indexes else {
+            panic!("the intrinsic owner must retain its three declared indexes")
+        };
+        let declarations = [*fallback_index, *prefix_index, *suffix_index].map(|index| {
+            fixture
+                .store
+                .index_info(index)
+                .and_then(super::super::signatures::IndexInfo::declaration)
+                .unwrap()
+        });
+        let overlapping = fixture
+            .store
+            .symbol_node_links(valid)
+            .and_then(|links| links.resolved_symbol)
+            .unwrap();
+        let owner = fixture.store.symbol(overlapping).unwrap();
+        assert_eq!(
+            owner.flags(),
+            SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT
+        );
+        assert_eq!(owner.check_flags(), CheckFlags::INDEX_SYMBOL);
+        assert_eq!(owner.declarations(), Some(declarations.as_slice()));
+        assert_eq!(owner.value_declaration(), Some(declarations[0]));
+        assert_eq!(owner.parent(), Some(intrinsics));
+        let attributes = fixture
+            .store
+            .value_symbol_links(overlapping)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let intersection = fixture
+            .store
+            .validate_intersection_type(attributes)
+            .unwrap();
+        assert_eq!(intersection.types.len(), 2);
+        for name in ["label", "count"] {
+            assert!(
+                fixture
+                    .store
+                    .symbol_table(intersection.members)
+                    .and_then(|members| members.get_source(name))
+                    .is_some()
+            );
+        }
+        assert_eq!(
+            fixture
+                .store
+                .jsx_element_links(valid)
+                .and_then(|links| links.resolved_jsx_element_attributes_type),
+            Some(attributes),
+        );
+        for expression in [valid, invalid, missing, prefix, suffix, fallback] {
+            assert_eq!(
+                fixture
+                    .store
+                    .jsx_element_links(expression)
+                    .unwrap()
+                    .jsx_flags,
+                JsxFlags::INTRINSIC_INDEXED_ELEMENT,
+            );
+        }
+        let individual_symbols = [*fallback_index, *prefix_index, *suffix_index].map(|index| {
+            fixture
+                .store
+                .index_info(index)
+                .and_then(super::super::signatures::IndexInfo::index_symbol)
+                .unwrap()
+        });
+        assert!(!individual_symbols.contains(&overlapping));
+
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.symbol_len(),
+            fixture.store.signature_len(),
+            fixture.store.index_info_len(),
+            fixture.store.checker_link_allocated_lengths(),
+            diagnostics.as_slice().to_vec(),
+        );
+        for expression in [valid, invalid, missing, prefix, suffix, fallback] {
+            fixture.check(expression, CanonicalJsxRuntime::Preserve, &mut diagnostics);
+        }
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.signature_len(),
+                fixture.store.index_info_len(),
+                fixture.store.checker_link_allocated_lengths(),
+                diagnostics.as_slice().to_vec(),
+            ),
+            warm,
+        );
+
+        assert!(fixture.store.set_symbol_declarations(
+            overlapping,
+            Some(vec![declarations[0]]),
+            Some(declarations[0]),
+        ));
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.symbol_len(),
+            fixture.store.index_info_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        let host = DeclaredTypeHost::new([(&fixture.parsed.arena, &fixture.bound)]).unwrap();
+        assert!(matches!(
+            fixture.store.check_jsx_element(
+                &host,
+                valid,
+                CanonicalCheckerOptions::default(),
+                &mut diagnostics,
+            ),
+            Err(SourceCheckError::Property(node)) if node == valid
+        ));
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.index_info_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            before,
         );
     }
 
