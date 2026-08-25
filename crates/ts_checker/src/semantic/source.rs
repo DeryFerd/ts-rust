@@ -39849,7 +39849,7 @@ fn recover_unclosed_jsx_source(
         || facts.is_javascript_file()
         || facts.is_external_or_common_js_module()
         || !bound.diagnostics().is_empty()
-        || options.jsx_runtime != super::CanonicalJsxRuntime::Classic
+        || options.jsx_runtime != super::production::CanonicalJsxRuntime::Classic
         || options.no_unused_locals
         || options.no_unused_parameters
         || source_text.len() > 65_536
