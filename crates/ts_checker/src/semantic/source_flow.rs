@@ -1160,11 +1160,11 @@ impl SourceFlowFrame<'_, '_> {
                         let value = store
                             .type_node_links(condition.value)
                             .and_then(|links| links.resolved_type)
-                            .ok_or_else(|| {
-                                SourceFlowError::Invariant(SourceFlowInvariant::EqualityNarrowing(
+                            .ok_or(SourceFlowError::Invariant(
+                                SourceFlowInvariant::EqualityNarrowing(
                                     SourceEqualityNarrowingError::MissingValue(condition.value),
-                                ))
-                            })?;
+                                ),
+                            ))?;
                         let discriminant = condition
                             .discriminant
                             .map(|access| {
