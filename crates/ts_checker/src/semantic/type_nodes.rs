@@ -38155,6 +38155,126 @@ mod tests {
     }
 
     #[test]
+    fn function_type_any_array_rest_generic_arguments_preserve_global_identity_and_cache_proof() {
+        let mut fixture = global_array_fixture(concat!(
+            "interface Requireable<Value> { value: Value; } ",
+            "declare const func: Requireable<(...args: any[]) => any>;",
+        ));
+        let global_types = initialize_fixture_global_types(&mut fixture);
+        let annotation = variable_type_node(&fixture, "func");
+        let function = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionType).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .expect("the generic argument must retain its function type");
+        let parameters = function_parameter_nodes(&fixture, function);
+        let [parameter] = parameters.as_slice() else {
+            panic!("the function type must retain its one array rest parameter")
+        };
+        let parameter = *parameter;
+        let parameter_symbol = node_symbol(&fixture, parameter);
+        let array_annotation = parameter_type_node(&fixture, parameter);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let cold = function_store_state(&fixture.store);
+
+        assert!(matches!(
+            query_node(&mut fixture, function, &mut diagnostics),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::UnsupportedSyntax {
+                    node,
+                    kind: SyntaxKind::FunctionType,
+                }
+            )) if node == parameter
+        ));
+        assert_eq!(function_store_state(&fixture.store), cold);
+
+        let resolved =
+            query_global_node(&mut fixture, &global_types, annotation, &mut diagnostics).unwrap();
+        let function_type = fixture
+            .store
+            .type_node_links(function)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let signature = function_signature(&fixture.store, function);
+        let signature_record = fixture.store.signature(signature).unwrap();
+        assert_eq!(signature_record.flags(), SignatureFlags::HAS_REST_PARAMETER);
+        assert_eq!(signature_record.min_argument_count(), 0);
+        assert_eq!(signature_record.parameters(), [parameter_symbol]);
+        assert_eq!(
+            fixture.store.callable_signature_parameter_types(signature),
+            Some([global_types.any_array_type].as_slice()),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .value_symbol_links(parameter_symbol)
+                .and_then(|links| links.resolved_type),
+            Some(global_types.any_array_type),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .type_node_links(array_annotation)
+                .and_then(|links| links.resolved_type),
+            Some(global_types.any_array_type),
+        );
+        assert!(matches!(
+            functions::validate_stored_function_type(&fixture.store, function_type),
+            functions::StoredFunctionTypeValidation::Valid(_)
+        ));
+        let warm = function_store_state(&fixture.store);
+        assert_eq!(
+            query_global_node(&mut fixture, &global_types, annotation, &mut diagnostics),
+            Ok(resolved),
+        );
+        assert_eq!(function_store_state(&fixture.store), warm);
+
+        let correct_links = fixture
+            .store
+            .value_symbol_links(parameter_symbol)
+            .unwrap()
+            .clone();
+        let forged = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        assert!(fixture.store.set_value_symbol_links(
+            parameter_symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(forged),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        assert_eq!(
+            functions::validate_stored_function_type(&fixture.store, function_type),
+            functions::StoredFunctionTypeValidation::Malformed,
+        );
+        let corrupted = function_store_state(&fixture.store);
+        assert!(matches!(
+            query_global_node(&mut fixture, &global_types, function, &mut diagnostics),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::InvalidCachedUnionType(_)
+                    | TypeNodeUnavailable::InvalidFunctionType(_)
+            ))
+        ));
+        assert_eq!(function_store_state(&fixture.store), corrupted);
+        assert!(
+            fixture
+                .store
+                .set_value_symbol_links(parameter_symbol, correct_links)
+        );
+        assert_eq!(
+            query_global_node(&mut fixture, &global_types, function, &mut diagnostics),
+            Ok(function_type),
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
     fn function_type_unsupported_phase_one_matrix_is_atomic() {
         let assert_unsupported = |mut fixture: Fixture| {
             let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Fn");

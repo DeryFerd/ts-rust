@@ -1,8 +1,8 @@
 //! Exact function-type signatures for the dependency-closed type-node cut.
 //!
-//! This module owns nongeneric function types, implicit `any[]` rest parameters,
-//! authenticated identifier and assertion predicates, and generic function
-//! types with outer lexical constraints.
+//! This module owns nongeneric function types, authenticated explicit and
+//! implicit `any[]` rest parameters, identifier and assertion predicates, and
+//! generic function types with outer lexical constraints.
 //! The type-node planner/executor only supplies recursive annotation callbacks;
 //! binder proof, cache validation, shell publication, signatures, parameter
 //! value types, and lazy return-type validation stay here.
@@ -485,8 +485,18 @@ pub(super) fn plan_function_type(
         } else {
             false
         };
+        let explicit_any_rest = data.dot_dot_dot_token.is_some()
+            && !implicit_any_rest
+            && plan_explicit_any_array_rest_parameter(
+                store,
+                host,
+                node,
+                parameter,
+                type_node,
+                array_targets,
+            )?;
         let rest_tuple_element = match data.dot_dot_dot_token {
-            Some(token) if implicit_any_rest => {
+            Some(token) if implicit_any_rest || explicit_any_rest => {
                 let token = NodeRef::new(node.arena, node.file, token);
                 let token_record = preflight_node(store, host, token)?;
                 if token_record.kind != SyntaxKind::DotDotDotToken
@@ -626,7 +636,7 @@ pub(super) fn plan_function_type(
             rest_tuple_element,
             implicit_any_rest,
         });
-        if !optional && !implicit_any_rest {
+        if !optional && !implicit_any_rest && !explicit_any_rest {
             min_argument_count = parameters.len();
         }
     }
@@ -713,6 +723,79 @@ pub(super) fn plan_function_type(
     };
     function_type_state(store, &plan, true)?;
     Ok(plan)
+}
+
+fn plan_explicit_any_array_rest_parameter(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    function: NodeRef,
+    parameter: NodeRef,
+    annotation: NodeRef,
+    array_targets: Option<CanonicalArrayTargets>,
+) -> Result<bool, FunctionTypeError> {
+    let record = preflight_node(store, host, annotation)?;
+    let NodeData::ArrayTypeNode(array) = &record.data else {
+        return Ok(false);
+    };
+    let element = NodeRef::new(annotation.arena, annotation.file, array.element_type);
+    let element_record = preflight_node(store, host, element)?;
+    if element_record.kind != SyntaxKind::AnyKeyword {
+        return Ok(false);
+    }
+    if record.kind != SyntaxKind::ArrayType
+        || record.flags.0 != 0
+        || record.parent != Some(parameter.node)
+        || element_record.flags.0 != 0
+        || element_record.parent != Some(annotation.node)
+        || element_record.range.start != record.range.start
+        || element_record.range.end > record.range.end
+    {
+        return Err(invariant(FunctionTypeInvariant::InvalidParameter(
+            parameter,
+        )));
+    }
+    let function_record = preflight_node(store, host, function)?;
+    let NodeData::FunctionTypeNode(function_data) = &function_record.data else {
+        return Err(invariant(FunctionTypeInvariant::InvalidSyntax(function)));
+    };
+    let parameter_record = preflight_node(store, host, parameter)?;
+    let NodeData::ParameterDeclaration(parameter_data) = &parameter_record.data else {
+        return Err(invariant(FunctionTypeInvariant::InvalidParameter(
+            parameter,
+        )));
+    };
+    if function_data.parameters.nodes.last() != Some(&parameter.node)
+        || parameter_data.question_token.is_some()
+    {
+        return Err(FunctionTypeError::Unsupported(
+            FunctionTypeUnsupported::RestParameter(parameter),
+        ));
+    }
+    let Some(array_targets) = array_targets else {
+        return Err(FunctionTypeError::Unsupported(
+            FunctionTypeUnsupported::RestParameter(parameter),
+        ));
+    };
+    let any = store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| bootstrap.any_type)
+        .ok_or_else(|| invariant(FunctionTypeInvariant::InvalidParameterCache(parameter)))?;
+    let any_array = implicit_any_array_type(store)
+        .ok_or_else(|| invariant(FunctionTypeInvariant::InvalidParameterCache(parameter)))?;
+    let canonical = store
+        .canonical_array_reference_with_targets(array_targets, any_array)
+        .map_err(|_| invariant(FunctionTypeInvariant::InvalidParameterCache(parameter)))?
+        .ok_or_else(|| invariant(FunctionTypeInvariant::InvalidParameterCache(parameter)))?;
+    if canonical.readonly
+        || canonical.array_literal
+        || canonical.base_type != any_array
+        || canonical.element_type != any
+    {
+        return Err(invariant(FunctionTypeInvariant::InvalidParameterCache(
+            parameter,
+        )));
+    }
+    Ok(true)
 }
 
 fn plan_rest_tuple_parameter(
