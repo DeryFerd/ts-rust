@@ -30,6 +30,7 @@
 //! A derived constructor may retain one public, interface-typed parameter
 //! property and forward one primitive interface property to its base.
 //! Numeric instance and static fields can retain a direct numeric initializer.
+//! Private fields, empty methods, and paired accessors retain their class brand.
 //! One authenticated class/interface merge can retain a string auto-accessor
 //! and its shared binder-owned property symbol in either declaration order.
 //! An instance field may also reference its own constructor parameter and
@@ -2442,6 +2443,41 @@ fn plan_ambient_class_method_parameter(
     })
 }
 
+/// Returns a private member's visible spelling only for its exact class owner.
+pub(super) fn authenticated_private_class_symbol_name(
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+    symbol: SemanticSymbolId,
+) -> Option<&str> {
+    let record = store.symbol(symbol)?;
+    let expected_owner = store.symbol_store().assigned_global_symbol_id(owner)?;
+    let encoded = std::str::from_utf8(record.name().as_bytes().strip_prefix(b"\xFE#")?).ok()?;
+    let (encoded_owner, private_name) = encoded.split_once('@')?;
+    (record.name().is_private_identifier()
+        && !encoded_owner.starts_with('0')
+        && encoded_owner.parse::<u64>().ok()? == expected_owner
+        && private_name.starts_with('#')
+        && private_name.len() > 1)
+        .then_some(private_name)
+}
+
+fn class_member_symbol_name_matches(
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+    symbol: SemanticSymbolId,
+    name: &str,
+    private: bool,
+) -> bool {
+    if private {
+        authenticated_private_class_symbol_name(store, owner, symbol) == Some(name)
+    } else {
+        store
+            .symbol(symbol)
+            .and_then(|record| record.name().as_utf8())
+            == Some(name)
+    }
+}
+
 fn plan_method(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -2519,16 +2555,27 @@ fn plan_method(
     };
     let name_node = NodeRef::new(declaration.arena, declaration.file, method.name);
     let name_record = preflight_node(store, host, name_node)?;
-    let NodeData::Identifier(identifier) = &name_record.data else {
-        return Err(unsupported(ClassUnsupported::PropertyName {
-            node: name_node,
-            kind: name_record.kind,
-        }));
+    let (method_name, private) = match &name_record.data {
+        NodeData::Identifier(identifier) => (identifier.text.as_str(), false),
+        NodeData::PrivateIdentifier(identifier) => (identifier.text.as_str(), true),
+        _ => {
+            return Err(unsupported(ClassUnsupported::PropertyName {
+                node: name_node,
+                kind: name_record.kind,
+            }));
+        }
     };
-    if name_record.kind != SyntaxKind::Identifier
+    let expected_name_kind = if private {
+        SyntaxKind::PrivateIdentifier
+    } else {
+        SyntaxKind::Identifier
+    };
+    if name_record.kind != expected_name_kind
         || name_record.parent != Some(declaration.node)
         || name_record.range.start < record.range.start
         || name_record.range.end > method.parameters.range.start
+        || private
+            && (name_record.flags.0 != 0 || !method_name.starts_with('#') || method_name.len() <= 1)
     {
         return Err(invariant(ClassInvariant::InvalidName(name_node)));
     }
@@ -2541,9 +2588,17 @@ fn plan_method(
         None,
     )?;
     if readonly
+        || private
+            && (ambient
+                || side == ClassPropertySide::Instance && method.modifiers.is_some()
+                || side == ClassPropertySide::Static
+                    && method
+                        .modifiers
+                        .as_ref()
+                        .is_none_or(|modifiers| modifiers.list.nodes.len() != 1))
         || side == ClassPropertySide::Static
             && matches!(
-                identifier.text.as_str(),
+                method_name,
                 "prototype" | "name" | "length" | "caller" | "arguments"
             )
     {
@@ -2653,7 +2708,7 @@ fn plan_method(
     .and_then(|table| store.symbol_table(table));
     if symbol_record.flags() != SymbolFlags::METHOD
         || symbol_record.check_flags() != CheckFlags::NONE
-        || symbol_record.name().as_utf8() != Some(identifier.text.as_str())
+        || !class_member_symbol_name_matches(store, owner, symbol, method_name, private)
         || symbol_record.declarations() != Some(&[declaration])
         || symbol_record.value_declaration() != Some(declaration)
         || symbol_record.members().is_some()
@@ -2661,7 +2716,7 @@ fn plan_method(
         || symbol_record.parent() != Some(owner)
         || symbol_record.export_symbol().is_some()
         || store.get_merged_symbol(symbol) != Some(symbol)
-        || table.and_then(|table| table.get_source(&identifier.text)) != Some(symbol)
+        || table.and_then(|table| table.get(symbol_record.name())) != Some(symbol)
     {
         return Err(invariant(ClassInvariant::InvalidPropertySymbol(
             declaration,
@@ -2672,7 +2727,7 @@ fn plan_method(
         declaration,
         symbol,
         name_node,
-        name: identifier.text.clone(),
+        name: method_name.to_owned(),
         side,
         ambient,
         return_type_node,
@@ -2708,6 +2763,29 @@ fn accessor_name(
         return Err(invariant(ClassInvariant::InvalidName(name)));
     }
     Ok((name, identifier.text.clone()))
+}
+
+fn class_accessor_name(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    name: ts_ast::NodeId,
+) -> Result<(NodeRef, String, bool), ClassError> {
+    let name_ref = NodeRef::new(declaration.arena, declaration.file, name);
+    let record = preflight_node(store, host, name_ref)?;
+    let NodeData::PrivateIdentifier(identifier) = &record.data else {
+        return accessor_name(store, host, declaration, name)
+            .map(|(name, text)| (name, text, false));
+    };
+    if record.kind != SyntaxKind::PrivateIdentifier
+        || record.flags.0 != 0
+        || record.parent != Some(declaration.node)
+        || !identifier.text.starts_with('#')
+        || identifier.text.len() <= 1
+    {
+        return Err(invariant(ClassInvariant::InvalidName(name_ref)));
+    }
+    Ok((name_ref, identifier.text.clone(), true))
 }
 
 fn plan_numeric_getter_return(
@@ -2896,7 +2974,7 @@ fn plan_class_accessor_pair(
     {
         return Err(reject());
     }
-    let (name_node, name) = accessor_name(store, host, getter, accessor.name)?;
+    let (name_node, name, private) = class_accessor_name(store, host, getter, accessor.name)?;
     let Some(type_node) = accessor.type_ else {
         return Err(reject());
     };
@@ -2922,8 +3000,9 @@ fn plan_class_accessor_pair(
     if setter_record.parent != getter_record.parent {
         return Err(reject());
     }
-    let (_, setter_name) = accessor_name(store, host, setter, setter_data.name)?;
-    if setter_name != name {
+    let (_, setter_name, setter_private) =
+        class_accessor_name(store, host, setter, setter_data.name)?;
+    if setter_name != name || setter_private != private {
         return Err(reject());
     }
     let (setter_parameter, setter_parameter_symbol) =
@@ -2940,7 +3019,7 @@ fn plan_class_accessor_pair(
     if setter_symbol != symbol
         || symbol_record.flags() != SymbolFlags::ACCESSOR
         || symbol_record.check_flags() != CheckFlags::NONE
-        || symbol_record.name().as_utf8() != Some(name.as_str())
+        || !class_member_symbol_name_matches(store, owner, symbol, &name, private)
         || symbol_record.declarations() != Some(&[getter, setter])
         || symbol_record.value_declaration() != Some(getter)
         || symbol_record.members().is_some()
@@ -2948,7 +3027,7 @@ fn plan_class_accessor_pair(
         || symbol_record.parent() != Some(owner)
         || symbol_record.export_symbol().is_some()
         || store.get_merged_symbol(symbol) != Some(symbol)
-        || members.and_then(|members| members.get_source(&name)) != Some(symbol)
+        || members.and_then(|members| members.get(symbol_record.name())) != Some(symbol)
     {
         return Err(invariant(ClassInvariant::InvalidPropertySymbol(getter)));
     }
@@ -3157,16 +3236,29 @@ fn plan_property(
 
     let name = NodeRef::new(member.arena, member.file, property.name);
     let name_record = preflight_node(store, host, name)?;
-    let NodeData::Identifier(identifier) = &name_record.data else {
-        return Err(unsupported(ClassUnsupported::PropertyName {
-            node: name,
-            kind: name_record.kind,
-        }));
+    let (property_name, private) = match &name_record.data {
+        NodeData::Identifier(identifier) => (identifier.text.as_str(), false),
+        NodeData::PrivateIdentifier(identifier) => (identifier.text.as_str(), true),
+        _ => {
+            return Err(unsupported(ClassUnsupported::PropertyName {
+                node: name,
+                kind: name_record.kind,
+            }));
+        }
     };
-    if name_record.kind != SyntaxKind::Identifier
+    let expected_name_kind = if private {
+        SyntaxKind::PrivateIdentifier
+    } else {
+        SyntaxKind::Identifier
+    };
+    if name_record.kind != expected_name_kind
         || name_record.parent != Some(member.node)
         || name_record.range.start < record.range.start
         || name_record.range.end > record.range.end
+        || private
+            && (name_record.flags.0 != 0
+                || !property_name.starts_with('#')
+                || property_name.len() <= 1)
     {
         return Err(invariant(ClassInvariant::InvalidName(name)));
     }
@@ -3180,6 +3272,27 @@ fn plan_property(
         property.modifiers.as_ref(),
         merged_auto_accessor,
     )?;
+    if private
+        && (merged_auto_accessor.is_some()
+            || property.postfix_token.is_some()
+            || property.initializer.is_none()
+            || property.modifiers.as_ref().is_some_and(|modifiers| {
+                modifiers.list.nodes.iter().any(|modifier| {
+                    host.node(NodeRef::new(member.arena, member.file, *modifier))
+                        .is_none_or(|modifier| {
+                            !matches!(
+                                modifier.kind,
+                                SyntaxKind::StaticKeyword | SyntaxKind::ReadonlyKeyword
+                            )
+                        })
+                })
+            }))
+    {
+        return Err(unsupported(ClassUnsupported::PropertyName {
+            node: name,
+            kind: name_record.kind,
+        }));
+    }
 
     let type_node = NodeRef::new(member.arena, member.file, type_node);
     let type_record = preflight_node(store, host, type_node)?;
@@ -3256,7 +3369,8 @@ fn plan_property(
                     (Some(literal.text.clone()), None, None)
                 }
                 NodeData::Identifier(identifier) => {
-                    if side != ClassPropertySide::Instance
+                    if private
+                        || side != ClassPropertySide::Instance
                         || initializer_record.kind != SyntaxKind::Identifier
                         || initializer_node != type_node
                         || property.type_.is_some()
@@ -3270,7 +3384,8 @@ fn plan_property(
                     (None, None, Some(identifier.text.clone()))
                 }
                 NodeData::StringLiteral(literal) => {
-                    if merged_auto_accessor.is_none()
+                    if private
+                        || merged_auto_accessor.is_none()
                         || side != ClassPropertySide::Instance
                         || initializer_record.kind != SyntaxKind::StringLiteral
                         || literal.token_flags.0 != 0
@@ -3314,7 +3429,7 @@ fn plan_property(
     }
     if side == ClassPropertySide::Static
         && matches!(
-            identifier.text.as_str(),
+            property_name,
             "prototype" | "name" | "length" | "caller" | "arguments"
         )
     {
@@ -3394,14 +3509,14 @@ fn plan_property(
     if symbol_record.flags() != expected_flags
         || (symbol_record.check_flags() != CheckFlags::NONE
             && symbol_record.check_flags() != expected_check_flags)
-        || symbol_record.name().as_utf8() != Some(identifier.text.as_str())
+        || !class_member_symbol_name_matches(store, owner, symbol, property_name, private)
         || !declarations_match
         || symbol_record.members().is_some()
         || symbol_record.exports().is_some()
         || symbol_record.parent() != Some(owner)
         || symbol_record.export_symbol().is_some()
         || store.get_merged_symbol(symbol) != Some(symbol)
-        || table.and_then(|table| table.get_source(&identifier.text)) != Some(symbol)
+        || table.and_then(|table| table.get(symbol_record.name())) != Some(symbol)
     {
         return Err(invariant(ClassInvariant::InvalidPropertySymbol(member)));
     }
@@ -3417,7 +3532,7 @@ fn plan_property(
         initializer_parameter_name,
         merged_interface_annotation: merged_auto_accessor.map(|merged| merged.interface_annotation),
         auto_accessor: merged_auto_accessor.is_some(),
-        name: identifier.text.clone(),
+        name: property_name.to_owned(),
         side,
         optional,
         definite,
@@ -6534,6 +6649,14 @@ fn exact_accessor_state(
     let Some(fresh) = accessor_fresh_literal_type(store, accessor) else {
         return false;
     };
+    let name_kind = if store
+        .symbol(accessor.symbol)
+        .is_some_and(|symbol| symbol.name().is_private_identifier())
+    {
+        SyntaxKind::PrivateIdentifier
+    } else {
+        SyntaxKind::Identifier
+    };
     store.type_node_links(accessor.type_node)
         == Some(&TypeNodeLinks {
             resolved_type: Some(type_),
@@ -6554,7 +6677,7 @@ fn exact_accessor_state(
                     })
             })
         && exact_accessor_getter_signature(store, accessor.getter, type_).is_some()
-        && store.source_node_kind(accessor.name_node) == Some(SyntaxKind::Identifier)
+        && store.source_node_kind(accessor.name_node) == Some(name_kind)
         && store.source_node_parent(accessor.name_node)
             == Some(SourceNodeParent::Parent(accessor.getter))
         && store.source_node_kind(accessor.setter_parameter) == Some(SyntaxKind::Parameter)
@@ -7664,10 +7787,6 @@ fn authenticate_private_indexed_class_field(
 
     let symbol = bound_symbol(store, host, field)?;
     let symbol_record = store.symbol(symbol)?;
-    let expected_owner = store.symbol_store().assigned_global_symbol_id(owner)?;
-    let encoded_name =
-        std::str::from_utf8(symbol_record.name().as_bytes().strip_prefix(b"\xFE#")?).ok()?;
-    let (encoded_owner, encoded_private) = encoded_name.split_once('@')?;
     let members = store
         .symbol(owner)?
         .members()
@@ -7675,9 +7794,8 @@ fn authenticate_private_indexed_class_field(
     if symbol_record.flags() != SymbolFlags::PROPERTY
         || symbol_record.check_flags() != CheckFlags::NONE
         || !symbol_record.name().is_private_identifier()
-        || encoded_owner.starts_with('0')
-        || encoded_owner.parse::<u64>().ok()? != expected_owner
-        || encoded_private != private.text
+        || authenticated_private_class_symbol_name(store, owner, symbol)
+            != Some(private.text.as_str())
         || symbol_record.declarations() != Some(&[field])
         || symbol_record.value_declaration() != Some(field)
         || symbol_record.members().is_some()
@@ -10401,21 +10519,33 @@ fn planned_class_member_entries(
         .map(|property| {
             (
                 property.declaration,
-                EscapedName::source(property.name.as_str()),
+                store
+                    .symbol(property.symbol)
+                    .expect("an authenticated class property retains its symbol")
+                    .name()
+                    .to_owned(),
                 property.symbol,
             )
         })
         .chain(methods.iter().map(|method| {
             (
                 method.declaration,
-                EscapedName::source(method.name.as_str()),
+                store
+                    .symbol(method.symbol)
+                    .expect("an authenticated class method retains its symbol")
+                    .name()
+                    .to_owned(),
                 method.symbol,
             )
         }))
         .chain(accessor.into_iter().map(|accessor| {
             (
                 accessor.getter,
-                EscapedName::source(accessor.name.as_str()),
+                store
+                    .symbol(accessor.symbol)
+                    .expect("an authenticated class accessor retains its symbol")
+                    .name()
+                    .to_owned(),
                 accessor.symbol,
             )
         }))
@@ -13729,6 +13859,30 @@ fn exact_stored_property(
         );
     }
     let bootstrap = store.intrinsic_bootstrap()?;
+    let private_name = if record.name().is_private_identifier() {
+        Some(authenticated_private_class_symbol_name(
+            store, owner, property,
+        )?)
+    } else {
+        None
+    };
+    if private_name.is_some()
+        && (flags != SymbolFlags::PROPERTY
+            || !matches!(check_flags, CheckFlags::NONE | CheckFlags::READONLY)
+            || store.symbol(owner).is_none_or(|owner| {
+                [owner.members(), owner.exports()]
+                    .into_iter()
+                    .flatten()
+                    .all(|members| {
+                        store
+                            .symbol_table(members)
+                            .and_then(|members| members.get(record.name()))
+                            != Some(property)
+                    })
+            }))
+    {
+        return None;
+    }
     let primitive = [
         bootstrap.any_type,
         bootstrap.unknown_type,
@@ -13871,7 +14025,8 @@ fn exact_stored_property(
                             == Some(property);
                 }
                 let annotation_valid = match store.source_node_kind(previous) {
-                    Some(SyntaxKind::Identifier) => true,
+                    Some(SyntaxKind::Identifier) => private_name.is_none(),
+                    Some(SyntaxKind::PrivateIdentifier) => private_name.is_some(),
                     Some(SyntaxKind::NumberKeyword) => {
                         store.type_node_links(previous)
                             == Some(&TypeNodeLinks {
@@ -13883,6 +14038,25 @@ fn exact_stored_property(
                                 bootstrap.number_type,
                                 &[],
                             )
+                            && (private_name.is_none()
+                                || previous
+                                    .node
+                                    .index()
+                                    .checked_sub(1)
+                                    .and_then(|index| u32::try_from(index).ok())
+                                    .map(|index| {
+                                        NodeRef::new(
+                                            declaration.arena,
+                                            declaration.file,
+                                            ts_ast::NodeId::new(index),
+                                        )
+                                    })
+                                    .is_some_and(|name| {
+                                        store.source_node_kind(name)
+                                            == Some(SyntaxKind::PrivateIdentifier)
+                                            && store.source_node_parent(name)
+                                                == Some(SourceNodeParent::Parent(*declaration))
+                                    }))
                     }
                     _ => false,
                 };
@@ -13902,8 +14076,10 @@ fn exact_stored_property(
                     return false;
                 };
                 let expected_property_type = if check_flags == CheckFlags::READONLY
-                    && store.source_node_kind(previous) == Some(SyntaxKind::Identifier)
-                {
+                    && matches!(
+                        store.source_node_kind(previous),
+                        Some(SyntaxKind::Identifier | SyntaxKind::PrivateIdentifier)
+                    ) {
                     literal.regular_type
                 } else {
                     bootstrap.number_type
@@ -13937,7 +14113,10 @@ fn exact_stored_property(
                             })
                     })
             },
-            |annotation| store.source_type_node_result_is_exact(annotation, property_type, &[]),
+            |annotation| {
+                private_name.is_none()
+                    && store.source_type_node_result_is_exact(annotation, property_type, &[])
+            },
         );
     ((flags == SymbolFlags::PROPERTY || flags == (SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL))
         && matches!(check_flags, CheckFlags::NONE | CheckFlags::READONLY)
@@ -14007,9 +14186,11 @@ fn exact_stored_method_return_type(
         return false;
     }
     match store.source_node_kind(previous) {
-        Some(SyntaxKind::Identifier | SyntaxKind::Parameter) => store
-            .intrinsic_bootstrap()
-            .is_some_and(|bootstrap| return_type == bootstrap.void_type),
+        Some(SyntaxKind::Identifier | SyntaxKind::PrivateIdentifier | SyntaxKind::Parameter) => {
+            store
+                .intrinsic_bootstrap()
+                .is_some_and(|bootstrap| return_type == bootstrap.void_type)
+        }
         Some(kind)
             if kind.is_keyword_type()
                 && (bodyless
@@ -14217,6 +14398,32 @@ fn exact_stored_ambient_class_method_parameters(
     Some(planned)
 }
 
+fn exact_stored_private_class_member_name(
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+    declaration: NodeRef,
+    symbol: SemanticSymbolId,
+) -> bool {
+    let Some(record) = store.symbol(symbol) else {
+        return false;
+    };
+    if !record.name().is_private_identifier() {
+        return true;
+    }
+    authenticated_private_class_symbol_name(store, owner, symbol).is_some()
+        && (0..declaration.node.index()).rev().any(|index| {
+            u32::try_from(index).ok().is_some_and(|index| {
+                let name = NodeRef::new(
+                    declaration.arena,
+                    declaration.file,
+                    ts_ast::NodeId::new(index),
+                );
+                store.source_node_kind(name) == Some(SyntaxKind::PrivateIdentifier)
+                    && store.source_node_parent(name) == Some(SourceNodeParent::Parent(declaration))
+            })
+        })
+}
+
 fn exact_stored_method(
     store: &CanonicalTypeMapperStore,
     owner: SemanticSymbolId,
@@ -14262,6 +14469,7 @@ fn exact_stored_method(
         && store.source_node_kind(*declaration) == Some(SyntaxKind::MethodDeclaration)
         && store.source_node_parent(*declaration)
             == Some(SourceNodeParent::Parent(owner_declaration))
+        && exact_stored_private_class_member_name(store, owner, *declaration, method)
         && exact_stored_method_return_type(store, *declaration, return_type)
         && exact_method_value(
             store,
@@ -14299,6 +14507,8 @@ fn exact_stored_accessor(
         && store.source_node_kind(setter) == Some(SyntaxKind::SetAccessor)
         && store.source_node_parent(getter) == Some(SourceNodeParent::Parent(owner_declaration))
         && store.source_node_parent(setter) == Some(SourceNodeParent::Parent(owner_declaration))
+        && exact_stored_private_class_member_name(store, owner, getter, accessor)
+        && exact_stored_private_class_member_name(store, owner, setter, accessor)
         && store.value_symbol_links(accessor)
             == Some(&ValueSymbolLinks {
                 resolved_type: Some(number),
@@ -16617,6 +16827,329 @@ mod tests {
             ),
             warm,
         );
+    }
+
+    #[test]
+    fn private_instance_and_static_fields_preserve_nominal_keys_and_warm_replay() {
+        let mut fixture = fixture(concat!(
+            "class First { #value = 1; value = 2; static #count = 3; ",
+            "static readonly #frozen = 4; } ",
+            "class Second { #value: number = 5; static #count: number = 6; }",
+        ));
+        let first_owner = class_symbol(&fixture, "First");
+        let second_owner = class_symbol(&fixture, "Second");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let first_plan =
+            plan_nongeneric_class_member_query(&fixture.store, &host, first_owner).unwrap();
+        let second_plan =
+            plan_nongeneric_class_member_query(&fixture.store, &host, second_owner).unwrap();
+        let ClassMemberQueryPlan::Direct(first_class) = &first_plan else {
+            panic!("private fields belong to one direct class")
+        };
+        let ClassMemberQueryPlan::Direct(second_class) = &second_plan else {
+            panic!("private fields belong to one direct class")
+        };
+        let first_private = first_class.class.instance_properties[0].symbol;
+        let first_public = first_class.class.instance_properties[1].symbol;
+        let first_static = first_class.class.static_properties[0].symbol;
+        let first_readonly = first_class.class.static_properties[1].symbol;
+        let second_private = second_class.class.instance_properties[0].symbol;
+        let second_static = second_class.class.static_properties[0].symbol;
+
+        let first =
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &first_plan).unwrap();
+        let second =
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &second_plan).unwrap();
+
+        assert_eq!(
+            first.declared_instance_properties(),
+            &[first_private, first_public],
+        );
+        assert_eq!(
+            first.declared_static_properties(),
+            &[first_static, first_readonly]
+        );
+        assert_eq!(second.declared_instance_properties(), &[second_private]);
+        assert_eq!(second.declared_static_properties(), &[second_static]);
+        for (owner, symbol, spelling) in [
+            (first_owner, first_private, "#value"),
+            (first_owner, first_static, "#count"),
+            (first_owner, first_readonly, "#frozen"),
+            (second_owner, second_private, "#value"),
+            (second_owner, second_static, "#count"),
+        ] {
+            assert_eq!(
+                authenticated_private_class_symbol_name(&fixture.store, owner, symbol),
+                Some(spelling),
+            );
+        }
+        assert_eq!(
+            authenticated_private_class_symbol_name(&fixture.store, second_owner, first_private),
+            None,
+        );
+        assert_ne!(
+            fixture.store.symbol(first_private).unwrap().name(),
+            fixture.store.symbol(second_private).unwrap().name(),
+        );
+        assert_ne!(
+            fixture.store.symbol(first_static).unwrap().name(),
+            fixture.store.symbol(second_static).unwrap().name(),
+        );
+        assert_eq!(
+            fixture.store.symbol(first_readonly).unwrap().check_flags(),
+            CheckFlags::READONLY,
+        );
+        for instance in [
+            first.shells().instance_type(),
+            second.shells().instance_type(),
+        ] {
+            assert_eq!(
+                validate_class_heritage_members(&fixture.store, instance),
+                ClassHeritageMembersValidation::Valid,
+            );
+        }
+
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.symbol_store().symbol_table_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &first_plan),
+            Ok(first),
+        );
+        assert_eq!(
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &second_plan),
+            Ok(second),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.symbol_store().symbol_table_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn private_instance_and_static_methods_preserve_branded_callable_identities() {
+        let mut fixture = fixture("class Model { #run() {} static #build(): void {} }");
+        let owner = class_symbol(&fixture, "Model");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
+        let ClassMemberQueryPlan::Direct(class) = &plan else {
+            panic!("private methods belong to one direct class")
+        };
+        let instance = class.class.instance_methods[0].symbol;
+        let static_method = class.class.static_methods[0].symbol;
+
+        let members =
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan).unwrap();
+
+        assert_eq!(members.declared_instance_properties(), &[instance]);
+        assert_eq!(members.declared_static_properties(), &[static_method]);
+        assert_eq!(
+            authenticated_private_class_symbol_name(&fixture.store, owner, instance),
+            Some("#run"),
+        );
+        assert_eq!(
+            authenticated_private_class_symbol_name(&fixture.store, owner, static_method),
+            Some("#build"),
+        );
+        assert_eq!(
+            validate_class_heritage_members(&fixture.store, members.shells().instance_type()),
+            ClassHeritageMembersValidation::Valid,
+        );
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan),
+            Ok(members),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn private_numeric_accessor_pairs_share_one_owner_branded_symbol() {
+        let mut fixture = fixture(concat!(
+            "class Model { get #value(): number { return 1; } ",
+            "set #value(next) {} }",
+        ));
+        let owner = class_symbol(&fixture, "Model");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
+        let ClassMemberQueryPlan::Direct(class) = &plan else {
+            panic!("a private accessor pair belongs to one direct class")
+        };
+        let accessor = class.class.accessor.as_ref().unwrap().clone();
+
+        let members =
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan).unwrap();
+
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(members.declared_instance_properties(), &[accessor.symbol]);
+        assert_eq!(
+            authenticated_private_class_symbol_name(&fixture.store, owner, accessor.symbol),
+            Some("#value"),
+        );
+        assert!(exact_accessor_state(&fixture.store, &accessor, number));
+        assert_eq!(
+            validate_class_heritage_members(&fixture.store, members.shells().instance_type()),
+            ClassHeritageMembersValidation::Valid,
+        );
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan),
+            Ok(members),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn inherited_same_spelling_private_fields_keep_distinct_owner_brands() {
+        let mut fixture = fixture(concat!(
+            "class Base { #value = 1; } ",
+            "class Derived extends Base { #value = 2; }",
+        ));
+        let base_owner = class_symbol(&fixture, "Base");
+        let derived_owner = class_symbol(&fixture, "Derived");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let plan =
+            plan_nongeneric_class_member_query(&fixture.store, &host, derived_owner).unwrap();
+
+        let members =
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan).unwrap();
+
+        let [own, inherited] = members.instance_properties() else {
+            panic!("same-spelling private fields retain both owner identities")
+        };
+        assert_eq!(
+            authenticated_private_class_symbol_name(&fixture.store, derived_owner, *own),
+            Some("#value"),
+        );
+        assert_eq!(
+            authenticated_private_class_symbol_name(&fixture.store, base_owner, *inherited),
+            Some("#value"),
+        );
+        assert_ne!(
+            fixture.store.symbol(*own).unwrap().name(),
+            fixture.store.symbol(*inherited).unwrap().name(),
+        );
+        assert_eq!(
+            validate_class_heritage_members(&fixture.store, members.shells().instance_type()),
+            ClassHeritageMembersValidation::Valid,
+        );
+    }
+
+    #[test]
+    fn private_members_reject_foreign_owners_and_poisoned_caches() {
+        for poison in 0..3 {
+            let mut fixture = fixture(concat!(
+                "class First { #value = 1; } ",
+                "class Second { #value = 2; }",
+            ));
+            let owner = class_symbol(&fixture, "First");
+            let foreign = class_symbol(&fixture, "Second");
+            let bound = &fixture.files[&fixture.file];
+            let host = host(&fixture.parsed.arena, bound);
+            let property = fixture
+                .store
+                .symbol(owner)
+                .and_then(Symbol::members)
+                .and_then(|members| fixture.store.symbol_table(members))
+                .and_then(|members| {
+                    members
+                        .iter()
+                        .find_map(|(name, symbol)| name.is_private_identifier().then_some(symbol))
+                })
+                .unwrap();
+            let declaration = fixture
+                .store
+                .symbol(property)
+                .and_then(Symbol::value_declaration)
+                .unwrap();
+            let expected = match poison {
+                0 => {
+                    assert!(fixture.store.set_symbol_relationships(
+                        property,
+                        None,
+                        None,
+                        Some(foreign),
+                        None,
+                    ));
+                    invariant(ClassInvariant::InvalidPropertySymbol(declaration))
+                }
+                1 => {
+                    assert!(fixture.store.set_symbol_flags(
+                        property,
+                        SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL,
+                        CheckFlags::NONE,
+                    ));
+                    invariant(ClassInvariant::InvalidPropertySymbol(declaration))
+                }
+                2 => {
+                    let wrong = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+                    assert!(fixture.store.set_value_symbol_links(
+                        property,
+                        ValueSymbolLinks {
+                            resolved_type: Some(wrong),
+                            ..ValueSymbolLinks::default()
+                        },
+                    ));
+                    invariant(ClassInvariant::InvalidPropertyValueCache(property))
+                }
+                _ => unreachable!("only declared private-member poison cases are visited"),
+            };
+            let cold = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            assert_eq!(
+                plan_nongeneric_class_member_query(&fixture.store, &host, owner),
+                Err(expected),
+                "poison case {poison}",
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                cold,
+            );
+            assert!(fixture.store.declared_type_links(owner).is_none());
+            assert!(fixture.store.value_symbol_links(owner).is_none());
+        }
     }
 
     #[test]

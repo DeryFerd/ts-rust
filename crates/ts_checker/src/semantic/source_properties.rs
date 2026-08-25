@@ -10,7 +10,9 @@
 //! constructors read their validated static member tables without treating
 //! construct signatures as property-only objects. Namespace reexports retain
 //! their export alias while reading the final value symbol. Validated class
-//! getter/setter pairs expose their shared accessor symbol. Exact
+//! getter/setter pairs expose their shared accessor symbol. Private class
+//! members retain their owner-branded symbols and exact access diagnostics.
+//! Exact
 //! two-constituent
 //! unions of source-declared type literals reuse the canonical union-property
 //! adapter. A property missing from any union constituent recovers with
@@ -145,8 +147,15 @@ pub(super) struct SourcePropertyPlan {
     pub(super) receiver: PlannedExpression,
     name_node: NodeRef,
     name: String,
+    privacy: SourcePropertyPrivacy,
     position: SourcePropertyPosition,
     optional: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourcePropertyPrivacy {
+    Public,
+    Private { enclosing_class: Option<NodeRef> },
 }
 
 /// The exact source position for which a property access was proven.
@@ -166,6 +175,7 @@ pub(super) struct DirectSourcePropertySyntax {
     receiver: NodeRef,
     name_node: NodeRef,
     name: String,
+    privacy: SourcePropertyPrivacy,
     position: SourcePropertyPosition,
     optional: bool,
 }
@@ -190,14 +200,15 @@ impl SourcePropertyPlan {
     }
 }
 
-/// Unrendered pinned TS2339 recovery retained through recursive expression
-/// execution until the source checker can supply its formatter host/options.
+/// Unrendered public or private property recovery retained until source
+/// checking supplies its diagnostic host and options.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SourcePropertyDiagnostic {
     name_node: NodeRef,
     receiver_type: TypeId,
     missing_type: Option<TypeId>,
     suggestion: Option<SemanticSymbolId>,
+    private_owner: Option<SemanticSymbolId>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -231,6 +242,12 @@ enum NamespaceProperty {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ClassStaticProperty {
+    Present(ResolvedOwnProperty),
+    Missing,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClassInstanceProperty {
     Present(ResolvedOwnProperty),
     Missing,
 }
@@ -339,17 +356,32 @@ fn plan_direct_source_property_syntax_at(
     let Some(name_record) = arena.get(access.name) else {
         return Err(unsupported_access(node));
     };
-    let NodeData::Identifier(identifier) = &name_record.data else {
-        return Err(unsupported_access(node));
-    };
-    if name_record.parent != Some(node.node)
-        || name_record.kind != SyntaxKind::Identifier
-        || name_record.flags.0 != 0
-        || identifier.flow_node.is_some()
-        || identifier.text.is_empty()
-    {
+    if name_record.parent != Some(node.node) || name_record.flags.0 != 0 {
         return Err(unsupported_access(node));
     }
+    let (name, privacy) = match &name_record.data {
+        NodeData::Identifier(identifier)
+            if name_record.kind == SyntaxKind::Identifier
+                && identifier.flow_node.is_none()
+                && !identifier.text.is_empty() =>
+        {
+            (identifier.text.clone(), SourcePropertyPrivacy::Public)
+        }
+        NodeData::PrivateIdentifier(identifier)
+            if name_record.kind == SyntaxKind::PrivateIdentifier
+                && identifier.text.starts_with('#')
+                && identifier.text.len() > 1
+                && access.question_dot_token.is_none() =>
+        {
+            (
+                identifier.text.clone(),
+                SourcePropertyPrivacy::Private {
+                    enclosing_class: enclosing_private_source_class(arena, store, node)?,
+                },
+            )
+        }
+        _ => return Err(unsupported_access(node)),
+    };
 
     let optional = if let Some(token_id) = access.question_dot_token {
         let Some(token) = arena.get(token_id) else {
@@ -368,16 +400,58 @@ fn plan_direct_source_property_syntax_at(
     } else {
         receiver_continues_optional_chain(arena, receiver_record)
     };
+    if optional && matches!(privacy, SourcePropertyPrivacy::Private { .. }) {
+        return Err(unsupported_access(node));
+    }
 
     preflight_property_links(store, node)?;
     Ok(DirectSourcePropertySyntax {
         node,
         receiver,
         name_node,
-        name: identifier.text.clone(),
+        name,
+        privacy,
         position,
         optional,
     })
+}
+
+fn enclosing_private_source_class(
+    arena: &NodeArena,
+    store: &CanonicalTypeMapperStore,
+    node: NodeRef,
+) -> Result<Option<NodeRef>, SourcePropertyError> {
+    let mut current = node;
+    loop {
+        let record = arena
+            .get(current.node)
+            .ok_or(SourcePropertyError::InvalidCache(node))?;
+        if store.source_node_kind(current) != Some(record.kind) {
+            return Err(SourcePropertyError::InvalidCache(node));
+        }
+        let Some(parent) = record.parent else {
+            if store.source_node_parent(current) != Some(super::store::SourceNodeParent::Root) {
+                return Err(SourcePropertyError::InvalidCache(node));
+            }
+            return Ok(None);
+        };
+        let parent = NodeRef::new(node.arena, node.file, parent);
+        if store.source_node_parent(current) != Some(super::store::SourceNodeParent::Parent(parent))
+        {
+            return Err(SourcePropertyError::InvalidCache(node));
+        }
+        let record = arena
+            .get(parent.node)
+            .ok_or(SourcePropertyError::InvalidCache(node))?;
+        if store.source_node_kind(parent) != Some(record.kind) {
+            return Err(SourcePropertyError::InvalidCache(node));
+        }
+        match record.kind {
+            SyntaxKind::ClassDeclaration => return Ok(Some(parent)),
+            SyntaxKind::ClassExpression => return Err(unsupported_access(node)),
+            _ => current = parent,
+        }
+    }
 }
 
 pub(super) fn finish_direct_source_property_plan(
@@ -394,6 +468,7 @@ pub(super) fn finish_direct_source_property_plan(
         receiver,
         name_node: syntax.name_node,
         name: syntax.name.clone(),
+        privacy: syntax.privacy,
         position: syntax.position,
         optional: syntax.optional,
     })
@@ -417,6 +492,15 @@ pub(super) fn check_direct_source_property(
             bootstrap.undefined_type,
         )
     };
+    if let SourcePropertyPrivacy::Private { enclosing_class } = plan.privacy {
+        return check_private_source_property(
+            store,
+            plan,
+            receiver_type,
+            error_type,
+            enclosing_class,
+        );
+    }
     let (receiver_type, propagate_undefined) = if plan.optional && receiver_type != any {
         optional_property_receiver(store, global_types, plan, receiver_type)?
     } else {
@@ -490,6 +574,7 @@ pub(super) fn check_direct_source_property(
                     receiver_type,
                     missing_type: None,
                     suggestion: None,
+                    private_owner: None,
                 }),
             ),
             NamespaceProperty::Missing => {
@@ -531,6 +616,7 @@ pub(super) fn check_direct_source_property(
                     receiver_type,
                     missing_type: Some(missing_type),
                     suggestion,
+                    private_owner: None,
                 }),
             )
         }
@@ -542,8 +628,9 @@ pub(super) fn check_direct_source_property(
     {
         Some(ClassStaticProperty::Present(property)) => Some(property),
         Some(ClassStaticProperty::Missing) => None,
-        None => match resolve_class_instance_accessor(store, plan, receiver_type)? {
-            Some(accessor) => Some(accessor),
+        None => match resolve_class_instance_member(store, plan, receiver_type)? {
+            Some(ClassInstanceProperty::Present(member)) => Some(member),
+            Some(ClassInstanceProperty::Missing) => None,
             None => match resolve_published_scalar_wrapper_method(
                 store,
                 global_types,
@@ -617,6 +704,7 @@ pub(super) fn check_direct_source_property(
                 receiver_type,
                 missing_type: None,
                 suggestion: direct_property_spelling_suggestion(store, plan, receiver_type)?,
+                private_owner: None,
             }),
         )
     };
@@ -633,6 +721,179 @@ pub(super) fn check_direct_source_property(
         type_
     };
 
+    publish_property_links(store, plan.node, property, type_)?;
+    Ok(CheckedSourceProperty { type_, diagnostic })
+}
+
+fn check_private_source_property(
+    store: &mut CanonicalTypeMapperStore,
+    plan: &SourcePropertyPlan,
+    receiver_type: TypeId,
+    error_type: TypeId,
+    enclosing_class: Option<NodeRef>,
+) -> Result<CheckedSourceProperty, SourcePropertyError> {
+    let receiver = store
+        .type_payload(receiver_type)
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    let owner = receiver
+        .symbol()
+        .and_then(|owner| store.get_merged_symbol(owner))
+        .ok_or(SourcePropertyError::Unsupported(
+            SourcePropertyUnsupported::MissingOwnProperty {
+                node: plan.node,
+                receiver_type,
+            },
+        ))?;
+    let class = store
+        .symbol(owner)
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    let instance = store
+        .declared_type_links(owner)
+        .and_then(|links| links.declared_type)
+        .ok_or(SourcePropertyError::Unsupported(
+            SourcePropertyUnsupported::MissingOwnProperty {
+                node: plan.node,
+                receiver_type,
+            },
+        ))?;
+    let static_side = store
+        .value_symbol_links(owner)
+        .and_then(|links| links.resolved_type)
+        == Some(receiver_type);
+    if !class.flags().contains(SymbolFlags::CLASS) || !static_side && instance != receiver_type {
+        return Err(SourcePropertyError::Unsupported(
+            SourcePropertyUnsupported::MissingOwnProperty {
+                node: plan.node,
+                receiver_type,
+            },
+        ));
+    }
+    if classes::validate_class_heritage_members(store, instance)
+        != ClassHeritageMembersValidation::Valid
+    {
+        return Err(SourcePropertyError::InvalidCache(plan.node));
+    }
+    let structured = receiver
+        .data()
+        .structured()
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    let members = structured
+        .members
+        .and_then(|members| store.symbol_table(members))
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    let properties = structured
+        .properties
+        .as_deref()
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    let mut matching_property = None;
+    for symbol in properties.iter().copied() {
+        let property = store
+            .symbol(symbol)
+            .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+        if !property.name().is_private_identifier() {
+            continue;
+        }
+        let private_owner = property
+            .parent()
+            .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+        let private_class = store
+            .symbol(private_owner)
+            .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+        let private_name =
+            classes::authenticated_private_class_symbol_name(store, private_owner, symbol)
+                .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+        if !private_class.flags().contains(SymbolFlags::CLASS)
+            || members.get(property.name()) != Some(symbol)
+        {
+            return Err(SourcePropertyError::InvalidCache(plan.node));
+        }
+        if private_name != plan.name.as_str() {
+            continue;
+        }
+        let declaration = private_class
+            .value_declaration()
+            .filter(|declaration| {
+                store.source_node_kind(*declaration) == Some(SyntaxKind::ClassDeclaration)
+            })
+            .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+        let candidate = (symbol, private_owner, declaration);
+        if enclosing_class == Some(declaration) {
+            matching_property = Some(candidate);
+            break;
+        }
+        if matching_property.is_none() {
+            matching_property = Some(candidate);
+        }
+    }
+    let Some((symbol, private_owner, declaration)) = matching_property else {
+        return Err(SourcePropertyError::Unsupported(
+            SourcePropertyUnsupported::MissingOwnProperty {
+                node: plan.node,
+                receiver_type,
+            },
+        ));
+    };
+    let property = store
+        .symbol(symbol)
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    let flags = property.flags();
+    let valid_flags = flags == SymbolFlags::PROPERTY
+        || flags == SymbolFlags::METHOD
+        || flags == SymbolFlags::ACCESSOR;
+    let valid_checks = if flags == SymbolFlags::PROPERTY {
+        matches!(
+            property.check_flags(),
+            CheckFlags::NONE | CheckFlags::READONLY
+        )
+    } else {
+        property.check_flags() == CheckFlags::NONE
+    };
+    let declared_members = store.symbol(private_owner).and_then(|owner| {
+        if static_side {
+            owner.exports()
+        } else {
+            owner.members()
+        }
+    });
+    let links = store
+        .value_symbol_links(symbol)
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    let type_ = links
+        .resolved_type
+        .filter(|type_| store.type_payload(*type_).is_some())
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    if !valid_flags
+        || !valid_checks
+        || property.parent() != Some(private_owner)
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || declared_members
+            .and_then(|members| store.symbol_table(members))
+            .and_then(|members| members.get(property.name()))
+            != Some(symbol)
+        || links
+            != &(ValueSymbolLinks {
+                resolved_type: Some(type_),
+                ..ValueSymbolLinks::default()
+            })
+    {
+        return Err(SourcePropertyError::InvalidCache(plan.node));
+    }
+
+    let (type_, property, diagnostic) = if enclosing_class == Some(declaration) {
+        (type_, Some(symbol), None)
+    } else {
+        (
+            error_type,
+            None,
+            Some(SourcePropertyDiagnostic {
+                name_node: plan.name_node,
+                receiver_type,
+                missing_type: None,
+                suggestion: None,
+                private_owner: Some(private_owner),
+            }),
+        )
+    };
     publish_property_links(store, plan.node, property, type_)?;
     Ok(CheckedSourceProperty { type_, diagnostic })
 }
@@ -1407,11 +1668,11 @@ fn resolve_class_static_property(
     })))
 }
 
-fn resolve_class_instance_accessor(
+fn resolve_class_instance_member(
     store: &CanonicalTypeMapperStore,
     plan: &SourcePropertyPlan,
     receiver_type: TypeId,
-) -> Result<Option<ResolvedOwnProperty>, SourcePropertyError> {
+) -> Result<Option<ClassInstanceProperty>, SourcePropertyError> {
     let receiver = store
         .type_payload(receiver_type)
         .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
@@ -1441,20 +1702,44 @@ fn resolve_class_instance_accessor(
         .members
         .and_then(|members| store.symbol_table(members))
         .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    let private_surface = members.iter().any(|(name, _)| name.is_private_identifier());
+    if private_surface
+        && classes::validate_class_heritage_members(store, receiver_type)
+            != ClassHeritageMembersValidation::Valid
+    {
+        return Err(SourcePropertyError::InvalidCache(plan.node));
+    }
     let Some(symbol) = members.get_source(&plan.name) else {
-        return Ok(None);
+        return Ok(private_surface.then_some(ClassInstanceProperty::Missing));
     };
-    let accessor = store
+    let member = store
         .symbol(symbol)
         .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
-    if !accessor.flags().intersects(SymbolFlags::ACCESSOR) {
+    let flags = member.flags();
+    let accessor = flags.intersects(SymbolFlags::ACCESSOR);
+    if !accessor && !private_surface {
         return Ok(None);
     }
+    let supported_flags = if accessor {
+        flags == SymbolFlags::ACCESSOR
+    } else {
+        flags == SymbolFlags::PROPERTY
+            || flags == (SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL)
+            || flags == SymbolFlags::METHOD
+    };
+    let valid_parent = if accessor {
+        member.parent() == Some(owner)
+    } else {
+        member
+            .parent()
+            .and_then(|parent| store.symbol(parent))
+            .is_some_and(|parent| parent.flags().contains(SymbolFlags::CLASS))
+    };
     if classes::validate_class_heritage_members(store, receiver_type)
         != ClassHeritageMembersValidation::Valid
-        || accessor.flags() != SymbolFlags::ACCESSOR
-        || accessor.parent() != Some(owner)
-        || accessor.name().as_utf8() != Some(plan.name.as_str())
+        || !supported_flags
+        || !valid_parent
+        || member.name().as_utf8() != Some(plan.name.as_str())
         || store.get_merged_symbol(symbol) != Some(symbol)
         || structured
             .properties
@@ -1480,12 +1765,12 @@ fn resolve_class_instance_accessor(
         return Err(SourcePropertyError::InvalidCache(plan.node));
     }
 
-    Ok(Some(ResolvedOwnProperty {
+    Ok(Some(ClassInstanceProperty::Present(ResolvedOwnProperty {
         symbol,
         type_,
-        optional: false,
-        readonly: accessor.check_flags().contains(CheckFlags::READONLY),
-    }))
+        optional: flags.contains(SymbolFlags::OPTIONAL),
+        readonly: member.check_flags().contains(CheckFlags::READONLY),
+    })))
 }
 
 fn resolve_enum_property(
@@ -1998,8 +2283,8 @@ fn global_object_affects_missing_property(
     .is_some())
 }
 
-/// Renders the exact TS2339/TS2551 union diagnostic after recursive expression
-/// execution reaches the source-owned diagnostic staging boundary.
+/// Renders exact public or private property diagnostics after recursive
+/// expression execution reaches the source-owned diagnostic staging boundary.
 pub(super) fn prepare_source_property_diagnostic(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -2011,15 +2296,87 @@ pub(super) fn prepare_source_property_diagnostic(
     if options.no_error_truncation {
         flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
     }
-    let name = match host.node(deferred.name_node) {
+    let (name, private_name) = match host.node(deferred.name_node) {
         Some(node) if node.kind == SyntaxKind::Identifier => match &node.data {
             NodeData::Identifier(identifier) if !identifier.text.is_empty() => {
-                identifier.text.as_str()
+                (identifier.text.as_str(), false)
+            }
+            _ => return Err(SourcePropertyError::InvalidCache(deferred.name_node)),
+        },
+        Some(node) if node.kind == SyntaxKind::PrivateIdentifier => match &node.data {
+            NodeData::PrivateIdentifier(identifier)
+                if identifier.text.starts_with('#') && identifier.text.len() > 1 =>
+            {
+                (identifier.text.as_str(), true)
             }
             _ => return Err(SourcePropertyError::InvalidCache(deferred.name_node)),
         },
         _ => return Err(SourcePropertyError::InvalidCache(deferred.name_node)),
     };
+    if let Some(private_owner) = deferred.private_owner {
+        if !private_name || deferred.missing_type.is_some() || deferred.suggestion.is_some() {
+            return Err(SourcePropertyError::InvalidCache(deferred.name_node));
+        }
+        let owner = store
+            .symbol(private_owner)
+            .ok_or(SourcePropertyError::InvalidCache(deferred.name_node))?;
+        let owner_name = owner
+            .name()
+            .as_utf8()
+            .ok_or(SourcePropertyError::InvalidCache(deferred.name_node))?;
+        let receiver = store
+            .type_payload(deferred.receiver_type)
+            .ok_or(SourcePropertyError::InvalidCache(deferred.name_node))?;
+        let receiver_owner = receiver
+            .symbol()
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            .ok_or(SourcePropertyError::InvalidCache(deferred.name_node))?;
+        let instance = store
+            .declared_type_links(receiver_owner)
+            .and_then(|links| links.declared_type)
+            .ok_or(SourcePropertyError::InvalidCache(deferred.name_node))?;
+        let valid_receiver = deferred.receiver_type == instance
+            || store
+                .value_symbol_links(receiver_owner)
+                .and_then(|links| links.resolved_type)
+                == Some(deferred.receiver_type);
+        if !owner.flags().contains(SymbolFlags::CLASS)
+            || !valid_receiver
+            || classes::validate_class_heritage_members(store, instance)
+                != ClassHeritageMembersValidation::Valid
+            || receiver
+                .data()
+                .structured()
+                .and_then(|structured| structured.properties.as_deref())
+                .is_none_or(|properties| {
+                    !properties.iter().copied().any(|symbol| {
+                        classes::authenticated_private_class_symbol_name(
+                            store,
+                            private_owner,
+                            symbol,
+                        ) == Some(name)
+                            && store
+                                .symbol(symbol)
+                                .and_then(ts_binder::semantic::Symbol::parent)
+                                == Some(private_owner)
+                    })
+                })
+        {
+            return Err(SourcePropertyError::InvalidCache(deferred.name_node));
+        }
+        return Ok(CanonicalCheckerDiagnostic {
+            node: Some(deferred.name_node),
+            range_override: None,
+            diagnostic: Diagnostic::with_arguments(
+                message_by_code(18_013).ok_or(SourcePropertyError::MissingDiagnostic(18_013))?,
+                [name, owner_name],
+            ),
+            related_information: Vec::new(),
+        });
+    }
+    if private_name {
+        return Err(SourcePropertyError::InvalidCache(deferred.name_node));
+    }
     let suggestion = match deferred.suggestion {
         Some(suggestion) => Some(
             store
@@ -3668,6 +4025,286 @@ mod tests {
                 .and_then(|links| links.resolved_type),
             Some(fresh_type),
         );
+    }
+
+    #[test]
+    fn private_member_syntax_retains_its_exact_enclosing_class_and_call_capability() {
+        let parsed = parsed("class Model { #run() {} call() { return this.#run(); } }");
+        let file = FileId::new(580);
+        let access = property_access(&parsed, file);
+        let call = NodeRef::new(
+            parsed.arena.id(),
+            file,
+            parsed.arena.get(access.node).unwrap().parent.unwrap(),
+        );
+        let store = registered_store(&parsed, file);
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ClassDeclaration).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+
+        let syntax =
+            plan_direct_source_property_call_syntax(&parsed.arena, &store, access, call).unwrap();
+
+        assert_eq!(syntax.name, "#run");
+        assert_eq!(
+            syntax.privacy,
+            SourcePropertyPrivacy::Private {
+                enclosing_class: Some(declaration),
+            },
+        );
+    }
+
+    #[test]
+    fn private_fields_methods_and_accessors_report_exact_ts18013() {
+        for (index, (source, spelling, static_side)) in [
+            (
+                "class Model { #value = 1; } const result = model.#value;",
+                "#value",
+                false,
+            ),
+            (
+                "class Model { static #value = 1; } const result = Model.#value;",
+                "#value",
+                true,
+            ),
+            (
+                "class Model { #run() {} } const result = model.#run;",
+                "#run",
+                false,
+            ),
+            (
+                "class Model { static #run() {} } const result = Model.#run;",
+                "#run",
+                true,
+            ),
+            (
+                concat!(
+                    "class Model { get #value(): number { return 1; } ",
+                    "set #value(next) {} } const result = model.#value;",
+                ),
+                "#value",
+                false,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let parsed = parsed(source);
+            let file = FileId::new(581 + u32::try_from(index).unwrap());
+            let access = property_access(&parsed, file);
+            let (mut context, owner, instance, value) = published_class(&parsed, file, "Model");
+            let receiver_type = if static_side { value } else { instance };
+            let error = context.store().intrinsic_bootstrap().unwrap().error_type;
+            let syntax =
+                plan_direct_source_property_syntax(&parsed.arena, context.store(), access).unwrap();
+            let receiver = identifier_receiver(&syntax, owner);
+            let plan = finish_direct_source_property_plan(&syntax, receiver).unwrap();
+
+            let checked = check_direct_source_property(
+                context.store_mut_for_test(),
+                None,
+                &plan,
+                receiver_type,
+            )
+            .unwrap();
+
+            assert_eq!(checked.type_, error, "{source}");
+            assert!(context.store().symbol_node_links(access).is_none());
+            let (_, bound) = context.file(file).unwrap();
+            let host = DeclaredTypeHost::new([(&parsed.arena, bound)]).unwrap();
+            let diagnostic = prepare_source_property_diagnostic(
+                context.store(),
+                &host,
+                context.global_types(),
+                context.options(),
+                &checked.diagnostic.unwrap(),
+            )
+            .unwrap();
+            assert_eq!(diagnostic.diagnostic.code(), 18_013, "{source}");
+            assert_eq!(
+                diagnostic.diagnostic.render().unwrap(),
+                format!(
+                    "Property '{spelling}' is not accessible outside class 'Model' because it has a private identifier."
+                ),
+                "{source}",
+            );
+            let warm = (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+            assert_eq!(
+                check_direct_source_property(
+                    context.store_mut_for_test(),
+                    None,
+                    &plan,
+                    receiver_type,
+                ),
+                Ok(checked),
+                "{source}",
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                warm,
+            );
+        }
+    }
+
+    #[test]
+    fn inherited_private_field_diagnostics_name_the_exact_declaring_class() {
+        let parsed = parsed(concat!(
+            "class Base { #value = 1; } ",
+            "class Derived extends Base {} ",
+            "const result = derived.#value;",
+        ));
+        let file = FileId::new(590);
+        let access = property_access(&parsed, file);
+        let (mut context, owner, instance, _) = published_class(&parsed, file, "Derived");
+        let syntax =
+            plan_direct_source_property_syntax(&parsed.arena, context.store(), access).unwrap();
+        let receiver = identifier_receiver(&syntax, owner);
+        let plan = finish_direct_source_property_plan(&syntax, receiver).unwrap();
+
+        let checked =
+            check_direct_source_property(context.store_mut_for_test(), None, &plan, instance)
+                .unwrap();
+
+        let (_, bound) = context.file(file).unwrap();
+        let host = DeclaredTypeHost::new([(&parsed.arena, bound)]).unwrap();
+        let diagnostic = prepare_source_property_diagnostic(
+            context.store(),
+            &host,
+            context.global_types(),
+            context.options(),
+            &checked.diagnostic.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(diagnostic.diagnostic.code(), 18_013);
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "Property '#value' is not accessible outside class 'Base' because it has a private identifier.",
+        );
+    }
+
+    #[test]
+    fn private_class_members_do_not_hide_public_or_missing_property_behavior() {
+        for (index, (source, member, missing)) in [
+            (
+                "class Model { #secret = 1; value = 2; } const result = model.value;",
+                "value",
+                false,
+            ),
+            (
+                concat!(
+                    "class Base { value = 2; } ",
+                    "class Model extends Base { #secret = 1; } ",
+                    "const result = model.value;",
+                ),
+                "value",
+                false,
+            ),
+            (
+                "class Model { #secret = 1; } const result = model.missing;",
+                "missing",
+                true,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let parsed = parsed(source);
+            let file = FileId::new(591 + u32::try_from(index).unwrap());
+            let access = property_access(&parsed, file);
+            let (mut context, owner, instance, _) = published_class(&parsed, file, "Model");
+            let syntax =
+                plan_direct_source_property_syntax(&parsed.arena, context.store(), access).unwrap();
+            let receiver = identifier_receiver(&syntax, owner);
+            let plan = finish_direct_source_property_plan(&syntax, receiver).unwrap();
+
+            let checked =
+                check_direct_source_property(context.store_mut_for_test(), None, &plan, instance)
+                    .unwrap();
+
+            if missing {
+                assert_eq!(
+                    checked.type_,
+                    context.store().intrinsic_bootstrap().unwrap().error_type,
+                );
+                assert_eq!(checked.diagnostic.unwrap().private_owner, None);
+                assert!(context.store().symbol_node_links(access).is_none());
+            } else {
+                assert_eq!(
+                    checked.type_,
+                    context.store().intrinsic_bootstrap().unwrap().number_type,
+                );
+                assert_eq!(checked.diagnostic, None);
+                let symbol = context
+                    .store()
+                    .type_payload(instance)
+                    .and_then(|record| record.data().structured())
+                    .and_then(|structured| structured.members)
+                    .and_then(|members| context.store().symbol_table(members))
+                    .and_then(|members| members.get_source(member))
+                    .unwrap();
+                assert_eq!(
+                    context
+                        .store()
+                        .symbol_node_links(access)
+                        .and_then(|links| links.resolved_symbol),
+                    Some(symbol),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn poisoned_private_member_links_reject_before_access_publication() {
+        let parsed = parsed("class Model { #value = 1; } const result = model.#value;");
+        let file = FileId::new(594);
+        let access = property_access(&parsed, file);
+        let (mut context, owner, instance, _) = published_class(&parsed, file, "Model");
+        let property = context
+            .store()
+            .symbol(owner)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| context.store().symbol_table(members))
+            .and_then(|members| {
+                members
+                    .iter()
+                    .find_map(|(name, symbol)| name.is_private_identifier().then_some(symbol))
+            })
+            .unwrap();
+        let wrong = context.store().intrinsic_bootstrap().unwrap().string_type;
+        assert!(context.store_mut_for_test().set_value_symbol_links(
+            property,
+            ValueSymbolLinks {
+                resolved_type: Some(wrong),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        let syntax =
+            plan_direct_source_property_syntax(&parsed.arena, context.store(), access).unwrap();
+        let receiver = identifier_receiver(&syntax, owner);
+        let plan = finish_direct_source_property_plan(&syntax, receiver).unwrap();
+
+        assert_eq!(
+            check_direct_source_property(context.store_mut_for_test(), None, &plan, instance),
+            Err(SourcePropertyError::InvalidCache(access)),
+        );
+        assert!(context.store().type_node_links(access).is_none());
+        assert!(context.store().symbol_node_links(access).is_none());
     }
 
     #[test]
