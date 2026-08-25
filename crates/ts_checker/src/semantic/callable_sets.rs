@@ -1176,14 +1176,14 @@ fn instantiated_composite_method_type_matches(
             mapped_method_type_parameter(store, mapper, template) == Some(actual)
         }
         (Some(TypeData::Intrinsic(_) | TypeData::Literal(_)), Some(_)) => template == actual,
-        (Some(TypeData::Union(source)), Some(TypeData::Union(mapped))) => {
+        (Some(TypeData::Union(source)), Some(TypeData::Union(mapped_union))) => {
             source.union.types.iter().all(|source| {
-                mapped.union.types.iter().any(|actual| {
+                mapped_union.union.types.iter().any(|actual| {
                     instantiated_composite_method_type_matches(
                         store, *source, *actual, mapper, active,
                     )
                 })
-            }) && mapped.union.types.iter().all(|actual| {
+            }) && mapped_union.union.types.iter().all(|actual| {
                 source.union.types.iter().any(|source| {
                     instantiated_composite_method_type_matches(
                         store, *source, *actual, mapper, active,
@@ -1201,16 +1201,18 @@ fn instantiated_composite_method_type_matches(
             validate_direct_generic_reference(store, template),
             validate_direct_generic_reference(store, actual),
         ) {
-            (Ok(source), Ok(mapped)) => {
-                source.target == mapped.target
-                    && source.type_arguments.len() == mapped.type_arguments.len()
-                    && source.type_arguments.iter().zip(mapped.type_arguments).all(
-                        |(source, actual)| {
+            (Ok(source), Ok(mapped_reference)) => {
+                source.target == mapped_reference.target
+                    && source.type_arguments.len() == mapped_reference.type_arguments.len()
+                    && source
+                        .type_arguments
+                        .iter()
+                        .zip(mapped_reference.type_arguments)
+                        .all(|(source, actual)| {
                             instantiated_composite_method_type_matches(
                                 store, *source, actual, mapper, active,
                             )
-                        },
-                    )
+                        })
             }
             _ => false,
         },
@@ -1226,11 +1228,11 @@ fn mapped_method_type_parameter(
     type_: TypeId,
 ) -> Option<TypeId> {
     match store.mapper_application(mapper, type_)? {
-        TypeMapperApplication::Direct(mapped) => Some(mapped),
+        TypeMapperApplication::Direct(mapped_type) => Some(mapped_type),
         TypeMapperApplication::Merged { first, second }
         | TypeMapperApplication::Composite { first, second } => {
-            let mapped = mapped_method_type_parameter(store, first, type_)?;
-            mapped_method_type_parameter(store, second, mapped)
+            let mapped_type = mapped_method_type_parameter(store, first, type_)?;
+            mapped_method_type_parameter(store, second, mapped_type)
         }
     }
 }
