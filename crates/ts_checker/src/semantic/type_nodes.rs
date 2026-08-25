@@ -5578,12 +5578,316 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         Ok(Some(namespace))
     }
 
+    /// Recognizes React's callable HTML factory without resolving its alias base.
+    #[allow(clippy::too_many_lines)] // The factory, forwarded parameters, alias, and namespace form one proof.
+    fn authenticated_react_factory_alias_heritage(
+        &self,
+        symbol: SemanticSymbolId,
+        namespace: SemanticSymbolId,
+    ) -> bool {
+        let Some(owner) = self.store.symbol(symbol) else {
+            return false;
+        };
+        let Some([declaration]) = owner.declarations() else {
+            return false;
+        };
+        let declaration = *declaration;
+        let Ok(record) = preflight_node(self.store, self.host, declaration) else {
+            return false;
+        };
+        let NodeData::InterfaceDeclaration(interface) = &record.data else {
+            return false;
+        };
+        let Some(parameters) = interface.type_parameters.as_ref() else {
+            return false;
+        };
+        let [first_parameter, second_parameter] = parameters.nodes.as_slice() else {
+            return false;
+        };
+        let Some(clauses) = interface.heritage_clauses.as_ref() else {
+            return false;
+        };
+        let [clause] = clauses.nodes.as_slice() else {
+            return false;
+        };
+        let clause = NodeRef::new(declaration.arena, declaration.file, *clause);
+        let Ok(clause_record) = preflight_node(self.store, self.host, clause) else {
+            return false;
+        };
+        let NodeData::HeritageClause(heritage) = &clause_record.data else {
+            return false;
+        };
+        let [base] = heritage.types.nodes.as_slice() else {
+            return false;
+        };
+        let base = NodeRef::new(clause.arena, clause.file, *base);
+        let Ok(base_record) = preflight_node(self.store, self.host, base) else {
+            return false;
+        };
+        let NodeData::ExpressionWithTypeArguments(expression) = &base_record.data else {
+            return false;
+        };
+        let Some(arguments) = expression.type_arguments.as_ref() else {
+            return false;
+        };
+        let [first_argument, second_argument] = arguments.nodes.as_slice() else {
+            return false;
+        };
+        let name = NodeRef::new(base.arena, base.file, expression.expression);
+        let Some(bound) = self.host.bound_file(declaration) else {
+            return false;
+        };
+        let Some(exports) = self
+            .store
+            .symbol(namespace)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| self.store.symbol_table(exports))
+        else {
+            return false;
+        };
+        let Some(alias) = exports
+            .get_source("DOMFactory")
+            .and_then(|alias| self.store.get_merged_symbol(alias))
+        else {
+            return false;
+        };
+        let Some(alias_owner) = self.store.symbol(alias) else {
+            return false;
+        };
+        let Some([alias_declaration]) = alias_owner.declarations() else {
+            return false;
+        };
+        let alias_declaration = *alias_declaration;
+        let Ok(alias_record) = preflight_node(self.store, self.host, alias_declaration) else {
+            return false;
+        };
+        let NodeData::TypeAliasDeclaration(alias_data) = &alias_record.data else {
+            return false;
+        };
+        let Some(alias_parameters) = alias_data.type_parameters.as_ref() else {
+            return false;
+        };
+        let alias_body = NodeRef::new(
+            alias_declaration.arena,
+            alias_declaration.file,
+            alias_data.type_,
+        );
+        let Ok(alias_body_record) = preflight_node(self.store, self.host, alias_body) else {
+            return false;
+        };
+        let NodeData::FunctionTypeNode(alias_function) = &alias_body_record.data else {
+            return false;
+        };
+        let [signature] = interface.members.nodes.as_slice() else {
+            return false;
+        };
+        let signature = NodeRef::new(declaration.arena, declaration.file, *signature);
+        let Ok(signature_record) = preflight_node(self.store, self.host, signature) else {
+            return false;
+        };
+        let NodeData::CallSignatureDeclaration(call) = &signature_record.data else {
+            return false;
+        };
+        let Some(signature_symbol) = bound
+            .symbol(signature)
+            .and_then(|signature| self.store.get_merged_symbol(signature))
+        else {
+            return false;
+        };
+        let Some(signature_owner) = self.store.symbol(signature_symbol) else {
+            return false;
+        };
+        if owner.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
+            || owner.check_flags() != CheckFlags::NONE
+            || owner.name().as_utf8() != Some("DetailedHTMLFactory")
+            || record.kind != SyntaxKind::InterfaceDeclaration
+            || record.flags.0 != 0
+            || parameters.has_trailing_comma
+            || clauses.has_trailing_comma
+            || clause_record.kind != SyntaxKind::HeritageClause
+            || clause_record.flags.0 != 0
+            || clause_record.parent != Some(declaration.node)
+            || heritage.token != SyntaxKind::ExtendsKeyword
+            || heritage.facts != 0
+            || heritage.types.has_trailing_comma
+            || base_record.kind != SyntaxKind::ExpressionWithTypeArguments
+            || base_record.flags.0 != 0
+            || base_record.parent != Some(clause.node)
+            || expression.facts != 0
+            || arguments.has_trailing_comma
+            || !self.react_detailed_html_props_identifier(name, base, "DOMFactory")
+            || self.resolve_uncached_type_reference_symbol(base).ok() != Some(alias)
+            || alias_owner.flags() != SymbolFlags::TYPE_ALIAS
+            || alias_owner.check_flags() != CheckFlags::NONE
+            || alias_owner.name().as_utf8() != Some("DOMFactory")
+            || alias_owner.value_declaration().is_some()
+            || alias_owner.members().is_some()
+            || alias_owner.exports().is_some()
+            || alias_owner.export_symbol().is_some()
+            || self.store.get_parent_of_symbol(alias) != Some(namespace)
+            || alias_record.kind != SyntaxKind::TypeAliasDeclaration
+            || alias_record.flags.0 != 0
+            || alias_record.parent != record.parent
+            || alias_parameters.nodes.len() != 2
+            || alias_parameters.has_trailing_comma
+            || !self
+                .host
+                .symbol_matches(self.store, alias_declaration, alias)
+            || alias_body_record.kind != SyntaxKind::FunctionType
+            || alias_body_record.flags.0 != 0
+            || alias_body_record.parent != Some(alias_declaration.node)
+            || alias_function.type_parameters.is_some()
+            || alias_function.parameters.has_trailing_comma
+            || interface.members.has_trailing_comma
+            || signature_record.kind != SyntaxKind::CallSignature
+            || signature_record.flags.0 != 0
+            || signature_record.parent != Some(declaration.node)
+            || call.full_signature.is_some()
+            || call.next_container.is_some()
+            || call.symbol.is_some()
+            || call.type_parameters.is_some()
+            || call.parameters.has_trailing_comma
+            || signature_owner.flags() != SymbolFlags::SIGNATURE
+            || signature_owner.check_flags() != CheckFlags::NONE
+            || signature_owner.name() != InternalSymbolName::Call.as_ref()
+            || signature_owner.declarations() != Some(&[signature])
+            || signature_owner.value_declaration().is_some()
+            || signature_owner.members().is_some()
+            || signature_owner.exports().is_some()
+            || signature_owner.export_symbol().is_some()
+            || self.store.get_parent_of_symbol(signature_symbol) != Some(symbol)
+            || owner
+                .members()
+                .and_then(|members| self.store.symbol_table(members))
+                .and_then(|members| members.get(InternalSymbolName::Call.as_ref()))
+                != Some(signature_symbol)
+            || self
+                .store
+                .signature_links(signature)
+                .is_some_and(|links| links != &SignatureLinks::default())
+            || !self.is_react_ambient_module_namespace(namespace, declaration)
+        {
+            return false;
+        }
+
+        for (callable, parameters) in [
+            (alias_body, &alias_function.parameters),
+            (signature, &call.parameters),
+        ] {
+            let [props, children] = parameters.nodes.as_slice() else {
+                return false;
+            };
+            for (parameter, expected, optional, rest) in [
+                (*props, "props", true, false),
+                (*children, "children", false, true),
+            ] {
+                let parameter = NodeRef::new(callable.arena, callable.file, parameter);
+                let Ok(parameter_record) = preflight_node(self.store, self.host, parameter) else {
+                    return false;
+                };
+                let NodeData::ParameterDeclaration(parameter_data) = &parameter_record.data else {
+                    return false;
+                };
+                let name = NodeRef::new(parameter.arena, parameter.file, parameter_data.name);
+                let Some(annotation) = parameter_data.type_ else {
+                    return false;
+                };
+                let annotation = NodeRef::new(parameter.arena, parameter.file, annotation);
+                if parameter_record.kind != SyntaxKind::Parameter
+                    || parameter_record.flags.0 != 0
+                    || parameter_record.parent != Some(callable.node)
+                    || parameter_data.initializer.is_some()
+                    || parameter_data.modifiers.is_some()
+                    || parameter_data.symbol.is_some()
+                    || parameter_data.facts != 0
+                    || parameter_data.question_token.is_some() != optional
+                    || parameter_data.dot_dot_dot_token.is_some() != rest
+                    || !self.react_detailed_html_props_identifier(name, parameter, expected)
+                    || self.host.node(annotation).is_none_or(|record| {
+                        record.parent != Some(parameter.node)
+                            || rest && record.kind != SyntaxKind::ArrayType
+                    })
+                {
+                    return false;
+                }
+            }
+        }
+
+        if let Some(target) = self
+            .store
+            .declared_type_links(symbol)
+            .and_then(|links| links.declared_type)
+        {
+            let Some(record) = self.store.type_payload(target) else {
+                return false;
+            };
+            let TypeData::Interface(interface) = record.data() else {
+                return false;
+            };
+            let Ok(reference) = validate_direct_generic_reference(self.store, target) else {
+                return false;
+            };
+            if record.symbol() != Some(symbol)
+                || reference.target != target
+                || reference.type_arguments.len() != 2
+                || interface.base_types_resolved
+                || interface.resolved_base_constructor_type.is_some()
+                || interface.resolved_base_types.is_some()
+                || interface.declared_members_resolved
+                || interface.reference.object.structured != StructuredTypeData::default()
+            {
+                return false;
+            }
+        }
+
+        for (parameter, argument, expected) in [
+            (*first_parameter, *first_argument, "P"),
+            (*second_parameter, *second_argument, "T"),
+        ] {
+            let parameter = NodeRef::new(declaration.arena, declaration.file, parameter);
+            let Some(parameter_symbol) = bound
+                .symbol(parameter)
+                .and_then(|parameter| self.store.get_merged_symbol(parameter))
+            else {
+                return false;
+            };
+            let Some(parameter_owner) = self.store.symbol(parameter_symbol) else {
+                return false;
+            };
+            if parameter_owner.flags() != SymbolFlags::TYPE_PARAMETER
+                || parameter_owner.check_flags() != CheckFlags::NONE
+                || parameter_owner.name().as_utf8() != Some(expected)
+                || self.store.get_parent_of_symbol(parameter_symbol) != Some(symbol)
+                || owner
+                    .members()
+                    .and_then(|members| self.store.symbol_table(members))
+                    .and_then(|members| members.get(parameter_owner.name()))
+                    != Some(parameter_symbol)
+                || !self.react_detailed_html_props_parameter_reference(
+                    NodeRef::new(base.arena, base.file, argument),
+                    base,
+                    expected,
+                    parameter_symbol,
+                )
+            {
+                return false;
+            }
+        }
+
+        true
+    }
+
     fn has_generic_interface_heritage(
         &self,
         symbol: SemanticSymbolId,
     ) -> Result<bool, DeclaredTypeError> {
         let react_namespace = self.authenticated_react_interface_namespace(symbol)?;
         if self.store.get_parent_of_symbol(symbol).is_some() && react_namespace.is_none() {
+            return Ok(false);
+        }
+        if react_namespace.is_some_and(|namespace| {
+            self.authenticated_react_factory_alias_heritage(symbol, namespace)
+        }) {
             return Ok(false);
         }
         let declarations = self
@@ -34079,6 +34383,122 @@ mod tests {
             Ok(target),
         );
         assert_eq!(store_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Factory alias ownership, optional/rest syntax, and warm poison form one proof.
+    fn ambient_react_html_factory_alias_heritage_remains_authenticated_and_lazy() {
+        let mut fixture = fixture(concat!(
+            "declare module 'react' { ",
+            "export = React; ",
+            "namespace React { ",
+            "type ReactNode = string; ",
+            "type DOMFactory<P, T> = (props?: P, ...children: ReactNode[]) => T; ",
+            "interface DetailedHTMLFactory<P, T> extends DOMFactory<P, T> { ",
+            "(props?: P, ...children: ReactNode[]): T; ",
+            "} } }",
+        ));
+        let factory = named_symbol(
+            &fixture,
+            SyntaxKind::InterfaceDeclaration,
+            "DetailedHTMLFactory",
+        );
+        let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "DOMFactory");
+        let namespace = fixture.store.get_parent_of_symbol(factory).unwrap();
+        let exports = fixture.store.symbol(namespace).unwrap().exports().unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let target = query_declared(
+            &mut fixture,
+            factory,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        let TypeData::Interface(interface) = fixture.store.type_payload(target).unwrap().data()
+        else {
+            panic!("DetailedHTMLFactory must retain its canonical generic interface")
+        };
+        assert!(!interface.base_types_resolved);
+        assert!(interface.resolved_base_types.is_none());
+        assert!(!interface.declared_members_resolved);
+        assert!(fixture.store.type_alias_links(alias).is_none());
+        let call = fixture
+            .store
+            .symbol(factory)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| fixture.store.symbol_table(members))
+            .and_then(|members| members.get(InternalSymbolName::Call.as_ref()))
+            .unwrap();
+        assert!(fixture.store.value_symbol_links(call).is_none());
+
+        let warm = store_state(&fixture.store);
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                factory,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(target),
+        );
+        assert_eq!(store_state(&fixture.store), warm);
+
+        assert_eq!(
+            fixture
+                .store
+                .insert_symbol(exports, EscapedName::source("DOMFactory"), factory),
+            Some(Some(alias)),
+        );
+        let poisoned = store_state(&fixture.store);
+        assert!(
+            query_declared(
+                &mut fixture,
+                factory,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .is_err(),
+        );
+        assert_eq!(store_state(&fixture.store), poisoned);
+        assert_eq!(
+            fixture
+                .store
+                .insert_symbol(exports, EscapedName::source("DOMFactory"), alias),
+            Some(Some(factory)),
+        );
+
+        assert!(
+            fixture
+                .store
+                .set_interface_base_resolution(target, true, None, None),
+        );
+        let poisoned = store_state(&fixture.store);
+        assert!(
+            query_declared(
+                &mut fixture,
+                factory,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .is_err(),
+        );
+        assert_eq!(store_state(&fixture.store), poisoned);
+        assert!(
+            fixture
+                .store
+                .set_interface_base_resolution(target, false, None, None),
+        );
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                factory,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Ok(target),
+        );
         assert!(diagnostics.is_empty());
     }
 
