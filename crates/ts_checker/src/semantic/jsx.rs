@@ -26,6 +26,7 @@ use super::{
     SourceCheckProvenanceError, SourceLiteralCacheError, SourceSyntaxRole, SymbolNodeLinks, TypeId,
     TypeNodeLinks, UnsupportedSourceSyntax, ValueSymbolLinks,
     array_types::CanonicalArrayTargets,
+    bootstrap::UnionReduction,
     callable_sets::{StoredCallableSetValidation, validate_stored_callable_set},
     formatter::{
         AssignabilityErrorDisplay, CanonicalTypeFormatFlags,
@@ -3611,6 +3612,44 @@ fn resolve_expected_jsx_child_type(
         .map_err(Into::into)
 }
 
+fn contextual_jsx_child_element_type(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    expected: TypeId,
+) -> Result<TypeId, SourceCheckError> {
+    let Some(global_types) = global_types else {
+        return Ok(expected);
+    };
+    if let Some(array) = store.canonical_array_reference(global_types, expected)? {
+        return Ok(array.element_type);
+    }
+
+    let Some(super::TypeData::Union(union)) = store
+        .type_payload(expected)
+        .map(super::type_records::TypeRecord::data)
+    else {
+        return Ok(expected);
+    };
+    let constituents = union.union.types.clone();
+    let mut projected = Vec::with_capacity(constituents.len());
+    let mut has_array = false;
+    for constituent in constituents {
+        if let Some(array) = store.canonical_array_reference(global_types, constituent)? {
+            projected.push(array.element_type);
+            has_array = true;
+        } else {
+            projected.push(constituent);
+        }
+    }
+    if !has_array {
+        return Ok(expected);
+    }
+
+    store
+        .expression_union_type_with_global_types(global_types, &projected, UnionReduction::None)
+        .map_err(Into::into)
+}
+
 fn jsx_child_is_assignable(
     store: &mut CanonicalTypeMapperStore,
     source: TypeId,
@@ -3906,7 +3945,7 @@ fn check_jsx_implicit_children(
     let mut first_node = None;
     let mut child_types = Vec::with_capacity(plan.children.len());
     let expected_child = if plan.children.len() > 1 {
-        resolve_expected_jsx_child_type(
+        let expected = resolve_expected_jsx_child_type(
             store,
             source.2,
             expected_attributes,
@@ -3914,7 +3953,10 @@ fn check_jsx_implicit_children(
             plan.opening,
             options,
             diagnostics,
-        )?
+        )?;
+        expected
+            .map(|expected| contextual_jsx_child_element_type(store, source.3, expected))
+            .transpose()?
     } else {
         None
     };
@@ -11779,6 +11821,167 @@ mod runtime_tests {
             ),
             cold,
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Array child contexts share canonical targets and warm caches.
+    fn function_component_array_children_use_their_contextual_element_types() {
+        let source = concat!(
+            "interface Array<T> {}\n",
+            "interface ReadonlyArray<T> {}\n",
+            "declare var React: any;\n",
+            "declare namespace JSX {\n",
+            "  interface Element { marker: string; }\n",
+            "  interface ElementChildrenAttribute { children: {}; }\n",
+            "  interface IntrinsicElements { span: {}; }\n",
+            "}\n",
+            "interface ArrayChildren { children: JSX.Element[]; }\n",
+            "interface FlexibleChildren { children: JSX.Element | JSX.Element[]; }\n",
+            "interface TextChildren { children: string[]; }\n",
+            "interface MixedChildren { ",
+            "children: string | JSX.Element | (string | JSX.Element)[]; }\n",
+            "interface ReadonlyChildren { children: ReadonlyArray<JSX.Element>; }\n",
+            "declare function ArrayComponent(props: ArrayChildren): any;\n",
+            "declare function FlexibleComponent(props: FlexibleChildren): any;\n",
+            "declare function MixedComponent(props: MixedChildren): any;\n",
+            "declare function ReadonlyComponent(props: ReadonlyChildren): any;\n",
+            "declare function TextComponent(props: TextChildren): any;\n",
+            "const direct = <ArrayComponent><span /><span /></ArrayComponent>;\n",
+            "const flexible = <FlexibleComponent><span /><span /></FlexibleComponent>;\n",
+            "const mixed = <MixedComponent><span />ready</MixedComponent>;\n",
+            "const readonly = <ReadonlyComponent><span /><span /></ReadonlyComponent>;\n",
+            "const invalid = <TextComponent>ready{123}</TextComponent>;\n",
+        );
+
+        for (index, runtime) in [CanonicalJsxRuntime::Classic, CanonicalJsxRuntime::Preserve]
+            .into_iter()
+            .enumerate()
+        {
+            let parsed = parse_jsx_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let file = FileId::new(8_200 + u32::try_from(index).unwrap());
+            let mut binder = CanonicalBinder::new();
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source("\"/project/jsx-array-children.tsx\""),
+                        CanonicalSourceLanguage::TypeScript,
+                        false,
+                        CanonicalModuleState::Script,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+            let mut context = crate::semantic::CanonicalCheckerContext::new(
+                binder.finish(),
+                vec![(file, &parsed.arena)],
+                CanonicalCheckerOptions {
+                    jsx_runtime: runtime,
+                    ..CanonicalCheckerOptions::default()
+                },
+            )
+            .unwrap();
+
+            context.check_source_file(file).unwrap();
+
+            let [diagnostic] = context.diagnostics().as_slice() else {
+                panic!("only the numeric array child must fail in {runtime:?} mode")
+            };
+            assert_eq!(diagnostic.diagnostic.code(), 2322);
+            assert_eq!(
+                diagnostic.diagnostic.render().unwrap(),
+                "Type 'number' is not assignable to type 'string'.",
+            );
+            let range = parsed
+                .arena
+                .get(diagnostic.node.unwrap().node)
+                .unwrap()
+                .range;
+            assert_eq!(
+                source.get(range.start.get() as usize..range.end.get() as usize),
+                Some("{123}"),
+            );
+
+            let element_type = context
+                .store()
+                .intrinsic_bootstrap()
+                .and_then(|bootstrap| context.store().symbol_table(bootstrap.globals))
+                .and_then(|globals| globals.get_source("JSX"))
+                .and_then(|namespace| context.store().symbol(namespace))
+                .and_then(ts_binder::semantic::Symbol::exports)
+                .and_then(|exports| context.store().symbol_table(exports))
+                .and_then(|exports| exports.get_source("Element"))
+                .and_then(|symbol| context.store().declared_type_links(symbol))
+                .and_then(|links| links.declared_type)
+                .unwrap();
+            let mut component_children = 0;
+            for (node, record) in parsed.arena.iter() {
+                let NodeData::JsxOpeningElement(opening_data) = &record.data else {
+                    continue;
+                };
+                let opening = NodeRef::new(parsed.arena.id(), file, node);
+                let NodeData::Identifier(tag) =
+                    &parsed.arena.get(opening_data.tag_name).unwrap().data
+                else {
+                    panic!("the test component tags are direct identifiers")
+                };
+                let attributes = child_ref(opening, opening_data.attributes);
+                let type_ = context
+                    .store()
+                    .type_node_links(attributes)
+                    .and_then(|links| links.resolved_type)
+                    .unwrap();
+                let children = context
+                    .store()
+                    .type_payload(type_)
+                    .and_then(|record| record.data().structured())
+                    .and_then(|structured| structured.members)
+                    .and_then(|members| context.store().symbol_table(members))
+                    .and_then(|members| members.get_source("children"))
+                    .unwrap();
+                let child_type = context
+                    .store()
+                    .value_symbol_links(children)
+                    .and_then(|links| links.resolved_type)
+                    .unwrap();
+                let array = context
+                    .store()
+                    .canonical_array_reference(context.global_types(), child_type)
+                    .unwrap()
+                    .unwrap();
+                if matches!(tag.text.as_str(), "FlexibleComponent" | "ReadonlyComponent") {
+                    assert_eq!(array.element_type, element_type);
+                }
+                component_children += 1;
+            }
+            assert_eq!(component_children, 5);
+
+            let cold = (
+                context.store().type_len(),
+                context.store().symbol_len(),
+                context.store().mapper_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+                context.diagnostics().as_slice().to_vec(),
+            );
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().symbol_len(),
+                    context.store().mapper_len(),
+                    context.store().signature_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    context.diagnostics().as_slice().to_vec(),
+                ),
+                cold,
+            );
+        }
     }
 
     #[test]
