@@ -7533,8 +7533,11 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                     ));
                 }
                 Err(CanonicalNameResolutionError::AliasResolutionUnavailable(alias)) => {
-                    if let Some(target) =
-                        self.authenticated_merged_interface_import_alias_target(node, alias)
+                    if let Some(target) = self
+                        .authenticated_ambient_module_import_alias_target(node, alias)
+                        .or_else(|| {
+                            self.authenticated_merged_interface_import_alias_target(node, alias)
+                        })
                     {
                         target
                     } else {
@@ -11723,8 +11726,11 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         match resolved {
             Err(CanonicalNameResolutionError::AliasResolutionUnavailable(alias)) => {
                 if self
-                    .authenticated_merged_interface_import_alias_target(node, alias)
+                    .authenticated_ambient_module_import_alias_target(node, alias)
                     .is_none()
+                    && self
+                        .authenticated_merged_interface_import_alias_target(node, alias)
+                        .is_none()
                 {
                     return Err(type_node_unavailable(
                         TypeNodeUnavailable::ImportAliasTypeReference { node, alias },
@@ -11902,7 +11908,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         Some(target)
     }
 
-    /// Resolves an already authenticated named import inside an ambient module.
+    /// Resolves a cold or already authenticated named import inside an ambient module.
     fn authenticated_ambient_module_import_alias_target(
         &self,
         reference: NodeRef,
@@ -11915,9 +11921,21 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         let declaration = *declaration;
         let bound = self.host.bound_file(declaration)?;
         let facts = bound.source_facts()?;
-        let links = self.store.alias_symbol_links(alias)?;
-        let super::AliasTargetState::Resolved(target) = links.alias_target else {
-            return None;
+        let cached_target = match self.store.alias_symbol_links(alias) {
+            None => None,
+            Some(links) if links == &super::AliasSymbolLinks::default() => None,
+            Some(links) => {
+                let super::AliasTargetState::Resolved(target) = links.alias_target else {
+                    return None;
+                };
+                if self.store.get_merged_symbol(target) != Some(target)
+                    || links.immediate_target != Some(target)
+                    || links.type_only_declaration.is_some()
+                {
+                    return None;
+                }
+                Some(target)
+            }
         };
         if record.flags() != SymbolFlags::ALIAS
             || record.check_flags() != CheckFlags::NONE
@@ -11932,9 +11950,6 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             || !declaration.is_for(reference.arena, reference.file)
             || bound.symbol(declaration) != Some(alias)
             || self.store.get_merged_symbol(alias) != Some(alias)
-            || self.store.get_merged_symbol(target) != Some(target)
-            || links.immediate_target != Some(target)
-            || links.type_only_declaration.is_some()
         {
             return None;
         }
@@ -12099,6 +12114,13 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             } else {
                 imported_module
             };
+        let target = self
+            .store
+            .symbol(expected_owner)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| self.store.symbol_table(exports))
+            .and_then(|exports| exports.get_source(&imported_name.text))
+            .and_then(|symbol| self.store.get_merged_symbol(symbol))?;
         let target_record = self.store.symbol(target)?;
         let allowed = SymbolFlags::TYPE_ALIAS | SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT;
         (target_record
@@ -12106,14 +12128,7 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             .intersects(SymbolFlags::TYPE_ALIAS | SymbolFlags::INTERFACE)
             && target_record.flags().without(allowed) == SymbolFlags::NONE
             && self.store.get_parent_of_symbol(target) == Some(expected_owner)
-            && self
-                .store
-                .symbol(expected_owner)
-                .and_then(ts_binder::semantic::Symbol::exports)
-                .and_then(|exports| self.store.symbol_table(exports))
-                .and_then(|exports| exports.get_source(&imported_name.text))
-                .and_then(|symbol| self.store.get_merged_symbol(symbol))
-                == Some(target))
+            && cached_target.is_none_or(|cached| cached == target))
         .then_some(target)
     }
 
@@ -12198,11 +12213,15 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             Ok(None) => Err(type_node_unavailable(
                 TypeNodeUnavailable::MissingTypeReference(node),
             )),
-            Err(CanonicalNameResolutionError::AliasResolutionUnavailable(alias)) => {
-                Err(type_node_unavailable(
-                    TypeNodeUnavailable::ImportAliasTypeReference { node, alias },
-                ))
-            }
+            Err(CanonicalNameResolutionError::AliasResolutionUnavailable(alias)) => self
+                .authenticated_ambient_module_import_alias_target(node, alias)
+                .or_else(|| self.authenticated_merged_interface_import_alias_target(node, alias))
+                .ok_or_else(|| {
+                    type_node_unavailable(TypeNodeUnavailable::ImportAliasTypeReference {
+                        node,
+                        alias,
+                    })
+                }),
             Err(error) => Err(error.into()),
         }
     }
@@ -30510,6 +30529,205 @@ mod tests {
             ))
         ));
         assert_eq!(store_state(&fixture.store), before);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep ambient import identity, both targets, and forged caches together.
+    fn ambient_react_type_imports_resolve_cold_and_reject_forged_alias_caches() {
+        let PropTypesInferPropsFixture {
+            library,
+            declarations,
+            library_file,
+            declaration_file,
+            files,
+            mut store,
+        } = prop_types_declaration_fixture(
+            parse_source_file("interface LibraryMarker {}"),
+            parse_source_file(concat!(
+                "declare module 'prop-types' { ",
+                "import { ReactNode, ReactElement } from 'react'; ",
+                "export interface Requireable<Value> { value: Value; } ",
+                "export const node: Requireable<ReactNode>; ",
+                "export const element: Requireable<ReactElement<any>>; ",
+                "} ",
+                "declare module 'react' { ",
+                "export = React; ",
+                "namespace React { ",
+                "type ReactNode = string | number; ",
+                "interface ReactElement<Props> { props: Props; } ",
+                "} }",
+            )),
+            true,
+        );
+        let bound = files.get(&declaration_file).unwrap();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&library.arena, files.get(&library_file).unwrap()),
+                (&declarations.arena, bound),
+            ],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let import = |expected: &str| {
+            declarations
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::ImportSpecifier(import) = &record.data else {
+                        return None;
+                    };
+                    (identifier_text(&declarations.arena, import.name) == Some(expected)).then_some(
+                        NodeRef::new(declarations.arena.id(), declaration_file, node),
+                    )
+                })
+                .unwrap()
+        };
+        let declaration_named = |kind: SyntaxKind, expected: &str| {
+            declarations
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == kind
+                        && declaration_name(&declarations.arena, record) == Some(expected))
+                    .then_some(NodeRef::new(
+                        declarations.arena.id(),
+                        declaration_file,
+                        node,
+                    ))
+                })
+                .unwrap()
+        };
+        let variable_annotation = |expected: &str| {
+            let declaration = declaration_named(SyntaxKind::VariableDeclaration, expected);
+            let NodeData::VariableDeclaration(variable) =
+                &declarations.arena.get(declaration.node).unwrap().data
+            else {
+                unreachable!("the declaration was selected by its variable syntax")
+            };
+            NodeRef::new(declaration.arena, declaration.file, variable.type_.unwrap())
+        };
+        let reference_named = |expected: &str| {
+            declarations
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::TypeReferenceNode(reference) = &record.data else {
+                        return None;
+                    };
+                    (identifier_text(&declarations.arena, reference.type_name) == Some(expected))
+                        .then_some(NodeRef::new(
+                            declarations.arena.id(),
+                            declaration_file,
+                            node,
+                        ))
+                })
+                .unwrap()
+        };
+        let node_alias = bound.symbol(import("ReactNode")).unwrap();
+        let element_alias = bound.symbol(import("ReactElement")).unwrap();
+        let node_target = bound
+            .symbol(declaration_named(
+                SyntaxKind::TypeAliasDeclaration,
+                "ReactNode",
+            ))
+            .unwrap();
+        let element_target = bound
+            .symbol(declaration_named(
+                SyntaxKind::InterfaceDeclaration,
+                "ReactElement",
+            ))
+            .unwrap();
+        let node_reference = reference_named("ReactNode");
+        let element_reference = reference_named("ReactElement");
+        let node_root = variable_annotation("node");
+        let element_root = variable_annotation("element");
+        assert!(store.alias_symbol_links(node_alias).is_none());
+        assert!(store.alias_symbol_links(element_alias).is_none());
+        let aliases = HashMap::new();
+        let planner = TypeQueryPlanner::new(&store, &host, None, None, false, &aliases);
+        assert_eq!(
+            planner.authenticated_ambient_module_import_alias_target(node_reference, node_alias),
+            Some(node_target),
+        );
+        assert_eq!(
+            planner.authenticated_ambient_module_import_alias_target(
+                element_reference,
+                element_alias,
+            ),
+            Some(element_target),
+        );
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let node_type = CanonicalTypeQuery::new(
+            &mut store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_type_from_type_node(node_root)
+        .unwrap();
+        let element_type = CanonicalTypeQuery::new(
+            &mut store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_type_from_type_node(element_root)
+        .unwrap();
+        for (alias, reference, target) in [
+            (node_alias, node_reference, node_target),
+            (element_alias, element_reference, element_target),
+        ] {
+            assert!(store.alias_symbol_links(alias).is_none());
+            assert_eq!(
+                store
+                    .symbol_node_links(reference)
+                    .and_then(|links| links.resolved_symbol),
+                Some(target),
+            );
+        }
+        let warm = store_state(&store);
+        for (root, expected) in [(node_root, node_type), (element_root, element_type)] {
+            assert_eq!(
+                CanonicalTypeQuery::new(
+                    &mut store,
+                    &host,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_type_from_type_node(root),
+                Ok(expected),
+            );
+        }
+        assert_eq!(store_state(&store), warm);
+
+        assert!(store.set_alias_symbol_links(
+            node_alias,
+            crate::semantic::AliasSymbolLinks {
+                immediate_target: Some(element_target),
+                ..crate::semantic::AliasSymbolLinks::default()
+            },
+        ));
+        let poisoned = store_state(&store);
+        let result = CanonicalTypeQuery::new(
+            &mut store,
+            &host,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_type_from_type_node(node_reference);
+        assert!(matches!(
+            result,
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::ImportAliasTypeReference { node, alias }
+            )) if node == node_reference && alias == node_alias
+        ));
+        assert_eq!(store_state(&store), poisoned);
         assert!(diagnostics.is_empty());
     }
 
