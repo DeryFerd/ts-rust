@@ -55,6 +55,14 @@ pub(super) struct SourceEnumMemberPlan {
     pub(super) symbol: SemanticSymbolId,
 }
 
+/// A missing member diagnostic paired with its invalid const enum initializer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceEnumMissingMemberDiagnostic {
+    pub(super) initializer: NodeRef,
+    pub(super) node: NodeRef,
+    pub(super) arguments: [String; 2],
+}
+
 /// Allocation-free plan for one bounded top-level or local enum statement.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SourceEnumPlan {
@@ -68,6 +76,7 @@ pub(super) struct SourceEnumPlan {
     pub(super) owner_symbol: SemanticSymbolId,
     pub(super) members: Vec<SourceEnumMemberPlan>,
     pub(super) diagnostics: Vec<EnumMemberDiagnostic>,
+    pub(super) missing_member_diagnostics: Vec<SourceEnumMissingMemberDiagnostic>,
     pub(super) export_route: SourceEnumExportRoute,
     pub(super) is_const: bool,
     pub(super) is_ambient: bool,
@@ -238,6 +247,92 @@ fn range_contains(parent: &Node, child: &Node) -> bool {
     parent.range.start.get() <= child.range.start.get()
         && child.range.start.get() <= child.range.end.get()
         && child.range.end.get() <= parent.range.end.get()
+}
+
+fn missing_const_enum_member_diagnostic(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    member: NodeRef,
+    initializer: NodeRef,
+    enum_name: &str,
+) -> Option<SourceEnumMissingMemberDiagnostic> {
+    let initializer_record = host.node(initializer)?;
+    if initializer_record.parent != Some(member.node) || initializer_record.flags.0 != 0 {
+        return None;
+    }
+
+    let (receiver, name, member_name) = match &initializer_record.data {
+        NodeData::PropertyAccessExpression(access)
+            if initializer_record.kind == SyntaxKind::PropertyAccessExpression
+                && access.question_dot_token.is_none() =>
+        {
+            let receiver = NodeRef::new(initializer.arena, initializer.file, access.expression);
+            let name = NodeRef::new(initializer.arena, initializer.file, access.name);
+            let name_record = host.node(name)?;
+            let NodeData::Identifier(identifier) = &name_record.data else {
+                return None;
+            };
+            if name_record.kind != SyntaxKind::Identifier
+                || name_record.flags.0 != 0
+                || name_record.parent != Some(initializer.node)
+                || !range_contains(initializer_record, name_record)
+            {
+                return None;
+            }
+            (receiver, name, identifier.text.as_str())
+        }
+        NodeData::ElementAccessExpression(access)
+            if initializer_record.kind == SyntaxKind::ElementAccessExpression
+                && access.question_dot_token.is_none() =>
+        {
+            let receiver = NodeRef::new(initializer.arena, initializer.file, access.expression);
+            let name = NodeRef::new(
+                initializer.arena,
+                initializer.file,
+                access.argument_expression,
+            );
+            let name_record = host.node(name)?;
+            let NodeData::StringLiteral(literal) = &name_record.data else {
+                return None;
+            };
+            if name_record.kind != SyntaxKind::StringLiteral
+                || name_record.flags.0 != 0
+                || name_record.parent != Some(initializer.node)
+                || !range_contains(initializer_record, name_record)
+            {
+                return None;
+            }
+            (receiver, name, literal.text.as_str())
+        }
+        _ => return None,
+    };
+
+    let receiver_record = host.node(receiver)?;
+    let NodeData::Identifier(receiver_name) = &receiver_record.data else {
+        return None;
+    };
+    let owner_record = store.symbol(owner)?;
+    let exports = owner_record
+        .exports()
+        .and_then(|exports| store.symbol_table(exports))?;
+    if receiver_record.kind != SyntaxKind::Identifier
+        || receiver_record.flags.0 != 0
+        || receiver_record.parent != Some(initializer.node)
+        || !range_contains(initializer_record, receiver_record)
+        || receiver_name.text != enum_name
+        || owner_record.flags() != SymbolFlags::CONST_ENUM
+        || owner_record.name().as_utf8() != Some(enum_name)
+        || exports.get_source(member_name).is_some()
+    {
+        return None;
+    }
+
+    Some(SourceEnumMissingMemberDiagnostic {
+        initializer,
+        node: name,
+        arguments: [member_name.to_owned(), format!("typeof {enum_name}")],
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -468,6 +563,7 @@ fn plan_source_enum(
     let mut seen = HashSet::with_capacity(enumeration.members.nodes.len());
     let mut previous_end = None;
     let mut members = Vec::with_capacity(enumeration.members.nodes.len());
+    let mut missing_member_diagnostics = Vec::new();
     for member_id in &enumeration.members.nodes {
         let member = NodeRef::new(declaration.arena, declaration.file, *member_id);
         if !seen.insert(member) {
@@ -555,6 +651,23 @@ fn plan_source_enum(
         let symbol = store.get_merged_symbol(declaration_symbol).ok_or_else(|| {
             invariant(SourceEnumInvariant::InvalidMergedSymbol(declaration_symbol))
         })?;
+        if is_const && let Some(initializer) = member_data.initializer {
+            let initializer = NodeRef::new(member.arena, member.file, initializer);
+            if diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == 2474 && diagnostic.node == initializer)
+                && let Some(diagnostic) = missing_const_enum_member_diagnostic(
+                    store,
+                    host,
+                    owner_symbol,
+                    member,
+                    initializer,
+                    &name_data.text,
+                )
+            {
+                missing_member_diagnostics.push(diagnostic);
+            }
+        }
         members.push(SourceEnumMemberPlan {
             declaration: member,
             name: member_name,
@@ -574,6 +687,7 @@ fn plan_source_enum(
         owner_symbol,
         members,
         diagnostics,
+        missing_member_diagnostics,
         export_route,
         is_const,
         is_ambient,
@@ -1149,6 +1263,88 @@ mod tests {
         assert_eq!(
             materialized.members[1].value,
             enums::CanonicalEnumMemberValue::Computed,
+        );
+    }
+
+    #[test]
+    fn missing_const_enum_members_retain_exact_property_diagnostic_plans() {
+        let mut fixture = fixture(
+            concat!(
+                "const enum Invalid { ",
+                "Existing = 1, ",
+                "Property = Invalid.Missing, ",
+                "Indexed = Invalid['Absent'], ",
+                "Valid = Invalid.Existing, ",
+                "Unknown = missing, ",
+                "}",
+            ),
+            CanonicalModuleState::Script,
+            false,
+        );
+        let declaration = statement(&fixture, 0);
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.type_alias_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        let plan = plan_top_level_enum(&fixture.store, &host, declaration).unwrap();
+
+        assert_eq!(
+            plan.diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [2474, 2474, 2474],
+        );
+        let [property, indexed] = plan.missing_member_diagnostics.as_slice() else {
+            panic!("only missing properties and string indices require TS2339")
+        };
+        assert_eq!(property.arguments, ["Missing", "typeof Invalid"]);
+        assert_eq!(indexed.arguments, ["Absent", "typeof Invalid"]);
+        assert_eq!(
+            fixture.parsed.arena.get(property.node.node).unwrap().kind,
+            SyntaxKind::Identifier,
+        );
+        assert_eq!(
+            fixture.parsed.arena.get(indexed.node.node).unwrap().kind,
+            SyntaxKind::StringLiteral,
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.type_alias_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+        assert!(
+            fixture
+                .store
+                .value_symbol_links(plan.owner_symbol)
+                .is_none()
+        );
+
+        let result = execute_top_level_enum(&mut fixture.store, &host, &plan).unwrap();
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.type_alias_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        assert_eq!(
+            execute_top_level_enum(&mut fixture.store, &host, &plan),
+            Ok(result),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.type_alias_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm,
         );
     }
 

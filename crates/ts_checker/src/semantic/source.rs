@@ -26474,6 +26474,24 @@ fn issue_source_enum_diagnostics(
         } else {
             issue_node_diagnostic(diagnostics, diagnostic.node, diagnostic.code)?;
         }
+        for missing in enumeration
+            .missing_member_diagnostics
+            .iter()
+            .filter(|missing| missing.initializer == diagnostic.node)
+        {
+            merge_retry_diagnostic(
+                diagnostics,
+                CanonicalCheckerDiagnostic {
+                    node: Some(missing.node),
+                    range_override: None,
+                    diagnostic: Diagnostic::with_arguments(
+                        message_by_code(2339).ok_or(SourceCheckError::MissingDiagnostic(2339))?,
+                        missing.arguments.iter().cloned(),
+                    ),
+                    related_information: Vec::new(),
+                },
+            );
+        }
     }
     Ok(())
 }
@@ -51355,6 +51373,57 @@ mod tests {
             context.recheck_source_file(file).unwrap();
             assert_eq!(observable_state(&context, file), warm);
         }
+    }
+
+    #[test]
+    fn missing_const_enum_members_report_initializer_and_property_diagnostics_in_order() {
+        let source = parsed(concat!(
+            "const enum E1 { ",
+            "Existing = 1, ",
+            "Y = E1.Z, ",
+            "Y1 = E1['Z'], ",
+            "Valid = E1.Existing, ",
+            "Unknown = missing, ",
+            "}",
+        ));
+        let file = FileId::new(9_394);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2474, 2339, 2474, 2339, 2474],
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| node_text(&source, diagnostic.node.unwrap()))
+                .collect::<Vec<_>>(),
+            ["E1.Z", "Z", "E1['Z']", "'Z'", "missing"],
+        );
+        for diagnostic in [&diagnostics[1], &diagnostics[3]] {
+            assert_eq!(diagnostic.diagnostic.arguments, ["Z", "typeof E1"]);
+            assert_eq!(
+                diagnostic.diagnostic.render().unwrap(),
+                "Property 'Z' does not exist on type 'typeof E1'.",
+            );
+            let node = diagnostic.node.unwrap();
+            assert!(context.store().type_node_links(node).is_none());
+            assert!(context.store().symbol_node_links(node).is_none());
+        }
+        let owner = global_symbol(&context, "E1");
+        assert!(context.store().declared_type_links(owner).is_some());
+        assert!(context.store().value_symbol_links(owner).is_some());
+        let warm = observable_state(&context, file);
+
+        context.recheck_source_file(file).unwrap();
+
+        assert_eq!(observable_state(&context, file), warm);
     }
 
     #[test]
