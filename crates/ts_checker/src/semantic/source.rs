@@ -16952,14 +16952,19 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 ));
             }
         };
+        let previously_uninitialized = self
+            .assignable_uninitialized_variables
+            .contains(&variable_symbol);
         let repeated = redeclared
-            && self
+            && (self
                 .redeclared_top_level_variables
-                .contains(&variable_symbol);
+                .contains(&variable_symbol)
+                || previously_uninitialized);
         if repeated
             && (!self.prior_variables.contains(&variable_symbol)
                 || !self.readable_variables.contains(&variable_symbol)
-                || !self.assignable_mutable_variables.contains(&variable_symbol))
+                || !self.assignable_mutable_variables.contains(&variable_symbol)
+                    && !previously_uninitialized)
         {
             return Err(SourceCheckError::Variable(
                 VariableInvariant::InvalidSymbolShape(variable_symbol),
@@ -59472,6 +59477,44 @@ mod tests {
         context.recheck_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
         assert_eq!(context.store().value_symbol_links(value).cloned(), links);
+    }
+
+    #[test]
+    fn annotated_top_level_var_redeclarations_accept_later_initializers() {
+        let source = parsed(concat!(
+            "var value: number; ",
+            "var value = 1; ",
+            "const observed = value;",
+        ));
+        let file = FileId::new(8_529);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let value = variable_symbol(&context, &source, file, "value");
+        assert_eq!(
+            context
+                .store()
+                .symbol(value)
+                .and_then(|symbol| symbol.declarations())
+                .map(<[NodeRef]>::len),
+            Some(2),
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(
+            variable_value_type(&context, &source, file, "value"),
+            number
+        );
+        assert_eq!(
+            variable_value_type(&context, &source, file, "observed"),
+            number,
+        );
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, file));
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
     }
 
     #[test]
