@@ -7,7 +7,7 @@
 //! pinned `CompareDiagnostics` sorting policy.
 
 use ts_ast::NodeRef;
-use ts_core::TextRange;
+use ts_core::{TextPos, TextRange};
 use ts_diagnostics::Diagnostic;
 
 /// Selects the upstream missing-name diagnostic for known ambient globals.
@@ -37,18 +37,33 @@ pub struct CanonicalCheckerRelatedInformation {
 ///
 /// Construction alone does not prove ownership because the AST is held by the
 /// production checker and compiler boundaries. Both boundaries validate that
-/// the anchor is the diagnostic's primary node and that the nonempty range is
-/// contained by the anchor and its source file before publishing it.
+/// the anchor is the diagnostic's primary node and that its range is contained
+/// by the anchor and source. Zero-width positions require explicit internal
+/// authorization for grammar diagnostics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CanonicalCheckerDiagnosticRange {
     anchor: NodeRef,
     range: TextRange,
+    allow_empty: bool,
 }
 
 impl CanonicalCheckerDiagnosticRange {
     #[must_use]
     pub const fn new(anchor: NodeRef, range: TextRange) -> Self {
-        Self { anchor, range }
+        Self {
+            anchor,
+            range,
+            allow_empty: false,
+        }
+    }
+
+    #[must_use]
+    pub(super) const fn empty_at(anchor: NodeRef, position: TextPos) -> Self {
+        Self {
+            anchor,
+            range: TextRange::new(position, position),
+            allow_empty: true,
+        }
     }
 
     #[must_use]
@@ -70,7 +85,8 @@ impl CanonicalCheckerDiagnosticRange {
         source_range: TextRange,
     ) -> bool {
         self.anchor == diagnostic_node
-            && self.range.start.get() < self.range.end.get()
+            && (self.range.start.get() < self.range.end.get()
+                || self.allow_empty && self.range.start == self.range.end)
             && source_range.start.get() <= self.range.start.get()
             && self.range.end.get() <= source_range.end.get()
             && anchor_range.start.get() <= self.range.start.get()
@@ -414,6 +430,35 @@ mod tests {
         let primary = Diagnostic::with_arguments(message_by_code(2300).unwrap(), ["target"]);
 
         diagnostics_lookup_at_ranges(first, second, primary);
+    }
+
+    #[test]
+    fn explicit_empty_grammar_ranges_preserve_position_and_reject_foreign_anchors() {
+        let parsed = parse_source_file("let target = 1;");
+        let file = FileId::new(21);
+        let (identifier, record) = parsed
+            .arena
+            .iter()
+            .find(|(_, record)| record.kind == ts_ast::SyntaxKind::Identifier)
+            .unwrap();
+        let anchor = NodeRef::new(parsed.arena.id(), file, identifier);
+        let source = parsed.arena.get(parsed.source_file).unwrap().range;
+        let position = record.range.end;
+        let ordinary =
+            CanonicalCheckerDiagnosticRange::new(anchor, TextRange::new(position, position));
+        let grammar = CanonicalCheckerDiagnosticRange::empty_at(anchor, position);
+        let outside =
+            CanonicalCheckerDiagnosticRange::empty_at(anchor, TextPos::new(position.get() + 1));
+        let foreign = CanonicalCheckerDiagnosticRange::empty_at(
+            NodeRef::new(parsed.arena.id(), FileId::new(22), identifier),
+            position,
+        );
+
+        assert!(!ordinary.is_valid_for(anchor, record.range, source));
+        assert!(grammar.is_valid_for(anchor, record.range, source));
+        assert_eq!(grammar.range(), TextRange::new(position, position));
+        assert!(!outside.is_valid_for(anchor, record.range, source));
+        assert!(!foreign.is_valid_for(anchor, record.range, source));
     }
 
     #[test]

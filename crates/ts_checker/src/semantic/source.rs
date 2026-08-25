@@ -2783,6 +2783,14 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     if is_javascript_file
                         && let Some(symbol) = self.bound.symbol(statement)
                         && let Some(grammar) =
+                            self.plan_javascript_jsdoc_empty_heritage_class(statement, symbol)?
+                    {
+                        statements.push(PlannedStatement::ClassGrammar(grammar));
+                        continue;
+                    }
+                    if is_javascript_file
+                        && let Some(symbol) = self.bound.symbol(statement)
+                        && let Some(grammar) =
                             self.plan_javascript_jsdoc_ambient_heritage_class(statement, symbol)?
                     {
                         statements.push(PlannedStatement::ClassGrammar(grammar));
@@ -11677,6 +11685,118 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     arguments: vec![identifier.text.clone()],
                 },
             ],
+        }))
+    }
+
+    fn plan_javascript_jsdoc_empty_heritage_class(
+        &self,
+        declaration: NodeRef,
+        symbol: SemanticSymbolId,
+    ) -> Result<Option<ClassGrammarDiagnosticPlan>, SourceCheckError> {
+        let Some((store, _)) = self.semantic else {
+            return Ok(None);
+        };
+        if self
+            .bound
+            .source_facts()
+            .is_none_or(|facts| !facts.is_javascript_file() || facts.is_external_module())
+            || self
+                .javascript_jsdoc
+                .as_ref()
+                .and_then(|plan| plan.declaration(declaration))
+                .and_then(PlannedJavaScriptDeclaration::augments_type)
+                .is_none_or(|annotation| !matches!(annotation.type_(), JsDocType::Named(_)))
+        {
+            return Ok(None);
+        }
+
+        let record = self.node(declaration)?;
+        let NodeData::ClassDeclaration(class) = &record.data else {
+            return Ok(None);
+        };
+        let Some(name) = class.name.map(|node| self.reference(node)) else {
+            return Ok(None);
+        };
+        let name_record = self.node(name)?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Ok(None);
+        };
+        let Some(owner) = store.symbol(symbol) else {
+            return Ok(None);
+        };
+        let Some(exports) = owner
+            .exports()
+            .and_then(|exports| store.symbol_table(exports))
+        else {
+            return Ok(None);
+        };
+        let Some(clauses) = class.heritage_clauses.as_ref() else {
+            return Ok(None);
+        };
+        let [clause] = clauses.nodes.as_slice() else {
+            return Ok(None);
+        };
+        let clause = self.reference(*clause);
+        let clause_record = self.node(clause)?;
+        let NodeData::HeritageClause(heritage) = &clause_record.data else {
+            return Ok(None);
+        };
+        if record.kind != SyntaxKind::ClassDeclaration
+            || record.flags.0 != 0
+            || record.parent != Some(self.source.node_ref().node)
+            || class.flow_node.is_some()
+            || class.local_symbol.is_some()
+            || class.symbol.is_some()
+            || class.next_container.is_some()
+            || class.facts != 0
+            || class.modifiers.is_some()
+            || class.type_parameters.is_some()
+            || class.members.has_trailing_comma
+            || !class.members.nodes.is_empty()
+            || class.members.range.end != record.range.end
+            || name_record.kind != SyntaxKind::Identifier
+            || name_record.flags.0 != 0
+            || name_record.parent != Some(declaration.node)
+            || identifier.flow_node.is_some()
+            || owner.flags() != SymbolFlags::CLASS
+            || owner.check_flags() != CheckFlags::NONE
+            || owner.name().as_utf8() != Some(identifier.text.as_str())
+            || owner.declarations() != Some(&[declaration])
+            || owner.value_declaration() != Some(declaration)
+            || owner.members().is_some()
+            || owner.parent().is_some()
+            || owner.export_symbol().is_some()
+            || store.get_merged_symbol(symbol) != Some(symbol)
+            || exports.len() != 1
+            || exports.get_source("prototype").is_none()
+            || clauses.has_trailing_comma
+            || clauses.range != clause_record.range
+            || clause_record.kind != SyntaxKind::HeritageClause
+            || clause_record.flags.0 != 0
+            || clause_record.parent != Some(declaration.node)
+            || heritage.token != SyntaxKind::ExtendsKeyword
+            || heritage.facts != 0
+            || heritage.types.has_trailing_comma
+            || !heritage.types.nodes.is_empty()
+            || heritage.types.range.start != heritage.types.range.end
+            || heritage.types.range.start != clause_record.range.end
+            || !self.source_spelling_matches(clause, "extends")
+        {
+            return Ok(None);
+        }
+
+        Ok(Some(ClassGrammarDiagnosticPlan {
+            declaration,
+            symbol,
+            diagnostics: vec![ClassGrammarDiagnostic {
+                node: clause,
+                range_override: Some(CanonicalCheckerDiagnosticRange::empty_at(
+                    clause,
+                    heritage.types.range.start,
+                )),
+                code: 1097,
+                arguments: vec!["extends".to_owned()],
+            }],
         }))
     }
 
@@ -66280,6 +66400,56 @@ class Foo2 {
                 .and_then(super::super::signatures::Signature::resolved_return_type),
             Some(context.store().intrinsic_bootstrap().unwrap().void_type),
         );
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn javascript_jsdoc_empty_heritage_lists_report_exact_zero_width_grammar_positions() {
+        let text = concat!(
+            "/** @augments X */\nclass C extends {}\n\n",
+            "/** @extends X */\nclass D extends {}",
+        );
+        let source = parse_javascript_source_file(text);
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let file = FileId::new(9_873);
+        let mut context = javascript_context(file, &source, CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 2);
+        for (diagnostic, class) in diagnostics.iter().zip(["C", "D"]) {
+            let expected = format!("class {class} extends");
+            let position = text.find(&expected).unwrap() + expected.len();
+            let node = diagnostic.node.unwrap();
+            let range = diagnostic.range_override.unwrap().range();
+            assert_eq!(diagnostic.diagnostic.code(), 1097);
+            assert_eq!(
+                diagnostic.diagnostic.render().unwrap(),
+                "'extends' list cannot be empty.",
+            );
+            assert_eq!(diagnostic.diagnostic.arguments, ["extends"]);
+            assert_eq!(
+                source.arena.get(node.node).unwrap().kind,
+                SyntaxKind::HeritageClause
+            );
+            assert_eq!(range.start.get() as usize, position);
+            assert_eq!(range.end.get() as usize, position);
+        }
+
+        let (_, bound) = context.file(file).unwrap();
+        for (node, record) in source.arena.iter() {
+            if record.kind != SyntaxKind::ClassDeclaration {
+                continue;
+            }
+            let declaration = NodeRef::new(source.arena.id(), file, node);
+            let symbol = bound.symbol(declaration).unwrap();
+            assert!(context.store().value_symbol_links(symbol).is_none());
+            assert!(context.store().declared_type_links(symbol).is_none());
+        }
 
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();
