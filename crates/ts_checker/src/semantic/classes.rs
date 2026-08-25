@@ -10,9 +10,9 @@
 //! The member transaction adds direct primitive property annotations,
 //! retained readonly state, final instance/static structured caches, and one
 //! default or explicit zero-argument construct signature. The public query
-//! additionally admits one direct local nongeneric base whose own completed
-//! graph is in the same supported family; the whole-source adapter consumes
-//! that graph only after seeing the exact direct base plan earlier in source.
+//! additionally admits one direct local base whose own completed graph is in
+//! the same supported family; plain generic classes can forward their exact
+//! declaration-owned parameters through direct generic heritage.
 //! Empty methods retain their canonical callable identities, including one
 //! authenticated `...args: any[]` rest parameter. Ambient classes also admit
 //! bodyless methods with direct primitive parameter and return annotations,
@@ -488,6 +488,13 @@ pub(super) struct DirectClassBasePlan {
     clause: NodeRef,
     node: NodeRef,
     expression: NodeRef,
+    symbol: SemanticSymbolId,
+    type_arguments: Vec<DirectClassBaseTypeArgument>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DirectClassBaseTypeArgument {
+    node: NodeRef,
     symbol: SemanticSymbolId,
 }
 
@@ -5520,10 +5527,6 @@ fn plan_direct_class_base(
     {
         return Err(invariant(ClassInvariant::InvalidHeritage(node)));
     }
-    if base.type_arguments.is_some() {
-        return Err(unsupported(ClassUnsupported::Heritage(node)));
-    }
-
     let expression = NodeRef::new(declaration.arena, declaration.file, base.expression);
     let expression_record = preflight_node(store, host, expression)?;
     let NodeData::Identifier(identifier) = &expression_record.data else {
@@ -5565,11 +5568,109 @@ fn plan_direct_class_base(
     {
         return Err(unsupported(ClassUnsupported::Heritage(expression)));
     }
+
+    let owner_record = preflight_node(store, host, declaration)?;
+    let NodeData::ClassDeclaration(owner_class) = &owner_record.data else {
+        return Err(invariant(ClassInvariant::InvalidDeclaration(declaration)));
+    };
+    let base_declaration = store
+        .symbol(symbol)
+        .and_then(Symbol::value_declaration)
+        .ok_or_else(|| invariant(ClassInvariant::InvalidHeritage(expression)))?;
+    let base_record = preflight_node(store, host, base_declaration)?;
+    let NodeData::ClassDeclaration(base_class) = &base_record.data else {
+        return Err(unsupported(ClassUnsupported::Heritage(expression)));
+    };
+    let mut type_arguments = Vec::new();
+    if let Some(arguments) = base.type_arguments.as_ref() {
+        let Some(owner_parameters) = owner_class.type_parameters.as_ref() else {
+            return Err(unsupported(ClassUnsupported::Heritage(node)));
+        };
+        let Some(base_parameters) = base_class.type_parameters.as_ref() else {
+            return Err(unsupported(ClassUnsupported::Heritage(node)));
+        };
+        if arguments.has_trailing_comma
+            || arguments.nodes.is_empty()
+            || arguments.nodes.len() != owner_parameters.nodes.len()
+            || arguments.nodes.len() != base_parameters.nodes.len()
+        {
+            return Err(unsupported(ClassUnsupported::Heritage(node)));
+        }
+        type_arguments
+            .try_reserve_exact(arguments.nodes.len())
+            .map_err(|_| invariant(ClassInvariant::Capacity(declaration)))?;
+        for (argument, parameter) in arguments.nodes.iter().zip(&owner_parameters.nodes) {
+            let argument = NodeRef::new(declaration.arena, declaration.file, *argument);
+            let argument_record = preflight_node(store, host, argument)?;
+            let NodeData::TypeReferenceNode(reference) = &argument_record.data else {
+                return Err(unsupported(ClassUnsupported::Heritage(argument)));
+            };
+            let name = NodeRef::new(argument.arena, argument.file, reference.type_name);
+            let name_record = preflight_node(store, host, name)?;
+            let NodeData::Identifier(identifier) = &name_record.data else {
+                return Err(unsupported(ClassUnsupported::Heritage(argument)));
+            };
+            let parameter = NodeRef::new(declaration.arena, declaration.file, *parameter);
+            let parameter_record = preflight_node(store, host, parameter)?;
+            let NodeData::TypeParameterDeclaration(parameter_data) = &parameter_record.data else {
+                return Err(invariant(ClassInvariant::InvalidHeritage(argument)));
+            };
+            let parameter_name = NodeRef::new(parameter.arena, parameter.file, parameter_data.name);
+            let parameter_name_record = preflight_node(store, host, parameter_name)?;
+            let NodeData::Identifier(expected) = &parameter_name_record.data else {
+                return Err(invariant(ClassInvariant::InvalidHeritage(argument)));
+            };
+            let parameter_symbol = bound_symbol(store, host, parameter)
+                .ok_or_else(|| invariant(ClassInvariant::InvalidHeritage(argument)))?;
+            let parameter_type = store
+                .declared_type_links(parameter_symbol)
+                .and_then(|links| links.declared_type);
+            if argument_record.kind != SyntaxKind::TypeReference
+                || argument_record.flags.0 != 0
+                || argument_record.parent != Some(node.node)
+                || argument_record.range.start < arguments.range.start
+                || argument_record.range.end > arguments.range.end
+                || reference.type_arguments.is_some()
+                || name_record.kind != SyntaxKind::Identifier
+                || name_record.flags.0 != 0
+                || name_record.parent != Some(argument.node)
+                || identifier.flow_node.is_some()
+                || identifier.text != expected.text
+                || store.get_parent_of_symbol(parameter_symbol) != Some(owner)
+                || store.type_node_links(argument).is_some_and(|links| {
+                    links != &TypeNodeLinks::default()
+                        && parameter_type.is_none_or(|type_| {
+                            links
+                                != &(TypeNodeLinks {
+                                    resolved_type: Some(type_),
+                                    ..TypeNodeLinks::default()
+                                })
+                        })
+                })
+                || store.symbol_node_links(argument).is_some_and(|links| {
+                    links != &SymbolNodeLinks::default()
+                        && links
+                            != &(SymbolNodeLinks {
+                                resolved_symbol: Some(parameter_symbol),
+                            })
+                })
+            {
+                return Err(unsupported(ClassUnsupported::Heritage(argument)));
+            }
+            type_arguments.push(DirectClassBaseTypeArgument {
+                node: argument,
+                symbol: parameter_symbol,
+            });
+        }
+    } else if base_class.type_parameters.is_some() {
+        return Err(unsupported(ClassUnsupported::Heritage(node)));
+    }
     Ok(DirectClassBasePlan {
         clause,
         node,
         expression,
         symbol,
+        type_arguments,
     })
 }
 
@@ -6717,6 +6818,76 @@ fn plan_class_declaration_modifiers(
     Ok((ambient, abstract_class, Some(local)))
 }
 
+fn validate_plain_class_type_parameters(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    declaration: NodeRef,
+    parameters: &ts_ast::NodeList,
+) -> Result<(), ClassError> {
+    let reject = || unsupported(ClassUnsupported::Generic(declaration));
+    let members = store
+        .symbol(owner)
+        .and_then(Symbol::members)
+        .and_then(|members| store.symbol_table(members))
+        .ok_or_else(reject)?;
+    if parameters.has_trailing_comma || parameters.nodes.is_empty() || parameters.nodes.len() > 4 {
+        return Err(reject());
+    }
+
+    let mut symbols = HashSet::new();
+    symbols
+        .try_reserve(parameters.nodes.len())
+        .map_err(|_| invariant(ClassInvariant::Capacity(declaration)))?;
+    let mut previous_end = parameters.range.start;
+    for parameter in &parameters.nodes {
+        let parameter = NodeRef::new(declaration.arena, declaration.file, *parameter);
+        let record = preflight_node(store, host, parameter)?;
+        let NodeData::TypeParameterDeclaration(data) = &record.data else {
+            return Err(reject());
+        };
+        let name = NodeRef::new(parameter.arena, parameter.file, data.name);
+        let name_record = preflight_node(store, host, name)?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Err(reject());
+        };
+        let symbol = bound_symbol(store, host, parameter).ok_or_else(reject)?;
+        let symbol_record = store.symbol(symbol).ok_or_else(reject)?;
+        if record.kind != SyntaxKind::TypeParameter
+            || record.flags.0 != 0
+            || record.parent != Some(declaration.node)
+            || record.range.start < previous_end
+            || record.range.end > parameters.range.end
+            || data.constraint.is_some()
+            || data.default_type.is_some()
+            || data.expression.is_some()
+            || data.symbol.is_some()
+            || data.modifiers.is_some()
+            || name_record.kind != SyntaxKind::Identifier
+            || name_record.flags.0 != 0
+            || name_record.parent != Some(parameter.node)
+            || identifier.flow_node.is_some()
+            || identifier.text.is_empty()
+            || symbol_record.flags() != SymbolFlags::TYPE_PARAMETER
+            || symbol_record.check_flags() != CheckFlags::NONE
+            || symbol_record.name().as_utf8() != Some(identifier.text.as_str())
+            || symbol_record.declarations() != Some(&[parameter])
+            || symbol_record.value_declaration().is_some()
+            || symbol_record.members().is_some()
+            || symbol_record.exports().is_some()
+            || symbol_record.export_symbol().is_some()
+            || store.get_merged_symbol(symbol) != Some(symbol)
+            || store.get_parent_of_symbol(symbol) != Some(owner)
+            || members.get_source(&identifier.text) != Some(symbol)
+            || !symbols.insert(symbol)
+        {
+            return Err(reject());
+        }
+        previous_end = record.range.end;
+    }
+    Ok(())
+}
+
 /// Produces the opaque syntax/binder proof consumed by the class shell
 /// executor and the root annotation adapter.
 fn plan_class_declaration(
@@ -6788,8 +6959,10 @@ fn plan_class_declaration(
                     && !facts.is_javascript_file()
             })
         });
-    if class.type_parameters.is_some() && !exported_ambient_declaration {
-        return Err(unsupported(ClassUnsupported::Generic(declaration)));
+    if let Some(parameters) = class.type_parameters.as_ref()
+        && !exported_ambient_declaration
+    {
+        validate_plain_class_type_parameters(store, host, symbol, declaration, parameters)?;
     }
     if symbol_record.flags() != SymbolFlags::CLASS && class.heritage_clauses.is_some() {
         return Err(unsupported(ClassUnsupported::MergedDeclarations(symbol)));
@@ -7224,8 +7397,13 @@ fn plan_class_declaration(
 
     let local_arity =
         preflight_class_or_interface_reference(store, host, symbol, SymbolFlags::CLASS)?;
-    if local_arity != 0 && !exported_ambient_declaration {
-        return Err(unsupported(ClassUnsupported::Generic(declaration)));
+    if local_arity
+        != class
+            .type_parameters
+            .as_ref()
+            .map_or(0, |parameters| parameters.nodes.len())
+    {
+        return Err(invariant(ClassInvariant::InvalidOwnerSymbol(symbol)));
     }
     let instance_table = instance_members.and_then(|table| store.symbol_table(table));
     let expected_instance_members = instance_properties
@@ -15065,6 +15243,54 @@ fn exact_derived_super_call_state(
             })
 }
 
+fn forwarded_class_base_instance(
+    store: &CanonicalTypeMapperStore,
+    plan: &DirectClassBasePlan,
+    owner_instance: TypeId,
+    base_instance: TypeId,
+) -> Option<TypeId> {
+    if plan.type_arguments.is_empty() {
+        return Some(base_instance);
+    }
+    let TypeData::Interface(owner) = store.type_payload(owner_instance)?.data() else {
+        return None;
+    };
+    let arguments = owner.reference.resolved_type_arguments.as_deref()?;
+    if arguments.len() != plan.type_arguments.len()
+        || plan
+            .type_arguments
+            .iter()
+            .zip(arguments)
+            .any(|(argument, type_)| {
+                store
+                    .declared_type_links(argument.symbol)
+                    .and_then(|links| links.declared_type)
+                    != Some(*type_)
+                    || store.type_node_links(argument.node)
+                        != Some(&TypeNodeLinks {
+                            resolved_type: Some(*type_),
+                            ..TypeNodeLinks::default()
+                        })
+                    || store.symbol_node_links(argument.node)
+                        != Some(&SymbolNodeLinks {
+                            resolved_symbol: Some(argument.symbol),
+                        })
+            })
+    {
+        return None;
+    }
+    let TypeData::Interface(base) = store.type_payload(base_instance)?.data() else {
+        return None;
+    };
+    let TypeCacheState::Allocated(instantiations) = &base.reference.object.instantiations else {
+        return None;
+    };
+    let reference = instantiations.get(&type_list_key(arguments)).copied()?;
+    let validated = validate_direct_generic_reference(store, reference).ok()?;
+    (validated.target == base_instance && validated.type_arguments.as_slice() == arguments)
+        .then_some(reference)
+}
+
 fn completed_derived_class_members(
     store: &CanonicalTypeMapperStore,
     plan: &ClassMemberPlan,
@@ -15074,6 +15300,8 @@ fn completed_derived_class_members(
     surfaces: &DerivedMemberSurfaces,
 ) -> Option<ClassMembers> {
     let base_plan = plan.class.base.as_ref()?;
+    let base_instance =
+        forwarded_class_base_instance(store, base_plan, instance_type, base.shells.instance_type)?;
     let instance = exact_instance_identity(store, &plan.class, instance_type)?;
     if store
         .declared_type_links(plan.class.symbol)
@@ -15081,7 +15309,7 @@ fn completed_derived_class_members(
         != Some(instance_type)
         || !instance.base_types_resolved
         || instance.resolved_base_constructor_type != Some(base.shells.value_type)
-        || instance.resolved_base_types.as_deref() != Some(&[base.shells.instance_type][..])
+        || instance.resolved_base_types.as_deref() != Some(&[base_instance][..])
         || !instance.declared_members_resolved
         || instance.declared_members != plan.class.instance_members
         || instance.declared_call_signatures.is_some()
@@ -16735,6 +16963,16 @@ fn execute_direct_derived_class_members(
     {
         return Ok(members);
     }
+    let base_heritage = plan
+        .class
+        .base
+        .as_ref()
+        .ok_or_else(|| invariant(ClassInvariant::InvalidHeritage(plan.class.declaration)))?;
+    if !base_heritage.type_arguments.is_empty() && base_state.is_none() {
+        return Err(unsupported(ClassUnsupported::Heritage(
+            base_heritage.expression,
+        )));
+    }
     let parameter_property = plan
         .class
         .constructor
@@ -16907,12 +17145,18 @@ fn execute_direct_derived_class_members(
     });
     let missing_super_call_type_node_links =
         usize::from(super_call.is_some_and(|call| store.type_node_links(call).is_none()));
+    let missing_generic_base_type_node_links = base_heritage
+        .type_arguments
+        .iter()
+        .filter(|argument| store.type_node_links(argument.node).is_none())
+        .count();
     let missing_type_node_links = missing_property_type_node_links
         .checked_add(missing_method_type_node_links)
         .and_then(|count| count.checked_add(missing_method_body_type_node_links))
         .and_then(|count| count.checked_add(missing_base_constructor_type_node_links))
         .and_then(|count| count.checked_add(missing_constructor_property_type_node_links))
         .and_then(|count| count.checked_add(missing_super_call_type_node_links))
+        .and_then(|count| count.checked_add(missing_generic_base_type_node_links))
         .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
     let missing_property_value_links = plan
         .class
@@ -17009,8 +17253,14 @@ fn execute_direct_derived_class_members(
         })
         .filter(|node| store.symbol_node_links(*node).is_none())
         .count();
+    let missing_generic_base_symbol_links = base_heritage
+        .type_arguments
+        .iter()
+        .filter(|argument| store.symbol_node_links(argument.node).is_none())
+        .count();
     let missing_symbol_links = missing_constructor_property_symbol_links
         .checked_add(missing_method_body_symbol_links)
+        .and_then(|count| count.checked_add(missing_generic_base_symbol_links))
         .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
     let method_count = plan
         .class
@@ -17018,8 +17268,19 @@ fn execute_direct_derived_class_members(
         .len()
         .checked_add(base_plan.class.methods.len())
         .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
+    let owner_arity =
+        preflight_class_or_interface_reference(store, host, plan.class.symbol, SymbolFlags::CLASS)?;
+    let base_arity = preflight_class_or_interface_reference(
+        store,
+        host,
+        base_plan.class.symbol,
+        SymbolFlags::CLASS,
+    )?;
     let type_count = method_count
         .checked_add(6)
+        .and_then(|count| count.checked_add(owner_arity))
+        .and_then(|count| count.checked_add(base_arity))
+        .and_then(|count| count.checked_add(usize::from(!base_heritage.type_arguments.is_empty())))
         .and_then(|count| {
             plan.class
                 .properties
@@ -17037,7 +17298,13 @@ fn execute_direct_derived_class_members(
         .checked_add(2)
         .ok_or_else(|| invariant(ClassInvariant::Capacity(plan.class.declaration)))?;
     prepare_class_literal_types(store, plan, Some(base_plan))?;
+    let generic_base_capacity = base_state
+        .as_ref()
+        .filter(|_| !base_heritage.type_arguments.is_empty())
+        .map(|base| store.try_reserve_object_instantiations(base.shells.instance_type, 1))
+        .unwrap_or(true);
     if !store.try_reserve_types(type_count)
+        || !generic_base_capacity
         || !store.try_reserve_signatures(signature_count)
         || !store.try_reserve_checker_symbol_allocations(
             0,
@@ -17064,9 +17331,39 @@ fn execute_direct_derived_class_members(
     let instance_type = store
         .get_declared_type_of_symbol(host, plan.class.symbol)
         .expect("the aggregate class preflight made derived identity publication infallible");
+    let type_parameters = match store.type_payload(instance_type).map(TypeRecord::data) {
+        Some(TypeData::Interface(instance)) => instance
+            .reference
+            .resolved_type_arguments
+            .clone()
+            .expect("an authenticated generic class retains its exact type arguments"),
+        _ => unreachable!("an authenticated class retains its declared instance identity"),
+    };
     let value_type = store
         .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(plan.class.symbol))
         .expect("the aggregate class transaction reserved the derived value type");
+    let resolved_base_instance = if base_heritage.type_arguments.is_empty() {
+        base.shells.instance_type
+    } else {
+        for (argument, type_) in base_heritage.type_arguments.iter().zip(&type_parameters) {
+            assert!(store.set_type_node_links(
+                argument.node,
+                TypeNodeLinks {
+                    resolved_type: Some(*type_),
+                    ..TypeNodeLinks::default()
+                },
+            ));
+            assert!(store.set_symbol_node_links(
+                argument.node,
+                SymbolNodeLinks {
+                    resolved_symbol: Some(argument.symbol),
+                },
+            ));
+        }
+        store
+            .create_direct_generic_reference_type(base.shells.instance_type, &type_parameters)
+            .expect("the aggregate class transaction reserved its forwarded base reference")
+    };
     let instance_members = prepared_instance_members.map(|prepared| {
         let table = store.alloc_prepared_symbol_table(prepared);
         for (name, symbol) in insertion_instance_entries {
@@ -17099,7 +17396,7 @@ fn execute_direct_derived_class_members(
                     SignatureFlags::NONE
                 },
             constructor_declaration,
-            Vec::new(),
+            type_parameters,
             None,
             constructor_parameters,
             Some(instance_type),
@@ -17113,7 +17410,7 @@ fn execute_direct_derived_class_members(
         )
         .expect("the aggregate class transaction reserved the derived signature");
     construct_signatures.push(default_construct_signature);
-    resolved_base_types.push(base.shells.instance_type);
+    resolved_base_types.push(resolved_base_instance);
 
     // Pinned `getTypeOfFuncClassEnumModuleWorker` allocates the value shell
     // before forcing the base-constructor cache.
@@ -20190,13 +20487,30 @@ fn validate_stored_derived_class(
         return None;
     }
     let base = validate_stored_no_base_class(store, provenance.base_instance_type)?;
+    let [resolved_base] = parts.instance.resolved_base_types.as_deref()? else {
+        return None;
+    };
+    let resolved_base_valid = if *resolved_base == provenance.base_instance_type {
+        true
+    } else {
+        validate_direct_generic_reference(store, *resolved_base)
+            .ok()
+            .is_some_and(|reference| {
+                reference.target == provenance.base_instance_type
+                    && parts
+                        .instance
+                        .reference
+                        .resolved_type_arguments
+                        .as_deref()
+                        .is_some_and(|arguments| reference.type_arguments.as_slice() == arguments)
+            })
+    };
     if base.parts.symbol != provenance.base_symbol
         || base.parts.value_type != provenance.base_value_type
         || base.parts.index.is_some()
         || !parts.instance.base_types_resolved
         || parts.instance.resolved_base_constructor_type != Some(provenance.base_value_type)
-        || parts.instance.resolved_base_types.as_deref()
-            != Some(&[provenance.base_instance_type][..])
+        || !resolved_base_valid
     {
         return None;
     }
@@ -26553,6 +26867,314 @@ mod tests {
     }
 
     #[test]
+    fn plain_generic_classes_preserve_type_parameters_private_fields_and_abstract_signatures() {
+        for (source, abstract_class) in [
+            ("class Model<Value> { value: string; #secret = 1; }", false),
+            (
+                "abstract class Model<Value> { abstract value: string; #secret = 1; }",
+                true,
+            ),
+        ] {
+            let mut fixture = fixture(source);
+            let owner = class_symbol(&fixture, "Model");
+            let declaration = class_node(&fixture, "Model");
+            let bound = &fixture.files[&fixture.file];
+            let host = host(&fixture.parsed.arena, bound);
+            let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner).unwrap();
+            let ClassMemberQueryPlan::Direct(class) = &plan else {
+                panic!("a generic class without heritage retains one direct plan")
+            };
+            let private = class.class.instance_properties[1].symbol;
+
+            let members =
+                execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan).unwrap();
+
+            let instance = fixture
+                .store
+                .type_payload(members.shells().instance_type())
+                .unwrap();
+            let TypeData::Interface(instance) = instance.data() else {
+                panic!("the generic class retains its canonical interface origin")
+            };
+            let [parameter] = instance
+                .reference
+                .resolved_type_arguments
+                .as_deref()
+                .unwrap()
+            else {
+                panic!("the generic class retains one declaration-owned type parameter")
+            };
+            let parameter_symbol = fixture
+                .store
+                .type_payload(*parameter)
+                .unwrap()
+                .symbol()
+                .unwrap();
+            assert_eq!(
+                fixture.store.get_parent_of_symbol(parameter_symbol),
+                Some(owner)
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .symbol(parameter_symbol)
+                    .unwrap()
+                    .name()
+                    .as_utf8(),
+                Some("Value"),
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .signature(members.default_construct_signature())
+                    .unwrap()
+                    .type_parameters(),
+                &[*parameter],
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .signature(members.default_construct_signature())
+                    .unwrap()
+                    .flags(),
+                SignatureFlags::CONSTRUCT
+                    | if abstract_class {
+                        SignatureFlags::ABSTRACT
+                    } else {
+                        SignatureFlags::NONE
+                    },
+            );
+            assert_eq!(
+                authenticated_private_class_symbol_name(&fixture.store, owner, private),
+                Some("#secret"),
+            );
+            assert_eq!(plan.declaration(), declaration);
+            assert_eq!(
+                validate_class_heritage_members(&fixture.store, members.shells().instance_type()),
+                ClassHeritageMembersValidation::Valid,
+            );
+            let warm = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            assert_eq!(
+                execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan),
+                Ok(members),
+                "{source}",
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                warm,
+                "{source}",
+            );
+        }
+    }
+
+    #[test]
+    fn generic_derived_classes_forward_their_exact_type_parameter_into_base_heritage() {
+        let mut fixture = fixture(concat!(
+            "class Base<Value> { inherited: string; } ",
+            "class Derived<Value> extends Base<Value> { #secret = 1; }",
+        ));
+        let base_owner = class_symbol(&fixture, "Base");
+        let owner = class_symbol(&fixture, "Derived");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let base_plan = plan_nongeneric_class_member_query(&fixture.store, &host, base_owner)
+            .expect("the generic base retains its declaration-owned type parameter");
+        let plan = plan_nongeneric_class_member_query(&fixture.store, &host, owner)
+            .expect("the derived class forwards its exact declaration-owned type parameter");
+        let ClassMemberQueryPlan::Derived { class, .. } = &plan else {
+            panic!("the generic class retains one direct generic base")
+        };
+        let [argument] = class.class.base.as_ref().unwrap().type_arguments.as_slice() else {
+            panic!("the generic heritage retains one authenticated type argument")
+        };
+        let argument = *argument;
+        let cold = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        assert!(matches!(
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan),
+            Err(ClassError::Unsupported(ClassUnsupported::Heritage(_))),
+        ));
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            cold,
+        );
+
+        let base =
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &base_plan).unwrap();
+        let members =
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan).unwrap();
+
+        let instance = fixture
+            .store
+            .type_payload(members.shells().instance_type())
+            .unwrap();
+        let TypeData::Interface(instance) = instance.data() else {
+            panic!("the derived class retains its canonical generic origin")
+        };
+        let [parameter] = instance
+            .reference
+            .resolved_type_arguments
+            .as_deref()
+            .unwrap()
+        else {
+            panic!("the derived class retains one type parameter")
+        };
+        let [base_reference] = instance.resolved_base_types.as_deref().unwrap() else {
+            panic!("the derived class retains one instantiated generic base")
+        };
+        let validated = validate_direct_generic_reference(&fixture.store, *base_reference).unwrap();
+        assert_eq!(validated.target, base.shells().instance_type());
+        assert_eq!(validated.type_arguments, vec![*parameter]);
+        assert_eq!(
+            fixture.store.type_node_links(argument.node),
+            Some(&TypeNodeLinks {
+                resolved_type: Some(*parameter),
+                ..TypeNodeLinks::default()
+            }),
+        );
+        assert_eq!(
+            fixture.store.symbol_node_links(argument.node),
+            Some(&SymbolNodeLinks {
+                resolved_symbol: Some(argument.symbol),
+            }),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .signature(members.default_construct_signature())
+                .unwrap()
+                .type_parameters(),
+            &[*parameter],
+        );
+        assert_eq!(
+            validate_class_heritage_members(&fixture.store, members.shells().instance_type()),
+            ClassHeritageMembersValidation::Valid,
+        );
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        assert_eq!(
+            execute_nongeneric_class_member_query(&mut fixture.store, &host, &plan),
+            Ok(members),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn generic_classes_reject_unsupported_constraints_and_forged_heritage_arguments() {
+        for (source, name) in [
+            ("class Model<Value extends string> {}", "Model"),
+            ("class Model<Value = string> {}", "Model"),
+            (
+                "class Base<Value> {} class Derived<Value> extends Base<string> {}",
+                "Derived",
+            ),
+            (
+                "class Base<First, Second> {} class Derived<Value> extends Base<Value> {}",
+                "Derived",
+            ),
+        ] {
+            let fixture = fixture(source);
+            let owner = class_symbol(&fixture, name);
+            let bound = &fixture.files[&fixture.file];
+            let host = host(&fixture.parsed.arena, bound);
+            let cold = (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+
+            assert!(
+                plan_nongeneric_class_member_query(&fixture.store, &host, owner).is_err(),
+                "{source}",
+            );
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.signature_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                cold,
+                "{source}",
+            );
+            assert!(fixture.store.declared_type_links(owner).is_none());
+            assert!(fixture.store.value_symbol_links(owner).is_none());
+        }
+
+        let mut fixture = fixture(concat!(
+            "class Base<Value> {} ",
+            "class Derived<Value> extends Base<Value> {}",
+        ));
+        let owner = class_symbol(&fixture, "Derived");
+        let argument = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::TypeReference).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let wrong = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        assert!(fixture.store.set_type_node_links(
+            argument,
+            TypeNodeLinks {
+                resolved_type: Some(wrong),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let poisoned = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        assert!(plan_nongeneric_class_member_query(&fixture.store, &host, owner).is_err());
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            poisoned,
+        );
+        assert!(fixture.store.declared_type_links(owner).is_none());
+        assert!(fixture.store.value_symbol_links(owner).is_none());
+    }
+
+    #[test]
     fn merged_null_base_super_call_preserves_exact_diagnostics_without_publication() {
         let fixture = fixture(concat!(
             "interface Base {}\n",
@@ -28732,7 +29354,7 @@ mod tests {
     #[test]
     fn unsupported_class_families_are_typed_and_do_not_publish_shells() {
         let cases = [
-            ("class Generic<T> {}", "Generic"),
+            ("class Generic<T extends string> {}", "Generic"),
             ("class Base {} class Derived extends Base {}", "Derived"),
             ("class Method { method(): void { return; } }", "Method"),
             ("class Initialized { value = () => 1; }", "Initialized"),
