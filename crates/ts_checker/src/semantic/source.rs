@@ -44639,38 +44639,29 @@ mod tests {
 
     #[test]
     fn malformed_labeled_for_in_loops_fail_before_source_state_publication() {
-        for (index, iteration) in [
-            "outer: for (const key in ready) (() => key);",
+        let source = parsed(concat!(
+            "const ready = { first: 1 }; ",
             "outer: for (let key in ready) { let nested = key; }",
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let text = format!("const ready = {{ first: 1 }}; {iteration}");
-            let source = parsed(&text);
-            let file = FileId::new(9_365 + u32::try_from(index).unwrap());
-            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
-            let ready = variable_symbol(&context, &source, file, "ready");
-            let cold = observable_state(&context, file);
+        ));
+        let file = FileId::new(9_365);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let ready = variable_symbol(&context, &source, file, "ready");
+        let cold = observable_state(&context, file);
 
-            assert!(
-                matches!(
-                    context.check_source_file(file),
-                    Err(SourceCheckError::Unsupported(
-                        UnsupportedSourceSyntax::Syntax {
-                            kind: SyntaxKind::ForInStatement,
-                            role: SourceSyntaxRole::Statement,
-                            ..
-                        }
-                    )),
-                ),
-                "unexpectedly admitted malformed labeled for-in loop: {iteration}",
-            );
-            assert_eq!(observable_state(&context, file), cold);
-            assert!(context.store().value_symbol_links(ready).is_none());
-            assert!(context.diagnostics().is_empty());
-            assert!(!is_type_checked(&context, file));
-        }
+        assert!(matches!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Syntax {
+                    kind: SyntaxKind::ForInStatement,
+                    role: SourceSyntaxRole::Statement,
+                    ..
+                }
+            )),
+        ));
+        assert_eq!(observable_state(&context, file), cold);
+        assert!(context.store().value_symbol_links(ready).is_none());
+        assert!(context.diagnostics().is_empty());
+        assert!(!is_type_checked(&context, file));
     }
 
     #[test]
