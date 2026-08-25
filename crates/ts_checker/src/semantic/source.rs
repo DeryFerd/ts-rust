@@ -26373,16 +26373,14 @@ fn strict_arguments_failure(error: SourceCheckError) -> Option<StrictArgumentsFa
             Some(StrictArgumentsFailure::Arrow(node))
         }
         SourceCheckError::DeclaredType(DeclaredTypeError::TypeNodeUnavailable(
-            TypeNodeUnavailable::UnsupportedSyntax { node, kind },
-        )) if matches!(
-            kind,
-            SyntaxKind::CallSignature
-                | SyntaxKind::ConstructSignature
-                | SyntaxKind::MethodSignature
-        ) =>
-        {
-            Some(StrictArgumentsFailure::Signature(node))
-        }
+            TypeNodeUnavailable::UnsupportedSyntax {
+                node,
+                kind:
+                    SyntaxKind::CallSignature
+                    | SyntaxKind::ConstructSignature
+                    | SyntaxKind::MethodSignature,
+            },
+        )) => Some(StrictArgumentsFailure::Signature(node)),
         _ => None,
     }
 }
@@ -26800,7 +26798,7 @@ fn issue_strict_arguments_assignment_diagnostic(
         .number_type;
     let arguments = global_types.arguments_type;
     session.reset_query();
-    if source_type_is_assignable_to(
+    let assignable = match source_type_is_assignable_to(
         store,
         host,
         global_types,
@@ -26809,7 +26807,44 @@ fn issue_strict_arguments_assignment_diagnostic(
         diagnostics,
         number,
         arguments,
-    )? {
+    ) {
+        Err(SourceCheckError::RelationUnavailable(
+            RelationUnavailable::UnresolvedStructuredMembers(unresolved),
+        )) if unresolved == arguments => {
+            let symbol = store
+                .type_payload(arguments)
+                .and_then(TypeRecord::symbol)
+                .ok_or(RelationUnavailable::UnresolvedStructuredMembers(arguments))?;
+            session.reset_query();
+            let mut resolution_diagnostics = CanonicalCheckerDiagnostics::default();
+            let resolved = CanonicalTypeQuery::new_with_global_types_and_session(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                &mut resolution_diagnostics,
+            )
+            .and_then(|mut query| query.get_declared_type_of_symbol(symbol));
+            merge_retry_diagnostics(diagnostics, resolution_diagnostics);
+            if resolved? != arguments {
+                return Err(RelationUnavailable::InvalidStructuredMembers(arguments).into());
+            }
+            session.reset_query();
+            source_type_is_assignable_to(
+                store,
+                host,
+                global_types,
+                options,
+                session,
+                diagnostics,
+                number,
+                arguments,
+            )?
+        }
+        result => result?,
+    };
+    if assignable {
         return Ok(());
     }
 
