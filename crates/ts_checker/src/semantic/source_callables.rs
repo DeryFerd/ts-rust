@@ -7930,16 +7930,14 @@ fn publish_prepared_contextual_source_callable(
             prepared.declaration,
         )));
     }
-    let Some(bootstrap) = store.intrinsic_bootstrap() else {
+    if store.intrinsic_bootstrap().is_none() {
         return Err(invariant(SourceCallableInvariant::Publication(
             prepared.declaration,
         )));
-    };
-    if (!property_anchor && !direct_call_anchor && prepared.return_type != bootstrap.void_type)
-        || (property_anchor || direct_call_anchor)
-            && store
-                .validate_cached_array_capability(prepared.return_type)
-                .is_err()
+    }
+    if store
+        .validate_cached_array_capability(prepared.return_type)
+        .is_err()
         || !store.try_reserve_types(1)
         || !store.try_reserve_signatures(1)
         || !store.try_reserve_source_callable_provenance(1)
@@ -9518,23 +9516,15 @@ pub(super) fn validate_stored_source_callable(
                 store.source_contextual_callable_anchor_is_exact(declaration, owner_symbol, anchor)
             },
         );
-        let property_anchor = anchor_valid
-            && variable.is_some_and(|anchor| {
-                store
-                    .symbol(anchor)
-                    .is_some_and(|symbol| symbol.flags() == SymbolFlags::PROPERTY)
-            });
         let return_type = signature_record.resolved_return_type();
-        let return_valid = store.intrinsic_bootstrap().is_some_and(|bootstrap| {
-            return_type.is_some_and(|return_type| {
-                (property_anchor || direct_call_anchor)
-                    && store.validate_cached_array_capability(return_type).is_ok()
-                    || !property_anchor && !direct_call_anchor && return_type == bootstrap.void_type
-            }) && store
+        let return_valid = store.intrinsic_bootstrap().is_some()
+            && return_type.is_some_and(|return_type| {
+                store.validate_cached_array_capability(return_type).is_ok()
+            })
+            && store
                 .function_signature_return_annotation(signature)
                 .is_none()
-                && !store.signature_has_circular_return_type(signature)
-        });
+            && !store.signature_has_circular_return_type(signature);
         let target_valid = target != type_
             && if direct_call_anchor {
                 signature_record.flags() == SignatureFlags::NONE
@@ -13788,6 +13778,88 @@ mod tests {
         )
         .unwrap();
         assert!(plan_source_callable(&fixture.store, &host, declaration, owner, None).is_ok());
+        assert_eq!(publication_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn contextual_variable_arrow_preserves_nonvoid_return_and_replays_warm() {
+        let mut fixture = QueryFixture::new(
+            "const callback: (value: string) => string = value => value;",
+            FileId::new(1_219),
+        );
+        let (variable, target_node, declaration) = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::VariableDeclaration(variable) = &record.data else {
+                    return None;
+                };
+                Some((
+                    NodeRef::new(fixture.parsed.arena.id(), fixture.file, node),
+                    NodeRef::new(fixture.parsed.arena.id(), fixture.file, variable.type_?),
+                    NodeRef::new(
+                        fixture.parsed.arena.id(),
+                        fixture.file,
+                        variable.initializer?,
+                    ),
+                ))
+            })
+            .unwrap();
+        let NodeData::ArrowFunction(arrow) =
+            &fixture.parsed.arena.get(declaration.node).unwrap().data
+        else {
+            panic!("expected a contextually typed arrow")
+        };
+        let [parameter] = arrow.parameters.nodes.as_slice() else {
+            panic!("expected one contextual arrow parameter")
+        };
+        let parameter = NodeRef::new(declaration.arena, declaration.file, *parameter);
+        let owner = fixture.bound.symbol(declaration).unwrap();
+        let variable = fixture.bound.symbol(variable).unwrap();
+        let parameter_symbol = fixture.bound.symbol(parameter).unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let target = fixture
+            .query_type_node(target_node, &mut diagnostics)
+            .unwrap();
+        let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        let prepared = PreparedContextualSourceCallable {
+            declaration,
+            owner_symbol: owner,
+            variable_symbol: variable,
+            contextual_target: target,
+            parameters: vec![ContextualSourceCallableParameter {
+                declaration: parameter,
+                symbol: parameter_symbol,
+                type_: string,
+            }],
+            flags: SignatureFlags::NONE,
+            min_argument_count: 1,
+            return_type: string,
+        };
+
+        let callable = publish_contextual_source_callable(&mut fixture.store, &prepared).unwrap();
+        let provenance = fixture.store.source_callable_provenance(callable).unwrap();
+        assert_eq!(provenance.contextual_target, Some(target));
+        assert_eq!(provenance.contextual_variable, Some(variable));
+        assert_eq!(
+            fixture
+                .store
+                .signature(provenance.signature)
+                .and_then(super::super::signatures::Signature::resolved_return_type),
+            Some(string),
+        );
+        assert!(matches!(
+            validate_stored_source_callable(&fixture.store, callable),
+            StoredSourceCallableValidation::Valid(_)
+        ));
+
+        let warm = publication_state(&fixture.store);
+        assert_eq!(
+            publish_contextual_source_callable(&mut fixture.store, &prepared),
+            Ok(callable),
+        );
         assert_eq!(publication_state(&fixture.store), warm);
         assert!(diagnostics.is_empty());
     }

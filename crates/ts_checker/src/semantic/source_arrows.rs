@@ -2,11 +2,11 @@
 //!
 //! The installed path proves an unannotated top-level declaration of the form
 //! `var|let|const name = (parameters): Return => body`. A separate read-only
-//! contextual planner proves `name: Context = (parameters) => {}` without
-//! resolving `Context` or fabricating parameter types. Both retain the ordinary
-//! variable symbol separately from the binder's anonymous FUNCTION owner and
-//! preserve the export route when present. Publication remains deferred to
-//! source dispatch.
+//! contextual planner proves `name: Context = (parameters) => body` for empty,
+//! concise, and single-return bodies without resolving `Context` or fabricating
+//! parameter types. Both retain the ordinary variable symbol separately from
+//! the binder's anonymous FUNCTION owner and preserve the export route when
+//! present. Publication remains deferred to source dispatch.
 
 use std::collections::HashSet;
 
@@ -73,10 +73,20 @@ pub(super) struct SourceContextualParameterPlan {
     pub(super) request: SourceContextualParameterRequest,
 }
 
-/// The only inferred-return shape admitted by the first contextual cut.
+/// The bounded inferred-return shapes admitted by contextual source arrows.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SourceContextualReturnOrigin {
-    InferredEmptyBody { block: NodeRef },
+    InferredEmptyBody {
+        block: NodeRef,
+    },
+    InferredConciseExpression {
+        expression: NodeRef,
+    },
+    InferredReturnExpression {
+        block: NodeRef,
+        statement: NodeRef,
+        expression: NodeRef,
+    },
 }
 
 /// Immutable syntax/binder proof for a context-sensitive arrow initializer.
@@ -440,7 +450,7 @@ fn plan_contextual_target_syntax_shape(
     host: &DeclaredTypeHost<'_>,
     type_node: NodeRef,
     array_targets: Option<CanonicalArrayTargets>,
-) -> Result<SourceContextualSignatureShape, SourceContextualArrowError> {
+) -> Result<(SourceContextualSignatureShape, NodeRef), SourceContextualArrowError> {
     let (function, alias) =
         contextual_function_type_syntax(store, host, type_node, None, &mut HashSet::new())?;
     let function_record = preflight_node(store, host, function)?;
@@ -460,17 +470,37 @@ fn plan_contextual_target_syntax_shape(
         }
     };
     let return_record = preflight_node(store, host, return_type)?;
-    if return_record.kind != SyntaxKind::VoidKeyword {
+    if !matches!(
+        return_record.kind,
+        SyntaxKind::VoidKeyword
+            | SyntaxKind::StringKeyword
+            | SyntaxKind::NumberKeyword
+            | SyntaxKind::BooleanKeyword
+            | SyntaxKind::BigIntKeyword
+            | SyntaxKind::AnyKeyword
+            | SyntaxKind::UnknownKeyword
+            | SyntaxKind::NeverKeyword
+            | SyntaxKind::UndefinedKeyword
+            | SyntaxKind::ObjectKeyword
+            | SyntaxKind::LiteralType
+            | SyntaxKind::TypeLiteral
+            | SyntaxKind::TypeReference
+            | SyntaxKind::ParenthesizedType
+            | SyntaxKind::UnionType
+    ) {
         return Err(contextual_unsupported(
             SourceContextualArrowUnsupported::ContextualTargetSyntax(return_type),
         ));
     }
-    Ok(SourceContextualSignatureShape {
-        call_signature_count: 1,
-        type_parameter_count: 0,
-        parameter_count,
-        has_effective_rest: false,
-    })
+    Ok((
+        SourceContextualSignatureShape {
+            call_signature_count: 1,
+            type_parameter_count: 0,
+            parameter_count,
+            has_effective_rest: false,
+        },
+        return_type,
+    ))
 }
 
 #[allow(clippy::too_many_lines)] // Keep one declared-call syntax and ownership proof atomic.
@@ -969,7 +999,7 @@ pub(super) fn plan_contextual_source_arrow(
             SourceContextualArrowInvariant::InvalidVariableType(type_node),
         ));
     }
-    let contextual_signature_shape =
+    let (contextual_signature_shape, contextual_return_type) =
         plan_contextual_target_syntax_shape(store, host, type_node, array_targets)?;
 
     let Some(initializer_id) = declaration.initializer else {
@@ -1289,29 +1319,81 @@ pub(super) fn plan_contextual_source_arrow(
 
     let body = NodeRef::new(initializer.arena, initializer.file, arrow.body);
     let body_record = preflight_node(store, host, body)?;
-    let NodeData::Block(block) = &body_record.data else {
-        return Err(contextual_unsupported(
-            SourceContextualArrowUnsupported::NonEmptyBody(body),
-        ));
-    };
-    if body_record.kind != SyntaxKind::Block
-        || body_record.parent != Some(initializer.node)
+    if body_record.parent != Some(initializer.node)
         || !range_contains(initializer_record.range, body_record.range)
         || body_record.flags.0 != 0
-        || block.flow_node.is_some()
-        || block.next_container.is_some()
-        || block.statements.has_trailing_comma
-        || block.facts != 0
     {
         return Err(contextual_invariant(
             SourceContextualArrowInvariant::InvalidBody(body),
         ));
     }
-    if !block.statements.nodes.is_empty() {
-        return Err(contextual_unsupported(
-            SourceContextualArrowUnsupported::NonEmptyBody(body),
-        ));
-    }
+    let return_origin = if let NodeData::Block(block) = &body_record.data {
+        if body_record.kind != SyntaxKind::Block
+            || block.flow_node.is_some()
+            || block.next_container.is_some()
+            || block.statements.has_trailing_comma
+            || block.facts != 0
+        {
+            return Err(contextual_invariant(
+                SourceContextualArrowInvariant::InvalidBody(body),
+            ));
+        }
+        match block.statements.nodes.as_slice() {
+            [] => {
+                if preflight_node(store, host, contextual_return_type)?.kind
+                    != SyntaxKind::VoidKeyword
+                {
+                    return Err(contextual_unsupported(
+                        SourceContextualArrowUnsupported::ContextualTargetSyntax(
+                            contextual_return_type,
+                        ),
+                    ));
+                }
+                SourceContextualReturnOrigin::InferredEmptyBody { block: body }
+            }
+            [statement] => {
+                let statement = NodeRef::new(body.arena, body.file, *statement);
+                let statement_record = preflight_node(store, host, statement)?;
+                let NodeData::ReturnStatement(return_statement) = &statement_record.data else {
+                    return Err(contextual_unsupported(
+                        SourceContextualArrowUnsupported::NonEmptyBody(body),
+                    ));
+                };
+                let Some(expression) = return_statement.expression else {
+                    return Err(contextual_unsupported(
+                        SourceContextualArrowUnsupported::NonEmptyBody(body),
+                    ));
+                };
+                let expression = NodeRef::new(statement.arena, statement.file, expression);
+                let expression_record = preflight_node(store, host, expression)?;
+                if statement_record.kind != SyntaxKind::ReturnStatement
+                    || statement_record.flags.0 != 0
+                    || statement_record.parent != Some(body.node)
+                    || return_statement.flow_node.is_some()
+                    || return_statement.facts != 0
+                    || !range_contains(body_record.range, statement_record.range)
+                    || expression_record.parent != Some(statement.node)
+                    || !range_contains(statement_record.range, expression_record.range)
+                {
+                    return Err(contextual_invariant(
+                        SourceContextualArrowInvariant::InvalidBody(statement),
+                    ));
+                }
+                SourceContextualReturnOrigin::InferredReturnExpression {
+                    block: body,
+                    statement,
+                    expression,
+                }
+            }
+            _ => {
+                return Err(contextual_unsupported(
+                    SourceContextualArrowUnsupported::NonEmptyBody(body),
+                ));
+            }
+        }
+    } else {
+        SourceContextualReturnOrigin::InferredConciseExpression { expression: body }
+    };
     let arrow_token = NodeRef::new(
         initializer.arena,
         initializer.file,
@@ -1350,7 +1432,7 @@ pub(super) fn plan_contextual_source_arrow(
         leading_required_parameter_count,
         flags,
         min_argument_count,
-        return_origin: SourceContextualReturnOrigin::InferredEmptyBody { block: body },
+        return_origin,
     };
     resolve_contextual_arrow_parameter_origins(&plan, contextual_signature_shape)?;
     Ok(plan)
@@ -3243,6 +3325,75 @@ mod tests {
                 exported,
             );
             assert_ne!(plan.variable_symbol, plan.owner_symbol);
+        }
+    }
+
+    #[test]
+    fn contextual_arrows_preserve_concise_and_single_return_body_provenance() {
+        for (index, source) in [
+            "const value: (input: number) => number = input => input;",
+            "const value: (input: number) => number = input => { return input; };",
+            concat!(
+                "type Result = { value: number }; ",
+                "const value: (input: number) => Result = input => ({ value: input });",
+            ),
+            concat!(
+                "const value: (input: number) => { value: number } = ",
+                "input => ({ value: input });",
+            ),
+            "const value: () => 'ready' = () => 'ready';",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture = Fixture::new(source);
+            let cold = (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            );
+            let plan = fixture.contextual_plan(0).unwrap();
+
+            match (index, plan.return_origin) {
+                (
+                    1,
+                    SourceContextualReturnOrigin::InferredReturnExpression {
+                        block,
+                        statement,
+                        expression,
+                    },
+                ) => {
+                    assert_eq!(
+                        fixture.parsed.arena.get(block.node).unwrap().kind,
+                        SyntaxKind::Block,
+                    );
+                    assert_eq!(
+                        fixture.parsed.arena.get(statement.node).unwrap().kind,
+                        SyntaxKind::ReturnStatement,
+                    );
+                    assert_eq!(
+                        fixture.parsed.arena.get(expression.node).unwrap().kind,
+                        SyntaxKind::Identifier,
+                    );
+                }
+                (_, SourceContextualReturnOrigin::InferredConciseExpression { expression }) => {
+                    assert_eq!(
+                        fixture.parsed.arena.get(expression.node).unwrap().parent,
+                        Some(plan.declaration.node),
+                    );
+                }
+                _ => panic!("unexpected contextual return origin for {source}"),
+            }
+
+            assert_ne!(plan.owner_symbol, plan.variable_symbol);
+            assert_eq!(
+                (
+                    fixture.store.type_len(),
+                    fixture.store.symbol_len(),
+                    fixture.store.checker_link_allocated_lengths(),
+                ),
+                cold,
+            );
         }
     }
 
