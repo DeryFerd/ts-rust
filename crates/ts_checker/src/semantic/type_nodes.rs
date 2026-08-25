@@ -3921,6 +3921,346 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             )? == arguments.nodes.len())
     }
 
+    /// Recognizes only React's defaulted `ComponentClass<P>` component-union branch.
+    #[allow(clippy::too_many_lines)] // Alias, forwarded parameter, defaults, and lazy heritage form one proof.
+    fn authenticated_react_component_type_union_constituent(
+        &self,
+        node: NodeRef,
+        symbol: SemanticSymbolId,
+    ) -> bool {
+        let Some(owner) = self.store.symbol(symbol) else {
+            return false;
+        };
+        if owner.name().as_utf8() != Some("ComponentClass")
+            || owner.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
+            || owner.check_flags() != CheckFlags::NONE
+        {
+            return false;
+        }
+        let Ok(Some(namespace)) = self.authenticated_react_interface_namespace(symbol) else {
+            return false;
+        };
+        let Some(exports) = self
+            .store
+            .symbol(namespace)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| self.store.symbol_table(exports))
+        else {
+            return false;
+        };
+        let Ok(reference_record) = preflight_node(self.store, self.host, node) else {
+            return false;
+        };
+        let NodeData::TypeReferenceNode(reference) = &reference_record.data else {
+            return false;
+        };
+        let Some([argument]) = reference
+            .type_arguments
+            .as_ref()
+            .map(|arguments| arguments.nodes.as_slice())
+        else {
+            return false;
+        };
+        let Some(union) = reference_record
+            .parent
+            .map(|parent| NodeRef::new(node.arena, node.file, parent))
+        else {
+            return false;
+        };
+        let Ok(union_record) = preflight_node(self.store, self.host, union) else {
+            return false;
+        };
+        let NodeData::UnionTypeNode(union_data) = &union_record.data else {
+            return false;
+        };
+        let [first, second] = union_data.types.nodes.as_slice() else {
+            return false;
+        };
+        if *first != node.node {
+            return false;
+        }
+        let Some(alias_declaration) = union_record
+            .parent
+            .map(|parent| NodeRef::new(union.arena, union.file, parent))
+        else {
+            return false;
+        };
+        let Ok(alias_record) = preflight_node(self.store, self.host, alias_declaration) else {
+            return false;
+        };
+        let NodeData::TypeAliasDeclaration(alias_data) = &alias_record.data else {
+            return false;
+        };
+        let Some(bound) = self.host.bound_file(alias_declaration) else {
+            return false;
+        };
+        let Some(alias) = bound
+            .symbol(alias_declaration)
+            .and_then(|alias| self.store.get_merged_symbol(alias))
+        else {
+            return false;
+        };
+        let Some(alias_owner) = self.store.symbol(alias) else {
+            return false;
+        };
+        let Some([parameter]) = alias_data
+            .type_parameters
+            .as_ref()
+            .map(|parameters| parameters.nodes.as_slice())
+        else {
+            return false;
+        };
+        let parameter = NodeRef::new(alias_declaration.arena, alias_declaration.file, *parameter);
+        let Ok(parameter_record) = preflight_node(self.store, self.host, parameter) else {
+            return false;
+        };
+        let NodeData::TypeParameterDeclaration(parameter_data) = &parameter_record.data else {
+            return false;
+        };
+        let Some(parameter_symbol) = bound
+            .symbol(parameter)
+            .and_then(|parameter| self.store.get_merged_symbol(parameter))
+        else {
+            return false;
+        };
+        let Some(default) = parameter_data
+            .default_type
+            .map(|default| NodeRef::new(parameter.arena, parameter.file, default))
+        else {
+            return false;
+        };
+        let Some(NodeData::TypeLiteralNode(empty)) =
+            self.host.node(default).map(|record| &record.data)
+        else {
+            return false;
+        };
+        let argument = NodeRef::new(node.arena, node.file, *argument);
+        let second = NodeRef::new(union.arena, union.file, *second);
+        let Ok(second_record) = preflight_node(self.store, self.host, second) else {
+            return false;
+        };
+        let NodeData::TypeReferenceNode(second_reference) = &second_record.data else {
+            return false;
+        };
+        let Some([second_argument]) = second_reference
+            .type_arguments
+            .as_ref()
+            .map(|arguments| arguments.nodes.as_slice())
+        else {
+            return false;
+        };
+        let second_argument = NodeRef::new(second.arena, second.file, *second_argument);
+        let Some(stateless) = exports
+            .get_source("StatelessComponent")
+            .and_then(|symbol| self.store.get_merged_symbol(symbol))
+        else {
+            return false;
+        };
+        let Some(stateless_owner) = self.store.symbol(stateless) else {
+            return false;
+        };
+        if reference_record.kind != SyntaxKind::TypeReference
+            || reference_record.flags.0 != 0
+            || union_record.kind != SyntaxKind::UnionType
+            || union_record.flags.0 != 0
+            || union_record.parent != Some(alias_declaration.node)
+            || alias_record.kind != SyntaxKind::TypeAliasDeclaration
+            || alias_record.flags.0 != 0
+            || alias_data.type_ != union.node
+            || alias_owner.flags() != SymbolFlags::TYPE_ALIAS
+            || alias_owner.check_flags() != CheckFlags::NONE
+            || alias_owner.name().as_utf8() != Some("ComponentType")
+            || self.store.get_parent_of_symbol(alias) != Some(namespace)
+            || exports
+                .get_source("ComponentType")
+                .and_then(|export| self.store.get_merged_symbol(export))
+                != Some(alias)
+            || parameter_record.kind != SyntaxKind::TypeParameter
+            || parameter_record.parent != Some(alias_declaration.node)
+            || !empty.members.nodes.is_empty()
+            || self
+                .store
+                .symbol(parameter_symbol)
+                .and_then(|parameter| parameter.name().as_utf8())
+                != Some("P")
+            || !self.react_detailed_html_props_parameter_reference(
+                argument,
+                node,
+                "P",
+                parameter_symbol,
+            )
+            || second_record.kind != SyntaxKind::TypeReference
+            || second_record.parent != Some(union.node)
+            || self.resolve_uncached_type_reference_symbol(second).ok() != Some(stateless)
+            || stateless_owner.name().as_utf8() != Some("StatelessComponent")
+            || stateless_owner.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
+            || stateless_owner.check_flags() != CheckFlags::NONE
+            || self.store.get_parent_of_symbol(stateless) != Some(namespace)
+            || !self.react_detailed_html_props_parameter_reference(
+                second_argument,
+                second,
+                "P",
+                parameter_symbol,
+            )
+            || !self.is_react_ambient_module_namespace(namespace, alias_declaration)
+        {
+            return false;
+        }
+
+        let Some([declaration]) = owner.declarations() else {
+            return false;
+        };
+        let declaration = *declaration;
+        let Ok(declaration_record) = preflight_node(self.store, self.host, declaration) else {
+            return false;
+        };
+        let NodeData::InterfaceDeclaration(component) = &declaration_record.data else {
+            return false;
+        };
+        let Some([props, state]) = component
+            .type_parameters
+            .as_ref()
+            .map(|parameters| parameters.nodes.as_slice())
+        else {
+            return false;
+        };
+        let props = NodeRef::new(declaration.arena, declaration.file, *props);
+        let state = NodeRef::new(declaration.arena, declaration.file, *state);
+        let Some(NodeData::TypeParameterDeclaration(props_data)) =
+            self.host.node(props).map(|record| &record.data)
+        else {
+            return false;
+        };
+        let Some(NodeData::TypeParameterDeclaration(state_data)) =
+            self.host.node(state).map(|record| &record.data)
+        else {
+            return false;
+        };
+        let Some(props_default) = props_data
+            .default_type
+            .map(|default| NodeRef::new(props.arena, props.file, default))
+        else {
+            return false;
+        };
+        let Some(NodeData::TypeLiteralNode(empty)) =
+            self.host.node(props_default).map(|record| &record.data)
+        else {
+            return false;
+        };
+        let Some(state_default) = state_data
+            .default_type
+            .map(|default| NodeRef::new(state.arena, state.file, default))
+        else {
+            return false;
+        };
+        let Some(component_state) = exports
+            .get_source("ComponentState")
+            .and_then(|symbol| self.store.get_merged_symbol(symbol))
+        else {
+            return false;
+        };
+        let Some(state_owner) = self.store.symbol(component_state) else {
+            return false;
+        };
+        let Some([state_declaration]) = state_owner.declarations() else {
+            return false;
+        };
+        let Some(NodeData::TypeAliasDeclaration(state_alias)) = self
+            .host
+            .node(*state_declaration)
+            .map(|record| &record.data)
+        else {
+            return false;
+        };
+        let state_body = NodeRef::new(
+            state_declaration.arena,
+            state_declaration.file,
+            state_alias.type_,
+        );
+        let Some(clauses) = component.heritage_clauses.as_ref() else {
+            return false;
+        };
+        let [clause] = clauses.nodes.as_slice() else {
+            return false;
+        };
+        let clause = NodeRef::new(declaration.arena, declaration.file, *clause);
+        let Some(NodeData::HeritageClause(heritage)) =
+            self.host.node(clause).map(|record| &record.data)
+        else {
+            return false;
+        };
+        let [base] = heritage.types.nodes.as_slice() else {
+            return false;
+        };
+        let base = NodeRef::new(clause.arena, clause.file, *base);
+        let Some(NodeData::ExpressionWithTypeArguments(base_reference)) =
+            self.host.node(base).map(|record| &record.data)
+        else {
+            return false;
+        };
+        let Some([base_props, base_state]) = base_reference
+            .type_arguments
+            .as_ref()
+            .map(|arguments| arguments.nodes.as_slice())
+        else {
+            return false;
+        };
+        let Some(lifecycle) = exports
+            .get_source("StaticLifecycle")
+            .and_then(|symbol| self.store.get_merged_symbol(symbol))
+        else {
+            return false;
+        };
+        let Some(lifecycle_owner) = self.store.symbol(lifecycle) else {
+            return false;
+        };
+        let Some(props_symbol) = bound
+            .symbol(props)
+            .and_then(|parameter| self.store.get_merged_symbol(parameter))
+        else {
+            return false;
+        };
+        let Some(state_symbol) = bound
+            .symbol(state)
+            .and_then(|parameter| self.store.get_merged_symbol(parameter))
+        else {
+            return false;
+        };
+
+        declaration_record.kind == SyntaxKind::InterfaceDeclaration
+            && declaration_record.parent == alias_record.parent
+            && empty.members.nodes.is_empty()
+            && state_owner.flags() == SymbolFlags::TYPE_ALIAS
+            && state_owner.check_flags() == CheckFlags::NONE
+            && state_owner.name().as_utf8() == Some("ComponentState")
+            && self.store.get_parent_of_symbol(component_state) == Some(namespace)
+            && self
+                .resolve_uncached_type_reference_symbol(state_default)
+                .ok()
+                == Some(component_state)
+            && self
+                .host
+                .node(state_body)
+                .is_some_and(|record| record.kind == SyntaxKind::AnyKeyword)
+            && lifecycle_owner.name().as_utf8() == Some("StaticLifecycle")
+            && lifecycle_owner.flags().without(SymbolFlags::TRANSIENT) == SymbolFlags::INTERFACE
+            && lifecycle_owner.check_flags() == CheckFlags::NONE
+            && self.store.get_parent_of_symbol(lifecycle) == Some(namespace)
+            && self.resolve_uncached_type_reference_symbol(base).ok() == Some(lifecycle)
+            && self.react_detailed_html_props_parameter_reference(
+                NodeRef::new(base.arena, base.file, *base_props),
+                base,
+                "P",
+                props_symbol,
+            )
+            && self.react_detailed_html_props_parameter_reference(
+                NodeRef::new(base.arena, base.file, *base_state),
+                base,
+                "S",
+                state_symbol,
+            )
+    }
+
     fn is_authenticated_jsdoc_arrow_union_type_parameter(
         &self,
         node: NodeRef,
@@ -9843,7 +10183,12 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 preflight_class_or_interface_reference(self.store, self.host, symbol, flags)?;
             if union_constituent
                 && (flags.contains(SymbolFlags::CLASS)
-                    || local_count != 0 && exact_import.is_some())
+                    || local_count != 0
+                        && (exact_import.is_some()
+                            || type_arguments.len() != local_count
+                                && !self.authenticated_react_component_type_union_constituent(
+                                    node, symbol,
+                                )))
             {
                 return Err(type_node_unavailable(
                     TypeNodeUnavailable::UnsupportedUnionConstituent(node),
@@ -28779,6 +29124,59 @@ mod tests {
             Ok(resolved),
         );
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn react_component_type_union_authenticates_its_defaulted_class_branch() {
+        let mut fixture = fixture(concat!(
+            "declare module 'react' { export = React; namespace React { ",
+            "type ComponentState = any; ",
+            "interface StaticLifecycle<P, S> {} ",
+            "interface ComponentClass<P = {}, S = ComponentState> ",
+            "extends StaticLifecycle<P, S> {} ",
+            "interface StatelessComponent<P = {}> {} ",
+            "type ComponentType<P = {}> = ComponentClass<P> | StatelessComponent<P>; ",
+            "} }",
+        ));
+        let component = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "ComponentClass");
+        let state = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "ComponentState");
+        let stateless = named_symbol(
+            &fixture,
+            SyntaxKind::InterfaceDeclaration,
+            "StatelessComponent",
+        );
+        let union = alias_parts(&fixture, "ComponentType").2;
+        let NodeData::UnionTypeNode(union_data) =
+            &fixture.parsed.arena.get(union.node).unwrap().data
+        else {
+            panic!("ComponentType must retain its two component references")
+        };
+        let reference = NodeRef::new(union.arena, union.file, union_data.types.nodes[0]);
+        let namespace = fixture.store.get_parent_of_symbol(component).unwrap();
+        let exports = fixture.store.symbol(namespace).unwrap().exports().unwrap();
+        let host = post_global_host(
+            &fixture.parsed.arena,
+            fixture.files.get(&fixture.file).unwrap(),
+        );
+        let aliases = HashMap::new();
+
+        assert!(
+            TypeQueryPlanner::new(&fixture.store, &host, None, None, false, &aliases)
+                .authenticated_react_component_type_union_constituent(reference, component)
+        );
+
+        assert_eq!(
+            fixture
+                .store
+                .insert_symbol(exports, EscapedName::source("ComponentState"), stateless,),
+            Some(Some(state)),
+        );
+        let poisoned = union_state(&fixture.store);
+        assert!(
+            !TypeQueryPlanner::new(&fixture.store, &host, None, None, false, &aliases)
+                .authenticated_react_component_type_union_constituent(reference, component)
+        );
+        assert_eq!(union_state(&fixture.store), poisoned);
     }
 
     #[test]
