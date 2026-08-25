@@ -21145,9 +21145,6 @@ fn check_planned_object_shorthand_assignment(
     staged_value_types: &mut HashMap<SemanticSymbolId, TypeId>,
     value_order: &mut Vec<SemanticSymbolId>,
 ) -> Result<(), SourceCheckError> {
-    if options.no_implicit_any {
-        return Err(SourcePlanner::unsupported_function_body(callable));
-    }
     let any = store
         .intrinsic_bootstrap()
         .ok_or(SourceCheckError::LiteralCache(
@@ -42932,6 +42929,53 @@ class Foo2 {
             Some(void),
         );
         assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn upstream_shorthand_property_assignment_accepts_production_strict_defaults() {
+        let source = parsed(concat!(
+            "// @noEmit: true\n\n",
+            "// https://github.com/microsoft/typescript-go/issues/3789\n\n",
+            "function ff(f: any) {\n",
+            "    let g;\n",
+            "    ({ g = (x: any, y: any) => x + y } = f);\n",
+            "}\n",
+        ));
+        let file = FileId::new(8_462);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                strict_bind_call_apply: true,
+                strict_builtin_iterator_return: true,
+                strict_function_types: true,
+                strict_property_initialization: true,
+                no_implicit_any: true,
+                no_emit: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let any = context.store().intrinsic_bootstrap().unwrap().any_type;
+        let local = variable_symbol(&context, &source, file, "g");
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(local)
+                .and_then(|links| links.resolved_type),
+            Some(any),
+        );
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, file));
 
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();
