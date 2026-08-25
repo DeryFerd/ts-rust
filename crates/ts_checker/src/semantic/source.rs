@@ -26646,6 +26646,19 @@ pub(super) fn check_source_file(
                 if let Some(diagnostic) = checked.diagnostic {
                     merge_retry_diagnostic(diagnostics, diagnostic);
                 }
+                let bootstrap =
+                    store
+                        .intrinsic_bootstrap()
+                        .ok_or(SourceCheckError::LiteralCache(
+                            SourceLiteralCacheError::BootstrapUninitialized,
+                        ))?;
+                let assignment_target = if checked.type_ == bootstrap.auto_type {
+                    bootstrap.any_type
+                } else {
+                    checked.type_
+                };
+                let assignment_expression =
+                    (assignment_target == checked.type_).then_some(assignment.expression);
                 let assigned = check_assignment_to_type(
                     store,
                     host,
@@ -26657,12 +26670,15 @@ pub(super) fn check_source_file(
                     &current_flow_types,
                     &preflighted_type_import_value_uses,
                     &mut deferred,
-                    checked.type_,
+                    assignment_target,
                     None,
                     &assignment.right,
                     assignment.element.node,
-                    Some(assignment.expression),
+                    assignment_expression,
                 )?;
+                if assignment_expression.is_none() {
+                    publish_expression_type(store, assignment.expression, assigned.assigned_type)?;
+                }
                 if valid_index {
                     let base = widened_fresh_literal_type(store, assigned.assigned_type)?;
                     let element = store.get_regular_type_of_object_literal(base)?;
