@@ -4727,22 +4727,22 @@ mod tests {
 
         for name in ["renamed", "required"] {
             let declaration = alias_declaration_named(&importer, importer_file, name);
-            let imported = alias(&bound_files, declaration);
+            let import_alias = alias(&bound_files, declaration);
             assert_eq!(
                 CanonicalAliasResolver::new(&mut store, &mut host)
-                    .get_immediate_aliased_symbol(imported)
+                    .get_immediate_aliased_symbol(import_alias)
                     .unwrap(),
                 Some(assignment),
             );
             assert_eq!(
                 CanonicalAliasResolver::new(&mut store, &mut host)
-                    .resolve_alias(imported)
+                    .resolve_alias(import_alias)
                     .unwrap()
                     .target,
                 AliasTargetState::Resolved(original),
             );
             assert_eq!(
-                store.alias_symbol_links(imported),
+                store.alias_symbol_links(import_alias),
                 Some(&AliasSymbolLinks {
                     immediate_target: Some(assignment),
                     alias_target: AliasTargetState::Resolved(original),
@@ -4752,13 +4752,13 @@ mod tests {
         }
 
         let allocations = (store.symbol_len(), store.symbol_store().symbol_table_len());
-        let imported = alias(
+        let import_alias = alias(
             &bound_files,
             alias_declaration_named(&importer, importer_file, "renamed"),
         );
         assert_eq!(
             CanonicalAliasResolver::new(&mut store, &mut host)
-                .resolve_alias(imported)
+                .resolve_alias(import_alias)
                 .unwrap()
                 .target,
             AliasTargetState::Resolved(original),
@@ -4796,7 +4796,7 @@ mod tests {
                 ]),
             );
             let declaration = alias_declaration_named(&importer, importer_file, "renamed");
-            let imported = alias(&bound_files, declaration);
+            let import_alias = alias(&bound_files, declaration);
             let module = source_module(&bound_files, target_file);
             let assignment = store
                 .symbol(module)
@@ -4829,7 +4829,7 @@ mod tests {
             assert_eq!(
                 unavailable_reason(
                     CanonicalAliasResolver::new(&mut store, &mut host)
-                        .resolve_alias(imported)
+                        .resolve_alias(import_alias)
                         .unwrap_err(),
                 ),
                 CanonicalAliasTargetUnavailable::MalformedModuleSymbol {
@@ -6752,7 +6752,7 @@ mod tests {
         let (mut store, bound_files, manifest) =
             fixture(&files, CanonicalModuleResolutionManifestInput::new(entries));
         let declaration = alias_declaration_named(&importer, importer_file, "value");
-        let imported = alias(&bound_files, declaration);
+        let import_alias = alias(&bound_files, declaration);
         let module = source_module(&bound_files, barrel_file);
         let mut host =
             ProductionAliasTargetHost::new(&store, sources(&files, &bound_files), &manifest)
@@ -6761,7 +6761,7 @@ mod tests {
         assert_eq!(
             unavailable_reason(
                 CanonicalAliasResolver::new(&mut store, &mut host)
-                    .resolve_alias(imported)
+                    .resolve_alias(import_alias)
                     .unwrap_err(),
             ),
             CanonicalAliasTargetUnavailable::ExportStarResolutionUnsupported {
@@ -6770,7 +6770,7 @@ mod tests {
             },
         );
         assert_eq!(
-            store.alias_symbol_links(imported),
+            store.alias_symbol_links(import_alias),
             Some(&AliasSymbolLinks::default())
         );
     }
