@@ -3539,7 +3539,7 @@ fn unparenthesized_arrow_argument_node(arena: &NodeArena, mut node: NodeRef) -> 
             }
             (NodeData::ArrowFunction(_), SyntaxKind::ArrowFunction) => return Some(node),
             (NodeData::FunctionExpression(_), SyntaxKind::FunctionExpression)
-                if is_supported_function_argument_syntax(arena, node) =>
+                if is_supported_function_expression_argument_syntax(arena, node) =>
             {
                 return Some(node);
             }
@@ -3589,7 +3589,7 @@ fn collect_array_argument_arrow_syntax(
             true
         }
         (NodeData::FunctionExpression(_), SyntaxKind::FunctionExpression) => {
-            if !is_supported_function_argument_syntax(arena, node) {
+            if !is_supported_function_expression_argument_syntax(arena, node) {
                 return false;
             }
             arrows.push(node);
@@ -3722,7 +3722,9 @@ fn is_supported_call_argument_syntax(arena: &NodeArena, node: NodeRef) -> bool {
             matches!(&record.data, NodeData::TaggedTemplateExpression(_))
         }
         SyntaxKind::ArrowFunction => is_supported_arrow_argument_syntax(arena, node),
-        SyntaxKind::FunctionExpression => is_supported_function_argument_syntax(arena, node),
+        SyntaxKind::FunctionExpression => {
+            is_supported_function_expression_argument_syntax(arena, node)
+        }
         SyntaxKind::ObjectLiteralExpression => {
             matches!(&record.data, NodeData::ObjectLiteralExpression(_))
         }
@@ -3741,7 +3743,8 @@ fn is_supported_call_argument_syntax(arena: &NodeArena, node: NodeRef) -> bool {
     }
 }
 
-fn is_supported_function_argument_syntax(arena: &NodeArena, node: NodeRef) -> bool {
+/// Accepts authenticated anonymous, zero-parameter function arguments.
+fn is_supported_function_expression_argument_syntax(arena: &NodeArena, node: NodeRef) -> bool {
     let Some(record) = arena.get(node.node) else {
         return false;
     };
@@ -7550,6 +7553,73 @@ mod tests {
     }
 
     #[test]
+    fn anonymous_function_argument_validation_rejects_forged_facts_names_and_body_ownership() {
+        for poison in 0..3 {
+            let mut parsed = parsed(concat!(
+                "function take(callback: () => void): void {} ",
+                "take(function () {});",
+            ));
+            let file = FileId::new(4_910 + poison);
+            let expression = parsed
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    (record.kind == SyntaxKind::FunctionExpression).then_some(NodeRef::new(
+                        parsed.arena.id(),
+                        file,
+                        node,
+                    ))
+                })
+                .expect("fixture must contain an anonymous function argument");
+            let NodeData::FunctionExpression(function) =
+                &parsed.arena.get(expression.node).unwrap().data
+            else {
+                panic!("expected an anonymous function argument")
+            };
+            let body = function.body;
+            let call_nodes = calls(&parsed, file);
+            let [call] = call_nodes.as_slice() else {
+                panic!("fixture must contain one direct call")
+            };
+            let call = *call;
+
+            match poison {
+                0 => {
+                    let NodeData::FunctionExpression(function) =
+                        &mut parsed.arena.get_mut(expression.node).unwrap().data
+                    else {
+                        unreachable!("the selected node is a function expression")
+                    };
+                    function.facts = 1;
+                }
+                1 => {
+                    let NodeData::FunctionExpression(function) =
+                        &mut parsed.arena.get_mut(expression.node).unwrap().data
+                    else {
+                        unreachable!("the selected node is a function expression")
+                    };
+                    function.name = Some(body);
+                }
+                2 => parsed.arena.get_mut(body).unwrap().parent = Some(call.node),
+                _ => unreachable!("only authenticated anonymous function fields are mutated"),
+            }
+
+            assert!(!is_supported_function_expression_argument_syntax(
+                &parsed.arena,
+                expression,
+            ));
+            let store = CanonicalTypeMapperStore::new();
+            assert!(matches!(
+                plan_direct_source_call_syntax(&parsed.arena, &store, call),
+                Err(SourceCheckError::Unsupported(UnsupportedSourceSyntax::Call(node)))
+                    if node == call
+            ));
+            assert!(store.type_node_links(call).is_none());
+            assert!(store.signature_links(call).is_none());
+        }
+    }
+
+    #[test]
     fn arrow_argument_validation_rejects_forged_parameter_and_return_annotations() {
         for poison in 0..3 {
             let mut parsed = parsed(concat!(
@@ -7975,6 +8045,155 @@ mod tests {
                 .collect::<Vec<_>>(),
             cold_properties
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One source graph proves direct and member callback identity.
+    fn anonymous_function_arguments_preserve_comments_callable_identity_and_warm_caches() {
+        let parsed = parsed(concat!(
+            "function accept(callback: () => void): void {} ",
+            "accept(// direct callback\n",
+            "function () {}); ",
+            "type API = { run: (callback: () => number) => string }; ",
+            "function use(api: API): string { return api.run(// member callback\n",
+            "function () { return 1; }); }",
+        ));
+        let file = FileId::new(4_913);
+        let mut call_nodes = calls(&parsed, file);
+        call_nodes.sort_by_key(|call| parsed.arena.get(call.node).unwrap().range.start);
+        let [direct_call, member_call] = call_nodes.as_slice() else {
+            panic!("expected one direct call and one member call")
+        };
+        let mut callbacks = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionExpression).then_some((
+                    record.range.start,
+                    NodeRef::new(parsed.arena.id(), file, node),
+                ))
+            })
+            .collect::<Vec<_>>();
+        callbacks.sort_by_key(|(start, _)| *start);
+        let [(_, direct_callback), (_, member_callback)] = callbacks.as_slice() else {
+            panic!("expected one anonymous function argument for each call")
+        };
+        let mut context = context(&parsed, file);
+
+        context.check_source_file(file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let void = bootstrap.void_type;
+        let number = bootstrap.number_type;
+        let (_, bound) = context.file(file).unwrap();
+        for (call, callback, expected_return) in [
+            (*direct_call, *direct_callback, void),
+            (*member_call, *member_callback, number),
+        ] {
+            let syntax = plan_direct_source_call_syntax(&parsed.arena, context.store(), call)
+                .expect("both anonymous callbacks must retain authenticated call syntax");
+            assert_eq!(syntax.argument_arrow_nodes, vec![Some(callback)]);
+            assert_eq!(syntax.array_argument_arrow_nodes, vec![vec![callback]]);
+            let owner = bound
+                .symbol(callback)
+                .expect("anonymous callbacks must retain binder-owned symbols");
+            let callable = context
+                .store()
+                .source_callable_type_for_owner(owner)
+                .expect("anonymous callbacks must publish authenticated callable types");
+            let provenance = context
+                .store()
+                .source_callable_provenance(callable)
+                .expect("anonymous callbacks must retain source callable provenance");
+            assert_eq!(provenance.declaration, callback);
+            assert_eq!(provenance.owner_symbol, owner);
+            assert_eq!(
+                context
+                    .store()
+                    .signature(provenance.signature)
+                    .and_then(super::super::signatures::Signature::resolved_return_type),
+                Some(expected_return),
+            );
+            assert!(matches!(
+                validate_stored_source_callable(context.store(), callable),
+                StoredSourceCallableValidation::Valid(_)
+            ));
+            assert_eq!(
+                context
+                    .store()
+                    .type_node_links(callback)
+                    .and_then(|links| links.resolved_type),
+                Some(callable),
+            );
+            assert!(
+                context
+                    .store()
+                    .signature_links(call)
+                    .is_some_and(|links| links.resolved_signature.signature().is_some())
+            );
+        }
+        let cold = (
+            [*direct_call, *member_call].map(|call| call_publication_state(&context, call)),
+            [*direct_callback, *member_callback]
+                .map(|callback| context.store().type_node_links(callback).cloned()),
+        );
+
+        context.recheck_source_file(file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
+        assert_eq!(
+            (
+                [*direct_call, *member_call].map(|call| call_publication_state(&context, call)),
+                [*direct_callback, *member_callback]
+                    .map(|callback| context.store().type_node_links(callback).cloned()),
+            ),
+            cold
+        );
+    }
+
+    #[test]
+    fn anonymous_function_arguments_preserve_exact_callback_return_diagnostics() {
+        let parsed = parsed(concat!(
+            "function accept(callback: () => string): void {} ",
+            "accept(function () { return 1; });",
+        ));
+        let file = FileId::new(4_914);
+        let call_nodes = calls(&parsed, file);
+        let [call] = call_nodes.as_slice() else {
+            panic!("fixture must contain one direct call")
+        };
+        let call = *call;
+        let callback = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionExpression).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .expect("fixture must contain one anonymous function argument");
+        let mut context = context(&parsed, file);
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("the callback return mismatch must produce exactly one diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2345);
+        assert_eq!(diagnostic.node, Some(callback));
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "Argument of type '() => number' is not assignable to parameter of type '() => string'."
+        );
+        assert!(context.store().type_node_links(callback).is_some());
+        let cold = call_publication_state(&context, call);
+
+        context.recheck_source_file(file).unwrap();
+
+        assert_eq!(call_publication_state(&context, call), cold);
     }
 
     #[test]
