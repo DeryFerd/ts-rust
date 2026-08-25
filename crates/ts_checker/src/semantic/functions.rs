@@ -425,8 +425,9 @@ pub(super) fn plan_function_type(
         } else if implicit_any_rest {
             let dependency = parameters
                 .last()
-                .map(|previous: &FunctionParameterPlan| previous.type_node)
-                .unwrap_or(return_type);
+                .map_or(return_type, |previous: &FunctionParameterPlan| {
+                    previous.type_node
+                });
             if implicit_any_array_type(store).is_none_or(|array| {
                 array_targets.is_none()
                     && store
@@ -1206,21 +1207,23 @@ fn source_jsdoc_function_type_display_projection(
     let record = store
         .signature(signature)
         .ok_or(FunctionTypeDisplayError::Malformed)?;
-    let types = store
+    let parameter_types = store
         .callable_signature_parameter_types(signature)
         .ok_or(FunctionTypeDisplayError::Malformed)?;
-    if function.parameters().len() != types.len() {
+    if function.parameters().len() != parameter_types.len() {
         return Err(FunctionTypeDisplayError::Malformed);
     }
     let parameters = function
         .parameters()
         .iter()
-        .zip(types)
-        .map(|(parameter, type_)| ValidatedSingleCallParameterDisplay {
-            name: parameter.name().to_owned(),
-            value_type: *type_,
-            optional: parameter.is_optional(),
-        })
+        .zip(parameter_types)
+        .map(
+            |(parameter, value_type)| ValidatedSingleCallParameterDisplay {
+                name: parameter.name().to_owned(),
+                value_type: *value_type,
+                optional: parameter.is_optional(),
+            },
+        )
         .collect();
     Ok(ValidatedSingleCallSignatureDisplay {
         owner: type_,
@@ -1394,10 +1397,9 @@ fn resolve_function_type_parameters(
         if parameter.constraint.is_some() != parameter.outer_symbol.is_some() {
             return Err(invariant(FunctionTypeInvariant::Publication(plan.node)));
         }
-        let constraint = parameter
-            .outer_symbol
-            .map(|symbol| execute_type_parameter(store, symbol))
-            .unwrap_or(no_constraint);
+        let constraint = parameter.outer_symbol.map_or(no_constraint, |symbol| {
+            execute_type_parameter(store, symbol)
+        });
         let inner = execute_type_parameter(store, parameter.symbol);
         if parameter.outer_symbol.is_some_and(|symbol| {
             cached_ordinary_type_parameter_owner(store, constraint) != Some(symbol)
