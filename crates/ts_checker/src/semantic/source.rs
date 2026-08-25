@@ -47615,7 +47615,7 @@ pub(super) fn check_source_file(
                             merge_retry_diagnostic(
                                 diagnostics,
                                 CanonicalCheckerDiagnostic {
-                                    node: Some(assignment.left),
+                                    node: Some(assignment.expression),
                                     range_override: None,
                                     diagnostic: Diagnostic::with_arguments(
                                         message_by_code(7008)
@@ -78229,7 +78229,7 @@ class Foo2 {
     }
 
     #[test]
-    fn function_expando_empty_arrays_report_implicit_any_at_the_property() {
+    fn function_expando_empty_arrays_report_implicit_any_at_the_assignment() {
         for (index, source_text) in [
             "function work() {} work.items = []; export {};",
             "const work = function () {}; work.items = []; export {};",
@@ -78256,7 +78256,10 @@ class Foo2 {
             };
             assert_eq!(diagnostic.diagnostic.code(), 7008);
             assert_eq!(diagnostic.diagnostic.arguments, ["items", "any[]"]);
-            assert_eq!(node_text(&source, diagnostic.node.unwrap()), "work.items");
+            assert_eq!(
+                node_text(&source, diagnostic.node.unwrap()),
+                "work.items = []"
+            );
             let (left, _) = assignment_parts(&source, file, 0);
             let expression = NodeRef::new(
                 source.arena.id(),
@@ -78310,7 +78313,11 @@ class Foo2 {
 
         let diagnostics = context.diagnostics().as_slice();
         assert_eq!(diagnostics.len(), 3);
-        for (diagnostic, expected) in diagnostics.iter().zip(["f1.a", "f2.a", "f3.a"]) {
+        for (diagnostic, expected) in
+            diagnostics
+                .iter()
+                .zip(["f1.a = []", "f2.a = []", "f3.a = []"])
+        {
             assert_eq!(diagnostic.diagnostic.code(), 7008);
             assert_eq!(diagnostic.diagnostic.arguments, ["a", "any[]"]);
             assert_eq!(node_text(&source, diagnostic.node.unwrap()), expected);

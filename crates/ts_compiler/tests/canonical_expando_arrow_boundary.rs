@@ -66,7 +66,12 @@ fn canonical_program_reports_exact_implicit_any_array_expando_diagnostics() {
     .unwrap();
 
     assert_eq!(program.diagnostics().len(), 3);
-    for (diagnostic, expected) in program.diagnostics().iter().zip(["f1.a", "f2.a", "f3.a"]) {
+    for (diagnostic, expected) in
+        program
+            .diagnostics()
+            .iter()
+            .zip(["f1.a = []", "f2.a = []", "f3.a = []"])
+    {
         assert_eq!(diagnostic.file_name.as_deref(), Some("/project/main.ts"));
         assert_eq!(diagnostic.code, Some(7008));
         assert_eq!(
