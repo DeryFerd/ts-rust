@@ -2190,6 +2190,26 @@ fn resolve_source_import_binding_phase(
         }
         AliasTargetState::Resolved(target) => target,
     };
+    // Merged interface references authenticate both import/export alias hops.
+    if direct_flags == SymbolFlags::ALIAS
+        && store.source_node_kind(binding.declaration) == Some(SyntaxKind::ImportEqualsDeclaration)
+        && store.symbol(direct_target).is_some_and(|assignment| {
+            assignment.name() == InternalSymbolName::ExportEquals.as_ref()
+                && assignment.value_declaration().is_some_and(|declaration| {
+                    store.source_node_kind(declaration) == Some(SyntaxKind::ExportAssignment)
+                })
+        })
+        && store.symbol(resolved_target).is_some_and(|target| {
+            target.flags() == SymbolFlags::INTERFACE | SymbolFlags::NAMESPACE_MODULE
+        })
+        && CanonicalAliasResolver::new(store, alias_host)
+            .get_immediate_aliased_symbol(direct_target)?
+            != Some(resolved_target)
+    {
+        return Err(invariant(SourceImportInvariant::InvalidAliasLinks(
+            direct_target,
+        )));
+    }
     if direct_flags != SymbolFlags::ALIAS && direct_is_alias && resolved_target == direct_target {
         return Err(unsupported(SourceImportUnsupported::TargetSymbol {
             alias: binding.alias_symbol,
@@ -2750,6 +2770,30 @@ pub(super) fn prepare_source_import_value(
                         callable.owner_symbol,
                     ))
                 })?;
+            if callable.return_type.is_inferred()
+                && store.symbol(callable.owner_symbol).is_some_and(|owner| {
+                    owner.flags() == SymbolFlags::FUNCTION | SymbolFlags::VALUE_MODULE
+                })
+                && store
+                    .signature(provenance.signature)
+                    .and_then(super::signatures::Signature::resolved_return_type)
+                    .is_none()
+            {
+                let void = store
+                    .intrinsic_bootstrap()
+                    .map(|bootstrap| bootstrap.void_type)
+                    .ok_or_else(|| {
+                        invariant(SourceImportInvariant::InvalidTargetLinks(
+                            callable.owner_symbol,
+                        ))
+                    })?;
+                publish_inferred_source_callable_return(
+                    store,
+                    &callable,
+                    provenance.signature,
+                    void,
+                )?;
+            }
             CanonicalTypeQuery::new_with_global_types_and_session(
                 store,
                 declared_host,
@@ -3713,7 +3757,18 @@ fn plan_direct_import_value_target(
         }
         return plan_direct_typescript_const_target(store, host, global_types, alias, target);
     }
-    if flags == SymbolFlags::FUNCTION {
+    if flags == SymbolFlags::FUNCTION
+        || flags == SymbolFlags::FUNCTION | SymbolFlags::VALUE_MODULE
+            && store.export_type_links(target).is_none()
+            && store
+                .alias_symbol_links(alias)
+                .and_then(|links| links.immediate_target)
+                .and_then(|assignment| store.symbol(assignment))
+                .is_some_and(|assignment| {
+                    assignment.flags() == SymbolFlags::ALIAS
+                        && assignment.name() == InternalSymbolName::ExportEquals.as_ref()
+                })
+    {
         return plan_direct_annotated_function_target(
             store,
             host,
@@ -6053,21 +6108,27 @@ fn plan_direct_annotated_function_target(
     let target_record = store
         .symbol(target)
         .ok_or_else(|| invariant(SourceImportInvariant::InvalidTargetSymbol(target)))?;
-    if target_record.flags() != SymbolFlags::FUNCTION {
+    let runtime_namespace =
+        target_record.flags() == SymbolFlags::FUNCTION | SymbolFlags::VALUE_MODULE;
+    if target_record.flags() != SymbolFlags::FUNCTION && !runtime_namespace {
         return Err(unsupported(SourceImportUnsupported::TargetSymbol {
             alias,
             target,
             flags: target_record.flags(),
         }));
     }
-    let Some([declaration]) = target_record.declarations() else {
-        return Err(unsupported(SourceImportUnsupported::TargetSymbol {
-            alias,
-            target,
-            flags: target_record.flags(),
-        }));
+    let declaration = if runtime_namespace {
+        authenticated_runtime_export_equals_callable(store, host, alias, target)?
+    } else {
+        let Some([declaration]) = target_record.declarations() else {
+            return Err(unsupported(SourceImportUnsupported::TargetSymbol {
+                alias,
+                target,
+                flags: target_record.flags(),
+            }));
+        };
+        *declaration
     };
-    let declaration = *declaration;
     if target_record.value_declaration() != Some(declaration) {
         return Err(invariant(SourceImportInvariant::InvalidTargetSymbol(
             target,
@@ -6116,14 +6177,14 @@ fn plan_direct_annotated_function_target(
                 }
             }
             SourceCallableState::Cold | SourceCallableState::AwaitingInferredReturn { .. } => {
-                let Some(module) = namespace_module else {
-                    return Err(unsupported(SourceImportUnsupported::TargetSymbol {
-                        alias,
-                        target,
-                        flags: target_record.flags(),
-                    }));
+                let valid = if runtime_namespace {
+                    exact_runtime_empty_void_function(store, host, &callable)?
+                } else if let Some(module) = namespace_module {
+                    exact_namespace_empty_void_function(store, host, &callable, module)?
+                } else {
+                    false
                 };
-                if !exact_namespace_empty_void_function(store, host, &callable, module)? {
+                if !valid {
                     return Err(unsupported(SourceImportUnsupported::TargetSymbol {
                         alias,
                         target,
@@ -6149,6 +6210,207 @@ fn plan_direct_annotated_function_target(
         )));
     }
     Ok(callable)
+}
+
+fn authenticated_runtime_export_equals_callable(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    alias: SemanticSymbolId,
+    target: SemanticSymbolId,
+) -> Result<NodeRef, SourceImportError> {
+    let invalid = || invariant(SourceImportInvariant::InvalidTargetSymbol(target));
+    let record = store.symbol(target).ok_or_else(invalid)?;
+    let Some([function, namespace]) = record.declarations() else {
+        return Err(unsupported(SourceImportUnsupported::TargetSymbol {
+            alias,
+            target,
+            flags: record.flags(),
+        }));
+    };
+    let function = *function;
+    let namespace = *namespace;
+    let (arena, bound) = host.source(function).ok_or_else(invalid)?;
+    let facts = bound.source_facts().ok_or_else(invalid)?;
+    let source = checked_node(arena, bound, store, bound.source_file())?;
+    let NodeData::SourceFile(source_data) = &source.data else {
+        return Err(invalid());
+    };
+    let function_record = checked_node(arena, bound, store, function)?;
+    let NodeData::FunctionDeclaration(function_data) = &function_record.data else {
+        return Err(invalid());
+    };
+    let namespace_record = checked_node(arena, bound, store, namespace)?;
+    let NodeData::ModuleDeclaration(namespace_data) = &namespace_record.data else {
+        return Err(invalid());
+    };
+    let function_name = function_data
+        .name
+        .map(|node| NodeRef::new(function.arena, function.file, node))
+        .ok_or_else(invalid)?;
+    let function_name_text = exact_identifier(
+        arena,
+        bound,
+        store,
+        function_name,
+        function,
+        SourceImportUnsupported::TargetDeclaration(function_name),
+    )?;
+    let namespace_name = NodeRef::new(namespace.arena, namespace.file, namespace_data.name);
+    let namespace_name_text = exact_identifier(
+        arena,
+        bound,
+        store,
+        namespace_name,
+        namespace,
+        SourceImportUnsupported::TargetDeclaration(namespace_name),
+    )?;
+    let assignment = store
+        .alias_symbol_links(alias)
+        .and_then(|links| links.immediate_target)
+        .ok_or_else(invalid)?;
+    let assignment_record = store.symbol(assignment).ok_or_else(invalid)?;
+    let Some([assignment_declaration]) = assignment_record.declarations() else {
+        return Err(invalid());
+    };
+    let assignment_declaration = *assignment_declaration;
+    let assignment_node = checked_node(arena, bound, store, assignment_declaration)?;
+    let NodeData::ExportAssignment(export) = &assignment_node.data else {
+        return Err(invalid());
+    };
+    let expression = NodeRef::new(
+        assignment_declaration.arena,
+        assignment_declaration.file,
+        export.expression,
+    );
+    let expression_text = exact_identifier(
+        arena,
+        bound,
+        store,
+        expression,
+        assignment_declaration,
+        SourceImportUnsupported::TargetDeclaration(expression),
+    )?;
+    let module = bound.symbol(bound.source_file()).ok_or_else(invalid)?;
+    let exports = store
+        .symbol(module)
+        .and_then(ts_binder::semantic::Symbol::exports)
+        .and_then(|exports| store.symbol_table(exports))
+        .ok_or_else(invalid)?;
+    let members = record
+        .exports()
+        .and_then(|exports| store.symbol_table(exports))
+        .ok_or_else(invalid)?;
+
+    if !facts.is_external_module()
+        || facts.is_declaration_file()
+        || facts.is_javascript_file()
+        || record.flags() != SymbolFlags::FUNCTION | SymbolFlags::VALUE_MODULE
+        || record.check_flags() != CheckFlags::NONE
+        || record.name().as_utf8() != Some(function_name_text.as_str())
+        || record.value_declaration() != Some(function)
+        || record.members().is_some()
+        || record.parent().is_some()
+        || record.export_symbol().is_some()
+        || store.get_merged_symbol(target) != Some(target)
+        || bound.symbol(function) != Some(target)
+        || bound.symbol(namespace) != Some(target)
+        || bound
+            .locals(bound.source_file())
+            .and_then(|locals| store.symbol_table(locals))
+            .and_then(|locals| locals.get(record.name()))
+            != Some(target)
+        || source_data.statements.nodes.as_slice()
+            != [function.node, namespace.node, assignment_declaration.node]
+        || function_record.kind != SyntaxKind::FunctionDeclaration
+        || function_record.parent != Some(bound.source_file().node)
+        || function_record.flags.0 != 0
+        || function_data.modifiers.is_some()
+        || function_data.body.is_none()
+        || namespace_record.kind != SyntaxKind::ModuleDeclaration
+        || namespace_record.parent != Some(bound.source_file().node)
+        || namespace_record.flags.0 != 0
+        || namespace_data.keyword != SyntaxKind::NamespaceKeyword
+        || namespace_data.modifiers.is_some()
+        || namespace_data.body.is_none()
+        || namespace_name_text != function_name_text
+        || members.is_empty()
+        || members.iter().any(|(_, member)| {
+            store.symbol(member).is_none_or(|record| {
+                record.parent() != Some(target) || store.get_merged_symbol(member) != Some(member)
+            })
+        })
+        || assignment_record.flags() != SymbolFlags::ALIAS
+        || assignment_record.check_flags() != CheckFlags::NONE
+        || assignment_record.name() != InternalSymbolName::ExportEquals.as_ref()
+        || assignment_record.value_declaration() != Some(assignment_declaration)
+        || assignment_record.members().is_some()
+        || assignment_record.exports().is_some()
+        || assignment_record.parent() != Some(module)
+        || assignment_record.export_symbol().is_some()
+        || store.get_merged_symbol(assignment) != Some(assignment)
+        || bound.symbol(assignment_declaration) != Some(assignment)
+        || assignment_node.kind != SyntaxKind::ExportAssignment
+        || assignment_node.parent != Some(bound.source_file().node)
+        || assignment_node.flags.0 != 0
+        || !export.is_export_equals
+        || export.flow_node.is_some()
+        || export.modifiers.is_some()
+        || export.symbol.is_some()
+        || export.type_.is_some()
+        || export.facts != 0
+        || expression_text != function_name_text
+        || exports.get(InternalSymbolName::ExportEquals.as_ref()) != Some(assignment)
+        || store.alias_symbol_links(assignment).is_none_or(|links| {
+            links.type_only_declaration.is_some()
+                || links
+                    .immediate_target
+                    .is_some_and(|immediate| immediate != target)
+                || links.alias_target != AliasTargetState::Resolved(target)
+        })
+    {
+        return Err(invalid());
+    }
+
+    Ok(function)
+}
+
+fn exact_runtime_empty_void_function(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    callable: &SourceCallablePlan,
+) -> Result<bool, SourceImportError> {
+    let Some((arena, bound)) = host.source(callable.declaration) else {
+        return Ok(false);
+    };
+    let declaration = checked_node(arena, bound, store, callable.declaration)?;
+    let NodeData::FunctionDeclaration(function) = &declaration.data else {
+        return Ok(false);
+    };
+    let body = checked_node(arena, bound, store, callable.body)?;
+    let NodeData::Block(block) = &body.data else {
+        return Ok(false);
+    };
+
+    Ok(function.parameters.nodes.is_empty()
+        && !function.parameters.has_trailing_comma
+        && function.type_parameters.is_none()
+        && function.type_.is_none()
+        && function.body == Some(callable.body.node)
+        && callable.family == SourceCallableFamily::FunctionDeclaration
+        && callable.parameters.is_empty()
+        && callable.type_parameters.is_empty()
+        && callable.return_type.is_inferred()
+        && !callable.body_mode.is_ambient()
+        && callable.flags == super::signatures::SignatureFlags::NONE
+        && callable.min_argument_count == 0
+        && body.kind == SyntaxKind::Block
+        && body.parent == Some(callable.declaration.node)
+        && body.flags.0 == 0
+        && block.flow_node.is_none()
+        && block.next_container.is_none()
+        && block.statements.nodes.is_empty()
+        && !block.statements.has_trailing_comma
+        && block.facts == 0)
 }
 
 fn exact_namespace_empty_void_function(
@@ -6910,7 +7172,8 @@ fn validate_prepared_import_value(
         }
         PreparedSourceImportTarget::AnnotatedFunction { signature } => {
             store.symbol(prepared.target_symbol).is_some_and(|target| {
-                target.flags() == SymbolFlags::FUNCTION
+                (target.flags() == SymbolFlags::FUNCTION
+                    || target.flags() == SymbolFlags::FUNCTION | SymbolFlags::VALUE_MODULE)
                     && target.value_declaration() == Some(prepared.target_declaration)
             }) && store.source_callable_type_for_owner(prepared.target_symbol)
                 == Some(prepared.type_)
@@ -8994,6 +9257,240 @@ mod tests {
             imports[0].bindings[0].alias_symbol
         );
         assert_eq!(forwarded[0].target_symbol, module);
+    }
+
+    #[test]
+    fn import_equals_preserves_ambient_merged_interface_and_namespace_exports() {
+        let mut fixture = fixture_with_module_states(
+            &[
+                concat!(
+                    "import foo = require('foo'); ",
+                    "declare var direct: foo; ",
+                    "declare var nested: foo.A;",
+                ),
+                concat!(
+                    "declare module 'foo' { ",
+                    "namespace B { export interface A {} } ",
+                    "interface B { bar(name: string): B.A; } ",
+                    "export = B; ",
+                    "}",
+                ),
+            ],
+            &[Route {
+                source: 0,
+                specifier: 0,
+                target: Some(1),
+            }],
+            &[CanonicalModuleState::External, CanonicalModuleState::Script],
+        );
+        let plan = fixture.try_plan_import_equals(0, 0).unwrap();
+        let target_file = &fixture.files[1];
+        let target_bound = fixture.bound.get(&target_file.file).unwrap();
+        let namespace = target_file
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                let NodeData::ModuleDeclaration(namespace) = &record.data else {
+                    return None;
+                };
+                matches!(
+                    target_file.parsed.arena.get(namespace.name).map(|name| &name.data),
+                    Some(NodeData::Identifier(name)) if name.text == "B"
+                )
+                .then_some(NodeRef::new(
+                    target_file.parsed.arena.id(),
+                    target_file.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let target = target_bound
+            .symbol(namespace)
+            .and_then(|symbol| fixture.store.get_merged_symbol(symbol))
+            .unwrap();
+        let assignment = target_file
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ExportAssignment).then_some(NodeRef::new(
+                    target_file.parsed.arena.id(),
+                    target_file.file,
+                    node,
+                ))
+            })
+            .and_then(|declaration| target_bound.symbol(declaration))
+            .unwrap();
+
+        let resolved = resolve_all(&mut fixture, &plan.bindings).unwrap();
+
+        assert_eq!(resolved[0].immediate_target_symbol, assignment);
+        assert_eq!(resolved[0].target_symbol, target);
+        assert_eq!(
+            fixture.store.symbol(target).unwrap().flags(),
+            SymbolFlags::INTERFACE | SymbolFlags::NAMESPACE_MODULE,
+        );
+        assert!(
+            fixture
+                .store
+                .symbol(target)
+                .and_then(ts_binder::semantic::Symbol::exports)
+                .and_then(|exports| fixture.store.symbol_table(exports))
+                .and_then(|exports| exports.get_source("A"))
+                .is_some(),
+        );
+        assert_eq!(
+            fixture.store.alias_symbol_links(assignment),
+            Some(&AliasSymbolLinks {
+                immediate_target: Some(target),
+                alias_target: AliasTargetState::Resolved(target),
+                ..AliasSymbolLinks::default()
+            }),
+        );
+        assert!(fixture.store.value_symbol_links(target).is_none());
+        assert!(
+            fixture
+                .store
+                .value_symbol_links(plan.bindings[0].alias_symbol)
+                .is_none(),
+        );
+
+        let warm = store_state(&fixture.store);
+        assert_eq!(resolve_all(&mut fixture, &plan.bindings).unwrap(), resolved);
+        assert_eq!(store_state(&fixture.store), warm);
+    }
+
+    #[test]
+    fn runtime_export_equals_imports_preserve_merged_callable_namespace_identity() {
+        let mut fixture = fixture(
+            &[
+                concat!(
+                    "import required = require('./target'); ",
+                    "import * as grouped from './target'; ",
+                    "const first = required; ",
+                    "const second = grouped;",
+                ),
+                concat!(
+                    "function callable() {} ",
+                    "namespace callable { export var value = 1; } ",
+                    "export = callable;",
+                ),
+            ],
+            &[
+                Route {
+                    source: 0,
+                    specifier: 0,
+                    target: Some(1),
+                },
+                Route {
+                    source: 0,
+                    specifier: 1,
+                    target: Some(1),
+                },
+            ],
+        );
+        let required = fixture.try_plan_import_equals(0, 0).unwrap();
+        let grouped = fixture.plan_import(0, 0);
+        let importer = &fixture.files[0];
+        let importer_bound = fixture.bound.get(&importer.file).unwrap();
+        let required_read = plan_source_import_identifier_read(
+            &importer.parsed.arena,
+            importer_bound,
+            &fixture.store,
+            &required.bindings[0],
+            identifier_initializer(&fixture, 0, "required"),
+            "required",
+            required.bindings[0].alias_symbol,
+        )
+        .unwrap();
+        let grouped_read = plan_source_import_identifier_read(
+            &importer.parsed.arena,
+            importer_bound,
+            &fixture.store,
+            &grouped.bindings[0],
+            identifier_initializer(&fixture, 0, "grouped"),
+            "grouped",
+            grouped.bindings[0].alias_symbol,
+        )
+        .unwrap();
+        let required_resolution = resolve_all(&mut fixture, &required.bindings).unwrap();
+        let grouped_resolution = resolve_all(&mut fixture, &grouped.bindings).unwrap();
+        let target_bound = fixture.bound.get(&fixture.files[1].file).unwrap();
+        let original = fixture
+            .store
+            .symbol_table(target_bound.locals(target_bound.source_file()).unwrap())
+            .unwrap()
+            .get_source("callable")
+            .unwrap();
+        let module = target_bound.symbol(target_bound.source_file()).unwrap();
+        let assignment = fixture
+            .store
+            .symbol(module)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| fixture.store.symbol_table(exports))
+            .and_then(|exports| exports.get(InternalSymbolName::ExportEquals.as_ref()))
+            .unwrap();
+
+        for resolved in [&required_resolution[0], &grouped_resolution[0]] {
+            assert_eq!(resolved.immediate_target_symbol, assignment);
+            assert_eq!(resolved.target_symbol, original);
+        }
+        resolve_namespace_exports(&mut fixture, &grouped_resolution[0]).unwrap();
+        let required_value =
+            prepare_one(&mut fixture, &required_resolution[0], &required_read).unwrap();
+        let grouped_value =
+            prepare_one(&mut fixture, &grouped_resolution[0], &grouped_read).unwrap();
+
+        assert_eq!(required_value.type_, grouped_value.type_);
+        assert_eq!(
+            fixture.store.source_callable_type_for_owner(original),
+            Some(required_value.type_),
+        );
+        assert!(matches!(
+            validate_stored_source_callable(&fixture.store, required_value.type_),
+            StoredSourceCallableValidation::Valid(_),
+        ));
+        let signature = fixture
+            .store
+            .source_callable_provenance(required_value.type_)
+            .map(|provenance| provenance.signature)
+            .and_then(|signature| fixture.store.signature(signature))
+            .unwrap();
+        assert_eq!(
+            signature.resolved_return_type(),
+            Some(fixture.store.intrinsic_bootstrap().unwrap().void_type),
+        );
+        assert!(
+            fixture
+                .store
+                .symbol(original)
+                .and_then(ts_binder::semantic::Symbol::exports)
+                .and_then(|exports| fixture.store.symbol_table(exports))
+                .and_then(|exports| exports.get_source("value"))
+                .is_some(),
+        );
+
+        let prepared = [required_value, grouped_value];
+        publish_for_test(&mut fixture.store, &prepared);
+        let warm = store_state(&fixture.store);
+        assert_eq!(
+            resolve_all(&mut fixture, &required.bindings).unwrap(),
+            required_resolution,
+        );
+        assert_eq!(
+            resolve_all(&mut fixture, &grouped.bindings).unwrap(),
+            grouped_resolution,
+        );
+        assert_eq!(
+            prepare_one(&mut fixture, &required_resolution[0], &required_read).unwrap(),
+            prepared[0],
+        );
+        assert_eq!(
+            prepare_one(&mut fixture, &grouped_resolution[0], &grouped_read).unwrap(),
+            prepared[1],
+        );
+        assert_eq!(store_state(&fixture.store), warm);
     }
 
     #[test]
