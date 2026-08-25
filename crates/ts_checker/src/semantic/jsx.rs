@@ -10991,10 +10991,23 @@ mod runtime_tests {
         let direct = fixture.expression("direct");
         let nested = fixture.expression("nested");
         let named = fixture.expression("named");
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [(&fixture.parsed.arena, &fixture.bound)],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let options = CanonicalCheckerOptions {
+            no_implicit_any: true,
+            jsx_runtime: CanonicalJsxRuntime::Preserve,
+            ..CanonicalCheckerOptions::default()
+        };
         let mut diagnostics = CanonicalCheckerDiagnostics::default();
 
         for expression in [primitive, direct, nested, named] {
-            fixture.check(expression, CanonicalJsxRuntime::Preserve, &mut diagnostics);
+            fixture
+                .store
+                .check_jsx_element(&host, expression, options, &mut diagnostics)
+                .unwrap();
         }
 
         assert_eq!(
@@ -11118,7 +11131,10 @@ mod runtime_tests {
             diagnostics.as_slice().to_vec(),
         );
         for expression in [primitive, direct, nested, named] {
-            fixture.check(expression, CanonicalJsxRuntime::Preserve, &mut diagnostics);
+            fixture
+                .store
+                .check_jsx_element(&host, expression, options, &mut diagnostics)
+                .unwrap();
         }
         assert_eq!(
             (
@@ -11139,7 +11155,6 @@ mod runtime_tests {
             },
         ));
         let before = fixture.store.checker_link_allocated_lengths();
-        let host = DeclaredTypeHost::new([(&fixture.parsed.arena, &fixture.bound)]).unwrap();
         assert!(matches!(
             fixture.store.check_jsx_element(
                 &host,
