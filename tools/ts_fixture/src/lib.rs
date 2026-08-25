@@ -6896,8 +6896,7 @@ mod tests {
                 "// @module: esnext\n",
                 "// @outDir: out\n",
                 "// @filename: unsupported.ts\n",
-                "const source = [1, 2];\n",
-                "const value = [...source];\n",
+                "for (let index = 0; index < 2; index++) {}\n",
             ),
         )
         .unwrap();
@@ -6913,7 +6912,7 @@ mod tests {
         assert!(compilation.outputs.is_empty());
         assert_eq!(variant.unsupported_details.len(), 1);
         assert!(
-            variant.unsupported_details[0].contains("kind: SpreadElement, role: ArrayElement"),
+            variant.unsupported_details[0].contains("kind: ForStatement, role: Statement"),
             "{:?}",
             variant.unsupported_details
         );
