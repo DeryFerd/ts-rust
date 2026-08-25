@@ -6331,6 +6331,93 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             && declaration.body == Some(body.node))
     }
 
+    /// Authenticates a concise arrow body or its sole block return.
+    fn conditional_arrow_return_annotation(
+        &self,
+        expression: NodeRef,
+    ) -> Result<Option<bool>, SourceCheckError> {
+        let Some(owner) = self
+            .node(expression)?
+            .parent
+            .map(|node| self.reference(node))
+        else {
+            return Ok(None);
+        };
+        let owner_record = self.node(owner)?;
+        let arrow = match &owner_record.data {
+            NodeData::ArrowFunction(arrow)
+                if owner_record.kind == SyntaxKind::ArrowFunction
+                    && arrow.body == expression.node =>
+            {
+                owner
+            }
+            NodeData::ReturnStatement(returned)
+                if owner_record.kind == SyntaxKind::ReturnStatement
+                    && owner_record.flags.0 == 0
+                    && returned.expression == Some(expression.node)
+                    && returned.flow_node.is_none()
+                    && returned.facts == 0 =>
+            {
+                let Some(body) = owner_record.parent.map(|node| self.reference(node)) else {
+                    return Ok(None);
+                };
+                let body_record = self.node(body)?;
+                let NodeData::Block(block) = &body_record.data else {
+                    return Ok(None);
+                };
+                if body_record.kind != SyntaxKind::Block
+                    || body_record.flags.0 != 0
+                    || block.flow_node.is_some()
+                    || block.next_container.is_some()
+                    || block.statements.has_trailing_comma
+                    || block.facts != 0
+                    || block.statements.nodes.as_slice() != [owner.node]
+                {
+                    return Ok(None);
+                }
+                let Some(arrow) = body_record.parent.map(|node| self.reference(node)) else {
+                    return Ok(None);
+                };
+                let arrow_record = self.node(arrow)?;
+                let NodeData::ArrowFunction(function) = &arrow_record.data else {
+                    return Ok(None);
+                };
+                if arrow_record.kind != SyntaxKind::ArrowFunction || function.body != body.node {
+                    return Ok(None);
+                }
+                if self.bound.container(owner) != Some(arrow)
+                    || self.bound.block_scope_container(owner) != Some(arrow)
+                    || self.bound.flow_container(owner) != Some(arrow)
+                {
+                    return Ok(None);
+                }
+                arrow
+            }
+            _ => return Ok(None),
+        };
+        let arrow_record = self.node(arrow)?;
+        let NodeData::ArrowFunction(function) = &arrow_record.data else {
+            return Ok(None);
+        };
+        let Some((store, _)) = self.semantic else {
+            return Ok(None);
+        };
+        let Some(symbol) = self.bound.symbol(arrow) else {
+            return Ok(None);
+        };
+        if function.facts != 0
+            || store
+                .symbol(symbol)
+                .is_none_or(|record| record.flags() != SymbolFlags::FUNCTION)
+            || store.get_merged_symbol(symbol) != Some(symbol)
+            || self.bound.container(expression) != Some(arrow)
+            || self.bound.block_scope_container(expression) != Some(arrow)
+        {
+            return Ok(None);
+        }
+        Ok(Some(function.type_.is_some()))
+    }
+
     /// Proves that constructor evaluation remains inside an admitted top-level expression.
     fn is_top_level_constructor_expression(
         &self,
@@ -18019,10 +18106,31 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             }
             NodeData::ReturnStatement(return_statement)
                 if owner_record.kind == SyntaxKind::ReturnStatement
-                    && return_statement.expression == Some(root.node)
-                    && self.is_direct_top_level_function_return(root)? =>
+                    && return_statement.expression == Some(root.node) =>
             {
-                (false, true)
+                if self.is_direct_top_level_function_return(root)? {
+                    (false, true)
+                } else if let Some(annotated) = self.conditional_arrow_return_annotation(root)? {
+                    (false, annotated)
+                } else {
+                    return Err(self.unsupported(
+                        expression,
+                        SyntaxKind::ConditionalExpression,
+                        SourceSyntaxRole::VariableInitializer,
+                    ));
+                }
+            }
+            NodeData::ArrowFunction(arrow)
+                if owner_record.kind == SyntaxKind::ArrowFunction && arrow.body == root.node =>
+            {
+                let Some(annotated) = self.conditional_arrow_return_annotation(root)? else {
+                    return Err(self.unsupported(
+                        expression,
+                        SyntaxKind::ConditionalExpression,
+                        SourceSyntaxRole::VariableInitializer,
+                    ));
+                };
+                (false, annotated)
             }
             _ => {
                 return Err(self.unsupported(
@@ -74562,6 +74670,148 @@ class Foo2 {
             assert_eq!(diagnostic.diagnostic.arguments, [source_type, target]);
         }
         assert!(is_type_checked(&context, file));
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn inferred_arrow_conditionals_preserve_object_branches_and_warm_identity() {
+        let source = parsed(concat!(
+            "const blocked = (value: number) => {\n",
+            "  return true ? { value } : { value: 1 };\n",
+            "};\n",
+            "const concise = (value: number) => true ? { value } : { value: 1 };\n",
+        ));
+        let file = FileId::new(4_818);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let (_, bound) = context.file(file).unwrap();
+        for name in ["blocked", "concise"] {
+            let arrow = variable_initializer(&source, file, name);
+            let owner = bound.symbol(arrow).unwrap();
+            let callable = context
+                .store()
+                .source_callable_type_for_owner(owner)
+                .unwrap();
+            let signature = context
+                .store()
+                .source_callable_provenance(callable)
+                .unwrap()
+                .signature;
+            let return_type = context
+                .store()
+                .signature(signature)
+                .and_then(super::super::signatures::Signature::resolved_return_type)
+                .unwrap();
+            assert_eq!(
+                context.type_to_string(return_type).unwrap(),
+                "{ value: number; }",
+                "arrow {name}",
+            );
+            assert_eq!(resolved_node_type(&context, arrow), callable);
+        }
+        for (node, record) in source.arena.iter() {
+            if record.kind == SyntaxKind::ObjectLiteralExpression {
+                let object = NodeRef::new(source.arena.id(), file, node);
+                assert_eq!(object_property_type(&context, object, "value"), number);
+            }
+        }
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn annotated_arrow_conditionals_report_each_invalid_branch() {
+        let source = parsed(concat!(
+            "const concise = (value: boolean): 3 => value ? 1 : 2;\n",
+            "const blocked = (value: boolean): string => {\n",
+            "  return value ? 'ready' : 1;\n",
+            "};\n",
+        ));
+        let file = FileId::new(4_819);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 3);
+        for (diagnostic, (node, source_type, target)) in
+            diagnostics
+                .iter()
+                .zip([("1", "1", "3"), ("2", "2", "3"), ("1", "number", "string")])
+        {
+            assert_eq!(diagnostic.diagnostic.code(), 2322);
+            assert_eq!(node_text(&source, diagnostic.node.unwrap()), node);
+            assert_eq!(diagnostic.diagnostic.arguments, [source_type, target]);
+        }
+        assert!(is_type_checked(&context, file));
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn contextual_arrow_callbacks_infer_conditional_object_returns() {
+        let source = parsed(concat!(
+            "declare function consume(callback: (value: number) => ",
+            "{ value: number }): void;\n",
+            "consume(value => {\n",
+            "  return true ? { value } : { value: 1 };\n",
+            "});\n",
+        ));
+        let file = FileId::new(4_820);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                no_implicit_any: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let arrow = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ArrowFunction).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let (_, bound) = context.file(file).unwrap();
+        let owner = bound.symbol(arrow).unwrap();
+        let callable = context
+            .store()
+            .source_callable_type_for_owner(owner)
+            .unwrap();
+        let signature = context
+            .store()
+            .source_callable_provenance(callable)
+            .unwrap()
+            .signature;
+        let returned = context
+            .store()
+            .signature(signature)
+            .and_then(super::super::signatures::Signature::resolved_return_type)
+            .unwrap();
+        assert_eq!(
+            context.type_to_string(returned).unwrap(),
+            "{ value: number; }"
+        );
+        assert_eq!(resolved_node_type(&context, arrow), callable);
+        assert!(context.diagnostics().is_empty());
 
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();
