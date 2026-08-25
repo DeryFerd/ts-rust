@@ -52,7 +52,7 @@ use super::{
     source_imports::SourceImportBindingPlan,
     store::{CachedSignatureLookup, SourceNodeParent},
     type_nodes::{CanonicalTypeQuery, normalize_numeric_separators},
-    type_records::{StructuredTypeData, TypeCacheState, type_list_key},
+    type_records::{StructuredTypeData, TypeCacheState, TypeRecord, type_list_key},
     types::{ObjectFlags, TypeFlags},
 };
 
@@ -408,7 +408,7 @@ impl SourceDefaultNewPlan {
                 .classes
                 .iter()
                 .any(ClassMemberQueryPlan::is_abstract)
-                .then(|| (2511, String::new())));
+                .then_some((2511, String::new())));
         }
         let imported_class;
         let class = match &self.target {
@@ -5093,7 +5093,7 @@ fn resolved_declared_class_union_constructor(
             let target = reference.object.target.ok_or_else(invalid)?;
             let target_owner = store
                 .type_payload(target)
-                .and_then(|record| record.symbol())
+                .and_then(TypeRecord::symbol)
                 .ok_or_else(invalid)?;
             let global_array = store
                 .intrinsic_bootstrap()
@@ -5126,7 +5126,7 @@ fn resolved_declared_class_union_constructor(
     {
         return Err(invalid());
     }
-    let candidates = match store.type_payload(value_type).map(|record| record.data()) {
+    let candidates = match store.type_payload(value_type).map(TypeRecord::data) {
         Some(TypeData::Union(candidates)) => candidates.union.types.as_slice(),
         Some(TypeData::Object(_))
             if matches!(
@@ -5152,7 +5152,7 @@ fn resolved_declared_class_union_constructor(
     for candidate in candidates {
         let owner = store
             .type_payload(*candidate)
-            .and_then(|record| record.symbol())
+            .and_then(TypeRecord::symbol)
             .ok_or_else(invalid)?;
         let class = union
             .classes
@@ -8920,7 +8920,7 @@ mod tests {
             assert!(candidates.union.types.iter().any(|candidate| {
                 store
                     .type_payload(*candidate)
-                    .and_then(|record| record.symbol())
+                    .and_then(TypeRecord::symbol)
                     .and_then(|symbol| authenticated_class_constructor_value(store, symbol))
                     .is_some_and(|(_, actual)| actual == signature)
             }));
