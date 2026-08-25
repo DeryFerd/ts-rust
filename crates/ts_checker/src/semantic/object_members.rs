@@ -1450,7 +1450,7 @@ pub(super) fn plan_interface(
     if symbol_record.flags().without(SymbolFlags::TRANSIENT) != expected_symbol_flags
         || symbol_record.check_flags() != CheckFlags::NONE
         || !valid_value_declaration
-        || merged_namespace_interface != !namespace_declarations.is_empty()
+        || merged_namespace_interface == namespace_declarations.is_empty()
         || merged_namespace_interface && !value_declarations.is_empty()
         || symbol_record.exports().is_some() != merged_namespace_interface
         || symbol_record.export_symbol().is_some()
