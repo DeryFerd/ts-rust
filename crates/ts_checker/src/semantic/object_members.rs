@@ -7528,7 +7528,6 @@ fn valid_unresolved_jsx_element_interface(
         || owner_record.check_flags() != CheckFlags::NONE
         || owner_record.name().as_utf8() != Some("Element")
         || owner_record.value_declaration().is_some()
-        || owner_record.members().is_some()
         || owner_record.exports().is_some()
         || owner_record.export_symbol().is_some()
         || store.get_merged_symbol(owner) != Some(owner)
@@ -7552,6 +7551,13 @@ fn valid_unresolved_jsx_element_interface(
             .and_then(|exports| exports.get_source("Element"))
             .and_then(|symbol| store.get_merged_symbol(symbol))
             != Some(owner)
+    {
+        return false;
+    }
+
+    let has_own_properties = owner_record.members().is_some();
+    if has_own_properties
+        && classify_declared_owner_members(store, owner) != DeclaredOwnerMemberDomain::PropertyOnly
     {
         return false;
     }
@@ -7584,12 +7590,15 @@ fn valid_unresolved_jsx_element_interface(
             None => return false,
         }
     }
-    let Some(heritage) = heritage else {
-        return false;
-    };
     let Some(name_index) = name_index else {
         return false;
     };
+    let Some(heritage) = heritage else {
+        return has_own_properties;
+    };
+    if has_own_properties {
+        return false;
+    }
     let mut bases = 0usize;
     for index in (name_index.saturating_add(1)..heritage.node.index()).rev() {
         let Ok(index) = u32::try_from(index) else {
