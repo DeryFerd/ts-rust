@@ -1119,6 +1119,7 @@ enum PlannedFunctionBody {
         else_statement: NodeRef,
         else_expression: PlannedExpression,
     },
+    EffectIf(Box<PlannedEffectIfFunctionStatements>),
     AsyncCapturedLoop(Box<PlannedAsyncCapturedLoop>),
     Linear(Box<PlannedLinearFunctionStatements>),
     ForIn(Box<PlannedLexicalIteration>),
@@ -1130,6 +1131,13 @@ enum PlannedFunctionBody {
     ConditionalEnum(Box<PlannedConditionalEnumFunctionStatements>),
     Statements(Box<PlannedFunctionStatements>),
     JoinedStatements(Box<PlannedJoinedFunctionStatements>),
+}
+
+#[derive(Clone, Debug)]
+struct PlannedEffectIfFunctionStatements {
+    condition: PlannedExpression,
+    then_calls: Vec<PlannedExpression>,
+    else_calls: Vec<PlannedExpression>,
 }
 
 #[derive(Clone, Debug)]
@@ -8611,10 +8619,14 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         };
         if let [statement_id] = statements.as_slice()
             && self.node(self.reference(*statement_id))?.kind == SyntaxKind::IfStatement
-            && let Some(body) =
-                self.plan_constant_boolean_return_if(callable, self.reference(*statement_id))?
         {
-            return Ok(body);
+            let statement = self.reference(*statement_id);
+            if let Some(body) = self.plan_constant_boolean_return_if(callable, statement)? {
+                return Ok(body);
+            }
+            if let Some(body) = self.plan_effect_if_function_body(callable, statement)? {
+                return Ok(PlannedFunctionBody::EffectIf(Box::new(body)));
+            }
         }
         if let [statement_id] = statements.as_slice()
             && self.node(self.reference(*statement_id))?.kind == SyntaxKind::ReturnStatement
@@ -9627,6 +9639,207 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         }))
     }
 
+    fn plan_effect_if_function_body(
+        &mut self,
+        callable: &SourceCallablePlan,
+        statement: NodeRef,
+    ) -> Result<Option<PlannedEffectIfFunctionStatements>, SourceCheckError> {
+        if callable.family != SourceCallableFamily::FunctionDeclaration
+            || callable.is_async
+            || !self.function_empty_body_return_supported(callable.return_type)?
+        {
+            return Ok(None);
+        }
+        let control =
+            match plan_source_control_if_syntax(self.arena, self.bound, statement, callable.body) {
+                Ok(control) => control,
+                Err(SourceFunctionStatementsError::Unsupported(_)) => return Ok(None),
+                Err(error) => return Err(Self::function_statements_plan_error(callable, error)),
+            };
+        let graph = self.bound.flow_graph();
+        if !control.nested_export_diagnostics.is_empty()
+            || self.node(control.condition)?.kind != SyntaxKind::CallExpression
+            || graph.container_is_complete(callable.declaration) != Some(true)
+            || graph.container_start(callable.declaration).is_none()
+            || graph.container_return(callable.declaration).is_some()
+            || graph.container_end(callable.declaration).is_none()
+            || self.bound.flow_container(statement) != Some(callable.declaration)
+        {
+            return Ok(None);
+        }
+        let Some(then_nodes) =
+            self.effect_if_branch_call_nodes(callable, statement, control.then_statement)?
+        else {
+            return Ok(None);
+        };
+        let else_nodes = match control.else_statement {
+            Some(branch) => {
+                let Some(calls) = self.effect_if_branch_call_nodes(callable, statement, branch)?
+                else {
+                    return Ok(None);
+                };
+                calls
+            }
+            None => Vec::new(),
+        };
+        if then_nodes.is_empty() && else_nodes.is_empty() {
+            return Ok(None);
+        }
+
+        let condition = self.plan_expression(control.condition)?;
+        if !self.effect_if_call_is_exact(&condition, true) {
+            return Err(Self::unsupported_function_body(callable));
+        }
+        let plan_calls = |planner: &mut Self,
+                          calls: Vec<NodeRef>|
+         -> Result<Vec<PlannedExpression>, SourceCheckError> {
+            calls
+                .into_iter()
+                .map(|call| {
+                    let expression = planner.plan_expression(call)?;
+                    if !planner.effect_if_call_is_exact(&expression, false) {
+                        return Err(Self::unsupported_function_body(callable));
+                    }
+                    Ok(expression)
+                })
+                .collect()
+        };
+        Ok(Some(PlannedEffectIfFunctionStatements {
+            condition,
+            then_calls: plan_calls(self, then_nodes)?,
+            else_calls: plan_calls(self, else_nodes)?,
+        }))
+    }
+
+    fn effect_if_branch_call_nodes(
+        &self,
+        callable: &SourceCallablePlan,
+        control: NodeRef,
+        branch: NodeRef,
+    ) -> Result<Option<Vec<NodeRef>>, SourceCheckError> {
+        let record = self.node(branch)?;
+        let (statements, parent) = match &record.data {
+            NodeData::Block(block)
+                if record.kind == SyntaxKind::Block
+                    && record.flags.0 == 0
+                    && record.parent == Some(control.node)
+                    && block.flow_node.is_none()
+                    && block.next_container.is_none()
+                    && !block.statements.has_trailing_comma
+                    && block.facts == 0
+                    && self.bound.container(branch) == Some(callable.declaration) =>
+            {
+                (block.statements.nodes.clone(), branch)
+            }
+            NodeData::ExpressionStatement(_)
+                if record.kind == SyntaxKind::ExpressionStatement
+                    && record.flags.0 == 0
+                    && record.parent == Some(control.node) =>
+            {
+                (vec![branch.node], control)
+            }
+            _ => return Ok(None),
+        };
+
+        let mut calls = Vec::with_capacity(statements.len());
+        let mut previous_end = record.range.start;
+        for statement in statements {
+            let statement = self.reference(statement);
+            let statement_record = self.node(statement)?;
+            let NodeData::ExpressionStatement(expression) = &statement_record.data else {
+                return Ok(None);
+            };
+            if statement_record.kind != SyntaxKind::ExpressionStatement
+                || statement_record.flags.0 != 0
+                || statement_record.parent != Some(parent.node)
+                || statement_record.range.start < previous_end
+                || statement_record.range.end > record.range.end
+                || expression.flow_node.is_some()
+                || self.bound.container(statement) != Some(callable.declaration)
+                || self.bound.flow_container(statement) != Some(callable.declaration)
+                || self.bound.flow_at(statement).is_none()
+                || self.bound.flow_graph().is_unreachable(statement) != Some(false)
+            {
+                return Ok(None);
+            }
+            let call = self.reference(expression.expression);
+            let call_record = self.node(call)?;
+            let NodeData::CallExpression(call_data) = &call_record.data else {
+                return Ok(None);
+            };
+            let callee = self.reference(call_data.expression);
+            if call_record.kind != SyntaxKind::CallExpression
+                || call_record.flags.0 != 0
+                || call_record.parent != Some(statement.node)
+                || call_record.range.start < statement_record.range.start
+                || call_record.range.end > statement_record.range.end
+                || call_data.question_dot_token.is_some()
+                || call_data.symbol.is_some()
+                || call_data.facts != 0
+                || self.node(callee)?.kind != SyntaxKind::Identifier
+                || self.node(callee)?.parent != Some(call.node)
+            {
+                return Ok(None);
+            }
+            previous_end = statement_record.range.end;
+            calls.push(call);
+        }
+        Ok(Some(calls))
+    }
+
+    fn effect_if_call_is_exact(&self, expression: &PlannedExpression, condition: bool) -> bool {
+        let PlannedExpressionKind::Call(call) = &expression.unparenthesized().kind else {
+            return false;
+        };
+        let PlannedExpressionKind::Identifier(read) = &call.callee.unparenthesized().kind else {
+            return false;
+        };
+        let Some((store, _)) = self.semantic else {
+            return false;
+        };
+        let Some(declarations) = store
+            .symbol(read.value_symbol)
+            .and_then(ts_binder::semantic::Symbol::declarations)
+        else {
+            return false;
+        };
+        read.kind == PlannedIdentifierReadKind::Function
+            && !declarations.is_empty()
+            && declarations.iter().all(|declaration| {
+                let Ok(record) = self.node(*declaration) else {
+                    return false;
+                };
+                let NodeData::FunctionDeclaration(function) = &record.data else {
+                    return false;
+                };
+                let Some(annotation) = function.type_.map(|node| self.reference(node)) else {
+                    return false;
+                };
+                self.node(annotation).is_ok_and(|annotation| {
+                    if condition {
+                        matches!(
+                            annotation.kind,
+                            SyntaxKind::AnyKeyword
+                                | SyntaxKind::UnknownKeyword
+                                | SyntaxKind::BooleanKeyword
+                        )
+                    } else {
+                        matches!(
+                            annotation.kind,
+                            SyntaxKind::AnyKeyword
+                                | SyntaxKind::UnknownKeyword
+                                | SyntaxKind::VoidKeyword
+                                | SyntaxKind::BooleanKeyword
+                                | SyntaxKind::StringKeyword
+                                | SyntaxKind::NumberKeyword
+                                | SyntaxKind::BigIntKeyword
+                                | SyntaxKind::UndefinedKeyword
+                        )
+                    }
+                })
+            })
+    }
+
     /// Accepts only a parser-recovered `for (let in)` with no iterable.
     fn is_recovered_empty_for_in_function_body(
         &self,
@@ -9919,6 +10132,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         &body,
                         PlannedFunctionBody::Empty
                             | PlannedFunctionBody::Return { .. }
+                            | PlannedFunctionBody::EffectIf(_)
                             | PlannedFunctionBody::Linear(_)
                             | PlannedFunctionBody::ForIn(_)
                             | PlannedFunctionBody::ForOf(_)
@@ -21413,6 +21627,25 @@ fn preflight_inferred_function_return_dependencies(
                         functions,
                     )
             }
+            PlannedFunctionBody::EffectIf(statements) => {
+                expression_is_closed(
+                    &statements.condition,
+                    &function.callable.parameters,
+                    &locals,
+                    functions,
+                ) && statements
+                    .then_calls
+                    .iter()
+                    .chain(&statements.else_calls)
+                    .all(|call| {
+                        expression_is_closed(
+                            call,
+                            &function.callable.parameters,
+                            &locals,
+                            functions,
+                        )
+                    })
+            }
             PlannedFunctionBody::AsyncCapturedLoop(statements) => {
                 function.callable.is_async
                     && function.callable.parameters.is_empty()
@@ -28114,6 +28347,61 @@ fn check_callable_parameter_initializers(
     Ok(flow_types)
 }
 
+#[allow(clippy::too_many_arguments)] // Conditional effects retain the active source checker state.
+fn check_planned_effect_if_function_statements(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source: SourceFileRef,
+    options: CanonicalCheckerOptions,
+    session: &mut InstantiationSession,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    flow_types: &HashMap<SemanticSymbolId, TypeId>,
+    preflighted_type_import_value_uses: &HashMap<NodeRef, PreparedSourceTypeImportValueUse>,
+    deferred: &mut Vec<DeferredAssertion>,
+    callable: &SourceCallablePlan,
+    statements: &PlannedEffectIfFunctionStatements,
+) -> Result<(), SourceCheckError> {
+    let condition = check_expression_type(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        session,
+        diagnostics,
+        flow_types,
+        preflighted_type_import_value_uses,
+        &statements.condition,
+        None,
+        deferred,
+    )?;
+    if store.type_payload(condition.result).is_none_or(|record| {
+        !record
+            .flags()
+            .intersects(TypeFlags::ANY_OR_UNKNOWN | TypeFlags::BOOLEAN_LIKE)
+    }) {
+        return Err(SourcePlanner::unsupported_function_body(callable));
+    }
+    for expression in statements.then_calls.iter().chain(&statements.else_calls) {
+        check_expression_type(
+            store,
+            host,
+            global_types,
+            source,
+            options,
+            session,
+            diagnostics,
+            flow_types,
+            preflighted_type_import_value_uses,
+            expression,
+            None,
+            deferred,
+        )?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn check_planned_void_switch_function_statements(
     store: &mut CanonicalTypeMapperStore,
@@ -30481,6 +30769,23 @@ fn check_planned_linear_function_statements(
                     PlannedFunctionBody::Empty => (None, flow_types),
                     PlannedFunctionBody::Return { expression, .. } => {
                         (Some(expression), flow_types)
+                    }
+                    PlannedFunctionBody::EffectIf(statements) => {
+                        check_planned_effect_if_function_statements(
+                            store,
+                            host,
+                            global_types,
+                            source,
+                            options,
+                            session,
+                            diagnostics,
+                            &flow_types,
+                            preflighted_type_import_value_uses,
+                            deferred,
+                            &function.callable,
+                            statements,
+                        )?;
+                        (None, flow_types)
                     }
                     PlannedFunctionBody::Linear(nested) => {
                         let flow_types = check_planned_linear_function_statements(
@@ -40137,6 +40442,23 @@ pub(super) fn check_source_file(
                 inferred_function_diagnostics[index] = Some(function_diagnostics);
                 continue;
             }
+            PlannedFunctionBody::EffectIf(statements) => {
+                check_planned_effect_if_function_statements(
+                    store,
+                    host,
+                    global_types,
+                    source,
+                    options,
+                    session,
+                    &mut function_diagnostics,
+                    &body_flow_types,
+                    &preflighted_type_import_value_uses,
+                    &mut deferred,
+                    &function.callable,
+                    statements,
+                )?;
+                (None, body_flow_types)
+            }
             PlannedFunctionBody::AsyncCapturedLoop(statements) => {
                 check_planned_async_captured_loop(
                     store,
@@ -41480,6 +41802,22 @@ pub(super) fn check_source_file(
                                 None,
                             )?;
                         }
+                    }
+                    PlannedFunctionBody::EffectIf(statements) => {
+                        check_planned_effect_if_function_statements(
+                            store,
+                            host,
+                            global_types,
+                            source,
+                            options,
+                            session,
+                            diagnostics,
+                            &body_flow_types,
+                            &preflighted_type_import_value_uses,
+                            &mut deferred,
+                            &function.callable,
+                            statements,
+                        )?;
                     }
                     PlannedFunctionBody::AsyncCapturedLoop(statements) => {
                         check_planned_async_captured_loop(
@@ -74926,6 +75264,117 @@ class Foo2 {
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn effect_only_if_else_calls_preserve_comments_void_returns_and_warm_caches() {
+        let source = parsed(concat!(
+            "declare function commentedParameters(first: any, second: any): any; ",
+            "function ifelse() { ",
+            "if (commentedParameters(1, 2)) { ",
+            "/*comment1*/ commentedParameters(3, 4); /*comment2*/ ",
+            "} else { commentedParameters(5, 6); } ",
+            "}",
+        ));
+        let file = FileId::new(9_991);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
+        let owner = function_symbol(&context, &source, file, "ifelse");
+        let callable = context
+            .store()
+            .source_callable_type_for_owner(owner)
+            .unwrap();
+        assert_eq!(context.type_to_string(callable).unwrap(), "() => void");
+        let any = context.store().intrinsic_bootstrap().unwrap().any_type;
+        let calls = source
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::CallExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 3);
+        for call in calls {
+            assert_eq!(resolved_node_type(&context, call), any);
+            assert!(context.store().signature_links(call).is_some());
+        }
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn effect_only_if_branches_preserve_argument_diagnostics_and_implicit_void() {
+        let source = parsed(concat!(
+            "declare function decide(value: number): boolean; ",
+            "declare function consume(value: number): void; ",
+            "function annotated(value: number): void { ",
+            "if (decide(value)) { consume(value); } else { consume('wrong'); } ",
+            "} ",
+            "function inferred(value: number) { if (decide(value)) consume(value); }",
+        ));
+        let file = FileId::new(9_992);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected one conditional call argument diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2345);
+        assert_eq!(node_text(&source, diagnostic.node.unwrap()), "'wrong'");
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "Argument of type 'string' is not assignable to parameter of type 'number'.",
+        );
+        let owner = function_symbol(&context, &source, file, "inferred");
+        let callable = context
+            .store()
+            .source_callable_type_for_owner(owner)
+            .unwrap();
+        assert_eq!(
+            context.type_to_string(callable).unwrap(),
+            "(value: number) => void"
+        );
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn effect_only_if_rejects_type_predicate_conditions_before_publication() {
+        let source = parsed(concat!(
+            "declare function isText(value: unknown): value is string; ",
+            "declare function consume(value: string): void; ",
+            "function rejected(value: unknown) { if (isText(value)) consume(value); }",
+        ));
+        let file = FileId::new(9_993);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let owner = function_symbol(&context, &source, file, "rejected");
+        let cold = observable_state(&context, file);
+
+        assert!(matches!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Function(SourceFunctionUnsupported::FunctionBody(_))
+            ))
+        ));
+        assert_eq!(observable_state(&context, file), cold);
+        assert!(
+            context
+                .store()
+                .source_callable_type_for_owner(owner)
+                .is_none()
+        );
     }
 
     #[test]
