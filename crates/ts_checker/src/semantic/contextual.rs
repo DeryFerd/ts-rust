@@ -2226,48 +2226,65 @@ mod tests {
         )
         .unwrap();
 
-        context.check_source_file(file).unwrap();
-
-        let parameter = parsed
+        let function = parsed
             .arena
             .iter()
-            .find_map(|(_, record)| {
-                let NodeData::ArrowFunction(arrow) = &record.data else {
-                    return None;
-                };
-                let [parameter] = arrow.parameters.nodes.as_slice() else {
-                    return None;
-                };
-                Some(NodeRef::new(parsed.arena.id(), file, *parameter))
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::FunctionType).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
             })
             .unwrap();
-        let symbol = context.file(file).unwrap().1.symbol(parameter).unwrap();
-        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
-        assert_eq!(
-            context
-                .store()
-                .value_symbol_links(symbol)
-                .and_then(|links| links.resolved_type),
-            Some(number),
-        );
-        assert!(context.diagnostics().is_empty());
+        let callable = context.get_type_from_type_node(function).unwrap();
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        let (number, undefined) = (bootstrap.number_type, bootstrap.undefined_type);
+        let contextual = context
+            .store_mut_for_test()
+            .literal_union_type(&[callable, undefined], None)
+            .unwrap();
 
-        let warm = (
+        let StoredSingleCallableValidation::Valid {
+            callable: signature,
+            ..
+        } = validate_stored_single_callable(context.store(), callable)
+        else {
+            panic!("the contextual union must contain one authenticated callable")
+        };
+        assert_eq!(signature.parameters.as_slice(), &[number]);
+
+        let before = (
             context.store().type_len(),
             context.store().mapper_len(),
             context.store().signature_len(),
+            context.store().symbol_len(),
             context.store().checker_link_allocated_lengths(),
+            context.store().relation_state_snapshot(),
         );
-        context.recheck_source_file(file).unwrap();
-        assert_eq!(
-            (
-                context.store().type_len(),
-                context.store().mapper_len(),
-                context.store().signature_len(),
-                context.store().checker_link_allocated_lengths(),
-            ),
-            warm,
-        );
+
+        for _ in 0..2 {
+            assert_eq!(
+                contextual_arrow_initializer_type(
+                    context.store(),
+                    Some(context.global_types()),
+                    contextual,
+                ),
+                Ok(callable),
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().mapper_len(),
+                    context.store().signature_len(),
+                    context.store().symbol_len(),
+                    context.store().checker_link_allocated_lengths(),
+                    context.store().relation_state_snapshot(),
+                ),
+                before,
+            );
+        }
+
         assert!(context.diagnostics().is_empty());
     }
 
