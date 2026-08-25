@@ -6475,7 +6475,16 @@ fn plan_conflict_marker_method_grammar_diagnostic(
     if members.len() != 2 || store.symbol_table(exports)?.len() != 1 {
         return None;
     }
-    let trailing = plan_method(store, host, owner, second, owner_record.members(), exports).ok()?;
+    let trailing = plan_method(
+        store,
+        host,
+        owner,
+        second,
+        owner_record.members(),
+        exports,
+        false,
+    )
+    .ok()?;
     if trailing.side != ClassPropertySide::Instance || trailing.name != "bar" {
         return None;
     }
