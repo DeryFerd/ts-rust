@@ -5482,6 +5482,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             .ok_or(DeclaredTypeError::Unavailable(
                 DeclaredTypeUnavailable::SymbolNotOwned(symbol),
             ))?;
+        if self.authenticated_react_svg_factory_alias_heritage(symbol) {
+            return Ok(());
+        }
         if self.plan.interfaces.contains_key(&symbol) {
             return Ok(());
         }
@@ -5576,6 +5579,317 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             ));
         }
         Ok(Some(namespace))
+    }
+
+    /// Recognizes React's nongeneric SVG factory without resolving its alias or call members.
+    #[allow(clippy::too_many_lines)] // Namespace, alias, SVG arguments, and callable syntax form one proof.
+    fn authenticated_react_svg_factory_alias_heritage(&self, symbol: SemanticSymbolId) -> bool {
+        let Some(owner) = self.store.symbol(symbol) else {
+            return false;
+        };
+        if owner.name().as_utf8() != Some("SVGFactory") {
+            return false;
+        }
+        let Ok(Some(namespace)) = self.authenticated_react_interface_namespace(symbol) else {
+            return false;
+        };
+        let Some([declaration]) = owner.declarations() else {
+            return false;
+        };
+        let declaration = *declaration;
+        let Some(bound) = self.host.bound_file(declaration) else {
+            return false;
+        };
+        let Some(facts) = bound.source_facts() else {
+            return false;
+        };
+        let Ok(record) = preflight_node(self.store, self.host, declaration) else {
+            return false;
+        };
+        let NodeData::InterfaceDeclaration(interface) = &record.data else {
+            return false;
+        };
+        let Some(clauses) = interface.heritage_clauses.as_ref() else {
+            return false;
+        };
+        let [clause] = clauses.nodes.as_slice() else {
+            return false;
+        };
+        let clause = NodeRef::new(declaration.arena, declaration.file, *clause);
+        let Ok(clause_record) = preflight_node(self.store, self.host, clause) else {
+            return false;
+        };
+        let NodeData::HeritageClause(heritage) = &clause_record.data else {
+            return false;
+        };
+        let [base] = heritage.types.nodes.as_slice() else {
+            return false;
+        };
+        let base = NodeRef::new(clause.arena, clause.file, *base);
+        let Ok(base_record) = preflight_node(self.store, self.host, base) else {
+            return false;
+        };
+        let NodeData::ExpressionWithTypeArguments(expression) = &base_record.data else {
+            return false;
+        };
+        let Some(arguments) = expression.type_arguments.as_ref() else {
+            return false;
+        };
+        let [attributes, element] = arguments.nodes.as_slice() else {
+            return false;
+        };
+        let attributes = NodeRef::new(base.arena, base.file, *attributes);
+        let element = NodeRef::new(base.arena, base.file, *element);
+        let Ok(attributes_record) = preflight_node(self.store, self.host, attributes) else {
+            return false;
+        };
+        let NodeData::TypeReferenceNode(attributes_reference) = &attributes_record.data else {
+            return false;
+        };
+        let Some([nested_element]) = attributes_reference
+            .type_arguments
+            .as_ref()
+            .map(|arguments| arguments.nodes.as_slice())
+        else {
+            return false;
+        };
+        let nested_element = NodeRef::new(attributes.arena, attributes.file, *nested_element);
+        let name = NodeRef::new(base.arena, base.file, expression.expression);
+        let attributes_name = NodeRef::new(
+            attributes.arena,
+            attributes.file,
+            attributes_reference.type_name,
+        );
+        let Some(exports) = self
+            .store
+            .symbol(namespace)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| self.store.symbol_table(exports))
+        else {
+            return false;
+        };
+        let Some(alias) = exports
+            .get_source("DOMFactory")
+            .and_then(|alias| self.store.get_merged_symbol(alias))
+        else {
+            return false;
+        };
+        let Some(alias_owner) = self.store.symbol(alias) else {
+            return false;
+        };
+        let Some([alias_declaration]) = alias_owner.declarations() else {
+            return false;
+        };
+        let alias_declaration = *alias_declaration;
+        let Ok(alias_record) = preflight_node(self.store, self.host, alias_declaration) else {
+            return false;
+        };
+        let NodeData::TypeAliasDeclaration(alias_data) = &alias_record.data else {
+            return false;
+        };
+        let Some(alias_parameters) = alias_data.type_parameters.as_ref() else {
+            return false;
+        };
+        let alias_body = NodeRef::new(
+            alias_declaration.arena,
+            alias_declaration.file,
+            alias_data.type_,
+        );
+        let Ok(alias_body_record) = preflight_node(self.store, self.host, alias_body) else {
+            return false;
+        };
+        let NodeData::FunctionTypeNode(alias_function) = &alias_body_record.data else {
+            return false;
+        };
+        let Some(svg_attributes) = exports
+            .get_source("SVGAttributes")
+            .and_then(|attributes| self.store.get_merged_symbol(attributes))
+        else {
+            return false;
+        };
+        let Some(attributes_owner) = self.store.symbol(svg_attributes) else {
+            return false;
+        };
+        let Ok(element_symbol) = self.resolve_uncached_type_reference_symbol(element) else {
+            return false;
+        };
+        let [signature] = interface.members.nodes.as_slice() else {
+            return false;
+        };
+        let signature = NodeRef::new(declaration.arena, declaration.file, *signature);
+        let Ok(signature_record) = preflight_node(self.store, self.host, signature) else {
+            return false;
+        };
+        let NodeData::CallSignatureDeclaration(call) = &signature_record.data else {
+            return false;
+        };
+        let Some(signature_symbol) = bound
+            .symbol(signature)
+            .and_then(|signature| self.store.get_merged_symbol(signature))
+        else {
+            return false;
+        };
+        let Some(signature_owner) = self.store.symbol(signature_symbol) else {
+            return false;
+        };
+        if !facts.is_declaration_file()
+            || facts.is_default_library()
+            || owner.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
+            || owner.check_flags() != CheckFlags::NONE
+            || owner.value_declaration().is_some()
+            || owner.exports().is_some()
+            || owner.export_symbol().is_some()
+            || !self.host.symbol_matches(self.store, declaration, symbol)
+            || record.kind != SyntaxKind::InterfaceDeclaration
+            || record.flags.0 != 0
+            || interface.type_parameters.is_some()
+            || clauses.has_trailing_comma
+            || clause_record.kind != SyntaxKind::HeritageClause
+            || clause_record.flags.0 != 0
+            || clause_record.parent != Some(declaration.node)
+            || heritage.token != SyntaxKind::ExtendsKeyword
+            || heritage.facts != 0
+            || heritage.types.has_trailing_comma
+            || base_record.kind != SyntaxKind::ExpressionWithTypeArguments
+            || base_record.flags.0 != 0
+            || base_record.parent != Some(clause.node)
+            || expression.facts != 0
+            || arguments.has_trailing_comma
+            || !self.react_detailed_html_props_identifier(name, base, "DOMFactory")
+            || self.resolve_uncached_type_reference_symbol(base).ok() != Some(alias)
+            || alias_owner.flags() != SymbolFlags::TYPE_ALIAS
+            || alias_owner.check_flags() != CheckFlags::NONE
+            || self.store.get_parent_of_symbol(alias) != Some(namespace)
+            || alias_record.kind != SyntaxKind::TypeAliasDeclaration
+            || alias_record.flags.0 != 0
+            || alias_record.parent != record.parent
+            || alias_parameters.nodes.len() != 2
+            || alias_parameters.has_trailing_comma
+            || !self
+                .host
+                .symbol_matches(self.store, alias_declaration, alias)
+            || alias_body_record.kind != SyntaxKind::FunctionType
+            || alias_body_record.flags.0 != 0
+            || alias_body_record.parent != Some(alias_declaration.node)
+            || alias_function.type_parameters.is_some()
+            || alias_function.parameters.has_trailing_comma
+            || attributes_record.kind != SyntaxKind::TypeReference
+            || attributes_record.flags.0 != 0
+            || attributes_record.parent != Some(base.node)
+            || !self.react_detailed_html_props_identifier(
+                attributes_name,
+                attributes,
+                "SVGAttributes",
+            )
+            || self.resolve_uncached_type_reference_symbol(attributes).ok() != Some(svg_attributes)
+            || attributes_owner.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
+            || attributes_owner.check_flags() != CheckFlags::NONE
+            || self.store.get_parent_of_symbol(svg_attributes) != Some(namespace)
+            || self
+                .resolve_uncached_type_reference_symbol(nested_element)
+                .ok()
+                != Some(element_symbol)
+            || !self.global_symbol_has_name(element_symbol, "SVGElement")
+            || !self.is_default_library_dom_interface_argument(element, element_symbol)
+            || !self.is_default_library_dom_interface_argument(nested_element, element_symbol)
+            || interface.members.has_trailing_comma
+            || signature_record.kind != SyntaxKind::CallSignature
+            || signature_record.flags.0 != 0
+            || signature_record.parent != Some(declaration.node)
+            || call.full_signature.is_some()
+            || call.next_container.is_some()
+            || call.symbol.is_some()
+            || call.type_parameters.is_some()
+            || call.parameters.has_trailing_comma
+            || signature_owner.flags() != SymbolFlags::SIGNATURE
+            || signature_owner.check_flags() != CheckFlags::NONE
+            || signature_owner.name() != InternalSymbolName::Call.as_ref()
+            || signature_owner.declarations() != Some(&[signature])
+            || signature_owner.value_declaration().is_some()
+            || signature_owner.members().is_some()
+            || signature_owner.exports().is_some()
+            || signature_owner.export_symbol().is_some()
+            || self.store.get_parent_of_symbol(signature_symbol) != Some(symbol)
+            || owner
+                .members()
+                .and_then(|members| self.store.symbol_table(members))
+                .and_then(|members| members.get(InternalSymbolName::Call.as_ref()))
+                != Some(signature_symbol)
+            || self
+                .store
+                .signature_links(signature)
+                .is_some_and(|links| links != &SignatureLinks::default())
+            || !self.is_react_ambient_module_namespace(namespace, declaration)
+        {
+            return false;
+        }
+
+        for (callable, parameters) in [
+            (alias_body, &alias_function.parameters),
+            (signature, &call.parameters),
+        ] {
+            let [props, children] = parameters.nodes.as_slice() else {
+                return false;
+            };
+            for (parameter, expected, optional, rest) in [
+                (*props, "props", true, false),
+                (*children, "children", false, true),
+            ] {
+                let parameter = NodeRef::new(callable.arena, callable.file, parameter);
+                let Ok(parameter_record) = preflight_node(self.store, self.host, parameter) else {
+                    return false;
+                };
+                let NodeData::ParameterDeclaration(parameter_data) = &parameter_record.data else {
+                    return false;
+                };
+                let name = NodeRef::new(parameter.arena, parameter.file, parameter_data.name);
+                let Some(annotation) = parameter_data.type_ else {
+                    return false;
+                };
+                let annotation = NodeRef::new(parameter.arena, parameter.file, annotation);
+                if parameter_record.kind != SyntaxKind::Parameter
+                    || parameter_record.flags.0 != 0
+                    || parameter_record.parent != Some(callable.node)
+                    || parameter_data.initializer.is_some()
+                    || parameter_data.modifiers.is_some()
+                    || parameter_data.symbol.is_some()
+                    || parameter_data.facts != 0
+                    || parameter_data.question_token.is_some() != optional
+                    || parameter_data.dot_dot_dot_token.is_some() != rest
+                    || !self.react_detailed_html_props_identifier(name, parameter, expected)
+                    || self.host.node(annotation).is_none_or(|record| {
+                        record.parent != Some(parameter.node)
+                            || rest && record.kind != SyntaxKind::ArrayType
+                    })
+                {
+                    return false;
+                }
+            }
+        }
+
+        if let Some(target) = self
+            .store
+            .declared_type_links(symbol)
+            .and_then(|links| links.declared_type)
+        {
+            let Some(record) = self.store.type_payload(target) else {
+                return false;
+            };
+            let TypeData::Interface(interface) = record.data() else {
+                return false;
+            };
+            if record.symbol() != Some(symbol)
+                || interface.base_types_resolved
+                || interface.resolved_base_constructor_type.is_some()
+                || interface.resolved_base_types.is_some()
+                || interface.declared_members_resolved
+                || interface.reference.object.structured != StructuredTypeData::default()
+            {
+                return false;
+            }
+        }
+
+        true
     }
 
     /// Recognizes React's callable HTML factory without resolving its alias base.
@@ -35143,6 +35457,173 @@ mod tests {
             Ok(target),
         );
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // SVG alias ownership, cold DOM arguments, and poisoned exports share one proof.
+    fn ambient_react_svg_factory_alias_heritage_remains_authenticated_and_lazy() {
+        let library = parse_source_file(concat!(
+            "interface Element { self: this; } declare var Element: unknown; ",
+            "interface SVGElement extends Element { ",
+            "addEventListener<Value extends string>(type: Value): void; ",
+            "} declare var SVGElement: unknown;",
+        ));
+        let react = parse_source_file(concat!(
+            "declare module 'react' { export = React; namespace React { ",
+            "interface DOMAttributes<T> {} ",
+            "interface SVGAttributes<T> extends DOMAttributes<T> {} ",
+            "interface ClassAttributes<T> {} interface ReactSVGElement {} ",
+            "type ReactNode = unknown; ",
+            "type DOMFactory<P, T> = ",
+            "(props?: ClassAttributes<T> & P | null, ...children: ReactNode[]) => ReactSVGElement; ",
+            "interface SVGFactory extends DOMFactory<SVGAttributes<SVGElement>, SVGElement> { ",
+            "(props?: ClassAttributes<SVGElement> & SVGAttributes<SVGElement> | null, ",
+            "...children: ReactNode[]): ReactSVGElement; } ",
+            "interface ReactSVG { animate: SVGFactory; circle: SVGFactory; } ",
+            "} }",
+        ));
+        let (mut context, library_file, react_file) =
+            default_library_interface_context(&library, &react, true);
+        let library_bound = context.file(library_file).unwrap().1.clone();
+        let react_bound = context.file(react_file).unwrap().1.clone();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&library.arena, &library_bound),
+                (&react.arena, &react_bound),
+            ],
+            GlobalMergeCompletion::for_test(context.options().name_resolution),
+        )
+        .unwrap();
+        let globals = context.store().intrinsic_bootstrap().unwrap().globals;
+        let svg = context
+            .store()
+            .symbol_table(globals)
+            .and_then(|globals| globals.get_source("SVGElement"))
+            .unwrap();
+        let element = context
+            .store()
+            .symbol_table(globals)
+            .and_then(|globals| globals.get_source("Element"))
+            .unwrap();
+        let references = react_dom_type_references(&react, react_file, "SVGElement");
+        let aliases = HashMap::new();
+        for reference in &references {
+            assert!(
+                TypeQueryPlanner::new(context.store(), &host, None, None, false, &aliases)
+                    .is_default_library_dom_interface_argument(*reference, svg)
+            );
+        }
+        let animate = react_dom_property_annotation(&react, react_file, "animate");
+        let circle = react_dom_property_annotation(&react, react_file, "circle");
+        let resolved = context.get_type_from_type_node(animate).unwrap();
+        assert_eq!(context.get_type_from_type_node(circle), Ok(resolved));
+        let factory = context
+            .store()
+            .symbol_node_links(animate)
+            .and_then(|links| links.resolved_symbol)
+            .unwrap();
+        let namespace = context.store().get_parent_of_symbol(factory).unwrap();
+        let exports = context
+            .store()
+            .symbol(namespace)
+            .unwrap()
+            .exports()
+            .unwrap();
+        let dom_factory = context
+            .store()
+            .symbol_table(exports)
+            .and_then(|exports| exports.get_source("DOMFactory"))
+            .unwrap();
+        let attributes = context
+            .store()
+            .symbol_table(exports)
+            .and_then(|exports| exports.get_source("SVGAttributes"))
+            .unwrap();
+        let record = context.store().type_payload(resolved).unwrap();
+        let TypeData::Interface(interface) = record.data() else {
+            panic!("SVGFactory must retain its canonical interface identity")
+        };
+        assert_eq!(record.symbol(), Some(factory));
+        assert!(!interface.base_types_resolved);
+        assert!(!interface.declared_members_resolved);
+        assert!(interface.resolved_base_types.is_none());
+        assert!(context.store().type_alias_links(dom_factory).is_none());
+        assert!(context.store().declared_type_links(svg).is_none());
+        let signature = context
+            .store()
+            .symbol(factory)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| context.store().symbol_table(members))
+            .and_then(|members| members.get(InternalSymbolName::Call.as_ref()))
+            .unwrap();
+        assert!(context.store().value_symbol_links(signature).is_none());
+
+        let warm = store_state(context.store());
+        assert_eq!(context.get_type_from_type_node(animate), Ok(resolved));
+        assert_eq!(context.get_type_from_type_node(circle), Ok(resolved));
+        assert_eq!(context.get_declared_type_of_symbol(factory), Ok(resolved));
+        assert_eq!(store_state(context.store()), warm);
+
+        assert_eq!(
+            context.store_mut_for_test().insert_symbol(
+                exports,
+                EscapedName::source("DOMFactory"),
+                attributes,
+            ),
+            Some(Some(dom_factory)),
+        );
+        let poisoned = store_state(context.store());
+        assert!(context.get_type_from_type_node(animate).is_err());
+        assert_eq!(store_state(context.store()), poisoned);
+        assert_eq!(
+            context.store_mut_for_test().insert_symbol(
+                exports,
+                EscapedName::source("DOMFactory"),
+                dom_factory,
+            ),
+            Some(Some(attributes)),
+        );
+
+        assert_eq!(
+            context.store_mut_for_test().insert_symbol(
+                exports,
+                EscapedName::source("SVGAttributes"),
+                factory,
+            ),
+            Some(Some(attributes)),
+        );
+        let poisoned = store_state(context.store());
+        assert!(context.get_type_from_type_node(animate).is_err());
+        assert_eq!(store_state(context.store()), poisoned);
+        assert_eq!(
+            context.store_mut_for_test().insert_symbol(
+                exports,
+                EscapedName::source("SVGAttributes"),
+                attributes,
+            ),
+            Some(Some(factory)),
+        );
+
+        assert_eq!(
+            context.store_mut_for_test().insert_symbol(
+                globals,
+                EscapedName::source("SVGElement"),
+                element,
+            ),
+            Some(Some(svg)),
+        );
+        let poisoned = store_state(context.store());
+        assert!(context.get_type_from_type_node(animate).is_err());
+        assert_eq!(store_state(context.store()), poisoned);
+        assert_eq!(
+            context.store_mut_for_test().insert_symbol(
+                globals,
+                EscapedName::source("SVGElement"),
+                svg,
+            ),
+            Some(Some(element)),
+        );
+        assert_eq!(context.get_type_from_type_node(animate), Ok(resolved));
     }
 
     #[test]
