@@ -2021,10 +2021,21 @@ mod tests {
             "declare module 'react' {\n",
             "  export = React;\n",
             "  namespace React {\n",
-            "    interface ReactElement<Props> { props: Props }\n",
+            "    type Key = string | number;\n",
+            "    interface ComponentClass<Props> {}\n",
+            "    interface SFC<Props> {}\n",
+            "    interface ReactElement<Props> {\n",
+            "      type: string | ComponentClass<Props> | SFC<Props>;\n",
+            "      props: Props;\n",
+            "      key: Key | null;\n",
+            "    }\n",
             "    interface ReactNodeArray extends Array<ReactNode> {}\n",
             "    type ReactFragment = {} | ReactNodeArray;\n",
-            "    type ReactNode = ReactElement<any> | ReactFragment | ",
+            "    interface ReactPortal extends ReactElement<any> {\n",
+            "      key: Key | null;\n",
+            "      children: ReactNode;\n",
+            "    }\n",
+            "    type ReactNode = ReactElement<any> | ReactFragment | ReactPortal | ",
             "string | number | boolean | null | undefined;\n",
             "  }\n",
             "  type MergePropTypes<Props, Inferred> = Props & Inferred;\n",
@@ -2036,6 +2047,7 @@ mod tests {
             default_library_heritage_context(&library, &source, true);
         let array = interface_symbol(&library, library_file, &context, "Array");
         let react_array = interface_symbol(&source, source_file, &context, "ReactNodeArray");
+        let portal = interface_symbol(&source, source_file, &context, "ReactPortal");
         let namespace = context.store().get_parent_of_symbol(react_array).unwrap();
         let exports = context
             .store()
@@ -2138,6 +2150,25 @@ mod tests {
                 .unwrap();
         assert!(properties.properties.is_empty());
         assert_eq!(properties.heritage.as_ref(), Some(&planned));
+        let portal_plan =
+            crate::semantic::object_members::plan_interface(context.store(), &host, portal)
+                .unwrap();
+        assert_eq!(
+            portal_plan
+                .properties
+                .iter()
+                .map(|property| property.name.as_str())
+                .collect::<Vec<_>>(),
+            ["key", "children"],
+        );
+        assert!(
+            crate::semantic::object_members::authenticated_react_portal_interface(
+                context.store(),
+                &host,
+                &portal_plan,
+            )
+            .unwrap()
+        );
         assert_eq!(
             (
                 context.store().type_len(),
@@ -2182,6 +2213,31 @@ mod tests {
             context.store().validate_union_constituent(array_shell),
             Ok(())
         );
+        let portal_shell = context
+            .store()
+            .declared_type_links(portal)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        let portal_record = context.store().type_payload(portal_shell).unwrap();
+        let TypeData::Interface(portal_data) = portal_record.data() else {
+            panic!("ReactPortal must retain an authenticated interface shell")
+        };
+        assert_eq!(
+            portal_record.object_flags(),
+            ObjectFlags::INTERFACE | ObjectFlags::REFERENCE,
+        );
+        assert!(!portal_data.base_types_resolved);
+        assert!(!portal_data.declared_members_resolved);
+        assert_eq!(
+            context.store().validate_union_constituent(portal_shell),
+            Ok(())
+        );
+        assert!(portal_plan.properties.iter().all(|property| {
+            context
+                .store()
+                .value_symbol_links(property.symbol)
+                .is_none()
+        }));
         assert!(
             context
                 .store()
@@ -2227,10 +2283,21 @@ mod tests {
             context.store().validate_union_constituent(array_shell),
             Err(LiteralTypeCacheError::InvalidCachedUnion(array_shell)),
         );
+        assert!(context.store_mut_for_test().set_interface_base_resolution(
+            portal_shell,
+            true,
+            None,
+            None
+        ));
+        assert_eq!(
+            context.store().validate_union_constituent(portal_shell),
+            Err(LiteralTypeCacheError::InvalidCachedUnion(portal_shell)),
+        );
     }
 
     #[test]
-    fn react_portal_generic_base_is_unsupported_without_forging_interface_corruption() {
+    #[allow(clippy::too_many_lines)] // Keep portal ownership, generic base, and warm union identity together.
+    fn react_portal_generic_base_preserves_binder_properties_and_lazy_union_identity() {
         let library = parse_source_file(concat!(
             "interface Array<Value> { length: number }\n",
             "declare var Array: any;\n",
@@ -2250,15 +2317,16 @@ mod tests {
             "    }\n",
             "    interface ReactPortal extends ReactElement<any> {\n",
             "      key: Key | null;\n",
-            "      children: string;\n",
+            "      children: ReactNode;\n",
             "    }\n",
+            "    type ReactNode = ReactElement<any> | ReactPortal | string;\n",
             "  }\n",
             "  type MergePropTypes<Props, Inferred> = Props & Inferred;\n",
             "}\n",
         ));
         assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
         assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
-        let (context, library_file, source_file) =
+        let (mut context, library_file, source_file) =
             default_library_heritage_context(&library, &source, true);
         let element = interface_symbol(&source, source_file, &context, "ReactElement");
         let portal = interface_symbol(&source, source_file, &context, "ReactPortal");
@@ -2285,14 +2353,25 @@ mod tests {
             context.store().checker_link_allocated_lengths(),
         );
 
+        let properties =
+            crate::semantic::object_members::plan_interface(context.store(), &host, portal)
+                .unwrap();
+        assert_eq!(properties.heritage.as_ref(), Some(&planned));
         assert_eq!(
-            crate::semantic::object_members::plan_interface(context.store(), &host, portal),
-            Err(
-                crate::semantic::object_members::PropertyObjectError::UnsupportedMember {
-                    node: base.node,
-                    kind: SyntaxKind::ExpressionWithTypeArguments,
-                }
-            ),
+            properties
+                .properties
+                .iter()
+                .map(|property| property.name.as_str())
+                .collect::<Vec<_>>(),
+            ["key", "children"],
+        );
+        assert!(
+            crate::semantic::object_members::authenticated_react_portal_interface(
+                context.store(),
+                &host,
+                &properties,
+            )
+            .unwrap()
         );
         assert_eq!(
             (
@@ -2303,6 +2382,57 @@ mod tests {
             ),
             cold,
         );
+
+        let namespace = context.store().get_parent_of_symbol(portal).unwrap();
+        let react_node = context
+            .store()
+            .symbol(namespace)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| context.store().symbol_table(exports))
+            .and_then(|exports| exports.get_source("ReactNode"))
+            .unwrap();
+        let options = context.options();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let resolved = CanonicalTypeQuery::new(
+            context.store_mut_for_test(),
+            &host,
+            options,
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_declared_type_of_symbol(react_node)
+        .unwrap();
+        let shell = context
+            .store()
+            .declared_type_links(portal)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        assert_eq!(context.store().validate_union_constituent(shell), Ok(()));
+        let warm = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            CanonicalTypeQuery::new(
+                context.store_mut_for_test(),
+                &host,
+                options,
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_declared_type_of_symbol(react_node),
+            Ok(resolved),
+        );
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+        assert!(diagnostics.is_empty());
     }
 
     #[test]

@@ -4415,7 +4415,13 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         }
         let planned = object_members::plan_interface(self.store, self.host, symbol)
             .map_err(property_object_error)?;
+        let lazy_react_portal =
+            object_members::authenticated_react_portal_interface(self.store, self.host, &planned)
+                .map_err(property_object_error)?;
         self.plan.interfaces.insert(symbol, planned.clone());
+        if lazy_react_portal {
+            return Ok(());
+        }
         if !self.planning_interfaces.insert(symbol) {
             return Ok(());
         }
@@ -15037,7 +15043,10 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                 .ok_or(DeclaredTypeError::Unavailable(
                     DeclaredTypeUnavailable::MissingDeclarations(symbol),
                 ))?;
-        if has_lazy_default_library_interface_base(&interface) {
+        let lazy_react_portal =
+            object_members::authenticated_react_portal_interface(self.store, self.host, &interface)
+                .map_err(property_object_error)?;
+        if has_lazy_default_library_interface_base(&interface) || lazy_react_portal {
             let record =
                 self.store
                     .type_payload(declared_type)

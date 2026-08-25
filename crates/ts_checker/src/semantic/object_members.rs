@@ -1594,6 +1594,9 @@ pub(super) fn plan_interface(
         for base in &heritage.bases {
             if !base.type_arguments.is_empty() {
                 plan_generic_interface(store, host, base.symbol)?;
+                if authenticated_react_portal_interface(store, host, &plan)? {
+                    return Ok(plan);
+                }
                 return Err(PropertyObjectError::UnsupportedMember {
                     node: base.node,
                     kind: SyntaxKind::ExpressionWithTypeArguments,
@@ -1768,6 +1771,201 @@ pub(super) fn plan_interface(
         });
     }
     Ok(plan)
+}
+
+/// Proves the exact lazy `ReactPortal extends ReactElement<any>` declaration.
+#[allow(clippy::too_many_lines)] // Portal, base, properties, and module ownership are one proof.
+pub(super) fn authenticated_react_portal_interface(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    plan: &PropertyObjectPlan,
+) -> Result<bool, PropertyObjectError> {
+    let Some(heritage) = plan.heritage.as_ref() else {
+        return Ok(false);
+    };
+    let [base] = heritage.bases.as_slice() else {
+        return Ok(false);
+    };
+    let [key, children] = plan.properties.as_slice() else {
+        return Ok(false);
+    };
+    let Some(owner) = store.symbol(plan.symbol) else {
+        return Err(PropertyObjectError::InvalidInterfaceSymbol(plan.symbol));
+    };
+    let Some(namespace) = store.get_parent_of_symbol(plan.symbol) else {
+        return Ok(false);
+    };
+    let Some(namespace_owner) = store.symbol(namespace) else {
+        return Err(PropertyObjectError::InvalidInterfaceSymbol(namespace));
+    };
+    let Some(exports) = namespace_owner
+        .exports()
+        .and_then(|exports| store.symbol_table(exports))
+    else {
+        return Ok(false);
+    };
+    let Some(members) = plan.members.and_then(|members| store.symbol_table(members)) else {
+        return Ok(false);
+    };
+    let Some(bound) = host.bound_file(plan.node) else {
+        return Ok(false);
+    };
+    let Some(facts) = bound.source_facts() else {
+        return Ok(false);
+    };
+    if plan.kind != PropertyObjectKind::Interface
+        || plan.declarations.as_slice() != [plan.node]
+        || plan.const_context
+        || !plan.methods.is_empty()
+        || !plan.accessors.is_empty()
+        || !plan.spreads.is_empty()
+        || !plan.indexes.is_empty()
+        || !plan.call_signatures.is_empty()
+        || plan.alias_symbol.is_some()
+        || owner.flags() != SymbolFlags::INTERFACE
+        || owner.check_flags() != CheckFlags::NONE
+        || owner.name().as_utf8() != Some("ReactPortal")
+        || owner.declarations() != Some(&[plan.node])
+        || owner.value_declaration().is_some()
+        || owner.members() != plan.members
+        || owner.exports().is_some()
+        || owner.export_symbol().is_some()
+        || !host.symbol_matches(store, plan.node, plan.symbol)
+        || !facts.is_declaration_file()
+        || facts.is_default_library()
+        || !namespace_owner.flags().intersects(SymbolFlags::NAMESPACE)
+        || namespace_owner.check_flags() != CheckFlags::NONE
+        || namespace_owner.name().as_utf8() != Some("React")
+        || exports
+            .get_source("ReactPortal")
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            != Some(plan.symbol)
+        || base.kind != DirectInterfaceBaseKind::Interface
+        || base.type_arguments.len() != 1
+        || store
+            .symbol(base.symbol)
+            .and_then(|symbol| symbol.name().as_utf8())
+            != Some("ReactElement")
+        || store.get_parent_of_symbol(base.symbol) != Some(namespace)
+        || exports
+            .get_source("ReactElement")
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            != Some(base.symbol)
+        || members.len() != 2
+        || key.name != "key"
+        || children.name != "children"
+    {
+        return Ok(false);
+    }
+
+    for property in [key, children] {
+        let Some(record) = store.symbol(property.symbol) else {
+            return Ok(false);
+        };
+        if property.optional
+            || property.readonly
+            || record.flags() != SymbolFlags::PROPERTY
+            || record.check_flags() != CheckFlags::NONE
+            || record.name().as_utf8() != Some(property.name.as_str())
+            || record.declarations() != Some(&[property.declaration])
+            || record.value_declaration() != Some(property.declaration)
+            || record.members().is_some()
+            || record.exports().is_some()
+            || record.export_symbol().is_some()
+            || store.get_parent_of_symbol(property.symbol) != Some(plan.symbol)
+            || members.get(record.name()) != Some(property.symbol)
+            || !host.symbol_matches(store, property.declaration, property.symbol)
+        {
+            return Ok(false);
+        }
+    }
+
+    let argument = base.type_arguments[0];
+    let Some(argument_record) = host.node(argument) else {
+        return Ok(false);
+    };
+    if argument_record.kind != SyntaxKind::AnyKeyword
+        || argument_record.flags.0 != 0
+        || argument_record.parent != Some(base.node.node)
+    {
+        return Ok(false);
+    }
+
+    let generic = plan_generic_interface(store, host, base.symbol)?;
+    let [element_type, element_props, element_key] = generic.properties.as_slice() else {
+        return Ok(false);
+    };
+    if generic.heritage.is_some()
+        || !generic.methods.is_empty()
+        || !generic.accessors.is_empty()
+        || !generic.spreads.is_empty()
+        || !generic.indexes.is_empty()
+        || !generic.call_signatures.is_empty()
+        || element_type.name != "type"
+        || element_props.name != "props"
+        || element_key.name != "key"
+        || !equivalent_merged_property_annotations(
+            store,
+            host,
+            key.type_node,
+            element_key.type_node,
+        )
+    {
+        return Ok(false);
+    }
+
+    let Some(child_record) = host.node(children.type_node) else {
+        return Ok(false);
+    };
+    let NodeData::TypeReferenceNode(child_reference) = &child_record.data else {
+        return Ok(false);
+    };
+    let child_name = NodeRef::new(
+        children.type_node.arena,
+        children.type_node.file,
+        child_reference.type_name,
+    );
+    let Some(child_name_record) = host.node(child_name) else {
+        return Ok(false);
+    };
+    let NodeData::Identifier(identifier) = &child_name_record.data else {
+        return Ok(false);
+    };
+    let Some(react_node) = exports
+        .get_source("ReactNode")
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+    else {
+        return Ok(false);
+    };
+    let Some(alias) = store.symbol(react_node) else {
+        return Ok(false);
+    };
+    let Ok(mut resolver) = host.name_resolver_host(store) else {
+        return Ok(false);
+    };
+    if child_record.kind != SyntaxKind::TypeReference
+        || child_record.flags.0 != 0
+        || child_record.parent != Some(children.declaration.node)
+        || child_reference.type_arguments.is_some()
+        || child_name_record.kind != SyntaxKind::Identifier
+        || child_name_record.flags.0 != 0
+        || child_name_record.parent != Some(children.type_node.node)
+        || identifier.flow_node.is_some()
+        || identifier.text != "ReactNode"
+        || alias.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::TYPE_ALIAS
+        || alias.check_flags() != CheckFlags::NONE
+        || store.get_parent_of_symbol(react_node) != Some(namespace)
+        || resolver
+            .resolve_entity_name(child_name, SymbolFlags::TYPE)
+            .ok()
+            .flatten()
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            != Some(react_node)
+    {
+        return Ok(false);
+    }
+
+    Ok(true)
 }
 
 fn authenticated_global_math_random_interface(
@@ -7161,6 +7359,7 @@ fn validate_resolved_declared_property_object_detailed(
             }
             if valid_unresolved_jsx_element_interface(store, type_, record, interface)
                 || valid_unresolved_react_node_array_interface(store, type_, record, interface)
+                || valid_unresolved_react_portal_interface(store, type_, record, interface)
             {
                 return TraversableBoundary(DeclaredPropertyObjectProof::Interface);
             }
@@ -7173,7 +7372,8 @@ fn validate_resolved_declared_property_object_detailed(
                             .and_then(|namespace| store.symbol(namespace))
                             .and_then(|namespace| namespace.name().as_utf8()),
                     ),
-                    (Some("Element"), Some("JSX")) | (Some("ReactNodeArray"), Some("React"))
+                    (Some("Element"), Some("JSX"))
+                        | (Some("ReactNodeArray" | "ReactPortal"), Some("React"))
                 )
                 && interface.base_types_resolved
                 && interface.resolved_base_types.is_none()
@@ -7662,6 +7862,256 @@ fn valid_unresolved_react_node_array_interface(
                 .is_none_or(|cached| store.get_merged_symbol(cached) == Some(expected))
         })
     })
+}
+
+#[allow(clippy::too_many_lines)] // The portal shell preserves exact React owner and generic-base edges.
+fn valid_unresolved_react_portal_interface(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    record: &TypeRecord,
+    interface: &InterfaceTypeData,
+) -> bool {
+    let Some(owner) = record.symbol() else {
+        return false;
+    };
+    let Some(owner_record) = store.symbol(owner) else {
+        return false;
+    };
+    let Some([declaration]) = owner_record.declarations() else {
+        return false;
+    };
+    let declaration = *declaration;
+    let Some(namespace) = store.get_parent_of_symbol(owner) else {
+        return false;
+    };
+    let Some(namespace_record) = store.symbol(namespace) else {
+        return false;
+    };
+    let Some(exports) = namespace_record
+        .exports()
+        .and_then(|exports| store.symbol_table(exports))
+    else {
+        return false;
+    };
+    let Some(members) = owner_record
+        .members()
+        .and_then(|members| store.symbol_table(members))
+    else {
+        return false;
+    };
+    let Some(SourceNodeParent::Parent(block)) = store.source_node_parent(declaration) else {
+        return false;
+    };
+    let Some(SourceNodeParent::Parent(module)) = store.source_node_parent(block) else {
+        return false;
+    };
+    let Some(element) = exports
+        .get_source("ReactElement")
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+    else {
+        return false;
+    };
+    let Some(element_record) = store.symbol(element) else {
+        return false;
+    };
+    let Some(element_members) = element_record
+        .members()
+        .and_then(|members| store.symbol_table(members))
+    else {
+        return false;
+    };
+    let Some(react_node) = exports
+        .get_source("ReactNode")
+        .and_then(|symbol| store.get_merged_symbol(symbol))
+    else {
+        return false;
+    };
+    let Some(alias) = store.symbol(react_node) else {
+        return false;
+    };
+    if record.flags() != TypeFlags::OBJECT
+        || record.object_flags() != ObjectFlags::INTERFACE | ObjectFlags::REFERENCE
+        || record.alias().is_some()
+        || validate_nongeneric_interface_argument_origin(store, type_).is_err()
+        || interface.reference.object.structured != StructuredTypeData::default()
+        || interface.base_types_resolved
+        || interface.resolved_base_constructor_type.is_some()
+        || interface.resolved_base_types.is_some()
+        || interface.declared_members_resolved
+        || interface.declared_members.is_some()
+        || interface.declared_call_signatures.is_some()
+        || interface.declared_construct_signatures.is_some()
+        || interface.declared_index_infos.is_some()
+        || store.direct_interface_heritage_provenance(type_).is_some()
+        || owner_record.flags() != SymbolFlags::INTERFACE
+        || owner_record.check_flags() != CheckFlags::NONE
+        || owner_record.name().as_utf8() != Some("ReactPortal")
+        || owner_record.value_declaration().is_some()
+        || owner_record.exports().is_some()
+        || owner_record.export_symbol().is_some()
+        || store.get_merged_symbol(owner) != Some(owner)
+        || store
+            .declared_type_links(owner)
+            .and_then(|links| links.declared_type)
+            != Some(type_)
+        || store.source_node_kind(declaration) != Some(SyntaxKind::InterfaceDeclaration)
+        || store.source_node_kind(block) != Some(SyntaxKind::ModuleBlock)
+        || store.source_node_kind(module) != Some(SyntaxKind::ModuleDeclaration)
+        || !namespace_record.flags().intersects(SymbolFlags::NAMESPACE)
+        || namespace_record.check_flags() != CheckFlags::NONE
+        || namespace_record.name().as_utf8() != Some("React")
+        || namespace_record
+            .declarations()
+            .is_none_or(|declarations| !declarations.contains(&module))
+        || exports
+            .get_source("ReactPortal")
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            != Some(owner)
+        || members.len() != 2
+        || element_record.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
+        || element_record.check_flags() != CheckFlags::NONE
+        || element_record.name().as_utf8() != Some("ReactElement")
+        || store.get_parent_of_symbol(element) != Some(namespace)
+        || element_members.len() != 4
+        || alias.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::TYPE_ALIAS
+        || alias.check_flags() != CheckFlags::NONE
+        || store.get_parent_of_symbol(react_node) != Some(namespace)
+    {
+        return false;
+    }
+
+    for name in ["type", "props", "key"] {
+        let Some(property) = element_members.get_source(name) else {
+            return false;
+        };
+        let Some(property_record) = store.symbol(property) else {
+            return false;
+        };
+        if property_record.flags() != SymbolFlags::PROPERTY
+            || property_record.check_flags() != CheckFlags::NONE
+            || store.get_parent_of_symbol(property) != Some(element)
+        {
+            return false;
+        }
+    }
+    for name in ["key", "children"] {
+        let Some(property) = members.get_source(name) else {
+            return false;
+        };
+        let Some(property_record) = store.symbol(property) else {
+            return false;
+        };
+        let Some([property_declaration]) = property_record.declarations() else {
+            return false;
+        };
+        if property_record.flags() != SymbolFlags::PROPERTY
+            || property_record.check_flags() != CheckFlags::NONE
+            || property_record.name().as_utf8() != Some(name)
+            || property_record.value_declaration() != Some(*property_declaration)
+            || store.get_parent_of_symbol(property) != Some(owner)
+            || store.source_node_parent(*property_declaration)
+                != Some(SourceNodeParent::Parent(declaration))
+            || store
+                .value_symbol_links(property)
+                .is_some_and(|links| links != &ValueSymbolLinks::default())
+        {
+            return false;
+        }
+        if name == "children" {
+            let Some(annotation) = store.source_direct_type_annotation(*property_declaration)
+            else {
+                return false;
+            };
+            if store.source_node_kind(annotation) != Some(SyntaxKind::TypeReference)
+                || store.symbol_node_links(annotation).is_some_and(|links| {
+                    links
+                        .resolved_symbol
+                        .is_some_and(|symbol| store.get_merged_symbol(symbol) != Some(react_node))
+                })
+            {
+                return false;
+            }
+        }
+    }
+
+    let mut heritage = None;
+    let mut name_index = None;
+    for index in (0..declaration.node.index()).rev() {
+        let Ok(index) = u32::try_from(index) else {
+            return false;
+        };
+        let candidate = NodeRef::new(
+            declaration.arena,
+            declaration.file,
+            ts_ast::NodeId::new(index),
+        );
+        if store.source_node_parent(candidate) != Some(SourceNodeParent::Parent(declaration)) {
+            continue;
+        }
+        match store.source_node_kind(candidate) {
+            Some(SyntaxKind::HeritageClause) => {
+                if heritage.replace(candidate).is_some() {
+                    return false;
+                }
+            }
+            Some(SyntaxKind::Identifier) => {
+                name_index = Some(candidate.node.index());
+                break;
+            }
+            Some(_) => {}
+            None => return false,
+        }
+    }
+    let (Some(heritage), Some(name_index)) = (heritage, name_index) else {
+        return false;
+    };
+    let mut base = None;
+    for index in (name_index.saturating_add(1)..heritage.node.index()).rev() {
+        let Ok(index) = u32::try_from(index) else {
+            return false;
+        };
+        let candidate = NodeRef::new(heritage.arena, heritage.file, ts_ast::NodeId::new(index));
+        if store.source_node_parent(candidate) != Some(SourceNodeParent::Parent(heritage)) {
+            continue;
+        }
+        if store.source_node_kind(candidate) != Some(SyntaxKind::ExpressionWithTypeArguments)
+            || base.replace(candidate).is_some()
+        {
+            return false;
+        }
+    }
+    let Some(base) = base else {
+        return false;
+    };
+    let mut expression = None;
+    let mut any = None;
+    for index in (name_index.saturating_add(1)..base.node.index()).rev() {
+        let Ok(index) = u32::try_from(index) else {
+            return false;
+        };
+        let candidate = NodeRef::new(base.arena, base.file, ts_ast::NodeId::new(index));
+        if store.source_node_parent(candidate) != Some(SourceNodeParent::Parent(base)) {
+            continue;
+        }
+        match store.source_node_kind(candidate) {
+            Some(SyntaxKind::Identifier) if expression.replace(candidate).is_none() => {}
+            Some(SyntaxKind::AnyKeyword) if any.replace(candidate).is_none() => {}
+            _ => return false,
+        }
+    }
+    let Some(expression) = expression else {
+        return false;
+    };
+    any.is_some()
+        && [(base, element), (expression, element)]
+            .into_iter()
+            .all(|(reference, expected)| {
+                store.symbol_node_links(reference).is_none_or(|links| {
+                    links
+                        .resolved_symbol
+                        .is_none_or(|cached| store.get_merged_symbol(cached) == Some(expected))
+                })
+            })
 }
 
 /// Validates the narrower property graph needed by cache-capability scans.
