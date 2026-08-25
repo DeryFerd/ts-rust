@@ -204,13 +204,13 @@ use super::{
         SourceImportPlan, SourceImportUnsupported, SourceNamedReexportBindingPlan,
         SourceNamedReexportPlan, plan_source_import_identifier_read,
         plan_source_jsdoc_typedef_import, plan_source_type_import_reference,
-        plan_top_level_import_equals, plan_top_level_named_reexport,
-        plan_top_level_named_specifier_type_import, plan_top_level_named_type_import,
-        plan_top_level_named_value_import, preflight_prepared_source_import_publications,
-        prepare_source_import_value, reject_source_type_import_value_use,
-        resolve_source_import_binding, resolve_source_import_namespace_exports,
-        resolve_source_jsdoc_typedef_import, resolve_source_named_reexport_binding,
-        resolve_source_type_import_binding,
+        plan_top_level_import_equals, plan_top_level_javascript_require,
+        plan_top_level_named_reexport, plan_top_level_named_specifier_type_import,
+        plan_top_level_named_type_import, plan_top_level_named_value_import,
+        preflight_prepared_source_import_publications, prepare_source_import_value,
+        reject_source_type_import_value_use, resolve_source_import_binding,
+        resolve_source_import_namespace_exports, resolve_source_jsdoc_typedef_import,
+        resolve_source_named_reexport_binding, resolve_source_type_import_binding,
     },
     source_namespaces::{
         SourceNamespaceMemberPlan, SourceNamespacePlan, execute_source_namespace,
@@ -1459,6 +1459,14 @@ struct PlannedCommonJsAssignment {
     named: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PlannedJavaScriptRequireAlias {
+    declaration: NodeRef,
+    name: NodeRef,
+    module_specifier: NodeRef,
+    alias_symbol: SemanticSymbolId,
+}
+
 #[derive(Clone, Debug)]
 struct PlannedArrowExpandoAssignment {
     expression: NodeRef,
@@ -1684,6 +1692,7 @@ enum PlannedStatement {
     Assignment(PlannedAssignment),
     EvolvingArrayAssignment(Box<PlannedEvolvingArrayAssignment>),
     CommonJsAssignment(PlannedCommonJsAssignment),
+    JavaScriptRequireAlias(PlannedJavaScriptRequireAlias),
     ArrowExpandoAssignment(PlannedArrowExpandoAssignment),
     ObjectExpandoAssignment(PlannedObjectExpandoAssignment),
     ImportedNamespaceAssignment(PlannedImportedNamespaceAssignment),
@@ -2014,8 +2023,47 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
 
         let mut value_imports = Vec::new();
         let mut type_imports = Vec::new();
+        let mut javascript_require_statements = HashMap::new();
         for statement in &source_statements {
             let statement = self.reference(*statement);
+            if is_javascript_file && self.node(statement)?.kind == SyntaxKind::VariableStatement {
+                let Some((store, _)) = self.semantic else {
+                    return Err(SourceCheckError::Unsupported(
+                        UnsupportedSourceSyntax::Import(statement),
+                    ));
+                };
+                if let Some(import) =
+                    plan_top_level_javascript_require(self.arena, self.bound, store, statement)
+                        .map_err(|error| Self::import_plan_error(statement, &error))?
+                {
+                    let [binding] = import.bindings.as_slice() else {
+                        return Err(SourceCheckError::Import(statement));
+                    };
+                    if self
+                        .type_import_bindings
+                        .contains_key(&binding.alias_symbol)
+                        || self
+                            .value_import_bindings
+                            .insert(binding.alias_symbol, binding.clone())
+                            .is_some()
+                        || javascript_require_statements
+                            .insert(
+                                statement,
+                                PlannedJavaScriptRequireAlias {
+                                    declaration: binding.declaration,
+                                    name: binding.local_name,
+                                    module_specifier: import.module_specifier,
+                                    alias_symbol: binding.alias_symbol,
+                                },
+                            )
+                            .is_some()
+                    {
+                        return Err(SourceCheckError::Import(binding.declaration));
+                    }
+                    value_imports.push(import);
+                }
+                continue;
+            }
             if let kind @ (SyntaxKind::ImportDeclaration | SyntaxKind::ImportEqualsDeclaration) =
                 self.node(statement)?.kind
             {
@@ -3292,6 +3340,10 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     statements.push(PlannedStatement::Function(index));
                 }
                 SyntaxKind::VariableStatement => {
+                    if let Some(require) = javascript_require_statements.remove(&statement) {
+                        statements.push(PlannedStatement::JavaScriptRequireAlias(require));
+                        continue;
+                    }
                     if let Some(variables) = preplanned_ambient_variables.remove(&statement) {
                         let initializers = variables
                             .iter()
@@ -12894,6 +12946,11 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         .then(|| target_declarations.first().copied())
                         .flatten()
                 })
+                .or_else(|| {
+                    (target.flags() == SymbolFlags::TYPE_ALIAS && target_declarations.len() == 1)
+                        .then(|| target_declarations.first().copied())
+                        .flatten()
+                })
         } else {
             match target_declarations {
                 [declaration] => Some(*declaration),
@@ -13087,6 +13144,25 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         .and_then(|candidate| store.get_merged_symbol(candidate))
                         == Some(target_symbol)
             });
+        let export_equals_type_alias = export_equals
+            && target.flags() == SymbolFlags::TYPE_ALIAS
+            && target.check_flags() == CheckFlags::NONE
+            && target.name().as_utf8() == Some(identifier.text.as_str())
+            && target.value_declaration().is_none()
+            && target.members().is_none()
+            && target.exports().is_none()
+            && target.parent().is_none()
+            && target.export_symbol().is_none()
+            && target_declarations == [target_declaration]
+            && target_record.kind == SyntaxKind::TypeAliasDeclaration
+            && target_record.parent == Some(self.source.node_ref().node)
+            && target_record.range.end <= declaration_start
+            && target_declaration.is_for(declaration.arena, declaration.file)
+            && self.bound.symbol(target_declaration) == Some(target_symbol)
+            && store.get_merged_symbol(target_symbol) == Some(target_symbol)
+            && store
+                .value_symbol_links(target_symbol)
+                .is_none_or(|links| links.resolved_type.is_none());
         let supported_target = !export_equals
             && target.flags() == SymbolFlags::INTERFACE
             && target_record.kind == SyntaxKind::InterfaceDeclaration
@@ -13105,18 +13181,21 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
             || export_equals_callable
             || export_equals_variable
             || export_equals_class
-            || export_equals_namespace;
+            || export_equals_namespace
+            || export_equals_type_alias;
         if !supported_target
             || !imported_enum_alias
                 && !export_equals_import_alias
                 && !export_equals_variable
                 && target_record.parent != Some(self.source.node_ref().node)
             || !export_equals_namespace && target_record.range.end > declaration_start
-            || target.flags() == SymbolFlags::INTERFACE
-                && (target.value_declaration().is_some()
-                    || store
-                        .value_symbol_links(target_symbol)
-                        .is_some_and(|links| links.resolved_type.is_some()))
+            || matches!(
+                target.flags(),
+                SymbolFlags::INTERFACE | SymbolFlags::TYPE_ALIAS
+            ) && (target.value_declaration().is_some()
+                || store
+                    .value_symbol_links(target_symbol)
+                    .is_some_and(|links| links.resolved_type.is_some()))
         {
             return Err(self.unsupported(
                 expression,
@@ -41664,6 +41743,67 @@ pub(super) fn check_source_file(
                     current_flow_types.insert(assignment.target_symbol, finalized);
                 }
             }
+            PlannedStatement::JavaScriptRequireAlias(require) => {
+                let resolved = resolved_imports
+                    .get(&require.alias_symbol)
+                    .ok_or(SourceCheckError::Import(require.declaration))?;
+                let target = store
+                    .symbol(resolved.target_symbol)
+                    .ok_or(SourceCheckError::Import(require.declaration))?;
+                let Some([declaration]) = target.declarations() else {
+                    return Err(SourceCheckError::Import(require.declaration));
+                };
+                if target.flags() != SymbolFlags::TYPE_ALIAS
+                    || target.check_flags() != CheckFlags::NONE
+                    || target.value_declaration().is_some()
+                    || target.members().is_some()
+                    || target.exports().is_some()
+                    || target.parent().is_some()
+                    || target.export_symbol().is_some()
+                    || declaration.file == require.declaration.file
+                    || store.source_node_kind(*declaration)
+                        != Some(SyntaxKind::TypeAliasDeclaration)
+                    || store.get_merged_symbol(resolved.target_symbol)
+                        != Some(resolved.target_symbol)
+                    || store.value_symbol_links(resolved.target_symbol).is_some()
+                    || store.value_symbol_links(require.alias_symbol).is_some()
+                {
+                    return Err(SourceCheckError::Unsupported(
+                        UnsupportedSourceSyntax::Import(require.declaration),
+                    ));
+                }
+
+                let name = host.node(require.name).ok_or(SourceCheckError::Provenance(
+                    SourceCheckProvenanceError::MissingNode(require.name),
+                ))?;
+                let NodeData::Identifier(identifier) = &name.data else {
+                    return Err(SourceCheckError::Import(require.declaration));
+                };
+                let specifier =
+                    host.node(require.module_specifier)
+                        .ok_or(SourceCheckError::Provenance(
+                            SourceCheckProvenanceError::MissingNode(require.module_specifier),
+                        ))?;
+                let NodeData::StringLiteral(module_name) = &specifier.data else {
+                    return Err(SourceCheckError::Import(require.declaration));
+                };
+                merge_retry_diagnostic(
+                    diagnostics,
+                    CanonicalCheckerDiagnostic {
+                        node: Some(require.name),
+                        range_override: None,
+                        diagnostic: Diagnostic::with_arguments(
+                            message_by_code(18042)
+                                .ok_or(SourceCheckError::MissingDiagnostic(18042))?,
+                            [
+                                identifier.text.clone(),
+                                format!("import(\"{}\")", module_name.text),
+                            ],
+                        ),
+                        related_information: Vec::new(),
+                    },
+                );
+            }
             PlannedStatement::CommonJsAssignment(assignment) => {
                 let expected_flags = if assignment.named {
                     if matches!(assignment.right.kind, PlannedExpressionKind::Identifier(_)) {
@@ -59043,6 +59183,62 @@ mod tests {
     }
 
     #[test]
+    fn export_equals_type_aliases_preserve_type_identity_without_runtime_values() {
+        let source = parsed("type Strings = string; export = Strings;");
+        let file = FileId::new(8_338);
+        let mut context = context_with_module_state(
+            &[(file, &source)],
+            CanonicalModuleState::External,
+            CanonicalCheckerOptions {
+                emit_common_js: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        let declaration = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::TypeAliasDeclaration).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let assignment = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ExportAssignment).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let (_, bound) = context.file(file).unwrap();
+        let target = bound.symbol(declaration).unwrap();
+        let export = bound.symbol(assignment).unwrap();
+
+        context.check_source_file(file).unwrap();
+
+        assert_eq!(
+            context
+                .store()
+                .alias_symbol_links(export)
+                .map(|links| (links.immediate_target, links.alias_target)),
+            Some((Some(target), AliasTargetState::Resolved(target))),
+        );
+        assert!(context.store().value_symbol_links(target).is_none());
+        assert!(context.store().value_symbol_links(export).is_none());
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
     fn export_equals_merged_ambient_functions_preserve_callable_namespace_aliases() {
         let source = parsed(concat!(
             "declare function callable(): void; ",
@@ -63506,6 +63702,135 @@ class Foo2 {
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Preserve the real cross-file require alias and exact TS18042.
+    fn javascript_require_of_type_only_export_equals_reports_exact_ts18042() {
+        let library = parsed("interface Array<T> {}");
+        let target = parsed("type Strings = string[]; export = Strings;");
+        let importer = parse_javascript_source_file("const t = require(\"./t\");");
+        assert!(
+            importer.diagnostics.is_empty(),
+            "{:?}",
+            importer.diagnostics
+        );
+        let library_file = FileId::new(9_860);
+        let target_file = FileId::new(9_861);
+        let importer_file = FileId::new(9_862);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &library.arena,
+                library.source_file,
+                library_file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/lib.d.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    true,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_source_file_with_facts(
+                &target.arena,
+                target.source_file,
+                target_file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/t.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::External,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_source_file_with_facts(
+                &importer.arena,
+                importer.source_file,
+                importer_file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/main.js\""),
+                    CanonicalSourceLanguage::JavaScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&library.arena, library_file)
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&target.arena, target_file)
+            .unwrap();
+        binder
+            .bind_javascript_declaration_slice(&importer.arena, importer_file)
+            .unwrap();
+        let specifier = importer
+            .arena
+            .iter()
+            .find_map(|(_, record)| match &record.data {
+                NodeData::CallExpression(call) => call.arguments.nodes.first().copied(),
+                _ => None,
+            })
+            .unwrap();
+        let manifest = CanonicalModuleResolutionManifestInput::new([
+            CanonicalModuleResolutionEntry::resolved(
+                NodeRef::new(importer.arena.id(), importer_file, specifier),
+                CanonicalResolvedModuleInput::new(
+                    target_file,
+                    CanonicalModuleResolutionMode::CommonJs,
+                    CanonicalModuleResolutionMode::CommonJs,
+                ),
+            ),
+        ]);
+        let mut context = CanonicalCheckerContext::new_with_module_resolutions(
+            binder.finish(),
+            vec![
+                (library_file, &library.arena),
+                (target_file, &target.arena),
+                (importer_file, &importer.arena),
+            ],
+            CanonicalCheckerOptions {
+                emit_common_js: true,
+                no_emit: true,
+                ..CanonicalCheckerOptions::default()
+            },
+            manifest,
+        )
+        .unwrap();
+
+        context.check_source_file(target_file).unwrap();
+        context.check_source_file(importer_file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected exactly one JavaScript type-only require diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 18042);
+        assert_eq!(node_text(&importer, diagnostic.node.unwrap()), "t");
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "'t' is a type and cannot be imported in JavaScript files. Use 'import(\"./t\")' in a JSDoc type annotation.",
+        );
+        let declaration = variable_declaration(&importer, importer_file, "t");
+        let (_, bound) = context.file(importer_file).unwrap();
+        let imported = bound.symbol(declaration).unwrap();
+        let target_symbol = context
+            .store()
+            .alias_symbol_links(imported)
+            .and_then(|links| links.alias_target.symbol())
+            .unwrap();
+        assert_eq!(
+            context.store().symbol(target_symbol).unwrap().flags(),
+            SymbolFlags::TYPE_ALIAS,
+        );
+        assert!(context.store().value_symbol_links(imported).is_none());
+        assert!(context.store().value_symbol_links(target_symbol).is_none());
+
+        let warm = observable_state(&context, importer_file);
+        context.recheck_source_file(importer_file).unwrap();
+        assert_eq!(observable_state(&context, importer_file), warm);
     }
 
     #[test]

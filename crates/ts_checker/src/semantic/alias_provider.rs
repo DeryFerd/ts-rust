@@ -451,7 +451,12 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
                 .bound
                 .source_facts()
                 .is_some_and(|facts| facts.is_javascript_file() && facts.is_common_js_module());
-            if !is_alias_symbol_declaration(source.arena, node, commonjs_javascript) {
+            if !is_alias_symbol_declaration(
+                source.arena,
+                declaration.node,
+                node,
+                commonjs_javascript,
+            ) {
                 continue;
             }
             let owned = source
@@ -517,6 +522,19 @@ impl<'source, 'arena, 'manifest> ProductionAliasTargetHost<'source, 'arena, 'man
                 Self::commonjs_assignment_alias_target(store, source, declaration, binary)?;
             return Ok(SupportedAliasDeclaration::LocalModuleMember {
                 target,
+                type_only: false,
+            });
+        }
+        if facts.is_javascript_file()
+            && facts.is_common_js_module()
+            && matches!(node.data, NodeData::VariableDeclaration(_))
+        {
+            let specifier = javascript_require_alias_specifier(source.arena, declaration.node)
+                .ok_or(CanonicalAliasTargetUnavailable::MalformedDeclaration(
+                    declaration,
+                ))?;
+            return Ok(SupportedAliasDeclaration::ExternalImportEquals {
+                specifier: NodeRef::new(declaration.arena, declaration.file, specifier),
                 type_only: false,
             });
         }
@@ -2987,7 +3005,12 @@ impl<MapperPayload> CanonicalAliasTargetHost<MapperPayload>
     }
 }
 
-fn is_alias_symbol_declaration(arena: &NodeArena, node: &Node, commonjs_javascript: bool) -> bool {
+fn is_alias_symbol_declaration(
+    arena: &NodeArena,
+    declaration: NodeId,
+    node: &Node,
+    commonjs_javascript: bool,
+) -> bool {
     match (node.kind, &node.data) {
         (SyntaxKind::ImportClause, NodeData::ImportClause(clause)) => clause.name.is_some(),
         (
@@ -3011,11 +3034,95 @@ fn is_alias_symbol_declaration(arena: &NodeArena, node: &Node, commonjs_javascri
                 && commonjs_assignment_export_name(arena, assignment.left).is_some()
                 && expression_is_alias(arena, assignment.right)
         }
-        // JavaScript require bindings need their own exact declaration
-        // predicate. Accepting every variable or binary expression could make
-        // reverse declaration lookup select an unrelated merged declaration.
+        (SyntaxKind::VariableDeclaration, NodeData::VariableDeclaration(_))
+            if commonjs_javascript =>
+        {
+            javascript_require_alias_specifier(arena, declaration).is_some()
+        }
         _ => false,
     }
+}
+
+fn javascript_require_alias_specifier(arena: &NodeArena, declaration: NodeId) -> Option<NodeId> {
+    let record = arena.get(declaration)?;
+    let NodeData::VariableDeclaration(variable) = &record.data else {
+        return None;
+    };
+    let initializer = variable.initializer?;
+    let list_id = record.parent?;
+    let list = arena.get(list_id)?;
+    let NodeData::VariableDeclarationList(declarations) = &list.data else {
+        return None;
+    };
+    let statement_id = list.parent?;
+    let statement = arena.get(statement_id)?;
+    let NodeData::VariableStatement(variable_statement) = &statement.data else {
+        return None;
+    };
+    let source = arena.get(statement.parent?)?;
+    let name = arena.get(variable.name)?;
+    let NodeData::Identifier(local) = &name.data else {
+        return None;
+    };
+    let call = arena.get(initializer)?;
+    let NodeData::CallExpression(require) = &call.data else {
+        return None;
+    };
+    let [specifier] = require.arguments.nodes.as_slice() else {
+        return None;
+    };
+    let callee = arena.get(require.expression)?;
+    let NodeData::Identifier(require_name) = &callee.data else {
+        return None;
+    };
+    let argument = arena.get(*specifier)?;
+    let NodeData::StringLiteral(module_name) = &argument.data else {
+        return None;
+    };
+
+    (record.kind == SyntaxKind::VariableDeclaration
+        && record.flags.0 == 0
+        && variable.exclamation_token.is_none()
+        && variable.local_symbol.is_none()
+        && variable.symbol.is_none()
+        && variable.type_.is_none()
+        && variable.facts == 0
+        && list.kind == SyntaxKind::VariableDeclarationList
+        && list.flags.0 == 1 << 1
+        && declarations.declarations.nodes.as_slice() == [declaration]
+        && !declarations.declarations.has_trailing_comma
+        && declarations.facts == 0
+        && statement.kind == SyntaxKind::VariableStatement
+        && statement.flags.0 == 0
+        && variable_statement.declaration_list == list_id
+        && variable_statement.modifiers.is_none()
+        && variable_statement.flow_node.is_none()
+        && variable_statement.facts == 0
+        && source.kind == SyntaxKind::SourceFile
+        && name.kind == SyntaxKind::Identifier
+        && name.parent == Some(declaration)
+        && name.flags.0 == 0
+        && local.flow_node.is_none()
+        && !local.text.is_empty()
+        && call.kind == SyntaxKind::CallExpression
+        && call.parent == Some(declaration)
+        && call.flags.0 == 0
+        && !require.arguments.has_trailing_comma
+        && require.question_dot_token.is_none()
+        && require.symbol.is_none()
+        && require.type_arguments.is_none()
+        && require.facts == 0
+        && callee.kind == SyntaxKind::Identifier
+        && callee.parent == Some(initializer)
+        && callee.flags.0 == 0
+        && require_name.flow_node.is_none()
+        && require_name.text == "require"
+        && argument.kind == SyntaxKind::StringLiteral
+        && argument.parent == Some(initializer)
+        && argument.flags.0 == 0
+        && module_name.token_flags.0 == 0
+        && !module_name.text.is_empty())
+    .then_some(*specifier)
 }
 
 fn is_syntactic_default_declaration(arena: &NodeArena, declaration: NodeRef) -> bool {
@@ -3806,6 +3913,100 @@ mod tests {
             symbols.map(|symbol| store.alias_symbol_links(symbol).cloned()),
             warm
         );
+    }
+
+    #[test]
+    fn javascript_require_alias_resolves_type_only_export_equals_without_value_state() {
+        let importer = parse_javascript_source_file("const selected = require('./target');");
+        let target = parsed("type Strings = string[]; export = Strings;");
+        assert!(
+            importer.diagnostics.is_empty(),
+            "{:?}",
+            importer.diagnostics
+        );
+        let importer_file = FileId::new(5_262);
+        let target_file = FileId::new(5_263);
+        let files = [
+            (importer_file, &importer, CanonicalModuleState::CommonJs),
+            (target_file, &target, CanonicalModuleState::External),
+        ];
+        let specifier = importer
+            .arena
+            .iter()
+            .find_map(|(_, record)| match &record.data {
+                NodeData::CallExpression(call) => call.arguments.nodes.first().copied(),
+                _ => None,
+            })
+            .unwrap();
+        let (mut store, bound_files, manifest) = fixture(
+            &files,
+            CanonicalModuleResolutionManifestInput::new([
+                CanonicalModuleResolutionEntry::resolved(
+                    node_ref(&importer, importer_file, specifier),
+                    CanonicalResolvedModuleInput::new(
+                        target_file,
+                        CanonicalModuleResolutionMode::CommonJs,
+                        CanonicalModuleResolutionMode::CommonJs,
+                    ),
+                ),
+            ]),
+        );
+        let declaration = importer
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::VariableDeclaration).then_some(node_ref(
+                    &importer,
+                    importer_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let imported = alias(&bound_files, declaration);
+        let module = source_module(&bound_files, target_file);
+        let export = store
+            .symbol(module)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| store.symbol_table(exports))
+            .and_then(|exports| exports.get(InternalSymbolName::ExportEquals.as_ref()))
+            .unwrap();
+        let target_bound = bound_files.get(&target_file).unwrap();
+        let target_symbol = target_bound
+            .locals(target_bound.source_file())
+            .and_then(|locals| store.symbol_table(locals))
+            .and_then(|locals| locals.get_source("Strings"))
+            .unwrap();
+        let mut host =
+            ProductionAliasTargetHost::new(&store, sources(&files, &bound_files), &manifest)
+                .unwrap();
+
+        assert_eq!(
+            CanonicalAliasResolver::new(&mut store, &mut host)
+                .get_immediate_aliased_symbol(imported)
+                .unwrap(),
+            Some(export),
+        );
+        assert_eq!(
+            CanonicalAliasResolver::new(&mut store, &mut host)
+                .resolve_alias(imported)
+                .unwrap()
+                .target,
+            AliasTargetState::Resolved(target_symbol),
+        );
+        assert_eq!(
+            store.symbol(target_symbol).unwrap().flags(),
+            SymbolFlags::TYPE_ALIAS,
+        );
+
+        let warm = store.alias_symbol_links(imported).cloned();
+        assert_eq!(
+            CanonicalAliasResolver::new(&mut store, &mut host)
+                .resolve_alias(imported)
+                .unwrap()
+                .target,
+            AliasTargetState::Resolved(target_symbol),
+        );
+        assert_eq!(store.alias_symbol_links(imported).cloned(), warm);
     }
 
     #[test]

@@ -1625,7 +1625,10 @@ impl Program {
                         .map(|node| (node.range, requested_mode.unwrap_or(source_mode)))
                 })
                 .collect::<Vec<_>>();
-            let specifiers = module_specifiers(&self.source_files[file_index].parse);
+            let specifiers = module_specifiers(
+                &self.source_files[file_index].parse,
+                is_javascript_file_name(&containing_file),
+            );
             for (specifier, range, can_resolve_ambient, side_effect_only) in specifiers {
                 let mode = usage_modes
                     .iter()
@@ -8047,6 +8050,17 @@ fn canonical_static_module_specifier(
                 Some(CanonicalModuleResolutionMode::CommonJs),
             )
         }
+        NodeData::VariableStatement(_) if is_javascript_file_name(&source.file_name) => {
+            let Some(specifier) = javascript_require_module_specifier(&source.parse, node) else {
+                return Ok(None);
+            };
+            (
+                Some(specifier),
+                None,
+                false,
+                Some(CanonicalModuleResolutionMode::CommonJs),
+            )
+        }
         _ => return Ok(None),
     };
     let Some(specifier) = specifier else {
@@ -8223,7 +8237,73 @@ fn canonical_resolution_mode_override(
     }
 }
 
-fn module_specifiers(parse: &ParseResult) -> Vec<(String, TextRange, bool, bool)> {
+fn javascript_require_module_specifier(parse: &ParseResult, statement: &Node) -> Option<NodeId> {
+    let NodeData::VariableStatement(variable_statement) = &statement.data else {
+        return None;
+    };
+    let list = parse.arena.get(variable_statement.declaration_list)?;
+    let NodeData::VariableDeclarationList(declarations) = &list.data else {
+        return None;
+    };
+    let [declaration] = declarations.declarations.nodes.as_slice() else {
+        return None;
+    };
+    let declaration_record = parse.arena.get(*declaration)?;
+    let NodeData::VariableDeclaration(variable) = &declaration_record.data else {
+        return None;
+    };
+    let call = parse.arena.get(variable.initializer?)?;
+    let NodeData::CallExpression(require) = &call.data else {
+        return None;
+    };
+    let [specifier] = require.arguments.nodes.as_slice() else {
+        return None;
+    };
+    let callee = parse.arena.get(require.expression)?;
+    let NodeData::Identifier(identifier) = &callee.data else {
+        return None;
+    };
+
+    (statement.kind == SyntaxKind::VariableStatement
+        && statement.parent == Some(parse.source_file)
+        && statement.flags.0 == 0
+        && variable_statement.modifiers.is_none()
+        && variable_statement.flow_node.is_none()
+        && variable_statement.facts == 0
+        && list.kind == SyntaxKind::VariableDeclarationList
+        && list.flags.0 == 1 << 1
+        && !declarations.declarations.has_trailing_comma
+        && declarations.facts == 0
+        && declaration_record.kind == SyntaxKind::VariableDeclaration
+        && declaration_record.parent == Some(variable_statement.declaration_list)
+        && declaration_record.flags.0 == 0
+        && variable.type_.is_none()
+        && variable.exclamation_token.is_none()
+        && call.kind == SyntaxKind::CallExpression
+        && call.parent == Some(*declaration)
+        && call.flags.0 == 0
+        && !require.arguments.has_trailing_comma
+        && require.question_dot_token.is_none()
+        && require.type_arguments.is_none()
+        && require.facts == 0
+        && callee.kind == SyntaxKind::Identifier
+        && identifier.flow_node.is_none()
+        && identifier.text == "require"
+        && matches!(
+            parse.arena.get(*specifier),
+            Some(Node {
+                kind: SyntaxKind::StringLiteral,
+                data: NodeData::StringLiteral(literal),
+                ..
+            }) if literal.token_flags.0 == 0 && !literal.text.is_empty()
+        ))
+    .then_some(*specifier)
+}
+
+fn module_specifiers(
+    parse: &ParseResult,
+    include_javascript_requires: bool,
+) -> Vec<(String, TextRange, bool, bool)> {
     let mut specifiers = parse
         .arena
         .iter()
@@ -8265,6 +8345,11 @@ fn module_specifiers(parse: &ParseResult) -> Vec<(String, TextRange, bool, bool)
                     .nodes
                     .first()
                     .and_then(|argument| string_literal(&parse.arena, *argument))
+                    .map(|(specifier, range)| (specifier, range, true, false))
+            }
+            NodeData::VariableStatement(_) if include_javascript_requires => {
+                javascript_require_module_specifier(parse, node)
+                    .and_then(|specifier| string_literal(&parse.arena, specifier))
                     .map(|(specifier, range)| (specifier, range, true, false))
             }
             _ => None,

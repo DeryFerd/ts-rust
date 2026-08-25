@@ -948,6 +948,161 @@ pub(super) fn resolve_source_jsdoc_typedef_import(
     })
 }
 
+/// Proves one exact JavaScript `const name = require("module")` alias.
+#[allow(clippy::too_many_lines)] // Authenticate the complete declaration and require-call owner.
+pub(super) fn plan_top_level_javascript_require(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    statement: NodeRef,
+) -> Result<Option<SourceImportPlan>, SourceImportError> {
+    let source = bound.source_file();
+    validate_source_identity(arena, bound, store, source)?;
+    if bound
+        .source_facts()
+        .is_none_or(|facts| !facts.is_javascript_file() || !facts.is_common_js_module())
+    {
+        return Ok(None);
+    }
+
+    let statement_record = checked_node(arena, bound, store, statement)?;
+    let NodeData::VariableStatement(variable_statement) = &statement_record.data else {
+        return Ok(None);
+    };
+    if statement_record.kind != SyntaxKind::VariableStatement
+        || statement_record.parent != Some(source.node)
+        || statement_record.flags.0 != 0
+        || variable_statement.modifiers.is_some()
+        || variable_statement.flow_node.is_some()
+        || variable_statement.facts != 0
+    {
+        return Ok(None);
+    }
+
+    let list = NodeRef::new(
+        statement.arena,
+        statement.file,
+        variable_statement.declaration_list,
+    );
+    let list_record = checked_node(arena, bound, store, list)?;
+    let NodeData::VariableDeclarationList(declarations) = &list_record.data else {
+        return Ok(None);
+    };
+    let [declaration] = declarations.declarations.nodes.as_slice() else {
+        return Ok(None);
+    };
+    if list_record.kind != SyntaxKind::VariableDeclarationList
+        || list_record.parent != Some(statement.node)
+        || list_record.flags.0 != NODE_FLAG_CONST
+        || declarations.declarations.has_trailing_comma
+        || declarations.facts != 0
+    {
+        return Ok(None);
+    }
+
+    let declaration = NodeRef::new(statement.arena, statement.file, *declaration);
+    let declaration_record = checked_node(arena, bound, store, declaration)?;
+    let NodeData::VariableDeclaration(variable) = &declaration_record.data else {
+        return Ok(None);
+    };
+    let Some(initializer) = variable.initializer else {
+        return Ok(None);
+    };
+    if declaration_record.kind != SyntaxKind::VariableDeclaration
+        || declaration_record.parent != Some(list.node)
+        || declaration_record.flags.0 != 0
+        || variable.exclamation_token.is_some()
+        || variable.local_symbol.is_some()
+        || variable.symbol.is_some()
+        || variable.type_.is_some()
+        || variable.facts != 0
+    {
+        return Ok(None);
+    }
+
+    let call = NodeRef::new(statement.arena, statement.file, initializer);
+    let call_record = checked_node(arena, bound, store, call)?;
+    let NodeData::CallExpression(require) = &call_record.data else {
+        return Ok(None);
+    };
+    let [specifier] = require.arguments.nodes.as_slice() else {
+        return Ok(None);
+    };
+    if call_record.kind != SyntaxKind::CallExpression
+        || call_record.parent != Some(declaration.node)
+        || call_record.flags.0 != 0
+        || require.arguments.has_trailing_comma
+        || require.question_dot_token.is_some()
+        || require.symbol.is_some()
+        || require.type_arguments.is_some()
+        || require.facts != 0
+    {
+        return Ok(None);
+    }
+
+    let callee = NodeRef::new(statement.arena, statement.file, require.expression);
+    let callee_record = checked_node(arena, bound, store, callee)?;
+    if !matches!(
+        &callee_record.data,
+        NodeData::Identifier(identifier)
+            if callee_record.kind == SyntaxKind::Identifier
+                && callee_record.parent == Some(call.node)
+                && callee_record.flags.0 == 0
+                && identifier.flow_node.is_none()
+                && identifier.text == "require"
+    ) {
+        return Ok(None);
+    }
+
+    let module_specifier = NodeRef::new(statement.arena, statement.file, *specifier);
+    let specifier_record = checked_node(arena, bound, store, module_specifier)?;
+    if !matches!(
+        &specifier_record.data,
+        NodeData::StringLiteral(literal)
+            if specifier_record.kind == SyntaxKind::StringLiteral
+                && specifier_record.parent == Some(call.node)
+                && specifier_record.flags.0 == 0
+                && literal.token_flags.0 == 0
+                && !literal.text.is_empty()
+    ) {
+        return Ok(None);
+    }
+
+    let local_name = NodeRef::new(statement.arena, statement.file, variable.name);
+    let local_text = exact_identifier(
+        arena,
+        bound,
+        store,
+        local_name,
+        declaration,
+        SourceImportUnsupported::NonIdentifierLocalName(local_name),
+    )?;
+    let Some(alias_symbol) = bound.symbol(declaration) else {
+        return Ok(None);
+    };
+    if store
+        .symbol(alias_symbol)
+        .is_none_or(|alias| alias.flags() != SymbolFlags::ALIAS)
+    {
+        return Ok(None);
+    }
+    validate_alias_symbol(store, alias_symbol, declaration, local_name, &local_text)?;
+    preflight_alias_value_links(store, alias_symbol)?;
+
+    Ok(Some(SourceImportPlan {
+        declaration: statement,
+        module_specifier,
+        bindings: vec![SourceImportBindingPlan {
+            declaration,
+            imported_name: local_name,
+            local_name,
+            imported_text: "*".to_owned(),
+            local_text,
+            alias_symbol,
+        }],
+    }))
+}
+
 /// Proves a top-level `import name = require("module")` or local namespace alias.
 ///
 /// The returned binding uses the same alias-resolution and value-publication

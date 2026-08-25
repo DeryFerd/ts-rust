@@ -148,6 +148,50 @@ fn unchecked_javascript_es_modules_share_one_bundler_graph() {
 }
 
 #[test]
+fn javascript_require_of_type_only_export_equals_reports_exact_ts18042() {
+    let filesystem = MemoryFileSystem::new(true);
+    filesystem
+        .write_file(
+            "/project/t.ts",
+            "type Strings = string[]; export = Strings;\n",
+        )
+        .unwrap();
+    filesystem
+        .write_file("/project/main.js", "const t = require(\"./t\");\n")
+        .unwrap();
+
+    let program = Program::try_new_with_canonical_checker(
+        &filesystem,
+        "/project",
+        &["main.js".to_owned()],
+        CompilerOptions {
+            allow_js: true,
+            check_js: true,
+            module: ModuleKind::CommonJs,
+            module_specified: true,
+            lib: Some(vec!["es5".to_owned()]),
+            no_emit: true,
+            ..CompilerOptions::default()
+        },
+    )
+    .unwrap();
+
+    assert!(program.source_file("/project/t.ts").is_some());
+    let [diagnostic] = program.diagnostics() else {
+        panic!(
+            "expected exactly one JavaScript type-only require diagnostic: {:?}",
+            program.diagnostics()
+        );
+    };
+    assert_eq!(diagnostic.file_name.as_deref(), Some("/project/main.js"));
+    assert_eq!(diagnostic.code, Some(18042));
+    assert_eq!(
+        diagnostic.message,
+        "'t' is a type and cannot be imported in JavaScript files. Use 'import(\"./t\")' in a JSDoc type annotation.",
+    );
+}
+
+#[test]
 fn unchecked_javascript_keeps_typescript_source_diagnostics() {
     let filesystem = MemoryFileSystem::new(true);
     filesystem
