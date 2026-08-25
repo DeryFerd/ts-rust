@@ -2170,7 +2170,11 @@ fn published_global_array_augmentation_method(
         && store.interface_method_linked_type(signature) == Some(type_)
         && store
             .callable_signature_parameter_types(signature)
-            .is_some_and(<[TypeId]>::is_empty))
+            .is_some_and(<[TypeId]>::is_empty)
+        && matches!(
+            super::callable_sets::validate_stored_declared_method_callable_set(store, type_),
+            Some(super::callable_sets::StoredCallableSetValidation::Valid { .. })
+        ))
     .then_some(type_)
 }
 
@@ -20322,6 +20326,33 @@ mod tests {
             context
                 .store_mut_for_test()
                 .set_value_symbol_links(method, original)
+        );
+
+        assert!(context.store_mut_for_test().set_object_instantiations(
+            callable,
+            super::super::type_records::TypeCacheState::Allocated(Default::default()),
+        ));
+        assert_eq!(
+            published_global_array_augmentation_method(
+                context.store(),
+                method,
+                method_declaration,
+                element,
+            ),
+            None,
+        );
+        assert!(context.store_mut_for_test().set_object_instantiations(
+            callable,
+            super::super::type_records::TypeCacheState::Unallocated,
+        ));
+        assert_eq!(
+            published_global_array_augmentation_method(
+                context.store(),
+                method,
+                method_declaration,
+                element,
+            ),
+            Some(callable),
         );
 
         assert_ne!(namespace.symbol, array);
