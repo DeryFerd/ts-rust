@@ -88,6 +88,7 @@ struct ResolvedObjectProperty {
     name: String,
     type_: TypeId,
     readonly: bool,
+    optional: bool,
 }
 
 /// One binder-owned shorthand assignment with an explicit default expression.
@@ -9253,7 +9254,11 @@ fn validated_synthetic_object_properties(
         let links = store.value_symbol_links(*symbol)?;
         let type_ = links.resolved_type?;
         let name = property.name().as_utf8()?;
-        if property.flags() != SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT
+        let allowed_flags = SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL | SymbolFlags::TRANSIENT;
+        if !property
+            .flags()
+            .contains(SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT)
+            || property.flags().without(allowed_flags) != SymbolFlags::NONE
             || property.check_flags().bits() & !CheckFlags::READONLY.bits() != 0
             || property.name().is_reserved_member_name()
             || property.name().is_private_identifier()
@@ -9279,6 +9284,7 @@ fn validated_synthetic_object_properties(
             name: name.to_owned(),
             type_,
             readonly: property.check_flags().contains(CheckFlags::READONLY),
+            optional: property.flags().contains(SymbolFlags::OPTIONAL),
         });
     }
     Some(resolved)
@@ -9309,6 +9315,7 @@ fn synthetic_object_literal_matches_plan(
             .all(|(planned, actual)| {
                 planned.name == actual.name
                     && planned.readonly == actual.readonly
+                    && planned.optional == actual.optional
                     && valid_object_literal_property_type(store, planned, actual.type_)
             })
 }
@@ -11308,8 +11315,14 @@ fn publish_synthetic_object_literal(
 
     let members = store.alloc_prepared_symbol_table(prepared_members);
     for property in properties {
+        let flags = SymbolFlags::PROPERTY
+            | if property.optional {
+                SymbolFlags::OPTIONAL
+            } else {
+                SymbolFlags::NONE
+            };
         let symbol = store.alloc_transient_symbol(
-            SymbolFlags::PROPERTY,
+            flags,
             EscapedName::source(&property.name),
             source_property_check_flags(property.readonly),
         );
@@ -11411,6 +11424,7 @@ pub(super) fn publish_object_literal(
                 name: property.name.clone(),
                 type_: *type_,
                 readonly: property.readonly,
+                optional: property.optional,
             })
             .collect::<Vec<_>>();
         return publish_synthetic_object_literal(store, plan, &properties);
@@ -11553,6 +11567,7 @@ fn projected_spread_donor_properties(
     let record = store.type_payload(type_)?;
     let structured = record.data().structured()?;
     let properties = structured.properties.as_deref().unwrap_or_default();
+    let indexes = structured.index_infos.as_deref().unwrap_or_default();
     if structured.properties.is_some() == properties.is_empty() {
         return None;
     }
@@ -11561,7 +11576,10 @@ fn projected_spread_donor_properties(
         None if properties.is_empty() => None,
         None => return None,
     };
-    if table.is_some_and(|table| table.len() != properties.len()) {
+    if table.is_some_and(|table| {
+        table.len() != properties.len() + usize::from(!indexes.is_empty())
+            || !indexes.is_empty() && table.get(InternalSymbolName::Index.as_ref()).is_none()
+    }) {
         return None;
     }
     let mut seen = HashSet::with_capacity(properties.len());
@@ -11573,8 +11591,8 @@ fn projected_spread_donor_properties(
         let property = store.symbol(*symbol)?;
         let name = property.name().as_utf8()?;
         let type_ = store.value_symbol_links(*symbol)?.resolved_type?;
-        if !property.flags().contains(SymbolFlags::PROPERTY)
-            || property.flags().contains(SymbolFlags::OPTIONAL)
+        let method = property.flags().contains(SymbolFlags::METHOD);
+        if !property.flags().contains(SymbolFlags::PROPERTY) && !method
             || property.check_flags().bits() & !CheckFlags::READONLY.bits() != 0
             || property.name().is_reserved_member_name()
             || property.name().is_private_identifier()
@@ -11582,6 +11600,9 @@ fn projected_spread_donor_properties(
             || store.get_merged_symbol(*symbol) != Some(*symbol)
             || store.type_payload(type_).is_none()
             || table.and_then(|table| table.get(property.name())) != Some(*symbol)
+            || method
+                && super::structured_members::valid_interface_method_value(store, *symbol, type_)
+                    .is_none()
         {
             return None;
         }
@@ -11589,9 +11610,128 @@ fn projected_spread_donor_properties(
             name: name.to_owned(),
             type_,
             readonly: property.check_flags().contains(CheckFlags::READONLY),
+            optional: property.flags().contains(SymbolFlags::OPTIONAL),
         });
     }
     Some(result)
+}
+
+#[allow(clippy::too_many_lines)] // Interface ownership, methods, and indexes share one proof.
+fn validated_indexed_or_method_interface_spread_donor(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Option<Vec<ResolvedObjectProperty>> {
+    let record = store.type_payload(type_)?;
+    let TypeData::Interface(interface) = record.data() else {
+        return None;
+    };
+    let owner = record.symbol()?;
+    let owner_record = store.symbol(owner)?;
+    let declarations = owner_record.declarations()?;
+    let structured = &interface.reference.object.structured;
+    let indexes = structured.index_infos.as_deref().unwrap_or_default();
+    if record.flags() != TypeFlags::OBJECT
+        || record.object_flags() != ObjectFlags::INTERFACE | ObjectFlags::MEMBERS_RESOLVED
+        || record.alias().is_some()
+        || owner_record.flags().without(SymbolFlags::TRANSIENT) != SymbolFlags::INTERFACE
+        || owner_record.check_flags() != CheckFlags::NONE
+        || owner_record.value_declaration().is_some()
+        || owner_record.exports().is_some()
+        || owner_record.export_symbol().is_some()
+        || declarations.is_empty()
+        || declarations.iter().any(|declaration| {
+            store.source_node_kind(*declaration) != Some(SyntaxKind::InterfaceDeclaration)
+        })
+        || store.get_merged_symbol(owner) != Some(owner)
+        || store
+            .declared_type_links(owner)
+            .and_then(|links| links.declared_type)
+            != Some(type_)
+        || !valid_thisless_interface_identity(interface)
+        || !interface.base_types_resolved
+        || !interface.declared_members_resolved
+        || interface.resolved_base_constructor_type.is_some()
+        || interface.declared_call_signatures.is_some()
+        || interface.declared_construct_signatures.is_some()
+        || interface.declared_members != owner_record.members()
+        || structured.constrained != ConstrainedTypeData::default()
+        || structured.signatures.is_some()
+        || structured.call_signature_count != 0
+        || structured
+            .object_type_without_abstract_construct_signatures
+            .is_some()
+        || interface.resolved_base_types.is_some()
+            && super::structured_members::validate_interface_heritage_members(store, type_)
+                != super::structured_members::InterfaceHeritageMembersValidation::Valid
+        || interface.resolved_base_types.is_none()
+            && interface.declared_index_infos.as_deref() != structured.index_infos.as_deref()
+    {
+        return None;
+    }
+
+    let members = structured.members?;
+    let table = store.symbol_table(members)?;
+    if !indexes.is_empty() {
+        let index_symbol = table.get(InternalSymbolName::Index.as_ref())?;
+        let index = store.symbol(index_symbol)?;
+        if index.flags() != SymbolFlags::SIGNATURE
+            || index.check_flags() != CheckFlags::NONE
+            || index.name() != InternalSymbolName::Index.as_ref()
+            || index.value_declaration().is_some()
+            || index.members().is_some()
+            || index.exports().is_some()
+            || index.export_symbol().is_some()
+            || store.get_parent_of_symbol(index_symbol) != Some(owner)
+            || store.get_merged_symbol(index_symbol) != Some(index_symbol)
+        {
+            return None;
+        }
+        let mut seen = HashSet::with_capacity(indexes.len());
+        for id in indexes {
+            let info = store.index_info(*id)?;
+            let declaration = info.declaration()?;
+            let Some(SourceNodeParent::Parent(parent)) = store.source_node_parent(declaration)
+            else {
+                return None;
+            };
+            if !seen.insert(*id)
+                || store.type_payload(info.key_type()).is_none()
+                || store.type_payload(info.value_type()).is_none()
+                || info.index_symbol().is_some()
+                || !info.components().is_empty()
+                || store.source_node_kind(declaration) != Some(SyntaxKind::IndexSignature)
+                || !declarations.contains(&parent)
+                || index
+                    .declarations()
+                    .is_none_or(|declarations| !declarations.contains(&declaration))
+            {
+                return None;
+            }
+        }
+    }
+
+    for property in structured.properties.as_deref().unwrap_or_default() {
+        let symbol = store.symbol(*property)?;
+        let links = store.value_symbol_links(*property)?;
+        let property_type = links.resolved_type?;
+        if symbol.parent() != Some(owner) && interface.resolved_base_types.is_none()
+            || links
+                != &(ValueSymbolLinks {
+                    resolved_type: Some(property_type),
+                    ..ValueSymbolLinks::default()
+                })
+            || symbol.flags().contains(SymbolFlags::METHOD)
+                && super::structured_members::valid_interface_method_value(
+                    store,
+                    *property,
+                    property_type,
+                )
+                .is_none()
+        {
+            return None;
+        }
+    }
+    projected_spread_donor_properties(store, type_)
 }
 
 fn validated_source_object_spread_donor(
@@ -11724,6 +11864,7 @@ fn validated_source_object_spread_donor(
             name: name.to_owned(),
             type_: property_type,
             readonly: property.check_flags().contains(CheckFlags::READONLY),
+            optional: false,
         });
     }
     let property_types = result
@@ -11735,11 +11876,236 @@ fn validated_source_object_spread_donor(
         .then_some(result)
 }
 
-fn validate_spread_donor(store: &CanonicalTypeMapperStore, type_: TypeId) -> SpreadDonorValidation {
+#[allow(clippy::too_many_lines)] // Authenticate the cached object and all assignment-owned members.
+fn validated_javascript_expando_spread_donor(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> Option<Vec<ResolvedObjectProperty>> {
+    let record = store.type_payload(type_)?;
+    let TypeData::Object(object) = record.data() else {
+        return None;
+    };
+    let owner = record.symbol()?;
+    let owner_record = store.symbol(owner)?;
+    let [declaration] = owner_record.declarations()? else {
+        return None;
+    };
+    let exports = owner_record.exports()?;
+    let Some(SourceNodeParent::Parent(variable)) = store.source_node_parent(*declaration) else {
+        return None;
+    };
+    let Some(SourceNodeParent::Parent(list)) = store.source_node_parent(variable) else {
+        return None;
+    };
+    let Some(SourceNodeParent::Parent(statement)) = store.source_node_parent(list) else {
+        return None;
+    };
+    let Some(SourceNodeParent::Parent(source)) = store.source_node_parent(statement) else {
+        return None;
+    };
+    if record.flags() != TypeFlags::OBJECT
+        || record.object_flags() != ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
+        || record.alias().is_some()
+        || !valid_object_tail(object)
+        || object.structured.constrained != ConstrainedTypeData::default()
+        || object.structured.members != Some(exports)
+        || object.structured.signatures.is_some()
+        || object.structured.call_signature_count != 0
+        || object.structured.index_infos.is_some()
+        || object
+            .structured
+            .object_type_without_abstract_construct_signatures
+            .is_some()
+        || owner_record.flags() != SymbolFlags::OBJECT_LITERAL
+        || owner_record.check_flags() != CheckFlags::NONE
+        || owner_record.name() != InternalSymbolName::Object.as_ref()
+        || owner_record.value_declaration() != Some(*declaration)
+        || owner_record.members().is_some()
+        || owner_record.parent().is_some()
+        || owner_record.export_symbol().is_some()
+        || store.get_merged_symbol(owner) != Some(owner)
+        || store.source_node_kind(*declaration) != Some(SyntaxKind::ObjectLiteralExpression)
+        || store.source_node_kind(variable) != Some(SyntaxKind::VariableDeclaration)
+        || store.source_node_kind(list) != Some(SyntaxKind::VariableDeclarationList)
+        || store.source_node_kind(statement) != Some(SyntaxKind::VariableStatement)
+        || store.source_node_kind(source) != Some(SyntaxKind::SourceFile)
+        || store.type_node_links(*declaration)
+            != Some(&TypeNodeLinks {
+                resolved_type: Some(type_),
+                ..TypeNodeLinks::default()
+            })
+    {
+        return None;
+    }
+
+    let table = store.symbol_table(exports)?;
+    let properties = object.structured.properties.as_deref()?;
+    if properties.is_empty() || table.len() != properties.len() {
+        return None;
+    }
+
+    let mut seen = HashSet::with_capacity(properties.len());
+    let mut result = Vec::with_capacity(properties.len());
+    for symbol in properties {
+        if !seen.insert(*symbol) {
+            return None;
+        }
+        let property = store.symbol(*symbol)?;
+        let [assignment] = property.declarations()? else {
+            return None;
+        };
+        let Some(SourceNodeParent::Parent(assignment_statement)) =
+            store.source_node_parent(*assignment)
+        else {
+            return None;
+        };
+        let links = store.value_symbol_links(*symbol)?;
+        let property_type = links.resolved_type?;
+        let name = property.name().as_utf8()?;
+        if property.flags() != SymbolFlags::PROPERTY | SymbolFlags::ASSIGNMENT
+            || property.check_flags() != CheckFlags::NONE
+            || property.name().is_reserved_member_name()
+            || property.name().is_private_identifier()
+            || property.name().is_late_bound()
+            || property.value_declaration() != Some(*assignment)
+            || property.parent() != Some(owner)
+            || property.members().is_some()
+            || property.exports().is_some()
+            || property.export_symbol().is_some()
+            || store.get_merged_symbol(*symbol) != Some(*symbol)
+            || !assignment.is_for(declaration.arena, declaration.file)
+            || store.source_node_kind(*assignment) != Some(SyntaxKind::BinaryExpression)
+            || store.source_node_kind(assignment_statement) != Some(SyntaxKind::ExpressionStatement)
+            || store.source_node_parent(assignment_statement)
+                != Some(SourceNodeParent::Parent(source))
+            || store.type_payload(property_type).is_none()
+            || table.get(property.name()) != Some(*symbol)
+            || links
+                != &(ValueSymbolLinks {
+                    resolved_type: Some(property_type),
+                    ..ValueSymbolLinks::default()
+                })
+        {
+            return None;
+        }
+        result.push(ResolvedObjectProperty {
+            name: name.to_owned(),
+            type_: property_type,
+            readonly: false,
+            optional: false,
+        });
+    }
+    Some(result)
+}
+
+fn spread_union_property_type(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    types: &[TypeId],
+) -> Option<TypeId> {
+    let [first, rest @ ..] = types else {
+        return None;
+    };
+    if rest.iter().all(|type_| type_ == first) {
+        return Some(*first);
+    }
+    if let Some(global_types) = global_types {
+        return store
+            .expression_union_type_with_global_types(global_types, types, UnionReduction::Literal)
+            .ok();
+    }
+    super::instantiate::canonical_anonymous_union(store, types).ok()
+}
+
+fn spread_union_empty_constituent(store: &CanonicalTypeMapperStore, type_: TypeId) -> bool {
+    let Some(record) = store.type_payload(type_) else {
+        return false;
+    };
+    let Some(bootstrap) = store.intrinsic_bootstrap() else {
+        return false;
+    };
+    record
+        .flags()
+        .intersects(TypeFlags::NULLABLE | TypeFlags::NEVER)
+        || type_ == bootstrap.false_type
+        || type_ == bootstrap.regular_false_type
+}
+
+fn validate_union_spread_donor(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    type_: TypeId,
+) -> SpreadDonorValidation {
+    let valid_union = global_types.map_or_else(
+        || store.validate_union_constituent(type_),
+        |global_types| store.validate_union_constituent_with_global_types(global_types, type_),
+    );
+    if valid_union.is_err() {
+        return SpreadDonorValidation::Malformed;
+    }
+    let Some(TypeData::Union(union)) = store.type_payload(type_).map(TypeRecord::data) else {
+        return SpreadDonorValidation::Malformed;
+    };
+    let constituents = union.union.types.clone();
+    let mut entries = Vec::<(ResolvedObjectProperty, Vec<TypeId>, usize)>::new();
+    let mut positions = HashMap::<String, usize>::new();
+    let mut object_constituents = 0usize;
+    for constituent in constituents.iter().copied() {
+        if spread_union_empty_constituent(store, constituent) {
+            continue;
+        }
+        let properties = match validate_spread_donor(store, global_types, constituent) {
+            SpreadDonorValidation::Valid(properties) => properties,
+            SpreadDonorValidation::Unsupported => return SpreadDonorValidation::Unsupported,
+            SpreadDonorValidation::Malformed => return SpreadDonorValidation::Malformed,
+        };
+        object_constituents += 1;
+        for property in properties {
+            if let Some(index) = positions.get(&property.name).copied() {
+                let (existing, types, present) = &mut entries[index];
+                if !types.contains(&property.type_) {
+                    types.push(property.type_);
+                }
+                existing.readonly &= property.readonly;
+                existing.optional |= property.optional;
+                *present += 1;
+            } else {
+                positions.insert(property.name.clone(), entries.len());
+                let type_ = property.type_;
+                entries.push((property, vec![type_], 1));
+            }
+        }
+    }
+    if object_constituents == 0 {
+        return SpreadDonorValidation::Unsupported;
+    }
+    let mut properties = Vec::with_capacity(entries.len());
+    for (mut property, types, present) in entries {
+        let Some(type_) = spread_union_property_type(store, global_types, &types) else {
+            return SpreadDonorValidation::Malformed;
+        };
+        property.type_ = type_;
+        property.optional |= present != constituents.len();
+        properties.push(property);
+    }
+    SpreadDonorValidation::Valid(properties)
+}
+
+fn validate_spread_donor(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    type_: TypeId,
+) -> SpreadDonorValidation {
     let Some(record) = store.type_payload(type_) else {
         return SpreadDonorValidation::Malformed;
     };
-    if record.flags() != TypeFlags::OBJECT {
+    let flags = record.flags();
+    let interface = matches!(record.data(), TypeData::Interface(_));
+    let symbol = record.symbol();
+    if flags.intersects(TypeFlags::UNION) {
+        return validate_union_spread_donor(store, global_types, type_);
+    }
+    if flags != TypeFlags::OBJECT {
         return SpreadDonorValidation::Unsupported;
     }
     match validate_resolved_declared_property_object(store, type_) {
@@ -11751,6 +12117,12 @@ fn validate_spread_donor(store: &CanonicalTypeMapperStore, type_: TypeId) -> Spr
         }
         DeclaredPropertyObjectValidation::Malformed => return SpreadDonorValidation::Malformed,
         DeclaredPropertyObjectValidation::NotDeclared => {}
+    }
+    if interface {
+        return validated_indexed_or_method_interface_spread_donor(store, type_).map_or(
+            SpreadDonorValidation::Malformed,
+            SpreadDonorValidation::Valid,
+        );
     }
     match store.validate_derived_object_literal_for_relation(type_) {
         super::derived_types::DerivedObjectLiteralValidation::Valid { .. } => {
@@ -11764,18 +12136,21 @@ fn validate_spread_donor(store: &CanonicalTypeMapperStore, type_: TypeId) -> Spr
         }
         super::derived_types::DerivedObjectLiteralValidation::NotDerived => {}
     }
-    if record.symbol().is_none() {
+    if symbol.is_none() {
         return validated_synthetic_object_properties(store, type_).map_or(
             SpreadDonorValidation::Malformed,
             SpreadDonorValidation::Valid,
         );
     }
-    if record
-        .symbol()
-        .and_then(|symbol| store.symbol(symbol))
-        .is_some_and(|symbol| symbol.flags() == SymbolFlags::OBJECT_LITERAL)
+    if let Some(owner) = symbol.and_then(|symbol| store.symbol(symbol))
+        && owner.flags() == SymbolFlags::OBJECT_LITERAL
     {
-        return validated_source_object_spread_donor(store, type_).map_or(
+        let properties = if owner.exports().is_some() {
+            validated_javascript_expando_spread_donor(store, type_)
+        } else {
+            validated_source_object_spread_donor(store, type_)
+        };
+        return properties.map_or(
             SpreadDonorValidation::Malformed,
             SpreadDonorValidation::Valid,
         );
@@ -11784,16 +12159,32 @@ fn validate_spread_donor(store: &CanonicalTypeMapperStore, type_: TypeId) -> Spr
 }
 
 fn merge_spread_property(
+    store: &mut CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
+    node: NodeRef,
     properties: &mut Vec<ResolvedObjectProperty>,
     positions: &mut HashMap<String, usize>,
     property: ResolvedObjectProperty,
-) {
+) -> Result<(), PropertyObjectError> {
     if let Some(index) = positions.get(&property.name).copied() {
-        properties[index] = property;
+        if property.optional {
+            let previous = &properties[index];
+            let type_ =
+                spread_union_property_type(store, global_types, &[previous.type_, property.type_])
+                    .ok_or(PropertyObjectError::InvalidObjectLiteral(node))?;
+            properties[index] = ResolvedObjectProperty {
+                type_,
+                optional: previous.optional,
+                ..property
+            };
+        } else {
+            properties[index] = property;
+        }
     } else {
         positions.insert(property.name.clone(), properties.len());
         properties.push(property);
     }
+    Ok(())
 }
 
 fn jsdoc_generic_arrow_spread_donor(
@@ -11882,9 +12273,10 @@ fn jsdoc_generic_arrow_spread_donor(
         })
 }
 
-/// Publishes authenticated concrete spreads, with canonical `any` absorption.
+/// Publishes authenticated concrete or union spreads, with canonical `any` absorption.
 pub(super) fn publish_object_literal_with_spreads(
     store: &mut CanonicalTypeMapperStore,
+    global_types: Option<&CanonicalGlobalTypes>,
     plan: &PropertyObjectPlan,
     property_types: &[TypeId],
     spread_types: &[TypeId],
@@ -11919,13 +12311,12 @@ pub(super) fn publish_object_literal_with_spreads(
             absorbs_any = true;
             continue;
         }
-        match validate_spread_donor(store, *type_) {
+        if jsdoc_generic_arrow_spread_donor(store, plan, *type_) {
+            donors.push(Some(Vec::new()));
+            continue;
+        }
+        match validate_spread_donor(store, global_types, *type_) {
             SpreadDonorValidation::Valid(properties) => donors.push(Some(properties)),
-            SpreadDonorValidation::Unsupported
-                if jsdoc_generic_arrow_spread_donor(store, plan, *type_) =>
-            {
-                donors.push(Some(Vec::new()));
-            }
             SpreadDonorValidation::Unsupported => {
                 return Err(PropertyObjectError::UnsupportedMember {
                     node: spread.declaration,
@@ -11979,26 +12370,34 @@ pub(super) fn publish_object_literal_with_spreads(
                 .expect("canonical any was handled before concrete spread publication");
             for property in donor {
                 merge_spread_property(
+                    store,
+                    global_types,
+                    plan.node,
                     &mut merged,
                     &mut positions,
                     ResolvedObjectProperty {
                         name: property.name.clone(),
                         type_: property.type_,
                         readonly: plan.const_context,
+                        optional: property.optional,
                     },
-                );
+                )?;
             }
             spread_index += 1;
         }
         merge_spread_property(
+            store,
+            global_types,
+            plan.node,
             &mut merged,
             &mut positions,
             ResolvedObjectProperty {
                 name: property.name.clone(),
                 type_: *type_,
                 readonly: property.readonly,
+                optional: property.optional,
             },
-        );
+        )?;
     }
     while let Some(spread) = plan.spreads.get(spread_index) {
         if spread.property_index != plan.properties.len() {
@@ -12009,14 +12408,18 @@ pub(super) fn publish_object_literal_with_spreads(
             .expect("canonical any was handled before concrete spread publication");
         for property in donor {
             merge_spread_property(
+                store,
+                global_types,
+                plan.node,
                 &mut merged,
                 &mut positions,
                 ResolvedObjectProperty {
                     name: property.name.clone(),
                     type_: property.type_,
                     readonly: plan.const_context,
+                    optional: property.optional,
                 },
-            );
+            )?;
         }
         spread_index += 1;
     }
@@ -12773,6 +13176,7 @@ mod generic_publication_tests {
         assert_eq!(
             publish_object_literal_with_spreads(
                 &mut fixture.store,
+                None,
                 &plan,
                 &[number, number],
                 &[any],
@@ -12801,6 +13205,7 @@ mod generic_publication_tests {
         assert_eq!(
             publish_object_literal_with_spreads(
                 &mut fixture.store,
+                None,
                 &plan,
                 &[number, number],
                 &[any],
@@ -12851,6 +13256,7 @@ mod generic_publication_tests {
 
         let result = publish_object_literal_with_spreads(
             &mut fixture.store,
+            None,
             &receiver_plan,
             &[zero, three, four],
             &[first_type, second_type],
@@ -12863,26 +13269,31 @@ mod generic_publication_tests {
                     name: "start".to_owned(),
                     type_: zero,
                     readonly: true,
+                    optional: false,
                 },
                 ResolvedObjectProperty {
                     name: "shared".to_owned(),
                     type_: boolean,
                     readonly: true,
+                    optional: false,
                 },
                 ResolvedObjectProperty {
                     name: "first".to_owned(),
                     type_: number,
                     readonly: true,
+                    optional: false,
                 },
                 ResolvedObjectProperty {
                     name: "second".to_owned(),
                     type_: number,
                     readonly: true,
+                    optional: false,
                 },
                 ResolvedObjectProperty {
                     name: "last".to_owned(),
                     type_: four,
                     readonly: true,
+                    optional: false,
                 },
             ]),
         );
@@ -12895,6 +13306,7 @@ mod generic_publication_tests {
         assert_eq!(
             publish_object_literal_with_spreads(
                 &mut fixture.store,
+                None,
                 &receiver_plan,
                 &[zero, three, four],
                 &[first_type, second_type],
@@ -12904,6 +13316,7 @@ mod generic_publication_tests {
         assert_eq!(
             publish_object_literal_with_spreads(
                 &mut fixture.store,
+                None,
                 &receiver_plan,
                 &[zero, three, nine],
                 &[first_type, second_type],
@@ -12921,6 +13334,316 @@ mod generic_publication_tests {
                 fixture.store.checker_link_allocated_lengths(),
             ),
             warm,
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep optional union publication, replay, and cache poison together.
+    fn union_spread_donors_preserve_optional_members_and_overwrite_order() {
+        let (mut fixture, _) = object_fixture(concat!(
+            "const first = { shared: 1, left: 'left' }; ",
+            "const second = { shared: 'right', right: true }; ",
+            "const result = { ...first } as const;",
+        ));
+        let host = host(&fixture.parsed, &fixture.bound);
+        let first = object_initializer(&fixture, "first");
+        let second = object_initializer(&fixture, "second");
+        let receiver = object_initializer(&fixture, "result");
+        let first_plan = plan_object_literal(&fixture.store, &host, first).unwrap();
+        let second_plan = plan_object_literal(&fixture.store, &host, second).unwrap();
+        let receiver_plan = plan_object_literal(&fixture.store, &host, receiver).unwrap();
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let number = bootstrap.number_type;
+        let string = bootstrap.string_type;
+        let boolean = bootstrap.boolean_type;
+        let first_type =
+            publish_object_literal(&mut fixture.store, &first_plan, &[number, string]).unwrap();
+        let second_type =
+            publish_object_literal(&mut fixture.store, &second_plan, &[string, boolean]).unwrap();
+        let donor = fixture
+            .store
+            .expression_union_type(&[first_type, second_type], UnionReduction::Literal)
+            .unwrap();
+
+        let result = publish_object_literal_with_spreads(
+            &mut fixture.store,
+            None,
+            &receiver_plan,
+            &[],
+            &[donor],
+        )
+        .unwrap();
+        let shared = fixture
+            .store
+            .expression_union_type(&[number, string], UnionReduction::Literal)
+            .unwrap();
+        assert_eq!(
+            validated_synthetic_object_properties(&fixture.store, result),
+            Some(vec![
+                ResolvedObjectProperty {
+                    name: "shared".to_owned(),
+                    type_: shared,
+                    readonly: true,
+                    optional: false,
+                },
+                ResolvedObjectProperty {
+                    name: "left".to_owned(),
+                    type_: string,
+                    readonly: true,
+                    optional: true,
+                },
+                ResolvedObjectProperty {
+                    name: "right".to_owned(),
+                    type_: boolean,
+                    readonly: true,
+                    optional: true,
+                },
+            ]),
+        );
+        let warm = (
+            fixture.store.type_len(),
+            fixture.store.symbol_len(),
+            fixture.store.symbol_store().symbol_table_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            publish_object_literal_with_spreads(
+                &mut fixture.store,
+                None,
+                &receiver_plan,
+                &[],
+                &[donor],
+            ),
+            Ok(result),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.symbol_store().symbol_table_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+
+        let optional = fixture
+            .store
+            .type_payload(result)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.members)
+            .and_then(|members| fixture.store.symbol_table(members))
+            .and_then(|members| members.get_source("left"))
+            .unwrap();
+        assert!(fixture.store.set_symbol_flags(
+            optional,
+            SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT,
+            CheckFlags::READONLY,
+        ));
+        let poisoned = (
+            fixture.store.type_len(),
+            fixture.store.symbol_len(),
+            fixture.store.symbol_store().symbol_table_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            publish_object_literal_with_spreads(
+                &mut fixture.store,
+                None,
+                &receiver_plan,
+                &[],
+                &[donor],
+            ),
+            Err(PropertyObjectError::InvalidCachedTypeLiteral {
+                node: receiver,
+                type_: result,
+            }),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.symbol_store().symbol_table_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            poisoned,
+        );
+        assert!(fixture.store.set_symbol_flags(
+            optional,
+            SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT | SymbolFlags::OPTIONAL,
+            CheckFlags::READONLY,
+        ));
+        assert_eq!(
+            publish_object_literal_with_spreads(
+                &mut fixture.store,
+                None,
+                &receiver_plan,
+                &[],
+                &[donor],
+            ),
+            Ok(result),
+        );
+    }
+
+    #[test]
+    fn optional_spread_overwrites_keep_prior_required_values() {
+        let (mut fixture, _) = object_fixture(concat!(
+            "const first = { value: 1 }; ",
+            "const second = { value: 'ready' }; ",
+            "const result = { ...first, ...second } as const;",
+        ));
+        let host = host(&fixture.parsed, &fixture.bound);
+        let first = object_initializer(&fixture, "first");
+        let second = object_initializer(&fixture, "second");
+        let receiver = object_initializer(&fixture, "result");
+        let first_plan = plan_object_literal(&fixture.store, &host, first).unwrap();
+        let second_plan = plan_object_literal(&fixture.store, &host, second).unwrap();
+        let receiver_plan = plan_object_literal(&fixture.store, &host, receiver).unwrap();
+        let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+        let number = bootstrap.number_type;
+        let string = bootstrap.string_type;
+        let false_type = bootstrap.false_type;
+        let first_type =
+            publish_object_literal(&mut fixture.store, &first_plan, &[number]).unwrap();
+        let second_type =
+            publish_object_literal(&mut fixture.store, &second_plan, &[string]).unwrap();
+        let optional = fixture
+            .store
+            .expression_union_type(&[false_type, second_type], UnionReduction::Literal)
+            .unwrap();
+
+        let result = publish_object_literal_with_spreads(
+            &mut fixture.store,
+            None,
+            &receiver_plan,
+            &[],
+            &[first_type, optional],
+        )
+        .unwrap();
+        let combined = fixture
+            .store
+            .expression_union_type(&[number, string], UnionReduction::Literal)
+            .unwrap();
+        assert_eq!(
+            validated_synthetic_object_properties(&fixture.store, result),
+            Some(vec![ResolvedObjectProperty {
+                name: "value".to_owned(),
+                type_: combined,
+                readonly: true,
+                optional: false,
+            }]),
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // The interface proof includes method, index, and poisoned links.
+    fn interface_spreads_preserve_methods_static_fields_and_indexed_members() {
+        let mut fixture = interface_fixture(
+            concat!(
+                "interface Shape { [key: string]: any; value: number; run(): number; } ",
+                "declare const input: Shape; ",
+                "const copied = { ...input, ['indexed']: 1 };",
+            ),
+            3_899,
+        );
+        let host = host(&fixture.parsed, &fixture.bound);
+        let receiver = object_initializer(&fixture, "copied");
+        let plan = plan_object_literal(&fixture.store, &host, receiver).unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let donor = CanonicalTypeQuery::new(
+            &mut fixture.store,
+            &host,
+            CanonicalCheckerOptions::default(),
+            &mut diagnostics,
+        )
+        .unwrap()
+        .get_declared_type_of_symbol(fixture.symbol)
+        .unwrap();
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        let method = fixture
+            .store
+            .symbol(fixture.symbol)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| fixture.store.symbol_table(members))
+            .and_then(|members| members.get_source("run"))
+            .unwrap();
+        let callable = fixture
+            .store
+            .value_symbol_links(method)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+
+        let result = publish_object_literal_with_spreads(
+            &mut fixture.store,
+            None,
+            &plan,
+            &[number],
+            &[donor],
+        )
+        .unwrap();
+        assert_eq!(
+            validated_synthetic_object_properties(&fixture.store, result),
+            Some(vec![
+                ResolvedObjectProperty {
+                    name: "value".to_owned(),
+                    type_: number,
+                    readonly: false,
+                    optional: false,
+                },
+                ResolvedObjectProperty {
+                    name: "run".to_owned(),
+                    type_: callable,
+                    readonly: false,
+                    optional: false,
+                },
+                ResolvedObjectProperty {
+                    name: "indexed".to_owned(),
+                    type_: number,
+                    readonly: false,
+                    optional: false,
+                },
+            ]),
+        );
+        assert!(diagnostics.is_empty());
+
+        let expected = fixture.store.value_symbol_links(method).unwrap().clone();
+        let mut poisoned = expected.clone();
+        poisoned.write_type = Some(number);
+        assert!(fixture.store.set_value_symbol_links(method, poisoned));
+        let before = (
+            fixture.store.type_len(),
+            fixture.store.symbol_len(),
+            fixture.store.symbol_store().symbol_table_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            publish_object_literal_with_spreads(
+                &mut fixture.store,
+                None,
+                &plan,
+                &[number],
+                &[donor],
+            ),
+            Err(PropertyObjectError::InvalidObjectLiteral(receiver)),
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.symbol_len(),
+                fixture.store.symbol_store().symbol_table_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            before,
+        );
+        assert!(fixture.store.set_value_symbol_links(method, expected));
+        assert_eq!(
+            publish_object_literal_with_spreads(
+                &mut fixture.store,
+                None,
+                &plan,
+                &[number],
+                &[donor],
+            ),
+            Ok(result),
         );
     }
 
@@ -12950,6 +13673,7 @@ mod generic_publication_tests {
         assert_eq!(
             publish_object_literal_with_spreads(
                 &mut fixture.store,
+                None,
                 &receiver_plan,
                 &[],
                 &[donor_type, any],
@@ -13003,6 +13727,7 @@ mod generic_publication_tests {
         assert_eq!(
             publish_object_literal_with_spreads(
                 &mut fixture.store,
+                None,
                 &receiver_plan,
                 &[],
                 &[donor_type],
@@ -13022,6 +13747,138 @@ mod generic_publication_tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // One fixture verifies poisoned donor and receiver caches.
+    fn synthetic_spreads_reject_poisoned_donor_and_receiver_caches() {
+        let (mut fixture, _) = object_fixture(concat!(
+            "const donor = { nested: { value: 1 } } as const; ",
+            "const result = { ...donor };",
+        ));
+        let host = host(&fixture.parsed, &fixture.bound);
+        let donor = object_initializer(&fixture, "donor");
+        let receiver = object_initializer(&fixture, "result");
+        let donor_plan = plan_object_literal(&fixture.store, &host, donor).unwrap();
+        let nested = donor_plan.properties[0].type_node;
+        let nested_plan = plan_object_literal(&fixture.store, &host, nested).unwrap();
+        let receiver_plan = plan_object_literal(&fixture.store, &host, receiver).unwrap();
+        let one = fixture
+            .store
+            .regular_number_literal_type(ts_jsnum::Number::new(1.0))
+            .unwrap();
+        let number = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        let nested_type = publish_object_literal(&mut fixture.store, &nested_plan, &[one]).unwrap();
+        let donor_type =
+            publish_object_literal(&mut fixture.store, &donor_plan, &[nested_type]).unwrap();
+        let donor_property = fixture
+            .store
+            .type_payload(donor_type)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.properties.as_deref())
+            .and_then(|properties| properties.first())
+            .copied()
+            .unwrap();
+        let donor_links = fixture
+            .store
+            .value_symbol_links(donor_property)
+            .unwrap()
+            .clone();
+        let mut poisoned_donor = donor_links.clone();
+        poisoned_donor.write_type = Some(number);
+        assert!(
+            fixture
+                .store
+                .set_value_symbol_links(donor_property, poisoned_donor)
+        );
+        let state = |store: &CanonicalTypeMapperStore| {
+            (
+                store.type_len(),
+                store.symbol_len(),
+                store.symbol_store().symbol_table_len(),
+                store.checker_link_allocated_lengths(),
+            )
+        };
+        let poisoned = state(&fixture.store);
+        assert_eq!(
+            publish_object_literal_with_spreads(
+                &mut fixture.store,
+                None,
+                &receiver_plan,
+                &[],
+                &[donor_type],
+            ),
+            Err(PropertyObjectError::InvalidObjectLiteral(receiver)),
+        );
+        assert_eq!(state(&fixture.store), poisoned);
+        assert!(fixture.store.type_node_links(receiver).is_none());
+        assert!(
+            fixture
+                .store
+                .set_value_symbol_links(donor_property, donor_links)
+        );
+
+        let receiver_type = publish_object_literal_with_spreads(
+            &mut fixture.store,
+            None,
+            &receiver_plan,
+            &[],
+            &[donor_type],
+        )
+        .unwrap();
+        let receiver_property = fixture
+            .store
+            .type_payload(receiver_type)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.properties.as_deref())
+            .and_then(|properties| properties.first())
+            .copied()
+            .unwrap();
+        let receiver_links = fixture
+            .store
+            .value_symbol_links(receiver_property)
+            .unwrap()
+            .clone();
+        let mut poisoned_receiver = receiver_links.clone();
+        poisoned_receiver.target = Some(donor_plan.properties[0].symbol);
+        assert!(
+            fixture
+                .store
+                .set_value_symbol_links(receiver_property, poisoned_receiver)
+        );
+        let poisoned = state(&fixture.store);
+        assert_eq!(
+            publish_object_literal_with_spreads(
+                &mut fixture.store,
+                None,
+                &receiver_plan,
+                &[],
+                &[donor_type],
+            ),
+            Err(PropertyObjectError::InvalidCachedTypeLiteral {
+                node: receiver,
+                type_: receiver_type,
+            }),
+        );
+        assert_eq!(state(&fixture.store), poisoned);
+        assert!(
+            fixture
+                .store
+                .set_value_symbol_links(receiver_property, receiver_links)
+        );
+
+        let warm = state(&fixture.store);
+        assert_eq!(
+            publish_object_literal_with_spreads(
+                &mut fixture.store,
+                None,
+                &receiver_plan,
+                &[],
+                &[donor_type],
+            ),
+            Ok(receiver_type),
+        );
+        assert_eq!(state(&fixture.store), warm);
+    }
+
+    #[test]
     fn unsupported_spread_donors_fail_before_publishing_partial_caches() {
         let (mut fixture, object) = object_fixture(concat!(
             "declare const source: any; ",
@@ -13038,7 +13895,7 @@ mod generic_publication_tests {
         );
 
         assert_eq!(
-            publish_object_literal_with_spreads(&mut fixture.store, &plan, &[], &[unknown]),
+            publish_object_literal_with_spreads(&mut fixture.store, None, &plan, &[], &[unknown]),
             Err(PropertyObjectError::UnsupportedMember {
                 node: plan.spreads[0].declaration,
                 kind: SyntaxKind::SpreadAssignment,
@@ -13196,6 +14053,7 @@ mod generic_publication_tests {
                 name: "nested".to_owned(),
                 type_: one,
                 readonly: true,
+                optional: false,
             }]),
         );
         assert_eq!(
@@ -13204,6 +14062,7 @@ mod generic_publication_tests {
                 name: "item".to_owned(),
                 type_: inner_type,
                 readonly: true,
+                optional: false,
             }]),
         );
         let warm = (

@@ -658,7 +658,7 @@ pub(super) struct LogicalBinaryPlan {
     parent: Option<DirectBinaryParent>,
 }
 
-/// Fully preflighted direct top-level conditional initializer.
+/// Fully preflighted top-level conditional initializer or object spread donor.
 #[derive(Clone, Debug)]
 pub(super) struct ConditionalExpressionPlan {
     node: NodeRef,
@@ -14575,7 +14575,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 _ => break,
             }
         }
-        let declaration = self
+        let owner = self
             .node(root)?
             .parent
             .map(|node| self.reference(node))
@@ -14586,24 +14586,28 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     SourceSyntaxRole::VariableInitializer,
                 )
             })?;
-        let declaration_record = self.node(declaration)?;
-        let NodeData::VariableDeclaration(variable) = &declaration_record.data else {
-            return Err(self.unsupported(
-                expression,
-                SyntaxKind::ConditionalExpression,
-                SourceSyntaxRole::VariableInitializer,
-            ));
+        let owner_record = self.node(owner)?;
+        let contextual = match &owner_record.data {
+            NodeData::VariableDeclaration(variable)
+                if owner_record.kind == SyntaxKind::VariableDeclaration
+                    && variable.initializer == Some(root.node) =>
+            {
+                variable.type_.is_some()
+            }
+            NodeData::SpreadAssignment(spread)
+                if owner_record.kind == SyntaxKind::SpreadAssignment
+                    && spread.expression == root.node =>
+            {
+                false
+            }
+            _ => {
+                return Err(self.unsupported(
+                    expression,
+                    SyntaxKind::ConditionalExpression,
+                    SourceSyntaxRole::VariableInitializer,
+                ));
+            }
         };
-        if declaration_record.kind != SyntaxKind::VariableDeclaration
-            || variable.initializer != Some(root.node)
-        {
-            return Err(self.unsupported(
-                expression,
-                SyntaxKind::ConditionalExpression,
-                SourceSyntaxRole::VariableInitializer,
-            ));
-        }
-        let contextual = variable.type_.is_some();
         let (condition_id, question_id, when_true_id, colon_id, when_false_id) = {
             let record = self.node(expression)?;
             let NodeData::ConditionalExpression(conditional) = &record.data else {
@@ -15981,12 +15985,21 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 ));
             };
             let operator = self.reference(binary.operator_token);
-            let left = self.reference(binary.left);
             let right = self.reference(binary.right);
-            if self.node(operator)?.kind != SyntaxKind::AmpersandAmpersandToken
-                || self.node(left)?.kind != SyntaxKind::Identifier
-                || self.node(right)?.kind != SyntaxKind::ObjectLiteralExpression
-            {
+            if !matches!(
+                self.node(operator)?.kind,
+                SyntaxKind::AmpersandAmpersandToken
+                    | SyntaxKind::BarBarToken
+                    | SyntaxKind::QuestionQuestionToken
+            ) || !matches!(
+                self.node(right)?.kind,
+                SyntaxKind::Identifier
+                    | SyntaxKind::ObjectLiteralExpression
+                    | SyntaxKind::ParenthesizedExpression
+                    | SyntaxKind::ConditionalExpression
+                    | SyntaxKind::PropertyAccessExpression
+                    | SyntaxKind::ElementAccessExpression
+            ) {
                 return Err(self.unsupported(
                     spread.declaration,
                     SyntaxKind::SpreadAssignment,
@@ -18295,6 +18308,7 @@ where
             } else {
                 super::object_members::publish_object_literal_with_spreads(
                     store,
+                    global_types,
                     plan,
                     &property_types,
                     &spread_types,
@@ -46136,6 +46150,63 @@ mod tests {
     }
 
     #[test]
+    fn nested_readonly_enum_spreads_keep_last_assignment_and_enum_identity() {
+        let source = parsed(concat!(
+            "export enum E { A = 'a', B = 'b' } ",
+            "export const first = { item: { value: E.A }, shared: E.A } as const; ",
+            "export const second = { item: { value: E.B }, shared: E.B } as const; ",
+            "export const result = { ...first, ...second, shared: E.A } as const;",
+        ));
+        let file = FileId::new(8_534);
+        let mut context = context_with_module_state(
+            &[(file, &source)],
+            CanonicalModuleState::External,
+            CanonicalCheckerOptions::default(),
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let assertion = variable_initializer(&source, file, "result");
+        let NodeData::AsExpression(assertion) = &source.arena.get(assertion.node).unwrap().data
+        else {
+            panic!("the merged result must retain its const assertion")
+        };
+        let result = NodeRef::new(source.arena.id(), file, assertion.expression);
+        let nested = object_property_type(&context, result, "item");
+        let nested_property = context
+            .store()
+            .type_payload(nested)
+            .and_then(|record| record.data().structured())
+            .and_then(|structured| structured.members)
+            .and_then(|members| context.store().symbol_table(members))
+            .and_then(|members| members.get_source("value"))
+            .unwrap();
+        let nested_value = context
+            .store()
+            .value_symbol_links(nested_property)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        assert_eq!(context.type_to_string(nested_value).unwrap(), "E.B");
+        assert_eq!(
+            context
+                .type_to_string(object_property_type(&context, result, "shared"))
+                .unwrap(),
+            "E.A",
+        );
+        assert_eq!(
+            context
+                .type_to_string(variable_value_type(&context, &source, file, "result"))
+                .unwrap(),
+            "{ readonly item: { readonly value: E.B; }; readonly shared: E.A; }",
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
     fn concrete_object_spreads_merge_donors_direct_properties_and_inline_literals() {
         let source = parsed(concat!(
             "const first = { shared: 'left', first: 1 }; ",
@@ -46175,6 +46246,354 @@ mod tests {
                 .type_to_string(variable_value_type(&context, &source, file, "merged"))
                 .unwrap(),
             "{ shared: boolean; first: number; second: number; last: number; }",
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn conditional_object_spreads_preserve_optional_union_fields_and_overwrites() {
+        let source = parsed(concat!(
+            "declare const condition: boolean; ",
+            "const first = { shared: 1, left: 'ready' }; ",
+            "const second = { shared: 'text', right: true }; ",
+            "const result = { ...(condition ? first : second), shared: 3 }; ",
+            "const selected = result.left;",
+        ));
+        let file = FileId::new(8_537);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let result = variable_initializer(&source, file, "result");
+        assert_eq!(
+            context
+                .type_to_string(object_property_type(&context, result, "shared"))
+                .unwrap(),
+            "number",
+        );
+        assert_eq!(
+            context
+                .type_to_string(variable_value_type(&context, &source, file, "selected"))
+                .unwrap(),
+            "string | undefined",
+        );
+        assert_eq!(
+            context
+                .type_to_string(variable_value_type(&context, &source, file, "result"))
+                .unwrap(),
+            "{ shared: number; left?: string; right?: boolean; }",
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn conditional_spread_property_unions_preserve_canonical_array_identities() {
+        let library = parsed("interface Array<T> {}");
+        let source = parsed(concat!(
+            "declare const condition: boolean; ",
+            "const numbers = { values: [1] }; ",
+            "const strings = { values: ['ready'] }; ",
+            "const copied = { ...(condition ? numbers : strings) };",
+        ));
+        let library_file = FileId::new(8_552);
+        let file = FileId::new(8_553);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions::default(),
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let copied = variable_initializer(&source, file, "copied");
+        let property = object_property_type(&context, copied, "values");
+        let Some(TypeData::Union(union)) =
+            context.store().type_payload(property).map(TypeRecord::data)
+        else {
+            panic!("the copied array property must retain both canonical array identities")
+        };
+        let elements = union
+            .union
+            .types
+            .iter()
+            .map(|array| {
+                context
+                    .store()
+                    .canonical_array_reference(context.global_types(), *array)
+                    .unwrap()
+                    .unwrap()
+                    .element_type
+            })
+            .collect::<Vec<_>>();
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        assert_eq!(elements.len(), 2);
+        assert!(elements.contains(&bootstrap.number_type));
+        assert!(elements.contains(&bootstrap.string_type));
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn imported_default_and_const_objects_remain_authenticated_spread_donors() {
+        let target = parsed(concat!(
+            "export const frozen = { exact: 1 } as const; ",
+            "export default { regular: 'ready' };",
+        ));
+        let importer = parsed(concat!(
+            "import selected from './target'; ",
+            "import { frozen } from './target'; ",
+            "const copied = { ...selected, ...frozen };",
+        ));
+        let target_file = FileId::new(8_554);
+        let importer_file = FileId::new(8_555);
+        let files = [(target_file, &target), (importer_file, &importer)];
+        let mut context = external_context_with_import_routes(
+            &files,
+            &[
+                SourceImportRoute {
+                    source: 1,
+                    specifier: 0,
+                    target: 0,
+                },
+                SourceImportRoute {
+                    source: 1,
+                    specifier: 1,
+                    target: 0,
+                },
+            ],
+        );
+
+        context.check_source_file(target_file).unwrap();
+        context.check_source_file(importer_file).unwrap();
+
+        let copied = variable_initializer(&importer, importer_file, "copied");
+        assert_eq!(
+            context
+                .type_to_string(object_property_type(&context, copied, "regular"))
+                .unwrap(),
+            "string",
+        );
+        assert_eq!(
+            context
+                .type_to_string(object_property_type(&context, copied, "exact"))
+                .unwrap(),
+            "1",
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, importer_file);
+        context.recheck_source_file(importer_file).unwrap();
+        assert_eq!(observable_state(&context, importer_file), warm);
+    }
+
+    #[test]
+    fn logical_spreads_preserve_shorthand_computed_fields_and_readonly_overwrites() {
+        let source = parsed(concat!(
+            "declare const enabled: boolean; ",
+            "const label = 'ready'; ",
+            "const donor = { label, [0]: 1, ['indexed']: true }; ",
+            "const result = { ...(enabled && donor), label: 'fixed' } as const;",
+        ));
+        let file = FileId::new(8_538);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    ..IntrinsicBootstrapOptions::default()
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let assertion = variable_initializer(&source, file, "result");
+        let NodeData::AsExpression(assertion) = &source.arena.get(assertion.node).unwrap().data
+        else {
+            panic!("the logical spread must retain its const assertion")
+        };
+        let result = NodeRef::new(source.arena.id(), file, assertion.expression);
+        assert_eq!(
+            context
+                .type_to_string(object_property_type(&context, result, "label"))
+                .unwrap(),
+            "\"fixed\"",
+        );
+        assert_eq!(
+            context
+                .type_to_string(variable_value_type(&context, &source, file, "result"))
+                .unwrap(),
+            "{ readonly label: \"fixed\"; readonly \"0\"?: number; readonly indexed?: boolean; }",
+        );
+        let TypeData::Object(object) = context
+            .store()
+            .type_payload(resolved_node_type(&context, result))
+            .unwrap()
+            .data()
+        else {
+            panic!("the logical spread must publish a concrete object")
+        };
+        assert!(
+            object
+                .structured
+                .properties
+                .as_deref()
+                .unwrap()
+                .iter()
+                .all(|property| {
+                    context
+                        .store()
+                        .symbol(*property)
+                        .unwrap()
+                        .check_flags()
+                        .contains(CheckFlags::READONLY)
+                })
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn non_strict_logical_spreads_keep_commented_following_members() {
+        let source = parsed(concat!(
+            "declare const enabled: boolean; ",
+            "const donor = { value: 1 }; ",
+            "const result = { ...(enabled && donor), /* preserved */ after: true };",
+        ));
+        let file = FileId::new(8_546);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let result = variable_initializer(&source, file, "result");
+        assert_eq!(
+            context
+                .type_to_string(variable_value_type(&context, &source, file, "result"))
+                .unwrap(),
+            "{ value: number; after: boolean; }",
+        );
+        let TypeData::Object(object) = context
+            .store()
+            .type_payload(resolved_node_type(&context, result))
+            .unwrap()
+            .data()
+        else {
+            panic!("the non-strict logical spread must retain a concrete object")
+        };
+        assert!(
+            object
+                .structured
+                .properties
+                .as_deref()
+                .unwrap()
+                .iter()
+                .all(|property| {
+                    !context
+                        .store()
+                        .symbol(*property)
+                        .unwrap()
+                        .flags()
+                        .contains(SymbolFlags::OPTIONAL)
+                })
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn indexed_interface_spreads_keep_method_callable_identity() {
+        let source = parsed(concat!(
+            "interface Shape { [key: string]: any; value: number; read(): number; } ",
+            "declare const input: Shape; ",
+            "const copied = { ...input, ['indexed']: 1 };",
+        ));
+        let file = FileId::new(8_539);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let copied = variable_initializer(&source, file, "copied");
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        assert_eq!(object_property_type(&context, copied, "value"), number);
+        assert_eq!(object_property_type(&context, copied, "indexed"), number);
+        let declaration = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::InterfaceDeclaration).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let (_, bound) = context.file(file).unwrap();
+        let owner = bound.symbol(declaration).unwrap();
+        let method = context
+            .store()
+            .symbol(owner)
+            .and_then(ts_binder::semantic::Symbol::members)
+            .and_then(|members| context.store().symbol_table(members))
+            .and_then(|members| members.get_source("read"))
+            .unwrap();
+        let callable = context
+            .store()
+            .value_symbol_links(method)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        assert_eq!(object_property_type(&context, copied, "read"), callable);
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn spread_shorthand_callables_preserve_contextual_signatures() {
+        let source = parsed(concat!(
+            "const run = (value: number): number => value; ",
+            "const donor = { run }; ",
+            "const copied = { ...donor } as const; ",
+            "const result = copied.run(1);",
+        ));
+        let file = FileId::new(8_545);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let copied = variable_initializer(&source, file, "copied");
+        let callable = variable_value_type(&context, &source, file, "run");
+        assert_eq!(object_property_type(&context, copied, "run"), callable);
+        assert_eq!(
+            variable_value_type(&context, &source, file, "result"),
+            context.store().intrinsic_bootstrap().unwrap().number_type,
         );
         assert!(context.diagnostics().is_empty());
 
@@ -46224,6 +46643,74 @@ mod tests {
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn warm_nested_spread_caches_reject_poisoned_synthetic_members() {
+        for (index, poison_donor) in [true, false].into_iter().enumerate() {
+            let source = parsed(concat!(
+                "const donor = { item: { value: 1 } } as const; ",
+                "const copied = { ...donor } as const;",
+            ));
+            let file = FileId::new(8_535 + u32::try_from(index).unwrap());
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            context.check_source_file(file).unwrap();
+
+            let name = if poison_donor { "donor" } else { "copied" };
+            let assertion = variable_initializer(&source, file, name);
+            let NodeData::AsExpression(assertion) = &source.arena.get(assertion.node).unwrap().data
+            else {
+                panic!("{name} must retain its const assertion")
+            };
+            let object = NodeRef::new(source.arena.id(), file, assertion.expression);
+            let type_ = resolved_node_type(&context, object);
+            let property = context
+                .store()
+                .type_payload(type_)
+                .and_then(|record| record.data().structured())
+                .and_then(|structured| structured.properties.as_deref())
+                .and_then(|properties| properties.first())
+                .copied()
+                .unwrap();
+            let expected = context
+                .store()
+                .value_symbol_links(property)
+                .unwrap()
+                .clone();
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            let mut poisoned_links = expected.clone();
+            poisoned_links.write_type = Some(number);
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_value_symbol_links(property, poisoned_links)
+            );
+            mark_source_unchecked(&mut context, file);
+            let poisoned = observable_state(&context, file);
+
+            assert_eq!(
+                context.check_source_file(file),
+                Err(SourceCheckError::ObjectLiteral(
+                    SourceObjectLiteralError::InvalidCache {
+                        node: object,
+                        type_: Some(type_),
+                    },
+                )),
+            );
+            assert_eq!(observable_state(&context, file), poisoned);
+            assert!(context.diagnostics().is_empty());
+            assert!(!is_type_checked(&context, file));
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_value_symbol_links(property, expected)
+            );
+
+            context.check_source_file(file).unwrap();
+            assert_eq!(resolved_node_type(&context, object), type_);
+            assert!(context.diagnostics().is_empty());
+            assert!(is_type_checked(&context, file));
+        }
     }
 
     #[test]
@@ -55835,6 +56322,65 @@ class Foo2 {
             Some(property),
         );
         assert_eq!(resolved_node_type(&context, read), number);
+        assert!(context.diagnostics().is_empty());
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn javascript_object_expando_spreads_preserve_binder_properties_and_replay_warm() {
+        let source = parse_javascript_source_file(concat!(
+            "var donor = {}; ",
+            "donor.value = 1; ",
+            "const copied = { ...donor, label: 'ready' }; ",
+            "const selected = copied.value;",
+        ));
+        assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+        let file = FileId::new(8_442);
+        let mut context = javascript_context(file, &source, CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let copied = variable_initializer(&source, file, "copied");
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        assert_eq!(object_property_type(&context, copied, "value"), number);
+        assert_eq!(object_property_type(&context, copied, "label"), string);
+        assert_eq!(
+            variable_value_type(&context, &source, file, "selected"),
+            number,
+        );
+        let (left, _) = assignment_parts(&source, file, 0);
+        let assignment = NodeRef::new(
+            source.arena.id(),
+            file,
+            source.arena.get(left.node).unwrap().parent.unwrap(),
+        );
+        let (_, bound) = context.file(file).unwrap();
+        let original = bound.symbol(assignment).unwrap();
+        let TypeData::Object(object) = context
+            .store()
+            .type_payload(resolved_node_type(&context, copied))
+            .unwrap()
+            .data()
+        else {
+            panic!("the copied JavaScript expando must retain a concrete object type")
+        };
+        let property = context
+            .store()
+            .symbol_table(object.structured.members.unwrap())
+            .and_then(|members| members.get_source("value"))
+            .unwrap();
+        assert_ne!(property, original);
+        assert_eq!(
+            context.store().value_symbol_links(property),
+            Some(&ValueSymbolLinks {
+                resolved_type: Some(number),
+                ..ValueSymbolLinks::default()
+            }),
+        );
         assert!(context.diagnostics().is_empty());
 
         let warm = observable_state(&context, file);
