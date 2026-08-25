@@ -32391,7 +32391,37 @@ fn materialize_source_overloads(
                 )?
                 .get_type_from_type_node(parameter.type_node);
                 merge_retry_diagnostics(diagnostics, annotation_diagnostics);
-                parameter_types.push(result?);
+                let parameter_type = result?;
+                if overload.declarations.len() > 1
+                    && store.source_node_kind(parameter.type_node) == Some(SyntaxKind::FunctionType)
+                    && let StoredSingleCallableValidation::Valid { callable, .. } =
+                        validate_stored_single_callable(store, parameter_type)
+                    && callable.return_type.is_none()
+                    && callable.parameters.len() == 1
+                    && callable.min_argument_count == 1
+                    && callable.rest_parameter.is_none()
+                    && store
+                        .signature(callable.signature)
+                        .is_some_and(|signature| {
+                            signature.type_parameters().is_empty()
+                                && !signature.has_rest_parameter()
+                        })
+                {
+                    session.reset_query();
+                    let mut callback_diagnostics = CanonicalCheckerDiagnostics::default();
+                    let return_type = CanonicalTypeQuery::new_with_global_types_and_session(
+                        store,
+                        host,
+                        global_types,
+                        options,
+                        session,
+                        &mut callback_diagnostics,
+                    )?
+                    .get_return_type_of_signature(callable.signature);
+                    merge_retry_diagnostics(diagnostics, callback_diagnostics);
+                    return_type?;
+                }
+                parameter_types.push(parameter_type);
             }
             let return_node =
                 declaration
