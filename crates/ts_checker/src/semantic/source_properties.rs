@@ -1524,6 +1524,14 @@ fn resolve_published_canonical_array_property(
     if is_method {
         validate_published_canonical_array_method(store, plan.node, symbol, declarations, type_)?;
     }
+    let element_parameter = interface
+        .reference
+        .resolved_type_arguments
+        .as_deref()
+        .and_then(|parameters| match parameters {
+            [parameter] => Some(*parameter),
+            _ => None,
+        });
     let requires_method_instantiation = is_method
         && !matches!(plan.name.as_str(), "map" | "filter" | "find" | "forEach")
         && store
@@ -1535,7 +1543,9 @@ fn resolve_published_canonical_array_property(
                     store
                         .signature(*signature)
                         .and_then(super::signatures::Signature::resolved_return_type)
-                        == Some(target)
+                        .is_some_and(|return_type| {
+                            return_type == target || Some(return_type) == element_parameter
+                        })
                 })
             });
     let instantiation = if requires_method_instantiation {
@@ -4047,6 +4057,212 @@ mod tests {
                 receiver,
             ),
             Ok(checked),
+        );
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().mapper_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Preserve the generic method, mapped result, and cache checks.
+    fn canonical_array_element_methods_specialize_return_types_cold_and_warm() {
+        let parsed = parsed(concat!(
+            "interface Array<T> { customMethod(): T; } ",
+            "interface ReadonlyArray<T> {} ",
+            "const result = values.customMethod();",
+        ));
+        let file = FileId::new(549);
+        let access = property_access(&parsed, file);
+        let call = NodeRef::new(
+            parsed.arena.id(),
+            file,
+            parsed.arena.get(access.node).unwrap().parent.unwrap(),
+        );
+        let mut context = array_property_context(&parsed, file);
+        let global_types = context.global_types().clone();
+        let (method, declaration, annotation, element) = {
+            let store = context.store();
+            let owner = store
+                .type_payload(global_types.array_type)
+                .and_then(TypeRecord::symbol)
+                .and_then(|symbol| store.get_merged_symbol(symbol))
+                .unwrap();
+            let method = store
+                .symbol(owner)
+                .and_then(ts_binder::semantic::Symbol::members)
+                .and_then(|members| store.symbol_table(members))
+                .and_then(|members| members.get_source("customMethod"))
+                .unwrap();
+            let declaration = store.symbol(method).unwrap().value_declaration().unwrap();
+            let NodeData::MethodSignatureDeclaration(signature) =
+                &parsed.arena.get(declaration.node).unwrap().data
+            else {
+                panic!("the custom method must retain its declaration")
+            };
+            let annotation = NodeRef::new(
+                declaration.arena,
+                declaration.file,
+                signature.type_.unwrap(),
+            );
+            let TypeData::Interface(array) =
+                store.type_payload(global_types.array_type).unwrap().data()
+            else {
+                panic!("Array must retain its generic interface target")
+            };
+            let [element] = array.reference.resolved_type_arguments.as_deref().unwrap() else {
+                panic!("Array must retain one generic element")
+            };
+            (method, declaration, annotation, *element)
+        };
+        let string = context.store().intrinsic_bootstrap().unwrap().string_type;
+        let receiver = context
+            .store_mut_for_test()
+            .create_canonical_array_type(&global_types, string, false)
+            .unwrap();
+        let (template, signature) = {
+            let store = context.store_mut_for_test();
+            assert!(store.set_type_node_links(
+                annotation,
+                TypeNodeLinks {
+                    resolved_type: Some(element),
+                    ..TypeNodeLinks::default()
+                },
+            ));
+            let template = store
+                .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(method))
+                .unwrap();
+            let signature = store
+                .alloc_signature(
+                    SignatureFlags::NONE,
+                    Some(declaration),
+                    Vec::new(),
+                    None,
+                    Vec::new(),
+                    Some(element),
+                    None,
+                    0,
+                )
+                .unwrap();
+            assert!(store.set_signature_links(
+                declaration,
+                SignatureLinks {
+                    resolved_signature: ResolvedSignatureState::Resolved(signature),
+                    ..SignatureLinks::default()
+                },
+            ));
+            assert!(store.set_value_symbol_links(
+                method,
+                ValueSymbolLinks {
+                    resolved_type: Some(template),
+                    ..ValueSymbolLinks::default()
+                },
+            ));
+            assert!(store.set_structured_type_members(
+                template,
+                None,
+                None,
+                Some(vec![signature]),
+                None,
+                None,
+            ));
+            assert!(
+                store.set_callable_signature_parameter_types_batch(vec![(signature, Vec::new(),)])
+            );
+            (template, signature)
+        };
+        let syntax =
+            plan_direct_source_property_call_syntax(&parsed.arena, context.store(), access, call)
+                .unwrap();
+        let plan =
+            finish_direct_source_property_plan(&syntax, identifier_receiver(&syntax, method))
+                .unwrap();
+
+        let checked = check_direct_source_property(
+            context.store_mut_for_test(),
+            Some(&global_types),
+            &plan,
+            receiver,
+        )
+        .unwrap();
+        assert_ne!(checked.type_, template);
+        assert_eq!(checked.diagnostic, None);
+        let TypeData::Object(callable) =
+            context.store().type_payload(checked.type_).unwrap().data()
+        else {
+            panic!("the concrete array must receive its own method callable")
+        };
+        let [specialized] = callable.structured.signatures.as_deref().unwrap() else {
+            panic!("the custom method must retain one specialized signature")
+        };
+        let specialized = context.store().signature(*specialized).unwrap();
+        assert_eq!(callable.target, Some(template));
+        assert_eq!(specialized.target(), Some(signature));
+        assert_eq!(specialized.resolved_return_type(), Some(string));
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(annotation)
+                .and_then(|links| links.resolved_type),
+            Some(element),
+        );
+        assert_eq!(
+            context
+                .store()
+                .symbol_node_links(access)
+                .and_then(|links| links.resolved_symbol),
+            Some(method),
+        );
+
+        let warm = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().mapper_len(),
+            context.store().symbol_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        assert_eq!(
+            check_direct_source_property(
+                context.store_mut_for_test(),
+                Some(&global_types),
+                &plan,
+                receiver,
+            ),
+            Ok(checked),
+        );
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().mapper_len(),
+                context.store().symbol_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+
+        let original = context.store().value_symbol_links(method).unwrap().clone();
+        let mut poisoned = original.clone();
+        poisoned.write_type = Some(string);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(method, poisoned)
+        );
+        assert_eq!(
+            check_direct_source_property(
+                context.store_mut_for_test(),
+                Some(&global_types),
+                &plan,
+                receiver,
+            ),
+            Err(SourcePropertyError::InvalidCache(access)),
         );
         assert_eq!(
             (
