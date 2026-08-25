@@ -5086,7 +5086,7 @@ mod tests {
 
     #[test]
     fn inaccessible_class_constructor_calls_report_exact_source_diagnostics() {
-        for (index, source, javascript, expected_code, name) in [
+        for (index, (source, javascript, expected_code, name)) in [
             (
                 "class Secret { private constructor() {} } new Secret();",
                 false,
