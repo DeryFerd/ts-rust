@@ -3022,10 +3022,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                         if let Some(grammar) = plan_class_grammar_diagnostics(store, host, symbol)
                             && grammar.declaration == statement
                             && grammar.symbol == symbol
-                            && matches!(
-                                grammar.diagnostics.as_slice(),
-                                [diagnostic] if diagnostic.code == 1245
-                            )
+                            && !grammar.diagnostics.is_empty()
                         {
                             statements.push(PlannedStatement::ClassGrammar(grammar));
                             continue;
@@ -56562,6 +56559,53 @@ mod tests {
         assert_eq!(node_text(&source, related.node.unwrap()), "b");
         assert!(context.store().declared_type_links(derived).is_none());
         assert!(context.store().value_symbol_links(derived).is_none());
+        assert!(is_type_checked(&context, file));
+
+        let warm = observable_state(&context, file);
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn abstract_property_initializer_reports_exact_access_and_related_diagnostics() {
+        let source = parsed(concat!(
+            "abstract class Model {\n",
+            "    abstract value: string;\n",
+            "    current = this.value;\n",
+            "}\n",
+        ));
+        let file = FileId::new(8_591);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let owner = global_symbol(&context, "Model");
+
+        context.check_source_file(file).unwrap();
+
+        let [abstract_access, uninitialized] = context.diagnostics().as_slice() else {
+            panic!("expected the abstract-access and use-before-initialization diagnostics")
+        };
+        assert_eq!(abstract_access.diagnostic.code(), 2715);
+        assert_eq!(abstract_access.diagnostic.arguments, ["value", "Model"]);
+        assert_eq!(node_text(&source, abstract_access.node.unwrap()), "value");
+        assert_eq!(
+            abstract_access.diagnostic.render().unwrap(),
+            "Abstract property 'value' in class 'Model' cannot be accessed in the constructor.",
+        );
+        assert!(abstract_access.related_information.is_empty());
+        assert_eq!(uninitialized.diagnostic.code(), 2729);
+        assert_eq!(uninitialized.diagnostic.arguments, ["value"]);
+        assert_eq!(uninitialized.node, abstract_access.node);
+        assert_eq!(
+            uninitialized.diagnostic.render().unwrap(),
+            "Property 'value' is used before its initialization.",
+        );
+        let [related] = uninitialized.related_information.as_slice() else {
+            panic!("the initialization diagnostic must retain the abstract declaration")
+        };
+        assert_eq!(related.diagnostic.code(), 2728);
+        assert_eq!(related.diagnostic.arguments, ["value"]);
+        assert_eq!(node_text(&source, related.node.unwrap()), "value");
+        assert!(context.store().declared_type_links(owner).is_none());
+        assert!(context.store().value_symbol_links(owner).is_none());
         assert!(is_type_checked(&context, file));
 
         let warm = observable_state(&context, file);

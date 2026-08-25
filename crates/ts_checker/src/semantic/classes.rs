@@ -21,6 +21,7 @@
 //! report exact implementation-name, missing-body, and duplicate-body errors.
 //! Abstract classes retain annotated abstract members and abstract constructors;
 //! invalid abstract methods retain their exact modifier and implementation errors.
+//! Abstract properties read by later field initializers retain both exact errors.
 //! Invalid class-field variance modifiers retain their exact TS1274 spans.
 //! Direct classes can also retain one string-to-number index signature.
 //! Annotated fields admit one authenticated ambient-function decorator.
@@ -12425,6 +12426,154 @@ fn plan_abstract_class_method_diagnostics(
     Some(diagnostics)
 }
 
+fn plan_abstract_property_initializer_diagnostics(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    owner: SemanticSymbolId,
+    declaration: NodeRef,
+    members: &ts_ast::NodeList,
+) -> Option<Vec<ClassGrammarDiagnostic>> {
+    let [abstract_property, initialized_property] = members.nodes.as_slice() else {
+        return None;
+    };
+    let owner_record = store.symbol(owner)?;
+    let instance_members = owner_record.members()?;
+    let static_members = owner_record.exports()?;
+    let member_table = store.symbol_table(instance_members)?;
+    if member_table.len() != 2 {
+        return None;
+    }
+
+    let abstract_property = NodeRef::new(declaration.arena, declaration.file, *abstract_property);
+    let abstract_property = plan_property(
+        store,
+        host,
+        owner,
+        abstract_property,
+        Some(instance_members),
+        static_members,
+    )
+    .ok()?;
+    let property_type = planned_property_type(store, host, &abstract_property).ok()?;
+    if !abstract_property.abstract_property
+        || abstract_property.side != ClassPropertySide::Instance
+        || abstract_property.initializer_node.is_some()
+        || validate_property_cache_state(store, &abstract_property, property_type).is_err()
+    {
+        return None;
+    }
+
+    let initialized_property =
+        NodeRef::new(declaration.arena, declaration.file, *initialized_property);
+    let field_record = preflight_node(store, host, initialized_property).ok()?;
+    let NodeData::PropertyDeclaration(field) = &field_record.data else {
+        return None;
+    };
+    let (field_name, field_name_text) =
+        accessor_name(store, host, initialized_property, field.name).ok()?;
+    let field_name_record = preflight_node(store, host, field_name).ok()?;
+    let access = NodeRef::new(
+        initialized_property.arena,
+        initialized_property.file,
+        field.initializer?,
+    );
+    let access_record = preflight_node(store, host, access).ok()?;
+    let NodeData::PropertyAccessExpression(property) = &access_record.data else {
+        return None;
+    };
+    let receiver = NodeRef::new(access.arena, access.file, property.expression);
+    let receiver_record = preflight_node(store, host, receiver).ok()?;
+    let NodeData::KeywordExpression(keyword) = &receiver_record.data else {
+        return None;
+    };
+    let reference = NodeRef::new(access.arena, access.file, property.name);
+    let reference_record = preflight_node(store, host, reference).ok()?;
+    let NodeData::Identifier(reference_name) = &reference_record.data else {
+        return None;
+    };
+    if field_record.kind != SyntaxKind::PropertyDeclaration
+        || field_record.flags.0 != 0
+        || field_record.parent != Some(declaration.node)
+        || field_record.range.start
+            < preflight_node(store, host, abstract_property.declaration)
+                .ok()?
+                .range
+                .end
+        || field.postfix_token.is_some()
+        || field.symbol.is_some()
+        || field.type_.is_some()
+        || field.facts != 0
+        || field.modifiers.is_some()
+        || field_name_record.range.end > access_record.range.start
+        || access_record.kind != SyntaxKind::PropertyAccessExpression
+        || access_record.flags.0 != 0
+        || access_record.parent != Some(initialized_property.node)
+        || access_record.range.end > field_record.range.end
+        || property.flow_node.is_some()
+        || property.question_dot_token.is_some()
+        || property.facts != 0
+        || receiver_record.kind != SyntaxKind::ThisKeyword
+        || receiver_record.flags.0 != 0
+        || receiver_record.parent != Some(access.node)
+        || keyword.flow_node.is_some()
+        || reference_record.kind != SyntaxKind::Identifier
+        || reference_record.flags.0 != 0
+        || reference_record.parent != Some(access.node)
+        || reference_record.range.start < receiver_record.range.end
+        || reference_name.flow_node.is_some()
+        || reference_name.text != abstract_property.name
+        || member_table.get_source(&reference_name.text) != Some(abstract_property.symbol)
+        || store
+            .type_node_links(access)
+            .is_some_and(|links| links != &TypeNodeLinks::default())
+        || store
+            .type_node_links(receiver)
+            .is_some_and(|links| links != &TypeNodeLinks::default())
+        || store
+            .symbol_node_links(access)
+            .is_some_and(|links| links != &SymbolNodeLinks::default())
+    {
+        return None;
+    }
+
+    let field_symbol = bound_symbol(store, host, initialized_property)?;
+    let symbol_record = store.symbol(field_symbol)?;
+    if symbol_record.flags() != SymbolFlags::PROPERTY
+        || symbol_record.check_flags() != CheckFlags::NONE
+        || symbol_record.name().as_utf8() != Some(field_name_text.as_str())
+        || symbol_record.declarations() != Some(&[initialized_property])
+        || symbol_record.value_declaration() != Some(initialized_property)
+        || symbol_record.members().is_some()
+        || symbol_record.exports().is_some()
+        || symbol_record.parent() != Some(owner)
+        || symbol_record.export_symbol().is_some()
+        || store.get_merged_symbol(field_symbol) != Some(field_symbol)
+        || member_table.get_source(&field_name_text) != Some(field_symbol)
+        || field_symbol == abstract_property.symbol
+        || store
+            .value_symbol_links(field_symbol)
+            .is_some_and(|links| links != &ValueSymbolLinks::default())
+    {
+        return None;
+    }
+
+    let class_name = owner_record.name().as_utf8()?.to_owned();
+    Some(vec![
+        ClassGrammarDiagnostic {
+            node: reference,
+            range_override: None,
+            code: 2715,
+            arguments: vec![reference_name.text.clone(), class_name],
+        },
+        ClassGrammarDiagnostic {
+            node: reference,
+            range_override: None,
+            code: 2729,
+            arguments: vec![reference_name.text.clone()],
+        },
+    ])
+}
+
 fn plan_class_field_variance_modifier_diagnostics(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -13740,6 +13889,22 @@ pub(super) fn plan_class_grammar_diagnostics(
         });
     }
     if abstract_class {
+        if class.heritage_clauses.is_none()
+            && export_table.len() == 1
+            && let Some(diagnostics) = plan_abstract_property_initializer_diagnostics(
+                store,
+                host,
+                symbol,
+                declaration,
+                &class.members,
+            )
+        {
+            return Some(ClassGrammarDiagnosticPlan {
+                declaration,
+                symbol,
+                diagnostics,
+            });
+        }
         return None;
     }
 
@@ -24145,6 +24310,99 @@ mod tests {
             assert!(fixture.store.declared_type_links(owner).is_none());
             assert!(fixture.store.value_symbol_links(owner).is_none());
         }
+    }
+
+    #[test]
+    fn abstract_property_initializer_grammar_preserves_exact_diagnostics_without_publication() {
+        const SOURCE: &str =
+            "abstract class Model { abstract value: string; current = this.value; }";
+        let fixture = fixture(SOURCE);
+        let owner = class_symbol(&fixture, "Model");
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+        let cold = (
+            fixture.store.type_len(),
+            fixture.store.signature_len(),
+            fixture.store.checker_link_allocated_lengths(),
+        );
+
+        let grammar = plan_class_grammar_diagnostics(&fixture.store, &host, owner)
+            .expect("the abstract initializer retains both upstream diagnostics");
+
+        let [abstract_access, uninitialized] = grammar.diagnostics.as_slice() else {
+            panic!("expected the abstract-access and use-before-initialization diagnostics")
+        };
+        assert_eq!(abstract_access.code, 2715);
+        assert_eq!(abstract_access.arguments, ["value", "Model"]);
+        assert_eq!(uninitialized.code, 2729);
+        assert_eq!(uninitialized.arguments, ["value"]);
+        assert_eq!(abstract_access.node, uninitialized.node);
+        let reference = fixture.parsed.arena.get(abstract_access.node.node).unwrap();
+        assert_eq!(
+            &SOURCE[reference.range.start.get() as usize..reference.range.end.get() as usize],
+            "value",
+        );
+        assert_eq!(
+            (
+                fixture.store.type_len(),
+                fixture.store.signature_len(),
+                fixture.store.checker_link_allocated_lengths(),
+            ),
+            cold,
+        );
+        assert!(fixture.store.declared_type_links(owner).is_none());
+        assert!(fixture.store.value_symbol_links(owner).is_none());
+    }
+
+    #[test]
+    fn abstract_property_initializer_grammar_rejects_unsupported_or_poisoned_access() {
+        for source in [
+            "abstract class Model { value: string; current = this.value; }",
+            "abstract class Model { abstract value: string; current = this.other; }",
+            "abstract class Model { abstract value: string; current: string = this.value; }",
+        ] {
+            let fixture = fixture(source);
+            let owner = class_symbol(&fixture, "Model");
+            let bound = &fixture.files[&fixture.file];
+            let host = host(&fixture.parsed.arena, bound);
+
+            assert!(
+                plan_class_grammar_diagnostics(&fixture.store, &host, owner).is_none(),
+                "{source}",
+            );
+            assert!(fixture.store.declared_type_links(owner).is_none());
+            assert!(fixture.store.value_symbol_links(owner).is_none());
+        }
+
+        let mut fixture =
+            fixture("abstract class Model { abstract value: string; current = this.value; }");
+        let owner = class_symbol(&fixture, "Model");
+        let access = fixture
+            .parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::PropertyAccessExpression).then_some(NodeRef::new(
+                    fixture.parsed.arena.id(),
+                    fixture.file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let wrong = fixture.store.intrinsic_bootstrap().unwrap().number_type;
+        assert!(fixture.store.set_type_node_links(
+            access,
+            TypeNodeLinks {
+                resolved_type: Some(wrong),
+                ..TypeNodeLinks::default()
+            },
+        ));
+        let bound = &fixture.files[&fixture.file];
+        let host = host(&fixture.parsed.arena, bound);
+
+        assert!(plan_class_grammar_diagnostics(&fixture.store, &host, owner).is_none());
+        assert!(fixture.store.declared_type_links(owner).is_none());
+        assert!(fixture.store.value_symbol_links(owner).is_none());
     }
 
     #[test]
