@@ -4664,27 +4664,44 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
         };
         debug_assert_eq!(self.node(operator)?.kind, SyntaxKind::EqualsToken);
 
-        let Some((store, _)) = self.semantic else {
+        let Some((store, host)) = self.semantic else {
             return Err(SourceCheckError::Unsupported(
                 UnsupportedSourceSyntax::Element(left),
             ));
         };
         let syntax = plan_direct_source_element_write_syntax(self.arena, store, left, expression)
             .map_err(|error| Self::element_plan_error(left, error))?;
-        let receiver_record = self.node(syntax.receiver())?;
-        let NodeData::Identifier(identifier) = &receiver_record.data else {
+        let receiver_node = syntax.receiver();
+        let receiver_record = self.node(receiver_node)?;
+        let NodeData::Identifier(receiver_name) = &receiver_record.data else {
             return Ok(None);
         };
         let Some(receiver_symbol) = self
             .bound
             .locals(self.source.node_ref())
             .and_then(|locals| store.symbol_table(locals))
-            .and_then(|locals| locals.get_source(&identifier.text))
+            .and_then(|locals| locals.get_source(&receiver_name.text))
             .and_then(|symbol| store.get_merged_symbol(symbol))
         else {
             return Ok(None);
         };
         if !self.evolving_array_variables.contains(&receiver_symbol) {
+            return Ok(None);
+        }
+        let read = plan_identifier_read(
+            self.arena,
+            self.bound,
+            store,
+            host,
+            &self.prior_variables,
+            &self.readable_variables,
+            receiver_node,
+            &receiver_name.text,
+        )
+        .map_err(Self::variable_plan_error)?;
+        if read.value_symbol != receiver_symbol
+            || !self.evolving_array_variables.contains(&read.value_symbol)
+        {
             return Ok(None);
         }
         let receiver = self.plan_expression(syntax.receiver())?;
