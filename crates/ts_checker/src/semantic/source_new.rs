@@ -872,8 +872,7 @@ pub(super) fn plan_direct_default_new(
     if executor.is_some() && !global_promise {
         return Err(unsupported(SourceNewUnsupported::Arguments(node)));
     }
-    if !global_array
-        && !(global_wrapper && identifier.text == "Boolean")
+    if !(global_array || global_wrapper && identifier.text == "Boolean")
         && arguments
             .iter()
             .any(|argument| matches!(&argument.value, SourceNewArgumentValue::EmptyObject(_)))

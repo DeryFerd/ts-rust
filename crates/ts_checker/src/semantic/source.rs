@@ -27349,8 +27349,8 @@ fn check_contextual_direct_call_arrow(
         _ => None,
     };
     if parameters.iter().any(|parameter| {
-        (!parameter.is_implicit_any()
-            && !(filter_predicate.is_some() && parameter.explicit_type_node().is_none()))
+        !(parameter.is_implicit_any()
+            || filter_predicate.is_some() && parameter.explicit_type_node().is_none())
             || parameter.optional
             || parameter.rest
             || parameter.initializer.is_some()

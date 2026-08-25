@@ -7842,7 +7842,7 @@ fn authenticated_global_boolean_constructor_optional_call(
     };
     let Some(value_declaration) = store
         .symbol(boolean)
-        .and_then(|record| record.value_declaration())
+        .and_then(ts_binder::semantic::Symbol::value_declaration)
     else {
         return false;
     };

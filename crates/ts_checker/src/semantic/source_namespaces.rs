@@ -2477,7 +2477,9 @@ fn authenticated_react_synthetic_event_current_target_annotation(
                 links.outer_type_parameters.is_none()
                     && links.resolved_type.is_none_or(|cached| {
                         matches!(
-                            store.type_payload(cached).map(|record| record.data()),
+                            store
+                                .type_payload(cached)
+                                .map(super::type_records::TypeRecord::data),
                             Some(TypeData::Intersection(intersection))
                                 if intersection.intersection.types.len() == 2
                                     && event_target_type.is_some_and(|target| {
@@ -2502,7 +2504,7 @@ fn authenticated_react_synthetic_event_current_target_annotation(
     Some(valid)
 }
 
-/// Keeps only SyntheticEvent's canonical `nativeEvent: Event` and `target: EventTarget` cold.
+/// Keeps only `SyntheticEvent`'s canonical `nativeEvent: Event` and `target: EventTarget` cold.
 fn authenticated_react_synthetic_event_dom_reference_annotation(
     arena: &NodeArena,
     bound: &BoundFile,
