@@ -7722,6 +7722,9 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
 
         let name = NodeRef::new(node.arena, node.file, query.expr_name);
         let name_record = preflight_node(self.store, self.host, name)?;
+        if matches!(name_record.data, NodeData::QualifiedName(_)) {
+            return self.plan_ambient_namespace_value_type_query(node, name);
+        }
         let NodeData::Identifier(identifier) = &name_record.data else {
             return Err(unsupported());
         };
@@ -7987,6 +7990,224 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             symbol,
             source_node,
             type_,
+        };
+        if let Some(previous) = self.plan.type_queries.insert(node, planned)
+            && previous != planned
+        {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+
+    /// Plans `typeof Namespace.value` only for a proven ambient namespace import.
+    #[allow(clippy::too_many_lines)] // The import, exported declaration, and cache checks share one proof.
+    fn plan_ambient_namespace_value_type_query(
+        &mut self,
+        node: NodeRef,
+        name: NodeRef,
+    ) -> Result<(), DeclaredTypeError> {
+        let unsupported = || {
+            type_node_unavailable(TypeNodeUnavailable::UnsupportedSyntax {
+                node,
+                kind: SyntaxKind::TypeQuery,
+            })
+        };
+        let invalid = || type_node_unavailable(TypeNodeUnavailable::InvalidTypeReference(node));
+        let alias = self
+            .ambient_module_namespace_import_alias(node, name)
+            .ok_or_else(&unsupported)?;
+        let symbol = self
+            .authenticated_ambient_module_namespace_import_member(
+                node,
+                name,
+                alias,
+                SymbolFlags::VALUE,
+            )
+            .ok_or_else(|| {
+                type_node_unavailable(TypeNodeUnavailable::ImportAliasTypeReference { node, alias })
+            })?;
+        let record = preflight_node(self.store, self.host, node)?;
+        let name_record = preflight_node(self.store, self.host, name)?;
+        let NodeData::QualifiedName(qualified) = &name_record.data else {
+            return Err(invalid());
+        };
+        let member = NodeRef::new(name.arena, name.file, qualified.right);
+        let member_record = preflight_node(self.store, self.host, member)?;
+        let NodeData::Identifier(member_name) = &member_record.data else {
+            return Err(invalid());
+        };
+        let symbol_record = self.store.symbol(symbol).ok_or_else(&invalid)?;
+        let Some([declaration]) = symbol_record.declarations() else {
+            return Err(unsupported());
+        };
+        let declaration = *declaration;
+        let bound = self.host.bound_file(declaration).ok_or_else(&invalid)?;
+        let owner = self
+            .store
+            .get_parent_of_symbol(symbol)
+            .ok_or_else(&invalid)?;
+        if !declaration.is_for(node.arena, node.file)
+            || symbol_record.flags() != SymbolFlags::BLOCK_SCOPED_VARIABLE
+            || symbol_record.value_declaration() != Some(declaration)
+            || symbol_record.name().as_utf8() != Some(member_name.text.as_str())
+            || symbol_record.check_flags() != CheckFlags::NONE
+            || symbol_record.members().is_some()
+            || symbol_record.exports().is_some()
+            || symbol_record.export_symbol().is_some()
+            || self.store.get_merged_symbol(symbol) != Some(symbol)
+            || bound
+                .symbol(declaration)
+                .and_then(|candidate| self.store.get_merged_symbol(candidate))
+                != Some(symbol)
+        {
+            return Err(unsupported());
+        }
+
+        let declaration_record = preflight_node(self.store, self.host, declaration)?;
+        let NodeData::VariableDeclaration(variable) = &declaration_record.data else {
+            return Err(unsupported());
+        };
+        let list = declaration_record
+            .parent
+            .map(|parent| NodeRef::new(declaration.arena, declaration.file, parent))
+            .ok_or_else(&unsupported)?;
+        let list_record = preflight_node(self.store, self.host, list)?;
+        let NodeData::VariableDeclarationList(declarations) = &list_record.data else {
+            return Err(unsupported());
+        };
+        let statement = list_record
+            .parent
+            .map(|parent| NodeRef::new(list.arena, list.file, parent))
+            .ok_or_else(&unsupported)?;
+        let statement_record = preflight_node(self.store, self.host, statement)?;
+        let NodeData::VariableStatement(statement_data) = &statement_record.data else {
+            return Err(unsupported());
+        };
+        let block = statement_record
+            .parent
+            .map(|parent| NodeRef::new(statement.arena, statement.file, parent))
+            .ok_or_else(&unsupported)?;
+        let block_record = preflight_node(self.store, self.host, block)?;
+        let NodeData::ModuleBlock(module_block) = &block_record.data else {
+            return Err(unsupported());
+        };
+        let module = block_record
+            .parent
+            .map(|parent| NodeRef::new(block.arena, block.file, parent))
+            .ok_or_else(&unsupported)?;
+        let module_record = preflight_node(self.store, self.host, module)?;
+        let NodeData::ModuleDeclaration(module_data) = &module_record.data else {
+            return Err(unsupported());
+        };
+        let Some(modifiers) = statement_data.modifiers.as_ref() else {
+            return Err(unsupported());
+        };
+        let [modifier] = modifiers.list.nodes.as_slice() else {
+            return Err(unsupported());
+        };
+        let modifier = NodeRef::new(statement.arena, statement.file, *modifier);
+        let modifier_record = preflight_node(self.store, self.host, modifier)?;
+        let annotation = variable
+            .type_
+            .map(|annotation| NodeRef::new(declaration.arena, declaration.file, annotation))
+            .ok_or_else(&unsupported)?;
+        let annotation_record = preflight_node(self.store, self.host, annotation)?;
+        if declaration_record.kind != SyntaxKind::VariableDeclaration
+            || declaration_record.flags.0 != 0
+            || declaration_record.range.end > record.range.start
+            || variable.initializer.is_some()
+            || variable.exclamation_token.is_some()
+            || variable.local_symbol.is_some()
+            || variable.symbol.is_some()
+            || variable.facts != 0
+            || list_record.kind != SyntaxKind::VariableDeclarationList
+            || list_record.flags.0 != NODE_FLAG_CONST
+            || !declarations.declarations.nodes.contains(&declaration.node)
+            || declarations.declarations.has_trailing_comma
+            || declarations.facts != 0
+            || statement_record.kind != SyntaxKind::VariableStatement
+            || statement_record.flags.0 != 0
+            || statement_data.declaration_list != list.node
+            || statement_data.flow_node.is_some()
+            || statement_data.facts != 0
+            || modifiers.flags.0 != 0
+            || modifiers.list.has_trailing_comma
+            || modifier_record.kind != SyntaxKind::ExportKeyword
+            || !matches!(modifier_record.data, NodeData::Token(_))
+            || modifier_record.flags.0 != 0
+            || modifier_record.parent != Some(statement.node)
+            || block_record.kind != SyntaxKind::ModuleBlock
+            || !module_block.statements.nodes.contains(&statement.node)
+            || module_record.kind != SyntaxKind::ModuleDeclaration
+            || module_data.body != Some(block.node)
+            || bound
+                .symbol(module)
+                .and_then(|candidate| self.store.get_merged_symbol(candidate))
+                != Some(owner)
+            || annotation_record.parent != Some(declaration.node)
+            || annotation_record.range.start < declaration_record.range.start
+            || annotation_record.range.end > declaration_record.range.end
+        {
+            return Err(unsupported());
+        }
+
+        let value_type = match self.store.value_symbol_links(symbol) {
+            None => None,
+            Some(links) if links == &super::ValueSymbolLinks::default() => None,
+            Some(links) => {
+                let type_ = links.resolved_type.ok_or_else(&invalid)?;
+                if links
+                    != &(super::ValueSymbolLinks {
+                        resolved_type: Some(type_),
+                        ..super::ValueSymbolLinks::default()
+                    })
+                    || self.store.type_payload(type_).is_none()
+                {
+                    return Err(invalid());
+                }
+                Some(type_)
+            }
+        };
+        let annotation_type = match self.store.type_node_links(annotation) {
+            Some(links) if links.outer_type_parameters.is_some() => return Err(invalid()),
+            Some(links) => links.resolved_type,
+            None => None,
+        };
+        if annotation_type.is_some_and(|type_| self.store.type_payload(type_).is_none())
+            || value_type.is_some_and(|value| annotation_type != Some(value))
+        {
+            return Err(invalid());
+        }
+        self.plan_type_node_in_context(annotation, None, false)?;
+
+        let cached_type = self
+            .store
+            .type_node_links(node)
+            .and_then(|links| links.resolved_type);
+        let cached_symbol = self
+            .store
+            .symbol_node_links(name)
+            .and_then(|links| links.resolved_symbol);
+        if self
+            .store
+            .type_node_links(node)
+            .is_some_and(|links| links.outer_type_parameters.is_some())
+            || self
+                .store
+                .symbol_node_links(node)
+                .is_some_and(|links| links.resolved_symbol.is_some())
+            || cached_type.is_some_and(|cached| Some(cached) != annotation_type)
+            || cached_symbol.is_some_and(|cached| cached != symbol)
+            || cached_type.is_some() != cached_symbol.is_some()
+        {
+            return Err(invalid());
+        }
+
+        let planned = PlannedValueTypeQuery {
+            name,
+            symbol,
+            source_node: Some(annotation),
+            type_: annotation_type,
         };
         if let Some(previous) = self.plan.type_queries.insert(node, planned)
             && previous != planned
@@ -14058,12 +14279,28 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
     }
 
     /// Resolves a proven exported type through an ambient namespace import.
-    #[allow(clippy::too_many_lines)] // The import, module, cache, and member proofs are inseparable.
     fn authenticated_ambient_module_namespace_import_alias_target(
         &self,
         reference: NodeRef,
         name: NodeRef,
         alias: SemanticSymbolId,
+    ) -> Option<SemanticSymbolId> {
+        self.authenticated_ambient_module_namespace_import_member(
+            reference,
+            name,
+            alias,
+            SymbolFlags::TYPE,
+        )
+    }
+
+    /// Resolves one binder-owned exported type or value through an ambient namespace import.
+    #[allow(clippy::too_many_lines)] // The import, module, cache, and member proofs are inseparable.
+    fn authenticated_ambient_module_namespace_import_member(
+        &self,
+        reference: NodeRef,
+        name: NodeRef,
+        alias: SemanticSymbolId,
+        meaning: SymbolFlags,
     ) -> Option<SemanticSymbolId> {
         let record = self.store.symbol(alias)?;
         let [declaration] = record.declarations()? else {
@@ -14333,13 +14570,19 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
             .and_then(|exports| exports.get_source(&member_name.text))
             .and_then(|symbol| self.store.get_merged_symbol(symbol))?;
         let target_record = self.store.symbol(target)?;
-        let allowed = SymbolFlags::TYPE_ALIAS | SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT;
-        (target_record
-            .flags()
-            .intersects(SymbolFlags::TYPE_ALIAS | SymbolFlags::INTERFACE)
-            && target_record.flags().without(allowed) == SymbolFlags::NONE
-            && self.store.get_parent_of_symbol(target) == Some(expected_owner))
-        .then_some(target)
+        let supported = if meaning == SymbolFlags::TYPE {
+            let allowed = SymbolFlags::TYPE_ALIAS | SymbolFlags::INTERFACE | SymbolFlags::TRANSIENT;
+            target_record
+                .flags()
+                .intersects(SymbolFlags::TYPE_ALIAS | SymbolFlags::INTERFACE)
+                && target_record.flags().without(allowed) == SymbolFlags::NONE
+        } else if meaning == SymbolFlags::VALUE {
+            target_record.flags() == SymbolFlags::BLOCK_SCOPED_VARIABLE
+        } else {
+            false
+        };
+        (supported && self.store.get_parent_of_symbol(target) == Some(expected_owner))
+            .then_some(target)
     }
 
     fn resolve_uncached_type_reference_symbol(
@@ -34920,6 +35163,238 @@ mod tests {
                 },
             ));
         }
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep imported typeof ownership and forged value caches together.
+    fn ambient_react_prop_type_queries_authenticate_imported_namespace_values() {
+        let PropTypesInferPropsFixture {
+            library,
+            declarations,
+            library_file,
+            declaration_file,
+            files,
+            mut store,
+        } = prop_types_declaration_fixture(
+            parse_source_file("interface LibraryMarker {}"),
+            parse_source_file(concat!(
+                "declare module 'prop-types' { ",
+                "export const any: string; ",
+                "export const node: number; ",
+                "} ",
+                "declare module 'forged-prop-types' { ",
+                "export const any: boolean; ",
+                "export const node: string; ",
+                "} ",
+                "declare module 'react' { ",
+                "import * as PropTypes from 'prop-types'; ",
+                "namespace React { ",
+                "interface ReactPropTypes { ",
+                "any: typeof PropTypes.any; ",
+                "node: typeof PropTypes.node; ",
+                "} } }",
+            )),
+            true,
+        );
+        let bound = files.get(&declaration_file).unwrap();
+        let host = DeclaredTypeHost::new_after_global_merge(
+            [
+                (&library.arena, files.get(&library_file).unwrap()),
+                (&declarations.arena, bound),
+            ],
+            GlobalMergeCompletion::for_test(CanonicalNameResolverOptions::default()),
+        )
+        .unwrap();
+        let variable = |expected: &str, occurrence: usize| {
+            declarations
+                .arena
+                .iter()
+                .filter_map(|(node, record)| {
+                    (record.kind == SyntaxKind::VariableDeclaration
+                        && declaration_name(&declarations.arena, record) == Some(expected))
+                    .then_some(NodeRef::new(
+                        declarations.arena.id(),
+                        declaration_file,
+                        node,
+                    ))
+                })
+                .nth(occurrence)
+                .unwrap()
+        };
+        let query = |expected: &str| {
+            declarations
+                .arena
+                .iter()
+                .find_map(|(node, record)| {
+                    let NodeData::TypeQueryNode(query) = &record.data else {
+                        return None;
+                    };
+                    let name = declarations.arena.get(query.expr_name)?;
+                    let NodeData::QualifiedName(qualified) = &name.data else {
+                        return None;
+                    };
+                    (identifier_text(&declarations.arena, qualified.right) == Some(expected))
+                        .then_some((
+                            NodeRef::new(declarations.arena.id(), declaration_file, node),
+                            NodeRef::new(
+                                declarations.arena.id(),
+                                declaration_file,
+                                query.expr_name,
+                            ),
+                        ))
+                })
+                .unwrap()
+        };
+        let binding = declarations
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::NamespaceImport).then_some(NodeRef::new(
+                    declarations.arena.id(),
+                    declaration_file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let alias = bound.symbol(binding).unwrap();
+        let any_symbol = bound.symbol(variable("any", 0)).unwrap();
+        let node_symbol = bound.symbol(variable("node", 0)).unwrap();
+        let forged_symbol = bound.symbol(variable("any", 1)).unwrap();
+        let module = store.get_parent_of_symbol(any_symbol).unwrap();
+        let forged_module = store.get_parent_of_symbol(forged_symbol).unwrap();
+        let (any, any_name) = query("any");
+        let (node, node_name) = query("node");
+        let (string, number, boolean) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.string_type,
+                bootstrap.number_type,
+                bootstrap.boolean_type,
+            )
+        };
+        assert!(store.alias_symbol_links(alias).is_none());
+        assert!(store.value_symbol_links(any_symbol).is_none());
+        assert!(store.value_symbol_links(node_symbol).is_none());
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        for (reference, name, symbol, expected) in [
+            (any, any_name, any_symbol, string),
+            (node, node_name, node_symbol, number),
+        ] {
+            assert_eq!(
+                CanonicalTypeQuery::new(
+                    &mut store,
+                    &host,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_type_from_type_node(reference),
+                Ok(expected),
+            );
+            assert_eq!(
+                store
+                    .symbol_node_links(name)
+                    .and_then(|links| links.resolved_symbol),
+                Some(symbol),
+            );
+            assert!(store.value_symbol_links(symbol).is_none());
+        }
+        assert!(store.alias_symbol_links(alias).is_none());
+
+        let cold = store_state(&store);
+        for (reference, expected) in [(any, string), (node, number)] {
+            assert_eq!(
+                CanonicalTypeQuery::new(
+                    &mut store,
+                    &host,
+                    CanonicalTypeQueryOptions::default(),
+                    &mut diagnostics,
+                )
+                .unwrap()
+                .get_type_from_type_node(reference),
+                Ok(expected),
+            );
+        }
+        assert_eq!(store_state(&store), cold);
+
+        assert!(store.set_alias_symbol_links(
+            alias,
+            crate::semantic::AliasSymbolLinks {
+                immediate_target: Some(module),
+                alias_target: crate::semantic::AliasTargetState::Resolved(module),
+                ..crate::semantic::AliasSymbolLinks::default()
+            },
+        ));
+        let warm = store_state(&store);
+        assert_eq!(
+            CanonicalTypeQuery::new(
+                &mut store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_from_type_node(any),
+            Ok(string),
+        );
+        assert_eq!(store_state(&store), warm);
+
+        assert!(store.set_alias_symbol_links(
+            alias,
+            crate::semantic::AliasSymbolLinks {
+                immediate_target: Some(forged_module),
+                alias_target: crate::semantic::AliasTargetState::Resolved(forged_module),
+                ..crate::semantic::AliasSymbolLinks::default()
+            },
+        ));
+        let poisoned_module = store_state(&store);
+        assert!(matches!(
+            CanonicalTypeQuery::new(
+                &mut store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_from_type_node(any),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::ImportAliasTypeReference { node, alias: actual }
+            )) if node == any && actual == alias
+        ));
+        assert_eq!(store_state(&store), poisoned_module);
+
+        assert!(store.set_alias_symbol_links(
+            alias,
+            crate::semantic::AliasSymbolLinks {
+                immediate_target: Some(module),
+                alias_target: crate::semantic::AliasTargetState::Resolved(module),
+                ..crate::semantic::AliasSymbolLinks::default()
+            },
+        ));
+        assert!(store.set_value_symbol_links(
+            any_symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(boolean),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        let poisoned_value = store_state(&store);
+        assert_eq!(
+            CanonicalTypeQuery::new(
+                &mut store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_type_from_type_node(any),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::InvalidTypeReference(any),
+            )),
+        );
+        assert_eq!(store_state(&store), poisoned_value);
         assert!(diagnostics.is_empty());
     }
 
