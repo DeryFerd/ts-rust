@@ -6558,7 +6558,13 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         {
             return Ok(());
         }
+        let array_heritage = record_heritage
+            && self.array_targets.is_some()
+            && !qualified
+            && name_text == "Array"
+            && type_arguments.len() == 1;
         if record_heritage
+            && !array_heritage
             && (qualified
                 || name_text != "Record"
                 || type_arguments.len() != 2
@@ -6806,7 +6812,14 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
                 DeclaredTypeError::Unavailable(DeclaredTypeUnavailable::SymbolNotOwned(symbol))
             })?
             .flags();
-        if record_heritage && flags != SymbolFlags::TYPE_ALIAS {
+        if record_heritage
+            && if array_heritage {
+                global_array_target != self.array_targets.map(CanonicalArrayTargets::array_type)
+                    || !self.global_symbol_has_name(symbol, "Array")
+            } else {
+                flags != SymbolFlags::TYPE_ALIAS
+            }
+        {
             return Err(type_node_unavailable(
                 TypeNodeUnavailable::UnsupportedReferenceTarget { node, symbol },
             ));
@@ -11335,12 +11348,23 @@ impl<'store, 'host, 'arena, 'aliases> TypeQueryPlanner<'store, 'host, 'arena, 'a
         node: NodeRef,
     ) -> Result<SemanticSymbolId, DeclaredTypeError> {
         let record = preflight_node(self.store, self.host, node)?;
-        let NodeData::TypeReferenceNode(reference) = &record.data else {
-            return Err(type_node_unavailable(
-                TypeNodeUnavailable::InvalidTypeReference(node),
-            ));
+        let name_id = match &record.data {
+            NodeData::TypeReferenceNode(reference) if record.kind == SyntaxKind::TypeReference => {
+                reference.type_name
+            }
+            NodeData::ExpressionWithTypeArguments(reference)
+                if record.kind == SyntaxKind::ExpressionWithTypeArguments
+                    && reference.facts == 0 =>
+            {
+                reference.expression
+            }
+            _ => {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidTypeReference(node),
+                ));
+            }
         };
-        let name = NodeRef::new(node.arena, node.file, reference.type_name);
+        let name = NodeRef::new(node.arena, node.file, name_id);
         let name_node = preflight_node(self.store, self.host, name)?;
         if name_node.parent != Some(node.node) || name_node.flags.0 & NODE_FLAG_JSDOC != 0 {
             return Err(type_node_unavailable(
@@ -23674,6 +23698,128 @@ mod tests {
             Ok(mapped),
         );
         assert_eq!(union_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn global_array_interface_heritage_reuses_its_authoritative_target_cold_and_warm() {
+        let mut fixture = global_array_fixture(concat!(
+            "type ReactNode = string; ",
+            "interface ReactNodeArray extends Array<ReactNode> {} ",
+            "let direct: Array<ReactNode>;",
+        ));
+        let global_types = initialize_fixture_global_types(&mut fixture);
+        let array = canonical_fixture_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Array");
+        let heritage =
+            fixture
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, syntax)| {
+                    (syntax.kind == SyntaxKind::ExpressionWithTypeArguments)
+                        .then_some(NodeRef::new(fixture.parsed.arena.id(), fixture.file, node))
+                })
+                .unwrap();
+        let direct = variable_type_node(&fixture, "direct");
+        let string = fixture.store.intrinsic_bootstrap().unwrap().string_type;
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+
+        let resolved =
+            query_global_node(&mut fixture, &global_types, heritage, &mut diagnostics).unwrap();
+        assert_eq!(
+            query_global_node(&mut fixture, &global_types, direct, &mut diagnostics),
+            Ok(resolved),
+        );
+        assert_eq!(type_reference_arguments(&fixture.store, resolved), [string]);
+        assert_eq!(
+            fixture
+                .store
+                .type_node_links(heritage)
+                .and_then(|links| links.resolved_type),
+            Some(resolved),
+        );
+        assert_eq!(
+            fixture
+                .store
+                .symbol_node_links(heritage)
+                .and_then(|links| links.resolved_symbol),
+            Some(array),
+        );
+
+        let warm = union_state(&fixture.store);
+        assert_eq!(
+            query_global_node(&mut fixture, &global_types, heritage, &mut diagnostics),
+            Ok(resolved),
+        );
+        assert_eq!(
+            query_global_node(&mut fixture, &global_types, direct, &mut diagnostics),
+            Ok(resolved),
+        );
+        assert_eq!(union_state(&fixture.store), warm);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn global_array_interface_heritage_rejects_missing_and_shadowed_targets_without_writes() {
+        let mut missing = global_array_fixture("interface ReactNodeArray extends Array<string> {}");
+        let missing_heritage =
+            missing
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, syntax)| {
+                    (syntax.kind == SyntaxKind::ExpressionWithTypeArguments)
+                        .then_some(NodeRef::new(missing.parsed.arena.id(), missing.file, node))
+                })
+                .unwrap();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let before = union_state(&missing.store);
+        assert_eq!(
+            query_node(&mut missing, missing_heritage, &mut diagnostics),
+            Err(type_node_unavailable(
+                TypeNodeUnavailable::UnsupportedSyntax {
+                    node: missing_heritage,
+                    kind: SyntaxKind::ExpressionWithTypeArguments,
+                },
+            )),
+        );
+        assert_eq!(union_state(&missing.store), before);
+
+        let mut shadowed = global_array_fixture(concat!(
+            "namespace React { ",
+            "type Array<Value> = Value; ",
+            "interface ReactNodeArray extends Array<string> {} ",
+            "}",
+        ));
+        let global_types = initialize_fixture_global_types(&mut shadowed);
+        let local = canonical_fixture_symbol(&shadowed, SyntaxKind::TypeAliasDeclaration, "Array");
+        let shadowed_heritage =
+            shadowed
+                .parsed
+                .arena
+                .iter()
+                .find_map(|(node, syntax)| {
+                    (syntax.kind == SyntaxKind::ExpressionWithTypeArguments).then_some(
+                        NodeRef::new(shadowed.parsed.arena.id(), shadowed.file, node),
+                    )
+                })
+                .unwrap();
+        let before = union_state(&shadowed.store);
+        assert_eq!(
+            query_global_node(
+                &mut shadowed,
+                &global_types,
+                shadowed_heritage,
+                &mut diagnostics,
+            ),
+            Err(type_node_unavailable(
+                TypeNodeUnavailable::UnsupportedReferenceTarget {
+                    node: shadowed_heritage,
+                    symbol: local,
+                },
+            )),
+        );
+        assert_eq!(union_state(&shadowed.store), before);
         assert!(diagnostics.is_empty());
     }
 

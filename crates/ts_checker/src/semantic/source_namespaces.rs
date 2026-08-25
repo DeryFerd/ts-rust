@@ -2568,6 +2568,97 @@ impl<'a> DeferredAmbientFunctionValidator<'a> {
         Ok(symbol)
     }
 
+    fn type_alias_owner(
+        &self,
+        declaration: NodeRef,
+        namespace: SemanticSymbolId,
+        symbol: SemanticSymbolId,
+    ) -> bool {
+        let Some(owner) = self.store.symbol(symbol) else {
+            return false;
+        };
+        let Some(exports) = self
+            .store
+            .symbol(namespace)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| self.store.symbol_table(exports))
+        else {
+            return false;
+        };
+        if self.store.get_parent_of_symbol(symbol) == Some(namespace) {
+            return exports
+                .get(owner.name())
+                .and_then(|export| self.store.get_merged_symbol(export))
+                == Some(symbol);
+        }
+        if owner.parent().is_some()
+            || !self
+                .bound
+                .source_facts()
+                .is_some_and(ts_binder::CanonicalSourceFileFacts::is_declaration_file)
+        {
+            return false;
+        }
+
+        let Some(block_id) = self
+            .arena
+            .get(declaration.node)
+            .and_then(|node| node.parent)
+        else {
+            return false;
+        };
+        let block = child(declaration, block_id);
+        let Ok(block_record) = owned_node(self.arena, self.bound, self.store, block) else {
+            return false;
+        };
+        let NodeData::ModuleBlock(block_data) = &block_record.data else {
+            return false;
+        };
+        let Some(module_id) = block_record.parent else {
+            return false;
+        };
+        let module = child(block, module_id);
+        let Ok(module_record) = owned_node(self.arena, self.bound, self.store, module) else {
+            return false;
+        };
+        let NodeData::ModuleDeclaration(module_data) = &module_record.data else {
+            return false;
+        };
+        let name = child(module, module_data.name);
+        let Ok(name_record) = owned_node(self.arena, self.bound, self.store, name) else {
+            return false;
+        };
+
+        block_record.kind == SyntaxKind::ModuleBlock
+            && block_data
+                .statements
+                .nodes
+                .iter()
+                .filter(|candidate| **candidate == declaration.node)
+                .count()
+                == 1
+            && module_record.kind == SyntaxKind::ModuleDeclaration
+            && module_record.parent == Some(self.bound.source_file().node)
+            && module_data.keyword == SyntaxKind::ModuleKeyword
+            && module_data.body == Some(block.node)
+            && name_record.kind == SyntaxKind::StringLiteral
+            && name_record.parent == Some(module.node)
+            && matches!(&name_record.data, NodeData::StringLiteral(_))
+            && self
+                .bound
+                .symbol(module)
+                .and_then(|module| self.store.get_merged_symbol(module))
+                == Some(namespace)
+            && self
+                .bound
+                .locals(module)
+                .and_then(|locals| self.store.symbol_table(locals))
+                .and_then(|locals| locals.get(owner.name()))
+                .and_then(|local| self.store.get_merged_symbol(local))
+                == Some(symbol)
+            && exports.get(owner.name()).is_none()
+    }
+
     fn type_alias(
         &mut self,
         declaration: NodeRef,
@@ -2611,15 +2702,7 @@ impl<'a> DeferredAmbientFunctionValidator<'a> {
                 .symbol(declaration)
                 .and_then(|bound_symbol| self.store.get_merged_symbol(bound_symbol))
                 != Some(symbol)
-            || self.store.get_parent_of_symbol(symbol) != Some(namespace)
-            || self
-                .store
-                .symbol(namespace)
-                .and_then(ts_binder::semantic::Symbol::exports)
-                .and_then(|exports| self.store.symbol_table(exports))
-                .and_then(|exports| exports.get(symbol_record.name()))
-                .and_then(|export| self.store.get_merged_symbol(export))
-                != Some(symbol)
+            || !self.type_alias_owner(declaration, namespace, symbol)
         {
             return Err(SourceCheckError::Provenance(
                 SourceCheckProvenanceError::MissingDeclarationSymbol(declaration),
@@ -10617,6 +10700,183 @@ mod tests {
             ),
             warm,
         );
+    }
+
+    #[test]
+    fn ambient_module_private_generic_aliases_keep_their_local_owners_cold_and_warm() {
+        let mut fixture = declaration_fixture(
+            concat!(
+                "declare module 'react' { ",
+                "export = React; ",
+                "namespace React { interface Element {} } ",
+                "type MergePropTypes<Props, Inferred> = Props & Inferred; ",
+                "type Defaultize<Props, Defaults> = Props | Defaults; ",
+                "}",
+            ),
+            CanonicalModuleState::Script,
+        );
+        let namespace = plan(&fixture, 0);
+        let locals = fixture
+            .context
+            .file(fixture.file)
+            .and_then(|(_, bound)| bound.locals(namespace.declaration))
+            .and_then(|locals| fixture.context.store().symbol_table(locals))
+            .unwrap();
+        let exports = fixture
+            .context
+            .store()
+            .symbol(namespace.symbol)
+            .and_then(ts_binder::semantic::Symbol::exports)
+            .and_then(|exports| fixture.context.store().symbol_table(exports))
+            .unwrap();
+        let aliases = namespace
+            .members
+            .iter()
+            .filter_map(|member| match member {
+                SourceNamespaceMemberPlan::TypeAlias {
+                    declaration,
+                    symbol,
+                    annotation,
+                    deferred,
+                    ..
+                } => Some((*declaration, *symbol, *annotation, *deferred)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(aliases.len(), 2);
+        for (declaration, symbol, annotation, deferred) in &aliases {
+            let owner = fixture.context.store().symbol(*symbol).unwrap();
+            assert!(*deferred, "{:?}", owner.name());
+            assert!(owner.parent().is_none());
+            assert_eq!(owner.declarations(), Some(&[*declaration][..]));
+            assert_eq!(locals.get(owner.name()), Some(*symbol));
+            assert!(exports.get(owner.name()).is_none());
+            assert!(fixture.context.store().type_alias_links(*symbol).is_none());
+            assert!(
+                fixture
+                    .context
+                    .store()
+                    .type_node_links(*annotation)
+                    .is_none()
+            );
+        }
+
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        for (_, symbol, annotation, _) in &aliases {
+            assert!(fixture.context.store().type_alias_links(*symbol).is_none());
+            assert!(
+                fixture
+                    .context
+                    .store()
+                    .type_node_links(*annotation)
+                    .is_none()
+            );
+        }
+        let warm = (
+            fixture.context.store().type_len(),
+            fixture.context.store().symbol_len(),
+            fixture.context.store().checker_link_allocated_lengths(),
+        );
+        assert!(execute(&mut fixture, &namespace).unwrap().is_empty());
+        assert_eq!(
+            (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn ambient_module_private_generic_aliases_reject_forged_ownership() {
+        for mutation in 0..3 {
+            let mut fixture = declaration_fixture(
+                concat!(
+                    "declare module 'react' { ",
+                    "export = React; ",
+                    "namespace React { interface Element {} } ",
+                    "type MergePropTypes<Props, Inferred> = Props & Inferred; ",
+                    "}",
+                ),
+                CanonicalModuleState::Script,
+            );
+            let namespace = plan(&fixture, 0);
+            let (alias_declaration, symbol) = namespace
+                .members
+                .iter()
+                .find_map(|member| match member {
+                    SourceNamespaceMemberPlan::TypeAlias {
+                        declaration,
+                        symbol,
+                        deferred,
+                        ..
+                    } => {
+                        assert!(*deferred);
+                        Some((*declaration, *symbol))
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            let locals = fixture
+                .context
+                .file(fixture.file)
+                .and_then(|(_, bound)| bound.locals(namespace.declaration))
+                .unwrap();
+            let exports = fixture
+                .context
+                .store()
+                .symbol(namespace.symbol)
+                .and_then(ts_binder::semantic::Symbol::exports)
+                .unwrap();
+            let store = fixture.context.store_mut_for_test();
+            match mutation {
+                0 => assert!(store.set_symbol_relationships(
+                    symbol,
+                    None,
+                    None,
+                    Some(namespace.symbol),
+                    None,
+                )),
+                1 => assert_eq!(
+                    store.insert_symbol(
+                        locals,
+                        EscapedName::source("MergePropTypes"),
+                        namespace.symbol,
+                    ),
+                    Some(Some(symbol)),
+                ),
+                2 => assert_eq!(
+                    store.insert_symbol(exports, EscapedName::source("MergePropTypes"), symbol),
+                    Some(None),
+                ),
+                _ => unreachable!(),
+            }
+            let before = (
+                fixture.context.store().type_len(),
+                fixture.context.store().symbol_len(),
+                fixture.context.store().checker_link_allocated_lengths(),
+            );
+            let root = declaration(&fixture, 0);
+            let (arena, bound) = fixture.context.file(fixture.file).unwrap();
+
+            assert!(matches!(
+                plan_source_namespace(arena, bound, fixture.context.store(), root),
+                Err(SourceCheckError::Provenance(
+                    SourceCheckProvenanceError::MissingDeclarationSymbol(node),
+                )) if node == alias_declaration
+            ));
+            assert!(fixture.context.store().type_alias_links(symbol).is_none());
+            assert_eq!(
+                (
+                    fixture.context.store().type_len(),
+                    fixture.context.store().symbol_len(),
+                    fixture.context.store().checker_link_allocated_lengths(),
+                ),
+                before,
+                "mutation {mutation}",
+            );
+        }
     }
 
     #[test]
