@@ -398,6 +398,9 @@ fn recover_direct_call_overload(
     if request.form != DirectCallForm::Call || class_method {
         return Ok(None);
     }
+    if let Some(candidate) = recover_uniform_overload_arity_error(candidates) {
+        return Ok(Some(candidate));
+    }
     recover_single_overload_argument_error(candidates, |source, target| {
         store.is_type_assignable_to_with_global_types_and_strict_function_types(
             source,
@@ -406,6 +409,32 @@ fn recover_direct_call_overload(
             strict_function_types,
         )
     })
+}
+
+/// Keeps TS2554 exact when every fixed overload has the same bounds and return.
+fn recover_uniform_overload_arity_error(
+    candidates: &[DirectCallResolution],
+) -> Option<DirectCallResolution> {
+    let first = candidates.first()?;
+    if first.projection.has_effective_rest
+        || !matches!(
+            first.applicability,
+            DirectCallApplicability::TooFewArguments { .. }
+                | DirectCallApplicability::TooManyArguments { .. }
+        )
+        || candidates.iter().skip(1).any(|candidate| {
+            candidate.applicability != first.applicability
+                || candidate.projection.has_effective_rest
+                || candidate.projection.minimum_argument_count
+                    != first.projection.minimum_argument_count
+                || candidate.projection.maximum_argument_count
+                    != first.projection.maximum_argument_count
+                || candidate.projection.return_type != first.projection.return_type
+        })
+    {
+        return None;
+    }
+    Some(first.clone())
 }
 
 /// Recovers TS2345 only when overload synthesis cannot change the return type.

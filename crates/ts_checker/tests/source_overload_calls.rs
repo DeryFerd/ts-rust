@@ -319,3 +319,132 @@ fn one_matching_overload_preserves_its_shared_return_and_argument_diagnostic() {
         cold
     );
 }
+
+#[test]
+#[allow(clippy::too_many_lines)] // One overload group proves both TS2554 ranges and warm identity.
+fn uniform_overload_arity_errors_preserve_diagnostics_signature_and_return() {
+    let source = concat!(
+        "interface Recovery { ",
+        "(text: string): string; ",
+        "(count: number): string; ",
+        "} ",
+        "function missing(value: Recovery): string { return value(); } ",
+        "function extra(value: Recovery): string { return value('ready', true); }",
+    );
+    let parsed = parse_source_file(source);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let file = FileId::new(3);
+    let mut calls = parsed
+        .arena
+        .iter()
+        .filter_map(|(node, record)| {
+            (record.kind == SyntaxKind::CallExpression).then_some((
+                record.range.start,
+                NodeRef::new(parsed.arena.id(), file, node),
+            ))
+        })
+        .collect::<Vec<_>>();
+    calls.sort_by_key(|(start, _)| *start);
+    let [(_, missing_call), (_, extra_call)] = calls.as_slice() else {
+        panic!("fixture contains one missing-argument and one extra-argument call")
+    };
+    let mut declarations = parsed
+        .arena
+        .iter()
+        .filter_map(|(node, record)| {
+            (record.kind == SyntaxKind::CallSignature).then_some((
+                record.range.start,
+                NodeRef::new(parsed.arena.id(), file, node),
+            ))
+        })
+        .collect::<Vec<_>>();
+    declarations.sort_by_key(|(start, _)| *start);
+    let [(_, first_declaration), (_, _)] = declarations.as_slice() else {
+        panic!("fixture contains two overload declarations")
+    };
+    let mut context = context(&parsed, file);
+
+    context.check_source_file(file).unwrap();
+
+    let [missing, extra] = context.diagnostics().as_slice() else {
+        panic!("both overload calls must produce their exact argument-count diagnostic")
+    };
+    assert_eq!(missing.diagnostic.code(), 2554);
+    assert_eq!(
+        missing.diagnostic.render().unwrap(),
+        "Expected 1 arguments, but got 0."
+    );
+    assert!(missing.range_override.is_none());
+    let [related] = missing.related_information.as_slice() else {
+        panic!("the missing argument must retain its first-overload parameter note")
+    };
+    assert_eq!(related.diagnostic.code(), 6210);
+    assert_eq!(
+        related.diagnostic.render().unwrap(),
+        "An argument for 'text' was not provided."
+    );
+    assert_eq!(extra.diagnostic.code(), 2554);
+    assert_eq!(
+        extra.diagnostic.render().unwrap(),
+        "Expected 1 arguments, but got 2."
+    );
+    assert!(extra.related_information.is_empty());
+    let extra_range = extra
+        .range_override
+        .expect("the extra argument must retain its source range")
+        .range();
+    assert_eq!(
+        &source[usize::try_from(extra_range.start.get()).unwrap()
+            ..usize::try_from(extra_range.end.get()).unwrap()],
+        "true"
+    );
+    let first_signature = context
+        .store()
+        .signature_links(*first_declaration)
+        .and_then(|links| links.resolved_signature.signature());
+    for call in [*missing_call, *extra_call] {
+        assert_eq!(
+            context
+                .store()
+                .signature_links(call)
+                .and_then(|links| links.resolved_signature.signature()),
+            first_signature
+        );
+        let return_type = context
+            .store()
+            .type_node_links(call)
+            .and_then(|links| links.resolved_type)
+            .expect("overload arity recovery must preserve its shared return type");
+        assert_eq!(context.type_to_string(return_type).unwrap(), "string");
+    }
+    let cold = (
+        context.store().type_len(),
+        context.store().mapper_len(),
+        context.store().signature_len(),
+        [*missing_call, *extra_call].map(|call| {
+            (
+                context.store().type_node_links(call).cloned(),
+                context.store().signature_links(call).cloned(),
+            )
+        }),
+        context.diagnostics().clone(),
+    );
+
+    context.recheck_source_file(file).unwrap();
+
+    assert_eq!(
+        (
+            context.store().type_len(),
+            context.store().mapper_len(),
+            context.store().signature_len(),
+            [*missing_call, *extra_call].map(|call| {
+                (
+                    context.store().type_node_links(call).cloned(),
+                    context.store().signature_links(call).cloned(),
+                )
+            }),
+            context.diagnostics().clone(),
+        ),
+        cold
+    );
+}
