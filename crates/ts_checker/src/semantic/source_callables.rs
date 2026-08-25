@@ -3154,7 +3154,7 @@ pub(super) fn source_object_property_arrow_symbol(
     .then_some(planned.symbol))
 }
 
-/// Authenticates one unparenthesized callback in a top-level direct call.
+/// Authenticates one unparenthesized callback in a direct or array method call.
 pub(super) fn source_direct_call_argument_arrow_is_exact(
     store: &CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
@@ -3188,15 +3188,7 @@ pub(super) fn source_direct_call_argument_arrow_is_exact(
     }
     let callee = NodeRef::new(call.arena, call.file, call_data.expression);
     let callee_record = preflight_node(store, host, callee)?;
-    let NodeData::Identifier(identifier) = &callee_record.data else {
-        return Ok(false);
-    };
-    if callee_record.kind != SyntaxKind::Identifier
-        || callee_record.parent != Some(call.node)
-        || callee_record.flags.0 != 0
-        || identifier.flow_node.is_some()
-        || identifier.text.is_empty()
-    {
+    if callee_record.parent != Some(call.node) || callee_record.flags.0 != 0 {
         return Ok(false);
     }
     let Some(SourceNodeParent::Parent(statement)) = store.source_node_parent(call) else {
@@ -3212,13 +3204,53 @@ pub(super) fn source_direct_call_argument_arrow_is_exact(
     let Some(owner) = bound.symbol(declaration) else {
         return Ok(false);
     };
-    let Some(callee_symbol) = bound
-        .locals(bound.source_file())
-        .and_then(|locals| store.symbol_table(locals))
-        .and_then(|locals| locals.get_source(&identifier.text))
-        .and_then(|symbol| store.get_merged_symbol(symbol))
-    else {
-        return Ok(false);
+    let callee_valid = match &callee_record.data {
+        NodeData::Identifier(identifier) if callee_record.kind == SyntaxKind::Identifier => {
+            identifier.flow_node.is_none()
+                && !identifier.text.is_empty()
+                && bound
+                    .locals(bound.source_file())
+                    .and_then(|locals| store.symbol_table(locals))
+                    .and_then(|locals| locals.get_source(&identifier.text))
+                    .and_then(|symbol| store.get_merged_symbol(symbol))
+                    .and_then(|symbol| store.symbol(symbol))
+                    .is_some_and(|symbol| symbol.flags().contains(SymbolFlags::FUNCTION))
+        }
+        NodeData::PropertyAccessExpression(property)
+            if callee_record.kind == SyntaxKind::PropertyAccessExpression =>
+        {
+            let Some(name) =
+                super::source_calls::source_global_array_callback_method_name(host, callee)
+            else {
+                return Ok(false);
+            };
+            let receiver = NodeRef::new(callee.arena, callee.file, property.expression);
+            if preflight_node(store, host, receiver)?.parent != Some(callee.node)
+                || property.question_dot_token.is_some()
+                || property.flow_node.is_some()
+                || property.facts != 0
+            {
+                return Ok(false);
+            }
+            let Some(globals) = store
+                .intrinsic_bootstrap()
+                .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+            else {
+                return Ok(false);
+            };
+            ["Array", "ReadonlyArray"].iter().any(|owner| {
+                globals
+                    .get_source(owner)
+                    .and_then(|owner| store.get_merged_symbol(owner))
+                    .and_then(|owner| store.symbol(owner))
+                    .and_then(ts_binder::semantic::Symbol::members)
+                    .and_then(|members| store.symbol_table(members))
+                    .and_then(|members| members.get_source(&name))
+                    .and_then(|method| store.symbol(method))
+                    .is_some_and(|method| method.flags() == SymbolFlags::METHOD)
+            })
+        }
+        _ => false,
     };
     Ok(statement_record.kind == SyntaxKind::ExpressionStatement
         && statement_record.flags.0 == 0
@@ -3240,9 +3272,7 @@ pub(super) fn source_direct_call_argument_arrow_is_exact(
                 && symbol.parent().is_none()
                 && symbol.export_symbol().is_none()
         })
-        && store
-            .symbol(callee_symbol)
-            .is_some_and(|symbol| symbol.flags().contains(SymbolFlags::FUNCTION)))
+        && callee_valid)
 }
 
 /// Authenticates ordinary extra callback parameters against a zero-arity target.
@@ -7468,11 +7498,20 @@ fn valid_direct_call_contextual_target_type(
     let Some(signature) = store.signature(callable.signature) else {
         return false;
     };
+    let Some(source_parameter) = callable.parameters.first().copied() else {
+        return false;
+    };
     signature.type_parameters().is_empty()
         && !signature.has_rest_parameter()
         && callable.rest_parameter.is_none()
-        && callable.min_argument_count == 1
-        && callable.parameters.as_slice() == [expected_parameter]
+        && callable.min_argument_count >= 1
+        && (source_parameter == expected_parameter
+            || super::source_calls::authenticated_array_callback_contextual_target(
+                store,
+                target,
+                source_parameter,
+                expected_parameter,
+            ))
 }
 
 /// Publishes the recursive owner cache and structured empty-member barrier.

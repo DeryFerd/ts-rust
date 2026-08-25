@@ -160,8 +160,9 @@ use super::{
     source_calls::{
         SourceCallCalleeForm, SourceCallPlan, check_direct_source_call,
         emit_call_type_argument_grammar_diagnostics, finish_direct_source_call_plan,
-        is_immediately_invoked_source_callable, plan_direct_source_call_syntax,
-        source_call_argument_contextual_type,
+        is_immediately_invoked_source_callable, materialize_global_array_callback_method,
+        plan_direct_source_call_syntax, source_call_argument_contextual_type,
+        source_global_array_callback_method_name,
     },
     source_elements::{
         CheckedSourceElement, SourceElementError, SourceElementPlan, SourceElementUnsupported,
@@ -21311,6 +21312,7 @@ fn check_expression_type(
                 PlannedExpressionKind::Call(_) | PlannedExpressionKind::New(_)
             ) || source_global_wrapper_method_name(host, property.node).is_some()
                 || source_is_global_array_concat_method(host, property.node)
+                || source_global_array_callback_method_name(host, property.node).is_some()
                 || matches!(
                     &property.receiver.unparenthesized().kind,
                     PlannedExpressionKind::Identifier(read)
@@ -21357,6 +21359,18 @@ fn check_expression_type(
                     receiver.result,
                 )
                 .map_err(|_| SourceCheckError::Property(property.node))?;
+            }
+            if let Some(name) = source_global_array_callback_method_name(host, property.node) {
+                materialize_global_array_callback_method(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    diagnostics,
+                    receiver.result,
+                    &name,
+                    property.node,
+                )?;
             }
             let checked =
                 check_direct_source_property(store, Some(global_types), property, receiver.result)
@@ -22761,17 +22775,25 @@ fn check_contextual_direct_call_arrow(
     let Some(signature) = store.signature(target.signature) else {
         return Err(unsupported());
     };
-    let [parameter_type] = target.parameters.as_slice() else {
+    let Some(parameter_type) = target.parameters.first().copied() else {
         return Err(unsupported());
     };
     if !signature.type_parameters().is_empty()
         || signature.has_rest_parameter()
         || target.rest_parameter.is_some()
-        || target.min_argument_count != 1
+        || target.min_argument_count == 0
     {
         return Err(unsupported());
     }
-    let parameter_type = *parameter_type;
+    let parameter_type = super::source_calls::array_callback_contextual_parameter_type(
+        store,
+        host,
+        global_types,
+        arrow.callable.declaration,
+        contextual_type,
+        parameter_type,
+    )?
+    .unwrap_or(parameter_type);
     let mut flow_types = current_flow_types.clone();
     if flow_types
         .insert(parameter.symbol, parameter_type)
