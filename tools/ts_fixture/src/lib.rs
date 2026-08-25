@@ -190,6 +190,9 @@ pub enum CompilationDiagnosticOrigin {
     #[default]
     Checker,
     CompilerOption,
+    Parser,
+    Configuration,
+    Synthetic,
 }
 
 /// Related diagnostic detail retained when the checker exposes it.
@@ -201,6 +204,10 @@ pub struct CompilationRelatedInformation {
     pub code: Option<u32>,
     pub category: Option<CompilationDiagnosticCategory>,
     pub message: String,
+    /// Nested related records retain their exact source ownership and declaration order.
+    pub related_information: Vec<Self>,
+    /// Related diagnostics participate recursively in upstream diagnostic ordering.
+    pub ordering: CompilationDiagnosticOrdering,
 }
 
 /// Diagnostic category retained by the fixture compiler when its source exposes one.
@@ -423,7 +430,11 @@ impl From<&CompilationRelatedInformation> for DiagnosticScorecardDiagnostic {
             code: diagnostic.code,
             category: diagnostic.category,
             message: diagnostic.message.clone(),
-            related_information: Vec::new(),
+            related_information: diagnostic
+                .related_information
+                .iter()
+                .map(DiagnosticScorecardDiagnostic::from)
+                .collect(),
         }
     }
 }
@@ -2663,12 +2674,8 @@ fn render_error_baseline(
     let mut artifact = RenderedDiagnosticArtifact::default();
     for (index, pair) in ordered.windows(2).enumerate() {
         if diagnostic_primary_order_key(pair[0]) == diagnostic_primary_order_key(pair[1])
-            && (pair[0].ordering.diagnostic.is_none() || pair[1].ordering.diagnostic.is_none())
-            && (pair[0].message != pair[1].message
-                || compare_compilation_related_information(
-                    pair[0].related_information.as_deref(),
-                    pair[1].related_information.as_deref(),
-                ) == Ordering::Equal)
+            && (!diagnostic_ordering_is_authenticated(pair[0])
+                || !diagnostic_ordering_is_authenticated(pair[1]))
         {
             artifact.unsupported_details.push(format!(
                 "diagnostics {index} and {} have the same path/range/code ordering key; the checker does not expose message arguments or message chains required by the pinned sort key",
@@ -2744,6 +2751,22 @@ fn render_error_baseline(
     artifact.unsupported_details.sort();
     artifact.unsupported_details.dedup();
     artifact
+}
+
+fn diagnostic_ordering_is_authenticated(diagnostic: &CompilationDiagnostic) -> bool {
+    diagnostic.ordering.diagnostic.is_some()
+        && diagnostic
+            .related_information
+            .as_deref()
+            .is_some_and(|related| related.iter().all(related_ordering_is_authenticated))
+}
+
+fn related_ordering_is_authenticated(diagnostic: &CompilationRelatedInformation) -> bool {
+    diagnostic.ordering.diagnostic.is_some()
+        && diagnostic
+            .related_information
+            .iter()
+            .all(related_ordering_is_authenticated)
 }
 
 fn error_baseline_unit_order(case: &Case) -> (Vec<usize>, Vec<String>) {
@@ -3099,10 +3122,20 @@ fn compare_compilation_diagnostics(
 }
 
 fn diagnostic_order_location(diagnostic: &CompilationDiagnostic) -> (i64, i64) {
-    diagnostic.range.map_or_else(
-        || match diagnostic.ordering.origin {
-            CompilationDiagnosticOrigin::CompilerOption => (-1, -1),
-            CompilationDiagnosticOrigin::Checker => (0, 0),
+    diagnostic_origin_location(diagnostic.range, diagnostic.ordering.origin)
+}
+
+fn diagnostic_origin_location(
+    range: Option<TextRange>,
+    origin: CompilationDiagnosticOrigin,
+) -> (i64, i64) {
+    range.map_or_else(
+        || match origin {
+            CompilationDiagnosticOrigin::CompilerOption
+            | CompilationDiagnosticOrigin::Synthetic => (-1, -1),
+            CompilationDiagnosticOrigin::Checker
+            | CompilationDiagnosticOrigin::Parser
+            | CompilationDiagnosticOrigin::Configuration => (0, 0),
         },
         |range| (i64::from(range.start.get()), i64::from(range.end.get())),
     )
@@ -3208,12 +3241,38 @@ fn recover_structured_compilation_diagnostic(
     rendered: &str,
 ) -> Option<ts_diagnostics::Diagnostic> {
     let message = ts_diagnostics::message_by_code(code?)?;
-    let mut lines = rendered.split('\n');
-    let head = lines.next()?;
-    let arguments = recover_diagnostic_message_arguments(message, head)?;
-    let diagnostic = ts_diagnostics::Diagnostic::with_arguments(message, arguments)
-        .with_details(lines.map(str::to_owned));
-    (diagnostic.render().ok().as_deref() == Some(rendered)).then_some(diagnostic)
+    let mut start = 0;
+    let mut recovered: Option<ts_diagnostics::Diagnostic> = None;
+    loop {
+        let end = rendered
+            .get(start..)?
+            .find('\n')
+            .map_or(rendered.len(), |offset| start + offset);
+        if let Some(arguments) = recover_diagnostic_message_arguments(message, rendered.get(..end)?)
+        {
+            let details = rendered
+                .get(end..)?
+                .strip_prefix('\n')
+                .map_or_else(Vec::new, |details| {
+                    details.split('\n').map(str::to_owned).collect()
+                });
+            let diagnostic = ts_diagnostics::Diagnostic::with_arguments(message, arguments)
+                .with_details(details);
+            if diagnostic.render().ok().as_deref() == Some(rendered) {
+                if recovered
+                    .as_ref()
+                    .is_some_and(|existing| existing != &diagnostic)
+                {
+                    return None;
+                }
+                recovered = Some(diagnostic);
+            }
+        }
+        if end == rendered.len() {
+            return recovered;
+        }
+        start = end + 1;
+    }
 }
 
 fn recover_diagnostic_message_arguments(
@@ -3296,26 +3355,23 @@ fn compare_compilation_related_information(
                     .unwrap_or_default()
                     .cmp(right.file_name.as_deref().unwrap_or_default())
                     .then_with(|| {
-                        left.range
-                            .map(|range| range.start)
-                            .cmp(&right.range.map(|range| range.start))
-                    })
-                    .then_with(|| {
-                        left.range
-                            .map(|range| range.end)
-                            .cmp(&right.range.map(|range| range.end))
+                        diagnostic_origin_location(left.range, left.ordering.origin).cmp(
+                            &diagnostic_origin_location(right.range, right.ordering.origin),
+                        )
                     })
                     .then_with(|| left.code.cmp(&right.code))
                     .then_with(|| {
-                        let left_structured =
-                            recover_structured_compilation_diagnostic(left.code, &left.message);
-                        let right_structured =
-                            recover_structured_compilation_diagnostic(right.code, &right.message);
                         compare_diagnostic_messages(
-                            left_structured.as_ref(),
+                            left.ordering.diagnostic.as_ref(),
                             &left.message,
-                            right_structured.as_ref(),
+                            right.ordering.diagnostic.as_ref(),
                             &right.message,
+                        )
+                    })
+                    .then_with(|| {
+                        compare_compilation_related_information(
+                            Some(&left.related_information),
+                            Some(&right.related_information),
                         )
                     })
             })
@@ -4731,7 +4787,7 @@ fn compile_case_variant(
         .map(|diagnostic| {
             let message = pinned_program_diagnostic_message(&program, diagnostic);
             let ordering = CompilationDiagnosticOrdering {
-                origin: CompilationDiagnosticOrigin::Checker,
+                origin: program_diagnostic_origin(&program, diagnostic),
                 diagnostic: recover_structured_compilation_diagnostic(diagnostic.code, &message),
             };
             CompilationDiagnostic {
@@ -4742,14 +4798,7 @@ fn compile_case_variant(
                     .and_then(&diagnostic_source_text),
                 range: diagnostic.range,
                 code: diagnostic.code,
-                category: Some(match diagnostic.category {
-                    ts_diagnostics::Category::Error => CompilationDiagnosticCategory::Error,
-                    ts_diagnostics::Category::Warning => CompilationDiagnosticCategory::Warning,
-                    ts_diagnostics::Category::Suggestion => {
-                        CompilationDiagnosticCategory::Suggestion
-                    }
-                    ts_diagnostics::Category::Message => CompilationDiagnosticCategory::Message,
-                }),
+                category: Some(compilation_diagnostic_category(diagnostic.category)),
                 message,
                 related_information: match checker {
                     // Legacy Program diagnostics still do not expose whether
@@ -4760,29 +4809,12 @@ fn compile_case_variant(
                         diagnostic
                             .related_information
                             .iter()
-                            .map(|related| CompilationRelatedInformation {
-                                file_name: related.file_name.clone(),
-                                source_text: related
-                                    .file_name
-                                    .as_deref()
-                                    .and_then(&diagnostic_source_text),
-                                range: related.range,
-                                code: related.code,
-                                category: Some(match related.category {
-                                    ts_diagnostics::Category::Error => {
-                                        CompilationDiagnosticCategory::Error
-                                    }
-                                    ts_diagnostics::Category::Warning => {
-                                        CompilationDiagnosticCategory::Warning
-                                    }
-                                    ts_diagnostics::Category::Suggestion => {
-                                        CompilationDiagnosticCategory::Suggestion
-                                    }
-                                    ts_diagnostics::Category::Message => {
-                                        CompilationDiagnosticCategory::Message
-                                    }
-                                }),
-                                message: related.message.clone(),
+                            .map(|related| {
+                                retain_compilation_related_information(
+                                    &program,
+                                    related,
+                                    &diagnostic_source_text,
+                                )
                             })
                             .collect(),
                     ),
@@ -4800,12 +4832,7 @@ fn compile_case_variant(
             source_text: None,
             range: None,
             code: Some(diagnostic.code()),
-            category: Some(match diagnostic.category() {
-                ts_diagnostics::Category::Error => CompilationDiagnosticCategory::Error,
-                ts_diagnostics::Category::Warning => CompilationDiagnosticCategory::Warning,
-                ts_diagnostics::Category::Suggestion => CompilationDiagnosticCategory::Suggestion,
-                ts_diagnostics::Category::Message => CompilationDiagnosticCategory::Message,
-            }),
+            category: Some(compilation_diagnostic_category(diagnostic.category())),
             message,
             related_information: match checker {
                 FixtureChecker::Legacy => None,
@@ -4847,6 +4874,75 @@ fn compile_case_variant(
         outputs,
         semantic_artifacts,
     })
+}
+
+fn program_diagnostic_origin(
+    program: &ts_compiler::Program,
+    diagnostic: &ts_compiler::ProgramDiagnostic,
+) -> CompilationDiagnosticOrigin {
+    let Some(file_name) = diagnostic.file_name.as_deref() else {
+        return if diagnostic.code == Some(2318) {
+            CompilationDiagnosticOrigin::Checker
+        } else {
+            CompilationDiagnosticOrigin::Synthetic
+        };
+    };
+    if is_tsconfig_file(file_name) {
+        return CompilationDiagnosticOrigin::Configuration;
+    }
+    if program.source_file(file_name).is_some_and(|source| {
+        source
+            .parse
+            .diagnostics
+            .iter()
+            .any(|parser| parser.code == diagnostic.code && Some(parser.range) == diagnostic.range)
+    }) {
+        return CompilationDiagnosticOrigin::Parser;
+    }
+    CompilationDiagnosticOrigin::Checker
+}
+
+fn retain_compilation_related_information(
+    program: &ts_compiler::Program,
+    diagnostic: &ts_compiler::ProgramDiagnostic,
+    diagnostic_source_text: &impl Fn(&str) -> Option<SourceText>,
+) -> CompilationRelatedInformation {
+    CompilationRelatedInformation {
+        file_name: diagnostic.file_name.clone(),
+        source_text: diagnostic
+            .file_name
+            .as_deref()
+            .and_then(diagnostic_source_text),
+        range: diagnostic.range,
+        code: diagnostic.code,
+        category: Some(compilation_diagnostic_category(diagnostic.category)),
+        message: diagnostic.message.clone(),
+        related_information: diagnostic
+            .related_information
+            .iter()
+            .map(|related| {
+                retain_compilation_related_information(program, related, diagnostic_source_text)
+            })
+            .collect(),
+        ordering: CompilationDiagnosticOrdering {
+            origin: program_diagnostic_origin(program, diagnostic),
+            diagnostic: recover_structured_compilation_diagnostic(
+                diagnostic.code,
+                &diagnostic.message,
+            ),
+        },
+    }
+}
+
+const fn compilation_diagnostic_category(
+    category: ts_diagnostics::Category,
+) -> CompilationDiagnosticCategory {
+    match category {
+        ts_diagnostics::Category::Error => CompilationDiagnosticCategory::Error,
+        ts_diagnostics::Category::Warning => CompilationDiagnosticCategory::Warning,
+        ts_diagnostics::Category::Suggestion => CompilationDiagnosticCategory::Suggestion,
+        ts_diagnostics::Category::Message => CompilationDiagnosticCategory::Message,
+    }
 }
 
 fn materialize_upstream_test_libraries(
@@ -6778,6 +6874,10 @@ mod tests {
                     .unwrap();
 
                 assert_eq!(diagnostic.message.contains(advice), expects_advice);
+                assert_eq!(
+                    diagnostic.ordering.origin,
+                    super::CompilationDiagnosticOrigin::Synthetic
+                );
                 assert_eq!(compilation.diagnostic_text.contains(advice), expects_advice);
                 assert_eq!(
                     compilation.semantic_artifacts.is_some(),
@@ -6817,6 +6917,10 @@ mod tests {
             )
         };
         assert_eq!(diagnostic.code, Some(5011));
+        assert_eq!(
+            diagnostic.ordering.origin,
+            super::CompilationDiagnosticOrigin::Configuration
+        );
         assert_eq!(diagnostic.file_name.as_deref(), Some("/app/tsconfig.json"));
         let source = diagnostic.source_text.as_ref().unwrap().as_scannable_str();
         let range = diagnostic.range.unwrap();
@@ -7845,6 +7949,39 @@ mod tests {
             option_diagnostics[0].message,
             "Option 'checkJs' cannot be specified without specifying option 'allowJs'."
         );
+        assert_eq!(
+            option_diagnostics[0].ordering.origin,
+            super::CompilationDiagnosticOrigin::CompilerOption
+        );
+    }
+
+    #[test]
+    fn fixture_compilation_retains_parser_diagnostic_origins() {
+        let case = Case::parse(
+            "parserOrigin.ts",
+            concat!(
+                "// @noCheck: true\n",
+                "// @noLib: true\n",
+                "// @noEmit: true\n",
+                "const value = ;\n",
+            ),
+        )
+        .unwrap();
+        let compilation = compile_case(&case).unwrap();
+        let diagnostic = compilation
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == Some(1109))
+            .unwrap_or_else(|| panic!("expected TS1109: {:?}", compilation.diagnostics));
+
+        assert_eq!(
+            diagnostic.ordering.origin,
+            super::CompilationDiagnosticOrigin::Parser
+        );
+        assert_eq!(
+            diagnostic.file_name.as_deref(),
+            Some("/.src/parserOrigin.ts")
+        );
     }
 
     #[test]
@@ -7936,6 +8073,8 @@ mod tests {
                 code: Some(2728),
                 category: Some(CompilationDiagnosticCategory::Message),
                 message: "The declaration is here.".to_owned(),
+                related_information: Vec::new(),
+                ordering: CompilationDiagnosticOrdering::default(),
             }]),
             ordering: CompilationDiagnosticOrdering::default(),
         };
@@ -7998,6 +8137,8 @@ mod tests {
                     code: Some(6203),
                     category: Some(CompilationDiagnosticCategory::Message),
                     message: "'primary' was also declared here.".to_owned(),
+                    related_information: Vec::new(),
+                    ordering: CompilationDiagnosticOrdering::default(),
                 },
                 CompilationRelatedInformation {
                     file_name: Some("/src/b.ts".to_owned()),
@@ -8009,6 +8150,8 @@ mod tests {
                     code: Some(6204),
                     category: Some(CompilationDiagnosticCategory::Message),
                     message: "and here.".to_owned(),
+                    related_information: Vec::new(),
+                    ordering: CompilationDiagnosticOrdering::default(),
                 },
             ]),
             ordering: CompilationDiagnosticOrdering::default(),
@@ -8384,6 +8527,163 @@ mod tests {
         assert!(
             super::recover_structured_compilation_diagnostic(Some(1007), "unrelated text")
                 .is_none()
+        );
+
+        let multiline = ts_diagnostics::Diagnostic::with_arguments(
+            message,
+            ["opening\nacross lines", "closing"],
+        )
+        .with_details(["  additional context"]);
+        let rendered = multiline.render().unwrap();
+        let recovered = super::recover_structured_compilation_diagnostic(Some(1007), &rendered)
+            .expect("multiline arguments must remain separate from diagnostic details");
+        assert_eq!(recovered.arguments, ["opening\nacross lines", "closing"]);
+        assert_eq!(recovered.details, ["  additional context"]);
+        assert_eq!(recovered.render().unwrap(), rendered);
+
+        let ambiguous = ts_diagnostics::Diagnostic::with_arguments(
+            ts_diagnostics::message_by_code(2739).unwrap(),
+            ["source", "target", "first property"],
+        )
+        .with_details(["  another property"])
+        .render()
+        .unwrap();
+        assert!(
+            super::recover_structured_compilation_diagnostic(Some(2739), &ambiguous).is_none(),
+            "an argument-ending template cannot distinguish multiline arguments from details"
+        );
+    }
+
+    #[test]
+    fn nested_related_information_orders_recursively_and_remains_in_scorecards() {
+        fn related(
+            name: &str,
+            children: Vec<CompilationRelatedInformation>,
+        ) -> CompilationRelatedInformation {
+            let diagnostic = ts_diagnostics::Diagnostic::with_arguments(
+                ts_diagnostics::message_by_code(2728).unwrap(),
+                [name],
+            );
+            CompilationRelatedInformation {
+                file_name: None,
+                source_text: None,
+                range: None,
+                code: Some(2728),
+                category: Some(CompilationDiagnosticCategory::Message),
+                message: diagnostic.render().unwrap(),
+                related_information: children,
+                ordering: super::CompilationDiagnosticOrdering {
+                    origin: super::CompilationDiagnosticOrigin::Checker,
+                    diagnostic: Some(diagnostic),
+                },
+            }
+        }
+
+        fn primary(child: &str) -> CompilationDiagnostic {
+            let diagnostic = ts_diagnostics::Diagnostic::with_arguments(
+                ts_diagnostics::message_by_code(2318).unwrap(),
+                ["Array"],
+            );
+            CompilationDiagnostic {
+                file_name: None,
+                source_text: None,
+                range: None,
+                code: Some(2318),
+                category: Some(CompilationDiagnosticCategory::Error),
+                message: diagnostic.render().unwrap(),
+                related_information: Some(vec![related("root", vec![related(child, Vec::new())])]),
+                ordering: super::CompilationDiagnosticOrdering {
+                    origin: super::CompilationDiagnosticOrigin::Checker,
+                    diagnostic: Some(diagnostic),
+                },
+            }
+        }
+
+        let later = primary("zeta");
+        let earlier = primary("alpha");
+        assert_eq!(
+            super::compare_compilation_diagnostics(&later, &earlier),
+            std::cmp::Ordering::Greater,
+        );
+
+        let scorecard = DiagnosticScorecardDiagnostic::from(&earlier);
+        let [root] = scorecard.related_information.as_slice() else {
+            panic!("expected the primary related record")
+        };
+        let [nested] = root.related_information.as_slice() else {
+            panic!("expected nested related information to remain owned by its parent")
+        };
+        assert_eq!(nested.code, Some(2728));
+        assert_eq!(nested.message, "'alpha' is declared here.");
+
+        let mut unproven = primary("alpha");
+        unproven.related_information.as_mut().unwrap()[0].related_information[0]
+            .ordering
+            .diagnostic = None;
+        let case = Case::parse("related.ts", "").unwrap();
+        let artifact = render_error_baseline(&case, &[unproven, later]);
+        assert!(
+            artifact
+                .unsupported_details
+                .iter()
+                .any(|detail| detail.contains("same path/range/code ordering key")),
+            "{artifact:?}"
+        );
+    }
+
+    #[test]
+    fn synthetic_program_diagnostics_keep_compiler_locations_before_checker_globals() {
+        fn diagnostic(
+            code: u32,
+            arguments: &[&str],
+            origin: super::CompilationDiagnosticOrigin,
+        ) -> CompilationDiagnostic {
+            let structured = ts_diagnostics::Diagnostic::with_arguments(
+                ts_diagnostics::message_by_code(code).unwrap(),
+                arguments.iter().copied(),
+            );
+            CompilationDiagnostic {
+                file_name: None,
+                source_text: None,
+                range: None,
+                code: Some(code),
+                category: Some(CompilationDiagnosticCategory::Error),
+                message: structured.render().unwrap(),
+                related_information: Some(Vec::new()),
+                ordering: super::CompilationDiagnosticOrdering {
+                    origin,
+                    diagnostic: Some(structured),
+                },
+            }
+        }
+
+        let case = Case::parse("global.ts", "").unwrap();
+        let diagnostics = [
+            diagnostic(
+                2318,
+                &["Array"],
+                super::CompilationDiagnosticOrigin::Checker,
+            ),
+            diagnostic(
+                5055,
+                &["output.js"],
+                super::CompilationDiagnosticOrigin::Synthetic,
+            ),
+            diagnostic(
+                5052,
+                &["checkJs", "allowJs"],
+                super::CompilationDiagnosticOrigin::CompilerOption,
+            ),
+        ];
+        let artifact = render_error_baseline(&case, &diagnostics);
+        assert!(artifact.unsupported_details.is_empty(), "{artifact:?}");
+        assert_eq!(
+            parse_error_baseline_header(&artifact.text),
+            concat!(
+                "error TS5052: Option 'checkJs' cannot be specified without specifying option 'allowJs'.\n",
+                "error TS5055: Cannot write file 'output.js' because it would overwrite input file.\n",
+                "error TS2318: Cannot find global type 'Array'.",
+            )
         );
     }
 
