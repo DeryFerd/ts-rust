@@ -22,7 +22,7 @@ use super::{
     CanonicalCheckerDiagnostic, CanonicalCheckerDiagnosticRange, CanonicalCheckerDiagnostics,
     CanonicalCheckerOptions, CanonicalCheckerRelatedInformation, CanonicalGlobalTypes,
     CanonicalTypeMapperStore, DeclaredTypeHost, DeclaredTypeLinks, JsxElementLinks, JsxFlags,
-    ResolvedSignatureState, SignatureId, SignatureLinks, SourceCheckError,
+    RelationUnavailable, ResolvedSignatureState, SignatureId, SignatureLinks, SourceCheckError,
     SourceCheckProvenanceError, SourceLiteralCacheError, SourceSyntaxRole, SymbolNodeLinks, TypeId,
     TypeNodeLinks, UnsupportedSourceSyntax, ValueSymbolLinks,
     array_types::CanonicalArrayTargets,
@@ -3255,6 +3255,7 @@ fn execute_jsx_element(
             check_attribute_assignability(
                 store,
                 host,
+                source.3,
                 plan.opening,
                 tag,
                 (expected_attributes, actual_attributes),
@@ -3445,7 +3446,15 @@ fn check_react_jsx_fragment_children(
         return Ok(true);
     };
     if children.individual_errors
-        || jsx_child_is_assignable(store, children.type_, expected, children.node)?
+        || jsx_child_is_assignable(
+            store,
+            children.type_,
+            expected,
+            children.node,
+            (host, source.3),
+            options,
+            diagnostics,
+        )?
     {
         return Ok(true);
     }
@@ -3553,6 +3562,9 @@ fn jsx_child_is_assignable(
     source: TypeId,
     target: TypeId,
     location: NodeRef,
+    (host, global_types): (&DeclaredTypeHost<'_>, Option<&CanonicalGlobalTypes>),
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
 ) -> Result<bool, SourceCheckError> {
     let (any, unknown) = {
         let bootstrap = store
@@ -3562,25 +3574,77 @@ fn jsx_child_is_assignable(
             ))?;
         (bootstrap.any_type, bootstrap.unknown_type)
     };
-    if source != unknown {
-        return store
-            .is_type_assignable_to(source, target)
-            .map_err(Into::into);
+    if source == unknown {
+        let record = store
+            .type_payload(source)
+            .ok_or(SourceCheckError::Property(location))?;
+        if record.flags() != TypeFlags::UNKNOWN
+            || !matches!(
+                record.data(),
+                super::TypeData::Intrinsic(intrinsic) if intrinsic.intrinsic_name == "unknown"
+            )
+        {
+            return Err(SourceCheckError::Property(location));
+        }
+
+        return Ok(target == any || target == unknown);
     }
 
-    let record = store
+    let relation = |store: &mut CanonicalTypeMapperStore| {
+        if let Some(global_types) = global_types {
+            store.is_type_assignable_to_with_global_types_and_strict_function_types(
+                source,
+                target,
+                global_types,
+                options.strict_function_types,
+            )
+        } else {
+            store.is_type_assignable_to(source, target)
+        }
+    };
+    let error = match relation(store) {
+        Ok(assignable) => return Ok(assignable),
+        Err(error @ RelationUnavailable::UnresolvedStructuredMembers(unresolved))
+            if unresolved == source =>
+        {
+            error
+        }
+        Err(error) => return Err(error.into()),
+    };
+
+    let Some(owner) = store
         .type_payload(source)
-        .ok_or(SourceCheckError::Property(location))?;
-    if record.flags() != TypeFlags::UNKNOWN
-        || !matches!(
-            record.data(),
-            super::TypeData::Intrinsic(intrinsic) if intrinsic.intrinsic_name == "unknown"
-        )
+        .and_then(|record| record.symbol())
+    else {
+        return Err(error.into());
+    };
+    let Some(namespace) = store.get_parent_of_symbol(owner) else {
+        return Err(error.into());
+    };
+    if store
+        .symbol(owner)
+        .and_then(|record| record.name().as_utf8())
+        != Some("Element")
+        || store
+            .symbol(namespace)
+            .and_then(|record| record.name().as_utf8())
+            != Some("JSX")
+        || store
+            .declared_type_links(owner)
+            .and_then(|links| links.declared_type)
+            != Some(source)
+        || !jsx_namespace_interface_has_heritage(store, host, namespace, owner)?
     {
+        return Err(error.into());
+    }
+
+    let resolved = CanonicalTypeQuery::new(store, host, options, diagnostics)?
+        .get_declared_type_of_symbol(owner)?;
+    if resolved != source {
         return Err(SourceCheckError::Property(location));
     }
 
-    Ok(target == any || target == unknown)
+    relation(store).map_err(Into::into)
 }
 
 #[allow(clippy::too_many_arguments)] // Contextual children retain their owner and expected props.
@@ -3674,7 +3738,15 @@ fn check_jsx_implicit_children(
         };
         first_node.get_or_insert(node);
         if let Some(expected) = expected_child
-            && !jsx_child_is_assignable(store, type_, expected, node)?
+            && !jsx_child_is_assignable(
+                store,
+                type_,
+                expected,
+                node,
+                (source.2, source.3),
+                options,
+                diagnostics,
+            )?
         {
             let display = get_type_names_for_assignability_error(store, type_, expected)?;
             add_diagnostic(diagnostics, node, 2322, [display.source, display.target])?;
@@ -5569,6 +5641,7 @@ fn validate_attribute_object(
 fn check_attribute_assignability(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
+    global_types: Option<&CanonicalGlobalTypes>,
     opening: NodeRef,
     tag: &JsxTagPlan,
     (expected, actual): (TypeId, TypeId),
@@ -5675,7 +5748,15 @@ fn check_attribute_assignability(
                 options,
                 diagnostics,
             )?
-            && !jsx_child_is_assignable(store, children.type_, expected_type, children.node)?
+            && !jsx_child_is_assignable(
+                store,
+                children.type_,
+                expected_type,
+                children.node,
+                (host, global_types),
+                options,
+                diagnostics,
+            )?
         {
             let display =
                 get_type_names_for_assignability_error(store, children.type_, expected_type)?;
