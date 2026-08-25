@@ -1877,9 +1877,27 @@ fn resolve_local_jsx_namespace_alias(
         if record.flags() != SymbolFlags::ALIAS || !visited.insert(symbol) {
             return Err(SourceCheckError::Import(location));
         }
-        let links = store
-            .alias_symbol_links(symbol)
-            .ok_or(SourceCheckError::Import(location))?;
+        let Some(links) = store.alias_symbol_links(symbol) else {
+            if is_unchecked_global_jsx_namespace_alias(store, symbol) {
+                return Err(unsupported(
+                    location,
+                    store
+                        .source_node_kind(location)
+                        .unwrap_or(SyntaxKind::Identifier),
+                ));
+            }
+            return Err(SourceCheckError::Import(location));
+        };
+        if links == &super::AliasSymbolLinks::default()
+            && is_unchecked_global_jsx_namespace_alias(store, symbol)
+        {
+            return Err(unsupported(
+                location,
+                store
+                    .source_node_kind(location)
+                    .unwrap_or(SyntaxKind::Identifier),
+            ));
+        }
         if links.type_only_declaration.is_some() || links.immediate_target.is_none() {
             return Err(SourceCheckError::Import(location));
         }
@@ -1888,6 +1906,81 @@ fn resolve_local_jsx_namespace_alias(
             .symbol()
             .ok_or(SourceCheckError::Import(location))?;
     }
+}
+
+fn is_unchecked_global_jsx_namespace_alias(
+    store: &CanonicalTypeMapperStore,
+    alias: SemanticSymbolId,
+) -> bool {
+    let Some(record) = store.symbol(alias) else {
+        return false;
+    };
+    let Some([declaration]) = record.declarations() else {
+        return false;
+    };
+    let declaration = *declaration;
+    let Some(super::store::SourceNodeParent::Parent(source)) =
+        store.source_node_parent(declaration)
+    else {
+        return false;
+    };
+    let Some(module) = record.parent() else {
+        return false;
+    };
+    let Some(module_record) = store.symbol(module) else {
+        return false;
+    };
+    let Some(exports) = module_record
+        .exports()
+        .and_then(|exports| store.symbol_table(exports))
+    else {
+        return false;
+    };
+    let Some(assignment) = exports.get(InternalSymbolName::ExportEquals.as_ref()) else {
+        return false;
+    };
+    let Some(assignment_record) = store.symbol(assignment) else {
+        return false;
+    };
+    let Some([assignment_declaration]) = assignment_record.declarations() else {
+        return false;
+    };
+    let assignment_declaration = *assignment_declaration;
+
+    record.flags() == SymbolFlags::ALIAS
+        && record.check_flags() == CheckFlags::NONE
+        && record.value_declaration().is_none()
+        && record.members().is_none()
+        && record.exports().is_none()
+        && record.export_symbol().is_none()
+        && store.get_merged_symbol(alias) == Some(alias)
+        && store.source_node_kind(declaration) == Some(SyntaxKind::NamespaceExportDeclaration)
+        && store.source_node_kind(source) == Some(SyntaxKind::SourceFile)
+        && store.source_node_parent(source) == Some(super::store::SourceNodeParent::Root)
+        && module_record.flags() == SymbolFlags::VALUE_MODULE
+        && module_record.check_flags() == CheckFlags::NONE
+        && module_record.declarations() == Some(&[source])
+        && module_record.value_declaration() == Some(source)
+        && module_record.parent().is_none()
+        && module_record.export_symbol().is_none()
+        && store.get_merged_symbol(module) == Some(module)
+        && assignment_record.flags() == SymbolFlags::ALIAS
+        && assignment_record.check_flags() == CheckFlags::NONE
+        && assignment_record.name() == InternalSymbolName::ExportEquals.as_ref()
+        && assignment_record.value_declaration() == Some(assignment_declaration)
+        && assignment_record.members().is_none()
+        && assignment_record.exports().is_none()
+        && assignment_record.parent() == Some(module)
+        && assignment_record.export_symbol().is_none()
+        && store.get_merged_symbol(assignment) == Some(assignment)
+        && store.source_node_kind(assignment_declaration) == Some(SyntaxKind::ExportAssignment)
+        && store.source_node_parent(assignment_declaration)
+            == Some(super::store::SourceNodeParent::Parent(source))
+        && store
+            .intrinsic_bootstrap()
+            .and_then(|bootstrap| store.symbol_table(bootstrap.globals))
+            .and_then(|globals| globals.get(record.name()))
+            == Some(alias)
 }
 
 fn jsx_plan_intrinsic_names(plan: &JsxElementPlan) -> HashSet<String> {
@@ -7039,6 +7132,112 @@ mod runtime_tests {
                 fixture.context.diagnostics().as_slice().to_vec(),
             ),
             warm,
+        );
+    }
+
+    #[test]
+    fn unchecked_global_umd_jsx_aliases_are_boundaries_without_hiding_poisoned_links() {
+        let library = parse_source_file(concat!(
+            "export = React; ",
+            "export as namespace React; ",
+            "declare namespace React { export const Fragment: any; }",
+        ));
+        let consumer = parse_jsx_source_file("const view = <React.Fragment />;");
+        assert!(library.diagnostics.is_empty(), "{:?}", library.diagnostics);
+        assert!(
+            consumer.diagnostics.is_empty(),
+            "{:?}",
+            consumer.diagnostics
+        );
+        let library_file = FileId::new(8_195);
+        let consumer_file = FileId::new(8_196);
+        let mut binder = CanonicalBinder::new();
+        for (parsed, file, declaration, state) in [
+            (&library, library_file, true, CanonicalModuleState::External),
+            (
+                &consumer,
+                consumer_file,
+                false,
+                CanonicalModuleState::Script,
+            ),
+        ] {
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(format!("\"/project/{}.tsx\"", file.index())),
+                        CanonicalSourceLanguage::TypeScript,
+                        declaration,
+                        state,
+                    ),
+                )
+                .unwrap();
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        let mut context = crate::semantic::CanonicalCheckerContext::new(
+            binder.finish(),
+            vec![
+                (library_file, &library.arena),
+                (consumer_file, &consumer.arena),
+            ],
+            CanonicalCheckerOptions {
+                jsx_runtime: CanonicalJsxRuntime::Classic,
+                ..CanonicalCheckerOptions::default()
+            },
+        )
+        .unwrap();
+        let globals = context.store().intrinsic_bootstrap().unwrap().globals;
+        let alias = context
+            .store()
+            .symbol_table(globals)
+            .and_then(|globals| globals.get_source("React"))
+            .unwrap();
+        let location = consumer
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                matches!(
+                    &record.data,
+                    NodeData::Identifier(identifier) if identifier.text == "React"
+                )
+                .then_some(NodeRef::new(consumer.arena.id(), consumer_file, node))
+            })
+            .unwrap();
+        assert!(context.store().alias_symbol_links(alias).is_none());
+        let cold = context.store().checker_link_allocated_lengths();
+
+        assert_eq!(
+            resolve_local_jsx_namespace_alias(context.store(), alias, location),
+            Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Syntax {
+                    node: location,
+                    kind: SyntaxKind::Identifier,
+                    role: SourceSyntaxRole::VariableInitializer,
+                }
+            )),
+        );
+        assert_eq!(context.store().checker_link_allocated_lengths(), cold);
+
+        let declaration = context
+            .store()
+            .symbol(alias)
+            .unwrap()
+            .declarations()
+            .unwrap()[0];
+        assert!(context.store_mut_for_test().set_alias_symbol_links(
+            alias,
+            AliasSymbolLinks {
+                type_only_declaration: Some(declaration),
+                ..AliasSymbolLinks::default()
+            },
+        ));
+        assert_eq!(
+            resolve_local_jsx_namespace_alias(context.store(), alias, location),
+            Err(SourceCheckError::Import(location)),
         );
     }
 
