@@ -273,6 +273,14 @@ enum SourceFlowAssignmentState {
     Resolved(TypeId),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceTypeofLeafMatch {
+    Exact(bool),
+    Any,
+    Unknown,
+    NonNullableUnknown,
+}
+
 #[derive(Default)]
 struct SourceFlowCoverage {
     assignments: HashSet<NodeRef>,
@@ -1259,8 +1267,8 @@ impl SourceFlowFrame<'_, '_> {
     }
 }
 
-/// Confirms that `typeof` filtering can classify every union leaf without
-/// invoking general relation, intersection, or type-parameter machinery.
+/// Confirms that `typeof` can classify canonical top types, authenticated
+/// branded primitives, and every union leaf without general relation queries.
 pub(super) fn source_typeof_narrowing_type_is_supported(
     store: &CanonicalTypeMapperStore,
     globals: &CanonicalGlobalTypes,
@@ -1297,25 +1305,43 @@ pub(super) fn narrow_by_typeof(
             retained.push(*leaf);
             continue;
         }
-        let matches = source_typeof_leaf_matches(store, globals, *leaf, tag)?;
-        if matches == require_match {
-            let retained_leaf = if require_match
-                && matches!(tag, SourceTypeofTag::Undefined)
-                && record.flags().intersects(TypeFlags::VOID)
+        let flags = record.flags();
+        match source_typeof_leaf_matches(store, globals, *leaf, tag)? {
+            SourceTypeofLeafMatch::Exact(matches) if matches == require_match => {
+                let retained_leaf = if require_match
+                    && matches!(tag, SourceTypeofTag::Undefined)
+                    && flags.intersects(TypeFlags::VOID)
+                {
+                    store
+                        .intrinsic_bootstrap()
+                        .map(|bootstrap| bootstrap.undefined_type)
+                        .ok_or(SourceTypeofNarrowingError::MissingBootstrap)?
+                } else {
+                    *leaf
+                };
+                retained.push(retained_leaf);
+            }
+            SourceTypeofLeafMatch::Exact(_)
+                if require_match
+                    && matches!(tag, SourceTypeofTag::Function)
+                    && flags.intersects(TypeFlags::NON_PRIMITIVE) =>
             {
-                store
-                    .intrinsic_bootstrap()
-                    .map(|bootstrap| bootstrap.undefined_type)
-                    .ok_or(SourceTypeofNarrowingError::MissingBootstrap)?
-            } else {
-                *leaf
-            };
-            retained.push(retained_leaf);
-        } else if require_match
-            && matches!(tag, SourceTypeofTag::Function)
-            && record.flags().intersects(TypeFlags::NON_PRIMITIVE)
-        {
-            retained.push(globals.function_type);
+                retained.push(globals.function_type);
+            }
+            SourceTypeofLeafMatch::Exact(_) => {}
+            kind @ (SourceTypeofLeafMatch::Any
+            | SourceTypeofLeafMatch::Unknown
+            | SourceTypeofLeafMatch::NonNullableUnknown) => {
+                append_narrowed_source_typeof_top(
+                    store,
+                    globals,
+                    *leaf,
+                    kind,
+                    tag,
+                    require_match,
+                    &mut retained,
+                )?;
+            }
         }
     }
     if retained == leaves {
@@ -1333,6 +1359,67 @@ pub(super) fn narrow_by_typeof(
     store
         .expression_union_type_with_global_types(globals, &retained, UnionReduction::Literal)
         .map_err(SourceTypeofNarrowingError::Union)
+}
+
+fn append_narrowed_source_typeof_top(
+    store: &CanonicalTypeMapperStore,
+    globals: &CanonicalGlobalTypes,
+    original: TypeId,
+    kind: SourceTypeofLeafMatch,
+    tag: SourceTypeofTag,
+    require_match: bool,
+    retained: &mut Vec<TypeId>,
+) -> Result<(), SourceTypeofNarrowingError> {
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(SourceTypeofNarrowingError::MissingBootstrap)?;
+    if !require_match {
+        if kind == SourceTypeofLeafMatch::Unknown && bootstrap.options.strict_null_checks {
+            match tag {
+                SourceTypeofTag::Object => {
+                    retained.extend([
+                        bootstrap.unknown_empty_object_type,
+                        bootstrap.undefined_type,
+                    ]);
+                    return Ok(());
+                }
+                SourceTypeofTag::Undefined => {
+                    retained.extend([bootstrap.unknown_empty_object_type, bootstrap.null_type]);
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+        retained.push(original);
+        return Ok(());
+    }
+
+    let narrowed = match tag {
+        SourceTypeofTag::String => bootstrap.string_type,
+        SourceTypeofTag::Number => bootstrap.number_type,
+        SourceTypeofTag::Boolean => bootstrap.boolean_type,
+        SourceTypeofTag::BigInt => bootstrap.bigint_type,
+        SourceTypeofTag::Symbol => bootstrap.es_symbol_type,
+        SourceTypeofTag::Undefined
+            if kind == SourceTypeofLeafMatch::NonNullableUnknown
+                && bootstrap.options.strict_null_checks =>
+        {
+            return Ok(());
+        }
+        SourceTypeofTag::Undefined => bootstrap.undefined_type,
+        SourceTypeofTag::Object if kind == SourceTypeofLeafMatch::Any => original,
+        SourceTypeofTag::Object => {
+            retained.push(bootstrap.non_primitive_type);
+            if kind == SourceTypeofLeafMatch::Unknown && bootstrap.options.strict_null_checks {
+                retained.push(bootstrap.null_type);
+            }
+            return Ok(());
+        }
+        SourceTypeofTag::Function if kind == SourceTypeofLeafMatch::Any => original,
+        SourceTypeofTag::Function => globals.function_type,
+    };
+    retained.push(narrowed);
+    Ok(())
 }
 
 fn collect_source_typeof_leaves(
@@ -1369,16 +1456,45 @@ fn source_typeof_leaf_matches(
     globals: &CanonicalGlobalTypes,
     type_: TypeId,
     tag: SourceTypeofTag,
-) -> Result<bool, SourceTypeofNarrowingError> {
+) -> Result<SourceTypeofLeafMatch, SourceTypeofNarrowingError> {
     let record = store
         .type_payload(type_)
         .ok_or(SourceTypeofNarrowingError::InvalidType(type_))?;
     let flags = record.flags();
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(SourceTypeofNarrowingError::MissingBootstrap)?;
+    if flags.intersects(TypeFlags::ANY) {
+        return if type_ == bootstrap.any_type {
+            Ok(SourceTypeofLeafMatch::Any)
+        } else {
+            Err(SourceTypeofNarrowingError::UnsupportedType(type_))
+        };
+    }
+    if flags.intersects(TypeFlags::UNKNOWN) {
+        return if type_ == bootstrap.unknown_type {
+            Ok(SourceTypeofLeafMatch::Unknown)
+        } else {
+            Err(SourceTypeofNarrowingError::UnsupportedType(type_))
+        };
+    }
+    if type_ == globals.function_type || type_ == bootstrap.any_function_type {
+        return Ok(SourceTypeofLeafMatch::Exact(matches!(
+            tag,
+            SourceTypeofTag::Function
+        )));
+    }
+    if type_ == bootstrap.unknown_empty_object_type
+        || type_ == bootstrap.empty_object_type
+        || type_ == bootstrap.empty_type_literal_type
+    {
+        return Ok(SourceTypeofLeafMatch::NonNullableUnknown);
+    }
+    if flags.intersects(TypeFlags::INTERSECTION) {
+        return source_typeof_branded_intersection_matches(store, globals, type_, tag);
+    }
     if flags.intersects(
-        TypeFlags::ANY
-            | TypeFlags::UNKNOWN
-            | TypeFlags::TYPE_PARAMETER
-            | TypeFlags::INTERSECTION
+        TypeFlags::TYPE_PARAMETER
             | TypeFlags::INDEX
             | TypeFlags::INDEXED_ACCESS
             | TypeFlags::CONDITIONAL
@@ -1443,7 +1559,62 @@ fn source_typeof_leaf_matches(
     if !classifiable {
         return Err(SourceTypeofNarrowingError::UnsupportedType(type_));
     }
-    Ok(matched)
+    Ok(SourceTypeofLeafMatch::Exact(matched))
+}
+
+fn source_typeof_branded_intersection_matches(
+    store: &CanonicalTypeMapperStore,
+    globals: &CanonicalGlobalTypes,
+    type_: TypeId,
+    tag: SourceTypeofTag,
+) -> Result<SourceTypeofLeafMatch, SourceTypeofNarrowingError> {
+    let record = store
+        .type_payload(type_)
+        .ok_or(SourceTypeofNarrowingError::InvalidType(type_))?;
+    let constituents = if record
+        .object_flags()
+        .contains(ObjectFlags::MEMBERS_RESOLVED)
+    {
+        store
+            .validate_intersection_type(type_)
+            .map(|projection| projection.types)
+    } else {
+        store
+            .validate_deferred_intersection_type(type_)
+            .map(|projection| projection.types)
+    }
+    .map_err(|_| SourceTypeofNarrowingError::UnsupportedType(type_))?;
+
+    let primitive_flags = TypeFlags::STRING_LIKE
+        | TypeFlags::NUMBER_LIKE
+        | TypeFlags::BIG_INT_LIKE
+        | TypeFlags::BOOLEAN_LIKE
+        | TypeFlags::ES_SYMBOL_LIKE;
+    let mut matched = None;
+    for constituent in constituents {
+        let constituent_record = store
+            .type_payload(constituent)
+            .ok_or(SourceTypeofNarrowingError::InvalidType(constituent))?;
+        let flags = constituent_record.flags();
+        if flags.intersects(primitive_flags) {
+            let SourceTypeofLeafMatch::Exact(candidate) =
+                source_typeof_leaf_matches(store, globals, constituent, tag)?
+            else {
+                return Err(SourceTypeofNarrowingError::UnsupportedType(type_));
+            };
+            if matched.is_some_and(|previous| previous != candidate) {
+                return Err(SourceTypeofNarrowingError::UnsupportedType(type_));
+            }
+            matched = Some(candidate);
+        } else if !flags
+            .intersects(TypeFlags::OBJECT | TypeFlags::NON_PRIMITIVE | TypeFlags::TYPE_PARAMETER)
+        {
+            return Err(SourceTypeofNarrowingError::UnsupportedType(type_));
+        }
+    }
+    matched
+        .map(SourceTypeofLeafMatch::Exact)
+        .ok_or(SourceTypeofNarrowingError::UnsupportedType(type_))
 }
 
 fn source_typeof_is_unbounded_empty_object(
@@ -2150,6 +2321,321 @@ mod tests {
         assert_eq!(
             label_antecedents(branch, &node),
             Err(SourceFlowInvariant::InvalidAntecedents(branch).into()),
+        );
+    }
+
+    #[test]
+    fn typeof_top_types_preserve_intrinsic_and_nullable_branch_identities() {
+        let parsed =
+            parse_source_file("function narrow(value: unknown): unknown { return value; }");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(2_420);
+        let mut context = loop_context(&parsed, file);
+        let globals = context.global_types().clone();
+        let (
+            any,
+            unknown,
+            non_nullable,
+            undefined,
+            null,
+            string,
+            number,
+            boolean,
+            bigint,
+            symbol,
+            object,
+            never,
+            error,
+            auto,
+        ) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.any_type,
+                bootstrap.unknown_type,
+                bootstrap.unknown_empty_object_type,
+                bootstrap.undefined_type,
+                bootstrap.null_type,
+                bootstrap.string_type,
+                bootstrap.number_type,
+                bootstrap.boolean_type,
+                bootstrap.bigint_type,
+                bootstrap.es_symbol_type,
+                bootstrap.non_primitive_type,
+                bootstrap.never_type,
+                bootstrap.error_type,
+                bootstrap.auto_type,
+            )
+        };
+        let nullable_object = context
+            .store_mut_for_test()
+            .expression_union_type_with_global_types(
+                &globals,
+                &[object, null],
+                UnionReduction::Literal,
+            )
+            .unwrap();
+        let not_object = context
+            .store_mut_for_test()
+            .expression_union_type_with_global_types(
+                &globals,
+                &[non_nullable, undefined],
+                UnionReduction::Literal,
+            )
+            .unwrap();
+        let not_undefined = context
+            .store_mut_for_test()
+            .expression_union_type_with_global_types(
+                &globals,
+                &[non_nullable, null],
+                UnionReduction::Literal,
+            )
+            .unwrap();
+
+        for (input, tag, require_match, expected) in [
+            (unknown, SourceTypeofTag::String, true, string),
+            (unknown, SourceTypeofTag::Number, true, number),
+            (unknown, SourceTypeofTag::Boolean, true, boolean),
+            (unknown, SourceTypeofTag::BigInt, true, bigint),
+            (unknown, SourceTypeofTag::Symbol, true, symbol),
+            (unknown, SourceTypeofTag::Undefined, true, undefined),
+            (unknown, SourceTypeofTag::Object, true, nullable_object),
+            (
+                unknown,
+                SourceTypeofTag::Function,
+                true,
+                globals.function_type,
+            ),
+            (unknown, SourceTypeofTag::String, false, unknown),
+            (unknown, SourceTypeofTag::Object, false, not_object),
+            (unknown, SourceTypeofTag::Undefined, false, not_undefined),
+            (any, SourceTypeofTag::String, true, string),
+            (any, SourceTypeofTag::Number, true, number),
+            (any, SourceTypeofTag::Object, true, any),
+            (any, SourceTypeofTag::Function, true, any),
+            (any, SourceTypeofTag::Undefined, false, any),
+            (non_nullable, SourceTypeofTag::String, true, string),
+            (non_nullable, SourceTypeofTag::Object, true, object),
+            (
+                non_nullable,
+                SourceTypeofTag::Function,
+                true,
+                globals.function_type,
+            ),
+            (non_nullable, SourceTypeofTag::Undefined, true, never),
+            (
+                non_nullable,
+                SourceTypeofTag::Undefined,
+                false,
+                non_nullable,
+            ),
+        ] {
+            assert_eq!(
+                source_typeof_narrowing_type_is_supported(context.store(), &globals, input, tag),
+                Ok(true),
+            );
+            assert_eq!(
+                narrow_by_typeof(
+                    context.store_mut_for_test(),
+                    &globals,
+                    input,
+                    tag,
+                    require_match,
+                ),
+                Ok(expected),
+            );
+            let warm = (
+                context.store().type_len(),
+                context.store().checker_link_allocated_lengths(),
+            );
+            assert_eq!(
+                narrow_by_typeof(
+                    context.store_mut_for_test(),
+                    &globals,
+                    input,
+                    tag,
+                    require_match,
+                ),
+                Ok(expected),
+            );
+            assert_eq!(
+                (
+                    context.store().type_len(),
+                    context.store().checker_link_allocated_lengths(),
+                ),
+                warm,
+            );
+        }
+
+        for unsupported in [error, auto] {
+            assert_eq!(
+                source_typeof_narrowing_type_is_supported(
+                    context.store(),
+                    &globals,
+                    unsupported,
+                    SourceTypeofTag::String,
+                ),
+                Ok(false),
+            );
+            assert_eq!(
+                narrow_by_typeof(
+                    context.store_mut_for_test(),
+                    &globals,
+                    unsupported,
+                    SourceTypeofTag::String,
+                    true,
+                ),
+                Err(SourceTypeofNarrowingError::UnsupportedType(unsupported)),
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_typeof_conditions_narrow_both_binder_flow_edges_and_replay() {
+        let parsed = parse_source_file(concat!(
+            "function classify(value: unknown): unknown { ",
+            "if (typeof value === 'object') { return value; } ",
+            "else { return value; } ",
+            "} ",
+            "function text(value: any): string { ",
+            "if (typeof value === 'string') { return value; } ",
+            "else { return ''; } ",
+            "}",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(2_421);
+        let mut context = loop_context(&parsed, file);
+
+        context.check_source_file(file).unwrap();
+
+        let returns = parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                let NodeData::Identifier(identifier) = &record.data else {
+                    return None;
+                };
+                if identifier.text != "value" {
+                    return None;
+                }
+                let parent = parsed.arena.get(record.parent?)?;
+                matches!(&parent.data, NodeData::ReturnStatement(returned)
+                    if returned.expression == Some(node))
+                .then_some(NodeRef::new(parsed.arena.id(), file, node))
+            })
+            .collect::<Vec<_>>();
+        let [unknown_true, unknown_false, any_true] = returns.as_slice() else {
+            panic!("expected two unknown return edges and one narrowed any return")
+        };
+        let (object, null, non_nullable, undefined, string) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.non_primitive_type,
+                bootstrap.null_type,
+                bootstrap.unknown_empty_object_type,
+                bootstrap.undefined_type,
+                bootstrap.string_type,
+            )
+        };
+        for (node, expected) in [
+            (*unknown_true, vec![object, null]),
+            (*unknown_false, vec![non_nullable, undefined]),
+        ] {
+            let type_ = context
+                .store()
+                .type_node_links(node)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            let TypeData::Union(union) = context.store().type_payload(type_).unwrap().data() else {
+                panic!("the unknown branch must retain an exact nullable union")
+            };
+            assert_eq!(union.union.types.len(), expected.len());
+            assert!(
+                expected
+                    .iter()
+                    .all(|member| union.union.types.contains(member))
+            );
+        }
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(*any_true)
+                .and_then(|links| links.resolved_type),
+            Some(string),
+        );
+        assert!(context.diagnostics().is_empty());
+
+        let warm = (
+            context.store().type_len(),
+            context.store().signature_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+        context.recheck_source_file(file).unwrap();
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().signature_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            warm,
+        );
+    }
+
+    #[test]
+    fn branded_string_intersections_keep_their_exact_identity_under_typeof() {
+        let parsed = parse_source_file(concat!(
+            "type Branded = 'ready' & { brand: true }; ",
+            "function take(value: Branded): Branded { return value; }",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(2_422);
+        let mut context = loop_context(&parsed, file);
+        let alias = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::TypeAliasDeclaration).then_some(NodeRef::new(
+                    parsed.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .and_then(|declaration| context.file(file).unwrap().1.symbol(declaration))
+            .unwrap();
+        let branded = context.get_declared_type_of_symbol(alias).unwrap();
+        let globals = context.global_types().clone();
+        let never = context.store().intrinsic_bootstrap().unwrap().never_type;
+        let before = (
+            context.store().type_len(),
+            context.store().checker_link_allocated_lengths(),
+        );
+
+        for (tag, require_match, expected) in [
+            (SourceTypeofTag::String, true, branded),
+            (SourceTypeofTag::String, false, never),
+            (SourceTypeofTag::Number, true, never),
+            (SourceTypeofTag::Object, false, branded),
+        ] {
+            assert_eq!(
+                source_typeof_narrowing_type_is_supported(context.store(), &globals, branded, tag),
+                Ok(true),
+            );
+            assert_eq!(
+                narrow_by_typeof(
+                    context.store_mut_for_test(),
+                    &globals,
+                    branded,
+                    tag,
+                    require_match,
+                ),
+                Ok(expected),
+            );
+        }
+        assert_eq!(
+            (
+                context.store().type_len(),
+                context.store().checker_link_allocated_lengths(),
+            ),
+            before,
         );
     }
 
