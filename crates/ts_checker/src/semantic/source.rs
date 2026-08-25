@@ -30,7 +30,7 @@
 //! two-constituent declared unions), direct indexed reads over supported
 //! objects, arrays, and strings, strict direct-identifier `typeof` flow checks,
 //! and direct assignments back to supported mutable declarations or
-//! binder-authenticated `CommonJS` exports and arrow expando properties.
+//! binder-authenticated `CommonJS` exports and function or arrow expandos.
 //! The complete source tree and complete supported-statement plan are validated
 //! before semantic execution begins. Execution may retain safe canonical memo
 //! caches while discovering a type-dependent capability boundary.
@@ -2927,6 +2927,38 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                                 receiver,
                                 index,
                                 variable_symbol: assignment.variable_symbol,
+                                owner_symbol: assignment.owner_symbol,
+                                property_symbol: assignment.property_symbol,
+                                right,
+                            },
+                        ));
+                        continue;
+                    }
+                    if let Some(assignment) = super::assignment::plan_function_expando_assignment(
+                        self.arena, self.bound, store, statement,
+                    )
+                    .map_err(Self::assignment_plan_error)?
+                    {
+                        if !self.hoisted_functions.contains(&assignment.owner_symbol) {
+                            return Err(SourceCheckError::Unsupported(
+                                UnsupportedSourceSyntax::Assignment(
+                                    AssignmentUnsupported::TargetNotPrior {
+                                        node: assignment.receiver,
+                                        symbol: assignment.owner_symbol,
+                                    },
+                                ),
+                            ));
+                        }
+                        let receiver = self.plan_expression(assignment.receiver)?;
+                        self.primitive_binary_position_roots
+                            .insert(assignment.right);
+                        let right = self.plan_expression(assignment.right)?;
+                        statements.push(PlannedStatement::ArrowExpandoAssignment(
+                            PlannedArrowExpandoAssignment {
+                                expression: assignment.expression,
+                                left: assignment.left,
+                                receiver,
+                                variable_symbol: assignment.owner_symbol,
                                 owner_symbol: assignment.owner_symbol,
                                 property_symbol: assignment.property_symbol,
                                 right,
@@ -27915,9 +27947,37 @@ pub(super) fn check_source_file(
                     None,
                     &mut deferred,
                 )?;
-                let widened_literal = widened_fresh_literal_type(store, value.result)?;
-                let property_type =
-                    store.get_widened_type_with_global_types(widened_literal, global_types)?;
+                let property_type = if matches!(
+                    &assignment.right.kind,
+                    PlannedExpressionKind::Array(elements) if elements.is_empty()
+                ) {
+                    if options.no_implicit_any {
+                        let name = store
+                            .symbol(assignment.property_symbol)
+                            .and_then(|property| property.name().as_utf8())
+                            .ok_or(SourceCheckError::Assignment(
+                                AssignmentInvariant::InvalidSymbolShape(assignment.property_symbol),
+                            ))?
+                            .to_owned();
+                        merge_retry_diagnostic(
+                            diagnostics,
+                            CanonicalCheckerDiagnostic {
+                                node: Some(assignment.left),
+                                range_override: None,
+                                diagnostic: Diagnostic::with_arguments(
+                                    message_by_code(7008)
+                                        .ok_or(SourceCheckError::MissingDiagnostic(7008))?,
+                                    [name, "any[]".to_owned()],
+                                ),
+                                related_information: Vec::new(),
+                            },
+                        );
+                    }
+                    global_types.any_array_type
+                } else {
+                    let widened_literal = widened_fresh_literal_type(store, value.result)?;
+                    store.get_widened_type_with_global_types(widened_literal, global_types)?
+                };
                 preflight_source_expression_cache(store, assignment.left, property_type)?;
                 preflight_source_expression_cache(store, assignment.expression, value.result)?;
                 stage_value_type(
@@ -27927,6 +27987,26 @@ pub(super) fn check_source_file(
                     assignment.property_symbol,
                     property_type,
                 )?;
+                if store
+                    .symbol(assignment.owner_symbol)
+                    .and_then(ts_binder::semantic::Symbol::value_declaration)
+                    .and_then(|declaration| store.source_node_kind(declaration))
+                    == Some(SyntaxKind::FunctionDeclaration)
+                {
+                    let links = ValueSymbolLinks {
+                        resolved_type: Some(property_type),
+                        ..ValueSymbolLinks::default()
+                    };
+                    if store
+                        .value_symbol_links(assignment.property_symbol)
+                        .is_none_or(|existing| existing != &links)
+                        && !store.set_value_symbol_links(assignment.property_symbol, links)
+                    {
+                        return Err(SourceCheckError::Variable(
+                            VariableInvariant::InvalidValueLinks(assignment.property_symbol),
+                        ));
+                    }
+                }
                 publish_expression_type(store, assignment.left, property_type)?;
                 publish_expression_type(store, assignment.expression, value.result)?;
             }
@@ -45205,6 +45285,151 @@ mod tests {
         let warm = observable_state(&context, file);
         context.recheck_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn direct_function_expandos_preserve_properties_and_source_callable_identity() {
+        for (index, javascript) in [false, true].into_iter().enumerate() {
+            let source_text = if javascript {
+                "function work() {} work.value = 1; const copied = work.value;"
+            } else {
+                "function work() {} work.value = 1; const copied = work.value; export {};"
+            };
+            let source = if javascript {
+                parse_javascript_source_file(source_text)
+            } else {
+                parsed(source_text)
+            };
+            assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
+            let file = FileId::new(8_460 + u32::try_from(index).unwrap());
+            let mut context = if javascript {
+                javascript_context(file, &source, CanonicalCheckerOptions::default())
+            } else {
+                context_with_module_state(
+                    &[(file, &source)],
+                    CanonicalModuleState::External,
+                    CanonicalCheckerOptions::default(),
+                )
+            };
+
+            context.check_source_file(file).unwrap();
+
+            let owner = function_symbol(&context, &source, file, "work");
+            let callable = context
+                .store()
+                .value_symbol_links(owner)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            assert_eq!(
+                context.store().source_callable_type_for_owner(owner),
+                Some(callable),
+            );
+            assert!(matches!(
+                validate_stored_source_callable(context.store(), callable),
+                StoredSourceCallableValidation::Valid(_)
+            ));
+            let (left, right) = assignment_parts(&source, file, 0);
+            let expression = NodeRef::new(
+                source.arena.id(),
+                file,
+                source.arena.get(left.node).unwrap().parent.unwrap(),
+            );
+            let (_, bound) = context.file(file).unwrap();
+            let property = bound.symbol(expression).unwrap();
+            assert_eq!(
+                context
+                    .store()
+                    .symbol(owner)
+                    .and_then(ts_binder::semantic::Symbol::exports)
+                    .and_then(|exports| context.store().symbol_table(exports))
+                    .and_then(|exports| exports.get_source("value")),
+                Some(property),
+            );
+            assert_eq!(
+                context.store().symbol(property).unwrap().flags(),
+                SymbolFlags::PROPERTY | SymbolFlags::ASSIGNMENT,
+            );
+            let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(property)
+                    .and_then(|links| links.resolved_type),
+                Some(number),
+            );
+            assert_eq!(resolved_node_type(&context, left), number);
+            assert_eq!(
+                resolved_node_type(&context, expression),
+                resolved_node_type(&context, right),
+            );
+            assert_eq!(
+                variable_value_type(&context, &source, file, "copied"),
+                number,
+            );
+            let copied = variable_initializer(&source, file, "copied");
+            assert_eq!(
+                context
+                    .store()
+                    .symbol_node_links(copied)
+                    .and_then(|links| links.resolved_symbol),
+                Some(property),
+            );
+            assert!(context.diagnostics().is_empty());
+
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
+    }
+
+    #[test]
+    fn function_expando_empty_arrays_report_implicit_any_at_the_property() {
+        for (index, source_text) in [
+            "function work() {} work.items = []; export {};",
+            "const work = () => {}; work.items = []; export {};",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parsed(source_text);
+            let file = FileId::new(8_462 + u32::try_from(index).unwrap());
+            let mut context = context_with_module_state(
+                &[(file, &source)],
+                CanonicalModuleState::External,
+                CanonicalCheckerOptions {
+                    no_implicit_any: true,
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+
+            context.check_source_file(file).unwrap();
+
+            let [diagnostic] = context.diagnostics().as_slice() else {
+                panic!("expected one implicit-any diagnostic for {source_text}")
+            };
+            assert_eq!(diagnostic.diagnostic.code(), 7008);
+            assert_eq!(diagnostic.diagnostic.arguments, ["items", "any[]"]);
+            assert_eq!(node_text(&source, diagnostic.node.unwrap()), "work.items");
+            let (left, _) = assignment_parts(&source, file, 0);
+            let expression = NodeRef::new(
+                source.arena.id(),
+                file,
+                source.arena.get(left.node).unwrap().parent.unwrap(),
+            );
+            let (_, bound) = context.file(file).unwrap();
+            let property = bound.symbol(expression).unwrap();
+            assert_eq!(
+                context
+                    .store()
+                    .value_symbol_links(property)
+                    .and_then(|links| links.resolved_type),
+                Some(context.global_types().any_array_type),
+            );
+
+            let warm = observable_state(&context, file);
+            context.recheck_source_file(file).unwrap();
+            assert_eq!(observable_state(&context, file), warm);
+        }
     }
 
     #[test]

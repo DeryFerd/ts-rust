@@ -9,8 +9,8 @@
 //! before admission.
 //! Separate `CommonJS` routes admit binder-authenticated assignments to
 //! `module.exports` and static named assignments on `exports` or `module.exports`.
-//! Direct arrow expandos retain their binder-owned property declaration and
-//! authenticate the preceding source `const` before admission.
+//! Direct arrow and function expandos retain their binder-owned properties and
+//! authenticate the source declaration before admission.
 //! JavaScript object expandos retain the initializer's real assignment exports.
 //! Name lookup follows the pinned lexical resolver and checker export/merge routing.
 //! Valid syntax outside that closure is a typed unsupported result; malformed AST,
@@ -58,6 +58,17 @@ pub(super) struct ArrowExpandoAssignmentPlan {
     pub(super) right: NodeRef,
     pub(super) receiver: NodeRef,
     pub(super) variable_symbol: SemanticSymbolId,
+    pub(super) owner_symbol: SemanticSymbolId,
+    pub(super) property_symbol: SemanticSymbolId,
+}
+
+/// One binder-authenticated static property assignment on a source function.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct FunctionExpandoAssignmentPlan {
+    pub(super) expression: NodeRef,
+    pub(super) left: NodeRef,
+    pub(super) right: NodeRef,
+    pub(super) receiver: NodeRef,
     pub(super) owner_symbol: SemanticSymbolId,
     pub(super) property_symbol: SemanticSymbolId,
 }
@@ -333,6 +344,21 @@ pub(super) fn plan_arrow_expando_assignment(
     .plan_arrow_expando(statement)
 }
 
+/// Authenticates `function.property = value` against the original binder symbols.
+pub(super) fn plan_function_expando_assignment(
+    arena: &NodeArena,
+    bound: &BoundFile,
+    store: &CanonicalTypeMapperStore,
+    statement: NodeRef,
+) -> Result<Option<FunctionExpandoAssignmentPlan>, AssignmentPlanError> {
+    CommonJsAssignmentPlanner {
+        arena,
+        bound,
+        store,
+    }
+    .plan_function_expando(statement)
+}
+
 /// Authenticates `object.name` and `object["name"]` against binder-owned exports.
 pub(super) fn plan_javascript_object_expando_assignment(
     arena: &NodeArena,
@@ -420,6 +446,193 @@ pub(super) fn plan_simple_assignment_with_all_source_targets(
 }
 
 impl CommonJsAssignmentPlanner<'_> {
+    #[allow(clippy::too_many_lines)] // Proves the assignment and its complete function owner.
+    fn plan_function_expando(
+        &self,
+        statement: NodeRef,
+    ) -> Result<Option<FunctionExpandoAssignmentPlan>, AssignmentPlanError> {
+        self.preflight_program()?;
+        if self
+            .bound
+            .source_facts()
+            .is_none_or(ts_binder::CanonicalSourceFileFacts::is_declaration_file)
+        {
+            return Ok(None);
+        }
+
+        let statement_node = self.node(statement)?;
+        let NodeData::ExpressionStatement(statement_data) = &statement_node.data else {
+            return Ok(None);
+        };
+        if statement_node.flags.0 != 0 || statement_data.flow_node.is_some() {
+            return Err(AssignmentInvariant::InvalidStatementShape(statement).into());
+        }
+        if statement_node.parent != Some(self.bound.source_file().node) {
+            return Err(AssignmentPlanError::Unsupported(
+                AssignmentUnsupported::NestedTarget(statement),
+            ));
+        }
+
+        let expression = self.reference(statement_data.expression);
+        self.require_parent(expression, Some(statement.node))?;
+        let expression_node = self.node(expression)?;
+        let NodeData::BinaryExpression(binary) = &expression_node.data else {
+            return Ok(None);
+        };
+        if expression_node.flags.0 != 0
+            || binary.symbol.is_some()
+            || binary.type_.is_some()
+            || binary.facts != 0
+            || binary.modifiers.is_some()
+        {
+            return Err(AssignmentPlanError::Unsupported(
+                AssignmentUnsupported::NonOrdinaryAssignment(expression),
+            ));
+        }
+        let operator = self.reference(binary.operator_token);
+        self.require_parent(operator, Some(expression.node))?;
+        let operator_node = self.node(operator)?;
+        if !matches!(operator_node.data, NodeData::Token(_)) || operator_node.flags.0 != 0 {
+            return Err(AssignmentInvariant::InvalidOperatorToken(operator).into());
+        }
+        if operator_node.kind != SyntaxKind::EqualsToken {
+            return Ok(None);
+        }
+
+        let left = self.reference(binary.left);
+        let right = self.reference(binary.right);
+        self.require_parent(left, Some(expression.node))?;
+        self.require_parent(right, Some(expression.node))?;
+        let left_node = self.node(left)?;
+        let NodeData::PropertyAccessExpression(access) = &left_node.data else {
+            return Ok(None);
+        };
+        if left_node.flags.0 != 0
+            || access.flow_node.is_some()
+            || access.question_dot_token.is_some()
+            || access.facts != 0
+        {
+            return Err(AssignmentPlanError::Unsupported(
+                AssignmentUnsupported::Syntax {
+                    node: left,
+                    kind: left_node.kind,
+                    role: AssignmentSyntaxRole::LeftHandSide,
+                },
+            ));
+        }
+        let receiver = self.reference(access.expression);
+        let name = self.reference(access.name);
+        self.require_parent(receiver, Some(left.node))?;
+        self.require_parent(name, Some(left.node))?;
+        let receiver_record = self.node(receiver)?;
+        let NodeData::Identifier(receiver_name) = &receiver_record.data else {
+            return Ok(None);
+        };
+        if receiver_record.flags.0 != 0
+            || receiver_name.flow_node.is_some()
+            || receiver_name.text.is_empty()
+        {
+            return Err(AssignmentInvariant::InvalidIdentifierShape(receiver).into());
+        }
+        let property_name_record = self.node(name)?;
+        let NodeData::Identifier(property_name) = &property_name_record.data else {
+            return Ok(None);
+        };
+        if property_name_record.flags.0 != 0
+            || property_name.flow_node.is_some()
+            || property_name.text.is_empty()
+        {
+            return Err(AssignmentInvariant::InvalidIdentifierShape(name).into());
+        }
+
+        let Some(property_symbol) = self.bound.symbol(expression) else {
+            return Ok(None);
+        };
+        let property = self
+            .store
+            .symbol(property_symbol)
+            .ok_or(AssignmentInvariant::InvalidSymbol(property_symbol))?;
+        let Some(owner_symbol) = property.parent() else {
+            return Ok(None);
+        };
+        let owner = self
+            .store
+            .symbol(owner_symbol)
+            .ok_or(AssignmentInvariant::InvalidSymbol(owner_symbol))?;
+        let Some(declaration) = owner.value_declaration() else {
+            return Ok(None);
+        };
+        if self.store.source_node_kind(declaration) != Some(SyntaxKind::FunctionDeclaration)
+            || owner.flags() != SymbolFlags::FUNCTION
+            || owner.parent().is_some()
+        {
+            return Ok(None);
+        }
+        if property.flags() != SymbolFlags::PROPERTY | SymbolFlags::ASSIGNMENT
+            || property.check_flags() != CheckFlags::NONE
+            || property.name().as_bytes() != property_name.text.as_bytes()
+            || property.declarations() != Some(&[expression])
+            || property.value_declaration() != Some(expression)
+            || property.members().is_some()
+            || property.exports().is_some()
+            || property.export_symbol().is_some()
+            || self.store.get_merged_symbol(property_symbol) != Some(property_symbol)
+        {
+            return Err(AssignmentInvariant::InvalidSymbolShape(property_symbol).into());
+        }
+        if owner.check_flags() != CheckFlags::NONE
+            || owner.name().as_bytes() != receiver_name.text.as_bytes()
+            || owner.declarations() != Some(&[declaration])
+            || owner.members().is_some()
+            || owner.export_symbol().is_some()
+            || self.store.get_merged_symbol(owner_symbol) != Some(owner_symbol)
+            || self.bound.symbol(declaration) != Some(owner_symbol)
+            || !super::source_callables::source_function_owner_expando_exports_are_valid(
+                self.store,
+                owner_symbol,
+                declaration,
+            )
+            || owner
+                .exports()
+                .and_then(|exports| self.store.symbol_table(exports))
+                .and_then(|exports| exports.get_source(&property_name.text))
+                != Some(property_symbol)
+        {
+            return Err(AssignmentInvariant::InvalidSymbolShape(owner_symbol).into());
+        }
+        if self
+            .bound
+            .locals(self.bound.source_file())
+            .and_then(|locals| self.store.symbol_table(locals))
+            .and_then(|locals| locals.get_source(&receiver_name.text))
+            != Some(owner_symbol)
+        {
+            return Err(AssignmentInvariant::InvalidSymbolShape(owner_symbol).into());
+        }
+        if let Some(cached) = self
+            .store
+            .symbol_node_links(receiver)
+            .and_then(|links| links.resolved_symbol)
+            && cached != owner_symbol
+        {
+            return Err(AssignmentInvariant::ResolvedSymbolMismatch {
+                node: receiver,
+                expected: owner_symbol,
+                actual: cached,
+            }
+            .into());
+        }
+
+        Ok(Some(FunctionExpandoAssignmentPlan {
+            expression,
+            left,
+            right,
+            receiver,
+            owner_symbol,
+            property_symbol,
+        }))
+    }
+
     #[allow(clippy::too_many_lines)] // Proves the complete object, receiver, and expando graph.
     fn plan_object_expando(
         &self,
@@ -3221,6 +3434,18 @@ mod tests {
             )
         }
 
+        fn function_expando_plan(
+            &self,
+            index: usize,
+        ) -> Result<Option<FunctionExpandoAssignmentPlan>, AssignmentPlanError> {
+            plan_function_expando_assignment(
+                &self.parsed.arena,
+                &self.bound,
+                &self.store,
+                self.expression_statement(index),
+            )
+        }
+
         fn object_expando_plan(
             &self,
             index: usize,
@@ -3466,6 +3691,93 @@ mod tests {
                 },
             )),
         );
+    }
+
+    #[test]
+    fn plans_binder_owned_function_expandos_without_semantic_writes() {
+        for fixture in [
+            Fixture::new("function work() {} work.value = 1; export {};"),
+            Fixture::javascript("function work() {} work.value = 1;"),
+        ] {
+            let statement = fixture.expression_statement(0);
+            let (expression, left, right) = assignment_parts(&fixture.parsed, statement);
+            let NodeData::PropertyAccessExpression(access) =
+                &fixture.parsed.arena.get(left.node).unwrap().data
+            else {
+                panic!("expected a direct function expando property")
+            };
+            let receiver = NodeRef::new(fixture.parsed.arena.id(), fixture.file, access.expression);
+            let owner = fixture.source_local("work");
+            let property = fixture.bound.symbol(expression).unwrap();
+            let before = observable_state(&fixture.store);
+
+            assert_eq!(
+                fixture.function_expando_plan(0),
+                Ok(Some(FunctionExpandoAssignmentPlan {
+                    expression,
+                    left,
+                    right,
+                    receiver,
+                    owner_symbol: owner,
+                    property_symbol: property,
+                })),
+            );
+            assert_eq!(observable_state(&fixture.store), before);
+        }
+    }
+
+    #[test]
+    fn function_expandos_reject_forged_properties_and_receiver_caches() {
+        let mut forged = Fixture::new("function work() {} work.value = 1; export {};");
+        let statement = forged.expression_statement(0);
+        let (expression, _, _) = assignment_parts(&forged.parsed, statement);
+        let property = forged.bound.symbol(expression).unwrap();
+        assert!(
+            forged
+                .store
+                .set_symbol_flags(property, SymbolFlags::PROPERTY, CheckFlags::NONE,)
+        );
+        let before = observable_state(&forged.store);
+        assert_eq!(
+            forged.function_expando_plan(0),
+            Err(AssignmentPlanError::Invariant(
+                AssignmentInvariant::InvalidSymbolShape(property),
+            )),
+        );
+        assert_eq!(observable_state(&forged.store), before);
+
+        let mut poisoned = Fixture::new(concat!(
+            "function work() {} const other = 1; ",
+            "work.value = 1; export {};",
+        ));
+        let statement = poisoned.expression_statement(0);
+        let (_, left, _) = assignment_parts(&poisoned.parsed, statement);
+        let NodeData::PropertyAccessExpression(access) =
+            &poisoned.parsed.arena.get(left.node).unwrap().data
+        else {
+            panic!("expected a direct function expando property")
+        };
+        let receiver = NodeRef::new(poisoned.parsed.arena.id(), poisoned.file, access.expression);
+        let owner = poisoned.source_local("work");
+        let other = poisoned.source_local("other");
+        assert!(poisoned.store.set_symbol_node_links(
+            receiver,
+            SymbolNodeLinks {
+                resolved_symbol: Some(other),
+            },
+        ));
+        let before = observable_state(&poisoned.store);
+        assert_eq!(
+            poisoned.function_expando_plan(0),
+            Err(AssignmentPlanError::Invariant(
+                AssignmentInvariant::ResolvedSymbolMismatch {
+                    node: receiver,
+                    expected: owner,
+                    actual: other,
+                },
+            )),
+        );
+        assert_eq!(observable_state(&poisoned.store), before);
     }
 
     #[test]

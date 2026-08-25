@@ -823,6 +823,11 @@ fn source_function_owner_exports_are_valid(
         return owner.flags() == SymbolFlags::FUNCTION
             || owner.flags() == SymbolFlags::FUNCTION | SymbolFlags::NAMESPACE_MODULE;
     };
+    if owner.flags() == SymbolFlags::FUNCTION {
+        return owner.value_declaration().is_some_and(|declaration| {
+            source_function_owner_expando_exports_are_valid(store, owner_symbol, declaration)
+        });
+    }
     if owner.flags() == SymbolFlags::FUNCTION | SymbolFlags::NAMESPACE_MODULE {
         return store.symbol_table(exports).is_some_and(|exports| {
             exports.iter().all(|(_, symbol)| {
@@ -878,6 +883,66 @@ fn source_function_owner_exports_are_valid(
         has_value_export |= record.flags().intersects(SymbolFlags::VALUE);
     }
     has_value_export
+}
+
+/// Validates direct binder-owned expando properties on a source function.
+pub(super) fn source_function_owner_expando_exports_are_valid(
+    store: &CanonicalTypeMapperStore,
+    owner_symbol: SemanticSymbolId,
+    declaration: NodeRef,
+) -> bool {
+    let Some(owner) = store.symbol(owner_symbol) else {
+        return false;
+    };
+    let Some(exports) = owner.exports() else {
+        return true;
+    };
+    let Some(SourceNodeParent::Parent(source)) = store.source_node_parent(declaration) else {
+        return false;
+    };
+    let Some(exports) = store.symbol_table(exports) else {
+        return false;
+    };
+    if exports.is_empty()
+        || owner.flags() != SymbolFlags::FUNCTION
+        || owner.check_flags() != CheckFlags::NONE
+        || owner.declarations() != Some(&[declaration])
+        || owner.value_declaration() != Some(declaration)
+        || owner.members().is_some()
+        || owner.parent().is_some()
+        || owner.export_symbol().is_some()
+        || store.get_merged_symbol(owner_symbol) != Some(owner_symbol)
+        || store.source_node_kind(declaration) != Some(SyntaxKind::FunctionDeclaration)
+        || store.source_node_kind(source) != Some(SyntaxKind::SourceFile)
+    {
+        return false;
+    }
+
+    exports.iter().all(|(name, symbol)| {
+        let Some(property) = store.symbol(symbol) else {
+            return false;
+        };
+        let Some([assignment]) = property.declarations() else {
+            return false;
+        };
+        let assignment = *assignment;
+        let Some(SourceNodeParent::Parent(statement)) = store.source_node_parent(assignment) else {
+            return false;
+        };
+        property.flags() == SymbolFlags::PROPERTY | SymbolFlags::ASSIGNMENT
+            && property.check_flags() == CheckFlags::NONE
+            && property.name() == name
+            && property.value_declaration() == Some(assignment)
+            && property.members().is_none()
+            && property.exports().is_none()
+            && property.parent() == Some(owner_symbol)
+            && property.export_symbol().is_none()
+            && store.get_merged_symbol(symbol) == Some(symbol)
+            && assignment.is_for(declaration.arena, declaration.file)
+            && store.source_node_kind(assignment) == Some(SyntaxKind::BinaryExpression)
+            && store.source_node_kind(statement) == Some(SyntaxKind::ExpressionStatement)
+            && store.source_node_parent(statement) == Some(SourceNodeParent::Parent(source))
+    })
 }
 
 /// Validates retained arrow expando ownership without borrowing source arenas.
@@ -979,6 +1044,48 @@ fn bound_source_arrow_owner_expando_exports_are_valid(
         };
         matches!(
             super::assignment::plan_arrow_expando_assignment(arena, bound, store, statement),
+            Ok(Some(plan))
+                if plan.owner_symbol == owner_symbol
+                    && plan.property_symbol == property
+                    && plan.expression == assignment
+        )
+    })
+}
+
+fn bound_source_function_owner_expando_exports_are_valid(
+    store: &CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    declaration: NodeRef,
+    owner_symbol: SemanticSymbolId,
+) -> bool {
+    if !source_function_owner_expando_exports_are_valid(store, owner_symbol, declaration) {
+        return false;
+    }
+    let Some(owner) = store.symbol(owner_symbol) else {
+        return false;
+    };
+    let Some(exports) = owner.exports() else {
+        return true;
+    };
+    let Some((arena, bound)) = host.source(declaration) else {
+        return false;
+    };
+    let Some(exports) = store.symbol_table(exports) else {
+        return false;
+    };
+
+    exports.iter().all(|(_, property)| {
+        let Some(assignment) = store
+            .symbol(property)
+            .and_then(ts_binder::semantic::Symbol::value_declaration)
+        else {
+            return false;
+        };
+        let Some(SourceNodeParent::Parent(statement)) = store.source_node_parent(assignment) else {
+            return false;
+        };
+        matches!(
+            super::assignment::plan_function_expando_assignment(arena, bound, store, statement),
             Ok(Some(plan))
                 if plan.owner_symbol == owner_symbol
                     && plan.property_symbol == property
@@ -1946,6 +2053,13 @@ fn plan_source_callable_with_owner_shape(
     )?;
     let exports_valid = if view.family == SourceCallableFamily::ArrowFunction {
         bound_source_arrow_owner_expando_exports_are_valid(store, host, declaration, owner_symbol)
+    } else if owner.flags() == SymbolFlags::FUNCTION && owner.exports().is_some() {
+        bound_source_function_owner_expando_exports_are_valid(
+            store,
+            host,
+            declaration,
+            owner_symbol,
+        )
     } else {
         source_function_owner_exports_are_valid(store, owner_symbol, owner)
     };

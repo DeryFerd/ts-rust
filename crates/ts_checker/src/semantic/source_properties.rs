@@ -37,6 +37,11 @@ use super::{
     member_resolution::UnionPropertyError,
     relater::ResolvedOwnProperty,
     source::{PlannedExpression, PlannedExpressionKind},
+    source_callables::{
+        SourceCallableFamily, StoredSourceCallableValidation,
+        source_arrow_owner_expando_exports_are_valid,
+        source_function_owner_expando_exports_are_valid, validate_stored_source_callable,
+    },
     spelling::get_spelling_suggestion,
     type_records::{TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
@@ -528,6 +533,10 @@ pub(super) fn check_direct_source_property(
                 }),
             )
         }
+    } else if let Some(property) =
+        resolve_published_source_callable_expando_property(store, plan, receiver_type)?
+    {
+        (property.type_, Some(property.symbol), None)
     } else if let Some(property) = match resolve_class_static_property(store, plan, receiver_type)?
     {
         Some(ClassStaticProperty::Present(property)) => Some(property),
@@ -1063,6 +1072,82 @@ fn validate_published_canonical_array_method(
         return Err(SourcePropertyError::InvalidCache(node));
     }
     Ok(())
+}
+
+fn resolve_published_source_callable_expando_property(
+    store: &CanonicalTypeMapperStore,
+    plan: &SourcePropertyPlan,
+    receiver_type: TypeId,
+) -> Result<Option<ResolvedOwnProperty>, SourcePropertyError> {
+    let Some(provenance) = store.source_callable_provenance(receiver_type) else {
+        return Ok(None);
+    };
+    let Some(owner) = store.symbol(provenance.owner_symbol) else {
+        return Err(SourcePropertyError::InvalidCache(plan.node));
+    };
+    let Some(exports) = owner.exports() else {
+        return Ok(None);
+    };
+    let valid_exports = match provenance.family {
+        SourceCallableFamily::ArrowFunction => source_arrow_owner_expando_exports_are_valid(
+            store,
+            provenance.owner_symbol,
+            provenance.declaration,
+        ),
+        SourceCallableFamily::FunctionDeclaration => {
+            source_function_owner_expando_exports_are_valid(
+                store,
+                provenance.owner_symbol,
+                provenance.declaration,
+            )
+        }
+    };
+    if !valid_exports
+        || !matches!(
+            validate_stored_source_callable(store, receiver_type),
+            StoredSourceCallableValidation::Valid(_)
+        )
+    {
+        return Err(SourcePropertyError::InvalidCache(plan.node));
+    }
+    let exports = store
+        .symbol_table(exports)
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    let Some(symbol) = exports.get_source(&plan.name) else {
+        return Ok(None);
+    };
+    let property = store
+        .symbol(symbol)
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    let links = store
+        .value_symbol_links(symbol)
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    let type_ = links
+        .resolved_type
+        .filter(|type_| store.type_payload(*type_).is_some())
+        .ok_or(SourcePropertyError::InvalidCache(plan.node))?;
+    if property.flags() != SymbolFlags::PROPERTY | SymbolFlags::ASSIGNMENT
+        || property.check_flags() != CheckFlags::NONE
+        || property.name().as_utf8() != Some(plan.name.as_str())
+        || property.parent() != Some(provenance.owner_symbol)
+        || property.members().is_some()
+        || property.exports().is_some()
+        || property.export_symbol().is_some()
+        || store.get_merged_symbol(symbol) != Some(symbol)
+        || links
+            != &(ValueSymbolLinks {
+                resolved_type: Some(type_),
+                ..ValueSymbolLinks::default()
+            })
+    {
+        return Err(SourcePropertyError::InvalidCache(plan.node));
+    }
+    Ok(Some(ResolvedOwnProperty {
+        symbol,
+        type_,
+        optional: false,
+        readonly: false,
+    }))
 }
 
 fn resolve_class_static_property(
